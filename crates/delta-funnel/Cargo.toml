@@ -1,0 +1,16 @@
+[package]
+name = "delta-funnel"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Export Delta Lake tables into Microsoft SQL Server efficiently"
+keywords = ["delta", "arrow", "mssql", "sql-server"]
+categories = ["database"]
+
+[lints]
+workspace = true
+
+[dependencies]

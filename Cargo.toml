@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/delta-funnel"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/mag1cfrog/delta-funnel"
+homepage = "https://github.com/mag1cfrog/delta-funnel"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"
