@@ -4,6 +4,7 @@
 //! such as Delta Lake into Microsoft SQL Server. Low-level Arrow to TDS bulk
 //! loading is expected to stay in `arrow-tiberius`.
 
+mod delta_kernel_adapter;
 pub mod error;
 
 pub use error::{Error, ErrorCategory, Result};
