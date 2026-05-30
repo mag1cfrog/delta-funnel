@@ -9,7 +9,9 @@ const INVALID_TABLE_URI: &str = "table location could not be parsed or normalize
 ///
 /// This uses the official `delta_kernel` URI handling path so bare local paths
 /// are canonicalized to `file://` URLs and remote object-store URLs keep the
-/// same URL semantics that snapshot loading will use.
+/// same URL semantics that snapshot loading will use. Relative local paths are
+/// resolved against the process current directory by the `delta_kernel`
+/// canonicalization path.
 ///
 /// # Errors
 ///
@@ -82,9 +84,20 @@ mod tests {
     fn normalizes_relative_local_paths_to_file_urls() -> Result<(), Box<dyn std::error::Error>> {
         let dir = TestDir::relative("relative")?;
         let normalized = normalize_delta_table_uri(dir.path.to_string_lossy())?;
+        let normalized_url = crate::delta_kernel_adapter::try_parse_uri(&normalized)?;
+        let normalized_path = normalized_url.to_file_path().map_err(|()| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "normalized file URL could not be converted to a local path",
+            )
+        })?;
+        let expected_path = fs::canonicalize(&dir.path)?;
+        let current_dir = fs::canonicalize(std::env::current_dir()?)?;
 
         assert!(normalized.starts_with("file://"));
         assert!(normalized.ends_with('/'));
+        assert_eq!(normalized_path, expected_path);
+        assert!(expected_path.starts_with(current_dir));
 
         Ok(())
     }
