@@ -36,6 +36,20 @@ pub enum DeltaFunnelError {
         reason: &'static str,
     },
 
+    /// A Delta source engine could not be constructed.
+    #[snafu(display("Delta source engine error: {reason}"))]
+    DeltaSourceEngine {
+        /// Sanitized reason for the engine construction failure.
+        reason: &'static str,
+    },
+
+    /// A Delta snapshot could not be loaded.
+    #[snafu(display("Delta snapshot load error: {reason}"))]
+    DeltaSnapshotLoad {
+        /// Sanitized reason for the snapshot load failure.
+        reason: &'static str,
+    },
+
     /// A required dependency contract is unavailable or incompatible.
     #[snafu(display("dependency compatibility error: {message}"))]
     DependencyCompatibility {
@@ -103,6 +117,30 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "invalid Delta source URI: table location could not be parsed or normalized"
+        );
+    }
+
+    #[test]
+    fn source_engine_error_has_sanitized_display() {
+        let error = DeltaFunnelError::DeltaSourceEngine {
+            reason: "object store engine could not be constructed",
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Delta source engine error: object store engine could not be constructed"
+        );
+    }
+
+    #[test]
+    fn snapshot_load_error_has_sanitized_display() {
+        let error = DeltaFunnelError::DeltaSnapshotLoad {
+            reason: "snapshot could not be loaded",
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Delta snapshot load error: snapshot could not be loaded"
         );
     }
 }
