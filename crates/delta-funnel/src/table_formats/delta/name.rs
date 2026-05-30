@@ -79,6 +79,16 @@ mod tests {
     use super::validate_delta_source_names;
     use crate::DeltaFunnelError;
 
+    fn assert_invalid_name(input: &str, expected_reason: &'static str) {
+        let result = validate_delta_source_names([input]);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::InvalidSourceName { name, reason })
+                if name == input && reason == expected_reason
+        ));
+    }
+
     #[test]
     fn accepts_simple_unquoted_identifiers() -> Result<(), DeltaFunnelError> {
         validate_delta_source_names(["orders", "_customers", "Regions_2026", "line_items"])?;
@@ -88,40 +98,46 @@ mod tests {
 
     #[test]
     fn rejects_empty_source_names() {
-        let result = validate_delta_source_names([""]);
-
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::InvalidSourceName { .. })
-        ));
+        assert_invalid_name("", "source names must not be empty");
     }
 
     #[test]
     fn rejects_source_names_that_start_with_a_digit() {
-        let result = validate_delta_source_names(["2026_orders"]);
-
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::InvalidSourceName { .. })
-        ));
+        assert_invalid_name(
+            "2026_orders",
+            "source names must start with an ASCII letter or underscore",
+        );
     }
 
     #[test]
     fn rejects_names_that_need_quoting_or_qualification() {
-        for name in [
-            "orders.latest",
-            "line-items",
-            "line items",
-            "\"orders\"",
-            "orders$",
-            "ordérs",
+        for (name, reason) in [
+            (
+                "orders.latest",
+                "source names may contain only ASCII letters, digits, and underscores",
+            ),
+            (
+                "line-items",
+                "source names may contain only ASCII letters, digits, and underscores",
+            ),
+            (
+                "line items",
+                "source names may contain only ASCII letters, digits, and underscores",
+            ),
+            (
+                "\"orders\"",
+                "source names must start with an ASCII letter or underscore",
+            ),
+            (
+                "orders$",
+                "source names may contain only ASCII letters, digits, and underscores",
+            ),
+            (
+                "ordérs",
+                "source names may contain only ASCII letters, digits, and underscores",
+            ),
         ] {
-            let result = validate_delta_source_names([name]);
-
-            assert!(matches!(
-                result,
-                Err(DeltaFunnelError::InvalidSourceName { .. })
-            ));
+            assert_invalid_name(name, reason);
         }
     }
 
@@ -132,6 +148,18 @@ mod tests {
         assert!(matches!(
             result,
             Err(DeltaFunnelError::DuplicateSourceName { name }) if name == "Orders"
+        ));
+    }
+
+    #[test]
+    fn invalid_name_wins_before_duplicate_detection() {
+        let result = validate_delta_source_names(["orders", "orders.latest", "Orders"]);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::InvalidSourceName { name, reason })
+                if name == "orders.latest"
+                    && reason == "source names may contain only ASCII letters, digits, and underscores"
         ));
     }
 }

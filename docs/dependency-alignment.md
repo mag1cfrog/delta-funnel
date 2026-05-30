@@ -35,8 +35,8 @@ Python-facing errors.
 ## Delta Kernel Boundary
 
 Stability-sensitive `delta_kernel` APIs are kept behind the private
-`delta_kernel_adapter` module. The foundation tests compile against the API
-symbols that later source and reader issues depend on:
+`table_formats::delta::kernel` module. The foundation tests compile against
+the API symbols that later Delta source and reader issues depend on:
 
 - `scan_metadata`
 - `visit_scan_files`

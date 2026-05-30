@@ -114,7 +114,17 @@ mod tests {
         path: PathBuf,
     }
 
+    struct TestDir {
+        path: PathBuf,
+    }
+
     impl Drop for DeltaLogTable {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
@@ -135,6 +145,17 @@ mod tests {
                 log_path.join("00000000000000000001.json"),
                 format!("{}\n", add_json("part-00001.parquet")),
             )?;
+
+            Ok(Self { path })
+        }
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let path = Path::new("target")
+                .join("delta-funnel-broken-snapshot-tests")
+                .join(unique_name(name)?);
+            fs::create_dir_all(&path)?;
 
             Ok(Self { path })
         }
@@ -198,5 +219,88 @@ mod tests {
             result,
             Err(DeltaFunnelError::DeltaSourceEngine { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_existing_empty_directory_as_snapshot_load_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TestDir::new("empty-table")?;
+        let result = load_delta_table_snapshot(dir.path.to_string_lossy(), None);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaSnapshotLoad { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_malformed_commit_json_as_snapshot_load_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TestDir::new("malformed-json")?;
+        let log_path = dir.path.join("_delta_log");
+        fs::create_dir_all(&log_path)?;
+        fs::write(log_path.join("00000000000000000000.json"), "{not json\n")?;
+
+        let result = load_delta_table_snapshot(dir.path.to_string_lossy(), None);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaSnapshotLoad { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_commit_without_protocol_or_metadata_as_snapshot_load_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TestDir::new("missing-protocol-metadata")?;
+        let log_path = dir.path.join("_delta_log");
+        fs::create_dir_all(&log_path)?;
+        fs::write(
+            log_path.join("00000000000000000000.json"),
+            format!("{}\n", add_json("part-00000.parquet")),
+        )?;
+
+        let result = load_delta_table_snapshot(dir.path.to_string_lossy(), None);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaSnapshotLoad { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_regular_file_as_invalid_source_uri() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TestDir::new("regular-file-parent")?;
+        let file_path = dir.path.join("not-a-directory");
+        fs::write(&file_path, "not a table")?;
+
+        let result = load_delta_table_snapshot(file_path.to_string_lossy(), None);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::InvalidSourceUri { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_errors_do_not_expose_secret_bearing_uri() {
+        let result = load_delta_table_snapshot("ftp://user:password@example.com/table", None);
+        let error = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+
+        assert!(!error.contains("user"));
+        assert!(!error.contains("password"));
+        assert!(!error.contains("example.com"));
+        assert!(!error.contains("ftp://"));
     }
 }

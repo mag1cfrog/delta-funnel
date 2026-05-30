@@ -271,4 +271,44 @@ mod tests {
             Err(DeltaFunnelError::DuplicateSourceName { name }) if name == "Orders"
         ));
     }
+
+    #[test]
+    fn rejects_invalid_name_before_multi_source_table_uri_loading() {
+        let result = load_delta_sources([
+            DeltaSourceConfig {
+                name: "orders".to_owned(),
+                table_uri: "missing/orders".to_owned(),
+                version: None,
+            },
+            DeltaSourceConfig {
+                name: "customers.latest".to_owned(),
+                table_uri: "missing/customers".to_owned(),
+                version: None,
+            },
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::InvalidSourceName { name, .. }) if name == "customers.latest"
+        ));
+    }
+
+    #[test]
+    fn source_load_errors_do_not_expose_secret_bearing_uri() {
+        let result = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: "ftp://user:password@example.com/table".to_owned(),
+            version: None,
+        });
+
+        let error = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+
+        assert!(!error.contains("user"));
+        assert!(!error.contains("password"));
+        assert!(!error.contains("example.com"));
+        assert!(!error.contains("ftp://"));
+    }
 }
