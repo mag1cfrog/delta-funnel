@@ -13,3 +13,6 @@ The initial direction is:
 The workspace currently contains the core `delta-funnel` crate. More crates can
 be added for Python bindings, CLI tools, or integration test harnesses as the
 design hardens.
+
+Foundation dependency and error-handling decisions are recorded in
+[`docs/dependency-alignment.md`](docs/dependency-alignment.md).

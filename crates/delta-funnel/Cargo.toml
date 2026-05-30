@@ -14,3 +14,10 @@ categories = ["database"]
 workspace = true
 
 [dependencies]
+arrow-tiberius = "0.1.0"
+delta_kernel = { version = "0.23.0", default-features = false, features = [
+    "arrow",
+    "default-engine-native-tls",
+    "internal-api",
+] }
+snafu = "0.9"
