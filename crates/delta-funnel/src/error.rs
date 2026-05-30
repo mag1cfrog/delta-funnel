@@ -29,6 +29,13 @@ pub enum DeltaFunnelError {
         name: String,
     },
 
+    /// A Delta source URI is not valid for snapshot loading.
+    #[snafu(display("invalid Delta source URI: {reason}"))]
+    InvalidSourceUri {
+        /// Sanitized reason for the validation failure.
+        reason: &'static str,
+    },
+
     /// A required dependency contract is unavailable or incompatible.
     #[snafu(display("dependency compatibility error: {message}"))]
     DependencyCompatibility {
@@ -85,5 +92,17 @@ mod tests {
         };
 
         assert_eq!(error.to_string(), "duplicate Delta source name `Orders`");
+    }
+
+    #[test]
+    fn invalid_source_uri_error_has_sanitized_display() {
+        let error = DeltaFunnelError::InvalidSourceUri {
+            reason: "table location could not be parsed or normalized",
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "invalid Delta source URI: table location could not be parsed or normalized"
+        );
     }
 }
