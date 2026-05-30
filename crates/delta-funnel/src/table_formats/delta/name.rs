@@ -8,13 +8,97 @@ const EMPTY_NAME: &str = "source names must not be empty";
 const INVALID_FIRST_CHARACTER: &str = "source names must start with an ASCII letter or underscore";
 const INVALID_CHARACTER: &str =
     "source names may contain only ASCII letters, digits, and underscores";
+const SQL_KEYWORD: &str = "source names must not be SQL keywords";
+
+const RESERVED_SQL_KEYWORDS: &[&str] = &[
+    "all",
+    "alter",
+    "analyze",
+    "and",
+    "anti",
+    "as",
+    "asof",
+    "by",
+    "case",
+    "connect",
+    "cross",
+    "delete",
+    "distinct",
+    "distribute",
+    "drop",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "explain",
+    "false",
+    "fetch",
+    "for",
+    "format",
+    "from",
+    "full",
+    "global",
+    "group",
+    "having",
+    "in",
+    "inner",
+    "insert",
+    "intersect",
+    "into",
+    "is",
+    "join",
+    "lateral",
+    "left",
+    "like",
+    "limit",
+    "minus",
+    "natural",
+    "not",
+    "null",
+    "offset",
+    "on",
+    "open",
+    "or",
+    "order",
+    "outer",
+    "partition",
+    "pivot",
+    "prewhere",
+    "qualify",
+    "returning",
+    "right",
+    "sample",
+    "select",
+    "semi",
+    "set",
+    "settings",
+    "sort",
+    "start",
+    "table",
+    "tablesample",
+    "then",
+    "top",
+    "true",
+    "union",
+    "unpivot",
+    "update",
+    "using",
+    "values",
+    "view",
+    "when",
+    "where",
+    "window",
+    "with",
+];
 
 /// Validates Delta source names before registration.
 ///
 /// Source names are DataFusion table names for the MVP. They intentionally use
 /// a simple unquoted identifier subset: ASCII letters, digits, and underscores,
-/// with a letter or underscore as the first character. Duplicate checks are
-/// case-insensitive so unquoted SQL references cannot become ambiguous.
+/// with a letter or underscore as the first character. Common SQL keywords are
+/// rejected to avoid names that require quoting in user queries. Duplicate
+/// checks are case-insensitive so unquoted SQL references cannot become
+/// ambiguous.
 ///
 /// # Errors
 ///
@@ -52,11 +136,15 @@ fn validate_source_name(name: &str) -> Result<(), DeltaFunnelError> {
         return Err(invalid_source_name(name, INVALID_FIRST_CHARACTER));
     }
 
-    if chars.all(is_valid_following_character) {
-        Ok(())
-    } else {
-        Err(invalid_source_name(name, INVALID_CHARACTER))
+    if !chars.all(is_valid_following_character) {
+        return Err(invalid_source_name(name, INVALID_CHARACTER));
     }
+
+    if is_reserved_sql_keyword(name) {
+        return Err(invalid_source_name(name, SQL_KEYWORD));
+    }
+
+    Ok(())
 }
 
 fn invalid_source_name(name: &str, reason: &'static str) -> DeltaFunnelError {
@@ -72,6 +160,12 @@ fn is_valid_first_character(value: char) -> bool {
 
 fn is_valid_following_character(value: char) -> bool {
     value == '_' || value.is_ascii_alphanumeric()
+}
+
+fn is_reserved_sql_keyword(value: &str) -> bool {
+    RESERVED_SQL_KEYWORDS
+        .iter()
+        .any(|keyword| value.eq_ignore_ascii_case(keyword))
 }
 
 #[cfg(test)]
@@ -138,6 +232,13 @@ mod tests {
             ),
         ] {
             assert_invalid_name(name, reason);
+        }
+    }
+
+    #[test]
+    fn rejects_sql_keywords_that_would_need_quoting() {
+        for name in ["select", "FROM", "Join", "where", "table"] {
+            assert_invalid_name(name, "source names must not be SQL keywords");
         }
     }
 

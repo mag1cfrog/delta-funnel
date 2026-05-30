@@ -14,7 +14,10 @@ pub enum DeltaFunnelError {
     },
 
     /// A Delta source name is not valid for registration.
-    #[snafu(display("invalid Delta source name `{name}`: {reason}"))]
+    #[snafu(display(
+        "invalid Delta source name `{}`: {reason}",
+        sanitize_source_name_for_display(name)
+    ))]
     InvalidSourceName {
         /// Caller-provided source name.
         name: String,
@@ -23,7 +26,10 @@ pub enum DeltaFunnelError {
     },
 
     /// Two configured Delta sources use the same registration name.
-    #[snafu(display("duplicate Delta source name `{name}`"))]
+    #[snafu(display(
+        "duplicate Delta source name `{}`",
+        sanitize_source_name_for_display(name)
+    ))]
     DuplicateSourceName {
         /// Caller-provided duplicate source name.
         name: String,
@@ -56,6 +62,10 @@ pub enum DeltaFunnelError {
         /// Sanitized message suitable for logs and Python-facing errors.
         message: String,
     },
+}
+
+fn sanitize_source_name_for_display(name: &str) -> String {
+    name.chars().flat_map(char::escape_default).collect()
 }
 
 #[cfg(test)]
@@ -97,6 +107,20 @@ mod tests {
             error.to_string(),
             "invalid Delta source name `orders.latest`: source names may contain only ASCII letters, digits, and underscores"
         );
+    }
+
+    #[test]
+    fn invalid_source_name_display_escapes_control_characters() {
+        let error = DeltaFunnelError::InvalidSourceName {
+            name: "orders\nlatest\tname".to_owned(),
+            reason: "source names may contain only ASCII letters, digits, and underscores",
+        };
+
+        let display = error.to_string();
+
+        assert!(!display.contains('\n'));
+        assert!(!display.contains('\t'));
+        assert!(display.contains(r"orders\nlatest\tname"));
     }
 
     #[test]

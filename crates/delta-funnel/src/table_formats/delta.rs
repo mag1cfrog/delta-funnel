@@ -225,6 +225,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_sql_keyword_name_before_table_uri() {
+        let result = load_delta_source(DeltaSourceConfig {
+            name: "select".to_owned(),
+            table_uri: "missing/path".to_owned(),
+            version: None,
+        });
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::InvalidSourceName { name, reason })
+                if name == "select" && reason == "source names must not be SQL keywords"
+        ));
+    }
+
+    #[test]
+    fn rejects_blank_table_uri_as_invalid_source_uri() {
+        let result = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: " \t\n".to_owned(),
+            version: None,
+        });
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::InvalidSourceUri { reason })
+                if reason == "table location must not be empty"
+        ));
+    }
+
+    #[test]
     fn loads_multiple_named_delta_sources() -> Result<(), Box<dyn std::error::Error>> {
         let orders = DeltaLogTable::new("orders")?;
         let customers = DeltaLogTable::new("customers")?;

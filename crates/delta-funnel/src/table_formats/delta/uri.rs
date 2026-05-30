@@ -4,6 +4,7 @@ use crate::DeltaFunnelError;
 
 use super::kernel::try_parse_uri;
 
+const EMPTY_TABLE_URI: &str = "table location must not be empty";
 const INVALID_TABLE_URI: &str = "table location could not be parsed or normalized";
 
 /// Normalizes a Delta table URI for later snapshot loading.
@@ -21,6 +22,13 @@ const INVALID_TABLE_URI: &str = "table location could not be parsed or normalize
 pub(crate) fn normalize_delta_table_uri(
     table_uri: impl AsRef<str>,
 ) -> Result<String, DeltaFunnelError> {
+    let table_uri = table_uri.as_ref();
+    if table_uri.trim().is_empty() {
+        return Err(DeltaFunnelError::InvalidSourceUri {
+            reason: EMPTY_TABLE_URI,
+        });
+    }
+
     let table_url = try_parse_uri(table_uri).map_err(|_| DeltaFunnelError::InvalidSourceUri {
         reason: INVALID_TABLE_URI,
     })?;
@@ -123,6 +131,19 @@ mod tests {
         assert_eq!(normalized, "s3://bucket/path/to/table/");
 
         Ok(())
+    }
+
+    #[test]
+    fn rejects_empty_or_blank_table_uris() {
+        for table_uri in ["", " \t\n"] {
+            let result = normalize_delta_table_uri(table_uri);
+
+            assert!(matches!(
+                result,
+                Err(DeltaFunnelError::InvalidSourceUri { reason })
+                    if reason == "table location must not be empty"
+            ));
+        }
     }
 
     #[test]
