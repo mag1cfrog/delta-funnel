@@ -64,13 +64,44 @@ impl PlannedDeltaSource {
 pub fn load_delta_source(
     config: DeltaSourceConfig,
 ) -> Result<PlannedDeltaSource, DeltaFunnelError> {
+    validate_delta_source_names([config.name.as_str()])?;
+
+    load_delta_source_after_name_validation(config)
+}
+
+/// Loads configured Delta sources after validating all names.
+///
+/// Name validation and duplicate detection run before any URI normalization,
+/// engine construction, or snapshot loading.
+///
+/// # Errors
+///
+/// Returns [`DeltaFunnelError::InvalidSourceName`] or
+/// [`DeltaFunnelError::DuplicateSourceName`] before loading any snapshot when
+/// source names are invalid or ambiguous. Otherwise returns the same URI,
+/// engine, and snapshot-loading errors as [`load_delta_source`].
+pub fn load_delta_sources<I>(configs: I) -> Result<Vec<PlannedDeltaSource>, DeltaFunnelError>
+where
+    I: IntoIterator<Item = DeltaSourceConfig>,
+{
+    let configs: Vec<_> = configs.into_iter().collect();
+
+    validate_delta_source_names(configs.iter().map(|config| config.name.as_str()))?;
+
+    configs
+        .into_iter()
+        .map(load_delta_source_after_name_validation)
+        .collect()
+}
+
+fn load_delta_source_after_name_validation(
+    config: DeltaSourceConfig,
+) -> Result<PlannedDeltaSource, DeltaFunnelError> {
     let DeltaSourceConfig {
         name,
         table_uri,
         version,
     } = config;
-
-    validate_delta_source_names([name.as_str()])?;
 
     let snapshot = load_delta_table_snapshot(&table_uri, version)?;
 
@@ -87,7 +118,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{DeltaSourceConfig, load_delta_source};
+    use super::{DeltaSourceConfig, load_delta_source, load_delta_sources};
     use crate::DeltaFunnelError;
 
     struct DeltaLogTable {
@@ -180,6 +211,54 @@ mod tests {
         assert!(matches!(
             result,
             Err(DeltaFunnelError::InvalidSourceName { .. })
+        ));
+    }
+
+    #[test]
+    fn loads_multiple_named_delta_sources() -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("orders")?;
+        let customers = DeltaLogTable::new("customers")?;
+
+        let sources = load_delta_sources([
+            DeltaSourceConfig {
+                name: "orders".to_owned(),
+                table_uri: orders.path.to_string_lossy().to_string(),
+                version: None,
+            },
+            DeltaSourceConfig {
+                name: "customers".to_owned(),
+                table_uri: customers.path.to_string_lossy().to_string(),
+                version: Some(0),
+            },
+        ])?;
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].name(), "orders");
+        assert_eq!(sources[0].version(), 1);
+        assert_eq!(sources[1].name(), "customers");
+        assert_eq!(sources[1].version(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicate_names_before_table_uri_loading() {
+        let result = load_delta_sources([
+            DeltaSourceConfig {
+                name: "orders".to_owned(),
+                table_uri: "missing/orders".to_owned(),
+                version: None,
+            },
+            DeltaSourceConfig {
+                name: "Orders".to_owned(),
+                table_uri: "missing/customers".to_owned(),
+                version: None,
+            },
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DuplicateSourceName { name }) if name == "Orders"
         ));
     }
 }

@@ -12,7 +12,9 @@ mod source_snapshot;
 mod source_uri;
 
 pub use error::DeltaFunnelError;
-pub use named_source::{DeltaSourceConfig, PlannedDeltaSource, load_delta_source};
+pub use named_source::{
+    DeltaSourceConfig, PlannedDeltaSource, load_delta_source, load_delta_sources,
+};
 pub use source_name::validate_delta_source_names;
 pub use source_snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
 pub use source_uri::normalize_delta_table_uri;
