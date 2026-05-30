@@ -22,9 +22,10 @@ a blocker unless a deliberate conversion boundary is added.
 
 ## Error Pattern
 
-DeltaFunnel uses SNAFU for errors. The foundation crate exposes only the small
-`Result` and `Error` pattern needed now. Later issues should add their own
-phase-specific variants when they implement those phases.
+DeltaFunnel uses SNAFU for errors. The foundation crate currently exposes the
+explicit `DeltaFunnelError` type and does not define a crate-level `Result`
+alias. Later issues should add their own phase-specific variants when they
+implement those phases.
 
 Error display messages must be sanitized. Dependency debug output, SQL Server
 connection strings, object-store credentials, access keys, secret keys, and
@@ -34,11 +35,15 @@ Python-facing errors.
 ## Delta Kernel Boundary
 
 Stability-sensitive `delta_kernel` APIs are kept behind the private
-`delta_kernel_adapter` module. The foundation tests compile against the API
-symbols that later source and reader issues depend on:
+`table_formats::delta::kernel` module. The foundation tests compile against
+the API symbols that later Delta source and reader issues depend on:
 
 - `scan_metadata`
 - `visit_scan_files`
+- `try_parse_uri`
+- `store_from_url_opts`
+- `Snapshot::builder_for`
+- `SnapshotBuilder::at_version`
 - `get_selection_vector`
 - `SelectionVector` through the deletion-vector selection API
 - `transform_to_logical`
