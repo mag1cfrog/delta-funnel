@@ -5,6 +5,8 @@
 //! loading is expected to stay in `arrow-tiberius`.
 
 mod delta_kernel_adapter;
+#[cfg(test)]
+mod dependency_guard;
 pub mod error;
 mod named_source;
 mod source_name;
