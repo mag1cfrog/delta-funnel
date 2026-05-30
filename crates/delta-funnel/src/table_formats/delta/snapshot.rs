@@ -1,10 +1,11 @@
 //! Delta source snapshot loading.
 
 use crate::DeltaFunnelError;
-use crate::delta_kernel_adapter::{
+
+use super::kernel::{
     DefaultEngineBuilder, Snapshot, SnapshotRef, Version, store_from_url_opts, try_parse_uri,
 };
-use crate::source_uri::normalize_delta_table_uri;
+use super::uri::normalize_delta_table_uri;
 
 const ENGINE_CONSTRUCTION_FAILED: &str = "object store engine could not be constructed";
 const SNAPSHOT_LOAD_FAILED: &str = "snapshot could not be loaded";

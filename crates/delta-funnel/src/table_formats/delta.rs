@@ -1,9 +1,15 @@
-//! Named Delta source loading.
+//! Delta table-format source loading.
 
 use crate::DeltaFunnelError;
-use crate::delta_kernel_adapter::Version;
-use crate::source_name::validate_delta_source_names;
-use crate::source_snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
+
+mod kernel;
+mod name;
+mod snapshot;
+mod uri;
+
+use kernel::Version;
+use name::validate_delta_source_names;
+use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
 
 /// Caller-provided configuration for one named Delta source.
 pub struct DeltaSourceConfig {

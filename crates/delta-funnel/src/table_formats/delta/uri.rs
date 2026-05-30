@@ -1,7 +1,8 @@
 //! Delta source table URI normalization.
 
 use crate::DeltaFunnelError;
-use crate::delta_kernel_adapter::try_parse_uri;
+
+use super::kernel::try_parse_uri;
 
 const INVALID_TABLE_URI: &str = "table location could not be parsed or normalized";
 
@@ -33,7 +34,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::normalize_delta_table_uri;
+    use super::{normalize_delta_table_uri, try_parse_uri};
     use crate::DeltaFunnelError;
 
     struct TestDir {
@@ -86,7 +87,7 @@ mod tests {
     fn normalizes_relative_local_paths_to_file_urls() -> Result<(), Box<dyn std::error::Error>> {
         let dir = TestDir::relative("relative")?;
         let normalized = normalize_delta_table_uri(dir.path.to_string_lossy())?;
-        let normalized_url = crate::delta_kernel_adapter::try_parse_uri(&normalized)?;
+        let normalized_url = try_parse_uri(&normalized)?;
         let normalized_path = normalized_url.to_file_path().map_err(|()| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

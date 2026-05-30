@@ -3,18 +3,18 @@
 //! This crate will own the high-level export orchestration from table formats
 //! such as Delta Lake into Microsoft SQL Server. Low-level Arrow to TDS bulk
 //! loading is expected to stay in `arrow-tiberius`.
+//!
+//! Module boundaries should follow the load workflow. `table_formats` owns
+//! upstream table-format integrations, starting with Delta source configuration
+//! and snapshot loading. Later DataFusion provider, query execution, SQL Server
+//! sink, and orchestration work should land in their own modules when the first
+//! real implementation slice needs them.
 
-mod delta_kernel_adapter;
-#[cfg(test)]
-mod dependency_guard;
 pub mod error;
-mod named_source;
-mod source_name;
-mod source_snapshot;
-mod source_uri;
+mod table_formats;
 
 pub use error::DeltaFunnelError;
-pub use named_source::{
+pub use table_formats::{
     DeltaSourceConfig, PlannedDeltaSource, load_delta_source, load_delta_sources,
 };
 
