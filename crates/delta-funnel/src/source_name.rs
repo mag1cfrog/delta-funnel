@@ -21,7 +21,7 @@ const INVALID_CHARACTER: &str =
 /// Returns [`DeltaFunnelError::InvalidSourceName`] for the first invalid name,
 /// or [`DeltaFunnelError::DuplicateSourceName`] for the first case-insensitive
 /// duplicate.
-pub fn validate_delta_source_names<I, S>(names: I) -> Result<(), DeltaFunnelError>
+pub(crate) fn validate_delta_source_names<I, S>(names: I) -> Result<(), DeltaFunnelError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,

@@ -17,7 +17,9 @@ const INVALID_TABLE_URI: &str = "table location could not be parsed or normalize
 ///
 /// Returns [`DeltaFunnelError::InvalidSourceUri`] when the table location
 /// cannot be parsed or normalized by `delta_kernel`.
-pub fn normalize_delta_table_uri(table_uri: impl AsRef<str>) -> Result<String, DeltaFunnelError> {
+pub(crate) fn normalize_delta_table_uri(
+    table_uri: impl AsRef<str>,
+) -> Result<String, DeltaFunnelError> {
     let table_url = try_parse_uri(table_uri).map_err(|_| DeltaFunnelError::InvalidSourceUri {
         reason: INVALID_TABLE_URI,
     })?;

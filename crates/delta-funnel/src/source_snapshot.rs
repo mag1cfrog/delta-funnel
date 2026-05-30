@@ -1,9 +1,10 @@
 //! Delta source snapshot loading.
 
+use crate::DeltaFunnelError;
 use crate::delta_kernel_adapter::{
     DefaultEngineBuilder, Snapshot, SnapshotRef, Version, store_from_url_opts, try_parse_uri,
 };
-use crate::{DeltaFunnelError, normalize_delta_table_uri};
+use crate::source_uri::normalize_delta_table_uri;
 
 const ENGINE_CONSTRUCTION_FAILED: &str = "object store engine could not be constructed";
 const SNAPSHOT_LOAD_FAILED: &str = "snapshot could not be loaded";
@@ -13,7 +14,7 @@ const SNAPSHOT_LOAD_FAILED: &str = "snapshot could not be loaded";
 /// This is intentionally narrower than a named source config. It proves and
 /// owns the source-side state that later protocol and DataFusion provider
 /// slices can consume without reloading the snapshot.
-pub struct LoadedDeltaTableSnapshot {
+pub(crate) struct LoadedDeltaTableSnapshot {
     table_uri: String,
     snapshot: SnapshotRef,
 }
@@ -21,13 +22,13 @@ pub struct LoadedDeltaTableSnapshot {
 impl LoadedDeltaTableSnapshot {
     /// Normalized Delta table URI used to load the snapshot.
     #[must_use]
-    pub fn table_uri(&self) -> &str {
+    pub(crate) fn table_uri(&self) -> &str {
         &self.table_uri
     }
 
     /// Loaded Delta table version.
     #[must_use]
-    pub fn version(&self) -> Version {
+    pub(crate) fn version(&self) -> Version {
         self.kernel_snapshot().version()
     }
 
@@ -75,7 +76,7 @@ impl DeltaKernelEngine {
 /// backed default engine cannot be constructed, or
 /// [`DeltaFunnelError::DeltaSnapshotLoad`] when `delta_kernel` cannot load the
 /// requested snapshot.
-pub fn load_delta_table_snapshot(
+pub(crate) fn load_delta_table_snapshot(
     table_uri: impl AsRef<str>,
     version: Option<Version>,
 ) -> Result<LoadedDeltaTableSnapshot, DeltaFunnelError> {
