@@ -6,8 +6,10 @@
 
 mod delta_kernel_adapter;
 pub mod error;
+mod source_name;
 
 pub use error::DeltaFunnelError;
+pub use source_name::validate_delta_source_names;
 
 /// Current crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
