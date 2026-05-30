@@ -28,7 +28,11 @@ impl LoadedDeltaTableSnapshot {
     /// Loaded Delta table version.
     #[must_use]
     pub fn version(&self) -> Version {
-        self.snapshot.version()
+        self.kernel_snapshot().version()
+    }
+
+    pub(crate) fn kernel_snapshot(&self) -> &SnapshotRef {
+        &self.snapshot
     }
 }
 

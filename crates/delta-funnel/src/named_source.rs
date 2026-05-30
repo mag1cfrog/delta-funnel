@@ -39,13 +39,17 @@ impl PlannedDeltaSource {
     /// Normalized Delta table URI used for snapshot loading.
     #[must_use]
     pub fn table_uri(&self) -> &str {
-        self.snapshot.table_uri()
+        self.loaded_snapshot().table_uri()
     }
 
     /// Loaded Delta table version.
     #[must_use]
     pub fn version(&self) -> Version {
-        self.snapshot.version()
+        self.loaded_snapshot().version()
+    }
+
+    pub(crate) fn loaded_snapshot(&self) -> &LoadedDeltaTableSnapshot {
+        &self.snapshot
     }
 }
 
@@ -181,6 +185,7 @@ mod tests {
         assert_eq!(source.requested_table_uri(), requested_table_uri);
         assert!(source.table_uri().starts_with("file://"));
         assert_eq!(source.version(), 1);
+        assert_eq!(source.loaded_snapshot().version(), 1);
 
         Ok(())
     }
