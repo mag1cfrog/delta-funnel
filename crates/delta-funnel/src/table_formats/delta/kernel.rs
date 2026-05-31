@@ -8,7 +8,46 @@ pub(crate) use delta_kernel::engine::default::storage::store_from_url_opts;
 pub(crate) use delta_kernel::scan::Scan;
 pub(crate) use delta_kernel::scan::ScanMetadata;
 pub(crate) use delta_kernel::scan::state::{DvInfo, ScanFile, transform_to_logical};
+pub(crate) use delta_kernel::table_features::TABLE_FEATURES_MIN_READER_VERSION;
+use delta_kernel::table_features::TableFeature;
 pub(crate) use delta_kernel::{Snapshot, SnapshotRef, Version, try_parse_uri};
+
+/// Protocol details extracted through the private kernel adapter boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeltaKernelProtocol {
+    pub(crate) min_reader_version: i32,
+    pub(crate) min_writer_version: i32,
+    pub(crate) reader_features: Vec<String>,
+    pub(crate) writer_features: Vec<String>,
+}
+
+/// Extracts the Delta protocol from a loaded snapshot.
+#[must_use]
+pub(crate) fn snapshot_protocol_report(snapshot: &SnapshotRef) -> DeltaKernelProtocol {
+    let protocol = snapshot.table_configuration().protocol();
+
+    DeltaKernelProtocol {
+        min_reader_version: protocol.min_reader_version(),
+        min_writer_version: protocol.min_writer_version(),
+        reader_features: feature_names(protocol.reader_features()),
+        writer_features: feature_names(protocol.writer_features()),
+    }
+}
+
+fn feature_names(features: Option<&[TableFeature]>) -> Vec<String> {
+    features
+        .unwrap_or_default()
+        .iter()
+        .map(feature_name)
+        .collect()
+}
+
+fn feature_name(feature: &TableFeature) -> String {
+    match feature {
+        TableFeature::Unknown(name) => name.clone(),
+        _ => feature.as_ref().to_owned(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -39,6 +78,8 @@ mod tests {
         let _ = <Box<dyn delta_kernel::EngineData> as EngineDataArrowExt>::try_into_record_batch;
         let _ = collect_scan_file;
         let _ = snapshot_ref_version;
+        let _ = super::snapshot_protocol_report;
+        let _ = super::TABLE_FEATURES_MIN_READER_VERSION;
     }
 
     #[test]
