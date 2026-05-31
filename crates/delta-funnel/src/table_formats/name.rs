@@ -1,4 +1,4 @@
-//! Delta source registration name validation.
+//! Table-format source registration name validation.
 
 use std::collections::HashSet;
 
@@ -91,7 +91,7 @@ const RESERVED_SQL_KEYWORDS: &[&str] = &[
     "with",
 ];
 
-/// Validates Delta source names before registration.
+/// Validates table-format source names before registration.
 ///
 /// Source names are DataFusion table names for the MVP. They intentionally use
 /// a simple unquoted identifier subset: ASCII letters, digits, and underscores,
@@ -105,7 +105,7 @@ const RESERVED_SQL_KEYWORDS: &[&str] = &[
 /// Returns [`DeltaFunnelError::InvalidSourceName`] for the first invalid name,
 /// or [`DeltaFunnelError::DuplicateSourceName`] for the first case-insensitive
 /// duplicate.
-pub(crate) fn validate_delta_source_names<I, S>(names: I) -> Result<(), DeltaFunnelError>
+pub(crate) fn validate_table_source_names<I, S>(names: I) -> Result<(), DeltaFunnelError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -170,11 +170,11 @@ fn is_reserved_sql_keyword(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_delta_source_names;
+    use super::validate_table_source_names;
     use crate::DeltaFunnelError;
 
     fn assert_invalid_name(input: &str, expected_reason: &'static str) {
-        let result = validate_delta_source_names([input]);
+        let result = validate_table_source_names([input]);
 
         assert!(matches!(
             result,
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn accepts_simple_unquoted_identifiers() -> Result<(), DeltaFunnelError> {
-        validate_delta_source_names(["orders", "_customers", "Regions_2026", "line_items"])?;
+        validate_table_source_names(["orders", "_customers", "Regions_2026", "line_items"])?;
 
         Ok(())
     }
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn rejects_case_insensitive_duplicates() {
-        let result = validate_delta_source_names(["orders", "customers", "Orders"]);
+        let result = validate_table_source_names(["orders", "customers", "Orders"]);
 
         assert!(matches!(
             result,
@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn invalid_name_wins_before_duplicate_detection() {
-        let result = validate_delta_source_names(["orders", "orders.latest", "Orders"]);
+        let result = validate_table_source_names(["orders", "orders.latest", "Orders"]);
 
         assert!(matches!(
             result,

@@ -15,7 +15,7 @@ use datafusion::prelude::SessionContext;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
-    table_formats::delta_source_arrow_schema,
+    table_formats::{delta_source_arrow_schema, validate_table_source_names},
 };
 
 /// Delta source and preflight state used to build a DataFusion table provider.
@@ -63,12 +63,20 @@ pub fn register_delta_sources(
     ctx: &SessionContext,
     configs: Vec<DeltaTableProviderConfig>,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
+    reject_duplicate_registration_names(&configs)?;
+
     let sources = configs
         .into_iter()
         .map(|config| register_delta_source(ctx, config))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(RegisteredDeltaSources { sources })
+}
+
+fn reject_duplicate_registration_names(
+    configs: &[DeltaTableProviderConfig],
+) -> Result<(), DeltaFunnelError> {
+    validate_table_source_names(configs.iter().map(|config| config.source.name()))
 }
 
 fn register_delta_source(
@@ -379,6 +387,48 @@ mod tests {
                 ..
             }) if source_name == "orders" && reason.contains("already exists")
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_registration_names_fail_before_partial_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("duplicate-orders")?;
+        let customers = DeltaLogTable::new("duplicate-customers")?;
+        let orders_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: orders.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let customers_source = load_delta_source(DeltaSourceConfig {
+            name: "Orders".to_owned(),
+            table_uri: customers.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let orders_preflight = preflight_delta_protocol(&orders_source)?;
+        let customers_preflight = preflight_delta_protocol(&customers_source)?;
+        let ctx = SessionContext::new();
+
+        let result = register_delta_sources(
+            &ctx,
+            vec![
+                DeltaTableProviderConfig {
+                    source: orders_source,
+                    protocol: orders_preflight,
+                },
+                DeltaTableProviderConfig {
+                    source: customers_source,
+                    protocol: customers_preflight,
+                },
+            ],
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DuplicateSourceName { name }) if name == "Orders"
+        ));
+        assert!(!ctx.table_exist("orders")?);
 
         Ok(())
     }
