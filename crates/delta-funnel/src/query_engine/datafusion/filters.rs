@@ -14,10 +14,10 @@ pub(crate) enum ProviderFilterPushdownKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderFilterReason {
-    UnsupportedInitialPolicy,
-    UnsupportedExpressionShape,
-    UnsupportedInternalColumn,
-    UnsupportedUnknownColumn,
+    InitialPolicy,
+    ExpressionShape,
+    InternalColumn,
+    UnknownColumn,
 }
 
 impl ProviderFilterReason {
@@ -25,10 +25,10 @@ impl ProviderFilterReason {
     #[must_use]
     pub(crate) fn code(self) -> &'static str {
         match self {
-            Self::UnsupportedInitialPolicy => "unsupported_initial_policy",
-            Self::UnsupportedExpressionShape => "unsupported_expression_shape",
-            Self::UnsupportedInternalColumn => "unsupported_internal_column",
-            Self::UnsupportedUnknownColumn => "unsupported_unknown_column",
+            Self::InitialPolicy => "unsupported_initial_policy",
+            Self::ExpressionShape => "unsupported_expression_shape",
+            Self::InternalColumn => "unsupported_internal_column",
+            Self::UnknownColumn => "unsupported_unknown_column",
         }
     }
 }
@@ -214,17 +214,17 @@ fn unsupported_filter_reason(filter: &Expr, unknown_columns: &[String]) -> Provi
         .iter()
         .any(|column| column.name.starts_with("__delta_funnel_"))
     {
-        return ProviderFilterReason::UnsupportedInternalColumn;
+        return ProviderFilterReason::InternalColumn;
     }
 
     if !unknown_columns.is_empty() {
-        return ProviderFilterReason::UnsupportedUnknownColumn;
+        return ProviderFilterReason::UnknownColumn;
     }
 
     if is_simple_comparison(filter) {
-        ProviderFilterReason::UnsupportedInitialPolicy
+        ProviderFilterReason::InitialPolicy
     } else {
-        ProviderFilterReason::UnsupportedExpressionShape
+        ProviderFilterReason::ExpressionShape
     }
 }
 

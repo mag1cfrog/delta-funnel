@@ -10,7 +10,7 @@ repository = "https://github.com/mag1cfrog/delta-funnel"
 homepage = "https://github.com/mag1cfrog/delta-funnel"
 
 [workspace.lints.rust]
-missing_docs = "warn"
+missing_docs = "deny"
 
 [workspace.lints.clippy]
 expect_used = "deny"

@@ -1393,7 +1393,7 @@ mod tests {
         );
         assert_eq!(
             plan.decisions[0].reason,
-            ProviderFilterReason::UnsupportedInitialPolicy
+            ProviderFilterReason::InitialPolicy
         );
         assert_eq!(plan.decisions[0].referenced_columns, vec!["region"]);
         assert_eq!(plan.decisions[0].partition_columns, vec!["region"]);
@@ -1406,12 +1406,12 @@ mod tests {
         assert_eq!(plan.decisions[2].referenced_columns, vec!["id"]);
         assert_eq!(
             plan.decisions[3].reason,
-            ProviderFilterReason::UnsupportedUnknownColumn
+            ProviderFilterReason::UnknownColumn
         );
         assert_eq!(plan.decisions[3].unknown_columns, vec!["ghost_column"]);
         assert_eq!(
             plan.decisions[4].reason,
-            ProviderFilterReason::UnsupportedInternalColumn
+            ProviderFilterReason::InternalColumn
         );
         assert_eq!(
             plan.decisions[4].unknown_columns,
@@ -1469,11 +1469,11 @@ mod tests {
                 .map(|decision| decision.reason)
                 .collect::<Vec<_>>(),
             vec![
-                ProviderFilterReason::UnsupportedExpressionShape,
-                ProviderFilterReason::UnsupportedExpressionShape,
-                ProviderFilterReason::UnsupportedExpressionShape,
-                ProviderFilterReason::UnsupportedExpressionShape,
-                ProviderFilterReason::UnsupportedExpressionShape
+                ProviderFilterReason::ExpressionShape,
+                ProviderFilterReason::ExpressionShape,
+                ProviderFilterReason::ExpressionShape,
+                ProviderFilterReason::ExpressionShape,
+                ProviderFilterReason::ExpressionShape
             ]
         );
 
@@ -1513,7 +1513,7 @@ mod tests {
         assert_eq!(plan.decisions[0].unknown_columns, vec!["profile.age"]);
         assert_eq!(
             plan.decisions[0].reason,
-            ProviderFilterReason::UnsupportedUnknownColumn
+            ProviderFilterReason::UnknownColumn
         );
 
         Ok(())
@@ -1552,7 +1552,7 @@ mod tests {
         assert!(plan.decisions[0].data_columns.is_empty());
         assert_eq!(
             plan.decisions[0].reason,
-            ProviderFilterReason::UnsupportedUnknownColumn
+            ProviderFilterReason::UnknownColumn
         );
 
         Ok(())
@@ -1580,7 +1580,7 @@ mod tests {
         assert!(plan.decisions[0].unknown_columns.is_empty());
         assert_eq!(
             plan.decisions[0].reason,
-            ProviderFilterReason::UnsupportedInitialPolicy
+            ProviderFilterReason::InitialPolicy
         );
 
         Ok(())
@@ -1623,7 +1623,7 @@ mod tests {
 
         assert_eq!(
             plan.decisions[0].reason,
-            ProviderFilterReason::UnsupportedUnknownColumn
+            ProviderFilterReason::UnknownColumn
         );
         assert!(!reason_code.contains('\n'));
         assert!(!reason_code.contains('\r'));
