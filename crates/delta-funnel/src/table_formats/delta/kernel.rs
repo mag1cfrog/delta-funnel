@@ -14,6 +14,7 @@ pub(crate) use delta_kernel::engine::default::storage::store_from_url_opts;
 pub(crate) use delta_kernel::scan::Scan;
 pub(crate) use delta_kernel::scan::ScanMetadata;
 pub(crate) use delta_kernel::scan::state::{DvInfo, ScanFile, transform_to_logical};
+pub(crate) use delta_kernel::schema::SchemaRef as KernelSchemaRef;
 pub(crate) use delta_kernel::table_features::TABLE_FEATURES_MIN_READER_VERSION;
 use delta_kernel::table_features::TableFeature;
 pub(crate) use delta_kernel::{Snapshot, SnapshotRef, Version, try_parse_uri};
@@ -45,6 +46,24 @@ pub(crate) fn snapshot_arrow_schema(snapshot: &SnapshotRef) -> Result<ArrowSchem
     let schema: ArrowSchema = snapshot.schema().as_ref().try_into_arrow()?;
 
     Ok(Arc::new(schema))
+}
+
+/// Builds kernel scan state for the selected logical Delta columns.
+#[allow(dead_code)]
+pub(crate) fn build_projected_scan(
+    snapshot: &SnapshotRef,
+    projected_column_names: Option<&[String]>,
+) -> delta_kernel::DeltaResult<(Scan, KernelSchemaRef)> {
+    let schema = match projected_column_names {
+        Some(names) => snapshot.schema().project(names)?,
+        None => snapshot.schema(),
+    };
+    let scan = Arc::clone(snapshot)
+        .scan_builder()
+        .with_schema(Arc::clone(&schema))
+        .build()?;
+
+    Ok((scan, schema))
 }
 
 fn feature_names(features: Option<&[TableFeature]>) -> Vec<String> {
@@ -83,6 +102,7 @@ mod tests {
     #[test]
     fn delta_kernel_internal_api_symbols_are_available() {
         let _ = DefaultEngineBuilder::new;
+        let _ = super::build_projected_scan;
         let _ = Scan::scan_metadata;
         let _ = ScanMetadata::visit_scan_files::<Vec<ScanFile>>;
         let _ = DvInfo::get_selection_vector;
