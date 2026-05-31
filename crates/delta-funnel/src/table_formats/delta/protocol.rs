@@ -1,6 +1,7 @@
 //! Delta protocol preflight.
 
 use crate::DeltaFunnelError;
+use crate::redaction::sanitize_uri_for_display;
 
 use super::PlannedDeltaSource;
 use super::kernel::{
@@ -18,7 +19,7 @@ const SUPPORTED_READER_FEATURES: &[&str] = &[];
 pub struct DeltaProtocolReport {
     /// DataFusion table name for this source.
     pub source_name: String,
-    /// Normalized Delta table URI used for snapshot loading.
+    /// Sanitized normalized Delta table URI context.
     pub table_uri: String,
     /// Resolved Delta snapshot version.
     pub snapshot_version: Version,
@@ -79,10 +80,19 @@ fn report_from_kernel(
     source: &PlannedDeltaSource,
     kernel: DeltaKernelProtocol,
 ) -> DeltaProtocolReport {
+    build_protocol_report(source.name(), source.table_uri(), source.version(), kernel)
+}
+
+fn build_protocol_report(
+    source_name: &str,
+    table_uri: &str,
+    snapshot_version: Version,
+    kernel: DeltaKernelProtocol,
+) -> DeltaProtocolReport {
     DeltaProtocolReport {
-        source_name: source.name().to_owned(),
-        table_uri: source.table_uri().to_owned(),
-        snapshot_version: source.version(),
+        source_name: source_name.to_owned(),
+        table_uri: sanitize_uri_for_display(table_uri),
+        snapshot_version,
         min_reader_version: kernel.min_reader_version,
         min_writer_version: kernel.min_writer_version,
         reader_features: kernel.reader_features,
@@ -243,6 +253,23 @@ mod tests {
         assert!(report.writer_features.is_empty());
 
         Ok(())
+    }
+
+    #[test]
+    fn protocol_report_sanitizes_uri_context() {
+        let report = super::build_protocol_report(
+            "orders",
+            "s3://user:password@example.com/table?token=secret#debug",
+            42,
+            super::DeltaKernelProtocol {
+                min_reader_version: 1,
+                min_writer_version: 2,
+                reader_features: Vec::new(),
+                writer_features: Vec::new(),
+            },
+        );
+
+        assert_eq!(report.table_uri, "s3://example.com/table");
     }
 
     #[test]
