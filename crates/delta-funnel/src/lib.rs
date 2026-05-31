@@ -11,6 +11,7 @@
 //! real implementation slice needs them.
 
 pub mod error;
+mod query_engine;
 mod redaction;
 mod table_formats;
 
