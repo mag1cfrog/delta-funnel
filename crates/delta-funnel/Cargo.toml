@@ -14,10 +14,17 @@ categories = ["database"]
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
 arrow-tiberius = "0.1.0"
+datafusion = { version = "53.1.0", default-features = false, features = [
+    "sql",
+] }
 delta_kernel = { version = "0.23.0", default-features = false, features = [
     "arrow",
     "default-engine-native-tls",
     "internal-api",
 ] }
 snafu = "0.9"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

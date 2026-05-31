@@ -3,13 +3,12 @@
 use crate::DeltaFunnelError;
 
 mod kernel;
-mod name;
 mod protocol;
 mod snapshot;
 mod uri;
 
-use kernel::Version;
-use name::validate_delta_source_names;
+use super::validate_table_source_names;
+use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };
@@ -62,6 +61,13 @@ impl PlannedDeltaSource {
     }
 }
 
+pub(crate) fn delta_source_arrow_schema(
+    source: &PlannedDeltaSource,
+) -> Result<ArrowSchemaRef, String> {
+    snapshot_arrow_schema(source.loaded_snapshot().kernel_snapshot())
+        .map_err(|error| error.to_string())
+}
+
 /// Loads one named Delta source.
 ///
 /// Name validation runs before URI normalization, engine construction, or
@@ -77,7 +83,7 @@ impl PlannedDeltaSource {
 pub fn load_delta_source(
     config: DeltaSourceConfig,
 ) -> Result<PlannedDeltaSource, DeltaFunnelError> {
-    validate_delta_source_names([config.name.as_str()])?;
+    validate_table_source_names([config.name.as_str()])?;
 
     load_delta_source_after_name_validation(config)
 }
@@ -99,7 +105,7 @@ where
 {
     let configs: Vec<_> = configs.into_iter().collect();
 
-    validate_delta_source_names(configs.iter().map(|config| config.name.as_str()))?;
+    validate_table_source_names(configs.iter().map(|config| config.name.as_str()))?;
 
     configs
         .into_iter()

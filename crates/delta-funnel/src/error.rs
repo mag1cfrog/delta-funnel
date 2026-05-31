@@ -75,6 +75,38 @@ pub enum DeltaFunnelError {
         reason: String,
     },
 
+    /// A Delta source schema could not be exposed to the query engine.
+    #[snafu(display(
+        "Delta source schema error for source `{}` ({}): {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(reason)
+    ))]
+    DeltaSourceSchema {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Sanitized reason for the schema failure.
+        reason: String,
+    },
+
+    /// A Delta source could not be registered with DataFusion.
+    #[snafu(display(
+        "DataFusion registration error for source `{}` ({}): {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(reason)
+    ))]
+    DataFusionRegistration {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Sanitized reason for the registration failure.
+        reason: String,
+    },
+
     /// A required dependency contract is unavailable or incompatible.
     #[snafu(display("dependency compatibility error: {message}"))]
     DependencyCompatibility {
@@ -85,6 +117,10 @@ pub enum DeltaFunnelError {
 
 fn sanitize_source_name_for_display(name: &str) -> String {
     name.chars().flat_map(char::escape_default).collect()
+}
+
+fn sanitize_reason_for_display(reason: &str) -> String {
+    reason.chars().flat_map(char::escape_default).collect()
 }
 
 #[cfg(test)]
@@ -202,6 +238,46 @@ mod tests {
         assert!(display.contains("snapshot version 7"));
         assert!(display.contains("s3://example.com/table"));
         assert!(display.contains("deletionVectors"));
+        assert!(!display.contains('\n'));
+        assert!(!display.contains("user"));
+        assert!(!display.contains("password"));
+        assert!(!display.contains("token"));
+        assert!(!display.contains("secret"));
+    }
+
+    #[test]
+    fn source_schema_error_has_sanitized_display() {
+        let error = DeltaFunnelError::DeltaSourceSchema {
+            source_name: "orders\nlatest".to_owned(),
+            table_uri: "s3://user:password@example.com/table?token=secret".to_owned(),
+            reason: "field\nname could not be converted".to_owned(),
+        };
+
+        let display = error.to_string();
+
+        assert!(display.contains(r"orders\nlatest"));
+        assert!(display.contains("s3://example.com/table"));
+        assert!(display.contains(r"field\nname"));
+        assert!(!display.contains('\n'));
+        assert!(!display.contains("user"));
+        assert!(!display.contains("password"));
+        assert!(!display.contains("token"));
+        assert!(!display.contains("secret"));
+    }
+
+    #[test]
+    fn datafusion_registration_error_has_sanitized_display() {
+        let error = DeltaFunnelError::DataFusionRegistration {
+            source_name: "orders\nlatest".to_owned(),
+            table_uri: "s3://user:password@example.com/table?token=secret".to_owned(),
+            reason: "table\nalready exists".to_owned(),
+        };
+
+        let display = error.to_string();
+
+        assert!(display.contains(r"orders\nlatest"));
+        assert!(display.contains("s3://example.com/table"));
+        assert!(display.contains(r"table\nalready exists"));
         assert!(!display.contains('\n'));
         assert!(!display.contains("user"));
         assert!(!display.contains("password"));

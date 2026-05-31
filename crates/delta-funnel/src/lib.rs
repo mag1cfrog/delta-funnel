@@ -11,10 +11,14 @@
 //! real implementation slice needs them.
 
 pub mod error;
+pub(crate) mod query_engine;
 mod redaction;
 mod table_formats;
 
 pub use error::DeltaFunnelError;
+pub use query_engine::{
+    DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources, register_delta_sources,
+};
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, PlannedDeltaSource, ProtocolPreflight,
     load_delta_source, load_delta_sources, preflight_delta_protocol, preflight_delta_sources,

@@ -2,6 +2,12 @@
 
 #![allow(unused_imports)]
 
+use std::sync::Arc;
+
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+pub(crate) use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use delta_kernel::arrow::error::ArrowError;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 pub(crate) use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 pub(crate) use delta_kernel::engine::default::DefaultEngineBuilder;
 pub(crate) use delta_kernel::engine::default::storage::store_from_url_opts;
@@ -32,6 +38,13 @@ pub(crate) fn snapshot_protocol_report(snapshot: &SnapshotRef) -> DeltaKernelPro
         reader_features: feature_names(protocol.reader_features()),
         writer_features: feature_names(protocol.writer_features()),
     }
+}
+
+/// Converts the loaded snapshot logical Delta schema to an Arrow schema.
+pub(crate) fn snapshot_arrow_schema(snapshot: &SnapshotRef) -> Result<ArrowSchemaRef, ArrowError> {
+    let schema: ArrowSchema = snapshot.schema().as_ref().try_into_arrow()?;
+
+    Ok(Arc::new(schema))
 }
 
 fn feature_names(features: Option<&[TableFeature]>) -> Vec<String> {
@@ -78,6 +91,7 @@ mod tests {
         let _ = <Box<dyn delta_kernel::EngineData> as EngineDataArrowExt>::try_into_record_batch;
         let _ = collect_scan_file;
         let _ = snapshot_ref_version;
+        let _ = super::snapshot_arrow_schema;
         let _ = super::snapshot_protocol_report;
         let _ = super::TABLE_FEATURES_MIN_READER_VERSION;
     }
