@@ -1260,6 +1260,7 @@ name = "delta-funnel"
 version = "0.1.0"
 dependencies = [
  "arrow-tiberius",
+ "async-trait",
  "datafusion",
  "delta_kernel",
  "snafu",

@@ -8,7 +8,7 @@ mod protocol;
 mod snapshot;
 mod uri;
 
-use kernel::Version;
+use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 use name::validate_delta_source_names;
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
@@ -60,6 +60,13 @@ impl PlannedDeltaSource {
     pub(crate) fn loaded_snapshot(&self) -> &LoadedDeltaTableSnapshot {
         &self.snapshot
     }
+}
+
+pub(crate) fn delta_source_arrow_schema(
+    source: &PlannedDeltaSource,
+) -> Result<ArrowSchemaRef, String> {
+    snapshot_arrow_schema(source.loaded_snapshot().kernel_snapshot())
+        .map_err(|error| error.to_string())
 }
 
 /// Loads one named Delta source.
