@@ -10,7 +10,9 @@ mod uri;
 
 use kernel::Version;
 use name::validate_delta_source_names;
-pub use protocol::{DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol};
+pub use protocol::{
+    DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
+};
 use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
 
 /// Caller-provided configuration for one named Delta source.

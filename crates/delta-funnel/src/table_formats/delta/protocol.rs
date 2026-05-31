@@ -50,6 +50,17 @@ pub fn preflight_delta_protocol(
     Ok(ProtocolPreflight { protocol })
 }
 
+/// Runs conservative Delta protocol preflight for loaded sources.
+///
+/// # Errors
+///
+/// Returns the first source-specific protocol compatibility error.
+pub fn preflight_delta_sources(
+    sources: &[PlannedDeltaSource],
+) -> Result<Vec<ProtocolPreflight>, DeltaFunnelError> {
+    sources.iter().map(preflight_delta_protocol).collect()
+}
+
 /// Extracts protocol details for one loaded source without applying policy.
 #[must_use]
 pub fn delta_protocol_report(source: &PlannedDeltaSource) -> DeltaProtocolReport {
@@ -120,8 +131,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{DeltaProtocolReport, delta_protocol_report, preflight_delta_protocol};
-    use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source};
+    use super::{
+        DeltaProtocolReport, delta_protocol_report, preflight_delta_protocol,
+        preflight_delta_sources,
+    };
+    use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, load_delta_sources};
 
     struct DeltaLogTable {
         path: PathBuf,
@@ -186,6 +200,14 @@ mod tests {
         })?;
 
         Ok(source)
+    }
+
+    fn source_config(name: &str, table: &DeltaLogTable) -> DeltaSourceConfig {
+        DeltaSourceConfig {
+            name: name.to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        }
     }
 
     #[test]
@@ -269,6 +291,52 @@ mod tests {
                 reason,
                 ..
             }) if reason.contains("minReaderVersion 2")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn preflights_multiple_sources() -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("orders", LEGACY_PROTOCOL_JSON)?;
+        let customers = DeltaLogTable::new("customers", WRITER_ONLY_FEATURE_PROTOCOL_JSON)?;
+        let sources = load_delta_sources([
+            source_config("orders", &orders),
+            source_config("customers", &customers),
+        ])?;
+
+        let preflights = preflight_delta_sources(&sources)?;
+
+        assert_eq!(preflights.len(), 2);
+        assert_eq!(preflights[0].protocol.source_name, "orders");
+        assert_eq!(preflights[0].protocol.min_reader_version, 1);
+        assert_eq!(preflights[1].protocol.source_name, "customers");
+        assert_eq!(
+            preflights[1].protocol.writer_features,
+            vec!["inCommitTimestamp"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn multi_source_preflight_reports_failing_source() -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("orders", LEGACY_PROTOCOL_JSON)?;
+        let customers = DeltaLogTable::new("customers", DELETION_VECTOR_PROTOCOL_JSON)?;
+        let sources = load_delta_sources([
+            source_config("orders", &orders),
+            source_config("customers", &customers),
+        ])?;
+
+        let result = preflight_delta_sources(&sources);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaProtocolCompatibility {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "customers" && reason.contains("deletionVectors")
         ));
 
         Ok(())

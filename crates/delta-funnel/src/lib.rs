@@ -17,7 +17,7 @@ mod table_formats;
 pub use error::DeltaFunnelError;
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, PlannedDeltaSource, ProtocolPreflight,
-    load_delta_source, load_delta_sources, preflight_delta_protocol,
+    load_delta_source, load_delta_sources, preflight_delta_protocol, preflight_delta_sources,
 };
 
 /// Current crate version.
