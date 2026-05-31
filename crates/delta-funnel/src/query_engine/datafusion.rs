@@ -494,6 +494,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_fails_at_deliberate_delta_scan_stub()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "execution-stub")?;
+
+        let dataframe = ctx.sql("select * from orders").await?;
+        let result = dataframe.collect().await;
+
+        assert!(matches!(
+            result,
+            Err(error) if error
+                .to_string()
+                .contains("Delta scan execution is owned by a later implementation issue")
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sql_analysis_works_for_join_across_registered_sources()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
