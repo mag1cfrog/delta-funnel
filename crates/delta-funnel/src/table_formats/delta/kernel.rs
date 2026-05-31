@@ -11,6 +11,9 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 pub(crate) use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 pub(crate) use delta_kernel::engine::default::DefaultEngineBuilder;
 pub(crate) use delta_kernel::engine::default::storage::store_from_url_opts;
+pub(crate) use delta_kernel::expressions::{
+    ColumnName, Expression, Predicate, PredicateRef, Scalar,
+};
 pub(crate) use delta_kernel::scan::Scan;
 pub(crate) use delta_kernel::scan::ScanMetadata;
 pub(crate) use delta_kernel::scan::state::{DvInfo, ScanFile, transform_to_logical};
@@ -54,6 +57,21 @@ pub(crate) fn build_projected_scan(
     snapshot: &SnapshotRef,
     projected_column_names: Option<&[String]>,
 ) -> delta_kernel::DeltaResult<(Scan, KernelSchemaRef)> {
+    build_projected_predicated_scan(snapshot, projected_column_names, None)
+}
+
+/// Builds kernel scan state for selected logical Delta columns and an optional predicate.
+///
+/// This helper intentionally leaves parsed stats output disabled. `delta_kernel`
+/// 0.23.0 supports combining `ScanBuilder::with_predicate` with
+/// `ScanBuilder::include_all_stats_columns`, and a later scan-metadata slice
+/// should choose that path when it needs parsed file stats output.
+#[allow(dead_code)]
+pub(crate) fn build_projected_predicated_scan(
+    snapshot: &SnapshotRef,
+    projected_column_names: Option<&[String]>,
+    predicate: Option<DeltaKernelPredicate>,
+) -> delta_kernel::DeltaResult<(Scan, KernelSchemaRef)> {
     let schema = match projected_column_names {
         Some(names) => snapshot.schema().project(names)?,
         None => snapshot.schema(),
@@ -61,9 +79,55 @@ pub(crate) fn build_projected_scan(
     let scan = Arc::clone(snapshot)
         .scan_builder()
         .with_schema(Arc::clone(&schema))
+        .with_predicate(predicate.map(DeltaKernelPredicate::into_inner))
         .build()?;
 
     Ok((scan, schema))
+}
+
+/// Private wrapper around an official `delta_kernel` predicate.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DeltaKernelPredicate {
+    inner: PredicateRef,
+}
+
+#[allow(dead_code)]
+impl DeltaKernelPredicate {
+    #[must_use]
+    pub(crate) fn new(predicate: Predicate) -> Self {
+        Self {
+            inner: Arc::new(predicate),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn as_ref(&self) -> &PredicateRef {
+        &self.inner
+    }
+
+    #[must_use]
+    pub(crate) fn into_inner(self) -> PredicateRef {
+        self.inner
+    }
+}
+
+#[cfg(test)]
+fn scan_builder_with_predicate_symbol(
+    builder: delta_kernel::scan::ScanBuilder,
+    predicate: PredicateRef,
+) -> delta_kernel::scan::ScanBuilder {
+    builder.with_predicate(predicate)
+}
+
+#[cfg(test)]
+fn scan_builder_with_predicate_and_stats_symbol(
+    builder: delta_kernel::scan::ScanBuilder,
+    predicate: PredicateRef,
+) -> delta_kernel::scan::ScanBuilder {
+    builder
+        .with_predicate(predicate)
+        .include_all_stats_columns()
 }
 
 fn feature_names(features: Option<&[TableFeature]>) -> Vec<String> {
@@ -84,8 +148,10 @@ fn feature_name(feature: &TableFeature) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArrowEngineData, DefaultEngineBuilder, DvInfo, EngineDataArrowExt, Scan, ScanFile,
-        ScanMetadata, Snapshot, SnapshotRef, Version, store_from_url_opts, transform_to_logical,
+        ArrowEngineData, ColumnName, DefaultEngineBuilder, DeltaKernelPredicate, DvInfo,
+        EngineDataArrowExt, Expression, Predicate, Scalar, Scan, ScanFile, ScanMetadata, Snapshot,
+        SnapshotRef, Version, scan_builder_with_predicate_and_stats_symbol,
+        scan_builder_with_predicate_symbol, store_from_url_opts, transform_to_logical,
         try_parse_uri,
     };
     use arrow_tiberius::{MssqlProfile, PlanOptions, plan_arrow_schema_to_mssql_mappings};
@@ -114,6 +180,21 @@ mod tests {
         let _ = super::snapshot_arrow_schema;
         let _ = super::snapshot_protocol_report;
         let _ = super::TABLE_FEATURES_MIN_READER_VERSION;
+        let _ = scan_builder_with_predicate_symbol;
+        let _ = scan_builder_with_predicate_and_stats_symbol;
+    }
+
+    #[test]
+    fn delta_kernel_predicate_api_symbols_are_available() {
+        let id_column = Expression::Column(ColumnName::new(["id"]));
+        let value = Expression::Literal(Scalar::Integer(7));
+        let equality = Predicate::eq(id_column.clone(), value);
+        let null_check = Predicate::is_null(id_column.clone());
+        let combined = Predicate::and(equality.clone(), Predicate::not(null_check));
+        let wrapped = DeltaKernelPredicate::new(Predicate::or(combined, equality));
+
+        let _predicate_ref = wrapped.as_ref();
+        let _owned_predicate_ref = wrapped.into_inner();
     }
 
     #[test]
