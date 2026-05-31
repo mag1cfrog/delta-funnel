@@ -562,7 +562,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::{CatalogProvider, SchemaProvider};
-    use datafusion::common::{DataFusionError, Result as DataFusionResult, ScalarValue};
+    use datafusion::common::{Column, DataFusionError, Result as DataFusionResult, ScalarValue};
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::datasource::{TableProvider, TableType};
     use datafusion::logical_expr::{
@@ -1513,6 +1513,34 @@ mod tests {
         assert_eq!(
             plan.decisions[0].reason,
             ProviderFilterReason::UnsupportedUnknownColumn
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_classifies_qualified_top_level_reference_without_losing_diagnostic_ref()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("qualified-filter-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let qualified_filter = Expr::Column(Column::new(Some("orders"), "id")).eq(lit(7));
+
+        let plan = provider.plan_filters(&[&qualified_filter]);
+
+        assert_eq!(plan.unsupported_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert_eq!(plan.decisions[0].referenced_columns, vec!["orders.id"]);
+        assert_eq!(plan.decisions[0].data_columns, vec!["orders.id"]);
+        assert!(plan.decisions[0].unknown_columns.is_empty());
+        assert_eq!(
+            plan.decisions[0].reason,
+            ProviderFilterReason::UnsupportedInitialPolicy
         );
 
         Ok(())
