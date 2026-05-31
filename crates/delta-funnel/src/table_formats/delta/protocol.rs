@@ -7,6 +7,10 @@ use super::kernel::{
     DeltaKernelProtocol, TABLE_FEATURES_MIN_READER_VERSION, Version, snapshot_protocol_report,
 };
 
+// Reader features are Delta correctness requirements. Keep this allowlist
+// empty until the provider execution path proves support for each feature.
+// For example, `deletionVectors` must remain rejected until rows are masked
+// before reaching DataFusion.
 const SUPPORTED_READER_FEATURES: &[&str] = &[];
 
 /// Protocol details for one named Delta source.
@@ -118,6 +122,11 @@ fn unsupported_reader_feature(features: &[String]) -> Option<&str> {
 }
 
 fn is_supported_reader_version(version: i32) -> bool {
+    // Version 1 is the basic legacy read protocol. Version 3 is Delta's
+    // table-feature protocol; the concrete reader requirements are then
+    // expressed by `readerFeatures` and checked separately above.
+    // Legacy reader version 2 implies column mapping support, so keep it
+    // rejected until physical-to-logical column handling is implemented.
     matches!(version, 1) || version == TABLE_FEATURES_MIN_READER_VERSION
 }
 
