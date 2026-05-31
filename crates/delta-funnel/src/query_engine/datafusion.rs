@@ -1143,6 +1143,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_provider_scan_rejects_duplicate_projection_at_public_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-duplicate-projection")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![1, 1];
+
+        let result = provider.scan(&state, Some(&projection), &[], None).await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+            .to_string()
+            .contains("projection index 1 is duplicated"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_direct_filter_injection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-filter-injection")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter = datafusion::logical_expr::col("id").eq(datafusion::logical_expr::lit(7));
+
+        let result = provider.scan(&state, None, &[filter], None).await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::Plan(message)) if message
+            .contains("filter pushdown is unsupported"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn table_provider_scan_limit_does_not_change_projection_contract()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("table-provider-limit-unsupported")?;
@@ -1174,6 +1223,31 @@ mod tests {
             with_limit_scan.scan_plan().scan_projection,
             without_limit_scan.scan_plan().scan_projection
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_limit_stays_above_non_reading_delta_scan() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "limit-above-scan")?;
+
+        let dataframe = ctx.sql("select id from orders limit 1").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("GlobalLimitExec"), "{plan_display}");
+        assert!(
+            plan_display.contains("DeltaScanPlanningExec"),
+            "{plan_display}"
+        );
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0]));
 
         Ok(())
     }
