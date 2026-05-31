@@ -562,10 +562,12 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::{CatalogProvider, SchemaProvider};
-    use datafusion::common::{DataFusionError, Result as DataFusionResult};
+    use datafusion::common::{DataFusionError, Result as DataFusionResult, ScalarValue};
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::datasource::{TableProvider, TableType};
-    use datafusion::logical_expr::{TableProviderFilterPushDown, cast, col, lit};
+    use datafusion::logical_expr::{
+        ColumnarValue, Expr, TableProviderFilterPushDown, Volatility, cast, col, create_udf, lit,
+    };
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::{SessionConfig, SessionContext};
 
@@ -1436,18 +1438,37 @@ mod tests {
         let or_filter = col("id")
             .gt(lit(1))
             .or(col("customer_name").eq(lit("alice")));
-        let not_filter = datafusion::logical_expr::Expr::Not(Box::new(col("id").gt(lit(1))));
+        let not_filter = Expr::Not(Box::new(col("id").gt(lit(1))));
+        let scalar_udf = create_udf(
+            "is_interesting",
+            vec![DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(false))))),
+        );
+        let scalar_function_filter =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![col("customer_name")],
+            ));
 
-        let plan = provider.plan_filters(&[&cast_filter, &and_filter, &or_filter, &not_filter]);
+        let plan = provider.plan_filters(&[
+            &cast_filter,
+            &and_filter,
+            &or_filter,
+            &not_filter,
+            &scalar_function_filter,
+        ]);
 
-        assert_eq!(plan.unsupported_count, 4);
-        assert_eq!(plan.residual_filter_count, 4);
+        assert_eq!(plan.unsupported_count, 5);
+        assert_eq!(plan.residual_filter_count, 5);
         assert_eq!(
             plan.decisions
                 .iter()
                 .map(|decision| decision.reason)
                 .collect::<Vec<_>>(),
             vec![
+                ProviderFilterReason::UnsupportedExpressionShape,
                 ProviderFilterReason::UnsupportedExpressionShape,
                 ProviderFilterReason::UnsupportedExpressionShape,
                 ProviderFilterReason::UnsupportedExpressionShape,
