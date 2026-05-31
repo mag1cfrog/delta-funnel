@@ -64,10 +64,16 @@ pub fn register_delta_sources(
     configs: Vec<DeltaTableProviderConfig>,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
     reject_duplicate_registration_names(&configs)?;
-
-    let sources = configs
+    let providers = configs
         .into_iter()
-        .map(|config| register_delta_source(ctx, config))
+        .map(|config| DeltaTableProvider::try_new(config.source, config.protocol))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    reject_existing_registration_names(ctx, &providers)?;
+
+    let sources = providers
+        .into_iter()
+        .map(|provider| register_delta_provider(ctx, provider))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(RegisteredDeltaSources { sources })
@@ -79,11 +85,38 @@ fn reject_duplicate_registration_names(
     validate_table_source_names(configs.iter().map(|config| config.source.name()))
 }
 
-fn register_delta_source(
+fn reject_existing_registration_names(
     ctx: &SessionContext,
-    config: DeltaTableProviderConfig,
+    providers: &[DeltaTableProvider],
+) -> Result<(), DeltaFunnelError> {
+    let default_catalog = ctx.catalog("datafusion");
+    let default_schema = default_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.schema("public"));
+    let existing_names = default_schema
+        .as_ref()
+        .map_or_else(Vec::new, |schema| schema.table_names());
+
+    for provider in providers {
+        if let Some(existing_name) = existing_names
+            .iter()
+            .find(|existing_name| existing_name.eq_ignore_ascii_case(provider.source_name()))
+        {
+            return Err(DeltaFunnelError::DataFusionRegistration {
+                source_name: provider.source_name().to_owned(),
+                table_uri: provider.source.table_uri().to_owned(),
+                reason: format!("table already exists: {existing_name}"),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn register_delta_provider(
+    ctx: &SessionContext,
+    provider: DeltaTableProvider,
 ) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
-    let provider = DeltaTableProvider::try_new(config.source, config.protocol)?;
     let registered = RegisteredDeltaSource {
         name: provider.source_name().to_owned(),
         snapshot_version: provider.snapshot_version(),
@@ -414,6 +447,113 @@ mod tests {
                 ..
             }) if source_name == "orders" && reason.contains("already exists")
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn existing_table_conflict_fails_before_partial_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("existing-conflict-orders")?;
+        let customers = DeltaLogTable::new("existing-conflict-customers")?;
+        let orders_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: orders.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let customers_source = load_delta_source(DeltaSourceConfig {
+            name: "customers".to_owned(),
+            table_uri: customers.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let orders_preflight = preflight_delta_protocol(&orders_source)?;
+        let customers_preflight = preflight_delta_protocol(&customers_source)?;
+        let ctx = SessionContext::new();
+        let placeholder_schema = Arc::new(Schema::new(vec![Field::new(
+            "existing",
+            DataType::Utf8,
+            true,
+        )]));
+
+        ctx.register_table("customers", Arc::new(EmptyTable::new(placeholder_schema)))?;
+        let result = register_delta_sources(
+            &ctx,
+            vec![
+                DeltaTableProviderConfig {
+                    source: orders_source,
+                    protocol: orders_preflight,
+                },
+                DeltaTableProviderConfig {
+                    source: customers_source,
+                    protocol: customers_preflight,
+                },
+            ],
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DataFusionRegistration {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "customers" && reason.contains("already exists")
+        ));
+        assert!(!ctx.table_exist("orders")?);
+        assert!(ctx.table_exist("customers")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_conversion_failure_fails_before_partial_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("schema-partial-orders")?;
+        let customers = DeltaLogTable::new_with_schema(
+            "schema-partial-customers",
+            INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
+            "[]",
+            r#""partitionValues":{}"#,
+        )?;
+        let orders_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: orders.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let customers_source = load_delta_source(DeltaSourceConfig {
+            name: "customers".to_owned(),
+            table_uri: customers.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let orders_preflight = preflight_delta_protocol(&orders_source)?;
+        let customers_preflight = preflight_delta_protocol(&customers_source)?;
+        let ctx = SessionContext::new();
+
+        let result = register_delta_sources(
+            &ctx,
+            vec![
+                DeltaTableProviderConfig {
+                    source: orders_source,
+                    protocol: orders_preflight,
+                },
+                DeltaTableProviderConfig {
+                    source: customers_source,
+                    protocol: customers_preflight,
+                },
+            ],
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaSourceSchema {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "customers"
+                && reason.contains("bad_array")
+                && reason.contains("delta.columnMapping.nested.ids")
+        ));
+        assert!(!ctx.table_exist("orders")?);
+        assert!(!ctx.table_exist("customers")?);
 
         Ok(())
     }
