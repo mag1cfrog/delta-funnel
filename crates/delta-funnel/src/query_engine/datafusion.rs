@@ -189,6 +189,20 @@ mod tests {
 
     impl DeltaLogTable {
         fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_schema(
+                name,
+                DEFAULT_SCHEMA_FIELDS_JSON,
+                "[]",
+                r#""partitionValues":{}"#,
+            )
+        }
+
+        fn new_with_schema(
+            name: &str,
+            schema_fields_json: &str,
+            partition_columns_json: &str,
+            add_partition_values_json: &str,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let path = Path::new("target")
                 .join("delta-funnel-datafusion-provider-tests")
                 .join(unique_name(name)?);
@@ -196,11 +210,18 @@ mod tests {
             fs::create_dir_all(&log_path)?;
             fs::write(
                 log_path.join("00000000000000000000.json"),
-                format!("{PROTOCOL_JSON}\n{METADATA_JSON}\n"),
+                format!(
+                    "{}\n{}\n",
+                    PROTOCOL_JSON,
+                    metadata_json(schema_fields_json, partition_columns_json)
+                ),
             )?;
             fs::write(
                 log_path.join("00000000000000000001.json"),
-                format!("{}\n", add_json("part-00001.parquet")),
+                format!(
+                    "{}\n",
+                    add_json("part-00001.parquet", add_partition_values_json)
+                ),
             )?;
 
             Ok(Self { path })
@@ -208,11 +229,20 @@ mod tests {
     }
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
-    const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const DEFAULT_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+    const PARTITIONED_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+    const NESTED_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]"#;
+    const INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"bad_array\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{\"delta.columnMapping.nested.ids\":\"not an object\"}}]"#;
 
-    fn add_json(path: &str) -> String {
+    fn metadata_json(schema_fields_json: &str, partition_columns_json: &str) -> String {
         format!(
-            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+            r#"{{"metaData":{{"id":"delta-funnel-test","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":{schema_fields_json}}}","partitionColumns":{partition_columns_json},"configuration":{{}},"createdTime":1587968585495}}}}"#
+        )
+    }
+
+    fn add_json(path: &str, partition_values_json: &str) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}",{partition_values_json},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
         )
     }
 
@@ -407,6 +437,99 @@ mod tests {
         assert_eq!(schema.field(0).data_type(), &DataType::Int32);
         assert_eq!(schema.field(1).name(), "customer_name");
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_schema_includes_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "partition-schema",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let schema = provider.schema();
+
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(1).name(), "region");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_analysis_accepts_nested_source_columns_without_target_planning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "nested-schema",
+            NESTED_SCHEMA_FIELDS_JSON,
+            "[]",
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let ctx = SessionContext::new();
+
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+        let dataframe = ctx.sql("select id from orders").await?;
+        let schema = dataframe.schema();
+
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_conversion_failure_reports_source_and_field_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "schema-failure",
+            INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
+            "[]",
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let result = DeltaTableProvider::try_new(source, preflight);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaSourceSchema {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "orders"
+                && reason.contains("bad_array")
+                && reason.contains("delta.columnMapping.nested.ids")
+        ));
 
         Ok(())
     }
