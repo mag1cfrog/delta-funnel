@@ -196,9 +196,9 @@ fn schema_lookup_name(flat_column_ref: &str, schema: &SchemaRef) -> String {
     if schema.field_with_name(first_segment).is_ok() {
         flat_column_ref.to_owned()
     } else {
-        let (_qualifier, unqualified_name) = flat_column_ref
+        let unqualified_name = flat_column_ref
             .rsplit_once('.')
-            .expect("dotted reference should split on the last dot");
+            .map_or(flat_column_ref, |(_qualifier, name)| name);
         // Case 4: the prefix is not a top-level field, as in `orders.id`
         // against a provider schema with top-level `id`. Treat the prefix as a
         // relation qualifier and use the suffix for top-level schema metadata.
