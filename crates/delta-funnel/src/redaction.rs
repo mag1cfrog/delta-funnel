@@ -64,6 +64,20 @@ mod tests {
     }
 
     #[test]
+    fn uri_display_redacts_fragment_without_query() {
+        let display = sanitize_uri_for_display("https://example.com/table#access_token=secret");
+
+        assert_eq!(display, "https://example.com/table");
+    }
+
+    #[test]
+    fn uri_display_preserves_at_signs_outside_authority() {
+        let display = sanitize_uri_for_display("s3://bucket/path@name/table?token=secret");
+
+        assert_eq!(display, "s3://bucket/path@name/table");
+    }
+
+    #[test]
     fn uri_display_escapes_control_characters() {
         let display = sanitize_uri_for_display("s3://bucket/table\nname");
 

@@ -384,6 +384,44 @@ mod tests {
     }
 
     #[test]
+    fn protocol_policy_allows_reader_version_three_without_reader_features() {
+        let report = DeltaProtocolReport {
+            source_name: "orders".to_owned(),
+            table_uri: "s3://bucket/table/".to_owned(),
+            snapshot_version: 42,
+            min_reader_version: super::TABLE_FEATURES_MIN_READER_VERSION,
+            min_writer_version: 7,
+            reader_features: Vec::new(),
+            writer_features: vec!["inCommitTimestamp".to_owned()],
+        };
+
+        assert!(super::ensure_protocol_supported(&report).is_ok());
+    }
+
+    #[test]
+    fn protocol_policy_reports_first_unsupported_reader_feature() {
+        let report = DeltaProtocolReport {
+            source_name: "orders".to_owned(),
+            table_uri: "s3://bucket/table/".to_owned(),
+            snapshot_version: 42,
+            min_reader_version: super::TABLE_FEATURES_MIN_READER_VERSION,
+            min_writer_version: 7,
+            reader_features: vec!["deletionVectors".to_owned(), "madeUpFeature".to_owned()],
+            writer_features: vec!["deletionVectors".to_owned(), "madeUpFeature".to_owned()],
+        };
+
+        let result = super::ensure_protocol_supported(&report);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaProtocolCompatibility {
+                reason,
+                ..
+            }) if reason.contains("deletionVectors") && !reason.contains("madeUpFeature")
+        ));
+    }
+
+    #[test]
     fn compatibility_error_display_redacts_uri_credentials() {
         let error = DeltaFunnelError::DeltaProtocolCompatibility {
             source_name: "orders".to_owned(),
