@@ -814,6 +814,101 @@ mod tests {
     }
 
     #[test]
+    fn hostile_projection_index_fails_without_overflow_or_panic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("hostile-projection-scan-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let result = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![usize::MAX]),
+        });
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaScanProjection {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "orders"
+                && reason.contains("projection index")
+                && reason.contains("out of bounds")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_drift_between_arrow_and_kernel_fails_instead_of_full_scan_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("schema-drift-projection-scan-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let mut provider = DeltaTableProvider::try_new(source, preflight)?;
+        provider.schema = Arc::new(Schema::new(vec![Field::new(
+            "ghost_column",
+            DataType::Utf8,
+            true,
+        )]));
+
+        let result = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+        });
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaScanConstruction {
+                source_name,
+                source,
+                ..
+            }) if source_name == "orders"
+                && source.to_string().contains("ghost_column")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_construction_error_display_escapes_control_characters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("schema-drift-redaction-scan-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let mut provider = DeltaTableProvider::try_new(source, preflight)?;
+        provider.schema = Arc::new(Schema::new(vec![Field::new(
+            "ghost\ncolumn",
+            DataType::Utf8,
+            true,
+        )]));
+
+        let error = match provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+        }) {
+            Ok(_) => return Err("tampered schema should not build a kernel scan".into()),
+            Err(error) => error,
+        };
+        let display = error.to_string();
+
+        assert!(display.contains("ghost\\ncolumn"));
+        assert!(!display.contains("ghost\ncolumn"));
+
+        Ok(())
+    }
+
+    #[test]
     fn provider_scan_plan_dependencies_use_official_delta_kernel_only()
     -> Result<(), Box<dyn std::error::Error>> {
         let manifest =
