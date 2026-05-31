@@ -354,6 +354,33 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn catalog_inspection_exposes_registered_provider_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "catalog-inspection")?;
+
+        let catalog = ctx.catalog("datafusion").ok_or("missing default catalog")?;
+        let schema = catalog.schema("public").ok_or("missing default schema")?;
+        let provider = schema
+            .table("orders")
+            .await?
+            .ok_or("missing registered table provider")?;
+        let provider_schema = provider.schema();
+
+        assert!(schema.table_names().contains(&"orders".to_owned()));
+        assert_eq!(provider.table_type(), TableType::Base);
+        assert_eq!(provider_schema.fields().len(), 2);
+        assert_eq!(provider_schema.field(0).name(), "id");
+        assert_eq!(provider_schema.field(0).data_type(), &DataType::Int32);
+        assert!(!provider_schema.field(0).is_nullable());
+        assert_eq!(provider_schema.field(1).name(), "customer_name");
+        assert_eq!(provider_schema.field(1).data_type(), &DataType::Utf8);
+        assert!(provider_schema.field(1).is_nullable());
+
+        Ok(())
+    }
+
     #[test]
     fn registration_failure_reports_source_context() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("registration-failure")?;
