@@ -107,6 +107,38 @@ pub enum DeltaFunnelError {
         reason: String,
     },
 
+    /// A Delta provider scan projection could not be planned.
+    #[snafu(display(
+        "Delta scan projection error for source `{}` ({}): {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(reason)
+    ))]
+    DeltaScanProjection {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Sanitized reason for the projection failure.
+        reason: String,
+    },
+
+    /// A Delta kernel scan could not be constructed.
+    #[snafu(display(
+        "Delta scan construction error for source `{}` ({}): {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    DeltaScanConstruction {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Kernel scan construction failure.
+        source: Box<delta_kernel::Error>,
+    },
+
     /// A required dependency contract is unavailable or incompatible.
     #[snafu(display("dependency compatibility error: {message}"))]
     DependencyCompatibility {

@@ -1,6 +1,7 @@
 //! DataFusion integration.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -16,7 +17,10 @@ use datafusion::prelude::SessionContext;
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
     redaction::sanitize_uri_for_display,
-    table_formats::{delta_source_arrow_schema, validate_table_source_names},
+    table_formats::{
+        ProjectedDeltaScan, build_projected_delta_scan, delta_source_arrow_schema,
+        validate_table_source_names,
+    },
 };
 
 /// Delta source and preflight state used to build a DataFusion table provider.
@@ -51,6 +55,40 @@ pub(crate) struct DeltaTableProvider {
     source: PlannedDeltaSource,
     protocol: DeltaProtocolReport,
     schema: SchemaRef,
+}
+
+/// Caller request used to build a provider scan plan.
+#[allow(dead_code)]
+pub(crate) struct ProviderScanPlanRequest {
+    /// Requested DataFusion projection indexes against the provider logical schema.
+    pub(crate) requested_projection: Option<Vec<usize>>,
+}
+
+/// Kernel-backed scan intent for one Delta provider scan.
+#[allow(dead_code)]
+pub(crate) struct ProviderScanPlan {
+    /// DataFusion table name for this source.
+    pub(crate) source_name: String,
+    /// Normalized Delta table URI for this source.
+    pub(crate) table_uri: String,
+    /// Resolved Delta snapshot version.
+    pub(crate) snapshot_version: u64,
+    /// Arrow schema expected from this provider scan.
+    pub(crate) projected_schema: SchemaRef,
+    /// Protocol report captured before provider registration.
+    pub(crate) protocol: DeltaProtocolReport,
+    /// Projection indexes accepted and used for this scan, if any.
+    pub(crate) scan_projection: Option<Vec<usize>>,
+    kernel_scan: ProjectedDeltaScan,
+}
+
+impl ProviderScanPlan {
+    /// Returns the private kernel scan state for later provider scan phases.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn kernel_scan(&self) -> &ProjectedDeltaScan {
+        &self.kernel_scan
+    }
 }
 
 /// Registers preflighted Delta sources into a DataFusion session.
@@ -196,6 +234,112 @@ impl DeltaTableProvider {
     fn protocol(&self) -> &DeltaProtocolReport {
         &self.protocol
     }
+
+    #[allow(dead_code)]
+    fn plan_scan(
+        &self,
+        request: ProviderScanPlanRequest,
+    ) -> Result<ProviderScanPlan, DeltaFunnelError> {
+        let ProjectionPlan {
+            projected_schema,
+            scan_projection,
+            projected_column_names,
+        } = self.plan_projection(request.requested_projection)?;
+        let kernel_scan =
+            build_projected_delta_scan(&self.source, projected_column_names.as_deref()).map_err(
+                |source| DeltaFunnelError::DeltaScanConstruction {
+                    source_name: self.source_name().to_owned(),
+                    table_uri: self.source.table_uri().to_owned(),
+                    source: Box::new(source),
+                },
+            )?;
+
+        Ok(ProviderScanPlan {
+            source_name: self.source_name().to_owned(),
+            table_uri: self.source.table_uri().to_owned(),
+            snapshot_version: self.snapshot_version(),
+            projected_schema,
+            protocol: self.protocol.clone(),
+            scan_projection,
+            kernel_scan,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn plan_projection(
+        &self,
+        projection: Option<Vec<usize>>,
+    ) -> Result<ProjectionPlan, DeltaFunnelError> {
+        let Some(projection) = projection else {
+            return Ok(ProjectionPlan {
+                projected_schema: self.schema(),
+                scan_projection: None,
+                projected_column_names: None,
+            });
+        };
+
+        reject_duplicate_projection_indexes(&projection).map_err(|reason| {
+            DeltaFunnelError::DeltaScanProjection {
+                source_name: self.source_name().to_owned(),
+                table_uri: self.source.table_uri().to_owned(),
+                reason,
+            }
+        })?;
+
+        let projected_column_names = projection
+            .iter()
+            .map(|index| {
+                self.schema.fields().get(*index).map_or_else(
+                    || {
+                        Err(DeltaFunnelError::DeltaScanProjection {
+                            source_name: self.source_name().to_owned(),
+                            table_uri: self.source.table_uri().to_owned(),
+                            reason: format!(
+                                "projection index {index} is out of bounds for schema with {} fields",
+                                self.schema.fields().len()
+                            ),
+                        })
+                    },
+                    |field| Ok(field.name().to_owned()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let projected_schema =
+            Arc::new(self.schema.as_ref().project(&projection).map_err(|error| {
+                DeltaFunnelError::DeltaScanProjection {
+                    source_name: self.source_name().to_owned(),
+                    table_uri: self.source.table_uri().to_owned(),
+                    reason: error.to_string(),
+                }
+            })?);
+
+        Ok(ProjectionPlan {
+            projected_schema,
+            scan_projection: Some(projection),
+            projected_column_names: Some(projected_column_names),
+        })
+    }
+}
+
+#[allow(dead_code)]
+struct ProjectionPlan {
+    projected_schema: SchemaRef,
+    scan_projection: Option<Vec<usize>>,
+    projected_column_names: Option<Vec<String>>,
+}
+
+#[allow(dead_code)]
+fn reject_duplicate_projection_indexes(projection: &[usize]) -> Result<(), String> {
+    let mut seen = HashSet::with_capacity(projection.len());
+
+    for index in projection {
+        if !seen.insert(*index) {
+            return Err(format!("projection index {index} is duplicated"));
+        }
+    }
+
+    Ok(())
 }
 
 fn reject_mismatched_preflight(
@@ -273,7 +417,10 @@ mod tests {
     use datafusion::datasource::{TableProvider, TableType};
     use datafusion::prelude::{SessionConfig, SessionContext};
 
-    use super::{DeltaTableProvider, DeltaTableProviderConfig, register_delta_sources};
+    use super::{
+        DeltaTableProvider, DeltaTableProviderConfig, ProviderScanPlanRequest,
+        register_delta_sources,
+    };
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     struct DeltaLogTable {
@@ -491,6 +638,190 @@ mod tests {
         assert_eq!(schema.field(1).name(), "customer_name");
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
         assert!(schema.field(1).is_nullable());
+
+        Ok(())
+    }
+
+    #[test]
+    fn full_projection_scan_plan_preserves_source_context() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table = DeltaLogTable::new("full-scan-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: None,
+        })?;
+
+        assert_eq!(plan.source_name, "orders");
+        assert!(plan.table_uri.starts_with("file://"));
+        assert_eq!(plan.snapshot_version, 1);
+        assert_eq!(plan.protocol.source_name, "orders");
+        assert_eq!(plan.scan_projection, None);
+        assert_eq!(plan.projected_schema.fields().len(), 2);
+        assert_eq!(plan.projected_schema.field(0).name(), "id");
+        assert_eq!(plan.projected_schema.field(1).name(), "customer_name");
+        assert_eq!(plan.kernel_scan().kernel_schema().num_fields(), 2);
+        let _ = plan.kernel_scan().kernel_scan();
+
+        Ok(())
+    }
+
+    #[test]
+    fn projected_scan_plan_preserves_requested_order() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("ordered-projection-scan-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![1, 0]),
+        })?;
+
+        assert_eq!(plan.scan_projection, Some(vec![1, 0]));
+        assert_eq!(plan.projected_schema.fields().len(), 2);
+        assert_eq!(plan.projected_schema.field(0).name(), "customer_name");
+        assert_eq!(plan.projected_schema.field(1).name(), "id");
+        assert_eq!(plan.kernel_scan().kernel_schema().num_fields(), 2);
+        let kernel_names = plan
+            .kernel_scan()
+            .kernel_schema()
+            .fields()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kernel_names, vec!["customer_name", "id"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn single_column_scan_plan_projects_kernel_and_arrow_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("single-projection-scan-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![1]),
+        })?;
+
+        assert_eq!(plan.projected_schema.fields().len(), 1);
+        assert_eq!(plan.projected_schema.field(0).name(), "customer_name");
+        assert_eq!(plan.projected_schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(plan.kernel_scan().kernel_schema().num_fields(), 1);
+        let kernel_field = plan
+            .kernel_scan()
+            .kernel_schema()
+            .field_at_index(0)
+            .ok_or("missing projected kernel field")?;
+        assert_eq!(kernel_field.name(), "customer_name");
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_projection_scan_plan_is_valid_for_count_style_scans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("empty-projection-scan-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![]),
+        })?;
+
+        assert_eq!(plan.scan_projection, Some(vec![]));
+        assert_eq!(plan.projected_schema.fields().len(), 0);
+        assert_eq!(plan.kernel_scan().kernel_schema().num_fields(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_projection_indexes_fail_before_kernel_scan_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("duplicate-projection-scan-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let result = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![1, 1]),
+        });
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaScanProjection {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "orders"
+                && reason.contains("projection index 1 is duplicated")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_projection_index_fails_before_execution() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("invalid-projection-scan-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let result = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![2]),
+        });
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaScanProjection {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "orders"
+                && reason.contains("projection index 2 is out of bounds")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_scan_plan_dependencies_use_official_delta_kernel_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))?;
+
+        assert!(manifest.contains("delta_kernel"));
+        assert!(!manifest.contains("deltalake"));
+        assert!(!manifest.contains("buoyant_kernel"));
 
         Ok(())
     }

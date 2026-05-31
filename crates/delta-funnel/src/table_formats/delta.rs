@@ -31,6 +31,29 @@ pub struct PlannedDeltaSource {
     snapshot: LoadedDeltaTableSnapshot,
 }
 
+/// Kernel-backed scan state for one projected Delta scan.
+#[allow(dead_code)]
+pub(crate) struct ProjectedDeltaScan {
+    scan: kernel::Scan,
+    kernel_schema: kernel::KernelSchemaRef,
+}
+
+impl ProjectedDeltaScan {
+    /// Returns the projected kernel schema selected for this scan.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn kernel_schema(&self) -> &kernel::KernelSchemaRef {
+        &self.kernel_schema
+    }
+
+    /// Returns the kernel scan handle that later metadata planning will consume.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn kernel_scan(&self) -> &kernel::Scan {
+        &self.scan
+    }
+}
+
 impl PlannedDeltaSource {
     /// DataFusion table name for this source.
     #[must_use]
@@ -66,6 +89,23 @@ pub(crate) fn delta_source_arrow_schema(
 ) -> Result<ArrowSchemaRef, String> {
     snapshot_arrow_schema(source.loaded_snapshot().kernel_snapshot())
         .map_err(|error| error.to_string())
+}
+
+/// Builds kernel-backed scan state for a loaded Delta source projection.
+#[allow(dead_code)]
+pub(crate) fn build_projected_delta_scan(
+    source: &PlannedDeltaSource,
+    projected_column_names: Option<&[String]>,
+) -> Result<ProjectedDeltaScan, delta_kernel::Error> {
+    let (scan, kernel_schema) = kernel::build_projected_scan(
+        source.loaded_snapshot().kernel_snapshot(),
+        projected_column_names,
+    )?;
+
+    Ok(ProjectedDeltaScan {
+        scan,
+        kernel_schema,
+    })
 }
 
 /// Loads one named Delta source.
