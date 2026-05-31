@@ -222,6 +222,30 @@ mod tests {
         Ok(format!("{}-{}-{nanos}", std::process::id(), name))
     }
 
+    fn register_fixture_source(
+        ctx: &SessionContext,
+        source_name: &str,
+        fixture_name: &str,
+    ) -> Result<DeltaLogTable, Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new(fixture_name)?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: source_name.to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        register_delta_sources(
+            ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        Ok(table)
+    }
+
     #[test]
     fn datafusion_table_provider_api_symbols_are_available() -> datafusion::error::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -325,6 +349,64 @@ mod tests {
                 ..
             }) if source_name == "orders" && reason.contains("already exists")
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_analysis_works_for_select_star_without_scan_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "select-star")?;
+
+        let dataframe = ctx.sql("select * from orders").await?;
+        let schema = dataframe.schema();
+
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "customer_name");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_analysis_works_for_projection_without_delta_projection_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "projection")?;
+
+        let dataframe = ctx.sql("select customer_name from orders").await?;
+        let optimized = dataframe.into_optimized_plan()?;
+        let schema = optimized.schema();
+
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "customer_name");
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_analysis_works_for_join_across_registered_sources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let _orders = register_fixture_source(&ctx, "orders", "join-orders")?;
+        let _customers = register_fixture_source(&ctx, "customers", "join-customers")?;
+
+        let dataframe = ctx
+            .sql(
+                "select orders.id, customers.customer_name \
+                 from orders join customers on orders.id = customers.id",
+            )
+            .await?;
+        let optimized = dataframe.into_optimized_plan()?;
+        let schema = optimized.schema();
+
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(1).name(), "customer_name");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
 
         Ok(())
     }

@@ -25,3 +25,6 @@ delta_kernel = { version = "0.23.0", default-features = false, features = [
     "internal-api",
 ] }
 snafu = "0.9"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1264,6 +1264,7 @@ dependencies = [
  "datafusion",
  "delta_kernel",
  "snafu",
+ "tokio",
 ]
 
 [[package]]
