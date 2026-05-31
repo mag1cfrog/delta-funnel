@@ -37,7 +37,19 @@ pub struct DeltaProtocolReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolPreflight {
     /// Protocol report captured during preflight.
-    pub protocol: DeltaProtocolReport,
+    protocol: DeltaProtocolReport,
+}
+
+impl ProtocolPreflight {
+    /// Protocol report captured during preflight.
+    #[must_use]
+    pub fn protocol(&self) -> &DeltaProtocolReport {
+        &self.protocol
+    }
+
+    pub(crate) fn into_protocol(self) -> DeltaProtocolReport {
+        self.protocol
+    }
 }
 
 /// Runs conservative Delta protocol preflight for one loaded source.

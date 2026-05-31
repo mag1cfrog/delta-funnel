@@ -15,6 +15,7 @@ use datafusion::prelude::SessionContext;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
+    redaction::sanitize_uri_for_display,
     table_formats::{delta_source_arrow_schema, validate_table_source_names},
 };
 
@@ -71,10 +72,7 @@ pub fn register_delta_sources(
 
     reject_existing_registration_names(ctx, &providers)?;
 
-    let sources = providers
-        .into_iter()
-        .map(|provider| register_delta_provider(ctx, provider))
-        .collect::<Result<Vec<_>, _>>()?;
+    let sources = register_delta_providers(ctx, providers)?;
 
     Ok(RegisteredDeltaSources { sources })
 }
@@ -137,11 +135,41 @@ fn register_delta_provider(
     Ok(registered)
 }
 
+fn register_delta_providers(
+    ctx: &SessionContext,
+    providers: Vec<DeltaTableProvider>,
+) -> Result<Vec<RegisteredDeltaSource>, DeltaFunnelError> {
+    let mut registered_sources = Vec::with_capacity(providers.len());
+    let mut registered_names = Vec::with_capacity(providers.len());
+
+    for provider in providers {
+        let registered = match register_delta_provider(ctx, provider) {
+            Ok(registered) => registered,
+            Err(error) => {
+                rollback_registered_delta_sources(ctx, &registered_names);
+                return Err(error);
+            }
+        };
+
+        registered_names.push(registered.name.clone());
+        registered_sources.push(registered);
+    }
+
+    Ok(registered_sources)
+}
+
+fn rollback_registered_delta_sources(ctx: &SessionContext, names: &[String]) {
+    for name in names.iter().rev() {
+        let _ = ctx.deregister_table(name.as_str());
+    }
+}
+
 impl DeltaTableProvider {
     fn try_new(
         source: PlannedDeltaSource,
         preflight: ProtocolPreflight,
     ) -> Result<Self, DeltaFunnelError> {
+        reject_mismatched_preflight(&source, preflight.protocol())?;
         let schema = delta_source_arrow_schema(&source).map_err(|reason| {
             DeltaFunnelError::DeltaSourceSchema {
                 source_name: source.name().to_owned(),
@@ -152,7 +180,7 @@ impl DeltaTableProvider {
 
         Ok(Self {
             source,
-            protocol: preflight.protocol,
+            protocol: preflight.into_protocol(),
             schema,
         })
     }
@@ -168,6 +196,29 @@ impl DeltaTableProvider {
     fn protocol(&self) -> &DeltaProtocolReport {
         &self.protocol
     }
+}
+
+fn reject_mismatched_preflight(
+    source: &PlannedDeltaSource,
+    protocol: &DeltaProtocolReport,
+) -> Result<(), DeltaFunnelError> {
+    let source_table_uri = sanitize_uri_for_display(source.table_uri());
+
+    if protocol.source_name != source.name()
+        || protocol.snapshot_version != source.version()
+        || protocol.table_uri != source_table_uri
+    {
+        return Err(DeltaFunnelError::DataFusionRegistration {
+            source_name: source.name().to_owned(),
+            table_uri: source.table_uri().to_owned(),
+            reason: format!(
+                "protocol preflight belongs to source `{}` at snapshot version {} ({})",
+                protocol.source_name, protocol.snapshot_version, protocol.table_uri
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 impl fmt::Debug for DeltaTableProvider {
@@ -207,12 +258,17 @@ impl TableProvider for DeltaTableProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use async_trait::async_trait;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::{CatalogProvider, SchemaProvider};
+    use datafusion::common::{DataFusionError, Result as DataFusionResult};
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::datasource::{TableProvider, TableType};
     use datafusion::prelude::{SessionConfig, SessionContext};
@@ -317,6 +373,84 @@ mod tests {
         )?;
 
         Ok(table)
+    }
+
+    #[derive(Debug, Default)]
+    struct FailsOnCustomersSchemaProvider {
+        tables: Mutex<HashMap<String, Arc<dyn TableProvider>>>,
+    }
+
+    impl FailsOnCustomersSchemaProvider {
+        fn tables(&self) -> MutexGuard<'_, HashMap<String, Arc<dyn TableProvider>>> {
+            self.tables
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    #[async_trait]
+    impl SchemaProvider for FailsOnCustomersSchemaProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn table_names(&self) -> Vec<String> {
+            self.tables().keys().cloned().collect()
+        }
+
+        async fn table(
+            &self,
+            name: &str,
+        ) -> DataFusionResult<Option<Arc<dyn TableProvider>>, DataFusionError> {
+            Ok(self.tables().get(name).cloned())
+        }
+
+        fn register_table(
+            &self,
+            name: String,
+            table: Arc<dyn TableProvider>,
+        ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+            if name == "customers" {
+                return Err(DataFusionError::Execution(
+                    "forced customers registration failure".to_owned(),
+                ));
+            }
+
+            Ok(self.tables().insert(name, table))
+        }
+
+        fn deregister_table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+            Ok(self.tables().remove(name))
+        }
+
+        fn table_exist(&self, name: &str) -> bool {
+            self.tables().contains_key(name)
+        }
+    }
+
+    #[derive(Debug)]
+    struct SingleSchemaCatalogProvider {
+        schema: Arc<dyn SchemaProvider>,
+    }
+
+    impl SingleSchemaCatalogProvider {
+        fn new(schema: Arc<dyn SchemaProvider>) -> Self {
+            Self { schema }
+        }
+    }
+
+    impl CatalogProvider for SingleSchemaCatalogProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema_names(&self) -> Vec<String> {
+            vec!["public".to_owned()]
+        }
+
+        fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+            (name == "public").then(|| Arc::clone(&self.schema))
+        }
     }
 
     #[test]
@@ -454,6 +588,46 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_preflight_is_rejected_before_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("mismatched-preflight-orders")?;
+        let customers = DeltaLogTable::new("mismatched-preflight-customers")?;
+        let orders_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: orders.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let customers_source = load_delta_source(DeltaSourceConfig {
+            name: "customers".to_owned(),
+            table_uri: customers.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let customers_preflight = preflight_delta_protocol(&customers_source)?;
+        let ctx = SessionContext::new();
+
+        let result = register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source: orders_source,
+                protocol: customers_preflight,
+            }],
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DataFusionRegistration {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "orders"
+                && reason.contains("protocol preflight belongs to source `customers`")
+        ));
+        assert!(!ctx.table_exist("orders")?);
+
+        Ok(())
+    }
+
+    #[test]
     fn existing_table_conflict_fails_before_partial_registration()
     -> Result<(), Box<dyn std::error::Error>> {
         let orders = DeltaLogTable::new("existing-conflict-orders")?;
@@ -502,6 +676,62 @@ mod tests {
         ));
         assert!(!ctx.table_exist("orders")?);
         assert!(ctx.table_exist("customers")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn late_registration_failure_rolls_back_prior_sources() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let orders = DeltaLogTable::new("rollback-orders")?;
+        let customers = DeltaLogTable::new("rollback-customers")?;
+        let orders_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: orders.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let customers_source = load_delta_source(DeltaSourceConfig {
+            name: "customers".to_owned(),
+            table_uri: customers.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let orders_preflight = preflight_delta_protocol(&orders_source)?;
+        let customers_preflight = preflight_delta_protocol(&customers_source)?;
+        let ctx = SessionContext::new();
+        let failing_schema: Arc<dyn SchemaProvider> =
+            Arc::new(FailsOnCustomersSchemaProvider::default());
+
+        ctx.register_catalog(
+            "datafusion",
+            Arc::new(SingleSchemaCatalogProvider::new(Arc::clone(
+                &failing_schema,
+            ))),
+        );
+        let result = register_delta_sources(
+            &ctx,
+            vec![
+                DeltaTableProviderConfig {
+                    source: orders_source,
+                    protocol: orders_preflight,
+                },
+                DeltaTableProviderConfig {
+                    source: customers_source,
+                    protocol: customers_preflight,
+                },
+            ],
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DataFusionRegistration {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "customers"
+                && reason.contains("forced customers registration failure")
+        ));
+        assert!(!ctx.table_exist("orders")?);
+        assert!(!ctx.table_exist("customers")?);
 
         Ok(())
     }
