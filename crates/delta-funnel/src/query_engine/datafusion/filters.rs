@@ -125,25 +125,33 @@ impl ProviderFilterDecision {
         let mut referenced_columns = filter
             .column_refs()
             .iter()
-            .map(|column| column.name.clone())
+            .map(|column| column.flat_name())
             .collect::<Vec<_>>();
         referenced_columns.sort();
         referenced_columns.dedup();
 
         let unknown_columns = referenced_columns
             .iter()
-            .filter(|column| schema.field_with_name(column).is_err())
+            .filter(|column| {
+                schema
+                    .field_with_name(schema_lookup_name(column, schema).as_str())
+                    .is_err()
+            })
             .cloned()
             .collect::<Vec<_>>();
         let referenced_partition_columns = referenced_columns
             .iter()
-            .filter(|column| partition_columns.contains(*column))
+            .filter(|column| {
+                partition_columns.contains(schema_lookup_name(column, schema).as_str())
+            })
             .cloned()
             .collect::<Vec<_>>();
         let data_columns = referenced_columns
             .iter()
             .filter(|column| {
-                schema.field_with_name(column).is_ok() && !partition_columns.contains(*column)
+                let lookup_name = schema_lookup_name(column, schema);
+                schema.field_with_name(lookup_name.as_str()).is_ok()
+                    && !partition_columns.contains(lookup_name.as_str())
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -159,6 +167,38 @@ impl ProviderFilterDecision {
             data_columns,
             unknown_columns,
         }
+    }
+}
+
+fn schema_lookup_name(flat_column_ref: &str, schema: &SchemaRef) -> String {
+    // Case 1: the flat reference already names a top-level Arrow field. This
+    // also preserves unusual but legal top-level names that contain dots.
+    // Example: schema has top-level `id`, input is `id`.
+    // Example: schema has top-level `a.b`, input is `a.b`.
+    if schema.field_with_name(flat_column_ref).is_ok() {
+        return flat_column_ref.to_owned();
+    }
+
+    // Case 2: no qualifier or dotted path was present, and the exact top-level
+    // lookup failed above. Keep the original name so it is reported as unknown.
+    // Example: schema has no `ghost`, input is `ghost`.
+    let Some((prefix, suffix)) = flat_column_ref.rsplit_once('.') else {
+        return flat_column_ref.to_owned();
+    };
+
+    // Case 3: the prefix is itself a top-level field, as in `profile.age`
+    // against a schema that contains `profile`. Treat this as a nested-field
+    // style reference for this planning slice, keep the full reference, and let
+    // the top-level lookup fail so the filter stays unsupported.
+    // Example: schema has top-level `profile`, input is `profile.age`.
+    if schema.field_with_name(prefix).is_ok() {
+        flat_column_ref.to_owned()
+    } else {
+        // Case 4: the prefix is not a top-level field, as in `orders.id`
+        // against a provider schema with top-level `id`. Treat the prefix as a
+        // relation qualifier and use the suffix for top-level schema metadata.
+        // Example: schema has top-level `id`, input is `orders.id`.
+        suffix.to_owned()
     }
 }
 

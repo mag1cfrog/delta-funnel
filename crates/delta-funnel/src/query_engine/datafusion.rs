@@ -1430,14 +1430,18 @@ mod tests {
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let cast_filter = cast(col("id"), DataType::Int64).eq(lit(7_i64));
-        let boolean_filter = col("id")
+        let and_filter = col("id")
             .gt(lit(1))
             .and(col("customer_name").eq(lit("alice")));
+        let or_filter = col("id")
+            .gt(lit(1))
+            .or(col("customer_name").eq(lit("alice")));
+        let not_filter = datafusion::logical_expr::Expr::Not(Box::new(col("id").gt(lit(1))));
 
-        let plan = provider.plan_filters(&[&cast_filter, &boolean_filter]);
+        let plan = provider.plan_filters(&[&cast_filter, &and_filter, &or_filter, &not_filter]);
 
-        assert_eq!(plan.unsupported_count, 2);
-        assert_eq!(plan.residual_filter_count, 2);
+        assert_eq!(plan.unsupported_count, 4);
+        assert_eq!(plan.residual_filter_count, 4);
         assert_eq!(
             plan.decisions
                 .iter()
@@ -1445,9 +1449,69 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ProviderFilterReason::UnsupportedExpressionShape,
+                ProviderFilterReason::UnsupportedExpressionShape,
+                ProviderFilterReason::UnsupportedExpressionShape,
                 ProviderFilterReason::UnsupportedExpressionShape
             ]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_tracks_nested_field_reference_as_unsupported_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "nested-filter-plan",
+            NESTED_SCHEMA_FIELDS_JSON,
+            "[]",
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let nested_filter = col("profile.age").gt(lit(21));
+
+        let plan = provider.plan_filters(&[&nested_filter]);
+
+        assert_eq!(
+            plan.pushdown_statuses,
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, 1);
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert_eq!(plan.decisions[0].referenced_columns, vec!["profile.age"]);
+        assert_eq!(plan.decisions[0].unknown_columns, vec!["profile.age"]);
+        assert_eq!(
+            plan.decisions[0].reason,
+            ProviderFilterReason::UnsupportedUnknownColumn
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_planning_contract_does_not_call_kernel_or_read_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("query_engine")
+                .join("datafusion")
+                .join("filters.rs"),
+        )?;
+
+        assert!(!source.contains("with_predicate"));
+        assert!(!source.contains("with_filter"));
+        assert!(!source.contains("RecordBatch"));
+        assert!(!source.to_ascii_lowercase().contains("parquet"));
 
         Ok(())
     }
