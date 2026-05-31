@@ -89,10 +89,12 @@ fn reject_existing_registration_names(
     ctx: &SessionContext,
     providers: &[DeltaTableProvider],
 ) -> Result<(), DeltaFunnelError> {
-    let default_catalog = ctx.catalog("datafusion");
+    let state = ctx.state();
+    let catalog_options = &state.config_options().catalog;
+    let default_catalog = ctx.catalog(&catalog_options.default_catalog);
     let default_schema = default_catalog
         .as_ref()
-        .and_then(|catalog| catalog.schema("public"));
+        .and_then(|catalog| catalog.schema(&catalog_options.default_schema));
     let existing_names = default_schema
         .as_ref()
         .map_or_else(Vec::new, |schema| schema.table_names());
@@ -213,7 +215,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::datasource::{TableProvider, TableType};
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
 
     use super::{DeltaTableProvider, DeltaTableProviderConfig, register_delta_sources};
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
@@ -469,6 +471,61 @@ mod tests {
         let orders_preflight = preflight_delta_protocol(&orders_source)?;
         let customers_preflight = preflight_delta_protocol(&customers_source)?;
         let ctx = SessionContext::new();
+        let placeholder_schema = Arc::new(Schema::new(vec![Field::new(
+            "existing",
+            DataType::Utf8,
+            true,
+        )]));
+
+        ctx.register_table("customers", Arc::new(EmptyTable::new(placeholder_schema)))?;
+        let result = register_delta_sources(
+            &ctx,
+            vec![
+                DeltaTableProviderConfig {
+                    source: orders_source,
+                    protocol: orders_preflight,
+                },
+                DeltaTableProviderConfig {
+                    source: customers_source,
+                    protocol: customers_preflight,
+                },
+            ],
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DataFusionRegistration {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "customers" && reason.contains("already exists")
+        ));
+        assert!(!ctx.table_exist("orders")?);
+        assert!(ctx.table_exist("customers")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn existing_table_conflict_uses_configured_default_catalog_and_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("custom-default-orders")?;
+        let customers = DeltaLogTable::new("custom-default-customers")?;
+        let orders_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: orders.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let customers_source = load_delta_source(DeltaSourceConfig {
+            name: "customers".to_owned(),
+            table_uri: customers.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let orders_preflight = preflight_delta_protocol(&orders_source)?;
+        let customers_preflight = preflight_delta_protocol(&customers_source)?;
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_default_catalog_and_schema("custom_catalog", "custom_schema"),
+        );
         let placeholder_schema = Arc::new(Schema::new(vec![Field::new(
             "existing",
             DataType::Utf8,
