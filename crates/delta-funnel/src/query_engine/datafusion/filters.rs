@@ -251,3 +251,382 @@ fn is_simple_comparison(filter: &Expr) -> bool {
 fn is_column_or_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Column(_) | Expr::Literal(_, _))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::common::{Column, ScalarValue};
+    use datafusion::datasource::TableProvider;
+    use datafusion::logical_expr::{
+        ColumnarValue, Expr, TableProviderFilterPushDown, Volatility, cast, col, create_udf, lit,
+    };
+
+    use super::super::provider::DeltaTableProvider;
+    use super::*;
+    use crate::query_engine::datafusion::test_support::{
+        DEEP_NESTED_WITH_CITY_SCHEMA_FIELDS_JSON, DeltaLogTable, NESTED_SCHEMA_FIELDS_JSON,
+        PARTITIONED_SCHEMA_FIELDS_JSON,
+    };
+    use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+
+    #[test]
+    fn filter_pushdown_is_explicitly_unsupported_for_all_filters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-unsupported")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let id_filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1));
+        let name_filter =
+            datafusion::logical_expr::col("customer_name").eq(datafusion::logical_expr::lit("a"));
+
+        let support = provider.supports_filters_pushdown(&[&id_filter, &name_filter])?;
+
+        assert_eq!(
+            support,
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_empty_input_has_consistent_zero_counts() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table = DeltaLogTable::new("empty-filter-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_filters(&[]);
+
+        assert!(plan.pushdown_statuses.is_empty());
+        assert!(plan.decisions.is_empty());
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_preserves_order_duplicates_and_column_classification()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "ordered-filter-plan",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let region_filter = col("region").eq(lit("us-west"));
+        let id_filter = col("id").gt(lit(1));
+        let id_filter_duplicate = col("id").gt(lit(1));
+        let unknown_filter = col("ghost_column").eq(lit("x"));
+        let internal_filter = col("__delta_funnel_file_id").eq(lit("part-00001.parquet"));
+
+        let plan = provider.plan_filters(&[
+            &region_filter,
+            &id_filter,
+            &id_filter_duplicate,
+            &unknown_filter,
+            &internal_filter,
+        ]);
+
+        assert_eq!(
+            plan.pushdown_statuses,
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+            ]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, 5);
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(
+            plan.decisions
+                .iter()
+                .map(|decision| decision.input_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+
+        assert_eq!(
+            plan.decisions[0].kind,
+            ProviderFilterPushdownKind::Unsupported
+        );
+        assert_eq!(
+            plan.decisions[0].reason,
+            ProviderFilterReason::InitialPolicy
+        );
+        assert_eq!(plan.decisions[0].referenced_columns, vec!["region"]);
+        assert_eq!(plan.decisions[0].partition_columns, vec!["region"]);
+        assert!(plan.decisions[0].data_columns.is_empty());
+        assert!(plan.decisions[0].unknown_columns.is_empty());
+
+        assert_eq!(plan.decisions[1].referenced_columns, vec!["id"]);
+        assert_eq!(plan.decisions[1].data_columns, vec!["id"]);
+        assert!(plan.decisions[1].partition_columns.is_empty());
+        assert_eq!(plan.decisions[2].referenced_columns, vec!["id"]);
+        assert_eq!(
+            plan.decisions[3].reason,
+            ProviderFilterReason::UnknownColumn
+        );
+        assert_eq!(plan.decisions[3].unknown_columns, vec!["ghost_column"]);
+        assert_eq!(
+            plan.decisions[4].reason,
+            ProviderFilterReason::InternalColumn
+        );
+        assert_eq!(
+            plan.decisions[4].unknown_columns,
+            vec!["__delta_funnel_file_id"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_marks_complex_expression_shapes_unsupported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("complex-filter-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let cast_filter = cast(col("id"), DataType::Int64).eq(lit(7_i64));
+        let and_filter = col("id")
+            .gt(lit(1))
+            .and(col("customer_name").eq(lit("alice")));
+        let or_filter = col("id")
+            .gt(lit(1))
+            .or(col("customer_name").eq(lit("alice")));
+        let not_filter = Expr::Not(Box::new(col("id").gt(lit(1))));
+        let scalar_udf = create_udf(
+            "is_interesting",
+            vec![DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(false))))),
+        );
+        let scalar_function_filter =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![col("customer_name")],
+            ));
+
+        let plan = provider.plan_filters(&[
+            &cast_filter,
+            &and_filter,
+            &or_filter,
+            &not_filter,
+            &scalar_function_filter,
+        ]);
+
+        assert_eq!(plan.unsupported_count, 5);
+        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(
+            plan.decisions
+                .iter()
+                .map(|decision| decision.reason)
+                .collect::<Vec<_>>(),
+            vec![
+                ProviderFilterReason::ExpressionShape,
+                ProviderFilterReason::ExpressionShape,
+                ProviderFilterReason::ExpressionShape,
+                ProviderFilterReason::ExpressionShape,
+                ProviderFilterReason::ExpressionShape
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_tracks_nested_field_reference_as_unsupported_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "nested-filter-plan",
+            NESTED_SCHEMA_FIELDS_JSON,
+            "[]",
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let nested_filter = col("profile.age").gt(lit(21));
+
+        let plan = provider.plan_filters(&[&nested_filter]);
+
+        assert_eq!(
+            plan.pushdown_statuses,
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, 1);
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert_eq!(plan.decisions[0].referenced_columns, vec!["profile.age"]);
+        assert_eq!(plan.decisions[0].unknown_columns, vec!["profile.age"]);
+        assert_eq!(
+            plan.decisions[0].reason,
+            ProviderFilterReason::UnknownColumn
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_does_not_misclassify_deep_nested_ref_as_top_level_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "deep-nested-filter-plan",
+            DEEP_NESTED_WITH_CITY_SCHEMA_FIELDS_JSON,
+            "[]",
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let nested_filter = col("profile.address.city").eq(lit("Phoenix"));
+
+        let plan = provider.plan_filters(&[&nested_filter]);
+
+        assert_eq!(plan.unsupported_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert_eq!(
+            plan.decisions[0].referenced_columns,
+            vec!["profile.address.city"]
+        );
+        assert_eq!(
+            plan.decisions[0].unknown_columns,
+            vec!["profile.address.city"]
+        );
+        assert!(plan.decisions[0].data_columns.is_empty());
+        assert_eq!(
+            plan.decisions[0].reason,
+            ProviderFilterReason::UnknownColumn
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_classifies_qualified_top_level_reference_without_losing_diagnostic_ref()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("qualified-filter-plan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let qualified_filter = Expr::Column(Column::new(Some("orders"), "id")).eq(lit(7));
+
+        let plan = provider.plan_filters(&[&qualified_filter]);
+
+        assert_eq!(plan.unsupported_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert_eq!(plan.decisions[0].referenced_columns, vec!["orders.id"]);
+        assert_eq!(plan.decisions[0].data_columns, vec!["orders.id"]);
+        assert!(plan.decisions[0].unknown_columns.is_empty());
+        assert_eq!(
+            plan.decisions[0].reason,
+            ProviderFilterReason::InitialPolicy
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_planning_contract_does_not_call_kernel_or_read_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("query_engine")
+                .join("datafusion")
+                .join("filters.rs"),
+        )?;
+
+        let production_source = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or(source.as_str());
+
+        assert!(!production_source.contains("with_predicate"));
+        assert!(!production_source.contains("with_filter"));
+        assert!(!production_source.contains("RecordBatch"));
+        assert!(!production_source.to_ascii_lowercase().contains("parquet"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_reason_codes_are_control_character_safe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-plan-control-characters")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let hostile_filter = col("ghost\ncolumn").eq(lit("x"));
+
+        let plan = provider.plan_filters(&[&hostile_filter]);
+        let reason_code = plan.decisions[0].reason.code();
+
+        assert_eq!(
+            plan.decisions[0].reason,
+            ProviderFilterReason::UnknownColumn
+        );
+        assert!(!reason_code.contains('\n'));
+        assert!(!reason_code.contains('\r'));
+        assert!(!reason_code.contains('\t'));
+        assert_eq!(reason_code, "unsupported_unknown_column");
+
+        Ok(())
+    }
+}
