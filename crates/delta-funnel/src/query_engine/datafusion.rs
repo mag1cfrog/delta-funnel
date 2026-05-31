@@ -541,6 +541,7 @@ mod tests {
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::datasource::{TableProvider, TableType};
     use datafusion::logical_expr::TableProviderFilterPushDown;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     use super::{
@@ -646,6 +647,18 @@ mod tests {
         )?;
 
         Ok(table)
+    }
+
+    fn find_delta_scan_plans<'a>(
+        plan: &'a dyn ExecutionPlan,
+        found: &mut Vec<&'a DeltaScanPlanningExec>,
+    ) {
+        if let Some(scan) = plan.as_any().downcast_ref::<DeltaScanPlanningExec>() {
+            found.push(scan);
+        }
+        for child in plan.children() {
+            find_delta_scan_plans(child.as_ref(), found);
+        }
     }
 
     #[derive(Debug, Default)]
@@ -1518,6 +1531,42 @@ mod tests {
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "customer_name");
         assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn residual_filter_column_remains_available_below_final_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "residual-filter-projection")?;
+
+        let dataframe = ctx
+            .sql("select id from orders where customer_name = 'alice'")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert!(
+            plan_display.contains("DeltaScanPlanningExec"),
+            "{plan_display}"
+        );
+        assert_eq!(physical_plan.schema().fields().len(), 1);
+        assert_eq!(physical_plan.schema().field(0).name(), "id");
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].scan_plan().scan_projection,
+            Some(vec![0, 1]),
+            "scan must keep the residual filter column even though final output only projects id"
+        );
+        assert_eq!(scans[0].schema().fields().len(), 2);
+        assert_eq!(scans[0].schema().field(0).name(), "id");
+        assert_eq!(scans[0].schema().field(1).name(), "customer_name");
 
         Ok(())
     }
