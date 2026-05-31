@@ -7,6 +7,8 @@ use super::kernel::{
     DeltaKernelProtocol, TABLE_FEATURES_MIN_READER_VERSION, Version, snapshot_protocol_report,
 };
 
+const SUPPORTED_READER_FEATURES: &[&str] = &[];
+
 /// Protocol details for one named Delta source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeltaProtocolReport {
@@ -95,7 +97,7 @@ fn ensure_protocol_supported(protocol: &DeltaProtocolReport) -> Result<(), Delta
         ));
     }
 
-    if let Some(feature) = protocol.reader_features.first() {
+    if let Some(feature) = unsupported_reader_feature(&protocol.reader_features) {
         return Err(compatibility_error(
             protocol,
             format!(
@@ -106,6 +108,13 @@ fn ensure_protocol_supported(protocol: &DeltaProtocolReport) -> Result<(), Delta
     }
 
     Ok(())
+}
+
+fn unsupported_reader_feature(features: &[String]) -> Option<&str> {
+    features
+        .iter()
+        .map(String::as_str)
+        .find(|feature| !SUPPORTED_READER_FEATURES.contains(feature))
 }
 
 fn is_supported_reader_version(version: i32) -> bool {
