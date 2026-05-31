@@ -182,23 +182,29 @@ fn schema_lookup_name(flat_column_ref: &str, schema: &SchemaRef) -> String {
     // Case 2: no qualifier or dotted path was present, and the exact top-level
     // lookup failed above. Keep the original name so it is reported as unknown.
     // Example: schema has no `ghost`, input is `ghost`.
-    let Some((prefix, suffix)) = flat_column_ref.rsplit_once('.') else {
+    let Some((first_segment, _remainder)) = flat_column_ref.split_once('.') else {
         return flat_column_ref.to_owned();
     };
 
-    // Case 3: the prefix is itself a top-level field, as in `profile.age`
-    // against a schema that contains `profile`. Treat this as a nested-field
-    // style reference for this planning slice, keep the full reference, and let
-    // the top-level lookup fail so the filter stays unsupported.
+    // Case 3: the first path segment is itself a top-level field, as in
+    // `profile.age` against a schema that contains `profile`. Treat this as a
+    // nested-field style reference for this planning slice, keep the full
+    // reference, and let the top-level lookup fail so the filter stays
+    // unsupported.
     // Example: schema has top-level `profile`, input is `profile.age`.
-    if schema.field_with_name(prefix).is_ok() {
+    // Example: schema has top-level `profile`, input is `profile.address.city`.
+    if schema.field_with_name(first_segment).is_ok() {
         flat_column_ref.to_owned()
     } else {
+        let (_qualifier, unqualified_name) = flat_column_ref
+            .rsplit_once('.')
+            .expect("dotted reference should split on the last dot");
         // Case 4: the prefix is not a top-level field, as in `orders.id`
         // against a provider schema with top-level `id`. Treat the prefix as a
         // relation qualifier and use the suffix for top-level schema metadata.
         // Example: schema has top-level `id`, input is `orders.id`.
-        suffix.to_owned()
+        // Example: schema has top-level `id`, input is `catalog.public.orders.id`.
+        unqualified_name.to_owned()
     }
 }
 

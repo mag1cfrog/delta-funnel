@@ -633,6 +633,7 @@ mod tests {
     const DEFAULT_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
     const PARTITIONED_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
     const NESTED_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]"#;
+    const DEEP_NESTED_WITH_CITY_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"address\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
     const INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"bad_array\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{\"delta.columnMapping.nested.ids\":\"not an object\"}}]"#;
 
     fn metadata_json(schema_fields_json: &str, partition_columns_json: &str) -> String {
@@ -1510,6 +1511,45 @@ mod tests {
         assert_eq!(plan.residual_filter_count, 1);
         assert_eq!(plan.decisions[0].referenced_columns, vec!["profile.age"]);
         assert_eq!(plan.decisions[0].unknown_columns, vec!["profile.age"]);
+        assert_eq!(
+            plan.decisions[0].reason,
+            ProviderFilterReason::UnsupportedUnknownColumn
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_does_not_misclassify_deep_nested_ref_as_top_level_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "deep-nested-filter-plan",
+            DEEP_NESTED_WITH_CITY_SCHEMA_FIELDS_JSON,
+            "[]",
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let nested_filter = col("profile.address.city").eq(lit("Phoenix"));
+
+        let plan = provider.plan_filters(&[&nested_filter]);
+
+        assert_eq!(plan.unsupported_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert_eq!(
+            plan.decisions[0].referenced_columns,
+            vec!["profile.address.city"]
+        );
+        assert_eq!(
+            plan.decisions[0].unknown_columns,
+            vec!["profile.address.city"]
+        );
+        assert!(plan.decisions[0].data_columns.is_empty());
         assert_eq!(
             plan.decisions[0].reason,
             ProviderFilterReason::UnsupportedUnknownColumn
