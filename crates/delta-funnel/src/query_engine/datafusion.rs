@@ -8,10 +8,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
-use datafusion::common::{Result as DataFusionResult, not_impl_err};
+use datafusion::common::{DataFusionError, Result as DataFusionResult, not_impl_err};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::execution::TaskContext;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    SendableRecordBatchStream,
+};
 use datafusion::prelude::SessionContext;
 
 use crate::{
@@ -88,6 +94,102 @@ impl ProviderScanPlan {
     #[must_use]
     pub(crate) fn kernel_scan(&self) -> &ProjectedDeltaScan {
         &self.kernel_scan
+    }
+}
+
+struct DeltaScanPlanningExec {
+    scan_plan: ProviderScanPlan,
+    properties: Arc<PlanProperties>,
+}
+
+impl DeltaScanPlanningExec {
+    fn new(scan_plan: ProviderScanPlan) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&scan_plan.projected_schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        )
+        .with_scheduling_type(SchedulingType::Cooperative);
+
+        Self {
+            scan_plan,
+            properties: Arc::new(properties),
+        }
+    }
+
+    #[cfg(test)]
+    fn scan_plan(&self) -> &ProviderScanPlan {
+        &self.scan_plan
+    }
+}
+
+impl fmt::Debug for DeltaScanPlanningExec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeltaScanPlanningExec")
+            .field("source_name", &self.scan_plan.source_name)
+            .field("snapshot_version", &self.scan_plan.snapshot_version)
+            .field("scan_projection", &self.scan_plan.scan_projection)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for DeltaScanPlanningExec {
+    fn fmt_as(
+        &self,
+        display_type: DisplayFormatType,
+        formatter: &mut fmt::Formatter,
+    ) -> fmt::Result {
+        match display_type {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
+                formatter,
+                "DeltaScanPlanningExec: source={}, snapshot_version={}, projection={:?}",
+                self.scan_plan.source_name,
+                self.scan_plan.snapshot_version,
+                self.scan_plan.scan_projection
+            ),
+            DisplayFormatType::TreeRender => write!(formatter, "DeltaScanPlanningExec"),
+        }
+    }
+}
+
+impl ExecutionPlan for DeltaScanPlanningExec {
+    fn name(&self) -> &str {
+        "DeltaScanPlanningExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(DataFusionError::Internal(
+                "DeltaScanPlanningExec does not accept child execution plans".to_owned(),
+            ))
+        }
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        not_impl_err!("Delta scan read execution is owned by #17 and #4")
     }
 }
 
@@ -392,11 +494,34 @@ impl TableProvider for DeltaTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("Delta scan execution is owned by a later implementation issue")
+        if !filters.is_empty() {
+            return Err(DataFusionError::Plan(
+                "Delta scan received pushed filters even though filter pushdown is unsupported"
+                    .to_owned(),
+            ));
+        }
+
+        let scan_plan = self
+            .plan_scan(ProviderScanPlanRequest {
+                requested_projection: projection.cloned(),
+            })
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+
+        Ok(Arc::new(DeltaScanPlanningExec::new(scan_plan)))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![
+            TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
     }
 }
 
@@ -415,11 +540,13 @@ mod tests {
     use datafusion::common::{DataFusionError, Result as DataFusionResult};
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::datasource::{TableProvider, TableType};
+    use datafusion::logical_expr::TableProviderFilterPushDown;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     use super::{
-        DeltaTableProvider, DeltaTableProviderConfig, ProviderScanPlanRequest,
-        register_delta_sources,
+        DeltaScanPlanningExec, DeltaTableProvider, DeltaTableProviderConfig,
+        ProviderScanPlanRequest, register_delta_sources,
     };
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
@@ -520,6 +647,18 @@ mod tests {
         )?;
 
         Ok(table)
+    }
+
+    fn find_delta_scan_plans<'a>(
+        plan: &'a dyn ExecutionPlan,
+        found: &mut Vec<&'a DeltaScanPlanningExec>,
+    ) {
+        if let Some(scan) = plan.as_any().downcast_ref::<DeltaScanPlanningExec>() {
+            found.push(scan);
+        }
+        for child in plan.children() {
+            find_delta_scan_plans(child.as_ref(), found);
+        }
     }
 
     #[derive(Debug, Default)]
@@ -917,6 +1056,226 @@ mod tests {
         assert!(manifest.contains("delta_kernel"));
         assert!(!manifest.contains("deltalake"));
         assert!(!manifest.contains("buoyant_kernel"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_returns_projected_non_reading_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-scan-projection")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![1];
+
+        let plan = provider
+            .scan(&state, Some(&projection), &[], Some(10))
+            .await?;
+        let delta_plan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(plan.schema().fields().len(), 1);
+        assert_eq!(plan.schema().field(0).name(), "customer_name");
+        assert_eq!(delta_plan.scan_plan().source_name, "orders");
+        assert_eq!(delta_plan.scan_plan().scan_projection, Some(vec![1]));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_without_projection_returns_full_non_reading_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-full-scan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+
+        let plan = provider.scan(&state, None, &[], None).await?;
+        let delta_plan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(plan.schema().fields().len(), 2);
+        assert_eq!(plan.schema().field(0).name(), "id");
+        assert_eq!(plan.schema().field(1).name(), "customer_name");
+        assert_eq!(delta_plan.scan_plan().scan_projection, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_invalid_projection_before_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-invalid-projection")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![2];
+
+        let result = provider.scan(&state, Some(&projection), &[], None).await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+            .to_string()
+            .contains("projection index 2 is out of bounds"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_duplicate_projection_at_public_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-duplicate-projection")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![1, 1];
+
+        let result = provider.scan(&state, Some(&projection), &[], None).await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+            .to_string()
+            .contains("projection index 1 is duplicated"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_direct_filter_injection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-filter-injection")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter = datafusion::logical_expr::col("id").eq(datafusion::logical_expr::lit(7));
+
+        let result = provider.scan(&state, None, &[filter], None).await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::Plan(message)) if message
+            .contains("filter pushdown is unsupported"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_limit_does_not_change_projection_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-limit-unsupported")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![0];
+
+        let with_limit = provider
+            .scan(&state, Some(&projection), &[], Some(1))
+            .await?;
+        let without_limit = provider.scan(&state, Some(&projection), &[], None).await?;
+        let with_limit_scan = with_limit
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+        let without_limit_scan = without_limit
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(with_limit.schema(), without_limit.schema());
+        assert_eq!(
+            with_limit_scan.scan_plan().scan_projection,
+            without_limit_scan.scan_plan().scan_projection
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_limit_stays_above_non_reading_delta_scan() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "limit-above-scan")?;
+
+        let dataframe = ctx.sql("select id from orders limit 1").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("GlobalLimitExec"), "{plan_display}");
+        assert!(
+            plan_display.contains("DeltaScanPlanningExec"),
+            "{plan_display}"
+        );
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_is_explicitly_unsupported_for_all_filters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-unsupported")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let id_filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1));
+        let name_filter =
+            datafusion::logical_expr::col("customer_name").eq(datafusion::logical_expr::lit("a"));
+
+        let support = provider.supports_filters_pushdown(&[&id_filter, &name_filter])?;
+
+        assert_eq!(
+            support,
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported
+            ]
+        );
 
         Ok(())
     }
@@ -1347,6 +1706,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn residual_filter_column_remains_available_below_final_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "residual-filter-projection")?;
+
+        let dataframe = ctx
+            .sql("select id from orders where customer_name = 'alice'")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert!(
+            plan_display.contains("DeltaScanPlanningExec"),
+            "{plan_display}"
+        );
+        assert_eq!(physical_plan.schema().fields().len(), 1);
+        assert_eq!(physical_plan.schema().field(0).name(), "id");
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].scan_plan().scan_projection,
+            Some(vec![0, 1]),
+            "scan must keep the residual filter column even though final output only projects id"
+        );
+        assert_eq!(scans[0].schema().fields().len(), 2);
+        assert_eq!(scans[0].schema().field(0).name(), "id");
+        assert_eq!(scans[0].schema().field(1).name(), "customer_name");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn execution_fails_at_deliberate_delta_scan_stub()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
@@ -1359,7 +1754,7 @@ mod tests {
             result,
             Err(error) if error
                 .to_string()
-                .contains("Delta scan execution is owned by a later implementation issue")
+                .contains("Delta scan read execution is owned by #17 and #4")
         ));
 
         Ok(())
