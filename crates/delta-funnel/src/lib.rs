@@ -11,11 +11,13 @@
 //! real implementation slice needs them.
 
 pub mod error;
+mod redaction;
 mod table_formats;
 
 pub use error::DeltaFunnelError;
 pub use table_formats::{
-    DeltaSourceConfig, PlannedDeltaSource, load_delta_source, load_delta_sources,
+    DeltaProtocolReport, DeltaSourceConfig, PlannedDeltaSource, ProtocolPreflight,
+    load_delta_source, load_delta_sources, preflight_delta_protocol,
 };
 
 /// Current crate version.

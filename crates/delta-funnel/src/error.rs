@@ -1,5 +1,7 @@
 //! Shared error pattern for DeltaFunnel.
 
+use crate::redaction::sanitize_uri_for_display;
+
 use snafu::Snafu;
 
 /// Error type used by DeltaFunnel APIs.
@@ -54,6 +56,23 @@ pub enum DeltaFunnelError {
     DeltaSnapshotLoad {
         /// Sanitized reason for the snapshot load failure.
         reason: &'static str,
+    },
+
+    /// A Delta source requires an unsupported reader protocol.
+    #[snafu(display(
+        "Delta protocol compatibility error for source `{}` at snapshot version {snapshot_version} ({}): {reason}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri)
+    ))]
+    DeltaProtocolCompatibility {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Resolved Delta snapshot version.
+        snapshot_version: u64,
+        /// Sanitized reason for the compatibility failure.
+        reason: String,
     },
 
     /// A required dependency contract is unavailable or incompatible.
@@ -166,5 +185,27 @@ mod tests {
             error.to_string(),
             "Delta snapshot load error: snapshot could not be loaded"
         );
+    }
+
+    #[test]
+    fn protocol_compatibility_error_has_sanitized_display() {
+        let error = DeltaFunnelError::DeltaProtocolCompatibility {
+            source_name: "orders\nlatest".to_owned(),
+            table_uri: "s3://user:password@example.com/table?token=secret".to_owned(),
+            snapshot_version: 7,
+            reason: "unsupported Delta reader feature `deletionVectors`".to_owned(),
+        };
+
+        let display = error.to_string();
+
+        assert!(display.contains(r"orders\nlatest"));
+        assert!(display.contains("snapshot version 7"));
+        assert!(display.contains("s3://example.com/table"));
+        assert!(display.contains("deletionVectors"));
+        assert!(!display.contains('\n'));
+        assert!(!display.contains("user"));
+        assert!(!display.contains("password"));
+        assert!(!display.contains("token"));
+        assert!(!display.contains("secret"));
     }
 }

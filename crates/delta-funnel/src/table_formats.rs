@@ -2,4 +2,7 @@
 
 mod delta;
 
-pub use delta::{DeltaSourceConfig, PlannedDeltaSource, load_delta_source, load_delta_sources};
+pub use delta::{
+    DeltaProtocolReport, DeltaSourceConfig, PlannedDeltaSource, ProtocolPreflight,
+    load_delta_source, load_delta_sources, preflight_delta_protocol,
+};
