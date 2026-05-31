@@ -1090,6 +1090,94 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn table_provider_scan_without_projection_returns_full_non_reading_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-full-scan")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+
+        let plan = provider.scan(&state, None, &[], None).await?;
+        let delta_plan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(plan.schema().fields().len(), 2);
+        assert_eq!(plan.schema().field(0).name(), "id");
+        assert_eq!(plan.schema().field(1).name(), "customer_name");
+        assert_eq!(delta_plan.scan_plan().scan_projection, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_invalid_projection_before_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-invalid-projection")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![2];
+
+        let result = provider.scan(&state, Some(&projection), &[], None).await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+            .to_string()
+            .contains("projection index 2 is out of bounds"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_limit_does_not_change_projection_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("table-provider-limit-unsupported")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![0];
+
+        let with_limit = provider
+            .scan(&state, Some(&projection), &[], Some(1))
+            .await?;
+        let without_limit = provider.scan(&state, Some(&projection), &[], None).await?;
+        let with_limit_scan = with_limit
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+        let without_limit_scan = without_limit
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(with_limit.schema(), without_limit.schema());
+        assert_eq!(
+            with_limit_scan.scan_plan().scan_projection,
+            without_limit_scan.scan_plan().scan_projection
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn filter_pushdown_is_explicitly_unsupported_for_all_filters()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1101,11 +1189,19 @@ mod tests {
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
-        let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1));
+        let id_filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1));
+        let name_filter =
+            datafusion::logical_expr::col("customer_name").eq(datafusion::logical_expr::lit("a"));
 
-        let support = provider.supports_filters_pushdown(&[&filter])?;
+        let support = provider.supports_filters_pushdown(&[&id_filter, &name_filter])?;
 
-        assert_eq!(support, vec![TableProviderFilterPushDown::Unsupported]);
+        assert_eq!(
+            support,
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported
+            ]
+        );
 
         Ok(())
     }
