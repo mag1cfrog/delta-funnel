@@ -278,6 +278,10 @@ fn datafusion_column_to_kernel_expression(
 fn datafusion_scalar_to_kernel_scalar(
     value: &ScalarValue,
 ) -> Result<Scalar, DeltaKernelPredicateAdapterError> {
+    if value.is_null() {
+        return Err(DeltaKernelPredicateAdapterError::NullLiteral);
+    }
+
     match value {
         ScalarValue::Boolean(Some(value)) => Ok(Scalar::Boolean(*value)),
         ScalarValue::Int8(Some(value)) => Ok(Scalar::Byte(*value)),
@@ -289,16 +293,6 @@ fn datafusion_scalar_to_kernel_scalar(
         ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => {
             Ok(Scalar::String(value.clone()))
         }
-        ScalarValue::Null
-        | ScalarValue::Boolean(None)
-        | ScalarValue::Int8(None)
-        | ScalarValue::Int16(None)
-        | ScalarValue::Int32(None)
-        | ScalarValue::Int64(None)
-        | ScalarValue::Float32(None)
-        | ScalarValue::Float64(None)
-        | ScalarValue::Utf8(None)
-        | ScalarValue::LargeUtf8(None) => Err(DeltaKernelPredicateAdapterError::NullLiteral),
         _ => Err(DeltaKernelPredicateAdapterError::UnsupportedLiteral),
     }
 }
@@ -347,7 +341,7 @@ mod tests {
     };
     use arrow_tiberius::{MssqlProfile, PlanOptions, plan_arrow_schema_to_mssql_mappings};
     use datafusion::common::{Column, ScalarValue};
-    use datafusion::logical_expr::{Expr, col, lit};
+    use datafusion::logical_expr::{Expr, cast, col, lit};
     use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
 
     fn convert_datafusion_predicate(
@@ -443,6 +437,86 @@ mod tests {
         assert_eq!(
             convert_datafusion_predicate(&col("id").gt_eq(lit(7_i32))),
             Ok(Predicate::ge(id, Expression::Literal(Scalar::Integer(7))))
+        );
+    }
+
+    #[test]
+    fn datafusion_predicate_adapter_converts_supported_literal_types() {
+        assert_eq!(
+            convert_datafusion_predicate(
+                &col("byte_value").eq(Expr::Literal(ScalarValue::Int8(Some(7)), None))
+            ),
+            Ok(Predicate::eq(
+                kernel_column("byte_value"),
+                Expression::Literal(Scalar::Byte(7))
+            ))
+        );
+        assert_eq!(
+            convert_datafusion_predicate(
+                &col("short_value").eq(Expr::Literal(ScalarValue::Int16(Some(7)), None))
+            ),
+            Ok(Predicate::eq(
+                kernel_column("short_value"),
+                Expression::Literal(Scalar::Short(7))
+            ))
+        );
+        assert_eq!(
+            convert_datafusion_predicate(
+                &col("float_value").eq(Expr::Literal(ScalarValue::Float32(Some(7.5)), None))
+            ),
+            Ok(Predicate::eq(
+                kernel_column("float_value"),
+                Expression::Literal(Scalar::Float(7.5))
+            ))
+        );
+        assert_eq!(
+            convert_datafusion_predicate(
+                &col("double_value").eq(Expr::Literal(ScalarValue::Float64(Some(7.5)), None))
+            ),
+            Ok(Predicate::eq(
+                kernel_column("double_value"),
+                Expression::Literal(Scalar::Double(7.5))
+            ))
+        );
+        assert_eq!(
+            convert_datafusion_predicate(&col("large_string").eq(Expr::Literal(
+                ScalarValue::LargeUtf8(Some("value".to_owned())),
+                None
+            ))),
+            Ok(Predicate::eq(
+                kernel_column("large_string"),
+                Expression::Literal(Scalar::String("value".to_owned()))
+            ))
+        );
+    }
+
+    #[test]
+    fn datafusion_predicate_adapter_rejects_unproven_literal_types() {
+        let decimal = Expr::Literal(ScalarValue::Decimal128(Some(12345), 10, 2), None);
+        let timestamp = Expr::Literal(ScalarValue::TimestampMicrosecond(Some(12345), None), None);
+        let date = Expr::Literal(ScalarValue::Date32(Some(7)), None);
+        let binary = Expr::Literal(ScalarValue::Binary(Some(vec![1, 2, 3])), None);
+        let decimal_null = Expr::Literal(ScalarValue::Decimal128(None, 10, 2), None);
+        let timestamp_null = Expr::Literal(ScalarValue::TimestampMicrosecond(None, None), None);
+        let cast_filter = cast(col("id"), DataType::Int64).eq(lit(7_i64));
+
+        for literal in [decimal, timestamp, date, binary] {
+            assert_eq!(
+                convert_datafusion_predicate(&col("value").eq(literal)),
+                Err(DeltaKernelPredicateAdapterError::UnsupportedLiteral)
+            );
+        }
+
+        for literal in [decimal_null, timestamp_null] {
+            assert_eq!(
+                convert_datafusion_predicate(&col("value").eq(literal)),
+                Err(DeltaKernelPredicateAdapterError::NullLiteral)
+            );
+        }
+
+        assert_eq!(
+            convert_datafusion_predicate(&cast_filter),
+            Err(DeltaKernelPredicateAdapterError::UnsupportedExpression)
         );
     }
 
