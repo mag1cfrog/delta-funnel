@@ -191,6 +191,64 @@ fn datafusion_expr_to_kernel_predicate_inner(
         DataFusionExpr::IsNotNull(inner) => Ok(Predicate::is_not_null(
             datafusion_expr_to_kernel_expression(inner.as_ref())?,
         )),
+        DataFusionExpr::Between(between) => {
+            let expr = datafusion_expr_to_kernel_expression(between.expr.as_ref())?;
+            let low = datafusion_expr_to_kernel_expression(between.low.as_ref())?;
+            let high = datafusion_expr_to_kernel_expression(between.high.as_ref())?;
+
+            if between.negated {
+                Ok(Predicate::or(
+                    Predicate::lt(expr.clone(), low),
+                    Predicate::gt(expr, high),
+                ))
+            } else {
+                Ok(Predicate::and(
+                    Predicate::ge(expr.clone(), low),
+                    Predicate::le(expr, high),
+                ))
+            }
+        }
+        DataFusionExpr::InList(in_list) => datafusion_in_list_to_kernel_predicate(in_list),
+        _ => Err(DeltaKernelPredicateAdapterError::UnsupportedExpression),
+    }
+}
+
+fn datafusion_in_list_to_kernel_predicate(
+    in_list: &datafusion::logical_expr::expr::InList,
+) -> Result<Predicate, DeltaKernelPredicateAdapterError> {
+    if in_list.list.is_empty() {
+        return Ok(Predicate::literal(in_list.negated));
+    }
+
+    let expr = datafusion_expr_to_kernel_expression(in_list.expr.as_ref())?;
+    let predicates = in_list
+        .list
+        .iter()
+        .map(|item| {
+            let item = datafusion_in_list_item_to_kernel_expression(item)?;
+
+            if in_list.negated {
+                Ok(Predicate::ne(expr.clone(), item))
+            } else {
+                Ok(Predicate::eq(expr.clone(), item))
+            }
+        })
+        .collect::<Result<Vec<_>, DeltaKernelPredicateAdapterError>>()?;
+
+    if in_list.negated {
+        Ok(Predicate::and_from(predicates))
+    } else {
+        Ok(Predicate::or_from(predicates))
+    }
+}
+
+fn datafusion_in_list_item_to_kernel_expression(
+    expr: &DataFusionExpr,
+) -> Result<Expression, DeltaKernelPredicateAdapterError> {
+    match expr {
+        DataFusionExpr::Literal(value, _) => Ok(Expression::Literal(
+            datafusion_scalar_to_kernel_scalar(value)?,
+        )),
         _ => Err(DeltaKernelPredicateAdapterError::UnsupportedExpression),
     }
 }
@@ -421,12 +479,67 @@ mod tests {
     }
 
     #[test]
+    fn datafusion_predicate_adapter_converts_in_list_predicates() {
+        let part = kernel_column("part");
+        let part_eq_a = Predicate::eq(part.clone(), Expression::literal("a"));
+        let part_eq_c = Predicate::eq(part.clone(), Expression::literal("c"));
+        let part_ne_a = Predicate::ne(part.clone(), Expression::literal("a"));
+        let part_ne_c = Predicate::ne(part.clone(), Expression::literal("c"));
+
+        assert_eq!(
+            convert_datafusion_predicate(&col("part").in_list(vec![lit("a"), lit("c")], false)),
+            Ok(Predicate::or(part_eq_a.clone(), part_eq_c))
+        );
+        assert_eq!(
+            convert_datafusion_predicate(&col("part").in_list(vec![lit("a"), lit("c")], true)),
+            Ok(Predicate::and(part_ne_a, part_ne_c))
+        );
+        assert_eq!(
+            convert_datafusion_predicate(&col("part").in_list(vec![lit("a"), lit("a")], false)),
+            Ok(Predicate::or(part_eq_a.clone(), part_eq_a))
+        );
+        assert_eq!(
+            convert_datafusion_predicate(&col("part").in_list(Vec::<Expr>::new(), false)),
+            Ok(Predicate::literal(false))
+        );
+        assert_eq!(
+            convert_datafusion_predicate(&col("part").in_list(Vec::<Expr>::new(), true)),
+            Ok(Predicate::literal(true))
+        );
+    }
+
+    #[test]
+    fn datafusion_predicate_adapter_converts_between_predicates() {
+        let score = kernel_column("score");
+
+        assert_eq!(
+            convert_datafusion_predicate(&col("score").between(lit(10_i32), lit(20_i32))),
+            Ok(Predicate::and(
+                Predicate::ge(score.clone(), Expression::literal(10_i32)),
+                Predicate::le(score.clone(), Expression::literal(20_i32))
+            ))
+        );
+        assert_eq!(
+            convert_datafusion_predicate(&col("score").not_between(lit(10_i32), lit(20_i32))),
+            Ok(Predicate::or(
+                Predicate::lt(score.clone(), Expression::literal(10_i32)),
+                Predicate::gt(score, Expression::literal(20_i32))
+            ))
+        );
+    }
+
+    #[test]
     fn datafusion_predicate_adapter_rejects_unsafe_or_unproven_shapes() {
         let qualified_column = Expr::Column(Column::new(Some("orders"), "id")).eq(lit(7_i32));
         let dotted_column = col("profile.age").eq(lit(7_i32));
         let null_literal = col("id").eq(Expr::Literal(ScalarValue::Int32(None), None));
         let unsigned_literal = col("id").eq(Expr::Literal(ScalarValue::UInt64(Some(7)), None));
         let standalone_column = col("id");
+        let in_list_with_null = col("part").in_list(
+            vec![lit("a"), Expr::Literal(ScalarValue::Utf8(None), None)],
+            false,
+        );
+        let in_list_with_non_literal = col("part").in_list(vec![col("other_part")], false);
 
         assert_eq!(
             convert_datafusion_predicate(&qualified_column),
@@ -446,6 +559,14 @@ mod tests {
         );
         assert_eq!(
             convert_datafusion_predicate(&standalone_column),
+            Err(DeltaKernelPredicateAdapterError::UnsupportedExpression)
+        );
+        assert_eq!(
+            convert_datafusion_predicate(&in_list_with_null),
+            Err(DeltaKernelPredicateAdapterError::NullLiteral)
+        );
+        assert_eq!(
+            convert_datafusion_predicate(&in_list_with_non_literal),
             Err(DeltaKernelPredicateAdapterError::UnsupportedExpression)
         );
     }

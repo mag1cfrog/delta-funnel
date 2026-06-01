@@ -293,7 +293,7 @@ fn filter_pushdown_rejection_reason(
         return DeltaFilterPushdownRejectionReason::UnknownColumn;
     }
 
-    if is_simple_comparison(filter) {
+    if is_kernel_predicate_candidate(filter) {
         DeltaFilterPushdownRejectionReason::InitialPolicy
     } else {
         DeltaFilterPushdownRejectionReason::ExpressionShape
@@ -317,8 +317,12 @@ fn kernel_predicate_scope(
     }
 }
 
-fn is_simple_comparison(filter: &Expr) -> bool {
+fn is_kernel_predicate_candidate(filter: &Expr) -> bool {
     match filter {
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
+            is_kernel_predicate_candidate(binary.left.as_ref())
+                && is_kernel_predicate_candidate(binary.right.as_ref())
+        }
         Expr::BinaryExpr(binary)
             if matches!(
                 binary.op,
@@ -332,6 +336,17 @@ fn is_simple_comparison(filter: &Expr) -> bool {
         {
             is_column_or_literal(binary.left.as_ref())
                 && is_column_or_literal(binary.right.as_ref())
+        }
+        Expr::Not(inner) => is_kernel_predicate_candidate(inner.as_ref()),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => is_column_or_literal(inner.as_ref()),
+        Expr::Between(between) => {
+            is_column_or_literal(between.expr.as_ref())
+                && is_column_or_literal(between.low.as_ref())
+                && is_column_or_literal(between.high.as_ref())
+        }
+        Expr::InList(in_list) => {
+            is_column_or_literal(in_list.expr.as_ref())
+                && in_list.list.iter().all(is_column_or_literal)
         }
         _ => false,
     }
@@ -610,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_plan_marks_complex_expression_shapes_unsupported()
+    fn filter_plan_marks_unhandled_expression_shapes_unsupported()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("complex-filter-plan")?;
         let source = load_delta_source(DeltaSourceConfig {
@@ -621,13 +636,6 @@ mod tests {
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let cast_filter = cast(col("id"), DataType::Int64).eq(lit(7_i64));
-        let and_filter = col("id")
-            .gt(lit(1))
-            .and(col("customer_name").eq(lit("alice")));
-        let or_filter = col("id")
-            .gt(lit(1))
-            .or(col("customer_name").eq(lit("alice")));
-        let not_filter = Expr::Not(Box::new(col("id").gt(lit(1))));
         let scalar_udf = create_udf(
             "is_interesting",
             vec![DataType::Utf8],
@@ -641,16 +649,10 @@ mod tests {
                 vec![col("customer_name")],
             ));
 
-        let plan = provider.plan_filters(&[
-            &cast_filter,
-            &and_filter,
-            &or_filter,
-            &not_filter,
-            &scalar_function_filter,
-        ]);
+        let plan = provider.plan_filters(&[&cast_filter, &scalar_function_filter]);
 
-        assert_eq!(plan.unsupported_count, 5);
-        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(plan.unsupported_count, 2);
+        assert_eq!(plan.residual_filter_count, 2);
         assert!(
             plan.decisions
                 .iter()
@@ -670,11 +672,106 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 Some(DeltaFilterPushdownRejectionReason::ExpressionShape),
-                Some(DeltaFilterPushdownRejectionReason::ExpressionShape),
-                Some(DeltaFilterPushdownRejectionReason::ExpressionShape),
-                Some(DeltaFilterPushdownRejectionReason::ExpressionShape),
                 Some(DeltaFilterPushdownRejectionReason::ExpressionShape)
             ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_records_supported_kernel_predicate_shapes_without_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "supported-kernel-filter-plan",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let mixed_and_filter = col("region").eq(lit("us-west")).and(col("id").gt(lit(1)));
+        let data_or_filter = col("id").lt(lit(10)).or(col("id").gt(lit(100)));
+        let not_filter = Expr::Not(Box::new(col("id").gt(lit(1))));
+        let partition_in_filter =
+            col("region").in_list(vec![lit("us-west"), lit("us-east"), lit("us-west")], false);
+        let data_between_filter = col("id").between(lit(10), lit(20));
+        let null_in_filter = col("region").in_list(
+            vec![lit("us-west"), Expr::Literal(ScalarValue::Utf8(None), None)],
+            false,
+        );
+
+        let plan = provider.plan_filters(&[
+            &mixed_and_filter,
+            &data_or_filter,
+            &not_filter,
+            &partition_in_filter,
+            &data_between_filter,
+            &null_in_filter,
+        ]);
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+            ]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, 6);
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, 6);
+        assert!(
+            plan.decisions
+                .iter()
+                .all(|decision| decision.rejection_reason
+                    == Some(DeltaFilterPushdownRejectionReason::InitialPolicy))
+        );
+        assert_eq!(
+            plan.decisions[0].kernel_predicate.scope,
+            DeltaKernelPredicateScope::PartitionAndData
+        );
+        assert_eq!(
+            plan.decisions[1].kernel_predicate.scope,
+            DeltaKernelPredicateScope::DataOnly
+        );
+        assert_eq!(
+            plan.decisions[2].kernel_predicate.scope,
+            DeltaKernelPredicateScope::DataOnly
+        );
+        assert_eq!(
+            plan.decisions[3].kernel_predicate.scope,
+            DeltaKernelPredicateScope::PartitionOnly
+        );
+        assert_eq!(
+            plan.decisions[4].kernel_predicate.scope,
+            DeltaKernelPredicateScope::DataOnly
+        );
+        assert_eq!(
+            plan.decisions[5].kernel_predicate.scope,
+            DeltaKernelPredicateScope::PartitionOnly
+        );
+        assert!(
+            plan.decisions[..5].iter().all(|decision| decision
+                .kernel_predicate
+                .predicate
+                .is_some()
+                && decision.kernel_predicate.adapter_error.is_none())
+        );
+        assert!(plan.decisions[5].kernel_predicate.predicate.is_none());
+        assert_eq!(
+            plan.decisions[5].kernel_predicate.adapter_error,
+            Some(DeltaKernelPredicateAdapterError::NullLiteral)
         );
 
         Ok(())
