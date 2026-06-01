@@ -106,7 +106,7 @@ pub(crate) fn build_projected_predicated_scan(
 
 /// Private wrapper around an official `delta_kernel` predicate.
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeltaKernelPredicate {
     inner: PredicateRef,
 }
