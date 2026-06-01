@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::execution::DeltaScanPlanningExec;
-use super::filters::ProviderFilterPlan;
+use super::filters::DeltaFilterPushdownPlan;
 use super::projection::{ProjectionPlan, plan_projection};
 use super::registration::reject_mismatched_preflight;
 use super::scan_plan::{ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest};
@@ -79,8 +79,8 @@ impl DeltaTableProvider {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn plan_filters(&self, filters: &[&Expr]) -> ProviderFilterPlan {
-        ProviderFilterPlan::unsupported(filters, &self.schema, &self.partition_columns())
+    pub(crate) fn plan_filters(&self, filters: &[&Expr]) -> DeltaFilterPushdownPlan {
+        DeltaFilterPushdownPlan::unsupported(filters, &self.schema, &self.partition_columns())
     }
 
     #[allow(dead_code)]
@@ -109,7 +109,7 @@ impl DeltaTableProvider {
             projected_schema,
             protocol: self.protocol.clone(),
             scan_projection,
-            pushed_filter_plan: ProviderFilterPlan::empty_pushed(),
+            pushed_filter_plan: DeltaFilterPushdownPlan::empty_pushed(),
             kernel_scan,
         }))
     }
@@ -184,7 +184,7 @@ impl TableProvider for DeltaTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(self.plan_filters(filters).pushdown_statuses)
+        Ok(self.plan_filters(filters).datafusion_pushdowns())
     }
 }
 

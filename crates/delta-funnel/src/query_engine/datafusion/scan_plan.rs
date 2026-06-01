@@ -4,7 +4,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{DeltaProtocolReport, table_formats::ProjectedDeltaScan};
 
-use super::filters::ProviderFilterPlan;
+use super::filters::DeltaFilterPushdownPlan;
 
 /// Caller request used to build a provider scan plan.
 #[allow(dead_code)]
@@ -29,7 +29,7 @@ pub(crate) struct ProviderScanPlan {
     /// Projection indexes accepted and used for this scan, if any.
     pub(crate) scan_projection: Option<Vec<usize>>,
     /// Structured report for filters pushed into this scan.
-    pub(crate) pushed_filter_plan: ProviderFilterPlan,
+    pub(crate) pushed_filter_plan: DeltaFilterPushdownPlan,
     kernel_scan: ProjectedDeltaScan,
 }
 
@@ -40,7 +40,7 @@ pub(super) struct ProviderScanPlanParts {
     pub(super) projected_schema: SchemaRef,
     pub(super) protocol: DeltaProtocolReport,
     pub(super) scan_projection: Option<Vec<usize>>,
-    pub(super) pushed_filter_plan: ProviderFilterPlan,
+    pub(super) pushed_filter_plan: DeltaFilterPushdownPlan,
     pub(super) kernel_scan: ProjectedDeltaScan,
 }
 
@@ -122,7 +122,7 @@ mod tests {
             requested_projection: None,
         })?;
 
-        assert!(plan.pushed_filter_plan.pushdown_statuses.is_empty());
+        assert!(plan.pushed_filter_plan.datafusion_pushdowns().is_empty());
         assert!(plan.pushed_filter_plan.decisions.is_empty());
         assert_eq!(plan.pushed_filter_plan.exact_count, 0);
         assert_eq!(plan.pushed_filter_plan.inexact_count, 0);
