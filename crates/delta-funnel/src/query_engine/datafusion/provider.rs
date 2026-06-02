@@ -131,6 +131,10 @@ impl DeltaTableProvider {
     /// `supports_filters_pushdown`, but accepts owned expressions from the scan
     /// request instead of borrowed expressions from the support callback.
     fn plan_pushed_filters(&self, pushed_filters: &[Expr]) -> DeltaFilterPushdownPlan {
+        let pushed_filters = pushed_filters
+            .iter()
+            .map(|filter| unqualify_filter_columns(filter.clone(), &self.schema))
+            .collect::<Vec<_>>();
         let pushed_filter_refs = pushed_filters.iter().collect::<Vec<_>>();
         DeltaFilterPushdownPlan::partition_equality_pushdown(
             &pushed_filter_refs,
@@ -540,6 +544,40 @@ mod tests {
         let state = SessionContext::new().state();
         let filter =
             datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("us-west"));
+
+        let plan = provider.scan(&state, None, &[filter], None).await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.pushed_filter_count, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_accepts_qualified_exact_partition_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "table-provider-qualified-exact-partition-filter",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter = Expr::Column(datafusion::common::Column::new(Some("orders"), "region"))
+            .eq(datafusion::logical_expr::lit("us-west"));
 
         let plan = provider.scan(&state, None, &[filter], None).await?;
         let scan = plan
