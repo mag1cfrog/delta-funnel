@@ -1,13 +1,14 @@
 //! Filter pushdown planning for the Delta DataFusion provider.
 
 mod analysis;
+mod partition_pushdown;
 
 use std::collections::HashSet;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
-use self::analysis::{DeltaKernelPredicateAnalysis, analyze_unsupported_pushdown};
+use self::analysis::{DeltaKernelPredicateAnalysis, analyze_filter_for_pushdown};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeltaFilterPushdownOutcome {
@@ -89,6 +90,22 @@ impl DeltaFilterPushdownPlan {
         Self::from_decisions(decisions)
     }
 
+    #[allow(dead_code)]
+    #[must_use]
+    /// Plans the issue-33 exact partition-equality policy without wiring it to
+    /// the public TableProvider contract yet.
+    ///
+    /// This exists as a reviewable intermediate step: tests can validate the
+    /// exact/unsupported decisions before `DeltaTableProvider::scan` starts
+    /// accepting pushed filters.
+    pub(crate) fn partition_equality_pushdown(
+        filters: &[&Expr],
+        schema: &SchemaRef,
+        partition_columns: &HashSet<String>,
+    ) -> Self {
+        partition_pushdown::plan_partition_equality_pushdown(filters, schema, partition_columns)
+    }
+
     #[must_use]
     pub(crate) fn empty_pushed() -> Self {
         Self::from_decisions(Vec::new())
@@ -139,7 +156,7 @@ impl DeltaFilterPushdownDecision {
         partition_columns: &HashSet<String>,
     ) -> Self {
         let (kernel_predicate, rejection_reason) =
-            analyze_unsupported_pushdown(filter, schema, partition_columns);
+            analyze_filter_for_pushdown(filter, schema, partition_columns);
 
         Self {
             input_index,
@@ -277,6 +294,9 @@ mod tests {
         let filter_source_files = [
             filter_module_root.join("filters.rs"),
             filter_module_root.join("filters").join("analysis.rs"),
+            filter_module_root
+                .join("filters")
+                .join("partition_pushdown.rs"),
         ];
         let production_source = filter_source_files
             .iter()

@@ -30,7 +30,13 @@ pub(crate) struct DeltaKernelPredicateAnalysis {
     pub(crate) adapter_error: Option<DeltaKernelPredicateAdapterError>,
 }
 
-pub(super) fn analyze_unsupported_pushdown(
+/// Builds reusable diagnostics for a candidate DataFusion filter.
+///
+/// The analysis records referenced columns, partition/data/unknown scope, and
+/// whether the private Delta kernel adapter can convert the expression. It does
+/// not decide DataFusion pushdown status by itself; policy modules decide
+/// whether this analysis is `Exact`, `Inexact`, or `Unsupported`.
+pub(super) fn analyze_filter_for_pushdown(
     filter: &Expr,
     schema: &SchemaRef,
     partition_columns: &HashSet<String>,
