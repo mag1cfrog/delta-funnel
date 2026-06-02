@@ -406,6 +406,54 @@ mod tests {
     }
 
     #[test]
+    fn filter_pushdown_stays_unsupported_for_kernel_convertible_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-convertible-unsupported",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let partition_in_filter =
+            col("region").in_list(vec![lit("us-west"), lit("us-east")], false);
+        let data_between_filter = col("id").between(lit(10), lit(20));
+        let mixed_and_filter = col("region").eq(lit("us-west")).and(col("id").gt(lit(10)));
+        let mixed_or_filter = col("region").eq(lit("us-west")).or(col("id").gt(lit(10)));
+        let not_filter = Expr::Not(Box::new(col("id").gt(lit(10))));
+        let null_check_filter = col("region").is_not_null();
+
+        let support = provider.supports_filters_pushdown(&[
+            &partition_in_filter,
+            &data_between_filter,
+            &mixed_and_filter,
+            &mixed_or_filter,
+            &not_filter,
+            &null_check_filter,
+        ])?;
+
+        assert_eq!(
+            support,
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn filter_plan_empty_input_has_consistent_zero_counts() -> Result<(), Box<dyn std::error::Error>>
     {
         let table = DeltaLogTable::new("empty-filter-plan")?;
@@ -773,6 +821,56 @@ mod tests {
             plan.decisions[5].kernel_predicate.adapter_error,
             Some(DeltaKernelPredicateAdapterError::NullLiteral)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_plan_rejects_mixed_known_unknown_boolean_before_kernel_conversion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "mixed-known-unknown-filter-plan",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let filter = col("region")
+            .eq(lit("us-west"))
+            .and(col("ghost_column").eq(lit("x")));
+
+        let plan = provider.plan_filters(&[&filter]);
+
+        assert_eq!(plan.unsupported_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert_eq!(
+            plan.decisions[0].rejection_reason,
+            Some(DeltaFilterPushdownRejectionReason::UnknownColumn)
+        );
+        assert_eq!(
+            plan.decisions[0].kernel_predicate.scope,
+            DeltaKernelPredicateScope::Unsupported
+        );
+        assert_eq!(
+            plan.decisions[0].kernel_predicate.referenced_columns,
+            vec!["ghost_column", "region"]
+        );
+        assert_eq!(
+            plan.decisions[0].kernel_predicate.partition_columns,
+            vec!["region"]
+        );
+        assert_eq!(
+            plan.decisions[0].kernel_predicate.unknown_columns,
+            vec!["ghost_column"]
+        );
+        assert!(plan.decisions[0].kernel_predicate.predicate.is_none());
+        assert!(plan.decisions[0].kernel_predicate.adapter_error.is_none());
 
         Ok(())
     }
