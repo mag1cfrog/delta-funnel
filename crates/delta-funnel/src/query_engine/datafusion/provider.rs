@@ -143,7 +143,7 @@ impl DeltaTableProvider {
             .collect::<Vec<_>>();
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
-        DeltaFilterPushdownPlan::partition_equality_pushdown(
+        DeltaFilterPushdownPlan::partition_operator_pushdown(
             &filter_refs,
             &self.schema,
             &self.partition_columns(),

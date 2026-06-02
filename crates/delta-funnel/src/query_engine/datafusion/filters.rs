@@ -71,17 +71,17 @@ pub(crate) struct DeltaFilterPushdownPlan {
 
 impl DeltaFilterPushdownPlan {
     #[must_use]
-    /// Plans the issue-33 exact partition-equality policy.
+    /// Plans the exact static partition operator policy.
     ///
     /// The same policy is used by `supports_filters_pushdown` and by direct
     /// `scan` filter validation so the public support callback and scan
     /// boundary cannot drift apart.
-    pub(crate) fn partition_equality_pushdown(
+    pub(crate) fn partition_operator_pushdown(
         filters: &[&Expr],
         schema: &SchemaRef,
         partition_columns: &HashSet<String>,
     ) -> Self {
-        partition_pushdown::plan_partition_equality_pushdown(filters, schema, partition_columns)
+        partition_pushdown::plan_partition_operator_pushdown(filters, schema, partition_columns)
     }
 
     fn from_decisions(decisions: Vec<DeltaFilterPushdownDecision>) -> Self {
