@@ -416,6 +416,29 @@ mod tests {
     }
 
     #[test]
+    fn delta_kernel_predicate_and_from_combines_provider_predicates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let region = Predicate::eq(kernel_column("region"), Expression::literal("us-west"));
+        let day = Predicate::eq(kernel_column("day"), Expression::literal("2026-05-31"));
+
+        let empty = DeltaKernelPredicate::and_from(Vec::<DeltaKernelPredicate>::new());
+        let Some(combined) = DeltaKernelPredicate::and_from([
+            DeltaKernelPredicate::new(region.clone()),
+            DeltaKernelPredicate::new(day.clone()),
+        ]) else {
+            return Err("expected combined predicate".into());
+        };
+
+        assert!(empty.is_none());
+        assert_eq!(
+            combined.as_ref().as_ref(),
+            &Predicate::and_from(vec![region, day])
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn datafusion_predicate_adapter_converts_simple_comparisons() {
         let id = kernel_column("id");
 
