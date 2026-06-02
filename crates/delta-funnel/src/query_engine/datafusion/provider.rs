@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::execution::DeltaScanPlanningExec;
-use super::filters::ProviderFilterPlan;
+use super::filters::DeltaFilterPushdownPlan;
 use super::projection::{ProjectionPlan, plan_projection};
 use super::registration::reject_mismatched_preflight;
 use super::scan_plan::{ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest};
@@ -79,8 +79,8 @@ impl DeltaTableProvider {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn plan_filters(&self, filters: &[&Expr]) -> ProviderFilterPlan {
-        ProviderFilterPlan::unsupported(filters, &self.schema, &self.partition_columns())
+    pub(crate) fn plan_filters(&self, filters: &[&Expr]) -> DeltaFilterPushdownPlan {
+        DeltaFilterPushdownPlan::unsupported(filters, &self.schema, &self.partition_columns())
     }
 
     #[allow(dead_code)]
@@ -109,7 +109,7 @@ impl DeltaTableProvider {
             projected_schema,
             protocol: self.protocol.clone(),
             scan_projection,
-            pushed_filter_plan: ProviderFilterPlan::empty_pushed(),
+            pushed_filter_plan: DeltaFilterPushdownPlan::empty_pushed(),
             kernel_scan,
         }))
     }
@@ -184,7 +184,7 @@ impl TableProvider for DeltaTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(self.plan_filters(filters).pushdown_statuses)
+        Ok(self.plan_filters(filters).datafusion_pushdowns())
     }
 }
 
@@ -370,6 +370,46 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
         let filter = datafusion::logical_expr::col("id").eq(datafusion::logical_expr::lit(7));
+
+        let result = provider.scan(&state, None, &[filter], None).await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::Plan(message)) if message
+            .contains("filter pushdown is unsupported"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_convertible_filter_injection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "table-provider-convertible-filter-injection",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter = datafusion::logical_expr::col("region")
+            .in_list(
+                vec![
+                    datafusion::logical_expr::lit("us-west"),
+                    datafusion::logical_expr::lit("us-east"),
+                ],
+                false,
+            )
+            .and(datafusion::logical_expr::col("id").between(
+                datafusion::logical_expr::lit(10),
+                datafusion::logical_expr::lit(20),
+            ));
 
         let result = provider.scan(&state, None, &[filter], None).await;
 
