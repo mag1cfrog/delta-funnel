@@ -205,6 +205,38 @@ mod tests {
     }
 
     #[test]
+    fn filter_pushdown_reports_one_exact_status_for_partition_equality_and()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"day\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-exact-partition-and",
+            TWO_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["region","day"]"#,
+            r#""partitionValues":{"region":"us-west","day":"2026-05-31"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let filter = col("region")
+            .eq(lit("us-west"))
+            .and(col("day").eq(lit("2026-05-31")));
+
+        let support = provider.supports_filters_pushdown(&[&filter])?;
+        let plan = provider.plan_filters(&[&filter]);
+
+        assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
+        assert_eq!(plan.exact_count, 1);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 0);
+
+        Ok(())
+    }
+
+    #[test]
     fn filter_pushdown_keeps_data_filters_unsupported() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("filter-pushdown-data-unsupported")?;
         let source = load_delta_source(DeltaSourceConfig {
