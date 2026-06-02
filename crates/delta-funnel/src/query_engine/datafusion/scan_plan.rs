@@ -1,6 +1,7 @@
 //! Delta provider scan planning state.
 
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::logical_expr::Expr;
 
 use crate::{DeltaProtocolReport, table_formats::ProjectedDeltaScan};
 
@@ -11,6 +12,8 @@ use super::filters::DeltaFilterPushdownPlan;
 pub(crate) struct ProviderScanPlanRequest {
     /// Requested DataFusion projection indexes against the provider logical schema.
     pub(crate) requested_projection: Option<Vec<usize>>,
+    /// Filters pushed into this scan by DataFusion.
+    pub(crate) pushed_filters: Vec<Expr>,
 }
 
 /// Kernel-backed scan intent for one Delta provider scan.
@@ -71,6 +74,8 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
+
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     use super::super::provider::DeltaTableProvider;
@@ -91,6 +96,7 @@ mod tests {
 
         let plan = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: None,
+            pushed_filters: Vec::new(),
         })?;
 
         assert_eq!(plan.source_name, "orders");
@@ -120,6 +126,7 @@ mod tests {
 
         let plan = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: None,
+            pushed_filters: Vec::new(),
         })?;
 
         assert!(plan.pushed_filter_plan.datafusion_pushdowns().is_empty());
@@ -129,6 +136,56 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.unsupported_count, 0);
         assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 0);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_plan_preserves_multiple_exact_pushed_filters() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"day\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "multiple-exact-pushed-filter-report",
+            TWO_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["region","day"]"#,
+            r#""partitionValues":{"region":"us-west","day":"2026-05-31"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: vec![
+                col("region").eq(lit("us-west")),
+                col("day").eq(lit("2026-05-31")),
+            ],
+        })?;
+
+        assert_eq!(
+            plan.pushed_filter_plan.datafusion_pushdowns(),
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+        assert_eq!(plan.pushed_filter_plan.exact_count, 2);
+        assert_eq!(plan.pushed_filter_plan.inexact_count, 0);
+        assert_eq!(plan.pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 2);
+        assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
+        assert_eq!(plan.projected_schema.field(0).name(), "id");
+        let kernel_names = plan
+            .kernel_scan()
+            .kernel_schema()
+            .fields()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kernel_names, vec!["id", "region", "day"]);
 
         Ok(())
     }

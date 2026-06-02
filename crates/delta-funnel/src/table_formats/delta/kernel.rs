@@ -129,6 +129,26 @@ impl DeltaKernelPredicate {
     pub(crate) fn into_inner(self) -> PredicateRef {
         self.inner
     }
+
+    /// Combines multiple adapter-owned predicates with logical `AND`.
+    ///
+    /// delta_kernel's scan builder accepts one predicate. Provider planning can
+    /// receive multiple exact pushed filters, so this keeps the combination
+    /// inside the Delta table-format boundary instead of exposing kernel
+    /// predicate internals to DataFusion modules.
+    #[must_use]
+    pub(crate) fn and_from(predicates: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let predicates = predicates
+            .into_iter()
+            .map(|predicate| predicate.inner.as_ref().clone())
+            .collect::<Vec<_>>();
+
+        if predicates.is_empty() {
+            None
+        } else {
+            Some(Self::new(Predicate::and_from(predicates)))
+        }
+    }
 }
 
 /// Converts a supported DataFusion filter expression into an official kernel predicate.

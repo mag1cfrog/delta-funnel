@@ -14,7 +14,9 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
-    table_formats::{build_projected_delta_scan, delta_source_arrow_schema},
+    table_formats::{
+        ProjectedDeltaScan, build_projected_predicated_delta_scan, delta_source_arrow_schema,
+    },
 };
 
 use super::execution::DeltaScanPlanningExec;
@@ -93,14 +95,10 @@ impl DeltaTableProvider {
             scan_projection,
             projected_column_names,
         } = self.plan_projection(request.requested_projection)?;
+        let pushed_filter_plan = self.plan_pushed_filters(&request.pushed_filters);
+        self.reject_unaccepted_pushed_filters(&pushed_filter_plan)?;
         let kernel_scan =
-            build_projected_delta_scan(&self.source, projected_column_names.as_deref()).map_err(
-                |source| DeltaFunnelError::DeltaScanConstruction {
-                    source_name: self.source_name().to_owned(),
-                    table_uri: self.source.table_uri().to_owned(),
-                    source: Box::new(source),
-                },
-            )?;
+            self.build_kernel_scan(projected_column_names.as_deref(), &pushed_filter_plan)?;
 
         Ok(ProviderScanPlan::from_parts(ProviderScanPlanParts {
             source_name: self.source_name().to_owned(),
@@ -109,9 +107,77 @@ impl DeltaTableProvider {
             projected_schema,
             protocol: self.protocol.clone(),
             scan_projection,
-            pushed_filter_plan: DeltaFilterPushdownPlan::empty_pushed(),
+            pushed_filter_plan,
             kernel_scan,
         }))
+    }
+
+    /// Plans filters that DataFusion pushed into `scan`.
+    ///
+    /// This uses the issue-33 partition equality planner rather than the
+    /// public `supports_filters_pushdown` planner. Public optimizer pushdown
+    /// stays disabled, but a direct scan caller can still be classified against
+    /// the stricter exact-filter contract before acceptance.
+    fn plan_pushed_filters(&self, pushed_filters: &[Expr]) -> DeltaFilterPushdownPlan {
+        let pushed_filter_refs = pushed_filters.iter().collect::<Vec<_>>();
+        DeltaFilterPushdownPlan::partition_equality_pushdown(
+            &pushed_filter_refs,
+            &self.schema,
+            &self.partition_columns(),
+        )
+    }
+
+    /// Rejects pushed filters that this provider cannot fully apply.
+    ///
+    /// DataFusion treats pushed filters as provider-owned work. If any pushed
+    /// filter is unsupported, inexact, or residual, accepting the scan would
+    /// risk dropping part of the original filter.
+    fn reject_unaccepted_pushed_filters(
+        &self,
+        pushed_filter_plan: &DeltaFilterPushdownPlan,
+    ) -> Result<(), DeltaFunnelError> {
+        // The scan contract can only accept filters that are fully applied by
+        // this provider. Anything unsupported, inexact, or residual must be
+        // rejected instead of being passed to delta_kernel partially.
+        if pushed_filter_plan.unsupported_count > 0
+            || pushed_filter_plan.inexact_count > 0
+            || pushed_filter_plan.residual_filter_count > 0
+        {
+            return Err(DeltaFunnelError::DeltaScanFilter {
+                source_name: self.source_name().to_owned(),
+                table_uri: self.source.table_uri().to_owned(),
+                reason: "pushed filters must be exact partition equality predicates".to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Builds the delta_kernel scan state for a projected provider scan.
+    ///
+    /// The provider output schema is already determined by projection planning.
+    /// This helper only decides what delta_kernel must read internally, adds
+    /// hidden partition predicate columns when needed, and attaches the combined
+    /// exact predicate.
+    fn build_kernel_scan(
+        &self,
+        projected_column_names: Option<&[String]>,
+        pushed_filter_plan: &DeltaFilterPushdownPlan,
+    ) -> Result<ProjectedDeltaScan, DeltaFunnelError> {
+        let kernel_projected_column_names =
+            kernel_scan_column_names(projected_column_names, pushed_filter_plan);
+        let combined_predicate = pushed_filter_plan.combined_exact_kernel_predicate();
+
+        build_projected_predicated_delta_scan(
+            &self.source,
+            kernel_projected_column_names.as_deref(),
+            combined_predicate,
+        )
+        .map_err(|source| DeltaFunnelError::DeltaScanConstruction {
+            source_name: self.source_name().to_owned(),
+            table_uri: self.source.table_uri().to_owned(),
+            source: Box::new(source),
+        })
     }
 
     #[allow(dead_code)]
@@ -131,6 +197,30 @@ impl DeltaTableProvider {
     pub(crate) fn set_schema_for_tests(&mut self, schema: SchemaRef) {
         self.schema = schema;
     }
+}
+
+/// Builds the delta_kernel read schema column list for a scan.
+///
+/// DataFusion's output schema remains the requested projection, but
+/// delta_kernel validates predicate columns against its scan schema. When a
+/// pushed exact partition filter references a column outside the requested
+/// projection, that partition column is appended here as a hidden kernel read
+/// column so predicate construction can stay exact.
+fn kernel_scan_column_names(
+    projected_column_names: Option<&[String]>,
+    pushed_filter_plan: &DeltaFilterPushdownPlan,
+) -> Option<Vec<String>> {
+    // No requested projection means the kernel already scans the full table
+    // schema, so every partition predicate column is already available.
+    let mut column_names = projected_column_names?.to_vec();
+
+    for partition_column in pushed_filter_plan.exact_partition_column_names() {
+        if !column_names.contains(&partition_column) {
+            column_names.push(partition_column);
+        }
+    }
+
+    Some(column_names)
 }
 
 impl fmt::Debug for DeltaTableProvider {
@@ -164,16 +254,10 @@ impl TableProvider for DeltaTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        if !filters.is_empty() {
-            return Err(DataFusionError::Plan(
-                "Delta scan received pushed filters even though filter pushdown is unsupported"
-                    .to_owned(),
-            ));
-        }
-
         let scan_plan = self
             .plan_scan(ProviderScanPlanRequest {
                 requested_projection: projection.cloned(),
+                pushed_filters: filters.to_vec(),
             })
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
 
@@ -358,7 +442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_provider_scan_rejects_direct_filter_injection()
+    async fn table_provider_scan_rejects_unsupported_pushed_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("table-provider-filter-injection")?;
         let source = load_delta_source(DeltaSourceConfig {
@@ -374,9 +458,44 @@ mod tests {
         let result = provider.scan(&state, None, &[filter], None).await;
 
         assert!(
-            matches!(result, Err(DataFusionError::Plan(message)) if message
-            .contains("filter pushdown is unsupported"))
+            matches!(result, Err(DataFusionError::External(error)) if error
+            .to_string()
+            .contains("pushed filters must be exact partition equality predicates"))
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_accepts_exact_partition_equality_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "table-provider-exact-partition-filter",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter =
+            datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("us-west"));
+
+        let plan = provider.scan(&state, None, &[filter], None).await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.pushed_filter_count, 1);
 
         Ok(())
     }
@@ -414,8 +533,9 @@ mod tests {
         let result = provider.scan(&state, None, &[filter], None).await;
 
         assert!(
-            matches!(result, Err(DataFusionError::Plan(message)) if message
-            .contains("filter pushdown is unsupported"))
+            matches!(result, Err(DataFusionError::External(error)) if error
+            .to_string()
+            .contains("pushed filters must be exact partition equality predicates"))
         );
 
         Ok(())

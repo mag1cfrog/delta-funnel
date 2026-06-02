@@ -123,6 +123,22 @@ pub enum DeltaFunnelError {
         reason: String,
     },
 
+    /// A pushed Delta provider scan filter could not be planned safely.
+    #[snafu(display(
+        "Delta scan filter error for source `{}` ({}): {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(reason)
+    ))]
+    DeltaScanFilter {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Sanitized reason for the filter failure.
+        reason: String,
+    },
+
     /// A Delta kernel scan could not be constructed.
     #[snafu(display(
         "Delta scan construction error for source `{}` ({}): {}",
