@@ -85,17 +85,7 @@ impl DeltaTableProvider {
 
     #[allow(dead_code)]
     pub(crate) fn plan_filters(&self, filters: &[&Expr]) -> DeltaFilterPushdownPlan {
-        let unqualified_filters = filters
-            .iter()
-            .map(|filter| unqualify_filter_columns((*filter).clone(), &self.schema))
-            .collect::<Vec<_>>();
-        let unqualified_filter_refs = unqualified_filters.iter().collect::<Vec<_>>();
-
-        DeltaFilterPushdownPlan::partition_equality_pushdown(
-            &unqualified_filter_refs,
-            &self.schema,
-            &self.partition_columns(),
-        )
+        self.plan_provider_filters(filters.iter().map(|filter| (*filter).clone()))
     }
 
     #[allow(dead_code)]
@@ -127,17 +117,31 @@ impl DeltaTableProvider {
 
     /// Plans filters that DataFusion pushed into `scan`.
     ///
-    /// This uses the same issue-33 partition equality policy as
-    /// `supports_filters_pushdown`, but accepts owned expressions from the scan
-    /// request instead of borrowed expressions from the support callback.
+    /// This delegates to the same provider-boundary planner as
+    /// `supports_filters_pushdown` so the support callback and scan validation
+    /// cannot drift apart.
     fn plan_pushed_filters(&self, pushed_filters: &[Expr]) -> DeltaFilterPushdownPlan {
-        let pushed_filters = pushed_filters
-            .iter()
-            .map(|filter| unqualify_filter_columns(filter.clone(), &self.schema))
+        self.plan_provider_filters(pushed_filters.iter().cloned())
+    }
+
+    /// Plans provider-boundary filters with the issue-33 pushdown policy.
+    ///
+    /// DataFusion may present relation-qualified expressions to the support
+    /// callback and unqualified expressions to `scan`. This helper owns the
+    /// safe normalization step so every provider entry point classifies filters
+    /// with the same rules before calling the strict partition policy planner.
+    fn plan_provider_filters(
+        &self,
+        filters: impl IntoIterator<Item = Expr>,
+    ) -> DeltaFilterPushdownPlan {
+        let filters = filters
+            .into_iter()
+            .map(|filter| unqualify_filter_columns(filter, &self.schema))
             .collect::<Vec<_>>();
-        let pushed_filter_refs = pushed_filters.iter().collect::<Vec<_>>();
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
         DeltaFilterPushdownPlan::partition_equality_pushdown(
-            &pushed_filter_refs,
+            &filter_refs,
             &self.schema,
             &self.partition_columns(),
         )
