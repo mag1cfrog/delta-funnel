@@ -194,7 +194,7 @@ mod tests {
         let filter = col("region").eq(lit("us-west"));
 
         let support = provider.supports_filters_pushdown(&[&filter])?;
-        let plan = provider.plan_filters(&[&filter]);
+        let plan = provider.plan_supports_filters_pushdown(&[&filter]);
 
         assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
         assert_eq!(plan.exact_count, 1);
@@ -226,7 +226,7 @@ mod tests {
             .and(col("day").eq(lit("2026-05-31")));
 
         let support = provider.supports_filters_pushdown(&[&filter])?;
-        let plan = provider.plan_filters(&[&filter]);
+        let plan = provider.plan_supports_filters_pushdown(&[&filter]);
 
         assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
         assert_eq!(plan.exact_count, 1);
@@ -322,7 +322,7 @@ mod tests {
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
 
-        let plan = provider.plan_filters(&[]);
+        let plan = provider.plan_supports_filters_pushdown(&[]);
 
         assert!(plan.datafusion_pushdowns().is_empty());
         assert!(plan.decisions.is_empty());
@@ -385,7 +385,7 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let hostile_filter = col("ghost\ncolumn").eq(lit("x"));
 
-        let plan = provider.plan_filters(&[&hostile_filter]);
+        let plan = provider.plan_supports_filters_pushdown(&[&hostile_filter]);
         let reason_code = plan.decisions[0]
             .rejection_reason
             .map(DeltaFilterPushdownRejectionReason::code);

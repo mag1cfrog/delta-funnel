@@ -84,8 +84,11 @@ impl DeltaTableProvider {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn plan_filters(&self, filters: &[&Expr]) -> DeltaFilterPushdownPlan {
-        self.plan_provider_filters(filters.iter().map(|filter| (*filter).clone()))
+    pub(crate) fn plan_supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DeltaFilterPushdownPlan {
+        self.plan_normalized_provider_filters(filters.iter().map(|filter| (*filter).clone()))
     }
 
     #[allow(dead_code)]
@@ -98,7 +101,7 @@ impl DeltaTableProvider {
             scan_projection,
             projected_column_names,
         } = self.plan_projection(request.requested_projection)?;
-        let pushed_filter_plan = self.plan_pushed_filters(&request.pushed_filters);
+        let pushed_filter_plan = self.plan_scan_filters(&request.pushed_filters);
         self.reject_unaccepted_pushed_filters(&pushed_filter_plan)?;
         let kernel_scan =
             self.build_kernel_scan(projected_column_names.as_deref(), &pushed_filter_plan)?;
@@ -120,17 +123,17 @@ impl DeltaTableProvider {
     /// This delegates to the same provider-boundary planner as
     /// `supports_filters_pushdown` so the support callback and scan validation
     /// cannot drift apart.
-    fn plan_pushed_filters(&self, pushed_filters: &[Expr]) -> DeltaFilterPushdownPlan {
-        self.plan_provider_filters(pushed_filters.iter().cloned())
+    fn plan_scan_filters(&self, pushed_filters: &[Expr]) -> DeltaFilterPushdownPlan {
+        self.plan_normalized_provider_filters(pushed_filters.iter().cloned())
     }
 
-    /// Plans provider-boundary filters with the issue-33 pushdown policy.
+    /// Plans provider-boundary filters after applying safe name normalization.
     ///
     /// DataFusion may present relation-qualified expressions to the support
     /// callback and unqualified expressions to `scan`. This helper owns the
-    /// safe normalization step so every provider entry point classifies filters
-    /// with the same rules before calling the strict partition policy planner.
-    fn plan_provider_filters(
+    /// normalization step for both entry points, then delegates to the strict
+    /// partition pushdown policy planner.
+    fn plan_normalized_provider_filters(
         &self,
         filters: impl IntoIterator<Item = Expr>,
     ) -> DeltaFilterPushdownPlan {
@@ -331,7 +334,9 @@ impl TableProvider for DeltaTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(self.plan_filters(filters).datafusion_pushdowns())
+        Ok(self
+            .plan_supports_filters_pushdown(filters)
+            .datafusion_pushdowns())
     }
 }
 

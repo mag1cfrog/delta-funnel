@@ -267,7 +267,7 @@ mod tests {
         let unknown_filter = col("ghost_column").eq(lit("x"));
         let internal_filter = col("__delta_funnel_file_id").eq(lit("part-00001.parquet"));
 
-        let plan = provider.plan_filters(&[
+        let plan = provider.plan_supports_filters_pushdown(&[
             &region_filter,
             &id_filter,
             &id_filter_duplicate,
@@ -394,7 +394,7 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let filter = col("region").eq(col("id"));
 
-        let plan = provider.plan_filters(&[&filter]);
+        let plan = provider.plan_supports_filters_pushdown(&[&filter]);
 
         assert_eq!(
             plan.datafusion_pushdowns(),
@@ -459,7 +459,8 @@ mod tests {
                 vec![col("customer_name")],
             ));
 
-        let plan = provider.plan_filters(&[&cast_filter, &scalar_function_filter]);
+        let plan =
+            provider.plan_supports_filters_pushdown(&[&cast_filter, &scalar_function_filter]);
 
         assert_eq!(plan.unsupported_count, 2);
         assert_eq!(plan.residual_filter_count, 2);
@@ -516,7 +517,7 @@ mod tests {
             false,
         );
 
-        let plan = provider.plan_filters(&[
+        let plan = provider.plan_supports_filters_pushdown(&[
             &mixed_and_filter,
             &data_or_filter,
             &not_filter,
@@ -607,7 +608,7 @@ mod tests {
             .eq(lit("us-west"))
             .and(col("ghost_column").eq(lit("x")));
 
-        let plan = provider.plan_filters(&[&filter]);
+        let plan = provider.plan_supports_filters_pushdown(&[&filter]);
 
         assert_eq!(plan.unsupported_count, 1);
         assert_eq!(plan.residual_filter_count, 1);
@@ -655,7 +656,7 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let nested_filter = col("profile.age").gt(lit(21));
 
-        let plan = provider.plan_filters(&[&nested_filter]);
+        let plan = provider.plan_supports_filters_pushdown(&[&nested_filter]);
 
         assert_eq!(
             plan.datafusion_pushdowns(),
@@ -702,7 +703,7 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let nested_filter = col("profile.address.city").eq(lit("Phoenix"));
 
-        let plan = provider.plan_filters(&[&nested_filter]);
+        let plan = provider.plan_supports_filters_pushdown(&[&nested_filter]);
 
         assert_eq!(plan.unsupported_count, 1);
         assert_eq!(plan.residual_filter_count, 1);
