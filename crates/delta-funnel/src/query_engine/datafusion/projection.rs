@@ -107,6 +107,7 @@ mod tests {
 
         let plan = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: Some(vec![1, 0]),
+            pushed_filters: Vec::new(),
         })?;
 
         assert_eq!(plan.scan_projection, Some(vec![1, 0]));
@@ -139,6 +140,7 @@ mod tests {
 
         let plan = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: Some(vec![1]),
+            pushed_filters: Vec::new(),
         })?;
 
         assert_eq!(plan.projected_schema.fields().len(), 1);
@@ -169,6 +171,7 @@ mod tests {
 
         let plan = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: Some(vec![]),
+            pushed_filters: Vec::new(),
         })?;
 
         assert_eq!(plan.scan_projection, Some(vec![]));
@@ -192,6 +195,7 @@ mod tests {
 
         let result = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: Some(vec![1, 1]),
+            pushed_filters: Vec::new(),
         });
 
         assert!(matches!(
@@ -220,6 +224,7 @@ mod tests {
 
         let result = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: Some(vec![2]),
+            pushed_filters: Vec::new(),
         });
 
         assert!(matches!(
@@ -249,6 +254,7 @@ mod tests {
 
         let result = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: Some(vec![usize::MAX]),
+            pushed_filters: Vec::new(),
         });
 
         assert!(matches!(
@@ -284,6 +290,7 @@ mod tests {
 
         let result = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: Some(vec![0]),
+            pushed_filters: Vec::new(),
         });
 
         assert!(matches!(
@@ -318,6 +325,7 @@ mod tests {
 
         let error = match provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: Some(vec![0]),
+            pushed_filters: Vec::new(),
         }) {
             Ok(_) => return Err("tampered schema should not build a kernel scan".into()),
             Err(error) => error,

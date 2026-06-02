@@ -119,9 +119,14 @@ impl ExecutionPlan for DeltaScanPlanningExec {
 mod tests {
     use datafusion::prelude::SessionContext;
 
-    use crate::query_engine::datafusion::test_support::{
-        find_delta_scan_plans, register_fixture_source,
+    use crate::query_engine::datafusion::registration::{
+        DeltaTableProviderConfig, register_delta_sources,
     };
+    use crate::query_engine::datafusion::test_support::{
+        DeltaLogTable, PARTITIONED_SCHEMA_FIELDS_JSON, find_delta_scan_plans,
+        register_fixture_source,
+    };
+    use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     #[tokio::test]
     async fn sql_limit_stays_above_non_reading_delta_scan() -> Result<(), Box<dyn std::error::Error>>
@@ -155,6 +160,45 @@ mod tests {
         let _table = register_fixture_source(&ctx, "orders", "execution-stub")?;
 
         let dataframe = ctx.sql("select * from orders").await?;
+        let result = dataframe.collect().await;
+
+        assert!(matches!(
+            result,
+            Err(error) if error
+                .to_string()
+                .contains("Delta scan read execution is owned by #17 and #4")
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_partition_filter_execution_still_stops_at_scan_stub()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema(
+            "execution-stub-exact-partition-filter",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql("select id from orders where region = 'us-west'")
+            .await?;
         let result = dataframe.collect().await;
 
         assert!(matches!(

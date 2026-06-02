@@ -129,6 +129,26 @@ impl DeltaKernelPredicate {
     pub(crate) fn into_inner(self) -> PredicateRef {
         self.inner
     }
+
+    /// Combines multiple adapter-owned predicates with logical `AND`.
+    ///
+    /// delta_kernel's scan builder accepts one predicate. Provider planning can
+    /// receive multiple exact pushed filters, so this keeps the combination
+    /// inside the Delta table-format boundary instead of exposing kernel
+    /// predicate internals to DataFusion modules.
+    #[must_use]
+    pub(crate) fn and_from(predicates: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let predicates = predicates
+            .into_iter()
+            .map(|predicate| predicate.inner.as_ref().clone())
+            .collect::<Vec<_>>();
+
+        if predicates.is_empty() {
+            None
+        } else {
+            Some(Self::new(Predicate::and_from(predicates)))
+        }
+    }
 }
 
 /// Converts a supported DataFusion filter expression into an official kernel predicate.
@@ -393,6 +413,29 @@ mod tests {
 
         let _predicate_ref = wrapped.as_ref();
         let _owned_predicate_ref = wrapped.into_inner();
+    }
+
+    #[test]
+    fn delta_kernel_predicate_and_from_combines_provider_predicates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let region = Predicate::eq(kernel_column("region"), Expression::literal("us-west"));
+        let day = Predicate::eq(kernel_column("day"), Expression::literal("2026-05-31"));
+
+        let empty = DeltaKernelPredicate::and_from(Vec::<DeltaKernelPredicate>::new());
+        let Some(combined) = DeltaKernelPredicate::and_from([
+            DeltaKernelPredicate::new(region.clone()),
+            DeltaKernelPredicate::new(day.clone()),
+        ]) else {
+            return Err("expected combined predicate".into());
+        };
+
+        assert!(empty.is_none());
+        assert_eq!(
+            combined.as_ref().as_ref(),
+            &Predicate::and_from(vec![region, day])
+        );
+
+        Ok(())
     }
 
     #[test]

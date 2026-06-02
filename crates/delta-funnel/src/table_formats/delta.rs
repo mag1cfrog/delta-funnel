@@ -100,9 +100,24 @@ pub(crate) fn build_projected_delta_scan(
     source: &PlannedDeltaSource,
     projected_column_names: Option<&[String]>,
 ) -> Result<ProjectedDeltaScan, delta_kernel::Error> {
-    let (scan, kernel_schema) = kernel::build_projected_scan(
+    build_projected_predicated_delta_scan(source, projected_column_names, None)
+}
+
+/// Builds kernel-backed scan state for a loaded Delta source projection and predicate.
+///
+/// `projected_column_names` is the schema passed to delta_kernel's scan
+/// builder, not necessarily the final DataFusion output schema. Callers may
+/// include hidden predicate columns here when the final projection omits them.
+#[allow(dead_code)]
+pub(crate) fn build_projected_predicated_delta_scan(
+    source: &PlannedDeltaSource,
+    projected_column_names: Option<&[String]>,
+    predicate: Option<DeltaKernelPredicate>,
+) -> Result<ProjectedDeltaScan, delta_kernel::Error> {
+    let (scan, kernel_schema) = kernel::build_projected_predicated_scan(
         source.loaded_snapshot().kernel_snapshot(),
         projected_column_names,
+        predicate,
     )?;
 
     Ok(ProjectedDeltaScan {
