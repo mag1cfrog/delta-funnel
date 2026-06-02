@@ -224,10 +224,12 @@ fn is_column_or_literal(expr: &Expr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use datafusion::arrow::datatypes::DataType;
     use datafusion::common::{Column, ScalarValue};
+    use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{
         ColumnarValue, Expr, TableProviderFilterPushDown, Volatility, cast, col, create_udf, lit,
     };
@@ -276,18 +278,18 @@ mod tests {
         assert_eq!(
             plan.datafusion_pushdowns(),
             vec![
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
             ]
         );
-        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.exact_count, 1);
         assert_eq!(plan.inexact_count, 0);
-        assert_eq!(plan.unsupported_count, 5);
-        assert_eq!(plan.pushed_filter_count, 0);
-        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(plan.unsupported_count, 4);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 4);
         assert_eq!(
             plan.decisions
                 .iter()
@@ -296,14 +298,9 @@ mod tests {
             vec![0, 1, 2, 3, 4]
         );
 
-        assert_eq!(
-            plan.decisions[0].outcome,
-            DeltaFilterPushdownOutcome::Unsupported
-        );
-        assert_eq!(
-            plan.decisions[0].rejection_reason,
-            Some(DeltaFilterPushdownRejectionReason::InitialPolicy)
-        );
+        assert_eq!(plan.decisions[0].outcome, DeltaFilterPushdownOutcome::Exact);
+        assert!(!plan.decisions[0].residual);
+        assert!(plan.decisions[0].rejection_reason.is_none());
         assert_eq!(
             plan.decisions[0].kernel_predicate.referenced_columns,
             vec!["region"]
@@ -741,31 +738,19 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let qualified_filter = Expr::Column(Column::new(Some("orders"), "id")).eq(lit(7));
 
-        let plan = provider.plan_filters(&[&qualified_filter]);
+        let (analysis, rejection_reason) =
+            analyze_filter_for_pushdown(&qualified_filter, &provider.schema(), &HashSet::new());
 
-        assert_eq!(plan.unsupported_count, 1);
-        assert_eq!(plan.residual_filter_count, 1);
+        assert_eq!(analysis.referenced_columns, vec!["orders.id"]);
+        assert_eq!(analysis.data_columns, vec!["orders.id"]);
+        assert!(analysis.unknown_columns.is_empty());
         assert_eq!(
-            plan.decisions[0].kernel_predicate.referenced_columns,
-            vec!["orders.id"]
+            rejection_reason,
+            DeltaFilterPushdownRejectionReason::InitialPolicy
         );
+        assert!(analysis.predicate.is_none());
         assert_eq!(
-            plan.decisions[0].kernel_predicate.data_columns,
-            vec!["orders.id"]
-        );
-        assert!(
-            plan.decisions[0]
-                .kernel_predicate
-                .unknown_columns
-                .is_empty()
-        );
-        assert_eq!(
-            plan.decisions[0].rejection_reason,
-            Some(DeltaFilterPushdownRejectionReason::InitialPolicy)
-        );
-        assert!(plan.decisions[0].kernel_predicate.predicate.is_none());
-        assert_eq!(
-            plan.decisions[0].kernel_predicate.adapter_error,
+            analysis.adapter_error,
             Some(DeltaKernelPredicateAdapterError::UnsupportedColumnReference)
         );
 

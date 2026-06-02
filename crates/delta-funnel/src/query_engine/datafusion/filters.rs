@@ -10,7 +10,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::table_formats::DeltaKernelPredicate;
 
-use self::analysis::{DeltaKernelPredicateAnalysis, analyze_filter_for_pushdown};
+use self::analysis::DeltaKernelPredicateAnalysis;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeltaFilterPushdownOutcome {
@@ -71,35 +71,11 @@ pub(crate) struct DeltaFilterPushdownPlan {
 
 impl DeltaFilterPushdownPlan {
     #[must_use]
-    pub(crate) fn unsupported(
-        filters: &[&Expr],
-        schema: &SchemaRef,
-        partition_columns: &HashSet<String>,
-    ) -> Self {
-        let decisions = filters
-            .iter()
-            .enumerate()
-            .map(|(input_index, filter)| {
-                DeltaFilterPushdownDecision::unsupported(
-                    input_index,
-                    filter,
-                    schema,
-                    partition_columns,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        Self::from_decisions(decisions)
-    }
-
-    #[allow(dead_code)]
-    #[must_use]
-    /// Plans the issue-33 exact partition-equality policy without wiring it to
-    /// the public TableProvider contract yet.
+    /// Plans the issue-33 exact partition-equality policy.
     ///
-    /// This exists as a reviewable intermediate step: tests can validate the
-    /// exact/unsupported decisions before `DeltaTableProvider::scan` starts
-    /// accepting pushed filters.
+    /// The same policy is used by `supports_filters_pushdown` and by direct
+    /// `scan` filter validation so the public support callback and scan
+    /// boundary cannot drift apart.
     pub(crate) fn partition_equality_pushdown(
         filters: &[&Expr],
         schema: &SchemaRef,
@@ -184,26 +160,6 @@ impl DeltaFilterPushdownPlan {
     }
 }
 
-impl DeltaFilterPushdownDecision {
-    fn unsupported(
-        input_index: usize,
-        filter: &Expr,
-        schema: &SchemaRef,
-        partition_columns: &HashSet<String>,
-    ) -> Self {
-        let (kernel_predicate, rejection_reason) =
-            analyze_filter_for_pushdown(filter, schema, partition_columns);
-
-        Self {
-            input_index,
-            outcome: DeltaFilterPushdownOutcome::Unsupported,
-            residual: true,
-            rejection_reason: Some(rejection_reason),
-            kernel_predicate,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -220,9 +176,14 @@ mod tests {
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     #[test]
-    fn filter_pushdown_is_explicitly_unsupported_for_all_filters()
+    fn filter_pushdown_reports_exact_for_supported_partition_equality()
     -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("filter-pushdown-unsupported")?;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-exact-partition-equality",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
@@ -230,9 +191,31 @@ mod tests {
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
-        let id_filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1));
-        let name_filter =
-            datafusion::logical_expr::col("customer_name").eq(datafusion::logical_expr::lit("a"));
+        let filter = col("region").eq(lit("us-west"));
+
+        let support = provider.supports_filters_pushdown(&[&filter])?;
+        let plan = provider.plan_filters(&[&filter]);
+
+        assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
+        assert_eq!(plan.exact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_keeps_data_filters_unsupported() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-data-unsupported")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let id_filter = col("id").gt(lit(1));
+        let name_filter = col("customer_name").eq(lit("a"));
 
         let support = provider.supports_filters_pushdown(&[&id_filter, &name_filter])?;
 
@@ -248,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_pushdown_stays_unsupported_for_kernel_convertible_shapes()
+    fn filter_pushdown_rejects_non_equality_partition_shapes()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "filter-pushdown-convertible-unsupported",
@@ -321,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_planning_contract_does_not_call_kernel_or_read_paths()
+    fn filter_planning_contract_does_not_call_scan_or_read_paths()
     -> Result<(), Box<dyn std::error::Error>> {
         let filter_module_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")

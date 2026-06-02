@@ -8,7 +8,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
-use datafusion::common::{DataFusionError, Result as DataFusionResult};
+use datafusion::common::{
+    Column, DataFusionError, Result as DataFusionResult,
+    tree_node::{Transformed, TransformedResult, TreeNode},
+};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
@@ -82,7 +85,17 @@ impl DeltaTableProvider {
 
     #[allow(dead_code)]
     pub(crate) fn plan_filters(&self, filters: &[&Expr]) -> DeltaFilterPushdownPlan {
-        DeltaFilterPushdownPlan::unsupported(filters, &self.schema, &self.partition_columns())
+        let unqualified_filters = filters
+            .iter()
+            .map(|filter| unqualify_filter_columns((*filter).clone(), &self.schema))
+            .collect::<Vec<_>>();
+        let unqualified_filter_refs = unqualified_filters.iter().collect::<Vec<_>>();
+
+        DeltaFilterPushdownPlan::partition_equality_pushdown(
+            &unqualified_filter_refs,
+            &self.schema,
+            &self.partition_columns(),
+        )
     }
 
     #[allow(dead_code)]
@@ -114,10 +127,9 @@ impl DeltaTableProvider {
 
     /// Plans filters that DataFusion pushed into `scan`.
     ///
-    /// This uses the issue-33 partition equality planner rather than the
-    /// public `supports_filters_pushdown` planner. Public optimizer pushdown
-    /// stays disabled, but a direct scan caller can still be classified against
-    /// the stricter exact-filter contract before acceptance.
+    /// This uses the same issue-33 partition equality policy as
+    /// `supports_filters_pushdown`, but accepts owned expressions from the scan
+    /// request instead of borrowed expressions from the support callback.
     fn plan_pushed_filters(&self, pushed_filters: &[Expr]) -> DeltaFilterPushdownPlan {
         let pushed_filter_refs = pushed_filters.iter().collect::<Vec<_>>();
         DeltaFilterPushdownPlan::partition_equality_pushdown(
@@ -221,6 +233,49 @@ fn kernel_scan_column_names(
     }
 
     Some(column_names)
+}
+
+/// Removes relation qualifiers from provider support-check filters.
+///
+/// DataFusion's physical planner strips qualifiers before passing filters into
+/// `scan`. The support callback receives the logical filter earlier, while it
+/// may still contain references like `orders.region`. Normalizing here keeps
+/// `supports_filters_pushdown` and `scan` aligned without relaxing the lower
+/// level Delta kernel adapter for direct qualified-column inputs.
+///
+/// Nested-field style references are deliberately preserved. For example,
+/// `profile.age` must not become `age` just because DataFusion stores it as a
+/// column with a relation component.
+fn unqualify_filter_columns(filter: Expr, schema: &SchemaRef) -> Expr {
+    let original_filter = filter.clone();
+    match filter
+        .transform(|expr| {
+            if let Expr::Column(column) = expr {
+                if is_relation_qualified_top_level_column(&column, schema) {
+                    Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+                        column.name,
+                    ))))
+                } else {
+                    Ok(Transformed::no(Expr::Column(column)))
+                }
+            } else {
+                Ok(Transformed::no(expr))
+            }
+        })
+        .data()
+    {
+        Ok(filter) => filter,
+        Err(_error) => original_filter,
+    }
+}
+
+fn is_relation_qualified_top_level_column(column: &Column, schema: &SchemaRef) -> bool {
+    let flat_name = column.flat_name();
+    let Some((first_segment, _remainder)) = flat_name.split_once('.') else {
+        return false;
+    };
+
+    schema.field_with_name(&column.name).is_ok() && schema.field_with_name(first_segment).is_err()
 }
 
 impl fmt::Debug for DeltaTableProvider {
@@ -642,6 +697,68 @@ mod tests {
         assert_eq!(scans[0].schema().fields().len(), 2);
         assert_eq!(scans[0].schema().field(0).name(), "id");
         assert_eq!(scans[0].schema().field(1).name(), "customer_name");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_exact_partition_filter_is_pushed_without_residual_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema(
+            "sql-exact-partition-filter",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql("select id from orders where region = 'us-west'")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(!plan_display.contains("FilterExec"), "{plan_display}");
+        assert_eq!(physical_plan.schema().fields().len(), 1);
+        assert_eq!(physical_plan.schema().field(0).name(), "id");
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0]));
+        assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+        assert_eq!(scans[0].scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .residual_filter_count,
+            0
+        );
+        assert_eq!(scans[0].schema().fields().len(), 1);
+        assert_eq!(scans[0].schema().field(0).name(), "id");
+        let kernel_names = scans[0]
+            .scan_plan()
+            .kernel_scan()
+            .kernel_schema()
+            .fields()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kernel_names, vec!["id", "region"]);
 
         Ok(())
     }
