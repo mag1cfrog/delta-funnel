@@ -62,6 +62,13 @@ impl ProjectedDeltaScan {
     }
 
     #[cfg(test)]
+    /// Returns scan file paths after kernel scan planning and optional metadata filtering.
+    ///
+    /// The kernel scan may already apply any predicate attached through
+    /// `ScanBuilder::with_predicate`. The optional metadata predicate is then
+    /// evaluated by this provider against each `ScanFile.partition_values` so
+    /// tests can exercise the SQL-compatible partition metadata path without
+    /// reading Parquet files.
     pub(crate) fn scan_file_paths(
         &self,
         table_uri: &str,
