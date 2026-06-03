@@ -417,9 +417,11 @@ mod tests {
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        scan.scan_plan()
-            .kernel_scan()
-            .scan_file_paths(&scan.scan_plan().table_uri)
+        let scan_plan = scan.scan_plan();
+        scan_plan.kernel_scan().scan_file_paths(
+            &scan_plan.table_uri,
+            scan_plan.partition_metadata_filter.as_ref(),
+        )
     }
 
     #[test]
