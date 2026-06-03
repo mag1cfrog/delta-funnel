@@ -4,9 +4,10 @@ mod delta;
 mod name;
 
 pub(crate) use delta::{
-    DeltaKernelPredicate, DeltaKernelPredicateAdapterError, ProjectedDeltaScan,
-    build_projected_predicated_delta_scan, datafusion_expr_to_kernel_predicate,
-    delta_source_arrow_schema,
+    DeltaKernelPredicate, DeltaKernelPredicateAdapterError, DeltaPartitionMetadataPredicate,
+    DeltaPartitionNameMap, ProjectedDeltaScan, build_projected_predicated_delta_scan,
+    datafusion_expr_to_kernel_predicate, delta_source_arrow_schema,
+    supports_partition_metadata_logical_type,
 };
 pub use delta::{
     DeltaProtocolReport, DeltaSourceConfig, PlannedDeltaSource, ProtocolPreflight,

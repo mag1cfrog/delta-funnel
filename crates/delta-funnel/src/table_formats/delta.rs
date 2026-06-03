@@ -3,6 +3,7 @@
 use crate::DeltaFunnelError;
 
 mod kernel;
+mod partition_metadata;
 mod protocol;
 mod snapshot;
 mod uri;
@@ -11,6 +12,10 @@ use super::validate_table_source_names;
 use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{
     DeltaKernelPredicate, DeltaKernelPredicateAdapterError, datafusion_expr_to_kernel_predicate,
+};
+pub(crate) use partition_metadata::{
+    DeltaPartitionMetadataPredicate, DeltaPartitionNameMap,
+    supports_partition_metadata_logical_type,
 };
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
@@ -57,23 +62,39 @@ impl ProjectedDeltaScan {
     }
 
     #[cfg(test)]
+    /// Returns scan file paths after kernel scan planning and optional metadata filtering.
+    ///
+    /// The kernel scan may already apply any predicate attached through
+    /// `ScanBuilder::with_predicate`. The optional metadata predicate is then
+    /// evaluated by this provider against each `ScanFile.partition_values` so
+    /// tests can exercise the SQL-compatible partition metadata path without
+    /// reading Parquet files.
     pub(crate) fn scan_file_paths(
         &self,
         table_uri: &str,
+        partition_metadata_filter: Option<&DeltaPartitionMetadataPredicate>,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        fn collect_scan_file(paths: &mut Vec<String>, file: kernel::ScanFile) {
-            paths.push(file.path);
+        fn collect_scan_file(files: &mut Vec<kernel::ScanFile>, file: kernel::ScanFile) {
+            files.push(file);
         }
 
         let table_url = kernel::try_parse_uri(table_uri)?;
         let store = kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
         let engine = kernel::DefaultEngineBuilder::new(store).build();
-        let mut paths = Vec::new();
+        let mut files = Vec::new();
 
         for scan_metadata in self.scan.scan_metadata(&engine)? {
-            paths = scan_metadata?.visit_scan_files(paths, collect_scan_file)?;
+            files = scan_metadata?.visit_scan_files(files, collect_scan_file)?;
         }
 
+        let mut paths = files
+            .into_iter()
+            .filter(|file| {
+                partition_metadata_filter
+                    .is_none_or(|predicate| predicate.matches_scan_file(&file.partition_values))
+            })
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
         paths.sort();
         Ok(paths)
     }
@@ -213,11 +234,17 @@ fn load_delta_source_after_name_validation(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{DeltaSourceConfig, load_delta_source, load_delta_sources};
+    use datafusion::logical_expr::{col, lit};
+
+    use super::{
+        DeltaPartitionMetadataPredicate, DeltaPartitionNameMap, DeltaSourceConfig,
+        build_projected_delta_scan, load_delta_source, load_delta_sources,
+    };
     use crate::DeltaFunnelError;
 
     struct DeltaLogTable {
@@ -232,6 +259,14 @@ mod tests {
 
     impl DeltaLogTable {
         fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_metadata_and_adds(name, METADATA_JSON, &[add_json("part-00001.parquet")])
+        }
+
+        fn new_with_metadata_and_adds(
+            name: &str,
+            metadata_json: &str,
+            add_jsons: &[String],
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let path = Path::new("target")
                 .join("delta-funnel-named-source-tests")
                 .join(unique_name(name)?);
@@ -239,12 +274,13 @@ mod tests {
             fs::create_dir_all(&log_path)?;
             fs::write(
                 log_path.join("00000000000000000000.json"),
-                format!("{PROTOCOL_JSON}\n{METADATA_JSON}\n"),
+                format!("{PROTOCOL_JSON}\n{metadata_json}\n"),
             )?;
-            fs::write(
-                log_path.join("00000000000000000001.json"),
-                format!("{}\n", add_json("part-00001.parquet")),
-            )?;
+            fs::write(log_path.join("00000000000000000001.json"), {
+                let mut actions = add_jsons.join("\n");
+                actions.push('\n');
+                actions
+            })?;
 
             Ok(Self { path })
         }
@@ -252,10 +288,17 @@ mod tests {
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
 
     fn add_json(path: &str) -> String {
         format!(
             r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+        )
+    }
+
+    fn partitioned_add_json(path: &str, partition_values_json: &str) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{partition_values_json},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
         )
     }
 
@@ -281,6 +324,49 @@ mod tests {
         assert!(source.table_uri().starts_with("file://"));
         assert_eq!(source.version(), 1);
         assert_eq!(source.loaded_snapshot().version(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_file_paths_can_apply_partition_metadata_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "partition-metadata-filtered-scan-files",
+            PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("part-00000.parquet", r#"{"region":"us-west"}"#),
+                partitioned_add_json("part-00001.parquet", r#"{"region":""}"#),
+                partitioned_add_json("part-00002.parquet", r#"{}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let partition_columns = HashSet::from(["region".to_owned()]);
+        let physical_name_lookup = DeltaPartitionNameMap::identity(&partition_columns);
+        let metadata_filter = DeltaPartitionMetadataPredicate::from_datafusion_expr(
+            &col("region").eq(lit("")),
+            &super::delta_source_arrow_schema(&source)?,
+            &partition_columns,
+            &physical_name_lookup,
+        )?;
+        let scan = build_projected_delta_scan(&source, None)?;
+
+        assert_eq!(
+            scan.scan_file_paths(source.table_uri(), None)?,
+            vec![
+                "part-00000.parquet",
+                "part-00001.parquet",
+                "part-00002.parquet",
+            ]
+        );
+        assert_eq!(
+            scan.scan_file_paths(source.table_uri(), Some(&metadata_filter))?,
+            vec!["part-00001.parquet"]
+        );
 
         Ok(())
     }

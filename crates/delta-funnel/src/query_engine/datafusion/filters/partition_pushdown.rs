@@ -2,9 +2,11 @@
 
 use std::collections::HashSet;
 
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::{Expr, Operator};
+
+use crate::table_formats::supports_partition_metadata_logical_type;
 
 use super::analysis::{DeltaKernelPredicateScope, analyze_filter_for_pushdown};
 use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
@@ -129,8 +131,9 @@ fn is_supported_partition_in_list(filter: &Expr, negated: bool, schema: &SchemaR
 /// Restricts current exactness to string-typed logical partition columns.
 ///
 /// Delta serializes all partition values as text in the log, but this check is
-/// about the logical table schema type. Other primitive partition types can be
-/// added here after their typed metadata semantics are tested.
+/// about the logical table schema type. The supported type set is centralized
+/// in the Delta partition metadata evaluator so this planner and the evaluator
+/// expand together.
 fn is_supported_partition_column_type(column: &Column, schema: &SchemaRef) -> bool {
     if column.relation.is_some() || column.name.contains('.') {
         return false;
@@ -138,7 +141,7 @@ fn is_supported_partition_column_type(column: &Column, schema: &SchemaRef) -> bo
 
     schema
         .field_with_name(&column.name)
-        .is_ok_and(|field| matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8))
+        .is_ok_and(|field| supports_partition_metadata_logical_type(field.data_type()))
 }
 
 /// Restricts current exactness to non-empty, non-null string literals.
