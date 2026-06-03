@@ -1604,6 +1604,10 @@ mod tests {
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
                 0
             );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
+                "{name} unexpectedly built a partition metadata filter"
+            );
             assert_eq!(
                 scan_file_paths(scans[0])?,
                 vec![
