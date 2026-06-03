@@ -96,10 +96,11 @@ pub(crate) struct DeltaPartitionMetadataPredicate {
 impl DeltaPartitionMetadataPredicate {
     /// Converts a supported DataFusion expression into a metadata predicate.
     ///
-    /// The first slice supports string partition columns, string equality,
-    /// `IS NULL`, `IS NOT NULL`, and boolean composition over supported child
-    /// predicates. Unsupported expressions return a typed error so the caller
-    /// can keep DataFusion residual filtering instead of guessing.
+    /// The current policy supports string partition columns, string equality,
+    /// non-negated string `IN`, `IS NULL`, `IS NOT NULL`, and boolean
+    /// composition over supported child predicates. Unsupported expressions
+    /// return a typed error so the caller can keep DataFusion residual
+    /// filtering instead of guessing.
     pub(crate) fn from_datafusion_expr(
         expr: &Expr,
         logical_schema: &SchemaRef,
@@ -132,6 +133,10 @@ enum PartitionMetadataExpr {
         column: PhysicalPartitionColumn,
         literal: String,
     },
+    In {
+        column: PhysicalPartitionColumn,
+        literals: HashSet<String>,
+    },
     IsNull(PhysicalPartitionColumn),
     IsNotNull(PhysicalPartitionColumn),
     And(Box<PartitionMetadataExpr>, Box<PartitionMetadataExpr>),
@@ -145,6 +150,10 @@ impl PartitionMetadataExpr {
             Self::Eq { column, literal } => column
                 .value(partition_values)
                 .map(|value| SqlBool::from(value == literal.as_str()))
+                .unwrap_or(SqlBool::Null),
+            Self::In { column, literals } => column
+                .value(partition_values)
+                .map(|value| SqlBool::from(literals.contains(value)))
                 .unwrap_or(SqlBool::Null),
             Self::IsNull(column) => SqlBool::from(column.value(partition_values).is_none()),
             Self::IsNotNull(column) => SqlBool::from(column.value(partition_values).is_some()),
@@ -262,6 +271,14 @@ fn convert_expr(
             .map_err(|_| left_error)
         }),
         Expr::BinaryExpr(_) => Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator),
+        Expr::InList(in_list) => convert_in_list(
+            in_list.expr.as_ref(),
+            &in_list.list,
+            in_list.negated,
+            logical_schema,
+            partition_columns,
+            physical_name_lookup,
+        ),
         Expr::IsNull(inner) => Ok(PartitionMetadataExpr::IsNull(convert_column(
             inner.as_ref(),
             logical_schema,
@@ -282,6 +299,32 @@ fn convert_expr(
         )?))),
         _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression),
     }
+}
+
+fn convert_in_list(
+    column: &Expr,
+    literals: &[Expr],
+    negated: bool,
+    logical_schema: &SchemaRef,
+    partition_columns: &HashSet<String>,
+    physical_name_lookup: &DeltaPartitionNameMap,
+) -> Result<PartitionMetadataExpr, DeltaPartitionMetadataPredicateError> {
+    if negated || literals.is_empty() {
+        return Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression);
+    }
+
+    Ok(PartitionMetadataExpr::In {
+        column: convert_column(
+            column,
+            logical_schema,
+            partition_columns,
+            physical_name_lookup,
+        )?,
+        literals: literals
+            .iter()
+            .map(convert_string_literal)
+            .collect::<Result<HashSet<_>, _>>()?,
+    })
 }
 
 fn convert_equality(
@@ -469,6 +512,33 @@ mod tests {
     }
 
     #[test]
+    fn in_list_matches_sql_semantics_for_present_missing_and_raw_empty_values() {
+        let predicate = predicate(
+            &col("region").in_list(vec![lit("us-west"), lit("us-east"), lit("")], false),
+            &["region"],
+        )
+        .unwrap();
+
+        assert!(predicate.matches_scan_file(&values(&[("region", "us-west")])));
+        assert!(predicate.matches_scan_file(&values(&[("region", "us-east")])));
+        assert!(predicate.matches_scan_file(&values(&[("region", "")])));
+        assert!(!predicate.matches_scan_file(&values(&[("region", "eu-central")])));
+        assert!(!predicate.matches_scan_file(&HashMap::new()));
+    }
+
+    #[test]
+    fn in_list_deduplicates_literals_without_changing_matches() {
+        let predicate = predicate(
+            &col("region").in_list(vec![lit("us-west"), lit("us-west")], false),
+            &["region"],
+        )
+        .unwrap();
+
+        assert!(predicate.matches_scan_file(&values(&[("region", "us-west")])));
+        assert!(!predicate.matches_scan_file(&values(&[("region", "us-east")])));
+    }
+
+    #[test]
     fn boolean_composition_uses_sql_three_valued_logic() {
         let filter = col("region")
             .eq(lit("us-west"))
@@ -514,6 +584,13 @@ mod tests {
         let non_partition = col("id").eq(lit("1"));
         let null_literal = col("region").eq(Expr::Literal(ScalarValue::Utf8(None), None));
         let not_eq = col("region").not_eq(lit("us-west"));
+        let empty_in = col("region").in_list(Vec::<Expr>::new(), false);
+        let null_in = col("region").in_list(
+            vec![lit("us-west"), Expr::Literal(ScalarValue::Utf8(None), None)],
+            false,
+        );
+        let negated_in = col("region").in_list(vec![lit("us-west")], true);
+        let non_literal_in = col("region").in_list(vec![col("day")], false);
 
         assert_eq!(
             DeltaPartitionMetadataPredicate::from_datafusion_expr(
@@ -568,6 +645,42 @@ mod tests {
                 &name_map,
             ),
             Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator)
+        );
+        assert_eq!(
+            DeltaPartitionMetadataPredicate::from_datafusion_expr(
+                &empty_in,
+                &schema,
+                &region_partition_columns,
+                &name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression)
+        );
+        assert_eq!(
+            DeltaPartitionMetadataPredicate::from_datafusion_expr(
+                &null_in,
+                &schema,
+                &region_partition_columns,
+                &name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            DeltaPartitionMetadataPredicate::from_datafusion_expr(
+                &negated_in,
+                &schema,
+                &region_partition_columns,
+                &name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression)
+        );
+        assert_eq!(
+            DeltaPartitionMetadataPredicate::from_datafusion_expr(
+                &non_literal_in,
+                &schema,
+                &region_partition_columns,
+                &name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
         );
     }
 }
