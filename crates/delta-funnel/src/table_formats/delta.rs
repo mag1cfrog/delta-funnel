@@ -55,6 +55,28 @@ impl ProjectedDeltaScan {
     pub(crate) fn kernel_scan(&self) -> &kernel::Scan {
         &self.scan
     }
+
+    #[cfg(test)]
+    pub(crate) fn scan_file_paths(
+        &self,
+        table_uri: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        fn collect_scan_file(paths: &mut Vec<String>, file: kernel::ScanFile) {
+            paths.push(file.path);
+        }
+
+        let table_url = kernel::try_parse_uri(table_uri)?;
+        let store = kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
+        let engine = kernel::DefaultEngineBuilder::new(store).build();
+        let mut paths = Vec::new();
+
+        for scan_metadata in self.scan.scan_metadata(&engine)? {
+            paths = scan_metadata?.visit_scan_files(paths, collect_scan_file)?;
+        }
+
+        paths.sort();
+        Ok(paths)
+    }
 }
 
 impl PlannedDeltaSource {

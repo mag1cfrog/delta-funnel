@@ -61,6 +61,20 @@ mod test_support {
             partition_columns_json: &str,
             add_partition_values_json: &str,
         ) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_schema_and_adds(
+                name,
+                schema_fields_json,
+                partition_columns_json,
+                &[add_partition_values_json],
+            )
+        }
+
+        pub(crate) fn new_with_schema_and_adds(
+            name: &str,
+            schema_fields_json: &str,
+            partition_columns_json: &str,
+            add_partition_values_jsons: &[&str],
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let path = Path::new("target")
                 .join("delta-funnel-datafusion-provider-tests")
                 .join(unique_name(name)?);
@@ -74,12 +88,17 @@ mod test_support {
                     metadata_json(schema_fields_json, partition_columns_json)
                 ),
             )?;
+            let add_actions = add_partition_values_jsons
+                .iter()
+                .enumerate()
+                .map(|(index, partition_values_json)| {
+                    add_json(&format!("part-{index:05}.parquet"), partition_values_json)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             fs::write(
                 log_path.join("00000000000000000001.json"),
-                format!(
-                    "{}\n",
-                    add_json("part-00001.parquet", add_partition_values_json)
-                ),
+                format!("{add_actions}\n"),
             )?;
 
             Ok(Self { path })

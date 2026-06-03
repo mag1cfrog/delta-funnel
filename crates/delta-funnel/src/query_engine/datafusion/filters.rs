@@ -71,17 +71,17 @@ pub(crate) struct DeltaFilterPushdownPlan {
 
 impl DeltaFilterPushdownPlan {
     #[must_use]
-    /// Plans the issue-33 exact partition-equality policy.
+    /// Plans the exact static partition operator policy.
     ///
     /// The same policy is used by `supports_filters_pushdown` and by direct
     /// `scan` filter validation so the public support callback and scan
     /// boundary cannot drift apart.
-    pub(crate) fn partition_equality_pushdown(
+    pub(crate) fn partition_operator_pushdown(
         filters: &[&Expr],
         schema: &SchemaRef,
         partition_columns: &HashSet<String>,
     ) -> Self {
-        partition_pushdown::plan_partition_equality_pushdown(filters, schema, partition_columns)
+        partition_pushdown::plan_partition_operator_pushdown(filters, schema, partition_columns)
     }
 
     fn from_decisions(decisions: Vec<DeltaFilterPushdownDecision>) -> Self {
@@ -263,10 +263,10 @@ mod tests {
     }
 
     #[test]
-    fn filter_pushdown_rejects_non_equality_partition_shapes()
+    fn filter_pushdown_accepts_partition_in_and_rejects_unproven_shapes()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
-            "filter-pushdown-convertible-unsupported",
+            "filter-pushdown-partition-in",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
@@ -286,19 +286,21 @@ mod tests {
         let not_filter = Expr::Not(Box::new(col("id").gt(lit(10))));
         let null_check_filter = col("region").is_not_null();
 
-        let support = provider.supports_filters_pushdown(&[
+        let filters = [
             &partition_in_filter,
             &data_between_filter,
             &mixed_and_filter,
             &mixed_or_filter,
             &not_filter,
             &null_check_filter,
-        ])?;
+        ];
+        let support = provider.supports_filters_pushdown(&filters)?;
+        let plan = provider.plan_supports_filters_pushdown(&filters);
 
         assert_eq!(
             support,
             vec![
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
@@ -306,6 +308,9 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported,
             ]
         );
+        assert_eq!(plan.exact_count, 1);
+        assert_eq!(plan.unsupported_count, 5);
+        assert_eq!(plan.residual_filter_count, 5);
 
         Ok(())
     }

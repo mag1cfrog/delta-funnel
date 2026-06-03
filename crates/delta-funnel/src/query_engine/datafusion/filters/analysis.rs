@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_plan_records_supported_kernel_predicate_shapes_without_pushdown()
+    fn filter_plan_records_supported_kernel_predicate_shapes_with_only_in_pushed()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "supported-kernel-filter-plan",
@@ -532,22 +532,24 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
             ]
         );
-        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.exact_count, 1);
         assert_eq!(plan.inexact_count, 0);
-        assert_eq!(plan.unsupported_count, 6);
-        assert_eq!(plan.pushed_filter_count, 0);
-        assert_eq!(plan.residual_filter_count, 6);
-        assert!(
-            plan.decisions
-                .iter()
-                .all(|decision| decision.rejection_reason
-                    == Some(DeltaFilterPushdownRejectionReason::InitialPolicy))
-        );
+        assert_eq!(plan.unsupported_count, 5);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(plan.decisions[3].rejection_reason, None);
+        assert!(!plan.decisions[3].residual);
+        assert!(plan.decisions[..3].iter().all(|decision| {
+            decision.rejection_reason == Some(DeltaFilterPushdownRejectionReason::InitialPolicy)
+        }));
+        assert!(plan.decisions[4..].iter().all(|decision| {
+            decision.rejection_reason == Some(DeltaFilterPushdownRejectionReason::InitialPolicy)
+        }));
         assert_eq!(
             plan.decisions[0].kernel_predicate.scope,
             DeltaKernelPredicateScope::PartitionAndData
