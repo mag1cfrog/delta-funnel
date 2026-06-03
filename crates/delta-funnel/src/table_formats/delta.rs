@@ -13,7 +13,10 @@ use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{
     DeltaKernelPredicate, DeltaKernelPredicateAdapterError, datafusion_expr_to_kernel_predicate,
 };
-pub(crate) use partition_metadata::supports_partition_metadata_logical_type;
+pub(crate) use partition_metadata::{
+    DeltaPartitionMetadataPredicate, DeltaPartitionNameMap,
+    supports_partition_metadata_logical_type,
+};
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };

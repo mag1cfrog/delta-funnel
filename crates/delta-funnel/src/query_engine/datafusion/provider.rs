@@ -18,12 +18,13 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
     table_formats::{
-        ProjectedDeltaScan, build_projected_predicated_delta_scan, delta_source_arrow_schema,
+        DeltaPartitionMetadataPredicate, DeltaPartitionNameMap, ProjectedDeltaScan,
+        build_projected_predicated_delta_scan, delta_source_arrow_schema,
     },
 };
 
 use super::execution::DeltaScanPlanningExec;
-use super::filters::DeltaFilterPushdownPlan;
+use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
 use super::projection::{ProjectionPlan, plan_projection};
 use super::registration::reject_mismatched_preflight;
 use super::scan_plan::{ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest};
@@ -88,7 +89,10 @@ impl DeltaTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DeltaFilterPushdownPlan {
-        self.plan_normalized_provider_filters(filters.iter().map(|filter| (*filter).clone()))
+        let filters =
+            self.normalize_provider_filters(filters.iter().map(|filter| (*filter).clone()));
+
+        self.plan_normalized_provider_filters(&filters)
     }
 
     #[allow(dead_code)]
@@ -96,13 +100,20 @@ impl DeltaTableProvider {
         &self,
         request: ProviderScanPlanRequest,
     ) -> Result<ProviderScanPlan, DeltaFunnelError> {
+        let ProviderScanPlanRequest {
+            requested_projection,
+            pushed_filters,
+        } = request;
         let ProjectionPlan {
             projected_schema,
             scan_projection,
             projected_column_names,
-        } = self.plan_projection(request.requested_projection)?;
-        let pushed_filter_plan = self.plan_scan_filters(&request.pushed_filters);
+        } = self.plan_projection(requested_projection)?;
+        let normalized_pushed_filters = self.normalize_provider_filters(pushed_filters);
+        let pushed_filter_plan = self.plan_normalized_provider_filters(&normalized_pushed_filters);
         self.reject_unaccepted_pushed_filters(&pushed_filter_plan)?;
+        let partition_metadata_filter =
+            self.build_partition_metadata_filter(&normalized_pushed_filters, &pushed_filter_plan)?;
         let kernel_scan =
             self.build_kernel_scan(projected_column_names.as_deref(), &pushed_filter_plan)?;
 
@@ -114,33 +125,31 @@ impl DeltaTableProvider {
             protocol: self.protocol.clone(),
             scan_projection,
             pushed_filter_plan,
+            partition_metadata_filter,
             kernel_scan,
         }))
     }
 
-    /// Plans filters that DataFusion pushed into `scan`.
-    ///
-    /// This delegates to the same provider-boundary planner as
-    /// `supports_filters_pushdown` so the support callback and scan validation
-    /// cannot drift apart.
-    fn plan_scan_filters(&self, pushed_filters: &[Expr]) -> DeltaFilterPushdownPlan {
-        self.plan_normalized_provider_filters(pushed_filters.iter().cloned())
-    }
-
-    /// Plans provider-boundary filters after applying safe name normalization.
+    /// Applies safe name normalization to provider-boundary filters.
     ///
     /// DataFusion may present relation-qualified expressions to the support
     /// callback and unqualified expressions to `scan`. This helper owns the
-    /// normalization step for both entry points, then delegates to the strict
-    /// partition pushdown policy planner.
-    fn plan_normalized_provider_filters(
-        &self,
-        filters: impl IntoIterator<Item = Expr>,
-    ) -> DeltaFilterPushdownPlan {
-        let filters = filters
+    /// normalization step for both entry points before strict partition
+    /// pushdown planning or metadata predicate conversion.
+    fn normalize_provider_filters(&self, filters: impl IntoIterator<Item = Expr>) -> Vec<Expr> {
+        filters
             .into_iter()
             .map(|filter| unqualify_filter_columns(filter, &self.schema))
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    /// Plans provider-boundary filters after normalization has been applied.
+    ///
+    /// Keeping this as a separate step lets scan planning reuse the same
+    /// normalized expressions when building the provider-owned metadata
+    /// predicate, so filter classification and metadata conversion cannot see
+    /// different column names.
+    fn plan_normalized_provider_filters(&self, filters: &[Expr]) -> DeltaFilterPushdownPlan {
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
         DeltaFilterPushdownPlan::partition_operator_pushdown(
@@ -174,6 +183,51 @@ impl DeltaTableProvider {
         }
 
         Ok(())
+    }
+
+    /// Builds the provider-owned partition metadata predicate for accepted filters.
+    ///
+    /// This mirrors the current exact partition filter set without changing
+    /// kernel pruning yet. Later scan metadata planning can apply this
+    /// predicate directly to `ScanFile.partition_values` when SQL-compatible
+    /// metadata semantics must be authoritative.
+    fn build_partition_metadata_filter(
+        &self,
+        normalized_pushed_filters: &[Expr],
+        pushed_filter_plan: &DeltaFilterPushdownPlan,
+    ) -> Result<Option<DeltaPartitionMetadataPredicate>, DeltaFunnelError> {
+        let partition_columns = self.partition_columns();
+        let physical_name_lookup = DeltaPartitionNameMap::identity(&partition_columns);
+        let predicates = pushed_filter_plan
+            .decisions
+            .iter()
+            .filter(|decision| decision.outcome == DeltaFilterPushdownOutcome::Exact)
+            .map(|decision| {
+                let filter = normalized_pushed_filters.get(decision.input_index).ok_or_else(|| {
+                    DeltaFunnelError::DeltaScanFilter {
+                        source_name: self.source_name().to_owned(),
+                        table_uri: self.source.table_uri().to_owned(),
+                        reason: "exact pushed filter index was not found".to_owned(),
+                    }
+                })?;
+
+                DeltaPartitionMetadataPredicate::from_datafusion_expr(
+                    filter,
+                    &self.schema,
+                    &partition_columns,
+                    &physical_name_lookup,
+                )
+                .map_err(|error| DeltaFunnelError::DeltaScanFilter {
+                    source_name: self.source_name().to_owned(),
+                    table_uri: self.source.table_uri().to_owned(),
+                    reason: format!(
+                        "exact pushed filter cannot be converted to partition metadata predicate: {error}"
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(DeltaPartitionMetadataPredicate::and_from(predicates))
     }
 
     /// Builds the delta_kernel scan state for a projected provider scan.

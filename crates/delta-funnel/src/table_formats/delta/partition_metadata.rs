@@ -1,7 +1,7 @@
 //! SQL-compatible Delta partition metadata predicate evaluation.
 
-// This module is introduced one slice before provider scan planning consumes
-// it, so keep dead-code warnings quiet until the wiring slice removes this.
+// Scan plans can carry this predicate before scan metadata expansion consumes
+// it, so keep dead-code warnings quiet until file-level pruning calls it.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
@@ -114,6 +114,26 @@ impl DeltaPartitionMetadataPredicate {
                 partition_columns,
                 physical_name_lookup,
             )?,
+        })
+    }
+
+    /// Combines multiple metadata predicates with logical `AND`.
+    ///
+    /// DataFusion may push multiple exact filters into one scan. The scan plan
+    /// stores one metadata predicate for that whole provider-owned filter set,
+    /// so each accepted input filter becomes a child of this conjunction.
+    #[must_use]
+    pub(crate) fn and_from(predicates: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let mut predicates = predicates
+            .into_iter()
+            .map(|predicate| predicate.expr)
+            .collect::<Vec<_>>();
+        let first = predicates.pop()?;
+
+        Some(Self {
+            expr: predicates.into_iter().fold(first, |right, left| {
+                PartitionMetadataExpr::And(Box::new(left), Box::new(right))
+            }),
         })
     }
 
