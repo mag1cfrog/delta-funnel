@@ -343,7 +343,7 @@ impl TableProvider for DeltaTableProvider {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::common::DataFusionError;
+    use datafusion::common::{DataFusionError, ScalarValue};
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::datasource::{TableProvider, TableType};
     use datafusion::physical_plan::ExecutionPlan;
@@ -603,6 +603,92 @@ mod tests {
         assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.pushed_filter_count, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_unproven_partition_in_filters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"day\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "table-provider-unproven-partition-in-filters",
+            TWO_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["region","day"]"#,
+            r#""partitionValues":{"region":"us-west","day":"2026-05-31"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filters = vec![
+            (
+                "empty in",
+                datafusion::logical_expr::col("region").in_list(Vec::<Expr>::new(), false),
+            ),
+            (
+                "null in",
+                datafusion::logical_expr::col("region")
+                    .in_list(vec![Expr::Literal(ScalarValue::Utf8(None), None)], false),
+            ),
+            (
+                "mixed null in",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        Expr::Literal(ScalarValue::Utf8(None), None),
+                    ],
+                    false,
+                ),
+            ),
+            (
+                "wrong literal type in",
+                datafusion::logical_expr::col("region")
+                    .in_list(vec![datafusion::logical_expr::lit(1_i64)], false),
+            ),
+            (
+                "data column item in",
+                datafusion::logical_expr::col("region")
+                    .in_list(vec![datafusion::logical_expr::col("id")], false),
+            ),
+            (
+                "partition column item in",
+                datafusion::logical_expr::col("region")
+                    .in_list(vec![datafusion::logical_expr::col("day")], false),
+            ),
+            (
+                "cast item in",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![datafusion::logical_expr::cast(
+                        datafusion::logical_expr::lit("us-west"),
+                        DataType::Utf8,
+                    )],
+                    false,
+                ),
+            ),
+            (
+                "not in",
+                datafusion::logical_expr::col("region")
+                    .in_list(vec![datafusion::logical_expr::lit("us-west")], true),
+            ),
+        ];
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
 
         Ok(())
     }
@@ -905,6 +991,128 @@ mod tests {
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
         assert_eq!(kernel_names, vec!["id", "region"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_partition_in_edge_variants_document_rewrite_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"day\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema(
+            "sql-partition-in-edge-variants",
+            TWO_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["region","day"]"#,
+            r#""partitionValues":{"region":"us-west","day":"2026-05-31"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        enum ExpectedInProbe {
+            EmptyBeforeScan,
+            ExactAfterRewrite,
+            ResidualFilter,
+        }
+
+        let sql_cases = [
+            (
+                "null only",
+                "select id from orders where region in (null)",
+                ExpectedInProbe::EmptyBeforeScan,
+            ),
+            (
+                "mixed null",
+                "select id from orders where region in ('us-west', null)",
+                ExpectedInProbe::ResidualFilter,
+            ),
+            (
+                "wrong literal type",
+                "select id from orders where region in (1)",
+                ExpectedInProbe::ExactAfterRewrite,
+            ),
+            (
+                "data column item",
+                "select id from orders where region in (id)",
+                ExpectedInProbe::ResidualFilter,
+            ),
+            (
+                "partition column item",
+                "select id from orders where region in (day)",
+                ExpectedInProbe::ResidualFilter,
+            ),
+            (
+                "scalar function item",
+                "select id from orders where region in (lower('us-west'))",
+                ExpectedInProbe::ExactAfterRewrite,
+            ),
+            (
+                "cast item",
+                "select id from orders where region in (cast('us-west' as string))",
+                ExpectedInProbe::ExactAfterRewrite,
+            ),
+            (
+                "not in",
+                "select id from orders where region not in ('us-west')",
+                ExpectedInProbe::ResidualFilter,
+            ),
+        ];
+
+        for (name, sql, expectation) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            match expectation {
+                ExpectedInProbe::EmptyBeforeScan => {
+                    assert!(plan_display.contains("EmptyExec"), "{name}: {plan_display}");
+                    assert!(scans.is_empty(), "{name}: {plan_display}");
+                }
+                ExpectedInProbe::ExactAfterRewrite => {
+                    assert!(
+                        !plan_display.contains("FilterExec"),
+                        "{name}: {plan_display}"
+                    );
+                    assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+                    assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+                    assert_eq!(scans[0].scan_plan().pushed_filter_plan.unsupported_count, 0);
+                    assert_eq!(
+                        scans[0]
+                            .scan_plan()
+                            .pushed_filter_plan
+                            .residual_filter_count,
+                        0
+                    );
+                }
+                ExpectedInProbe::ResidualFilter => {
+                    assert!(
+                        plan_display.contains("FilterExec"),
+                        "{name} unexpectedly became exact:\n{plan_display}"
+                    );
+                    assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+                    assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+                    assert_eq!(
+                        scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                        0
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
