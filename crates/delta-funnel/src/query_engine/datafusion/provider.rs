@@ -360,6 +360,14 @@ mod tests {
     };
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
+    fn scan_file_paths(
+        scan: &DeltaScanPlanningExec,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        scan.scan_plan()
+            .kernel_scan()
+            .scan_file_paths(&scan.scan_plan().table_uri)
+    }
+
     #[test]
     fn datafusion_table_provider_api_symbols_are_available() -> datafusion::error::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -608,6 +616,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_partition_predicates_prune_null_missing_and_empty_values_distinctly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "exact-partition-null-missing-empty-pruning",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{"region":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = vec![
+            (
+                "single non-empty value",
+                datafusion::logical_expr::col("region")
+                    .eq(datafusion::logical_expr::lit("us-west")),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "in list with non-empty values",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        datafusion::logical_expr::lit("us-east"),
+                    ],
+                    false,
+                ),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let plan = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_empty_string_partition_literals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-empty-string-partition-literals",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":""}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filters = vec![
+            (
+                "empty string equality",
+                datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("")),
+            ),
+            (
+                "empty string in",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        datafusion::logical_expr::lit(""),
+                    ],
+                    false,
+                ),
+            ),
+        ];
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn table_provider_scan_rejects_unproven_partition_in_filters()
     -> Result<(), Box<dyn std::error::Error>> {
         const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"day\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
@@ -669,6 +794,63 @@ mod tests {
                     )],
                     false,
                 ),
+            ),
+            (
+                "not in",
+                datafusion::logical_expr::col("region")
+                    .in_list(vec![datafusion::logical_expr::lit("us-west")], true),
+            ),
+        ];
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_unproven_null_sensitive_partition_filters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-unproven-null-sensitive-partition-filters",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filters = vec![
+            ("is null", datafusion::logical_expr::col("region").is_null()),
+            (
+                "is not null",
+                datafusion::logical_expr::col("region").is_not_null(),
+            ),
+            (
+                "not equality",
+                Expr::Not(Box::new(
+                    datafusion::logical_expr::col("region")
+                        .eq(datafusion::logical_expr::lit("us-west")),
+                )),
             ),
             (
                 "not in",
@@ -1291,6 +1473,90 @@ mod tests {
                 "{}: {}",
                 case.name,
                 plan_display
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_null_missing_and_empty_partition_filters_stay_residual_without_kernel_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-null-missing-empty-partition-filters",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{"region":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let sql_cases = [
+            ("is null", "select id from orders where region is null"),
+            (
+                "is not null",
+                "select id from orders where region is not null",
+            ),
+            (
+                "not equality",
+                "select id from orders where not(region = 'us-west')",
+            ),
+            (
+                "not in",
+                "select id from orders where region not in ('us-west')",
+            ),
+            ("empty string", "select id from orders where region = ''"),
+            (
+                "empty string in",
+                "select id from orders where region in ('us-west', '')",
+            ),
+        ];
+
+        for (name, sql) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0
+            );
+            assert_eq!(
+                scan_file_paths(scans[0])?,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+                "{name}"
             );
         }
 

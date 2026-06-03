@@ -13,9 +13,9 @@ use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilter
 ///
 /// A filter can be exact here only when it is partition-only, kernel
 /// convertible, and accepted by the current operator semantics policy. The
-/// proven exact subset starts with non-null logical string equality, `IN`, and
-/// boolean composition of exact partition predicates. It can expand one
-/// operator class at a time after semantic tests. All other shapes
+/// proven exact subset starts with non-empty, non-null logical string equality,
+/// `IN`, and boolean composition of exact partition predicates. It can expand
+/// one operator class at a time after semantic tests. All other shapes
 /// stay `Unsupported` so DataFusion keeps them as residual filters.
 pub(super) fn plan_partition_operator_pushdown(
     filters: &[&Expr],
@@ -105,12 +105,13 @@ fn is_supported_partition_equality(column: &Expr, literal: &Expr, schema: &Schem
     is_supported_partition_column_type(column, schema) && is_supported_partition_literal(literal)
 }
 
-/// Accepts a non-negated, non-empty `IN` list for string partition columns.
+/// Accepts a non-negated `IN` list for non-empty string partition literals.
 ///
 /// `IN` is the first operator promoted after equality because it is equivalent
-/// to a disjunction of equality checks for this non-null string literal subset.
-/// Negated, empty, null-containing, or non-literal lists remain unsupported
-/// until their null and missing-value semantics are proven.
+/// to a disjunction of equality checks for this non-empty, non-null string
+/// literal subset. Negated, empty, null-containing, empty-string, or
+/// non-literal lists remain unsupported until their metadata semantics are
+/// proven.
 fn is_supported_partition_in_list(filter: &Expr, negated: bool, schema: &SchemaRef) -> bool {
     let Expr::InList(in_list) = filter else {
         return false;
@@ -140,19 +141,17 @@ fn is_supported_partition_column_type(column: &Column, schema: &SchemaRef) -> bo
         .is_ok_and(|field| matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8))
 }
 
-/// Restricts current exactness to non-null string literals.
+/// Restricts current exactness to non-empty, non-null string literals.
 ///
 /// This must evolve together with `is_supported_partition_column_type`; exact
 /// pushdown should only be claimed for type pairs whose Delta partition
 /// metadata semantics are tested.
 fn is_supported_partition_literal(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Literal(
-            ScalarValue::Utf8(Some(_)) | ScalarValue::LargeUtf8(Some(_)),
-            _
-        )
-    )
+    match expr {
+        Expr::Literal(ScalarValue::Utf8(Some(value)), _)
+        | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _) => !value.is_empty(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +346,8 @@ mod tests {
             vec![lit("us-west"), Expr::Literal(ScalarValue::Utf8(None), None)],
             false,
         );
+        let empty_string_equality = col("region").eq(lit(""));
+        let empty_string_in = col("region").in_list(vec![lit("us-west"), lit("")], false);
         let non_string_literal_in = col("region").in_list(vec![lit(7_i64)], false);
         let non_string_partition_in = col("id").in_list(vec![lit("7")], false);
         let non_literal_in = col("region").in_list(vec![col("day")], false);
@@ -355,6 +356,8 @@ mod tests {
             &[
                 &empty_in,
                 &null_in,
+                &empty_string_equality,
+                &empty_string_in,
                 &non_string_literal_in,
                 &non_string_partition_in,
                 &non_literal_in,
@@ -365,11 +368,11 @@ mod tests {
 
         assert_eq!(
             plan.datafusion_pushdowns(),
-            vec![TableProviderFilterPushDown::Unsupported; 5]
+            vec![TableProviderFilterPushDown::Unsupported; 7]
         );
         assert_eq!(plan.exact_count, 0);
-        assert_eq!(plan.unsupported_count, 5);
-        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(plan.unsupported_count, 7);
+        assert_eq!(plan.residual_filter_count, 7);
         assert!(plan.decisions.iter().all(|decision| decision.residual));
     }
 
