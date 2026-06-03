@@ -449,6 +449,41 @@ mod tests {
     }
 
     #[test]
+    fn partition_operator_planner_rejects_mixed_boolean_whole_filters() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["region", "day"]);
+        let partition_in = col("region").in_list(vec![lit("us-west"), lit("us-east")], false);
+        let exact_partition_or = partition_in.clone().or(col("region").eq(lit("eu-central")));
+        let filters = [
+            partition_in.clone().and(col("id").gt(lit(1_i64))),
+            partition_in.clone().or(col("id").eq(lit(1_i64))),
+            col("region")
+                .eq(lit("us-west"))
+                .or(col("id").eq(lit(1_i64))),
+            partition_in.clone().or(col("ghost").eq(lit("x"))),
+            partition_in.or(col("profile.age").eq(lit(1_i64))),
+            exact_partition_or.and(col("id").gt(lit(1_i64))),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| decision.residual));
+    }
+
+    #[test]
     fn partition_operator_planner_rejects_unknown_and_qualified_columns() {
         let schema = schema();
         let partition_columns = partition_columns(&["region"]);
