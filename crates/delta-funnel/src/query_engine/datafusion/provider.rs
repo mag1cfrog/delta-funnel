@@ -96,6 +96,12 @@ impl DeltaTableProvider {
     }
 
     #[allow(dead_code)]
+    /// Builds the complete provider scan plan for DataFusion's scan callback.
+    ///
+    /// Filter planning and scan planning intentionally stay separate here. The
+    /// kernel scan is only responsible for snapshot/projection planning, while
+    /// exact partition filters are converted into a provider-owned metadata
+    /// predicate and carried on `ProviderScanPlan` for scan-file pruning.
     pub(crate) fn plan_scan(
         &self,
         request: ProviderScanPlanRequest,
@@ -112,10 +118,18 @@ impl DeltaTableProvider {
         let normalized_pushed_filters = self.normalize_provider_filters(pushed_filters);
         let pushed_filter_plan = self.plan_normalized_provider_filters(&normalized_pushed_filters);
         self.reject_unaccepted_pushed_filters(&pushed_filter_plan)?;
-        let partition_metadata_filter =
-            self.build_partition_metadata_filter(&normalized_pushed_filters, &pushed_filter_plan)?;
-        let kernel_scan =
-            self.build_kernel_scan(projected_column_names.as_deref(), &pushed_filter_plan)?;
+        // Build the provider-side predicate before constructing the kernel
+        // scan. This makes the partition pruning contract explicit: the exact
+        // filters are accepted only because this predicate can later be applied
+        // to scan-file partition metadata.
+        let partition_metadata_filter = self.build_provider_partition_metadata_filter(
+            &normalized_pushed_filters,
+            &pushed_filter_plan,
+        )?;
+        // Do not pass partition predicates to delta_kernel. The kernel scan
+        // should enumerate files for the requested projection; provider-owned
+        // metadata pruning is applied after scan metadata expansion.
+        let kernel_scan = self.build_kernel_scan(projected_column_names.as_deref())?;
 
         Ok(ProviderScanPlan::from_parts(ProviderScanPlanParts {
             source_name: self.source_name().to_owned(),
@@ -187,11 +201,12 @@ impl DeltaTableProvider {
 
     /// Builds the provider-owned partition metadata predicate for accepted filters.
     ///
-    /// This mirrors the current exact partition filter set without changing
-    /// kernel pruning yet. Later scan metadata planning can apply this
-    /// predicate directly to `ScanFile.partition_values` when SQL-compatible
-    /// metadata semantics must be authoritative.
-    fn build_partition_metadata_filter(
+    /// The resulting predicate is stored on `ProviderScanPlan` next to the
+    /// unfiltered kernel scan state. Scan-file expansion applies it to
+    /// `ScanFile.partition_values` before any file paths are handed to the read
+    /// path, so partition pruning stays under provider SQL semantics instead of
+    /// delta_kernel predicate semantics.
+    fn build_provider_partition_metadata_filter(
         &self,
         normalized_pushed_filters: &[Expr],
         pushed_filter_plan: &DeltaFilterPushdownPlan,
@@ -232,23 +247,23 @@ impl DeltaTableProvider {
 
     /// Builds the delta_kernel scan state for a projected provider scan.
     ///
-    /// The provider output schema is already determined by projection planning.
-    /// This helper only decides what delta_kernel must read internally, adds
-    /// hidden partition predicate columns when needed, and attaches the combined
-    /// exact predicate.
+    /// Partition pushdown is provider-owned and applied to Delta scan-file
+    /// metadata after kernel scan planning. This keeps delta_kernel out of
+    /// partition predicate semantics and lets the kernel scan schema match the
+    /// requested projection.
     fn build_kernel_scan(
         &self,
         projected_column_names: Option<&[String]>,
-        pushed_filter_plan: &DeltaFilterPushdownPlan,
     ) -> Result<ProjectedDeltaScan, DeltaFunnelError> {
-        let kernel_projected_column_names =
-            kernel_scan_column_names(projected_column_names, pushed_filter_plan);
-        let combined_predicate = pushed_filter_plan.combined_exact_kernel_predicate();
+        let kernel_projected_column_names = projected_column_names.map(|names| names.to_vec());
 
         build_projected_predicated_delta_scan(
             &self.source,
             kernel_projected_column_names.as_deref(),
-            combined_predicate,
+            // Exact partition pushdown is represented by
+            // `ProviderScanPlan::partition_metadata_filter`, not by
+            // delta_kernel's predicate path.
+            None,
         )
         .map_err(|source| DeltaFunnelError::DeltaScanConstruction {
             source_name: self.source_name().to_owned(),
@@ -274,30 +289,6 @@ impl DeltaTableProvider {
     pub(crate) fn set_schema_for_tests(&mut self, schema: SchemaRef) {
         self.schema = schema;
     }
-}
-
-/// Builds the delta_kernel read schema column list for a scan.
-///
-/// DataFusion's output schema remains the requested projection, but
-/// delta_kernel validates predicate columns against its scan schema. When a
-/// pushed exact partition filter references a column outside the requested
-/// projection, that partition column is appended here as a hidden kernel read
-/// column so predicate construction can stay exact.
-fn kernel_scan_column_names(
-    projected_column_names: Option<&[String]>,
-    pushed_filter_plan: &DeltaFilterPushdownPlan,
-) -> Option<Vec<String>> {
-    // No requested projection means the kernel already scans the full table
-    // schema, so every partition predicate column is already available.
-    let mut column_names = projected_column_names?.to_vec();
-
-    for partition_column in pushed_filter_plan.exact_partition_column_names() {
-        if !column_names.contains(&partition_column) {
-            column_names.push(partition_column);
-        }
-    }
-
-    Some(column_names)
 }
 
 /// Removes relation qualifiers from provider support-check filters.
@@ -712,6 +703,116 @@ mod tests {
                 ),
                 vec!["part-00000.parquet", "part-00001.parquet"],
             ),
+            (
+                "is null",
+                datafusion::logical_expr::col("region").is_null(),
+                vec!["part-00002.parquet", "part-00004.parquet"],
+            ),
+            (
+                "is not null",
+                datafusion::logical_expr::col("region").is_not_null(),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "not equality",
+                datafusion::logical_expr::col("region")
+                    .not_eq(datafusion::logical_expr::lit("us-west")),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not equality expression",
+                Expr::Not(Box::new(
+                    datafusion::logical_expr::col("region")
+                        .eq(datafusion::logical_expr::lit("us-west")),
+                )),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not in list",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        datafusion::logical_expr::lit("us-east"),
+                    ],
+                    true,
+                ),
+                vec!["part-00003.parquet"],
+            ),
+            (
+                "not in expression",
+                Expr::Not(Box::new(datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        datafusion::logical_expr::lit("us-east"),
+                    ],
+                    false,
+                ))),
+                vec!["part-00003.parquet"],
+            ),
+            (
+                "less than",
+                datafusion::logical_expr::col("region")
+                    .lt(datafusion::logical_expr::lit("us-west")),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "less than or equal",
+                datafusion::logical_expr::col("region")
+                    .lt_eq(datafusion::logical_expr::lit("us-east")),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "greater than",
+                datafusion::logical_expr::col("region")
+                    .gt(datafusion::logical_expr::lit("us-east")),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "greater than or equal",
+                datafusion::logical_expr::col("region")
+                    .gt_eq(datafusion::logical_expr::lit("us-west")),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "between",
+                datafusion::logical_expr::col("region").between(
+                    datafusion::logical_expr::lit("us-east"),
+                    datafusion::logical_expr::lit("us-west"),
+                ),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not between",
+                datafusion::logical_expr::col("region").not_between(
+                    datafusion::logical_expr::lit("us-east"),
+                    datafusion::logical_expr::lit("us-west"),
+                ),
+                vec!["part-00003.parquet"],
+            ),
+            (
+                "contradictory between",
+                datafusion::logical_expr::col("region").between(
+                    datafusion::logical_expr::lit("z"),
+                    datafusion::logical_expr::lit("a"),
+                ),
+                Vec::new(),
+            ),
+            (
+                "contradictory not between",
+                datafusion::logical_expr::col("region").not_between(
+                    datafusion::logical_expr::lit("z"),
+                    datafusion::logical_expr::lit("a"),
+                ),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
         ];
 
         for (name, filter, expected_paths) in cases {
@@ -727,6 +828,10 @@ mod tests {
             assert_eq!(
                 scan.scan_plan().pushed_filter_plan.residual_filter_count,
                 0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
                 "{name}"
             );
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
@@ -768,6 +873,31 @@ mod tests {
                         datafusion::logical_expr::lit(""),
                     ],
                     false,
+                ),
+            ),
+            (
+                "empty string comparison",
+                datafusion::logical_expr::col("region").lt(datafusion::logical_expr::lit("")),
+            ),
+            (
+                "empty string between",
+                datafusion::logical_expr::col("region").between(
+                    datafusion::logical_expr::lit(""),
+                    datafusion::logical_expr::lit("us-west"),
+                ),
+            ),
+            (
+                "null between",
+                datafusion::logical_expr::col("region").between(
+                    Expr::Literal(ScalarValue::Utf8(None), None),
+                    datafusion::logical_expr::lit("us-west"),
+                ),
+            ),
+            (
+                "numeric between",
+                datafusion::logical_expr::col("region").between(
+                    datafusion::logical_expr::lit(7_i64),
+                    datafusion::logical_expr::lit("us-west"),
                 ),
             ),
         ];
@@ -852,9 +982,14 @@ mod tests {
                 ),
             ),
             (
-                "not in",
-                datafusion::logical_expr::col("region")
-                    .in_list(vec![datafusion::logical_expr::lit("us-west")], true),
+                "not in with null",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        Expr::Literal(ScalarValue::Utf8(None), None),
+                    ],
+                    true,
+                ),
             ),
         ];
 
@@ -875,16 +1010,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_provider_scan_rejects_unproven_null_sensitive_partition_filters()
+    async fn table_provider_scan_rejects_unsafe_negated_partition_filters()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "table-provider-unproven-null-sensitive-partition-filters",
+            "table-provider-unsafe-negated-partition-filters",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             &[
                 r#""partitionValues":{"region":"us-west"}"#,
-                r#""partitionValues":{"region":null}"#,
-                r#""partitionValues":{}"#,
+                r#""partitionValues":{"region":""}"#,
             ],
         )?;
         let source = load_delta_source(DeltaSourceConfig {
@@ -896,22 +1030,26 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
         let filters = vec![
-            ("is null", datafusion::logical_expr::col("region").is_null()),
             (
-                "is not null",
-                datafusion::logical_expr::col("region").is_not_null(),
-            ),
-            (
-                "not equality",
+                "not empty string equality",
                 Expr::Not(Box::new(
-                    datafusion::logical_expr::col("region")
-                        .eq(datafusion::logical_expr::lit("us-west")),
+                    datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("")),
                 )),
             ),
             (
-                "not in",
+                "empty string not in",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        datafusion::logical_expr::lit(""),
+                    ],
+                    true,
+                ),
+            ),
+            (
+                "non literal not in",
                 datafusion::logical_expr::col("region")
-                    .in_list(vec![datafusion::logical_expr::lit("us-west")], true),
+                    .in_list(vec![datafusion::logical_expr::col("id")], true),
             ),
         ];
 
@@ -1256,7 +1394,7 @@ mod tests {
             .fields()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
-        assert_eq!(kernel_names, vec!["id", "region"]);
+        assert_eq!(kernel_names, vec!["id"]);
 
         Ok(())
     }
@@ -1316,7 +1454,7 @@ mod tests {
             .fields()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
-        assert_eq!(kernel_names, vec!["id", "region"]);
+        assert_eq!(kernel_names, vec!["id"]);
 
         Ok(())
     }
@@ -1391,7 +1529,7 @@ mod tests {
             (
                 "not in",
                 "select id from orders where region not in ('us-west')",
-                ExpectedInProbe::ResidualFilter,
+                ExpectedInProbe::ExactAfterRewrite,
             ),
         ];
 
@@ -1536,11 +1674,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_null_missing_and_empty_partition_filters_stay_residual_without_kernel_pruning()
+    async fn sql_null_partition_filters_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-null-missing-empty-partition-filters",
+            "sql-null-partition-filters-exact",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             &[
@@ -1565,27 +1703,356 @@ mod tests {
         )?;
 
         let sql_cases = [
-            ("is null", "select id from orders where region is null"),
+            (
+                "is null",
+                "select id from orders where region is null",
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
             (
                 "is not null",
                 "select id from orders where region is not null",
-            ),
-            (
-                "not equality",
-                "select id from orders where not(region = 'us-west')",
-            ),
-            (
-                "not in",
-                "select id from orders where region not in ('us-west')",
-            ),
-            ("empty string", "select id from orders where region = ''"),
-            (
-                "empty string in",
-                "select id from orders where region in ('us-west', '')",
+                vec!["part-00000.parquet", "part-00002.parquet"],
             ),
         ];
 
-        for (name, sql) in sql_cases {
+        for (name, sql, expected_paths) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.unsupported_count, 0);
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+
+            let kernel_names = scans[0]
+                .scan_plan()
+                .kernel_scan()
+                .kernel_schema()
+                .fields()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(kernel_names, vec!["id"], "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_negated_partition_filters_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-negated-partition-filters-exact",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{"region":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let sql_cases = [
+            (
+                "not equality",
+                "select id from orders where region != 'us-west'",
+                1,
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not equality expression",
+                "select id from orders where not(region = 'us-west')",
+                1,
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not in",
+                "select id from orders where region not in ('us-west', 'us-east')",
+                2,
+                vec!["part-00003.parquet"],
+            ),
+        ];
+
+        for (name, sql, expected_exact_count, expected_paths) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_partition_comparison_filters_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-partition-comparison-filters-exact",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{"region":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let sql_cases = [
+            (
+                "less than",
+                "select id from orders where region < 'us-west'",
+                1,
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "less than or equal",
+                "select id from orders where region <= 'us-east'",
+                1,
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "greater than",
+                "select id from orders where region > 'us-east'",
+                1,
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed greater than",
+                "select id from orders where 'us-east' < region",
+                1,
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "between",
+                "select id from orders where region between 'us-east' and 'us-west'",
+                2,
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not between",
+                "select id from orders where region not between 'us-east' and 'us-west'",
+                1,
+                vec!["part-00003.parquet"],
+            ),
+            (
+                "contradictory between",
+                "select id from orders where region between 'z' and 'a'",
+                2,
+                Vec::new(),
+            ),
+            (
+                "contradictory not between",
+                "select id from orders where region not between 'z' and 'a'",
+                1,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, sql, expected_exact_count, expected_paths) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_empty_string_partition_filters_stay_residual_without_kernel_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-null-sensitive-partition-filters",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{"region":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let sql_cases = [
+            (
+                "empty string",
+                "select id from orders where region = ''",
+                0,
+                0,
+                false,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "empty string in",
+                "select id from orders where region in ('us-west', '')",
+                0,
+                0,
+                false,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "empty string comparison",
+                "select id from orders where region < ''",
+                0,
+                0,
+                false,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "empty string between",
+                "select id from orders where region between '' and 'us-west'",
+                1,
+                1,
+                true,
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (
+            name,
+            sql,
+            expected_exact_count,
+            expected_pushed_filter_count,
+            expected_metadata_filter,
+            expected_paths,
+        ) in sql_cases
+        {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -1599,25 +2066,22 @@ mod tests {
                 "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}: {plan_display}"
+            );
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name} unexpectedly built a partition metadata filter"
+                expected_pushed_filter_count,
+                "{name}: {plan_display}"
             );
             assert_eq!(
-                scan_file_paths(scans[0])?,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                    "part-00003.parquet",
-                ],
-                "{name}"
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                expected_metadata_filter,
+                "{name}: {plan_display}"
             );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
         }
 
         Ok(())
