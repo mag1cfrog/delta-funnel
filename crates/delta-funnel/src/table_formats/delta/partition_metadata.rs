@@ -804,6 +804,26 @@ mod tests {
     }
 
     #[test]
+    fn contradictory_between_bounds_follow_sql_boolean_semantics() {
+        let between = predicate(&col("region").between(lit("z"), lit("a")), &["region"]).unwrap();
+        let not_between =
+            predicate(&col("region").not_between(lit("z"), lit("a")), &["region"]).unwrap();
+        let west = values(&[("region", "us-west")]);
+        let east = values(&[("region", "us-east")]);
+        let empty = values(&[("region", "")]);
+        let missing = HashMap::new();
+
+        assert!(!between.matches_scan_file(&west));
+        assert!(!between.matches_scan_file(&east));
+        assert!(!between.matches_scan_file(&empty));
+        assert!(!between.matches_scan_file(&missing));
+        assert!(not_between.matches_scan_file(&west));
+        assert!(not_between.matches_scan_file(&east));
+        assert!(not_between.matches_scan_file(&empty));
+        assert!(!not_between.matches_scan_file(&missing));
+    }
+
+    #[test]
     fn boolean_composition_uses_sql_three_valued_logic() {
         let filter = col("region")
             .eq(lit("us-west"))

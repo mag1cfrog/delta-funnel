@@ -793,6 +793,26 @@ mod tests {
                 ),
                 vec!["part-00003.parquet"],
             ),
+            (
+                "contradictory between",
+                datafusion::logical_expr::col("region").between(
+                    datafusion::logical_expr::lit("z"),
+                    datafusion::logical_expr::lit("a"),
+                ),
+                Vec::new(),
+            ),
+            (
+                "contradictory not between",
+                datafusion::logical_expr::col("region").not_between(
+                    datafusion::logical_expr::lit("z"),
+                    datafusion::logical_expr::lit("a"),
+                ),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
         ];
 
         for (name, filter, expected_paths) in cases {
@@ -1890,6 +1910,22 @@ mod tests {
                 "select id from orders where region not between 'us-east' and 'us-west'",
                 1,
                 vec!["part-00003.parquet"],
+            ),
+            (
+                "contradictory between",
+                "select id from orders where region between 'z' and 'a'",
+                2,
+                Vec::new(),
+            ),
+            (
+                "contradictory not between",
+                "select id from orders where region not between 'z' and 'a'",
+                1,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
             ),
         ];
 
