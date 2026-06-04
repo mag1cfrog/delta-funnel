@@ -98,10 +98,11 @@ impl DeltaPartitionMetadataPredicate {
     /// Converts a supported DataFusion expression into a metadata predicate.
     ///
     /// The current policy supports string partition columns, string equality,
-    /// string inequality, string range comparisons, `IN`, `NOT IN`, `IS NULL`,
-    /// `IS NOT NULL`, negation, and boolean composition over supported child
-    /// predicates. Unsupported expressions return a typed error so the caller
-    /// can keep DataFusion residual filtering instead of guessing.
+    /// string inequality, string range comparisons, `BETWEEN`, `NOT BETWEEN`,
+    /// `IN`, `NOT IN`, `IS NULL`, `IS NOT NULL`, negation, and boolean
+    /// composition over supported child predicates. Unsupported expressions
+    /// return a typed error so the caller can keep DataFusion residual
+    /// filtering instead of guessing.
     pub(crate) fn from_datafusion_expr(
         expr: &Expr,
         logical_schema: &SchemaRef,
@@ -385,6 +386,15 @@ fn convert_expr(
             partition_columns,
             physical_name_lookup,
         ),
+        Expr::Between(between) => convert_between(
+            between.expr.as_ref(),
+            between.low.as_ref(),
+            between.high.as_ref(),
+            between.negated,
+            logical_schema,
+            partition_columns,
+            physical_name_lookup,
+        ),
         Expr::IsNull(inner) => Ok(PartitionMetadataExpr::IsNull(convert_column(
             inner.as_ref(),
             logical_schema,
@@ -404,6 +414,42 @@ fn convert_expr(
             physical_name_lookup,
         )?))),
         _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression),
+    }
+}
+
+fn convert_between(
+    column: &Expr,
+    low: &Expr,
+    high: &Expr,
+    negated: bool,
+    logical_schema: &SchemaRef,
+    partition_columns: &HashSet<String>,
+    physical_name_lookup: &DeltaPartitionNameMap,
+) -> Result<PartitionMetadataExpr, DeltaPartitionMetadataPredicateError> {
+    // BETWEEN is inclusive. Expressing it through the same comparison nodes
+    // keeps ordering and SQL null behavior in one place.
+    let lower_bound = convert_comparison(
+        column,
+        low,
+        PartitionComparisonOperator::GtEq,
+        logical_schema,
+        partition_columns,
+        physical_name_lookup,
+    )?;
+    let upper_bound = convert_comparison(
+        column,
+        high,
+        PartitionComparisonOperator::LtEq,
+        logical_schema,
+        partition_columns,
+        physical_name_lookup,
+    )?;
+    let between = PartitionMetadataExpr::And(Box::new(lower_bound), Box::new(upper_bound));
+
+    if negated {
+        Ok(PartitionMetadataExpr::Not(Box::new(between)))
+    } else {
+        Ok(between)
     }
 }
 
@@ -731,6 +777,33 @@ mod tests {
     }
 
     #[test]
+    fn between_uses_inclusive_string_bounds_and_sql_null_semantics() {
+        let between = predicate(
+            &col("region").between(lit("us-east"), lit("us-west")),
+            &["region"],
+        )
+        .unwrap();
+        let not_between = predicate(
+            &col("region").not_between(lit("us-east"), lit("us-west")),
+            &["region"],
+        )
+        .unwrap();
+        let west = values(&[("region", "us-west")]);
+        let east = values(&[("region", "us-east")]);
+        let empty = values(&[("region", "")]);
+        let missing = HashMap::new();
+
+        assert!(between.matches_scan_file(&west));
+        assert!(between.matches_scan_file(&east));
+        assert!(!between.matches_scan_file(&empty));
+        assert!(!between.matches_scan_file(&missing));
+        assert!(!not_between.matches_scan_file(&west));
+        assert!(!not_between.matches_scan_file(&east));
+        assert!(not_between.matches_scan_file(&empty));
+        assert!(!not_between.matches_scan_file(&missing));
+    }
+
+    #[test]
     fn boolean_composition_uses_sql_three_valued_logic() {
         let filter = col("region")
             .eq(lit("us-west"))
@@ -782,6 +855,9 @@ mod tests {
             false,
         );
         let non_literal_in = col("region").in_list(vec![col("day")], false);
+        let null_between =
+            col("region").between(Expr::Literal(ScalarValue::Utf8(None), None), lit("us-west"));
+        let non_literal_between = col("region").between(col("day"), lit("us-west"));
 
         assert_eq!(
             DeltaPartitionMetadataPredicate::from_datafusion_expr(
@@ -858,6 +934,24 @@ mod tests {
         assert_eq!(
             DeltaPartitionMetadataPredicate::from_datafusion_expr(
                 &non_literal_in,
+                &schema,
+                &region_partition_columns,
+                &name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            DeltaPartitionMetadataPredicate::from_datafusion_expr(
+                &null_between,
+                &schema,
+                &region_partition_columns,
+                &name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            DeltaPartitionMetadataPredicate::from_datafusion_expr(
+                &non_literal_between,
                 &schema,
                 &region_partition_columns,
                 &name_map,

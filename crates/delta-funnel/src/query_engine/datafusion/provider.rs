@@ -777,6 +777,22 @@ mod tests {
                     .gt_eq(datafusion::logical_expr::lit("us-west")),
                 vec!["part-00000.parquet"],
             ),
+            (
+                "between",
+                datafusion::logical_expr::col("region").between(
+                    datafusion::logical_expr::lit("us-east"),
+                    datafusion::logical_expr::lit("us-west"),
+                ),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not between",
+                datafusion::logical_expr::col("region").not_between(
+                    datafusion::logical_expr::lit("us-east"),
+                    datafusion::logical_expr::lit("us-west"),
+                ),
+                vec!["part-00003.parquet"],
+            ),
         ];
 
         for (name, filter, expected_paths) in cases {
@@ -842,6 +858,27 @@ mod tests {
             (
                 "empty string comparison",
                 datafusion::logical_expr::col("region").lt(datafusion::logical_expr::lit("")),
+            ),
+            (
+                "empty string between",
+                datafusion::logical_expr::col("region").between(
+                    datafusion::logical_expr::lit(""),
+                    datafusion::logical_expr::lit("us-west"),
+                ),
+            ),
+            (
+                "null between",
+                datafusion::logical_expr::col("region").between(
+                    Expr::Literal(ScalarValue::Utf8(None), None),
+                    datafusion::logical_expr::lit("us-west"),
+                ),
+            ),
+            (
+                "numeric between",
+                datafusion::logical_expr::col("region").between(
+                    datafusion::logical_expr::lit(7_i64),
+                    datafusion::logical_expr::lit("us-west"),
+                ),
             ),
         ];
 
@@ -1821,26 +1858,42 @@ mod tests {
             (
                 "less than",
                 "select id from orders where region < 'us-west'",
+                1,
                 vec!["part-00001.parquet", "part-00003.parquet"],
             ),
             (
                 "less than or equal",
                 "select id from orders where region <= 'us-east'",
+                1,
                 vec!["part-00001.parquet", "part-00003.parquet"],
             ),
             (
                 "greater than",
                 "select id from orders where region > 'us-east'",
+                1,
                 vec!["part-00000.parquet"],
             ),
             (
                 "reversed greater than",
                 "select id from orders where 'us-east' < region",
+                1,
                 vec!["part-00000.parquet"],
+            ),
+            (
+                "between",
+                "select id from orders where region between 'us-east' and 'us-west'",
+                2,
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not between",
+                "select id from orders where region not between 'us-east' and 'us-west'",
+                1,
+                vec!["part-00003.parquet"],
             ),
         ];
 
-        for (name, sql, expected_paths) in sql_cases {
+        for (name, sql, expected_exact_count, expected_paths) in sql_cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -1854,7 +1907,11 @@ mod tests {
                 "{name} unexpectedly kept a residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}: {plan_display}"
+            );
             assert_eq!(
                 scans[0]
                     .scan_plan()
@@ -1902,18 +1959,64 @@ mod tests {
         )?;
 
         let sql_cases = [
-            ("empty string", "select id from orders where region = ''"),
+            (
+                "empty string",
+                "select id from orders where region = ''",
+                0,
+                0,
+                false,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
             (
                 "empty string in",
                 "select id from orders where region in ('us-west', '')",
+                0,
+                0,
+                false,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
             ),
             (
                 "empty string comparison",
                 "select id from orders where region < ''",
+                0,
+                0,
+                false,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "empty string between",
+                "select id from orders where region between '' and 'us-west'",
+                1,
+                1,
+                true,
+                vec!["part-00000.parquet", "part-00002.parquet"],
             ),
         ];
 
-        for (name, sql) in sql_cases {
+        for (
+            name,
+            sql,
+            expected_exact_count,
+            expected_pushed_filter_count,
+            expected_metadata_filter,
+            expected_paths,
+        ) in sql_cases
+        {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -1927,25 +2030,22 @@ mod tests {
                 "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}: {plan_display}"
+            );
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name} unexpectedly built a partition metadata filter"
+                expected_pushed_filter_count,
+                "{name}: {plan_display}"
             );
             assert_eq!(
-                scan_file_paths(scans[0])?,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                    "part-00003.parquet",
-                ],
-                "{name}"
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                expected_metadata_filter,
+                "{name}: {plan_display}"
             );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
         }
 
         Ok(())
