@@ -2312,6 +2312,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integer_partition_boolean_composition_and_projection_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "integer-partition-boolean-composition",
+            INTEGER_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["long_part"]"#,
+            &[
+                r#""partitionValues":{"long_part":"7"}"#,
+                r#""partitionValues":{"long_part":"-1"}"#,
+                r#""partitionValues":{"long_part":"20"}"#,
+                r#""partitionValues":{"long_part":null}"#,
+                r#""partitionValues":{"long_part":""}"#,
+                r#""partitionValues":{"long_part":"not-an-integer"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let separate_and_filters = vec![
+            datafusion::logical_expr::col("long_part").gt_eq(datafusion::logical_expr::lit(-1_i64)),
+            datafusion::logical_expr::col("long_part").lt(datafusion::logical_expr::lit(20_i64)),
+        ];
+        let whole_and_filter = datafusion::logical_expr::col("long_part")
+            .gt_eq(datafusion::logical_expr::lit(-1_i64))
+            .and(
+                datafusion::logical_expr::col("long_part")
+                    .lt(datafusion::logical_expr::lit(20_i64)),
+            );
+        let whole_or_filter = datafusion::logical_expr::col("long_part")
+            .eq(datafusion::logical_expr::lit(7_i64))
+            .or(datafusion::logical_expr::col("long_part")
+                .eq(datafusion::logical_expr::lit(20_i64)));
+        let whole_not_filter = Expr::Not(Box::new(
+            datafusion::logical_expr::col("long_part").eq(datafusion::logical_expr::lit(7_i64)),
+        ));
+        let cases = [
+            (
+                "separate filters combine with and",
+                separate_and_filters,
+                2,
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "whole and",
+                vec![whole_and_filter],
+                1,
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "whole or",
+                vec![whole_or_filter],
+                1,
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "whole not",
+                vec![whole_not_filter],
+                1,
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, filters, expected_exact_count, expected_paths) in cases {
+            let filter_refs = filters.iter().collect::<Vec<_>>();
+            let support = provider.supports_filters_pushdown(&filter_refs)?;
+            assert_eq!(
+                support,
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().projected_schema.field(0).name(),
+                "id",
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn integer_partition_comparisons_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
