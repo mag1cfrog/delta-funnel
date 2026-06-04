@@ -531,6 +531,47 @@ mod tests {
     }
 
     #[test]
+    fn converts_integer_between_with_inclusive_and_negated_semantics() {
+        let between = predicate_expr(&col("id").between(lit(-1_i64), lit(7_i64)), &["id"]).unwrap();
+        let not_between =
+            predicate_expr(&col("id").not_between(lit(-1_i64), lit(7_i64)), &["id"]).unwrap();
+        let contradictory =
+            predicate_expr(&col("id").between(lit(10_i64), lit(-10_i64)), &["id"]).unwrap();
+        let contradictory_not =
+            predicate_expr(&col("id").not_between(lit(10_i64), lit(-10_i64)), &["id"]).unwrap();
+        let seven = values(&[("id", "7")]);
+        let negative_one = values(&[("id", "-1")]);
+        let twenty = values(&[("id", "20")]);
+        let raw_empty = values(&[("id", "")]);
+        let invalid_integer = values(&[("id", "not-an-integer")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&between, &seven));
+        assert!(matches_scan_file(&between, &negative_one));
+        assert!(!matches_scan_file(&between, &twenty));
+        assert!(!matches_scan_file(&between, &raw_empty));
+        assert!(!matches_scan_file(&between, &invalid_integer));
+        assert!(!matches_scan_file(&between, &missing));
+        assert!(!matches_scan_file(&not_between, &seven));
+        assert!(!matches_scan_file(&not_between, &negative_one));
+        assert!(matches_scan_file(&not_between, &twenty));
+        assert!(!matches_scan_file(&not_between, &raw_empty));
+        assert!(!matches_scan_file(&not_between, &invalid_integer));
+        assert!(!matches_scan_file(&not_between, &missing));
+        assert!(!matches_scan_file(&contradictory, &seven));
+        assert!(!matches_scan_file(&contradictory, &negative_one));
+        assert!(!matches_scan_file(&contradictory, &twenty));
+        assert!(matches_scan_file(&contradictory_not, &seven));
+        assert!(matches_scan_file(&contradictory_not, &negative_one));
+        assert!(matches_scan_file(&contradictory_not, &twenty));
+        assert!(!matches_scan_file(&contradictory_not, &raw_empty));
+        assert_eq!(
+            predicate_expr(&col("id").between(lit("1"), lit("9")), &["id"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+    }
+
+    #[test]
     fn converts_equality_for_non_empty_empty_and_reversed_string_literals() {
         let equals_west = predicate_expr(&col("region").eq(lit("us-west")), &["region"]).unwrap();
         let equals_empty = predicate_expr(&col("region").eq(lit("")), &["region"]).unwrap();

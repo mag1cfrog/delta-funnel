@@ -134,7 +134,7 @@ fn is_supported_partition_comparison(column: &Expr, literal: &Expr, schema: &Sch
     is_supported_partition_literal_for_column(column, literal, schema)
 }
 
-/// Accepts inclusive string partition ranges with proven non-empty literal bounds.
+/// Accepts inclusive partition ranges when both literal bounds are proven.
 fn is_supported_partition_between(filter: &Expr, schema: &SchemaRef) -> bool {
     let Expr::Between(between) = filter else {
         return false;
@@ -143,10 +143,7 @@ fn is_supported_partition_between(filter: &Expr, schema: &SchemaRef) -> bool {
         return false;
     };
 
-    // Integer range predicates will be promoted in the next slice. Until then,
-    // only string partition ranges retain the exactness already proven.
-    is_string_partition_column(column, schema)
-        && is_supported_partition_literal_for_column(column, between.low.as_ref(), schema)
+    is_supported_partition_literal_for_column(column, between.low.as_ref(), schema)
         && is_supported_partition_literal_for_column(column, between.high.as_ref(), schema)
 }
 
@@ -221,16 +218,6 @@ fn is_supported_partition_column_type(column: &Column, schema: &SchemaRef) -> bo
     schema
         .field_with_name(&column.name)
         .is_ok_and(|field| supports_partition_metadata_logical_type(field.data_type()))
-}
-
-fn is_string_partition_column(column: &Column, schema: &SchemaRef) -> bool {
-    if !is_supported_partition_column_type(column, schema) {
-        return false;
-    }
-
-    schema
-        .field_with_name(&column.name)
-        .is_ok_and(|field| matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8))
 }
 
 /// Restricts operators to type/literal pairs whose exactness is proven.
@@ -579,12 +566,14 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_accepts_string_partition_between() {
+    fn partition_operator_planner_accepts_string_and_integer_partition_between() {
         let schema = schema();
-        let partition_columns = partition_columns(&["region"]);
+        let partition_columns = partition_columns(&["region", "id"]);
         let filters = [
             col("region").between(lit("a"), lit("z")),
             col("region").not_between(lit("a"), lit("z")),
+            col("id").between(lit(1_i64), lit(9_i64)),
+            col("id").not_between(lit(1_i64), lit(9_i64)),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
@@ -700,7 +689,7 @@ mod tests {
             col("region").between(Expr::Literal(ScalarValue::Utf8(None), None), lit("us-west"));
         let numeric_comparison = col("region").lt(lit(7_i64));
         let numeric_between = col("region").between(lit(7_i64), lit("us-west"));
-        let non_string_partition_between = col("id").between(lit(1_i64), lit(9_i64));
+        let integer_partition_with_string_between = col("id").between(lit("1"), lit("9"));
         let non_literal_between = col("region").between(col("day"), lit("us-west"));
         let mixed_and = col("region")
             .eq(lit("us-west"))
@@ -720,7 +709,7 @@ mod tests {
                 &null_between,
                 &numeric_comparison,
                 &numeric_between,
-                &non_string_partition_between,
+                &integer_partition_with_string_between,
                 &non_literal_between,
                 &mixed_and,
                 &mixed_or,
