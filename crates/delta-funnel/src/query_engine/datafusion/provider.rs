@@ -717,6 +717,42 @@ mod tests {
                     "part-00003.parquet",
                 ],
             ),
+            (
+                "not equality",
+                datafusion::logical_expr::col("region")
+                    .not_eq(datafusion::logical_expr::lit("us-west")),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not equality expression",
+                Expr::Not(Box::new(
+                    datafusion::logical_expr::col("region")
+                        .eq(datafusion::logical_expr::lit("us-west")),
+                )),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not in list",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        datafusion::logical_expr::lit("us-east"),
+                    ],
+                    true,
+                ),
+                vec!["part-00003.parquet"],
+            ),
+            (
+                "not in expression",
+                Expr::Not(Box::new(datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        datafusion::logical_expr::lit("us-east"),
+                    ],
+                    false,
+                ))),
+                vec!["part-00003.parquet"],
+            ),
         ];
 
         for (name, filter, expected_paths) in cases {
@@ -861,9 +897,14 @@ mod tests {
                 ),
             ),
             (
-                "not in",
-                datafusion::logical_expr::col("region")
-                    .in_list(vec![datafusion::logical_expr::lit("us-west")], true),
+                "not in with null",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        Expr::Literal(ScalarValue::Utf8(None), None),
+                    ],
+                    true,
+                ),
             ),
         ];
 
@@ -884,16 +925,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_provider_scan_rejects_unproven_negated_partition_filters()
+    async fn table_provider_scan_rejects_unsafe_negated_partition_filters()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "table-provider-unproven-negated-partition-filters",
+            "table-provider-unsafe-negated-partition-filters",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             &[
                 r#""partitionValues":{"region":"us-west"}"#,
-                r#""partitionValues":{"region":null}"#,
-                r#""partitionValues":{}"#,
+                r#""partitionValues":{"region":""}"#,
             ],
         )?;
         let source = load_delta_source(DeltaSourceConfig {
@@ -906,16 +946,25 @@ mod tests {
         let state = SessionContext::new().state();
         let filters = vec![
             (
-                "not equality",
+                "not empty string equality",
                 Expr::Not(Box::new(
-                    datafusion::logical_expr::col("region")
-                        .eq(datafusion::logical_expr::lit("us-west")),
+                    datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("")),
                 )),
             ),
             (
-                "not in",
+                "empty string not in",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        datafusion::logical_expr::lit(""),
+                    ],
+                    true,
+                ),
+            ),
+            (
+                "non literal not in",
                 datafusion::logical_expr::col("region")
-                    .in_list(vec![datafusion::logical_expr::lit("us-west")], true),
+                    .in_list(vec![datafusion::logical_expr::col("id")], true),
             ),
         ];
 
@@ -1395,7 +1444,7 @@ mod tests {
             (
                 "not in",
                 "select id from orders where region not in ('us-west')",
-                ExpectedInProbe::ResidualFilter,
+                ExpectedInProbe::ExactAfterRewrite,
             ),
         ];
 
@@ -1624,7 +1673,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_null_sensitive_partition_filters_stay_residual_without_kernel_pruning()
+    async fn sql_negated_partition_filters_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-negated-partition-filters-exact",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{"region":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let sql_cases = [
+            (
+                "not equality",
+                "select id from orders where region != 'us-west'",
+                1,
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not equality expression",
+                "select id from orders where not(region = 'us-west')",
+                1,
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not in",
+                "select id from orders where region not in ('us-west', 'us-east')",
+                2,
+                vec!["part-00003.parquet"],
+            ),
+        ];
+
+        for (name, sql, expected_exact_count, expected_paths) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_empty_string_partition_filters_stay_residual_without_kernel_pruning()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -1653,14 +1789,6 @@ mod tests {
         )?;
 
         let sql_cases = [
-            (
-                "not equality",
-                "select id from orders where not(region = 'us-west')",
-            ),
-            (
-                "not in",
-                "select id from orders where region not in ('us-west')",
-            ),
             ("empty string", "select id from orders where region = ''"),
             (
                 "empty string in",

@@ -97,10 +97,10 @@ impl DeltaPartitionMetadataPredicate {
     /// Converts a supported DataFusion expression into a metadata predicate.
     ///
     /// The current policy supports string partition columns, string equality,
-    /// non-negated string `IN`, `IS NULL`, `IS NOT NULL`, and boolean
-    /// composition over supported child predicates. Unsupported expressions
-    /// return a typed error so the caller can keep DataFusion residual
-    /// filtering instead of guessing.
+    /// string inequality, `IN`, `NOT IN`, `IS NULL`, `IS NOT NULL`, negation,
+    /// and boolean composition over supported child predicates. Unsupported
+    /// expressions return a typed error so the caller can keep DataFusion
+    /// residual filtering instead of guessing.
     pub(crate) fn from_datafusion_expr(
         expr: &Expr,
         logical_schema: &SchemaRef,
@@ -292,6 +292,24 @@ fn convert_expr(
             )
             .map_err(|_| left_error)
         }),
+        Expr::BinaryExpr(binary) if binary.op == Operator::NotEq => convert_equality(
+            binary.left.as_ref(),
+            binary.right.as_ref(),
+            logical_schema,
+            partition_columns,
+            physical_name_lookup,
+        )
+        .or_else(|left_error| {
+            convert_equality(
+                binary.right.as_ref(),
+                binary.left.as_ref(),
+                logical_schema,
+                partition_columns,
+                physical_name_lookup,
+            )
+            .map_err(|_| left_error)
+        })
+        .map(|expr| PartitionMetadataExpr::Not(Box::new(expr))),
         Expr::BinaryExpr(_) => Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator),
         Expr::InList(in_list) => convert_in_list(
             in_list.expr.as_ref(),
@@ -331,11 +349,11 @@ fn convert_in_list(
     partition_columns: &HashSet<String>,
     physical_name_lookup: &DeltaPartitionNameMap,
 ) -> Result<PartitionMetadataExpr, DeltaPartitionMetadataPredicateError> {
-    if negated || literals.is_empty() {
+    if literals.is_empty() {
         return Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression);
     }
 
-    Ok(PartitionMetadataExpr::In {
+    let expr = PartitionMetadataExpr::In {
         column: convert_column(
             column,
             logical_schema,
@@ -346,7 +364,13 @@ fn convert_in_list(
             .iter()
             .map(convert_string_literal)
             .collect::<Result<HashSet<_>, _>>()?,
-    })
+    };
+
+    if negated {
+        Ok(PartitionMetadataExpr::Not(Box::new(expr)))
+    } else {
+        Ok(expr)
+    }
 }
 
 fn convert_equality(
@@ -561,6 +585,29 @@ mod tests {
     }
 
     #[test]
+    fn negated_equality_and_in_list_use_sql_null_semantics() {
+        let not_eq = predicate(&col("region").not_eq(lit("us-west")), &["region"]).unwrap();
+        let not_in = predicate(
+            &col("region").in_list(vec![lit("us-west"), lit("us-east")], true),
+            &["region"],
+        )
+        .unwrap();
+        let west = values(&[("region", "us-west")]);
+        let east = values(&[("region", "us-east")]);
+        let empty = values(&[("region", "")]);
+        let missing = HashMap::new();
+
+        assert!(!not_eq.matches_scan_file(&west));
+        assert!(not_eq.matches_scan_file(&east));
+        assert!(not_eq.matches_scan_file(&empty));
+        assert!(!not_eq.matches_scan_file(&missing));
+        assert!(!not_in.matches_scan_file(&west));
+        assert!(!not_in.matches_scan_file(&east));
+        assert!(not_in.matches_scan_file(&empty));
+        assert!(!not_in.matches_scan_file(&missing));
+    }
+
+    #[test]
     fn boolean_composition_uses_sql_three_valued_logic() {
         let filter = col("region")
             .eq(lit("us-west"))
@@ -605,13 +652,11 @@ mod tests {
         let dotted = col("region.value").eq(lit("us-west"));
         let non_partition = col("id").eq(lit("1"));
         let null_literal = col("region").eq(Expr::Literal(ScalarValue::Utf8(None), None));
-        let not_eq = col("region").not_eq(lit("us-west"));
         let empty_in = col("region").in_list(Vec::<Expr>::new(), false);
         let null_in = col("region").in_list(
             vec![lit("us-west"), Expr::Literal(ScalarValue::Utf8(None), None)],
             false,
         );
-        let negated_in = col("region").in_list(vec![lit("us-west")], true);
         let non_literal_in = col("region").in_list(vec![col("day")], false);
 
         assert_eq!(
@@ -661,15 +706,6 @@ mod tests {
         );
         assert_eq!(
             DeltaPartitionMetadataPredicate::from_datafusion_expr(
-                &not_eq,
-                &schema,
-                &region_partition_columns,
-                &name_map,
-            ),
-            Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator)
-        );
-        assert_eq!(
-            DeltaPartitionMetadataPredicate::from_datafusion_expr(
                 &empty_in,
                 &schema,
                 &region_partition_columns,
@@ -685,15 +721,6 @@ mod tests {
                 &name_map,
             ),
             Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
-        );
-        assert_eq!(
-            DeltaPartitionMetadataPredicate::from_datafusion_expr(
-                &negated_in,
-                &schema,
-                &region_partition_columns,
-                &name_map,
-            ),
-            Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression)
         );
         assert_eq!(
             DeltaPartitionMetadataPredicate::from_datafusion_expr(
