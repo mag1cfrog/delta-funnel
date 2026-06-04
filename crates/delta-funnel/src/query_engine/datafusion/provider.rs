@@ -405,6 +405,8 @@ mod tests {
     };
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
+    const INTEGER_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]"#;
+
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -2135,6 +2137,96 @@ mod tests {
         assert_eq!(schema.field(0).data_type(), &DataType::Int32);
         assert_eq!(schema.field(1).name(), "region");
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+
+        Ok(())
+    }
+
+    #[test]
+    fn integer_partition_schema_maps_delta_types_to_arrow_widths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "integer-partition-schema",
+            INTEGER_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["byte_part","short_part","int_part","long_part"]"#,
+            r#""partitionValues":{"byte_part":"-8","short_part":"-1024","int_part":"0","long_part":"9223372036854775807"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let schema = provider.schema();
+
+        assert_eq!(
+            schema.field_with_name("byte_part")?.data_type(),
+            &DataType::Int8
+        );
+        assert_eq!(
+            schema.field_with_name("short_part")?.data_type(),
+            &DataType::Int16
+        );
+        assert_eq!(
+            schema.field_with_name("int_part")?.data_type(),
+            &DataType::Int32
+        );
+        assert_eq!(
+            schema.field_with_name("long_part")?.data_type(),
+            &DataType::Int64
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn integer_partition_filters_remain_unsupported_until_typed_metadata_support()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "integer-partition-unsupported-boundary",
+            INTEGER_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["byte_part","short_part","int_part","long_part"]"#,
+            r#""partitionValues":{"byte_part":"7","short_part":"1024","int_part":"0","long_part":"9223372036854775807"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let filters = [
+            datafusion::logical_expr::col("byte_part").eq(datafusion::logical_expr::lit(7_i8)),
+            datafusion::logical_expr::col("short_part")
+                .not_eq(datafusion::logical_expr::lit(1024_i16)),
+            datafusion::logical_expr::col("int_part").lt(datafusion::logical_expr::lit(10_i32)),
+            datafusion::logical_expr::col("long_part").in_list(
+                vec![
+                    datafusion::logical_expr::lit(0_i64),
+                    datafusion::logical_expr::lit(9223372036854775807_i64),
+                ],
+                false,
+            ),
+            datafusion::logical_expr::col("int_part").between(
+                datafusion::logical_expr::lit(-10_i32),
+                datafusion::logical_expr::lit(10_i32),
+            ),
+            datafusion::logical_expr::col("long_part").is_null(),
+            datafusion::logical_expr::col("long_part").is_not_null(),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
 
         Ok(())
     }
