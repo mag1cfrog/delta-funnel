@@ -3,7 +3,7 @@
 use crate::DeltaFunnelError;
 
 mod kernel;
-mod partition_metadata;
+mod partition_metadata_predicate;
 mod protocol;
 mod snapshot;
 mod uri;
@@ -13,7 +13,7 @@ use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{
     DeltaKernelPredicate, DeltaKernelPredicateAdapterError, datafusion_expr_to_kernel_predicate,
 };
-pub(crate) use partition_metadata::{
+pub(crate) use partition_metadata_predicate::{
     DeltaPartitionMetadataPredicate, DeltaPartitionNameMap,
     supports_partition_metadata_logical_type,
 };
