@@ -44,7 +44,7 @@ impl PartitionMetadataValueKind {
             Self::SignedInteger { min, max } => raw_value
                 .parse::<i64>()
                 .ok()
-                .filter(|value| (min..=max).contains(value))
+                .filter(|value| min <= *value && *value <= max)
                 .map(PartitionScalar::SignedInteger),
         }
     }

@@ -131,11 +131,7 @@ fn is_supported_partition_comparison(column: &Expr, literal: &Expr, schema: &Sch
         return false;
     };
 
-    // Integer ordering will be promoted in the next slice. Keep the temporary
-    // exclusion here so the shared literal helper stays named for its stable
-    // role instead of for this operator-specific gap.
-    is_string_partition_column(column, schema)
-        && is_supported_partition_literal_for_column(column, literal, schema)
+    is_supported_partition_literal_for_column(column, literal, schema)
 }
 
 /// Accepts inclusive string partition ranges with proven non-empty literal bounds.
@@ -263,7 +259,7 @@ fn is_supported_partition_literal_for_column(
         ) => !value.is_empty(),
         (data_type, literal) => signed_integer_bounds(data_type)
             .zip(signed_integer_literal_value(literal))
-            .is_some_and(|((min, max), value)| (min..=max).contains(&value)),
+            .is_some_and(|((min, max), value)| min <= value && value <= max),
     }
 }
 
@@ -551,6 +547,38 @@ mod tests {
     }
 
     #[test]
+    fn partition_operator_planner_accepts_integer_partition_comparisons() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["id"]);
+        let filters = [
+            col("id").lt(lit(10_i64)),
+            col("id").lt_eq(lit(10_i64)),
+            col("id").gt(lit(-10_i64)),
+            col("id").gt_eq(lit(-10_i64)),
+            lit(10_i64).gt(col("id")),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+                && decision.kernel_predicate.adapter_error.is_none()
+        }));
+    }
+
+    #[test]
     fn partition_operator_planner_accepts_string_partition_between() {
         let schema = schema();
         let partition_columns = partition_columns(&["region"]);
@@ -672,10 +700,14 @@ mod tests {
             col("region").between(Expr::Literal(ScalarValue::Utf8(None), None), lit("us-west"));
         let numeric_comparison = col("region").lt(lit(7_i64));
         let numeric_between = col("region").between(lit(7_i64), lit("us-west"));
-        let non_string_partition_between = col("id").between(lit("1"), lit("9"));
+        let non_string_partition_between = col("id").between(lit(1_i64), lit(9_i64));
         let non_literal_between = col("region").between(col("day"), lit("us-west"));
-        let mixed_and = col("region").eq(lit("us-west")).and(col("id").gt(lit(10)));
-        let mixed_or = col("region").eq(lit("us-west")).or(col("id").gt(lit(10)));
+        let mixed_and = col("region")
+            .eq(lit("us-west"))
+            .and(col("day").gt(lit("2026-01-01")));
+        let mixed_or = col("region")
+            .eq(lit("us-west"))
+            .or(col("day").gt(lit("2026-01-01")));
         let not_filter = Expr::Not(Box::new(col("id").eq(lit("7"))));
         let null_literal = col("region").eq(Expr::Literal(ScalarValue::Utf8(None), None));
 

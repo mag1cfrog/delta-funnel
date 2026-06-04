@@ -257,16 +257,6 @@ fn convert_comparison(
         partition_columns,
         physical_name_lookup,
     )?;
-    // Integer ordering will be promoted in the next slice. Keep the temporary
-    // exclusion local to comparison conversion so the shared literal converter
-    // can keep its stable, operator-neutral role.
-    if matches!(
-        column.value_kind(),
-        PartitionMetadataValueKind::SignedInteger { .. }
-    ) {
-        return Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral);
-    }
-
     Ok(PartitionMetadataExpr::Compare {
         literal: convert_partition_literal(literal, column.value_kind())?,
         column,
@@ -349,7 +339,7 @@ fn convert_partition_literal(
         },
         PartitionMetadataValueKind::SignedInteger { min, max } => {
             convert_signed_integer_literal(expr)
-                .filter(|value| (min..=max).contains(value))
+                .filter(|value| min <= *value && *value <= max)
                 .map(PartitionScalar::SignedInteger)
                 .ok_or(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
         }
@@ -381,6 +371,7 @@ mod tests {
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
+            Field::new("small_id", DataType::Int8, false),
             Field::new("region", DataType::Utf8, true),
             Field::new("day", DataType::LargeUtf8, true),
         ]))
@@ -502,6 +493,39 @@ mod tests {
                 &col("id").eq(Expr::Literal(ScalarValue::Int64(None), None)),
                 &["id"]
             ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+    }
+
+    #[test]
+    fn converts_integer_comparisons_with_typed_ordering_and_width_bounds() {
+        let lt = predicate_expr(&col("id").lt(lit(7_i64)), &["id"]).unwrap();
+        let lt_eq = predicate_expr(&col("id").lt_eq(lit(-1_i64)), &["id"]).unwrap();
+        let gt = predicate_expr(&col("id").gt(lit(-1_i64)), &["id"]).unwrap();
+        let gt_eq = predicate_expr(&lit(7_i64).lt_eq(col("id")), &["id"]).unwrap();
+        let seven = values(&[("id", "7")]);
+        let negative_one = values(&[("id", "-1")]);
+        let raw_empty = values(&[("id", "")]);
+        let invalid_integer = values(&[("id", "not-an-integer")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&lt, &seven));
+        assert!(matches_scan_file(&lt, &negative_one));
+        assert!(matches_scan_file(&lt_eq, &negative_one));
+        assert!(!matches_scan_file(&lt_eq, &seven));
+        assert!(matches_scan_file(&gt, &seven));
+        assert!(!matches_scan_file(&gt, &negative_one));
+        assert!(matches_scan_file(&gt_eq, &seven));
+        assert!(!matches_scan_file(&gt_eq, &negative_one));
+        assert!(!matches_scan_file(&lt, &raw_empty));
+        assert!(!matches_scan_file(&lt, &invalid_integer));
+        assert!(!matches_scan_file(&lt, &missing));
+        assert_eq!(
+            predicate_expr(&col("id").lt(lit("7")), &["id"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(&col("small_id").lt(lit(128_i16)), &["small_id"]),
             Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
         );
     }
