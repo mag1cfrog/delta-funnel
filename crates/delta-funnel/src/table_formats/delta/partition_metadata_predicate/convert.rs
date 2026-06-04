@@ -8,6 +8,7 @@ use snafu::Snafu;
 use super::expr::{PartitionComparisonOperator, PartitionMetadataExpr};
 use super::names::{DeltaPartitionNameMap, PhysicalPartitionColumn};
 use super::supports_partition_metadata_logical_type;
+use super::value::{PartitionMetadataValueKind, PartitionScalar};
 
 /// Typed rejection from the provider-owned partition metadata evaluator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Snafu)]
@@ -221,16 +222,17 @@ fn convert_in_list(
         return Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression);
     }
 
+    let column = convert_column(
+        column,
+        logical_schema,
+        partition_columns,
+        physical_name_lookup,
+    )?;
     let expr = PartitionMetadataExpr::In {
-        column: convert_column(
-            column,
-            logical_schema,
-            partition_columns,
-            physical_name_lookup,
-        )?,
+        column: column.clone(),
         literals: literals
             .iter()
-            .map(convert_string_literal)
+            .map(|literal| convert_partition_literal(literal, column.value_kind()))
             .collect::<Result<HashSet<_>, _>>()?,
     };
 
@@ -249,15 +251,16 @@ fn convert_comparison(
     partition_columns: &HashSet<String>,
     physical_name_lookup: &DeltaPartitionNameMap,
 ) -> Result<PartitionMetadataExpr, DeltaPartitionMetadataPredicateError> {
+    let column = convert_column(
+        column,
+        logical_schema,
+        partition_columns,
+        physical_name_lookup,
+    )?;
     Ok(PartitionMetadataExpr::Compare {
-        column: convert_column(
-            column,
-            logical_schema,
-            partition_columns,
-            physical_name_lookup,
-        )?,
+        literal: convert_partition_literal(literal, column.value_kind())?,
+        column,
         op,
-        literal: convert_string_literal(literal)?,
     })
 }
 
@@ -268,14 +271,15 @@ fn convert_equality(
     partition_columns: &HashSet<String>,
     physical_name_lookup: &DeltaPartitionNameMap,
 ) -> Result<PartitionMetadataExpr, DeltaPartitionMetadataPredicateError> {
+    let column = convert_column(
+        column,
+        logical_schema,
+        partition_columns,
+        physical_name_lookup,
+    )?;
     Ok(PartitionMetadataExpr::Eq {
-        column: convert_column(
-            column,
-            logical_schema,
-            partition_columns,
-            physical_name_lookup,
-        )?,
-        literal: convert_string_literal(literal)?,
+        literal: convert_partition_literal(literal, column.value_kind())?,
+        column,
     })
 }
 
@@ -300,12 +304,17 @@ fn convert_column(
     if !supports_partition_metadata_logical_type(field.data_type()) {
         return Err(DeltaPartitionMetadataPredicateError::UnsupportedColumnType);
     }
+    let value_kind = PartitionMetadataValueKind::from_supported_data_type(field.data_type())
+        .ok_or(DeltaPartitionMetadataPredicateError::UnsupportedColumnType)?;
 
     let physical_name = physical_name_lookup
         .physical_name(logical_name)
         .ok_or(DeltaPartitionMetadataPredicateError::MissingPhysicalName)?;
 
-    Ok(PhysicalPartitionColumn::new(physical_name.to_owned()))
+    Ok(PhysicalPartitionColumn::new(
+        physical_name.to_owned(),
+        value_kind,
+    ))
 }
 
 fn top_level_column_name(column: &Column) -> Result<&str, DeltaPartitionMetadataPredicateError> {
@@ -316,11 +325,18 @@ fn top_level_column_name(column: &Column) -> Result<&str, DeltaPartitionMetadata
     }
 }
 
-fn convert_string_literal(expr: &Expr) -> Result<String, DeltaPartitionMetadataPredicateError> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(value)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _) => Ok(value.clone()),
-        _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+fn convert_partition_literal(
+    expr: &Expr,
+    value_kind: PartitionMetadataValueKind,
+) -> Result<PartitionScalar, DeltaPartitionMetadataPredicateError> {
+    match value_kind {
+        PartitionMetadataValueKind::String => match expr {
+            Expr::Literal(ScalarValue::Utf8(Some(value)), _)
+            | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _) => {
+                Ok(PartitionScalar::String(value.clone()))
+            }
+            _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+        },
     }
 }
 

@@ -2,21 +2,22 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use super::names::PhysicalPartitionColumn;
+use super::value::PartitionScalar;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PartitionMetadataExpr {
     Eq {
         column: PhysicalPartitionColumn,
-        literal: String,
+        literal: PartitionScalar,
     },
     Compare {
         column: PhysicalPartitionColumn,
         op: PartitionComparisonOperator,
-        literal: String,
+        literal: PartitionScalar,
     },
     In {
         column: PhysicalPartitionColumn,
-        literals: HashSet<String>,
+        literals: HashSet<PartitionScalar>,
     },
     IsNull(PhysicalPartitionColumn),
     IsNotNull(PhysicalPartitionColumn),
@@ -30,7 +31,8 @@ impl PartitionMetadataExpr {
         match self {
             Self::Eq { column, literal } => column
                 .value(partition_values)
-                .map(|value| SqlBool::from(value == literal.as_str()))
+                .and_then(|value| column.value_kind().parse_raw(value))
+                .map(|value| SqlBool::from(value == *literal))
                 .unwrap_or(SqlBool::Null),
             Self::Compare {
                 column,
@@ -38,11 +40,14 @@ impl PartitionMetadataExpr {
                 literal,
             } => column
                 .value(partition_values)
-                .map(|value| SqlBool::from(op.matches(value.cmp(literal.as_str()))))
+                .and_then(|value| column.value_kind().parse_raw(value))
+                .and_then(|value| value.compare(literal))
+                .map(|ordering| SqlBool::from(op.matches(ordering)))
                 .unwrap_or(SqlBool::Null),
             Self::In { column, literals } => column
                 .value(partition_values)
-                .map(|value| SqlBool::from(literals.contains(value)))
+                .and_then(|value| column.value_kind().parse_raw(value))
+                .map(|value| SqlBool::from(literals.contains(&value)))
                 .unwrap_or(SqlBool::Null),
             Self::IsNull(column) => SqlBool::from(column.value(partition_values).is_none()),
             Self::IsNotNull(column) => SqlBool::from(column.value(partition_values).is_some()),

@@ -12,11 +12,13 @@ use datafusion::logical_expr::Expr;
 mod convert;
 mod expr;
 mod names;
+mod value;
 
 pub(crate) use convert::DeltaPartitionMetadataPredicateError;
 use convert::convert_expr;
 use expr::{PartitionMetadataExpr, SqlBool};
 pub(crate) use names::DeltaPartitionNameMap;
+use value::PartitionMetadataValueKind;
 
 /// Returns whether this provider can evaluate a Delta partition column type from metadata.
 ///
@@ -28,7 +30,7 @@ pub(crate) use names::DeltaPartitionNameMap;
 /// update for both support planning and metadata evaluation.
 #[must_use]
 pub(crate) fn supports_partition_metadata_logical_type(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Utf8 | DataType::LargeUtf8)
+    PartitionMetadataValueKind::from_supported_data_type(data_type).is_some()
 }
 
 /// Provider-owned predicate over serialized Delta partition metadata.
