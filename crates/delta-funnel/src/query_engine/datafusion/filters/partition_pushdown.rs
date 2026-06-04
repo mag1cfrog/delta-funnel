@@ -165,14 +165,14 @@ fn is_supported_partition_column_literal_pair(
     is_supported_partition_literal_for_column(column, literal, schema)
 }
 
-/// Accepts an `IN` or `NOT IN` list for non-empty string partition literals.
+/// Accepts an `IN` or `NOT IN` list for proven partition literals.
 ///
 /// `IN` is the first operator promoted after equality because it is equivalent
-/// to a disjunction of equality checks for this non-empty, non-null string
-/// literal subset. `NOT IN` is represented by the provider metadata evaluator
-/// as `NOT(IN(...))`, preserving SQL null propagation. Empty, null-containing,
-/// empty-string, or non-literal lists remain unsupported until their metadata
-/// semantics are proven.
+/// to a disjunction of equality checks for this non-empty, non-null literal
+/// subset. `NOT IN` is represented by the provider metadata evaluator as
+/// `NOT(IN(...))`, preserving SQL null propagation. Empty, null-containing,
+/// empty-string, mixed-type, or non-literal lists remain unsupported until
+/// their metadata semantics are proven.
 fn is_supported_partition_in_list(filter: &Expr, schema: &SchemaRef) -> bool {
     let Expr::InList(in_list) = filter else {
         return false;
@@ -204,7 +204,7 @@ fn is_supported_partition_null_check(expr: &Expr, schema: &SchemaRef) -> bool {
     is_supported_partition_column_type(column, schema)
 }
 
-/// Restricts current exactness to string-typed logical partition columns.
+/// Restricts current exactness to supported logical partition column types.
 ///
 /// Delta serializes all partition values as text in the log, but this check is
 /// about the logical table schema type. The supported type set is centralized

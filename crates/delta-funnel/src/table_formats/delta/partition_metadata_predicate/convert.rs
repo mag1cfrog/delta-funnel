@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_integer_null_checks_without_promoting_integer_literals() {
+    fn converts_integer_null_checks_with_sql_metadata_semantics() {
         let is_null = predicate_expr(&col("id").is_null(), &["id"]).unwrap();
         let is_not_null = predicate_expr(&col("id").is_not_null(), &["id"]).unwrap();
         let normal = values(&[("id", "7")]);
