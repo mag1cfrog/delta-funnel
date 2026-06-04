@@ -391,6 +391,7 @@ mod tests {
     use datafusion::common::{DataFusionError, ScalarValue};
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::datasource::{TableProvider, TableType};
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
 
@@ -2215,6 +2216,120 @@ mod tests {
         assert_eq!(plan.exact_count, 0);
         assert_eq!(plan.unsupported_count, filters.len());
         assert_eq!(plan.residual_filter_count, filters.len());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn integer_partition_unsafe_direct_shapes_are_rejected_at_scan_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "integer-partition-unsafe-direct-shapes",
+            INTEGER_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["long_part"]"#,
+            r#""partitionValues":{"long_part":"7"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let scalar_udf = create_udf(
+            "integer_identity_for_pushdown_boundary",
+            vec![DataType::Int64],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(7))))),
+        );
+        let scalar_function =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![datafusion::logical_expr::col("long_part")],
+            ));
+        let filters = vec![
+            (
+                "null equality",
+                datafusion::logical_expr::col("long_part")
+                    .eq(Expr::Literal(ScalarValue::Int64(None), None)),
+            ),
+            (
+                "empty in",
+                datafusion::logical_expr::col("long_part").in_list(Vec::<Expr>::new(), false),
+            ),
+            (
+                "null in",
+                datafusion::logical_expr::col("long_part").in_list(
+                    vec![
+                        datafusion::logical_expr::lit(7_i64),
+                        Expr::Literal(ScalarValue::Int64(None), None),
+                    ],
+                    false,
+                ),
+            ),
+            (
+                "mixed string numeric in",
+                datafusion::logical_expr::col("long_part").in_list(
+                    vec![
+                        datafusion::logical_expr::lit(7_i64),
+                        datafusion::logical_expr::lit("7"),
+                    ],
+                    false,
+                ),
+            ),
+            (
+                "non literal in",
+                datafusion::logical_expr::col("long_part")
+                    .in_list(vec![datafusion::logical_expr::col("id")], false),
+            ),
+            (
+                "null between",
+                datafusion::logical_expr::col("long_part").between(
+                    Expr::Literal(ScalarValue::Int64(None), None),
+                    datafusion::logical_expr::lit(10_i64),
+                ),
+            ),
+            (
+                "non literal between",
+                datafusion::logical_expr::col("long_part").between(
+                    datafusion::logical_expr::col("id"),
+                    datafusion::logical_expr::lit(10_i64),
+                ),
+            ),
+            (
+                "cast operand",
+                datafusion::logical_expr::col("long_part").eq(datafusion::logical_expr::cast(
+                    datafusion::logical_expr::lit(7_i64),
+                    DataType::Int64,
+                )),
+            ),
+            (
+                "scalar function operand",
+                datafusion::logical_expr::col("long_part").eq(scalar_function),
+            ),
+        ];
+        let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
 
         Ok(())
     }

@@ -801,6 +801,17 @@ mod tests {
         let null_between =
             col("region").between(Expr::Literal(ScalarValue::Utf8(None), None), lit("us-west"));
         let non_literal_between = col("region").between(col("day"), lit("us-west"));
+        let integer_null_in = col("id").in_list(
+            vec![lit(7_i64), Expr::Literal(ScalarValue::Int64(None), None)],
+            false,
+        );
+        let integer_mixed_type_in = col("id").in_list(vec![lit(7_i64), lit("7")], false);
+        let integer_non_literal_in = col("id").in_list(vec![col("region")], false);
+        let integer_null_between =
+            col("id").between(Expr::Literal(ScalarValue::Int64(None), None), lit(9_i64));
+        let integer_non_literal_between = col("id").between(col("region"), lit(9_i64));
+        let integer_cast_operand =
+            col("id").eq(datafusion::logical_expr::cast(lit(7_i64), DataType::Int64));
 
         assert_eq!(
             convert_expr(&qualified, &schema, &region_partition_columns, &name_map),
@@ -868,6 +879,60 @@ mod tests {
                 &schema,
                 &region_partition_columns,
                 &name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            convert_expr(
+                &integer_null_in,
+                &schema,
+                &id_partition_columns,
+                &id_name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            convert_expr(
+                &integer_mixed_type_in,
+                &schema,
+                &id_partition_columns,
+                &id_name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            convert_expr(
+                &integer_non_literal_in,
+                &schema,
+                &id_partition_columns,
+                &id_name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            convert_expr(
+                &integer_null_between,
+                &schema,
+                &id_partition_columns,
+                &id_name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            convert_expr(
+                &integer_non_literal_between,
+                &schema,
+                &id_partition_columns,
+                &id_name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            convert_expr(
+                &integer_cast_operand,
+                &schema,
+                &id_partition_columns,
+                &id_name_map,
             ),
             Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
         );
