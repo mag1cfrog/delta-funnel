@@ -127,7 +127,15 @@ fn is_supported_partition_operator_filter(filter: &Expr, schema: &SchemaRef) -> 
 
 /// Accepts one column/literal range comparison if the current type policy can prove it.
 fn is_supported_partition_comparison(column: &Expr, literal: &Expr, schema: &SchemaRef) -> bool {
-    is_supported_partition_column_literal_pair(column, literal, schema)
+    let Expr::Column(column) = column else {
+        return false;
+    };
+
+    // Integer ordering will be promoted in the next slice. Keep the temporary
+    // exclusion here so the shared literal helper stays named for its stable
+    // role instead of for this operator-specific gap.
+    is_string_partition_column(column, schema)
+        && is_supported_partition_literal_for_column(column, literal, schema)
 }
 
 /// Accepts inclusive string partition ranges with proven non-empty literal bounds.
@@ -139,7 +147,10 @@ fn is_supported_partition_between(filter: &Expr, schema: &SchemaRef) -> bool {
         return false;
     };
 
-    is_supported_partition_literal_for_column(column, between.low.as_ref(), schema)
+    // Integer range predicates will be promoted in the next slice. Until then,
+    // only string partition ranges retain the exactness already proven.
+    is_string_partition_column(column, schema)
+        && is_supported_partition_literal_for_column(column, between.low.as_ref(), schema)
         && is_supported_partition_literal_for_column(column, between.high.as_ref(), schema)
 }
 
@@ -216,7 +227,17 @@ fn is_supported_partition_column_type(column: &Column, schema: &SchemaRef) -> bo
         .is_ok_and(|field| supports_partition_metadata_logical_type(field.data_type()))
 }
 
-/// Restricts literal operators to type/literal pairs whose exactness is proven.
+fn is_string_partition_column(column: &Column, schema: &SchemaRef) -> bool {
+    if !is_supported_partition_column_type(column, schema) {
+        return false;
+    }
+
+    schema
+        .field_with_name(&column.name)
+        .is_ok_and(|field| matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8))
+}
+
+/// Restricts operators to type/literal pairs whose exactness is proven.
 ///
 /// This must evolve together with `is_supported_partition_column_type`; exact
 /// pushdown should only be claimed for type pairs whose Delta partition
@@ -234,16 +255,35 @@ fn is_supported_partition_literal_for_column(
         return false;
     };
 
-    // Integer columns are admitted by the central type gate for null checks,
-    // but literal operators stay string-only until integer literal coercion is
-    // proven in a later slice.
     match (field.data_type(), literal) {
         (
             DataType::Utf8 | DataType::LargeUtf8,
             Expr::Literal(ScalarValue::Utf8(Some(value)), _)
             | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _),
         ) => !value.is_empty(),
-        _ => false,
+        (data_type, literal) => signed_integer_bounds(data_type)
+            .zip(signed_integer_literal_value(literal))
+            .is_some_and(|((min, max), value)| (min..=max).contains(&value)),
+    }
+}
+
+fn signed_integer_bounds(data_type: &DataType) -> Option<(i64, i64)> {
+    match data_type {
+        DataType::Int8 => Some((i64::from(i8::MIN), i64::from(i8::MAX))),
+        DataType::Int16 => Some((i64::from(i16::MIN), i64::from(i16::MAX))),
+        DataType::Int32 => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+        DataType::Int64 => Some((i64::MIN, i64::MAX)),
+        _ => None,
+    }
+}
+
+fn signed_integer_literal_value(literal: &Expr) -> Option<i64> {
+    match literal {
+        Expr::Literal(ScalarValue::Int8(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::Int16(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::Int32(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::Int64(Some(value)), _) => Some(*value),
+        _ => None,
     }
 }
 

@@ -2181,7 +2181,7 @@ mod tests {
     }
 
     #[test]
-    fn integer_partition_literal_filters_remain_unsupported_until_typed_metadata_support()
+    fn integer_partition_ordering_and_uncoerced_literals_remain_unsupported()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "integer-partition-unsupported-boundary",
@@ -2197,21 +2197,17 @@ mod tests {
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let filters = [
-            datafusion::logical_expr::col("byte_part").eq(datafusion::logical_expr::lit(7_i8)),
-            datafusion::logical_expr::col("short_part")
-                .not_eq(datafusion::logical_expr::lit(1024_i16)),
             datafusion::logical_expr::col("int_part").lt(datafusion::logical_expr::lit(10_i32)),
-            datafusion::logical_expr::col("long_part").in_list(
-                vec![
-                    datafusion::logical_expr::lit(0_i64),
-                    datafusion::logical_expr::lit(9223372036854775807_i64),
-                ],
-                false,
-            ),
+            datafusion::logical_expr::col("int_part").gt(datafusion::logical_expr::lit(-10_i32)),
             datafusion::logical_expr::col("int_part").between(
                 datafusion::logical_expr::lit(-10_i32),
                 datafusion::logical_expr::lit(10_i32),
             ),
+            datafusion::logical_expr::col("int_part").not_between(
+                datafusion::logical_expr::lit(-10_i32),
+                datafusion::logical_expr::lit(10_i32),
+            ),
+            datafusion::logical_expr::col("int_part").eq(datafusion::logical_expr::lit("0")),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
@@ -2225,6 +2221,143 @@ mod tests {
         assert_eq!(plan.exact_count, 0);
         assert_eq!(plan.unsupported_count, filters.len());
         assert_eq!(plan.residual_filter_count, filters.len());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn integer_partition_equality_and_membership_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "integer-partition-equality-membership",
+            INTEGER_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["long_part"]"#,
+            &[
+                r#""partitionValues":{"long_part":"7"}"#,
+                r#""partitionValues":{"long_part":"-1"}"#,
+                r#""partitionValues":{"long_part":null}"#,
+                r#""partitionValues":{"long_part":""}"#,
+                r#""partitionValues":{"long_part":"not-an-integer"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "equality",
+                datafusion::logical_expr::col("long_part").eq(datafusion::logical_expr::lit(7_i64)),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed equality",
+                datafusion::logical_expr::lit(7_i64).eq(datafusion::logical_expr::col("long_part")),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "inequality",
+                datafusion::logical_expr::col("long_part")
+                    .not_eq(datafusion::logical_expr::lit(7_i64)),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "in list",
+                datafusion::logical_expr::col("long_part").in_list(
+                    vec![
+                        datafusion::logical_expr::lit(7_i64),
+                        datafusion::logical_expr::lit(-1_i64),
+                    ],
+                    false,
+                ),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not in list",
+                datafusion::logical_expr::col("long_part")
+                    .in_list(vec![datafusion::logical_expr::lit(7_i64)], true),
+                vec!["part-00001.parquet"],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn integer_partition_width_bounds_are_respected_for_direct_filters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "integer-partition-width-boundaries",
+            INTEGER_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["byte_part","short_part","int_part","long_part"]"#,
+            r#""partitionValues":{"byte_part":"127","short_part":"32767","int_part":"2147483647","long_part":"9223372036854775807"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let exact_filters = [
+            datafusion::logical_expr::col("byte_part").eq(datafusion::logical_expr::lit(127_i8)),
+            datafusion::logical_expr::col("short_part")
+                .eq(datafusion::logical_expr::lit(32767_i16)),
+            datafusion::logical_expr::col("int_part")
+                .eq(datafusion::logical_expr::lit(2147483647_i32)),
+            datafusion::logical_expr::col("long_part")
+                .eq(datafusion::logical_expr::lit(9223372036854775807_i64)),
+        ];
+        let unsupported_filters = [
+            datafusion::logical_expr::col("byte_part").eq(datafusion::logical_expr::lit(128_i16)),
+            datafusion::logical_expr::col("short_part")
+                .eq(datafusion::logical_expr::lit(32768_i32)),
+            datafusion::logical_expr::col("int_part")
+                .eq(datafusion::logical_expr::lit(2147483648_i64)),
+        ];
+        let exact_refs = exact_filters.iter().collect::<Vec<_>>();
+        let unsupported_refs = unsupported_filters.iter().collect::<Vec<_>>();
+
+        let exact_plan = provider.plan_supports_filters_pushdown(&exact_refs);
+        let unsupported_plan = provider.plan_supports_filters_pushdown(&unsupported_refs);
+
+        assert_eq!(exact_plan.exact_count, exact_filters.len());
+        assert_eq!(exact_plan.unsupported_count, 0);
+        assert_eq!(unsupported_plan.exact_count, 0);
+        assert_eq!(
+            unsupported_plan.unsupported_count,
+            unsupported_filters.len()
+        );
 
         Ok(())
     }
@@ -2364,6 +2497,94 @@ mod tests {
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_integer_partition_equality_and_in_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-integer-partition-equality-membership",
+            INTEGER_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["long_part"]"#,
+            &[
+                r#""partitionValues":{"long_part":"7"}"#,
+                r#""partitionValues":{"long_part":"-1"}"#,
+                r#""partitionValues":{"long_part":null}"#,
+                r#""partitionValues":{"long_part":""}"#,
+                r#""partitionValues":{"long_part":"not-an-integer"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let cases = [
+            (
+                "equality",
+                "select id from orders where long_part = 7",
+                1,
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed equality",
+                "select id from orders where 7 = long_part",
+                1,
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "in list",
+                "select id from orders where long_part in (7, -1)",
+                1,
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+        ];
+
+        for (name, sql, expected_exact_count, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}: {plan_display}"
+            );
             assert_eq!(
                 scans[0]
                     .scan_plan()
