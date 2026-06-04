@@ -140,7 +140,9 @@ impl DeltaPartitionMetadataPredicate {
     /// Returns whether one scan file should be kept by this predicate.
     ///
     /// SQL three-valued logic is collapsed using WHERE semantics: only `TRUE`
-    /// keeps a file. `FALSE` and `NULL` both prune it.
+    /// keeps a file. `FALSE` and `NULL` both prune it. The input map is the raw
+    /// partition metadata attached to a Delta `ScanFile`: missing keys are SQL
+    /// nulls, while present empty strings are non-null empty strings.
     #[must_use]
     pub(crate) fn matches_scan_file(&self, partition_values: &HashMap<String, String>) -> bool {
         self.expr.eval(partition_values) == SqlBool::True

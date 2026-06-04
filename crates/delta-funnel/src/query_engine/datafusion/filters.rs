@@ -8,8 +8,6 @@ use std::collections::HashSet;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
-use crate::table_formats::DeltaKernelPredicate;
-
 use self::analysis::DeltaKernelPredicateAnalysis;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,45 +116,6 @@ impl DeltaFilterPushdownPlan {
             .iter()
             .map(|decision| decision.outcome.to_datafusion())
             .collect()
-    }
-
-    /// Combines exact pushed filters into the single predicate delta_kernel accepts.
-    ///
-    /// Unsupported and residual filters are intentionally ignored here. Callers
-    /// must reject those decisions before using this method, otherwise a scan
-    /// could silently drop part of the original filter.
-    #[must_use]
-    pub(crate) fn combined_exact_kernel_predicate(&self) -> Option<DeltaKernelPredicate> {
-        DeltaKernelPredicate::and_from(
-            self.decisions
-                .iter()
-                .filter(|decision| decision.outcome == DeltaFilterPushdownOutcome::Exact)
-                .filter_map(|decision| decision.kernel_predicate.predicate.clone()),
-        )
-    }
-
-    /// Returns partition columns referenced by exact pushed predicates.
-    ///
-    /// These columns may need to be present in the kernel read schema even when
-    /// they are not part of DataFusion's requested output projection. The order
-    /// follows the accepted filter decisions and duplicates are removed.
-    #[must_use]
-    pub(crate) fn exact_partition_column_names(&self) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut columns = Vec::new();
-
-        for column in self
-            .decisions
-            .iter()
-            .filter(|decision| decision.outcome == DeltaFilterPushdownOutcome::Exact)
-            .flat_map(|decision| decision.kernel_predicate.partition_columns.iter())
-        {
-            if seen.insert(column.clone()) {
-                columns.push(column.clone());
-            }
-        }
-
-        columns
     }
 }
 
@@ -305,12 +264,12 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
             ]
         );
-        assert_eq!(plan.exact_count, 1);
-        assert_eq!(plan.unsupported_count, 5);
-        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(plan.exact_count, 2);
+        assert_eq!(plan.unsupported_count, 4);
+        assert_eq!(plan.residual_filter_count, 4);
 
         Ok(())
     }

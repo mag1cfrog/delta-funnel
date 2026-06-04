@@ -13,12 +13,13 @@ use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilter
 
 /// Plans the exact static partition operator policy.
 ///
-/// A filter can be exact here only when it is partition-only, kernel
-/// convertible, and accepted by the current operator semantics policy. The
-/// proven exact subset starts with non-empty, non-null logical string equality,
-/// `IN`, and boolean composition of exact partition predicates. It can expand
-/// one operator class at a time after semantic tests. All other shapes
-/// stay `Unsupported` so DataFusion keeps them as residual filters.
+/// A filter can be exact here only when it is partition-only and accepted by
+/// the current provider metadata semantics policy. The proven exact subset
+/// currently includes non-empty, non-null logical string equality, `IN`,
+/// `IS NULL`, `IS NOT NULL`, and boolean composition of exact partition
+/// predicates. It can expand one operator class at a time after semantic tests.
+/// All other shapes stay `Unsupported` so DataFusion keeps them as residual
+/// filters.
 pub(super) fn plan_partition_operator_pushdown(
     filters: &[&Expr],
     schema: &SchemaRef,
@@ -49,12 +50,9 @@ fn partition_operator_decision(
 ) -> DeltaFilterPushdownDecision {
     let (kernel_predicate, rejection_reason) =
         analyze_filter_for_pushdown(filter, schema, partition_columns);
+    let is_partition_only = kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly;
 
-    if kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
-        && kernel_predicate.predicate.is_some()
-        && kernel_predicate.adapter_error.is_none()
-        && is_supported_partition_operator_filter(filter, schema)
-    {
+    if is_partition_only && is_supported_partition_operator_filter(filter, schema) {
         return DeltaFilterPushdownDecision {
             input_index,
             outcome: DeltaFilterPushdownOutcome::Exact,
@@ -78,7 +76,9 @@ fn partition_operator_decision(
 ///
 /// Column membership is intentionally checked by `analyze_filter_for_pushdown`;
 /// this helper verifies accepted leaf predicates or boolean composition whose
-/// leaves are accepted predicates.
+/// leaves are accepted predicates. Exact partition predicates are provider-owned
+/// and applied to Delta scan-file partition metadata, not to delta_kernel's
+/// predicate path.
 fn is_supported_partition_operator_filter(filter: &Expr, schema: &SchemaRef) -> bool {
     match filter {
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
@@ -94,6 +94,9 @@ fn is_supported_partition_operator_filter(filter: &Expr, schema: &SchemaRef) -> 
                 )
         }
         Expr::InList(in_list) => is_supported_partition_in_list(filter, in_list.negated, schema),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            is_supported_partition_null_check(inner.as_ref(), schema)
+        }
         _ => false,
     }
 }
@@ -126,6 +129,21 @@ fn is_supported_partition_in_list(filter: &Expr, negated: bool, schema: &SchemaR
         && !in_list.list.is_empty()
         && is_supported_partition_column_type(column, schema)
         && in_list.list.iter().all(is_supported_partition_literal)
+}
+
+/// Accepts null checks only for logical partition columns whose metadata
+/// representation is supported by the provider evaluator.
+///
+/// delta_kernel 0.23.0 treats raw empty partition values as null for its own
+/// predicate path, while SQL semantics distinguish missing/null from a present
+/// raw empty string. The provider-owned metadata evaluator is the authority for
+/// these predicates.
+fn is_supported_partition_null_check(expr: &Expr, schema: &SchemaRef) -> bool {
+    let Expr::Column(column) = expr else {
+        return false;
+    };
+
+    is_supported_partition_column_type(column, schema)
 }
 
 /// Restricts current exactness to string-typed logical partition columns.
@@ -297,6 +315,66 @@ mod tests {
     }
 
     #[test]
+    fn partition_operator_planner_accepts_null_checks_as_metadata_only_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["region"]);
+        let filters = [col("region").is_null(), col("region").is_not_null()];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+        assert_eq!(plan.exact_count, 2);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 2);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Exact
+                && !decision.residual
+                && decision.rejection_reason.is_none()
+                && decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+                && decision.kernel_predicate.predicate.is_some()
+                && decision.kernel_predicate.adapter_error.is_none()
+        }));
+    }
+
+    #[test]
+    fn partition_operator_planner_keeps_null_composition_metadata_only() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["region"]);
+        let filter = col("region").is_null().or(col("region").eq(lit("us-west")));
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &[&filter],
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact]
+        );
+        assert_eq!(plan.exact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert_eq!(
+            plan.decisions[0].kernel_predicate.scope,
+            DeltaKernelPredicateScope::PartitionOnly
+        );
+    }
+
+    #[test]
     fn partition_operator_planner_keeps_unproven_partition_only_operators_unsupported() {
         let schema = schema();
         let partition_columns = partition_columns(&["region"]);
@@ -309,8 +387,6 @@ mod tests {
             col("region").in_list(vec![lit("us-west"), lit("us-east")], true),
             col("region").between(lit("a"), lit("z")),
             col("region").not_between(lit("a"), lit("z")),
-            col("region").is_null(),
-            col("region").is_not_null(),
             Expr::Not(Box::new(col("region").eq(lit("us-west")))),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();

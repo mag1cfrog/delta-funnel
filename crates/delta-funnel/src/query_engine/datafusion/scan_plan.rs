@@ -37,6 +37,10 @@ pub(crate) struct ProviderScanPlan {
     /// Structured report for filters pushed into this scan.
     pub(crate) pushed_filter_plan: DeltaFilterPushdownPlan,
     /// Provider-owned SQL-compatible partition metadata predicate for this scan.
+    ///
+    /// This is deliberately separate from the private kernel scan state below.
+    /// delta_kernel enumerates candidate files, then this predicate prunes those
+    /// files by evaluating their `ScanFile.partition_values`.
     pub(crate) partition_metadata_filter: Option<DeltaPartitionMetadataPredicate>,
     kernel_scan: ProjectedDeltaScan,
 }
@@ -215,7 +219,7 @@ mod tests {
             .fields()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
-        assert_eq!(kernel_names, vec!["id", "region", "day"]);
+        assert_eq!(kernel_names, vec!["id"]);
 
         Ok(())
     }

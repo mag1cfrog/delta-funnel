@@ -64,11 +64,11 @@ impl ProjectedDeltaScan {
     #[cfg(test)]
     /// Returns scan file paths after kernel scan planning and optional metadata filtering.
     ///
-    /// The kernel scan may already apply any predicate attached through
-    /// `ScanBuilder::with_predicate`. The optional metadata predicate is then
-    /// evaluated by this provider against each `ScanFile.partition_values` so
-    /// tests can exercise the SQL-compatible partition metadata path without
-    /// reading Parquet files.
+    /// The provider currently builds partition pushdown as a metadata predicate
+    /// stored on `ProviderScanPlan`, not as a delta_kernel scan predicate. This
+    /// helper mirrors the intended read path: expand kernel scan metadata first,
+    /// then evaluate the provider predicate against each `ScanFile`'s partition
+    /// values before returning file paths.
     pub(crate) fn scan_file_paths(
         &self,
         table_uri: &str,
@@ -90,6 +90,9 @@ impl ProjectedDeltaScan {
         let mut paths = files
             .into_iter()
             .filter(|file| {
+                // This is the provider-owned partition pruning step. A file is
+                // kept only when there is no pushed partition predicate or when
+                // that predicate evaluates to SQL TRUE for the file metadata.
                 partition_metadata_filter
                     .is_none_or(|predicate| predicate.matches_scan_file(&file.partition_values))
             })
