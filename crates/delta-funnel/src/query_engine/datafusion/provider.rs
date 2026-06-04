@@ -753,6 +753,30 @@ mod tests {
                 ))),
                 vec!["part-00003.parquet"],
             ),
+            (
+                "less than",
+                datafusion::logical_expr::col("region")
+                    .lt(datafusion::logical_expr::lit("us-west")),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "less than or equal",
+                datafusion::logical_expr::col("region")
+                    .lt_eq(datafusion::logical_expr::lit("us-east")),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "greater than",
+                datafusion::logical_expr::col("region")
+                    .gt(datafusion::logical_expr::lit("us-east")),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "greater than or equal",
+                datafusion::logical_expr::col("region")
+                    .gt_eq(datafusion::logical_expr::lit("us-west")),
+                vec!["part-00000.parquet"],
+            ),
         ];
 
         for (name, filter, expected_paths) in cases {
@@ -814,6 +838,10 @@ mod tests {
                     ],
                     false,
                 ),
+            ),
+            (
+                "empty string comparison",
+                datafusion::logical_expr::col("region").lt(datafusion::logical_expr::lit("")),
             ),
         ];
 
@@ -1760,6 +1788,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_partition_comparison_filters_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-partition-comparison-filters-exact",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{"region":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let sql_cases = [
+            (
+                "less than",
+                "select id from orders where region < 'us-west'",
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "less than or equal",
+                "select id from orders where region <= 'us-east'",
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "greater than",
+                "select id from orders where region > 'us-east'",
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed greater than",
+                "select id from orders where 'us-east' < region",
+                vec!["part-00000.parquet"],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sql_empty_string_partition_filters_stay_residual_without_kernel_pruning()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
@@ -1793,6 +1906,10 @@ mod tests {
             (
                 "empty string in",
                 "select id from orders where region in ('us-west', '')",
+            ),
+            (
+                "empty string comparison",
+                "select id from orders where region < ''",
             ),
         ];
 

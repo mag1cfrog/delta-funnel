@@ -4,6 +4,7 @@
 // it, so keep dead-code warnings quiet until file-level pruning calls it.
 #![allow(dead_code)]
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
@@ -97,10 +98,10 @@ impl DeltaPartitionMetadataPredicate {
     /// Converts a supported DataFusion expression into a metadata predicate.
     ///
     /// The current policy supports string partition columns, string equality,
-    /// string inequality, `IN`, `NOT IN`, `IS NULL`, `IS NOT NULL`, negation,
-    /// and boolean composition over supported child predicates. Unsupported
-    /// expressions return a typed error so the caller can keep DataFusion
-    /// residual filtering instead of guessing.
+    /// string inequality, string range comparisons, `IN`, `NOT IN`, `IS NULL`,
+    /// `IS NOT NULL`, negation, and boolean composition over supported child
+    /// predicates. Unsupported expressions return a typed error so the caller
+    /// can keep DataFusion residual filtering instead of guessing.
     pub(crate) fn from_datafusion_expr(
         expr: &Expr,
         logical_schema: &SchemaRef,
@@ -155,6 +156,11 @@ enum PartitionMetadataExpr {
         column: PhysicalPartitionColumn,
         literal: String,
     },
+    Compare {
+        column: PhysicalPartitionColumn,
+        op: PartitionComparisonOperator,
+        literal: String,
+    },
     In {
         column: PhysicalPartitionColumn,
         literals: HashSet<String>,
@@ -173,6 +179,14 @@ impl PartitionMetadataExpr {
                 .value(partition_values)
                 .map(|value| SqlBool::from(value == literal.as_str()))
                 .unwrap_or(SqlBool::Null),
+            Self::Compare {
+                column,
+                op,
+                literal,
+            } => column
+                .value(partition_values)
+                .map(|value| SqlBool::from(op.matches(value.cmp(literal.as_str()))))
+                .unwrap_or(SqlBool::Null),
             Self::In { column, literals } => column
                 .value(partition_values)
                 .map(|value| SqlBool::from(literals.contains(value)))
@@ -184,6 +198,34 @@ impl PartitionMetadataExpr {
                 .and(right.eval(partition_values)),
             Self::Or(left, right) => left.eval(partition_values).or(right.eval(partition_values)),
             Self::Not(inner) => inner.eval(partition_values).not(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PartitionComparisonOperator {
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+impl PartitionComparisonOperator {
+    fn matches(self, ordering: Ordering) -> bool {
+        match self {
+            Self::Lt => ordering == Ordering::Less,
+            Self::LtEq => matches!(ordering, Ordering::Less | Ordering::Equal),
+            Self::Gt => ordering == Ordering::Greater,
+            Self::GtEq => matches!(ordering, Ordering::Greater | Ordering::Equal),
+        }
+    }
+
+    fn reverse(self) -> Self {
+        match self {
+            Self::Lt => Self::Gt,
+            Self::LtEq => Self::GtEq,
+            Self::Gt => Self::Lt,
+            Self::GtEq => Self::LtEq,
         }
     }
 }
@@ -310,6 +352,30 @@ fn convert_expr(
             .map_err(|_| left_error)
         })
         .map(|expr| PartitionMetadataExpr::Not(Box::new(expr))),
+        Expr::BinaryExpr(binary) if comparison_operator(binary.op).is_some() => {
+            let Some(op) = comparison_operator(binary.op) else {
+                return Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator);
+            };
+            convert_comparison(
+                binary.left.as_ref(),
+                binary.right.as_ref(),
+                op,
+                logical_schema,
+                partition_columns,
+                physical_name_lookup,
+            )
+            .or_else(|left_error| {
+                convert_comparison(
+                    binary.right.as_ref(),
+                    binary.left.as_ref(),
+                    op.reverse(),
+                    logical_schema,
+                    partition_columns,
+                    physical_name_lookup,
+                )
+                .map_err(|_| left_error)
+            })
+        }
         Expr::BinaryExpr(_) => Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator),
         Expr::InList(in_list) => convert_in_list(
             in_list.expr.as_ref(),
@@ -338,6 +404,16 @@ fn convert_expr(
             physical_name_lookup,
         )?))),
         _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression),
+    }
+}
+
+fn comparison_operator(op: Operator) -> Option<PartitionComparisonOperator> {
+    match op {
+        Operator::Lt => Some(PartitionComparisonOperator::Lt),
+        Operator::LtEq => Some(PartitionComparisonOperator::LtEq),
+        Operator::Gt => Some(PartitionComparisonOperator::Gt),
+        Operator::GtEq => Some(PartitionComparisonOperator::GtEq),
+        _ => None,
     }
 }
 
@@ -371,6 +447,26 @@ fn convert_in_list(
     } else {
         Ok(expr)
     }
+}
+
+fn convert_comparison(
+    column: &Expr,
+    literal: &Expr,
+    op: PartitionComparisonOperator,
+    logical_schema: &SchemaRef,
+    partition_columns: &HashSet<String>,
+    physical_name_lookup: &DeltaPartitionNameMap,
+) -> Result<PartitionMetadataExpr, DeltaPartitionMetadataPredicateError> {
+    Ok(PartitionMetadataExpr::Compare {
+        column: convert_column(
+            column,
+            logical_schema,
+            partition_columns,
+            physical_name_lookup,
+        )?,
+        op,
+        literal: convert_string_literal(literal)?,
+    })
 }
 
 fn convert_equality(
@@ -608,6 +704,33 @@ mod tests {
     }
 
     #[test]
+    fn comparisons_use_string_ordering_and_sql_null_semantics() {
+        let lt = predicate(&col("region").lt(lit("us-west")), &["region"]).unwrap();
+        let lt_eq = predicate(&col("region").lt_eq(lit("us-east")), &["region"]).unwrap();
+        let gt = predicate(&col("region").gt(lit("us-east")), &["region"]).unwrap();
+        let gt_eq = predicate(&lit("us-east").lt_eq(col("region")), &["region"]).unwrap();
+        let west = values(&[("region", "us-west")]);
+        let east = values(&[("region", "us-east")]);
+        let empty = values(&[("region", "")]);
+        let missing = HashMap::new();
+
+        assert!(!lt.matches_scan_file(&west));
+        assert!(lt.matches_scan_file(&east));
+        assert!(lt.matches_scan_file(&empty));
+        assert!(lt_eq.matches_scan_file(&east));
+        assert!(lt_eq.matches_scan_file(&empty));
+        assert!(!lt_eq.matches_scan_file(&west));
+        assert!(gt.matches_scan_file(&west));
+        assert!(!gt.matches_scan_file(&east));
+        assert!(!gt.matches_scan_file(&empty));
+        assert!(gt_eq.matches_scan_file(&west));
+        assert!(gt_eq.matches_scan_file(&east));
+        assert!(!gt_eq.matches_scan_file(&empty));
+        assert!(!lt.matches_scan_file(&missing));
+        assert!(!gt.matches_scan_file(&missing));
+    }
+
+    #[test]
     fn boolean_composition_uses_sql_three_valued_logic() {
         let filter = col("region")
             .eq(lit("us-west"))
@@ -652,6 +775,7 @@ mod tests {
         let dotted = col("region.value").eq(lit("us-west"));
         let non_partition = col("id").eq(lit("1"));
         let null_literal = col("region").eq(Expr::Literal(ScalarValue::Utf8(None), None));
+        let wrong_literal_type_comparison = col("region").lt(lit(7_i64));
         let empty_in = col("region").in_list(Vec::<Expr>::new(), false);
         let null_in = col("region").in_list(
             vec![lit("us-west"), Expr::Literal(ScalarValue::Utf8(None), None)],
@@ -698,6 +822,15 @@ mod tests {
         assert_eq!(
             DeltaPartitionMetadataPredicate::from_datafusion_expr(
                 &null_literal,
+                &schema,
+                &region_partition_columns,
+                &name_map,
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            DeltaPartitionMetadataPredicate::from_datafusion_expr(
+                &wrong_literal_type_comparison,
                 &schema,
                 &region_partition_columns,
                 &name_map,

@@ -16,10 +16,10 @@ use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilter
 /// A filter can be exact here only when it is partition-only and accepted by
 /// the current provider metadata semantics policy. The proven exact subset
 /// currently includes non-empty, non-null logical string equality, inequality,
-/// `IN`, `NOT IN`, `IS NULL`, `IS NOT NULL`, negation, and boolean composition
-/// of exact partition predicates. It can expand one operator class at a time
-/// after semantic tests. All other shapes stay `Unsupported` so DataFusion
-/// keeps them as residual filters.
+/// range comparisons, `IN`, `NOT IN`, `IS NULL`, `IS NOT NULL`, negation, and
+/// boolean composition of exact partition predicates. It can expand one
+/// operator class at a time after semantic tests. All other shapes stay
+/// `Unsupported` so DataFusion keeps them as residual filters.
 pub(super) fn plan_partition_operator_pushdown(
     filters: &[&Expr],
     schema: &SchemaRef,
@@ -101,6 +101,19 @@ fn is_supported_partition_operator_filter(filter: &Expr, schema: &SchemaRef) -> 
                     schema,
                 )
         }
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+            ) =>
+        {
+            is_supported_partition_comparison(binary.left.as_ref(), binary.right.as_ref(), schema)
+                || is_supported_partition_comparison(
+                    binary.right.as_ref(),
+                    binary.left.as_ref(),
+                    schema,
+                )
+        }
         Expr::InList(_) => is_supported_partition_in_list(filter, schema),
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
             is_supported_partition_null_check(inner.as_ref(), schema)
@@ -110,8 +123,22 @@ fn is_supported_partition_operator_filter(filter: &Expr, schema: &SchemaRef) -> 
     }
 }
 
+/// Accepts one column/literal range comparison if the current type policy can prove it.
+fn is_supported_partition_comparison(column: &Expr, literal: &Expr, schema: &SchemaRef) -> bool {
+    is_supported_partition_column_literal_pair(column, literal, schema)
+}
+
 /// Accepts one column/literal equality if the current type policy can prove it.
 fn is_supported_partition_equality(column: &Expr, literal: &Expr, schema: &SchemaRef) -> bool {
+    is_supported_partition_column_literal_pair(column, literal, schema)
+}
+
+/// Accepts one partition column paired with a literal whose metadata semantics are proven.
+fn is_supported_partition_column_literal_pair(
+    column: &Expr,
+    literal: &Expr,
+    schema: &SchemaRef,
+) -> bool {
     let Expr::Column(column) = column else {
         return false;
     };
@@ -417,14 +444,42 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_keeps_unproven_partition_only_operators_unsupported() {
+    fn partition_operator_planner_accepts_string_partition_comparisons() {
         let schema = schema();
         let partition_columns = partition_columns(&["region"]);
         let filters = [
             col("region").lt(lit("us-west")),
             col("region").lt_eq(lit("us-west")),
-            col("region").gt(lit("us-west")),
-            col("region").gt_eq(lit("us-west")),
+            col("region").gt(lit("us-east")),
+            col("region").gt_eq(lit("us-east")),
+            lit("us-east").lt(col("region")),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+                && decision.kernel_predicate.adapter_error.is_none()
+        }));
+    }
+
+    #[test]
+    fn partition_operator_planner_keeps_unproven_partition_only_operators_unsupported() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["region"]);
+        let filters = [
             col("region").between(lit("a"), lit("z")),
             col("region").not_between(lit("a"), lit("z")),
         ];
@@ -542,6 +597,8 @@ mod tests {
         let partition_columns = partition_columns(&["region", "id"]);
         let numeric_partition_literal = col("region").eq(lit(7_i64));
         let integer_partition_with_string_literal = col("id").eq(lit("7"));
+        let empty_string_comparison = col("region").lt(lit(""));
+        let numeric_comparison = col("region").lt(lit(7_i64));
         let mixed_and = col("region").eq(lit("us-west")).and(col("id").gt(lit(10)));
         let mixed_or = col("region").eq(lit("us-west")).or(col("id").gt(lit(10)));
         let not_filter = Expr::Not(Box::new(col("id").eq(lit("7"))));
@@ -551,6 +608,8 @@ mod tests {
             &[
                 &numeric_partition_literal,
                 &integer_partition_with_string_literal,
+                &empty_string_comparison,
+                &numeric_comparison,
                 &mixed_and,
                 &mixed_or,
                 &not_filter,
@@ -569,11 +628,13 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
             ]
         );
         assert_eq!(plan.exact_count, 0);
-        assert_eq!(plan.unsupported_count, 6);
-        assert_eq!(plan.residual_filter_count, 6);
+        assert_eq!(plan.unsupported_count, 8);
+        assert_eq!(plan.residual_filter_count, 8);
     }
 
     #[test]
