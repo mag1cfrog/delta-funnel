@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::{Expr, Operator};
 
@@ -139,9 +139,8 @@ fn is_supported_partition_between(filter: &Expr, schema: &SchemaRef) -> bool {
         return false;
     };
 
-    is_supported_partition_column_type(column, schema)
-        && is_supported_partition_literal(between.low.as_ref())
-        && is_supported_partition_literal(between.high.as_ref())
+    is_supported_partition_literal_for_column(column, between.low.as_ref(), schema)
+        && is_supported_partition_literal_for_column(column, between.high.as_ref(), schema)
 }
 
 /// Accepts one column/literal equality if the current type policy can prove it.
@@ -159,7 +158,7 @@ fn is_supported_partition_column_literal_pair(
         return false;
     };
 
-    is_supported_partition_column_type(column, schema) && is_supported_partition_literal(literal)
+    is_supported_partition_literal_for_column(column, literal, schema)
 }
 
 /// Accepts an `IN` or `NOT IN` list for non-empty string partition literals.
@@ -180,7 +179,10 @@ fn is_supported_partition_in_list(filter: &Expr, schema: &SchemaRef) -> bool {
 
     !in_list.list.is_empty()
         && is_supported_partition_column_type(column, schema)
-        && in_list.list.iter().all(is_supported_partition_literal)
+        && in_list
+            .list
+            .iter()
+            .all(|literal| is_supported_partition_literal_for_column(column, literal, schema))
 }
 
 /// Accepts null checks only for logical partition columns whose metadata
@@ -214,15 +216,33 @@ fn is_supported_partition_column_type(column: &Column, schema: &SchemaRef) -> bo
         .is_ok_and(|field| supports_partition_metadata_logical_type(field.data_type()))
 }
 
-/// Restricts current exactness to non-empty, non-null string literals.
+/// Restricts literal operators to type/literal pairs whose exactness is proven.
 ///
 /// This must evolve together with `is_supported_partition_column_type`; exact
 /// pushdown should only be claimed for type pairs whose Delta partition
 /// metadata semantics are tested.
-fn is_supported_partition_literal(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(value)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _) => !value.is_empty(),
+fn is_supported_partition_literal_for_column(
+    column: &Column,
+    literal: &Expr,
+    schema: &SchemaRef,
+) -> bool {
+    if !is_supported_partition_column_type(column, schema) {
+        return false;
+    }
+
+    let Ok(field) = schema.field_with_name(&column.name) else {
+        return false;
+    };
+
+    // Integer columns are admitted by the central type gate for null checks,
+    // but literal operators stay string-only until integer literal coercion is
+    // proven in a later slice.
+    match (field.data_type(), literal) {
+        (
+            DataType::Utf8 | DataType::LargeUtf8,
+            Expr::Literal(ScalarValue::Utf8(Some(value)), _)
+            | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _),
+        ) => !value.is_empty(),
         _ => false,
     }
 }

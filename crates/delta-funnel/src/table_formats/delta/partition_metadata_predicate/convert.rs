@@ -337,6 +337,9 @@ fn convert_partition_literal(
             }
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
+        PartitionMetadataValueKind::SignedInteger { .. } => {
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        }
     }
 }
 
@@ -406,6 +409,29 @@ mod tests {
         assert!(matches_scan_file(&is_not_null, &normal));
         assert!(matches_scan_file(&is_not_null, &raw_empty));
         assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_integer_null_checks_without_promoting_integer_literals() {
+        let is_null = predicate_expr(&col("id").is_null(), &["id"]).unwrap();
+        let is_not_null = predicate_expr(&col("id").is_not_null(), &["id"]).unwrap();
+        let normal = values(&[("id", "7")]);
+        let raw_empty = values(&[("id", "")]);
+        let invalid_integer = values(&[("id", "not-an-integer")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&is_null, &normal));
+        assert!(!matches_scan_file(&is_null, &raw_empty));
+        assert!(!matches_scan_file(&is_null, &invalid_integer));
+        assert!(matches_scan_file(&is_null, &missing));
+        assert!(matches_scan_file(&is_not_null, &normal));
+        assert!(matches_scan_file(&is_not_null, &raw_empty));
+        assert!(matches_scan_file(&is_not_null, &invalid_integer));
+        assert!(!matches_scan_file(&is_not_null, &missing));
+        assert_eq!(
+            predicate_expr(&col("id").eq(lit(7_i64)), &["id"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
     }
 
     #[test]
@@ -663,7 +689,7 @@ mod tests {
                 &id_partition_columns,
                 &id_name_map,
             ),
-            Err(DeltaPartitionMetadataPredicateError::UnsupportedColumnType)
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
         );
         assert_eq!(
             convert_expr(&null_literal, &schema, &region_partition_columns, &name_map),

@@ -25,9 +25,11 @@ use value::PartitionMetadataValueKind;
 /// Delta stores partition values as serialized text in add-file metadata, but
 /// exact SQL pushdown also depends on the logical schema type. Today only
 /// string-like partition columns have proven metadata semantics in this
-/// provider. When numeric, decimal, boolean, binary, date, and timestamp
-/// partition columns are promoted, this function is the single type gate to
-/// update for both support planning and metadata evaluation.
+/// provider. Integer-like partition columns currently support null checks
+/// while literal operators are still promoted separately. When decimal,
+/// boolean, binary, date, and timestamp partition columns are promoted, this
+/// function is the single type gate to update for both support planning and
+/// metadata evaluation.
 #[must_use]
 pub(crate) fn supports_partition_metadata_logical_type(data_type: &DataType) -> bool {
     PartitionMetadataValueKind::from_supported_data_type(data_type).is_some()
@@ -109,13 +111,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_type_policy_documents_current_string_only_scope() {
-        let supported = [DataType::Utf8, DataType::LargeUtf8];
-        let unsupported = [
+    fn metadata_type_policy_documents_current_promoted_scope() {
+        let supported = [
+            DataType::Utf8,
+            DataType::LargeUtf8,
             DataType::Int64,
             DataType::Int32,
             DataType::Int16,
             DataType::Int8,
+        ];
+        let unsupported = [
             DataType::Float32,
             DataType::Float64,
             DataType::Decimal128(10, 2),
