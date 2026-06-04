@@ -2732,6 +2732,13 @@ mod tests {
                 .eq(datafusion::logical_expr::lit(2147483647_i32)),
             datafusion::logical_expr::col("long_part")
                 .eq(datafusion::logical_expr::lit(9223372036854775807_i64)),
+            datafusion::logical_expr::col("byte_part").lt(datafusion::logical_expr::lit(127_i8)),
+            datafusion::logical_expr::col("short_part")
+                .gt_eq(datafusion::logical_expr::lit(32767_i16)),
+            datafusion::logical_expr::col("int_part").between(
+                datafusion::logical_expr::lit(-2147483648_i32),
+                datafusion::logical_expr::lit(2147483647_i32),
+            ),
         ];
         let unsupported_filters = [
             datafusion::logical_expr::col("byte_part").eq(datafusion::logical_expr::lit(128_i16)),
@@ -2739,6 +2746,13 @@ mod tests {
                 .eq(datafusion::logical_expr::lit(32768_i32)),
             datafusion::logical_expr::col("int_part")
                 .eq(datafusion::logical_expr::lit(2147483648_i64)),
+            datafusion::logical_expr::col("byte_part").lt(datafusion::logical_expr::lit(128_i16)),
+            datafusion::logical_expr::col("short_part")
+                .gt_eq(datafusion::logical_expr::lit(32768_i32)),
+            datafusion::logical_expr::col("int_part").between(
+                datafusion::logical_expr::lit(-2147483649_i64),
+                datafusion::logical_expr::lit(2147483647_i32),
+            ),
         ];
         let exact_refs = exact_filters.iter().collect::<Vec<_>>();
         let unsupported_refs = unsupported_filters.iter().collect::<Vec<_>>();
