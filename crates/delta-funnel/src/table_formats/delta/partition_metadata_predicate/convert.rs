@@ -400,6 +400,9 @@ fn convert_partition_literal(
                 .ok_or(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
+        PartitionMetadataValueKind::Float32 | PartitionMetadataValueKind::Float64 => {
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        }
     }
 }
 

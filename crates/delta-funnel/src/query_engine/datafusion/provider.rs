@@ -2670,7 +2670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn floating_partition_filters_remain_unsupported_at_scan_boundary()
+    async fn floating_partition_value_filters_remain_unsupported_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "floating-partition-unsupported-boundary",
@@ -2737,14 +2737,6 @@ mod tests {
                     .not_between(float_low, float_value.clone()),
             ),
             (
-                "float is null",
-                datafusion::logical_expr::col("float_part").is_null(),
-            ),
-            (
-                "float is not null",
-                datafusion::logical_expr::col("float_part").is_not_null(),
-            ),
-            (
                 "double equality",
                 datafusion::logical_expr::col("double_part").eq(double_value.clone()),
             ),
@@ -2786,14 +2778,6 @@ mod tests {
             (
                 "double not between",
                 datafusion::logical_expr::col("double_part").not_between(double_low, double_high),
-            ),
-            (
-                "double is null",
-                datafusion::logical_expr::col("double_part").is_null(),
-            ),
-            (
-                "double is not null",
-                datafusion::logical_expr::col("double_part").is_not_null(),
             ),
             (
                 "and composition",
@@ -2838,6 +2822,239 @@ mod tests {
                     .contains("pushed filters must be exact partition predicates")),
                 "{name} should be rejected"
             );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn floating_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "floating-partition-null-checks",
+            FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["float_part","double_part"]"#,
+            &[
+                r#""partitionValues":{"float_part":"1.5","double_part":"-2.25"}"#,
+                r#""partitionValues":{"float_part":null,"double_part":"-2.25"}"#,
+                r#""partitionValues":{"float_part":"1.5","double_part":null}"#,
+                r#""partitionValues":{"float_part":null,"double_part":null}"#,
+                r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "float is null",
+                datafusion::logical_expr::col("float_part").is_null(),
+                vec![
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                    "part-00005.parquet",
+                ],
+            ),
+            (
+                "float is not null",
+                datafusion::logical_expr::col("float_part").is_not_null(),
+                vec![
+                    "part-00000.parquet",
+                    "part-00002.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "double is null",
+                datafusion::logical_expr::col("double_part").is_null(),
+                vec![
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00005.parquet",
+                ],
+            ),
+            (
+                "double is not null",
+                datafusion::logical_expr::col("double_part").is_not_null(),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "and composition",
+                datafusion::logical_expr::col("float_part")
+                    .is_null()
+                    .and(datafusion::logical_expr::col("double_part").is_null()),
+                vec!["part-00003.parquet", "part-00005.parquet"],
+            ),
+            (
+                "or composition",
+                datafusion::logical_expr::col("float_part")
+                    .is_null()
+                    .or(datafusion::logical_expr::col("double_part").is_null()),
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00005.parquet",
+                ],
+            ),
+            (
+                "not composition",
+                Expr::Not(Box::new(
+                    datafusion::logical_expr::col("float_part").is_null(),
+                )),
+                vec![
+                    "part-00000.parquet",
+                    "part-00002.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.unsupported_count,
+                0,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_floating_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-floating-partition-null-checks",
+            FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["float_part","double_part"]"#,
+            &[
+                r#""partitionValues":{"float_part":"1.5","double_part":"-2.25"}"#,
+                r#""partitionValues":{"float_part":null,"double_part":"-2.25"}"#,
+                r#""partitionValues":{"float_part":"1.5","double_part":null}"#,
+                r#""partitionValues":{"float_part":null,"double_part":null}"#,
+                r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+        let sql_cases = [
+            (
+                "float is null",
+                "select id from orders where float_part is null",
+                vec![
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                    "part-00005.parquet",
+                ],
+            ),
+            (
+                "double is not null",
+                "select id from orders where double_part is not null",
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "null check or",
+                "select id from orders where float_part is null or double_part is null",
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00005.parquet",
+                ],
+            ),
+            (
+                "not null check",
+                "select id from orders where not(float_part is null)",
+                vec![
+                    "part-00000.parquet",
+                    "part-00002.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                1,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
         }
 
         Ok(())

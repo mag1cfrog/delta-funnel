@@ -338,6 +338,8 @@ mod tests {
             Field::new("is_current", DataType::Boolean, true),
             Field::new("event_date", DataType::Date32, true),
             Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new("float_part", DataType::Float32, true),
+            Field::new("double_part", DataType::Float64, true),
         ]))
     }
 
@@ -612,6 +614,36 @@ mod tests {
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
             &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_floating_null_checks_as_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["float_part", "double_part"]);
+        let filters = [
+            col("float_part").is_null(),
+            col("float_part").is_not_null(),
+            col("double_part").is_null(),
+            col("double_part").is_not_null(),
+            col("float_part")
+                .is_null()
+                .and(col("double_part").is_not_null()),
+            Expr::Not(Box::new(col("float_part").is_null())),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
             &schema,
             &partition_columns,
         );

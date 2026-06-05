@@ -121,10 +121,10 @@ mod tests {
             DataType::Date32,
             DataType::Decimal128(10, 2),
             DataType::Decimal128(38, 18),
-        ];
-        let unsupported = [
             DataType::Float32,
             DataType::Float64,
+        ];
+        let unsupported = [
             DataType::Decimal128(10, -1),
             DataType::Decimal128(10, 11),
             DataType::Decimal128(39, 2),

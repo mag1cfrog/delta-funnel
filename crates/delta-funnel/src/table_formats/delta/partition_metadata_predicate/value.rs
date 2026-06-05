@@ -18,6 +18,8 @@ pub(super) enum PartitionMetadataValueKind {
     Boolean,
     Date,
     Decimal { precision: u8, scale: i8 },
+    Float32,
+    Float64,
 }
 
 impl PartitionMetadataValueKind {
@@ -50,6 +52,8 @@ impl PartitionMetadataValueKind {
                     scale: *scale,
                 })
             }
+            DataType::Float32 => Some(Self::Float32),
+            DataType::Float64 => Some(Self::Float64),
             _ => None,
         }
     }
@@ -61,14 +65,14 @@ impl PartitionMetadataValueKind {
     pub(super) fn supports_ordering(self) -> bool {
         match self {
             Self::String | Self::SignedInteger { .. } | Self::Date | Self::Decimal { .. } => true,
-            Self::Boolean => false,
+            Self::Boolean | Self::Float32 | Self::Float64 => false,
         }
     }
 
     pub(super) fn supports_between(self) -> bool {
         match self {
             Self::String | Self::SignedInteger { .. } | Self::Date | Self::Decimal { .. } => true,
-            Self::Boolean => false,
+            Self::Boolean | Self::Float32 | Self::Float64 => false,
         }
     }
 
@@ -85,6 +89,7 @@ impl PartitionMetadataValueKind {
             Self::Decimal { precision, scale } => {
                 parse_delta_decimal(raw_value, precision, scale).map(PartitionScalar::Decimal)
             }
+            Self::Float32 | Self::Float64 => None,
         }
     }
 
@@ -337,11 +342,11 @@ mod tests {
         );
         assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Float32),
-            None
+            Some(PartitionMetadataValueKind::Float32)
         );
         assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Float64),
-            None
+            Some(PartitionMetadataValueKind::Float64)
         );
     }
 
