@@ -285,6 +285,9 @@ fn convert_comparison(
         partition_columns,
         physical_name_lookup,
     )?;
+    if !column.value_kind().supports_ordering() {
+        return Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator);
+    }
     Ok(PartitionMetadataExpr::Compare {
         literal: convert_partition_literal(literal, column.value_kind())?,
         column,
@@ -581,6 +584,28 @@ mod tests {
         assert_eq!(
             predicate_expr(&col("region"), &["region"]),
             Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression)
+        );
+    }
+
+    #[test]
+    fn rejects_boolean_ordering_predicates() {
+        assert_eq!(
+            predicate_expr(&col("is_current").lt(lit(true)), &["is_current"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("is_current").between(lit(false), lit(true)),
+                &["is_current"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("is_current").not_between(lit(false), lit(true)),
+                &["is_current"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator)
         );
     }
 

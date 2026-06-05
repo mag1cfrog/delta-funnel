@@ -2517,6 +2517,95 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn boolean_partition_unsafe_ordering_shapes_are_rejected_at_scan_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "boolean-partition-unsafe-ordering-shapes",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            r#""partitionValues":{"is_current":"true"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let scalar_udf = create_udf(
+            "boolean_identity_for_pushdown_boundary",
+            vec![DataType::Boolean],
+            DataType::Boolean,
+            Volatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))))),
+        );
+        let scalar_function =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![datafusion::logical_expr::col("is_current")],
+            ));
+        let filters = vec![
+            (
+                "less than",
+                datafusion::logical_expr::col("is_current").lt(datafusion::logical_expr::lit(true)),
+            ),
+            (
+                "greater than or equal",
+                datafusion::logical_expr::col("is_current")
+                    .gt_eq(datafusion::logical_expr::lit(false)),
+            ),
+            (
+                "between",
+                datafusion::logical_expr::col("is_current").between(
+                    datafusion::logical_expr::lit(false),
+                    datafusion::logical_expr::lit(true),
+                ),
+            ),
+            (
+                "not between",
+                datafusion::logical_expr::col("is_current").not_between(
+                    datafusion::logical_expr::lit(false),
+                    datafusion::logical_expr::lit(true),
+                ),
+            ),
+            (
+                "cast operand",
+                datafusion::logical_expr::col("is_current").eq(datafusion::logical_expr::cast(
+                    datafusion::logical_expr::lit(true),
+                    DataType::Boolean,
+                )),
+            ),
+            (
+                "scalar function operand",
+                datafusion::logical_expr::col("is_current").eq(scalar_function),
+            ),
+        ];
+        let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn integer_partition_uncoerced_literals_remain_unsupported()
     -> Result<(), Box<dyn std::error::Error>> {

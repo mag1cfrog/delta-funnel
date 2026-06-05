@@ -141,7 +141,7 @@ fn is_supported_partition_comparison(column: &Expr, literal: &Expr, schema: &Sch
         return false;
     };
 
-    is_supported_partition_literal_for_column(column, literal, schema)
+    is_supported_ordering_literal_for_column(column, literal, schema)
 }
 
 /// Accepts inclusive partition ranges when both literal bounds are proven.
@@ -153,8 +153,8 @@ fn is_supported_partition_between(filter: &Expr, schema: &SchemaRef) -> bool {
         return false;
     };
 
-    is_supported_partition_literal_for_column(column, between.low.as_ref(), schema)
-        && is_supported_partition_literal_for_column(column, between.high.as_ref(), schema)
+    is_supported_ordering_literal_for_column(column, between.low.as_ref(), schema)
+        && is_supported_ordering_literal_for_column(column, between.high.as_ref(), schema)
 }
 
 /// Accepts one column/literal equality if the metadata type policy can prove it.
@@ -258,6 +258,30 @@ fn is_supported_partition_literal_for_column(
             .zip(signed_integer_literal_value(literal))
             .is_some_and(|((min, max), value)| min <= value && value <= max),
     }
+}
+
+fn is_supported_ordering_literal_for_column(
+    column: &Column,
+    literal: &Expr,
+    schema: &SchemaRef,
+) -> bool {
+    if !is_supported_partition_literal_for_column(column, literal, schema) {
+        return false;
+    }
+
+    let Ok(field) = schema.field_with_name(&column.name) else {
+        return false;
+    };
+
+    matches!(
+        field.data_type(),
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+    )
 }
 
 fn signed_integer_bounds(data_type: &DataType) -> Option<(i64, i64)> {
@@ -576,6 +600,35 @@ mod tests {
         let schema = schema();
         let partition_columns = partition_columns(&["region", "id"]);
         let filters = [col("region"), col("id"), Expr::Not(Box::new(col("region")))];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_boolean_ordering_and_between() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let filters = [
+            col("is_current").lt(lit(true)),
+            col("is_current").lt_eq(lit(false)),
+            col("is_current").gt(lit(false)),
+            col("is_current").gt_eq(lit(true)),
+            col("is_current").between(lit(false), lit(true)),
+            col("is_current").not_between(lit(false), lit(true)),
+        ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(

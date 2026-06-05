@@ -44,6 +44,13 @@ impl PartitionMetadataValueKind {
         matches!(self, Self::Boolean)
     }
 
+    pub(super) fn supports_ordering(self) -> bool {
+        match self {
+            Self::String | Self::SignedInteger { .. } => true,
+            Self::Boolean => false,
+        }
+    }
+
     pub(super) fn parse_raw(self, raw_value: &str) -> Option<PartitionScalar> {
         match self {
             Self::String => Some(PartitionScalar::String(raw_value.to_owned())),
@@ -192,5 +199,6 @@ mod tests {
             PartitionMetadataValueKind::Boolean.parse_raw("not-a-boolean"),
             None
         );
+        assert!(!PartitionMetadataValueKind::Boolean.supports_ordering());
     }
 }
