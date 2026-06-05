@@ -2695,6 +2695,18 @@ mod tests {
         let double_nan = Expr::Literal(ScalarValue::Float64(Some(f64::NAN)), None);
         let double_infinity = Expr::Literal(ScalarValue::Float64(Some(f64::INFINITY)), None);
         let double_low = Expr::Literal(ScalarValue::Float64(Some(-3.0)), None);
+        let scalar_udf = create_udf(
+            "floating_identity_for_pushdown_boundary",
+            vec![DataType::Float32],
+            DataType::Float32,
+            Volatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Float32(Some(1.5))))),
+        );
+        let scalar_function =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![datafusion::logical_expr::col("float_part")],
+            ));
         let filters = vec![
             (
                 "float nan equality",
@@ -2767,6 +2779,21 @@ mod tests {
                 "double wrong width between",
                 datafusion::logical_expr::col("double_part")
                     .not_between(double_low, float_value.clone()),
+            ),
+            (
+                "cast operand",
+                datafusion::logical_expr::col("float_part").eq(datafusion::logical_expr::cast(
+                    float_value.clone(),
+                    DataType::Float32,
+                )),
+            ),
+            (
+                "scalar function operand",
+                datafusion::logical_expr::col("float_part").eq(scalar_function),
+            ),
+            (
+                "mixed partition data equality",
+                datafusion::logical_expr::col("float_part").eq(datafusion::logical_expr::col("id")),
             ),
             (
                 "and composition",
