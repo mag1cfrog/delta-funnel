@@ -12,6 +12,7 @@ use datafusion::arrow::datatypes::DataType;
 pub(super) enum PartitionMetadataValueKind {
     String,
     SignedInteger { min: i64, max: i64 },
+    Boolean,
 }
 
 impl PartitionMetadataValueKind {
@@ -34,6 +35,7 @@ impl PartitionMetadataValueKind {
                 min: i64::MIN,
                 max: i64::MAX,
             }),
+            DataType::Boolean => Some(Self::Boolean),
             _ => None,
         }
     }
@@ -46,6 +48,7 @@ impl PartitionMetadataValueKind {
                 .ok()
                 .filter(|value| min <= *value && *value <= max)
                 .map(PartitionScalar::SignedInteger),
+            Self::Boolean => raw_value.parse::<bool>().ok().map(PartitionScalar::Boolean),
         }
     }
 }
@@ -59,6 +62,7 @@ impl PartitionMetadataValueKind {
 pub(super) enum PartitionScalar {
     String(String),
     SignedInteger(i64),
+    Boolean(bool),
 }
 
 impl PartitionScalar {
@@ -116,6 +120,10 @@ mod tests {
             })
         );
         assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Boolean),
+            Some(PartitionMetadataValueKind::Boolean)
+        );
+        assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Float64),
             None
         );
@@ -161,5 +169,24 @@ mod tests {
             Some(PartitionScalar::SignedInteger(2147483647))
         );
         assert_eq!(int_kind.parse_raw("2147483648"), None);
+    }
+
+    #[test]
+    fn boolean_value_kind_parses_lowercase_delta_metadata_text() {
+        assert_eq!(
+            PartitionMetadataValueKind::Boolean.parse_raw("true"),
+            Some(PartitionScalar::Boolean(true))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Boolean.parse_raw("false"),
+            Some(PartitionScalar::Boolean(false))
+        );
+        assert_eq!(PartitionMetadataValueKind::Boolean.parse_raw("TRUE"), None);
+        assert_eq!(PartitionMetadataValueKind::Boolean.parse_raw("False"), None);
+        assert_eq!(PartitionMetadataValueKind::Boolean.parse_raw(""), None);
+        assert_eq!(
+            PartitionMetadataValueKind::Boolean.parse_raw("not-a-boolean"),
+            None
+        );
     }
 }

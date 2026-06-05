@@ -343,6 +343,9 @@ fn convert_partition_literal(
                 .map(PartitionScalar::SignedInteger)
                 .ok_or(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
         }
+        PartitionMetadataValueKind::Boolean => {
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        }
     }
 }
 
