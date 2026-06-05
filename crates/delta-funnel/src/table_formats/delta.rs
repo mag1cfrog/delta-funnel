@@ -64,8 +64,8 @@ impl ProjectedDeltaScan {
     #[cfg(test)]
     /// Returns scan file paths after kernel scan planning and optional metadata filtering.
     ///
-    /// The provider currently builds partition pushdown as a metadata predicate
-    /// stored on `ProviderScanPlan`, not as a delta_kernel scan predicate. This
+    /// The provider builds partition pushdown as a metadata predicate stored on
+    /// `ProviderScanPlan`, not as a delta_kernel scan predicate. This
     /// helper mirrors the intended read path: expand kernel scan metadata first,
     /// then evaluate the provider predicate against each `ScanFile`'s partition
     /// values before returning file paths.
