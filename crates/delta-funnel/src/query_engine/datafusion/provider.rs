@@ -411,6 +411,7 @@ mod tests {
     const DATE_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]"#;
     const DECIMAL_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]"#;
     const HIGH_PRECISION_DECIMAL_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(38,18)\",\"nullable\":true,\"metadata\":{}}]"#;
+    const FLOATING_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"float_part\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_part\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -2266,6 +2267,37 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn floating_partition_schema_maps_delta_types_to_arrow_float_widths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "floating-partition-schema",
+            FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["float_part","double_part"]"#,
+            r#""partitionValues":{"float_part":"1.5","double_part":"-2.25"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let schema = provider.schema();
+
+        assert_eq!(
+            schema.field_with_name("float_part")?.data_type(),
+            &DataType::Float32
+        );
+        assert_eq!(
+            schema.field_with_name("double_part")?.data_type(),
+            &DataType::Float64
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn date_partition_null_checks_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2606,6 +2638,180 @@ mod tests {
             (
                 "scalar function operand",
                 datafusion::logical_expr::col("amount").eq(scalar_function),
+            ),
+        ];
+        let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn floating_partition_filters_remain_unsupported_at_scan_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "floating-partition-unsupported-boundary",
+            FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["float_part","double_part"]"#,
+            r#""partitionValues":{"float_part":"1.5","double_part":"-2.25"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let float_low = Expr::Literal(ScalarValue::Float32(Some(0.5)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let double_low = Expr::Literal(ScalarValue::Float64(Some(-3.0)), None);
+        let double_high = Expr::Literal(ScalarValue::Float64(Some(0.0)), None);
+        let filters = vec![
+            (
+                "float equality",
+                datafusion::logical_expr::col("float_part").eq(float_value.clone()),
+            ),
+            (
+                "float inequality",
+                datafusion::logical_expr::col("float_part").not_eq(float_value.clone()),
+            ),
+            (
+                "float less than",
+                datafusion::logical_expr::col("float_part").lt(float_value.clone()),
+            ),
+            (
+                "float less than or equal",
+                datafusion::logical_expr::col("float_part").lt_eq(float_value.clone()),
+            ),
+            (
+                "float greater than",
+                datafusion::logical_expr::col("float_part").gt(float_value.clone()),
+            ),
+            (
+                "float greater than or equal",
+                datafusion::logical_expr::col("float_part").gt_eq(float_value.clone()),
+            ),
+            (
+                "float in list",
+                datafusion::logical_expr::col("float_part")
+                    .in_list(vec![float_value.clone()], false),
+            ),
+            (
+                "float not in list",
+                datafusion::logical_expr::col("float_part")
+                    .in_list(vec![float_value.clone()], true),
+            ),
+            (
+                "float between",
+                datafusion::logical_expr::col("float_part")
+                    .between(float_low.clone(), float_value.clone()),
+            ),
+            (
+                "float not between",
+                datafusion::logical_expr::col("float_part")
+                    .not_between(float_low, float_value.clone()),
+            ),
+            (
+                "float is null",
+                datafusion::logical_expr::col("float_part").is_null(),
+            ),
+            (
+                "float is not null",
+                datafusion::logical_expr::col("float_part").is_not_null(),
+            ),
+            (
+                "double equality",
+                datafusion::logical_expr::col("double_part").eq(double_value.clone()),
+            ),
+            (
+                "double inequality",
+                datafusion::logical_expr::col("double_part").not_eq(double_value.clone()),
+            ),
+            (
+                "double less than",
+                datafusion::logical_expr::col("double_part").lt(double_value.clone()),
+            ),
+            (
+                "double less than or equal",
+                datafusion::logical_expr::col("double_part").lt_eq(double_value.clone()),
+            ),
+            (
+                "double greater than",
+                datafusion::logical_expr::col("double_part").gt(double_value.clone()),
+            ),
+            (
+                "double greater than or equal",
+                datafusion::logical_expr::col("double_part").gt_eq(double_value.clone()),
+            ),
+            (
+                "double in list",
+                datafusion::logical_expr::col("double_part")
+                    .in_list(vec![double_value.clone()], false),
+            ),
+            (
+                "double not in list",
+                datafusion::logical_expr::col("double_part")
+                    .in_list(vec![double_value.clone()], true),
+            ),
+            (
+                "double between",
+                datafusion::logical_expr::col("double_part")
+                    .between(double_low.clone(), double_high.clone()),
+            ),
+            (
+                "double not between",
+                datafusion::logical_expr::col("double_part").not_between(double_low, double_high),
+            ),
+            (
+                "double is null",
+                datafusion::logical_expr::col("double_part").is_null(),
+            ),
+            (
+                "double is not null",
+                datafusion::logical_expr::col("double_part").is_not_null(),
+            ),
+            (
+                "and composition",
+                datafusion::logical_expr::col("float_part")
+                    .eq(float_value.clone())
+                    .and(datafusion::logical_expr::col("double_part").eq(double_value.clone())),
+            ),
+            (
+                "or composition",
+                datafusion::logical_expr::col("float_part")
+                    .eq(float_value.clone())
+                    .or(datafusion::logical_expr::col("double_part").eq(double_value)),
+            ),
+            (
+                "not composition",
+                Expr::Not(Box::new(
+                    datafusion::logical_expr::col("float_part").eq(float_value),
+                )),
             ),
         ];
         let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();

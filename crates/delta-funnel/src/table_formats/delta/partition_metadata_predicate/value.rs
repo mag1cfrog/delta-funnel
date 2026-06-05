@@ -336,6 +336,10 @@ mod tests {
             None
         );
         assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Float32),
+            None
+        );
+        assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Float64),
             None
         );
