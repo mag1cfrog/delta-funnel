@@ -377,6 +377,7 @@ mod tests {
             Field::new("small_id", DataType::Int8, false),
             Field::new("region", DataType::Utf8, true),
             Field::new("day", DataType::LargeUtf8, true),
+            Field::new("is_current", DataType::Boolean, true),
         ]))
     }
 
@@ -444,6 +445,29 @@ mod tests {
         assert!(matches_scan_file(&is_not_null, &normal));
         assert!(matches_scan_file(&is_not_null, &raw_empty));
         assert!(matches_scan_file(&is_not_null, &invalid_integer));
+        assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_boolean_null_checks_with_sql_metadata_semantics() {
+        let is_null = predicate_expr(&col("is_current").is_null(), &["is_current"]).unwrap();
+        let is_not_null =
+            predicate_expr(&col("is_current").is_not_null(), &["is_current"]).unwrap();
+        let raw_true = values(&[("is_current", "true")]);
+        let raw_false = values(&[("is_current", "false")]);
+        let raw_empty = values(&[("is_current", "")]);
+        let invalid_boolean = values(&[("is_current", "not-a-boolean")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&is_null, &raw_true));
+        assert!(!matches_scan_file(&is_null, &raw_false));
+        assert!(!matches_scan_file(&is_null, &raw_empty));
+        assert!(!matches_scan_file(&is_null, &invalid_boolean));
+        assert!(matches_scan_file(&is_null, &missing));
+        assert!(matches_scan_file(&is_not_null, &raw_true));
+        assert!(matches_scan_file(&is_not_null, &raw_false));
+        assert!(matches_scan_file(&is_not_null, &raw_empty));
+        assert!(matches_scan_file(&is_not_null, &invalid_boolean));
         assert!(!matches_scan_file(&is_not_null, &missing));
     }
 

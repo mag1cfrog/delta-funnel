@@ -283,6 +283,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("region", DataType::Utf8, true),
             Field::new("day", DataType::Utf8, true),
+            Field::new("is_current", DataType::Boolean, true),
         ]))
     }
 
@@ -438,6 +439,36 @@ mod tests {
                 && decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
                 && decision.kernel_predicate.predicate.is_some()
                 && decision.kernel_predicate.adapter_error.is_none()
+        }));
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_boolean_null_checks_as_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let filters = [col("is_current").is_null(), col("is_current").is_not_null()];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+        assert_eq!(plan.exact_count, 2);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Exact
+                && !decision.residual
+                && decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
         }));
     }
 

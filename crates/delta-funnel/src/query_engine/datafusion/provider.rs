@@ -407,6 +407,7 @@ mod tests {
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     const INTEGER_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]"#;
+    const BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -2182,6 +2183,108 @@ mod tests {
     }
 
     #[test]
+    fn boolean_partition_schema_maps_delta_type_to_arrow_boolean()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "boolean-partition-schema",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            r#""partitionValues":{"is_current":"true"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let schema = provider.schema();
+
+        assert_eq!(
+            schema.field_with_name("is_current")?.data_type(),
+            &DataType::Boolean
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boolean_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "boolean-partition-null-checks",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            &[
+                r#""partitionValues":{"is_current":"true"}"#,
+                r#""partitionValues":{"is_current":"false"}"#,
+                r#""partitionValues":{"is_current":null}"#,
+                r#""partitionValues":{"is_current":""}"#,
+                r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "is null",
+                datafusion::logical_expr::col("is_current").is_null(),
+                vec!["part-00002.parquet", "part-00005.parquet"],
+            ),
+            (
+                "is not null",
+                datafusion::logical_expr::col("is_current").is_not_null(),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.unsupported_count,
+                0,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn integer_partition_uncoerced_literals_remain_unsupported()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
@@ -2887,6 +2990,87 @@ mod tests {
                     "part-00000.parquet",
                     "part-00001.parquet",
                     "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_boolean_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-boolean-partition-null-checks",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            &[
+                r#""partitionValues":{"is_current":"true"}"#,
+                r#""partitionValues":{"is_current":"false"}"#,
+                r#""partitionValues":{"is_current":null}"#,
+                r#""partitionValues":{"is_current":""}"#,
+                r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let cases = [
+            (
+                "is null",
+                "select id from orders where is_current is null",
+                vec!["part-00002.parquet", "part-00005.parquet"],
+            ),
+            (
+                "is not null",
+                "select id from orders where is_current is not null",
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
                 ],
             ),
         ];
