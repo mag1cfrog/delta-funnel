@@ -408,6 +408,7 @@ mod tests {
 
     const INTEGER_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]"#;
     const BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]"#;
+    const DATE_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -2209,6 +2210,96 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn date_partition_schema_maps_delta_type_to_arrow_date32()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "date-partition-schema",
+            DATE_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_date"]"#,
+            r#""partitionValues":{"event_date":"2026-01-01"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let schema = provider.schema();
+
+        assert_eq!(
+            schema.field_with_name("event_date")?.data_type(),
+            &DataType::Date32
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn date_partition_filters_remain_unsupported_before_promotion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "date-partition-unsupported-boundary",
+            DATE_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_date"]"#,
+            r#""partitionValues":{"event_date":"2026-01-01"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filters = [
+            datafusion::logical_expr::col("event_date").is_null(),
+            datafusion::logical_expr::col("event_date").is_not_null(),
+            datafusion::logical_expr::col("event_date")
+                .eq(Expr::Literal(ScalarValue::Date32(Some(20_454)), None)),
+            datafusion::logical_expr::col("event_date")
+                .not_eq(Expr::Literal(ScalarValue::Date32(Some(20_454)), None)),
+            datafusion::logical_expr::col("event_date")
+                .lt(Expr::Literal(ScalarValue::Date32(Some(20_454)), None)),
+            datafusion::logical_expr::col("event_date").between(
+                Expr::Literal(ScalarValue::Date32(Some(20_453)), None),
+                Expr::Literal(ScalarValue::Date32(Some(20_454)), None),
+            ),
+            datafusion::logical_expr::col("event_date").in_list(
+                vec![Expr::Literal(ScalarValue::Date32(Some(20_454)), None)],
+                false,
+            ),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+
+        for filter in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                .to_string()
+                .contains("pushed filters must be exact partition predicates"))
+            );
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn boolean_partition_null_checks_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3478,6 +3569,83 @@ mod tests {
                 "{name}"
             );
             assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_date_partition_filters_remain_residual_before_promotion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-date-partition-residuals",
+            DATE_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_date"]"#,
+            &[
+                r#""partitionValues":{"event_date":"2026-01-01"}"#,
+                r#""partitionValues":{"event_date":"2026-01-02"}"#,
+                r#""partitionValues":{"event_date":null}"#,
+                r#""partitionValues":{"event_date":""}"#,
+                r#""partitionValues":{"event_date":"not-a-date"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+        let cases = [
+            (
+                "date literal equality",
+                "select id from orders where event_date = DATE '2026-01-01'",
+            ),
+            (
+                "string literal equality",
+                "select id from orders where event_date = '2026-01-01'",
+            ),
+            (
+                "date literal ordering",
+                "select id from orders where event_date < DATE '2026-01-02'",
+            ),
+            (
+                "date literal between",
+                "select id from orders where event_date between DATE '2026-01-01' and DATE '2026-01-02'",
+            ),
+        ];
+
+        for (name, sql) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display =
+                datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true);
+            let plan_display = plan_display.to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
