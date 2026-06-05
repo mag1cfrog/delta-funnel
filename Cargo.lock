@@ -1261,6 +1261,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-tiberius",
  "async-trait",
+ "chrono",
  "datafusion",
  "delta_kernel",
  "snafu",

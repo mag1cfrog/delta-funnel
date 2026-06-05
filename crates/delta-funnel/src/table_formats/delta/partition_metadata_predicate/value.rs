@@ -1,6 +1,9 @@
 use std::cmp::Ordering;
 
+use chrono::{Datelike, NaiveDate};
 use datafusion::arrow::datatypes::DataType;
+
+const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
 
 /// Logical value family used when evaluating serialized Delta partition metadata.
 ///
@@ -13,6 +16,7 @@ pub(super) enum PartitionMetadataValueKind {
     String,
     SignedInteger { min: i64, max: i64 },
     Boolean,
+    Date,
 }
 
 impl PartitionMetadataValueKind {
@@ -36,6 +40,7 @@ impl PartitionMetadataValueKind {
                 max: i64::MAX,
             }),
             DataType::Boolean => Some(Self::Boolean),
+            DataType::Date32 => Some(Self::Date),
             _ => None,
         }
     }
@@ -46,7 +51,7 @@ impl PartitionMetadataValueKind {
 
     pub(super) fn supports_ordering(self) -> bool {
         match self {
-            Self::String | Self::SignedInteger { .. } => true,
+            Self::String | Self::SignedInteger { .. } | Self::Date => true,
             Self::Boolean => false,
         }
     }
@@ -60,8 +65,26 @@ impl PartitionMetadataValueKind {
                 .filter(|value| min <= *value && *value <= max)
                 .map(PartitionScalar::SignedInteger),
             Self::Boolean => raw_value.parse::<bool>().ok().map(PartitionScalar::Boolean),
+            Self::Date => parse_delta_date(raw_value).map(PartitionScalar::Date),
         }
     }
+}
+
+fn parse_delta_date(raw_value: &str) -> Option<i32> {
+    if raw_value.len() != 10 {
+        return None;
+    }
+    if !raw_value
+        .bytes()
+        .enumerate()
+        .all(|(index, byte)| matches!((index, byte), (4 | 7, b'-') | (_, b'0'..=b'9')))
+    {
+        return None;
+    }
+
+    NaiveDate::parse_from_str(raw_value, "%Y-%m-%d")
+        .ok()
+        .map(|date| date.num_days_from_ce() - UNIX_EPOCH_DAYS_FROM_CE)
 }
 
 /// Typed literal or parsed raw partition metadata value.
@@ -74,6 +97,7 @@ pub(super) enum PartitionScalar {
     String(String),
     SignedInteger(i64),
     Boolean(bool),
+    Date(i32),
 }
 
 impl PartitionScalar {
@@ -81,6 +105,7 @@ impl PartitionScalar {
         match (self, other) {
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
             (Self::SignedInteger(left), Self::SignedInteger(right)) => Some(left.cmp(right)),
+            (Self::Date(left), Self::Date(right)) => Some(left.cmp(right)),
             _ => None,
         }
     }
@@ -133,6 +158,10 @@ mod tests {
         assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Boolean),
             Some(PartitionMetadataValueKind::Boolean)
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Date32),
+            Some(PartitionMetadataValueKind::Date)
         );
         assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Float64),
@@ -200,5 +229,47 @@ mod tests {
             None
         );
         assert!(!PartitionMetadataValueKind::Boolean.supports_ordering());
+    }
+
+    #[test]
+    fn date_value_kind_parses_delta_metadata_text_to_date32_days() {
+        assert_eq!(
+            PartitionMetadataValueKind::Date.parse_raw("1970-01-01"),
+            Some(PartitionScalar::Date(0))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Date.parse_raw("1969-12-31"),
+            Some(PartitionScalar::Date(-1))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Date.parse_raw("2026-01-01"),
+            Some(PartitionScalar::Date(20_454))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Date.parse_raw("2024-02-29"),
+            Some(PartitionScalar::Date(19_782))
+        );
+        assert_eq!(PartitionMetadataValueKind::Date.parse_raw(""), None);
+        assert_eq!(
+            PartitionMetadataValueKind::Date.parse_raw("not-a-date"),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Date.parse_raw("2026-02-29"),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Date.parse_raw("2026-1-01"),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Date.parse_raw("2026-01-1"),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Date.parse_raw("2026-01-01T00:00:00"),
+            None
+        );
+        assert!(PartitionMetadataValueKind::Date.supports_ordering());
     }
 }

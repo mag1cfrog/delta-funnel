@@ -117,13 +117,13 @@ mod tests {
             DataType::Int16,
             DataType::Int8,
             DataType::Boolean,
+            DataType::Date32,
         ];
         let unsupported = [
             DataType::Float32,
             DataType::Float64,
             DataType::Decimal128(10, 2),
             DataType::Binary,
-            DataType::Date32,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             DataType::Timestamp(TimeUnit::Microsecond, None),
         ];

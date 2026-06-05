@@ -254,6 +254,7 @@ fn is_supported_partition_literal_for_column(
             | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _),
         ) => !value.is_empty(),
         (DataType::Boolean, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) => true,
+        (DataType::Date32, Expr::Literal(ScalarValue::Date32(Some(_)), _)) => true,
         (data_type, literal) => signed_integer_bounds(data_type)
             .zip(signed_integer_literal_value(literal))
             .is_some_and(|((min, max), value)| min <= value && value <= max),
@@ -281,6 +282,7 @@ fn is_supported_ordering_literal_for_column(
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
+            | DataType::Date32
     )
 }
 
@@ -320,6 +322,7 @@ mod tests {
             Field::new("region", DataType::Utf8, true),
             Field::new("day", DataType::Utf8, true),
             Field::new("is_current", DataType::Boolean, true),
+            Field::new("event_date", DataType::Date32, true),
         ]))
     }
 
@@ -644,6 +647,136 @@ mod tests {
         assert_eq!(plan.exact_count, 0);
         assert_eq!(plan.unsupported_count, filters.len());
         assert_eq!(plan.residual_filter_count, filters.len());
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_date_equality_and_membership() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_date"]);
+        let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let leap_day_2024 = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
+        let filters = [
+            col("event_date").eq(new_year_2026.clone()),
+            new_year_2026.clone().eq(col("event_date")),
+            col("event_date").not_eq(new_year_2026.clone()),
+            col("event_date").in_list(
+                vec![new_year_2026.clone(), leap_day_2024, new_year_2026.clone()],
+                false,
+            ),
+            col("event_date").in_list(vec![new_year_2026], true),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+        }));
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_unproven_date_shapes() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_date"]);
+        let date = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let filters = [
+            col("event_date").eq(lit("2026-01-01")),
+            col("event_date").eq(Expr::Literal(ScalarValue::Date32(None), None)),
+            col("event_date").eq(Expr::Literal(
+                ScalarValue::Date64(Some(1_767_225_600_000)),
+                None,
+            )),
+            col("event_date").in_list(
+                vec![date.clone(), Expr::Literal(ScalarValue::Date32(None), None)],
+                false,
+            ),
+            col("event_date").in_list(vec![date.clone(), lit("2024-02-29")], false),
+            col("event_date").in_list(vec![col("day")], false),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_date_partition_comparisons() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_date"]);
+        let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let leap_day_2024 = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
+        let pre_epoch_day = Expr::Literal(ScalarValue::Date32(Some(-1)), None);
+        let filters = [
+            col("event_date").lt(new_year_2026.clone()),
+            col("event_date").lt_eq(pre_epoch_day),
+            col("event_date").gt(leap_day_2024),
+            col("event_date").gt_eq(new_year_2026.clone()),
+            new_year_2026.gt(col("event_date")),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_date_partition_between() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_date"]);
+        let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let leap_day_2024 = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
+        let filters = [
+            col("event_date").between(leap_day_2024.clone(), new_year_2026.clone()),
+            col("event_date").not_between(leap_day_2024, new_year_2026),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
     }
 
     #[test]
