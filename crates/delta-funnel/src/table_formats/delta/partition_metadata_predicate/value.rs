@@ -129,9 +129,19 @@ fn parse_delta_decimal(raw_value: &str, precision: u8, scale: i8) -> Option<i128
     if precision == 0 || 38 < precision || precision < scale {
         return None;
     }
-    let (negative, unsigned) = raw_value
+    let (mantissa, exponent) = match raw_value.find(['e', 'E']) {
+        Some(index) => {
+            let (mantissa, exponent) = raw_value.split_at(index);
+            if mantissa.is_empty() || exponent.len() == 1 || exponent[1..].contains(['e', 'E']) {
+                return None;
+            }
+            (mantissa, exponent[1..].parse::<i32>().ok()?)
+        }
+        None => (raw_value, 0),
+    };
+    let (negative, unsigned) = mantissa
         .strip_prefix('-')
-        .map_or((false, raw_value), |value| (true, value));
+        .map_or((false, mantissa), |value| (true, value));
     if unsigned.is_empty() {
         return None;
     }
@@ -150,13 +160,21 @@ fn parse_delta_decimal(raw_value: &str, precision: u8, scale: i8) -> Option<i128
         return None;
     }
 
-    let digits = format!("{integer}{fraction:0<width$}", width = scale as usize);
-    let significant_digits = digits.trim_start_matches('0').len();
-    if (precision as usize) < significant_digits {
+    let shift = i32::from(scale) + exponent - fraction.len() as i32;
+    let shift = u8::try_from(shift).ok()?;
+    let digits = format!("{integer}{fraction}");
+    let significant_digits = digits.trim_start_matches('0');
+    if significant_digits.is_empty() {
+        return Some(0);
+    }
+    if (precision as usize) < significant_digits.len() + usize::from(shift) {
         return None;
     }
 
-    let value = digits.parse::<i128>().ok()?;
+    let value = significant_digits
+        .parse::<i128>()
+        .ok()?
+        .checked_mul(pow10(shift)?)?;
     if negative {
         value.checked_neg()
     } else {
@@ -457,13 +475,28 @@ mod tests {
             high_precision_decimal.parse_raw("1.230000000000000000"),
             Some(PartitionScalar::Decimal(1_230_000_000_000_000_000))
         );
+        assert_eq!(
+            high_precision_decimal.parse_raw("0E-18"),
+            Some(PartitionScalar::Decimal(0))
+        );
+        assert_eq!(
+            high_precision_decimal.parse_raw("1.23E-16"),
+            Some(PartitionScalar::Decimal(123))
+        );
+        assert_eq!(
+            decimal.parse_raw("-1.23E+2"),
+            Some(PartitionScalar::Decimal(-12_300))
+        );
         assert_eq!(decimal.parse_raw("123456789.01"), None);
         assert_eq!(decimal.parse_raw("1.234"), None);
+        assert_eq!(decimal.parse_raw("1.234E-1"), None);
+        assert_eq!(decimal.parse_raw("1E39"), None);
         assert_eq!(decimal.parse_raw(""), None);
         assert_eq!(decimal.parse_raw("-"), None);
         assert_eq!(decimal.parse_raw(".12"), None);
         assert_eq!(decimal.parse_raw("1."), None);
         assert_eq!(decimal.parse_raw("+1.23"), None);
+        assert_eq!(decimal.parse_raw("1EE2"), None);
         assert_eq!(decimal.parse_raw("not-a-decimal"), None);
         assert!(decimal.supports_ordering());
         assert!(decimal.supports_between());

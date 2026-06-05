@@ -2982,6 +2982,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decimal_partition_exponent_metadata_is_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "decimal-partition-exponent-metadata",
+            HIGH_PRECISION_DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["amount"]"#,
+            &[
+                r#""partitionValues":{"amount":"0E-18"}"#,
+                r#""partitionValues":{"amount":"1.23E-16"}"#,
+                r#""partitionValues":{"amount":"not-a-decimal"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let tiny_amount = Expr::Literal(ScalarValue::Decimal128(Some(123), 38, 18), None);
+        let filter = datafusion::logical_expr::col("amount").eq(tiny_amount);
+
+        let support = provider.supports_filters_pushdown(&[&filter])?;
+        assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
+
+        let plan = provider
+            .scan(&state, Some(&vec![0]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 0);
+        assert!(scan.scan_plan().partition_metadata_filter.is_some());
+        assert_eq!(scan_file_paths(scan)?, vec!["part-00001.parquet"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn decimal_partition_equality_and_membership_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
