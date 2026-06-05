@@ -160,7 +160,10 @@ fn parse_delta_decimal(raw_value: &str, precision: u8, scale: i8) -> Option<i128
         return None;
     }
 
-    let shift = i32::from(scale) + exponent - fraction.len() as i32;
+    let fraction_len = i32::try_from(fraction.len()).ok()?;
+    let shift = i32::from(scale)
+        .checked_add(exponent)?
+        .checked_sub(fraction_len)?;
     let shift = u8::try_from(shift).ok()?;
     let digits = format!("{integer}{fraction}");
     let significant_digits = digits.trim_start_matches('0');
@@ -491,6 +494,8 @@ mod tests {
         assert_eq!(decimal.parse_raw("1.234"), None);
         assert_eq!(decimal.parse_raw("1.234E-1"), None);
         assert_eq!(decimal.parse_raw("1E39"), None);
+        assert_eq!(decimal.parse_raw("1E2147483647"), None);
+        assert_eq!(decimal.parse_raw("1E-2147483648"), None);
         assert_eq!(decimal.parse_raw(""), None);
         assert_eq!(decimal.parse_raw("-"), None);
         assert_eq!(decimal.parse_raw(".12"), None);
