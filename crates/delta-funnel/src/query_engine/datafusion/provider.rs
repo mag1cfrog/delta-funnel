@@ -2422,7 +2422,19 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
         let date = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
-        let filters = [
+        let scalar_udf = create_udf(
+            "date_identity_for_pushdown_boundary",
+            vec![DataType::Date32],
+            DataType::Date32,
+            Volatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Date32(Some(20_454))))),
+        );
+        let scalar_function =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![datafusion::logical_expr::col("event_date")],
+            ));
+        let filters = vec![
             datafusion::logical_expr::col("event_date")
                 .eq(datafusion::logical_expr::lit("2026-01-01")),
             datafusion::logical_expr::col("event_date")
@@ -2441,6 +2453,15 @@ mod tests {
             ),
             datafusion::logical_expr::col("event_date")
                 .in_list(vec![datafusion::logical_expr::col("id")], false),
+            datafusion::logical_expr::col("event_date")
+                .between(Expr::Literal(ScalarValue::Date32(None), None), date.clone()),
+            datafusion::logical_expr::col("event_date")
+                .between(datafusion::logical_expr::col("id"), date.clone()),
+            datafusion::logical_expr::col("event_date").eq(datafusion::logical_expr::cast(
+                date.clone(),
+                DataType::Date32,
+            )),
+            datafusion::logical_expr::col("event_date").eq(scalar_function),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
@@ -2625,6 +2646,117 @@ mod tests {
                 .ok_or("expected DeltaScanPlanningExec")?;
 
             assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn date_partition_boolean_composition_and_projection_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "date-partition-boolean-composition",
+            DATE_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_date"]"#,
+            &[
+                r#""partitionValues":{"event_date":"2026-01-01"}"#,
+                r#""partitionValues":{"event_date":"2024-02-29"}"#,
+                r#""partitionValues":{"event_date":"1969-12-31"}"#,
+                r#""partitionValues":{"event_date":null}"#,
+                r#""partitionValues":{"event_date":""}"#,
+                r#""partitionValues":{"event_date":"not-a-date"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let next_day = Expr::Literal(ScalarValue::Date32(Some(20_455)), None);
+        let leap_day_2024 = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
+        let pre_epoch_day = Expr::Literal(ScalarValue::Date32(Some(-1)), None);
+        let separate_and_filters = vec![
+            datafusion::logical_expr::col("event_date").gt_eq(leap_day_2024.clone()),
+            datafusion::logical_expr::col("event_date").lt(next_day.clone()),
+        ];
+        let whole_and_filter = datafusion::logical_expr::col("event_date")
+            .gt_eq(leap_day_2024.clone())
+            .and(datafusion::logical_expr::col("event_date").lt(next_day));
+        let whole_or_filter = datafusion::logical_expr::col("event_date")
+            .eq(new_year_2026.clone())
+            .or(datafusion::logical_expr::col("event_date").eq(pre_epoch_day));
+        let whole_not_filter = Expr::Not(Box::new(
+            datafusion::logical_expr::col("event_date").eq(new_year_2026),
+        ));
+        let cases = [
+            (
+                "separate filters combine with and",
+                separate_and_filters,
+                2,
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "whole and",
+                vec![whole_and_filter],
+                1,
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "whole or",
+                vec![whole_or_filter],
+                1,
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "whole not",
+                vec![whole_not_filter],
+                1,
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, filters, expected_exact_count, expected_paths) in cases {
+            let filter_refs = filters.iter().collect::<Vec<_>>();
+            let support = provider.supports_filters_pushdown(&filter_refs)?;
+            assert_eq!(
+                support,
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().projected_schema.field(0).name(),
+                "id",
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}"
+            );
             assert_eq!(
                 scan.scan_plan().pushed_filter_plan.residual_filter_count,
                 0,
