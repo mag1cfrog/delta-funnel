@@ -655,6 +655,125 @@ mod tests {
     }
 
     #[test]
+    fn converts_date_comparisons_with_typed_ordering_semantics() {
+        let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let leap_day_2024 = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
+        let pre_epoch_day = Expr::Literal(ScalarValue::Date32(Some(-1)), None);
+        let lt = predicate_expr(
+            &col("event_date").lt(new_year_2026.clone()),
+            &["event_date"],
+        )
+        .unwrap();
+        let lt_eq =
+            predicate_expr(&col("event_date").lt_eq(pre_epoch_day), &["event_date"]).unwrap();
+        let gt = predicate_expr(&col("event_date").gt(leap_day_2024), &["event_date"]).unwrap();
+        let gt_eq = predicate_expr(
+            &col("event_date").gt_eq(new_year_2026.clone()),
+            &["event_date"],
+        )
+        .unwrap();
+        let reversed =
+            predicate_expr(&new_year_2026.gt(col("event_date")), &["event_date"]).unwrap();
+        let raw_new_year_2026 = values(&[("event_date", "2026-01-01")]);
+        let raw_leap_day_2024 = values(&[("event_date", "2024-02-29")]);
+        let raw_pre_epoch_day = values(&[("event_date", "1969-12-31")]);
+        let raw_empty = values(&[("event_date", "")]);
+        let invalid_date = values(&[("event_date", "not-a-date")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&lt, &raw_new_year_2026));
+        assert!(matches_scan_file(&lt, &raw_leap_day_2024));
+        assert!(matches_scan_file(&lt, &raw_pre_epoch_day));
+        assert!(!matches_scan_file(&lt, &raw_empty));
+        assert!(!matches_scan_file(&lt, &invalid_date));
+        assert!(!matches_scan_file(&lt, &missing));
+        assert!(matches_scan_file(&lt_eq, &raw_pre_epoch_day));
+        assert!(!matches_scan_file(&lt_eq, &raw_leap_day_2024));
+        assert!(matches_scan_file(&gt, &raw_new_year_2026));
+        assert!(!matches_scan_file(&gt, &raw_leap_day_2024));
+        assert!(matches_scan_file(&gt_eq, &raw_new_year_2026));
+        assert!(!matches_scan_file(&gt_eq, &raw_leap_day_2024));
+        assert!(!matches_scan_file(&reversed, &raw_new_year_2026));
+        assert!(matches_scan_file(&reversed, &raw_leap_day_2024));
+        assert!(matches_scan_file(&reversed, &raw_pre_epoch_day));
+    }
+
+    #[test]
+    fn converts_date_between_with_inclusive_and_negated_semantics() {
+        let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let leap_day_2024 = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
+        let between = predicate_expr(
+            &col("event_date").between(leap_day_2024.clone(), new_year_2026.clone()),
+            &["event_date"],
+        )
+        .unwrap();
+        let not_between = predicate_expr(
+            &col("event_date").not_between(leap_day_2024.clone(), new_year_2026.clone()),
+            &["event_date"],
+        )
+        .unwrap();
+        let contradictory_between = predicate_expr(
+            &col("event_date").between(new_year_2026.clone(), leap_day_2024.clone()),
+            &["event_date"],
+        )
+        .unwrap();
+        let contradictory_not_between = predicate_expr(
+            &col("event_date").not_between(new_year_2026, leap_day_2024),
+            &["event_date"],
+        )
+        .unwrap();
+        let raw_new_year_2026 = values(&[("event_date", "2026-01-01")]);
+        let raw_leap_day_2024 = values(&[("event_date", "2024-02-29")]);
+        let raw_pre_epoch_day = values(&[("event_date", "1969-12-31")]);
+        let raw_empty = values(&[("event_date", "")]);
+        let invalid_date = values(&[("event_date", "not-a-date")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&between, &raw_new_year_2026));
+        assert!(matches_scan_file(&between, &raw_leap_day_2024));
+        assert!(!matches_scan_file(&between, &raw_pre_epoch_day));
+        assert!(!matches_scan_file(&between, &raw_empty));
+        assert!(!matches_scan_file(&between, &invalid_date));
+        assert!(!matches_scan_file(&between, &missing));
+        assert!(!matches_scan_file(&not_between, &raw_new_year_2026));
+        assert!(!matches_scan_file(&not_between, &raw_leap_day_2024));
+        assert!(matches_scan_file(&not_between, &raw_pre_epoch_day));
+        assert!(!matches_scan_file(&not_between, &raw_empty));
+        assert!(!matches_scan_file(&not_between, &invalid_date));
+        assert!(!matches_scan_file(&not_between, &missing));
+        assert!(!matches_scan_file(
+            &contradictory_between,
+            &raw_new_year_2026
+        ));
+        assert!(!matches_scan_file(
+            &contradictory_between,
+            &raw_leap_day_2024
+        ));
+        assert!(!matches_scan_file(
+            &contradictory_between,
+            &raw_pre_epoch_day
+        ));
+        assert!(matches_scan_file(
+            &contradictory_not_between,
+            &raw_new_year_2026
+        ));
+        assert!(matches_scan_file(
+            &contradictory_not_between,
+            &raw_leap_day_2024
+        ));
+        assert!(matches_scan_file(
+            &contradictory_not_between,
+            &raw_pre_epoch_day
+        ));
+        assert!(!matches_scan_file(&contradictory_not_between, &raw_empty));
+        assert!(!matches_scan_file(
+            &contradictory_not_between,
+            &invalid_date
+        ));
+        assert!(!matches_scan_file(&contradictory_not_between, &missing));
+    }
+
+    #[test]
     fn converts_boolean_shorthand_with_sql_metadata_semantics() {
         let shorthand = predicate_expr(&col("is_current"), &["is_current"]).unwrap();
         let not_shorthand =
