@@ -89,7 +89,8 @@ impl PartitionMetadataValueKind {
             Self::Decimal { precision, scale } => {
                 parse_delta_decimal(raw_value, precision, scale).map(PartitionScalar::Decimal)
             }
-            Self::Float32 | Self::Float64 => None,
+            Self::Float32 => parse_finite_float32(raw_value).map(PartitionScalar::Float32),
+            Self::Float64 => parse_finite_float64(raw_value).map(PartitionScalar::Float64),
         }
     }
 
@@ -240,6 +241,22 @@ fn pow10(exponent: u8) -> Option<i128> {
     (0..exponent).try_fold(1_i128, |value, _| value.checked_mul(10))
 }
 
+fn parse_finite_float32(raw_value: &str) -> Option<u32> {
+    raw_value
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(f32::to_bits)
+}
+
+fn parse_finite_float64(raw_value: &str) -> Option<u64> {
+    raw_value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(f64::to_bits)
+}
+
 /// Typed literal or parsed raw partition metadata value.
 ///
 /// The evaluator compares values only after both sides have been converted into
@@ -252,6 +269,8 @@ pub(super) enum PartitionScalar {
     Boolean(bool),
     Date(i32),
     Decimal(i128),
+    Float32(u32),
+    Float64(u64),
 }
 
 impl PartitionScalar {
@@ -514,6 +533,49 @@ mod tests {
         assert_eq!(decimal.parse_raw("not-a-decimal"), None);
         assert!(decimal.supports_ordering());
         assert!(decimal.supports_between());
+    }
+
+    #[test]
+    fn floating_value_kinds_parse_finite_delta_metadata_text_to_bits() {
+        assert_eq!(
+            PartitionMetadataValueKind::Float32.parse_raw("1.5"),
+            Some(PartitionScalar::Float32(1.5_f32.to_bits()))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float32.parse_raw("-0.0"),
+            Some(PartitionScalar::Float32((-0.0_f32).to_bits()))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float32.parse_raw("0.0"),
+            Some(PartitionScalar::Float32(0.0_f32.to_bits()))
+        );
+        assert_ne!(
+            PartitionMetadataValueKind::Float32.parse_raw("-0.0"),
+            PartitionMetadataValueKind::Float32.parse_raw("0.0")
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float64.parse_raw("-2.25"),
+            Some(PartitionScalar::Float64((-2.25_f64).to_bits()))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float64.parse_raw("1.25E-2"),
+            Some(PartitionScalar::Float64(1.25E-2_f64.to_bits()))
+        );
+
+        for raw_value in ["", "not-a-float", "NaN", "inf", "Infinity", "-Infinity"] {
+            assert_eq!(
+                PartitionMetadataValueKind::Float32.parse_raw(raw_value),
+                None
+            );
+            assert_eq!(
+                PartitionMetadataValueKind::Float64.parse_raw(raw_value),
+                None
+            );
+        }
+        assert!(!PartitionMetadataValueKind::Float32.supports_ordering());
+        assert!(!PartitionMetadataValueKind::Float32.supports_between());
+        assert!(!PartitionMetadataValueKind::Float64.supports_ordering());
+        assert!(!PartitionMetadataValueKind::Float64.supports_between());
     }
 
     #[test]

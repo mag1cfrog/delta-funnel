@@ -268,6 +268,12 @@ fn is_supported_partition_literal_for_column(
             *column_scale,
         )
         .is_some(),
+        (DataType::Float32, Expr::Literal(ScalarValue::Float32(Some(value)), _)) => {
+            value.is_finite()
+        }
+        (DataType::Float64, Expr::Literal(ScalarValue::Float64(Some(value)), _)) => {
+            value.is_finite()
+        }
         (data_type, literal) => signed_integer_bounds(data_type)
             .zip(signed_integer_literal_value(literal))
             .is_some_and(|((min, max), value)| min <= value && value <= max),
@@ -640,6 +646,38 @@ mod tests {
                 .is_null()
                 .and(col("double_part").is_not_null()),
             Expr::Not(Box::new(col("float_part").is_null())),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_finite_floating_equality_and_membership() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["float_part", "double_part"]);
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let negative_zero = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let filters = [
+            col("float_part").eq(float_value.clone()),
+            float_value.clone().eq(col("float_part")),
+            col("float_part").not_eq(float_value.clone()),
+            col("float_part").in_list(vec![float_value.clone(), negative_zero], false),
+            col("float_part").in_list(vec![float_value], true),
+            col("double_part").eq(double_value.clone()),
+            col("double_part").in_list(vec![double_value.clone(), double_value], false),
         ];
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
