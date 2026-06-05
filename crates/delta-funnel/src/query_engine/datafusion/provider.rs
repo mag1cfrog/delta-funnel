@@ -2520,10 +2520,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decimal_partition_literal_filters_remain_unsupported_before_literal_promotion()
+    async fn decimal_partition_unsafe_literal_filters_are_rejected_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
-            "decimal-partition-literal-unsupported-boundary",
+            "decimal-partition-unsafe-literal-boundary",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             r#""partitionValues":{"amount":"123.45"}"#,
@@ -2538,7 +2538,7 @@ mod tests {
         let state = SessionContext::new().state();
         let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
         let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
-        let different_scale = Expr::Literal(ScalarValue::Decimal128(Some(123_450), 12, 3), None);
+        let non_exact_scale = Expr::Literal(ScalarValue::Decimal128(Some(12_346), 10, 3), None);
         let scalar_udf = create_udf(
             "decimal_identity_for_pushdown_boundary",
             vec![DataType::Decimal128(10, 2)],
@@ -2559,25 +2559,17 @@ mod tests {
             ));
         let filters = vec![
             (
-                "decimal equality",
-                datafusion::logical_expr::col("amount").eq(amount.clone()),
-            ),
-            (
-                "reversed decimal equality",
-                amount.clone().eq(datafusion::logical_expr::col("amount")),
-            ),
-            (
-                "decimal inequality",
-                datafusion::logical_expr::col("amount").not_eq(amount.clone()),
+                "non exact scale equality",
+                datafusion::logical_expr::col("amount").eq(non_exact_scale.clone()),
             ),
             (
                 "decimal ordering",
                 datafusion::logical_expr::col("amount").gt(zero.clone()),
             ),
             (
-                "decimal in list",
+                "non exact scale in list",
                 datafusion::logical_expr::col("amount")
-                    .in_list(vec![amount.clone(), different_scale], false),
+                    .in_list(vec![amount.clone(), non_exact_scale], false),
             ),
             (
                 "decimal between",
@@ -2637,6 +2629,96 @@ mod tests {
                     .contains("pushed filters must be exact partition predicates")),
                 "{name} should be rejected"
             );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decimal_partition_equality_and_membership_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "decimal-partition-equality-membership",
+            DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["amount"]"#,
+            &[
+                r#""partitionValues":{"amount":"123.45"}"#,
+                r#""partitionValues":{"amount":"0.00"}"#,
+                r#""partitionValues":{"amount":"-1.23"}"#,
+                r#""partitionValues":{"amount":null}"#,
+                r#""partitionValues":{"amount":""}"#,
+                r#""partitionValues":{"amount":"not-a-decimal"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let negative_different_scale =
+            Expr::Literal(ScalarValue::Decimal128(Some(-1_230), 12, 3), None);
+        let same_amount_different_scale =
+            Expr::Literal(ScalarValue::Decimal128(Some(123_450), 12, 3), None);
+        let cases = [
+            (
+                "equality",
+                datafusion::logical_expr::col("amount").eq(amount.clone()),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed equality different scale",
+                negative_different_scale.eq(datafusion::logical_expr::col("amount")),
+                vec!["part-00002.parquet"],
+            ),
+            (
+                "inequality",
+                datafusion::logical_expr::col("amount").not_eq(amount.clone()),
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+            (
+                "in list",
+                datafusion::logical_expr::col("amount").in_list(
+                    vec![amount.clone(), zero.clone(), same_amount_different_scale],
+                    false,
+                ),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not in list",
+                datafusion::logical_expr::col("amount").in_list(vec![amount.clone()], true),
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
@@ -4375,11 +4457,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_decimal_partition_literal_filters_keep_residual_before_literal_promotion()
+    async fn sql_decimal_partition_unsafe_literal_filters_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-decimal-partition-literal-residuals",
+            "sql-decimal-partition-unsafe-literal-residuals",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -4408,24 +4490,12 @@ mod tests {
 
         let cases = [
             (
-                "decimal literal equality",
-                "select id from orders where amount = DECIMAL '123.45'",
-            ),
-            (
-                "numeric literal equality",
-                "select id from orders where amount = 123.45",
-            ),
-            (
-                "string literal equality coerced by datafusion",
+                "string literal equality casts column to utf8",
                 "select id from orders where amount = '123.45'",
             ),
             (
                 "decimal literal ordering",
                 "select id from orders where amount < DECIMAL '123.45'",
-            ),
-            (
-                "decimal literal in list",
-                "select id from orders where amount in (DECIMAL '123.45', DECIMAL '0.00')",
             ),
             (
                 "decimal literal between",
@@ -4461,6 +4531,107 @@ mod tests {
                 scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_decimal_partition_equality_and_membership_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-decimal-partition-equality-membership",
+            DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["amount"]"#,
+            &[
+                r#""partitionValues":{"amount":"123.45"}"#,
+                r#""partitionValues":{"amount":"0.00"}"#,
+                r#""partitionValues":{"amount":"-1.23"}"#,
+                r#""partitionValues":{"amount":null}"#,
+                r#""partitionValues":{"amount":""}"#,
+                r#""partitionValues":{"amount":"not-a-decimal"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let cases = [
+            (
+                "decimal literal equality",
+                "select id from orders where amount = DECIMAL '123.45'",
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "numeric literal equality",
+                "select id from orders where amount = 123.45",
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed decimal literal equality different scale",
+                "select id from orders where DECIMAL '-1.230' = amount",
+                vec!["part-00002.parquet"],
+            ),
+            (
+                "decimal literal inequality",
+                "select id from orders where amount != DECIMAL '123.45'",
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+            (
+                "decimal literal in list",
+                "select id from orders where amount in (DECIMAL '123.45', DECIMAL '0.00', DECIMAL '123.450')",
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "decimal literal not in list",
+                "select id from orders where amount not in (DECIMAL '123.45')",
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                1,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
         }
 
         Ok(())

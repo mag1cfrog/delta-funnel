@@ -6,7 +6,9 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::{Expr, Operator};
 
-use crate::table_formats::supports_partition_metadata_logical_type;
+use crate::table_formats::{
+    normalize_decimal_partition_literal, supports_partition_metadata_logical_type,
+};
 
 use super::analysis::{DeltaKernelPredicateScope, analyze_filter_for_pushdown};
 use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
@@ -255,6 +257,17 @@ fn is_supported_partition_literal_for_column(
         ) => !value.is_empty(),
         (DataType::Boolean, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) => true,
         (DataType::Date32, Expr::Literal(ScalarValue::Date32(Some(_)), _)) => true,
+        (
+            DataType::Decimal128(column_precision, column_scale),
+            Expr::Literal(ScalarValue::Decimal128(Some(value), precision, scale), _),
+        ) => normalize_decimal_partition_literal(
+            *value,
+            *precision,
+            *scale,
+            *column_precision,
+            *column_scale,
+        )
+        .is_some(),
         (data_type, literal) => signed_integer_bounds(data_type)
             .zip(signed_integer_literal_value(literal))
             .is_some_and(|((min, max), value)| min <= value && value <= max),
@@ -543,17 +556,54 @@ mod tests {
     }
 
     #[test]
+    fn partition_operator_planner_accepts_decimal_equality_and_membership() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["amount"]);
+        let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let same_amount_different_scale =
+            Expr::Literal(ScalarValue::Decimal128(Some(123_450), 12, 3), None);
+        let filters = [
+            col("amount").eq(amount.clone()),
+            amount.clone().eq(col("amount")),
+            col("amount").not_eq(amount.clone()),
+            col("amount").in_list(
+                vec![amount.clone(), same_amount_different_scale, amount.clone()],
+                false,
+            ),
+            col("amount").in_list(vec![amount], true),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Exact
+                && !decision.residual
+                && decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+        }));
+    }
+
+    #[test]
     fn partition_operator_planner_rejects_unproven_decimal_literal_shapes() {
         let schema = schema();
         let partition_columns = partition_columns(&["amount"]);
         let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
         let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
-        let different_scale = Expr::Literal(ScalarValue::Decimal128(Some(123_450), 12, 3), None);
+        let non_exact_scale = Expr::Literal(ScalarValue::Decimal128(Some(12_346), 10, 3), None);
         let filters = [
-            col("amount").eq(amount.clone()),
-            amount.clone().eq(col("amount")),
-            col("amount").not_eq(amount.clone()),
-            col("amount").in_list(vec![amount.clone(), different_scale], false),
+            col("amount").eq(non_exact_scale.clone()),
+            col("amount").in_list(vec![amount.clone(), non_exact_scale], false),
             col("amount").lt(amount.clone()),
             col("amount").between(zero, amount.clone()),
             col("amount").eq(lit("123.45")),

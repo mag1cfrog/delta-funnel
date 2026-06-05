@@ -384,9 +384,12 @@ fn convert_partition_literal(
             Expr::Literal(ScalarValue::Date32(Some(value)), _) => Ok(PartitionScalar::Date(*value)),
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
-        PartitionMetadataValueKind::Decimal { .. } => {
-            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
-        }
+        PartitionMetadataValueKind::Decimal { .. } => match expr {
+            Expr::Literal(ScalarValue::Decimal128(Some(value), precision, scale), _) => value_kind
+                .normalize_decimal_literal(*value, *precision, *scale)
+                .ok_or(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+            _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+        },
     }
 }
 
@@ -531,6 +534,86 @@ mod tests {
         assert!(matches_scan_file(&is_not_null, &raw_empty));
         assert!(matches_scan_file(&is_not_null, &invalid_decimal));
         assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_decimal_equality_and_in_lists_with_typed_metadata_semantics() {
+        let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let same_amount_different_scale =
+            Expr::Literal(ScalarValue::Decimal128(Some(123_450), 12, 3), None);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-1_230), 12, 3), None);
+        let eq = predicate_expr(&col("amount").eq(amount.clone()), &["amount"]).unwrap();
+        let reversed = predicate_expr(&negative.clone().eq(col("amount")), &["amount"]).unwrap();
+        let not_eq = predicate_expr(&col("amount").not_eq(amount.clone()), &["amount"]).unwrap();
+        let in_list = predicate_expr(
+            &col("amount").in_list(
+                vec![
+                    amount.clone(),
+                    zero.clone(),
+                    same_amount_different_scale.clone(),
+                ],
+                false,
+            ),
+            &["amount"],
+        )
+        .unwrap();
+        let not_in = predicate_expr(
+            &col("amount").in_list(vec![amount.clone()], true),
+            &["amount"],
+        )
+        .unwrap();
+        let raw_amount = values(&[("amount", "123.45")]);
+        let raw_zero = values(&[("amount", "0.00")]);
+        let raw_negative = values(&[("amount", "-1.23")]);
+        let raw_empty = values(&[("amount", "")]);
+        let invalid_decimal = values(&[("amount", "not-a-decimal")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&eq, &raw_amount));
+        assert!(!matches_scan_file(&eq, &raw_zero));
+        assert!(!matches_scan_file(&eq, &raw_empty));
+        assert!(!matches_scan_file(&eq, &invalid_decimal));
+        assert!(!matches_scan_file(&eq, &missing));
+        assert!(matches_scan_file(&reversed, &raw_negative));
+        assert!(!matches_scan_file(&reversed, &raw_amount));
+        assert!(!matches_scan_file(&not_eq, &raw_amount));
+        assert!(matches_scan_file(&not_eq, &raw_zero));
+        assert!(matches_scan_file(&not_eq, &raw_negative));
+        assert!(!matches_scan_file(&not_eq, &raw_empty));
+        assert!(!matches_scan_file(&not_eq, &invalid_decimal));
+        assert!(!matches_scan_file(&not_eq, &missing));
+        assert!(matches_scan_file(&in_list, &raw_amount));
+        assert!(matches_scan_file(&in_list, &raw_zero));
+        assert!(!matches_scan_file(&in_list, &raw_negative));
+        assert!(!matches_scan_file(&not_in, &raw_amount));
+        assert!(matches_scan_file(&not_in, &raw_zero));
+        assert!(matches_scan_file(&not_in, &raw_negative));
+        assert!(!matches_scan_file(&not_in, &raw_empty));
+        assert!(!matches_scan_file(&not_in, &invalid_decimal));
+        assert!(!matches_scan_file(&not_in, &missing));
+
+        assert_eq!(
+            predicate_expr(
+                &col("amount").eq(Expr::Literal(
+                    ScalarValue::Decimal128(Some(12_346), 10, 3),
+                    None
+                )),
+                &["amount"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("amount").eq(Expr::Literal(ScalarValue::Decimal128(None, 10, 2), None)),
+                &["amount"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(&col("amount").eq(lit("123.45")), &["amount"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
     }
 
     #[test]

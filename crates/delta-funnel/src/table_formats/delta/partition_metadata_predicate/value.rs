@@ -80,6 +80,24 @@ impl PartitionMetadataValueKind {
             }
         }
     }
+
+    pub(super) fn normalize_decimal_literal(
+        self,
+        value: i128,
+        precision: u8,
+        scale: i8,
+    ) -> Option<PartitionScalar> {
+        let Self::Decimal {
+            precision: column_precision,
+            scale: column_scale,
+        } = self
+        else {
+            return None;
+        };
+
+        normalize_decimal_partition_literal(value, precision, scale, column_precision, column_scale)
+            .map(PartitionScalar::Decimal)
+    }
 }
 
 fn parse_delta_date(raw_value: &str) -> Option<i32> {
@@ -137,6 +155,56 @@ fn parse_delta_decimal(raw_value: &str, precision: u8, scale: i8) -> Option<i128
     } else {
         Some(value)
     }
+}
+
+pub(crate) fn normalize_decimal_partition_literal(
+    value: i128,
+    precision: u8,
+    scale: i8,
+    column_precision: u8,
+    column_scale: i8,
+) -> Option<i128> {
+    let scale = u8::try_from(scale).ok()?;
+    let column_scale = u8::try_from(column_scale).ok()?;
+    if precision == 0
+        || 38 < precision
+        || precision < scale
+        || column_precision == 0
+        || 38 < column_precision
+        || column_precision < column_scale
+        || !decimal_precision_fits(value, precision)?
+    {
+        return None;
+    }
+
+    let normalized = match scale.cmp(&column_scale) {
+        Ordering::Less => value.checked_mul(pow10(column_scale - scale)?)?,
+        Ordering::Equal => value,
+        Ordering::Greater => {
+            let divisor = pow10(scale - column_scale)?;
+            if value % divisor != 0 {
+                return None;
+            }
+            value.checked_div(divisor)?
+        }
+    };
+
+    decimal_precision_fits(normalized, column_precision)?.then_some(normalized)
+}
+
+fn decimal_precision_fits(value: i128, precision: u8) -> Option<bool> {
+    let mut value = value.checked_abs()?;
+    let mut digits = 0;
+    while value != 0 {
+        digits += 1;
+        value /= 10;
+    }
+
+    Some(digits <= usize::from(precision))
+}
+
+fn pow10(exponent: u8) -> Option<i128> {
+    (0..exponent).try_fold(1_i128, |value, _| value.checked_mul(10))
 }
 
 /// Typed literal or parsed raw partition metadata value.
@@ -390,5 +458,33 @@ mod tests {
         assert_eq!(decimal.parse_raw("+1.23"), None);
         assert_eq!(decimal.parse_raw("not-a-decimal"), None);
         assert!(!decimal.supports_ordering());
+    }
+
+    #[test]
+    fn decimal_literal_normalization_rescales_only_when_exact_and_in_bounds() {
+        let decimal = PartitionMetadataValueKind::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+
+        assert_eq!(
+            decimal.normalize_decimal_literal(12_345, 10, 2),
+            Some(PartitionScalar::Decimal(12_345))
+        );
+        assert_eq!(
+            decimal.normalize_decimal_literal(1_234, 10, 1),
+            Some(PartitionScalar::Decimal(12_340))
+        );
+        assert_eq!(
+            decimal.normalize_decimal_literal(123_450, 12, 3),
+            Some(PartitionScalar::Decimal(12_345))
+        );
+        assert_eq!(decimal.normalize_decimal_literal(12_346, 10, 3), None);
+        assert_eq!(
+            decimal.normalize_decimal_literal(1_234_567_890_1, 11, 2),
+            None
+        );
+        assert_eq!(decimal.normalize_decimal_literal(12_345, 10, -1), None);
+        assert_eq!(decimal.normalize_decimal_literal(12_345, 39, 2), None);
     }
 }
