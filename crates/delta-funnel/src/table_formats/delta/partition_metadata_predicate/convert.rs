@@ -160,8 +160,36 @@ pub(super) fn convert_expr(
             partition_columns,
             physical_name_lookup,
         )?))),
+        Expr::Column(_) => convert_boolean_shorthand(
+            expr,
+            logical_schema,
+            partition_columns,
+            physical_name_lookup,
+        ),
         _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression),
     }
+}
+
+fn convert_boolean_shorthand(
+    column: &Expr,
+    logical_schema: &SchemaRef,
+    partition_columns: &HashSet<String>,
+    physical_name_lookup: &DeltaPartitionNameMap,
+) -> Result<PartitionMetadataExpr, DeltaPartitionMetadataPredicateError> {
+    let column = convert_column(
+        column,
+        logical_schema,
+        partition_columns,
+        physical_name_lookup,
+    )?;
+    if !column.value_kind().is_boolean() {
+        return Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression);
+    }
+
+    Ok(PartitionMetadataExpr::Eq {
+        column,
+        literal: PartitionScalar::Boolean(true),
+    })
 }
 
 fn convert_between(
@@ -525,6 +553,34 @@ mod tests {
                 &["is_current"]
             ),
             Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+    }
+
+    #[test]
+    fn converts_boolean_shorthand_with_sql_metadata_semantics() {
+        let shorthand = predicate_expr(&col("is_current"), &["is_current"]).unwrap();
+        let not_shorthand =
+            predicate_expr(&Expr::Not(Box::new(col("is_current"))), &["is_current"]).unwrap();
+        let raw_true = values(&[("is_current", "true")]);
+        let raw_false = values(&[("is_current", "false")]);
+        let raw_empty = values(&[("is_current", "")]);
+        let invalid_boolean = values(&[("is_current", "not-a-boolean")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&shorthand, &raw_true));
+        assert!(!matches_scan_file(&shorthand, &raw_false));
+        assert!(!matches_scan_file(&shorthand, &raw_empty));
+        assert!(!matches_scan_file(&shorthand, &invalid_boolean));
+        assert!(!matches_scan_file(&shorthand, &missing));
+        assert!(!matches_scan_file(&not_shorthand, &raw_true));
+        assert!(matches_scan_file(&not_shorthand, &raw_false));
+        assert!(!matches_scan_file(&not_shorthand, &raw_empty));
+        assert!(!matches_scan_file(&not_shorthand, &invalid_boolean));
+        assert!(!matches_scan_file(&not_shorthand, &missing));
+
+        assert_eq!(
+            predicate_expr(&col("region"), &["region"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression)
         );
     }
 

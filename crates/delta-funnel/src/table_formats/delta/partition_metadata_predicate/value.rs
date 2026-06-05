@@ -40,6 +40,10 @@ impl PartitionMetadataValueKind {
         }
     }
 
+    pub(super) fn is_boolean(self) -> bool {
+        matches!(self, Self::Boolean)
+    }
+
     pub(super) fn parse_raw(self, raw_value: &str) -> Option<PartitionScalar> {
         match self {
             Self::String => Some(PartitionScalar::String(raw_value.to_owned())),
