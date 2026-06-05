@@ -3037,6 +3037,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn floating_partition_boolean_composition_and_projection_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "floating-partition-boolean-composition",
+            FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["float_part","double_part"]"#,
+            &[
+                r#""partitionValues":{"float_part":"1.5","double_part":"-2.25"}"#,
+                r#""partitionValues":{"float_part":"-0.0","double_part":"0.0"}"#,
+                r#""partitionValues":{"float_part":"0.0","double_part":"1.0"}"#,
+                r#""partitionValues":{"float_part":"3.0","double_part":"4.0"}"#,
+                r#""partitionValues":{"float_part":null,"double_part":null}"#,
+                r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+                r#""partitionValues":{"float_part":"NaN","double_part":"Infinity"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let negative_zero_float = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let double_other = Expr::Literal(ScalarValue::Float64(Some(1.0)), None);
+        let separate_and_filters = vec![
+            datafusion::logical_expr::col("float_part").gt_eq(negative_zero_float.clone()),
+            datafusion::logical_expr::col("float_part")
+                .lt(Expr::Literal(ScalarValue::Float32(Some(3.0)), None)),
+        ];
+        let whole_and_filter = datafusion::logical_expr::col("float_part")
+            .gt_eq(negative_zero_float.clone())
+            .and(
+                datafusion::logical_expr::col("float_part")
+                    .lt(Expr::Literal(ScalarValue::Float32(Some(3.0)), None)),
+            );
+        let whole_or_filter = datafusion::logical_expr::col("float_part")
+            .eq(float_value.clone())
+            .or(datafusion::logical_expr::col("double_part").eq(double_other));
+        let whole_not_filter = Expr::Not(Box::new(
+            datafusion::logical_expr::col("float_part").eq(float_value),
+        ));
+        let cases = [
+            (
+                "separate filters combine with and",
+                separate_and_filters,
+                2,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                ],
+            ),
+            (
+                "whole and",
+                vec![whole_and_filter],
+                1,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                ],
+            ),
+            (
+                "whole or",
+                vec![whole_or_filter],
+                1,
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "whole not",
+                vec![whole_not_filter],
+                1,
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filters, expected_exact_count, expected_paths) in cases {
+            let filter_refs = filters.iter().collect::<Vec<_>>();
+            let support = provider.supports_filters_pushdown(&filter_refs)?;
+            assert_eq!(
+                support,
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().projected_schema.field(0).name(),
+                "id",
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn floating_partition_null_checks_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
