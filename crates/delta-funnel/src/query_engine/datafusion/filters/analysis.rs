@@ -214,6 +214,7 @@ fn is_kernel_predicate_candidate(filter: &Expr) -> bool {
             is_column_or_literal(in_list.expr.as_ref())
                 && in_list.list.iter().all(is_column_or_literal)
         }
+        Expr::Column(_) => true,
         _ => false,
     }
 }

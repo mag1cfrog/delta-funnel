@@ -160,8 +160,36 @@ pub(super) fn convert_expr(
             partition_columns,
             physical_name_lookup,
         )?))),
+        Expr::Column(_) => convert_boolean_shorthand(
+            expr,
+            logical_schema,
+            partition_columns,
+            physical_name_lookup,
+        ),
         _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression),
     }
+}
+
+fn convert_boolean_shorthand(
+    column: &Expr,
+    logical_schema: &SchemaRef,
+    partition_columns: &HashSet<String>,
+    physical_name_lookup: &DeltaPartitionNameMap,
+) -> Result<PartitionMetadataExpr, DeltaPartitionMetadataPredicateError> {
+    let column = convert_column(
+        column,
+        logical_schema,
+        partition_columns,
+        physical_name_lookup,
+    )?;
+    if !column.value_kind().is_boolean() {
+        return Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression);
+    }
+
+    Ok(PartitionMetadataExpr::Eq {
+        column,
+        literal: PartitionScalar::Boolean(true),
+    })
 }
 
 fn convert_between(
@@ -257,6 +285,9 @@ fn convert_comparison(
         partition_columns,
         physical_name_lookup,
     )?;
+    if !column.value_kind().supports_ordering() {
+        return Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator);
+    }
     Ok(PartitionMetadataExpr::Compare {
         literal: convert_partition_literal(literal, column.value_kind())?,
         column,
@@ -343,6 +374,12 @@ fn convert_partition_literal(
                 .map(PartitionScalar::SignedInteger)
                 .ok_or(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
         }
+        PartitionMetadataValueKind::Boolean => match expr {
+            Expr::Literal(ScalarValue::Boolean(Some(value)), _) => {
+                Ok(PartitionScalar::Boolean(*value))
+            }
+            _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+        },
     }
 }
 
@@ -374,6 +411,7 @@ mod tests {
             Field::new("small_id", DataType::Int8, false),
             Field::new("region", DataType::Utf8, true),
             Field::new("day", DataType::LargeUtf8, true),
+            Field::new("is_current", DataType::Boolean, true),
         ]))
     }
 
@@ -442,6 +480,133 @@ mod tests {
         assert!(matches_scan_file(&is_not_null, &raw_empty));
         assert!(matches_scan_file(&is_not_null, &invalid_integer));
         assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_boolean_null_checks_with_sql_metadata_semantics() {
+        let is_null = predicate_expr(&col("is_current").is_null(), &["is_current"]).unwrap();
+        let is_not_null =
+            predicate_expr(&col("is_current").is_not_null(), &["is_current"]).unwrap();
+        let raw_true = values(&[("is_current", "true")]);
+        let raw_false = values(&[("is_current", "false")]);
+        let raw_empty = values(&[("is_current", "")]);
+        let invalid_boolean = values(&[("is_current", "not-a-boolean")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&is_null, &raw_true));
+        assert!(!matches_scan_file(&is_null, &raw_false));
+        assert!(!matches_scan_file(&is_null, &raw_empty));
+        assert!(!matches_scan_file(&is_null, &invalid_boolean));
+        assert!(matches_scan_file(&is_null, &missing));
+        assert!(matches_scan_file(&is_not_null, &raw_true));
+        assert!(matches_scan_file(&is_not_null, &raw_false));
+        assert!(matches_scan_file(&is_not_null, &raw_empty));
+        assert!(matches_scan_file(&is_not_null, &invalid_boolean));
+        assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_boolean_equality_and_in_lists_with_typed_metadata_semantics() {
+        let eq = predicate_expr(&col("is_current").eq(lit(true)), &["is_current"]).unwrap();
+        let reversed = predicate_expr(&lit(false).eq(col("is_current")), &["is_current"]).unwrap();
+        let not_eq = predicate_expr(&col("is_current").not_eq(lit(true)), &["is_current"]).unwrap();
+        let in_list = predicate_expr(
+            &col("is_current").in_list(vec![lit(true), lit(false), lit(true)], false),
+            &["is_current"],
+        )
+        .unwrap();
+        let not_in = predicate_expr(
+            &col("is_current").in_list(vec![lit(true)], true),
+            &["is_current"],
+        )
+        .unwrap();
+        let raw_true = values(&[("is_current", "true")]);
+        let raw_false = values(&[("is_current", "false")]);
+        let raw_empty = values(&[("is_current", "")]);
+        let invalid_boolean = values(&[("is_current", "not-a-boolean")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&eq, &raw_true));
+        assert!(!matches_scan_file(&eq, &raw_false));
+        assert!(!matches_scan_file(&eq, &raw_empty));
+        assert!(!matches_scan_file(&eq, &invalid_boolean));
+        assert!(!matches_scan_file(&eq, &missing));
+        assert!(matches_scan_file(&reversed, &raw_false));
+        assert!(!matches_scan_file(&reversed, &raw_true));
+        assert!(!matches_scan_file(&not_eq, &raw_true));
+        assert!(matches_scan_file(&not_eq, &raw_false));
+        assert!(!matches_scan_file(&not_eq, &raw_empty));
+        assert!(!matches_scan_file(&not_eq, &invalid_boolean));
+        assert!(!matches_scan_file(&not_eq, &missing));
+        assert!(matches_scan_file(&in_list, &raw_true));
+        assert!(matches_scan_file(&in_list, &raw_false));
+        assert!(!matches_scan_file(&not_in, &raw_true));
+        assert!(matches_scan_file(&not_in, &raw_false));
+        assert!(!matches_scan_file(&not_in, &raw_empty));
+        assert!(!matches_scan_file(&not_in, &invalid_boolean));
+        assert!(!matches_scan_file(&not_in, &missing));
+
+        assert_eq!(
+            predicate_expr(&col("is_current").eq(lit("true")), &["is_current"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("is_current").eq(Expr::Literal(ScalarValue::Boolean(None), None)),
+                &["is_current"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+    }
+
+    #[test]
+    fn converts_boolean_shorthand_with_sql_metadata_semantics() {
+        let shorthand = predicate_expr(&col("is_current"), &["is_current"]).unwrap();
+        let not_shorthand =
+            predicate_expr(&Expr::Not(Box::new(col("is_current"))), &["is_current"]).unwrap();
+        let raw_true = values(&[("is_current", "true")]);
+        let raw_false = values(&[("is_current", "false")]);
+        let raw_empty = values(&[("is_current", "")]);
+        let invalid_boolean = values(&[("is_current", "not-a-boolean")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&shorthand, &raw_true));
+        assert!(!matches_scan_file(&shorthand, &raw_false));
+        assert!(!matches_scan_file(&shorthand, &raw_empty));
+        assert!(!matches_scan_file(&shorthand, &invalid_boolean));
+        assert!(!matches_scan_file(&shorthand, &missing));
+        assert!(!matches_scan_file(&not_shorthand, &raw_true));
+        assert!(matches_scan_file(&not_shorthand, &raw_false));
+        assert!(!matches_scan_file(&not_shorthand, &raw_empty));
+        assert!(!matches_scan_file(&not_shorthand, &invalid_boolean));
+        assert!(!matches_scan_file(&not_shorthand, &missing));
+
+        assert_eq!(
+            predicate_expr(&col("region"), &["region"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedExpression)
+        );
+    }
+
+    #[test]
+    fn rejects_boolean_ordering_predicates() {
+        assert_eq!(
+            predicate_expr(&col("is_current").lt(lit(true)), &["is_current"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("is_current").between(lit(false), lit(true)),
+                &["is_current"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("is_current").not_between(lit(false), lit(true)),
+                &["is_current"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator)
+        );
     }
 
     #[test]

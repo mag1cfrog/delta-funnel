@@ -15,9 +15,9 @@ use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilter
 ///
 /// A filter can be exact here only when it is partition-only and accepted by
 /// the provider metadata semantics policy. The proven exact subset includes
-/// supported logical partition column types for equality, inequality, range
-/// comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`, `NOT IN`, `IS NULL`, `IS NOT
-/// NULL`, negation, and boolean composition of exact partition predicates.
+/// supported logical partition column types for operators whose literal or
+/// ordering semantics are proven. Range comparisons, `BETWEEN`, and `NOT
+/// BETWEEN` are exact only for supported types with proven ordering semantics.
 /// Additional types and operators should be added only with semantic tests. All
 /// other shapes stay `Unsupported` so DataFusion keeps them as residual filters.
 pub(super) fn plan_partition_operator_pushdown(
@@ -120,8 +120,19 @@ fn is_supported_partition_operator_filter(filter: &Expr, schema: &SchemaRef) -> 
             is_supported_partition_null_check(inner.as_ref(), schema)
         }
         Expr::Not(inner) => is_supported_partition_operator_filter(inner.as_ref(), schema),
+        Expr::Column(column) => is_supported_partition_boolean_shorthand(column, schema),
         _ => false,
     }
+}
+
+fn is_supported_partition_boolean_shorthand(column: &Column, schema: &SchemaRef) -> bool {
+    if !is_supported_partition_column_type(column, schema) {
+        return false;
+    }
+
+    schema
+        .field_with_name(&column.name)
+        .is_ok_and(|field| matches!(field.data_type(), DataType::Boolean))
 }
 
 /// Accepts one column/literal range comparison if the metadata type policy can prove it.
@@ -130,7 +141,7 @@ fn is_supported_partition_comparison(column: &Expr, literal: &Expr, schema: &Sch
         return false;
     };
 
-    is_supported_partition_literal_for_column(column, literal, schema)
+    is_supported_ordering_literal_for_column(column, literal, schema)
 }
 
 /// Accepts inclusive partition ranges when both literal bounds are proven.
@@ -142,8 +153,8 @@ fn is_supported_partition_between(filter: &Expr, schema: &SchemaRef) -> bool {
         return false;
     };
 
-    is_supported_partition_literal_for_column(column, between.low.as_ref(), schema)
-        && is_supported_partition_literal_for_column(column, between.high.as_ref(), schema)
+    is_supported_ordering_literal_for_column(column, between.low.as_ref(), schema)
+        && is_supported_ordering_literal_for_column(column, between.high.as_ref(), schema)
 }
 
 /// Accepts one column/literal equality if the metadata type policy can prove it.
@@ -242,10 +253,35 @@ fn is_supported_partition_literal_for_column(
             Expr::Literal(ScalarValue::Utf8(Some(value)), _)
             | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _),
         ) => !value.is_empty(),
+        (DataType::Boolean, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) => true,
         (data_type, literal) => signed_integer_bounds(data_type)
             .zip(signed_integer_literal_value(literal))
             .is_some_and(|((min, max), value)| min <= value && value <= max),
     }
+}
+
+fn is_supported_ordering_literal_for_column(
+    column: &Column,
+    literal: &Expr,
+    schema: &SchemaRef,
+) -> bool {
+    if !is_supported_partition_literal_for_column(column, literal, schema) {
+        return false;
+    }
+
+    let Ok(field) = schema.field_with_name(&column.name) else {
+        return false;
+    };
+
+    matches!(
+        field.data_type(),
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+    )
 }
 
 fn signed_integer_bounds(data_type: &DataType) -> Option<(i64, i64)> {
@@ -283,6 +319,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("region", DataType::Utf8, true),
             Field::new("day", DataType::Utf8, true),
+            Field::new("is_current", DataType::Boolean, true),
         ]))
     }
 
@@ -439,6 +476,174 @@ mod tests {
                 && decision.kernel_predicate.predicate.is_some()
                 && decision.kernel_predicate.adapter_error.is_none()
         }));
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_boolean_null_checks_as_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let filters = [col("is_current").is_null(), col("is_current").is_not_null()];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+        assert_eq!(plan.exact_count, 2);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Exact
+                && !decision.residual
+                && decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+        }));
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_boolean_equality_and_membership() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let filters = [
+            col("is_current").eq(lit(true)),
+            lit(false).eq(col("is_current")),
+            col("is_current").not_eq(lit(false)),
+            col("is_current").in_list(vec![lit(true), lit(false), lit(true)], false),
+            col("is_current").in_list(vec![lit(true)], true),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+        }));
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_unproven_boolean_literal_shapes() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let filters = [
+            col("is_current").eq(lit("true")),
+            col("is_current").eq(Expr::Literal(ScalarValue::Boolean(None), None)),
+            col("is_current").in_list(
+                vec![lit(true), Expr::Literal(ScalarValue::Boolean(None), None)],
+                false,
+            ),
+            col("is_current").in_list(vec![lit(true), lit("false")], false),
+            col("is_current").in_list(vec![col("region")], false),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_boolean_shorthand() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let filters = [col("is_current"), Expr::Not(Box::new(col("is_current")))];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+        }));
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_non_boolean_shorthand() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["region", "id"]);
+        let filters = [col("region"), col("id"), Expr::Not(Box::new(col("region")))];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_boolean_ordering_and_between() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let filters = [
+            col("is_current").lt(lit(true)),
+            col("is_current").lt_eq(lit(false)),
+            col("is_current").gt(lit(false)),
+            col("is_current").gt_eq(lit(true)),
+            col("is_current").between(lit(false), lit(true)),
+            col("is_current").not_between(lit(false), lit(true)),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
     }
 
     #[test]

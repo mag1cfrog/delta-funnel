@@ -47,11 +47,11 @@ impl DeltaPartitionMetadataPredicate {
     /// Converts a supported DataFusion expression into a metadata predicate.
     ///
     /// The provider policy supports promoted logical partition types for
-    /// equality, inequality, range comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`,
-    /// `NOT IN`, `IS NULL`, `IS NOT NULL`, negation, and boolean composition
-    /// over supported child predicates. Unsupported expressions return a typed
-    /// error so the caller can keep DataFusion residual filtering instead of
-    /// guessing.
+    /// operators whose literal or ordering semantics are proven. Range
+    /// comparisons, `BETWEEN`, and `NOT BETWEEN` are accepted only for promoted
+    /// types with proven ordering semantics. Unsupported expressions return a
+    /// typed error so the caller can keep DataFusion residual filtering instead
+    /// of guessing.
     pub(crate) fn from_datafusion_expr(
         expr: &Expr,
         logical_schema: &SchemaRef,
@@ -116,12 +116,12 @@ mod tests {
             DataType::Int32,
             DataType::Int16,
             DataType::Int8,
+            DataType::Boolean,
         ];
         let unsupported = [
             DataType::Float32,
             DataType::Float64,
             DataType::Decimal128(10, 2),
-            DataType::Boolean,
             DataType::Binary,
             DataType::Date32,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),

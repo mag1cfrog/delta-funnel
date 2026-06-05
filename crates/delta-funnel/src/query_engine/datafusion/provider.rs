@@ -407,6 +407,7 @@ mod tests {
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     const INTEGER_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]"#;
+    const BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -2182,6 +2183,484 @@ mod tests {
     }
 
     #[test]
+    fn boolean_partition_schema_maps_delta_type_to_arrow_boolean()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "boolean-partition-schema",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            r#""partitionValues":{"is_current":"true"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let schema = provider.schema();
+
+        assert_eq!(
+            schema.field_with_name("is_current")?.data_type(),
+            &DataType::Boolean
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boolean_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "boolean-partition-null-checks",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            &[
+                r#""partitionValues":{"is_current":"true"}"#,
+                r#""partitionValues":{"is_current":"false"}"#,
+                r#""partitionValues":{"is_current":null}"#,
+                r#""partitionValues":{"is_current":""}"#,
+                r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "is null",
+                datafusion::logical_expr::col("is_current").is_null(),
+                vec!["part-00002.parquet", "part-00005.parquet"],
+            ),
+            (
+                "is not null",
+                datafusion::logical_expr::col("is_current").is_not_null(),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.unsupported_count,
+                0,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boolean_partition_equality_and_membership_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "boolean-partition-equality-membership",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            &[
+                r#""partitionValues":{"is_current":"true"}"#,
+                r#""partitionValues":{"is_current":"false"}"#,
+                r#""partitionValues":{"is_current":null}"#,
+                r#""partitionValues":{"is_current":""}"#,
+                r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "equality true",
+                datafusion::logical_expr::col("is_current").eq(datafusion::logical_expr::lit(true)),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed equality false",
+                datafusion::logical_expr::lit(false)
+                    .eq(datafusion::logical_expr::col("is_current")),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "inequality",
+                datafusion::logical_expr::col("is_current")
+                    .not_eq(datafusion::logical_expr::lit(true)),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "in list",
+                datafusion::logical_expr::col("is_current").in_list(
+                    vec![
+                        datafusion::logical_expr::lit(true),
+                        datafusion::logical_expr::lit(false),
+                        datafusion::logical_expr::lit(true),
+                    ],
+                    false,
+                ),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not in list",
+                datafusion::logical_expr::col("is_current")
+                    .in_list(vec![datafusion::logical_expr::lit(true)], true),
+                vec!["part-00001.parquet"],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boolean_partition_multiple_exact_filters_combine_with_and()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "boolean-partition-multiple-exact-filters",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            &[
+                r#""partitionValues":{"is_current":"true"}"#,
+                r#""partitionValues":{"is_current":"false"}"#,
+                r#""partitionValues":{"is_current":null}"#,
+                r#""partitionValues":{"is_current":""}"#,
+                r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filters = vec![
+            datafusion::logical_expr::col("is_current").is_not_null(),
+            datafusion::logical_expr::col("is_current").eq(datafusion::logical_expr::lit(true)),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0]), &filters, None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().projected_schema.field(0).name(), "id");
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 2);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 0);
+        assert!(scan.scan_plan().partition_metadata_filter.is_some());
+        assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boolean_partition_shorthand_is_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "boolean-partition-shorthand",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            &[
+                r#""partitionValues":{"is_current":"true"}"#,
+                r#""partitionValues":{"is_current":"false"}"#,
+                r#""partitionValues":{"is_current":null}"#,
+                r#""partitionValues":{"is_current":""}"#,
+                r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "shorthand",
+                datafusion::logical_expr::col("is_current"),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "not shorthand",
+                Expr::Not(Box::new(datafusion::logical_expr::col("is_current"))),
+                vec!["part-00001.parquet"],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boolean_partition_unsafe_literal_shapes_are_rejected_at_scan_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "boolean-partition-unsafe-literal-shapes",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            r#""partitionValues":{"is_current":"true"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filters = vec![
+            (
+                "string literal equality",
+                datafusion::logical_expr::col("is_current")
+                    .eq(datafusion::logical_expr::lit("true")),
+            ),
+            (
+                "null equality",
+                datafusion::logical_expr::col("is_current")
+                    .eq(Expr::Literal(ScalarValue::Boolean(None), None)),
+            ),
+            (
+                "null in",
+                datafusion::logical_expr::col("is_current").in_list(
+                    vec![
+                        datafusion::logical_expr::lit(true),
+                        Expr::Literal(ScalarValue::Boolean(None), None),
+                    ],
+                    false,
+                ),
+            ),
+            (
+                "mixed string boolean in",
+                datafusion::logical_expr::col("is_current").in_list(
+                    vec![
+                        datafusion::logical_expr::lit(true),
+                        datafusion::logical_expr::lit("false"),
+                    ],
+                    false,
+                ),
+            ),
+            (
+                "non literal in",
+                datafusion::logical_expr::col("is_current")
+                    .in_list(vec![datafusion::logical_expr::col("id")], false),
+            ),
+        ];
+        let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boolean_partition_unsafe_ordering_shapes_are_rejected_at_scan_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "boolean-partition-unsafe-ordering-shapes",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            r#""partitionValues":{"is_current":"true"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let scalar_udf = create_udf(
+            "boolean_identity_for_pushdown_boundary",
+            vec![DataType::Boolean],
+            DataType::Boolean,
+            Volatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))))),
+        );
+        let scalar_function =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![datafusion::logical_expr::col("is_current")],
+            ));
+        let filters = vec![
+            (
+                "less than",
+                datafusion::logical_expr::col("is_current").lt(datafusion::logical_expr::lit(true)),
+            ),
+            (
+                "greater than or equal",
+                datafusion::logical_expr::col("is_current")
+                    .gt_eq(datafusion::logical_expr::lit(false)),
+            ),
+            (
+                "between",
+                datafusion::logical_expr::col("is_current").between(
+                    datafusion::logical_expr::lit(false),
+                    datafusion::logical_expr::lit(true),
+                ),
+            ),
+            (
+                "not between",
+                datafusion::logical_expr::col("is_current").not_between(
+                    datafusion::logical_expr::lit(false),
+                    datafusion::logical_expr::lit(true),
+                ),
+            ),
+            (
+                "cast operand",
+                datafusion::logical_expr::col("is_current").eq(datafusion::logical_expr::cast(
+                    datafusion::logical_expr::lit(true),
+                    DataType::Boolean,
+                )),
+            ),
+            (
+                "scalar function operand",
+                datafusion::logical_expr::col("is_current").eq(scalar_function),
+            ),
+        ];
+        let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn integer_partition_uncoerced_literals_remain_unsupported()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
@@ -2918,6 +3397,263 @@ mod tests {
                 "{name}"
             );
             assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_boolean_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-boolean-partition-null-checks",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            &[
+                r#""partitionValues":{"is_current":"true"}"#,
+                r#""partitionValues":{"is_current":"false"}"#,
+                r#""partitionValues":{"is_current":null}"#,
+                r#""partitionValues":{"is_current":""}"#,
+                r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let cases = [
+            (
+                "is null",
+                "select id from orders where is_current is null",
+                vec!["part-00002.parquet", "part-00005.parquet"],
+            ),
+            (
+                "is not null",
+                "select id from orders where is_current is not null",
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_boolean_partition_shorthand_rewrites_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-boolean-partition-shorthand-rewrites",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            &[
+                r#""partitionValues":{"is_current":"true"}"#,
+                r#""partitionValues":{"is_current":"false"}"#,
+                r#""partitionValues":{"is_current":null}"#,
+                r#""partitionValues":{"is_current":""}"#,
+                r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let cases = [
+            (
+                "shorthand",
+                "select id from orders where is_current",
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "not shorthand",
+                "select id from orders where not is_current",
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "equality true rewrite",
+                "select id from orders where is_current = true",
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "inequality true rewrite",
+                "select id from orders where is_current != true",
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "reversed equality false rewrite",
+                "select id from orders where false = is_current",
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "in list rewrite",
+                "select id from orders where is_current in (true, false, true)",
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not in list rewrite",
+                "select id from orders where is_current not in (true)",
+                vec!["part-00001.parquet"],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                1,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_boolean_partition_ordering_filters_keep_residual_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-boolean-partition-ordering-residuals",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            &[
+                r#""partitionValues":{"is_current":"true"}"#,
+                r#""partitionValues":{"is_current":"false"}"#,
+                r#""partitionValues":{"is_current":null}"#,
+                r#""partitionValues":{"is_current":""}"#,
+                r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let cases = [
+            ("less than", "select id from orders where is_current < true"),
+            (
+                "between",
+                "select id from orders where is_current between false and true",
+            ),
+            (
+                "not between",
+                "select id from orders where is_current not between false and true",
+            ),
+        ];
+
+        for (name, sql) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
