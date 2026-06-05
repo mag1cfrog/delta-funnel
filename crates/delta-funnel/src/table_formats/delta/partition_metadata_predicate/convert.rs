@@ -380,6 +380,10 @@ fn convert_partition_literal(
             }
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
+        PartitionMetadataValueKind::Date => match expr {
+            Expr::Literal(ScalarValue::Date32(Some(value)), _) => Ok(PartitionScalar::Date(*value)),
+            _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+        },
     }
 }
 
