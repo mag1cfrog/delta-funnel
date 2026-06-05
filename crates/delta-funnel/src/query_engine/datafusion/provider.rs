@@ -410,6 +410,7 @@ mod tests {
     const BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]"#;
     const DATE_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]"#;
     const DECIMAL_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]"#;
+    const HIGH_PRECISION_DECIMAL_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(38,18)\",\"nullable\":true,\"metadata\":{}}]"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -2769,6 +2770,202 @@ mod tests {
                 .ok_or("expected DeltaScanPlanningExec")?;
 
             assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decimal_partition_boolean_composition_and_projection_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "decimal-partition-boolean-composition",
+            DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["amount"]"#,
+            &[
+                r#""partitionValues":{"amount":"123.45"}"#,
+                r#""partitionValues":{"amount":"0.00"}"#,
+                r#""partitionValues":{"amount":"-1.23"}"#,
+                r#""partitionValues":{"amount":null}"#,
+                r#""partitionValues":{"amount":""}"#,
+                r#""partitionValues":{"amount":"not-a-decimal"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-123), 10, 2), None);
+        let separate_and_filters = vec![
+            datafusion::logical_expr::col("amount").gt_eq(zero.clone()),
+            datafusion::logical_expr::col("amount").lt(amount.clone()),
+        ];
+        let whole_and_filter = datafusion::logical_expr::col("amount")
+            .gt_eq(zero.clone())
+            .and(datafusion::logical_expr::col("amount").lt(amount.clone()));
+        let whole_or_filter = datafusion::logical_expr::col("amount")
+            .eq(amount.clone())
+            .or(datafusion::logical_expr::col("amount").eq(negative));
+        let whole_not_filter =
+            Expr::Not(Box::new(datafusion::logical_expr::col("amount").eq(amount)));
+        let cases = [
+            (
+                "separate filters combine with and",
+                separate_and_filters,
+                2,
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "whole and",
+                vec![whole_and_filter],
+                1,
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "whole or",
+                vec![whole_or_filter],
+                1,
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "whole not",
+                vec![whole_not_filter],
+                1,
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, filters, expected_exact_count, expected_paths) in cases {
+            let filter_refs = filters.iter().collect::<Vec<_>>();
+            let support = provider.supports_filters_pushdown(&filter_refs)?;
+            assert_eq!(
+                support,
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().projected_schema.field(0).name(),
+                "id",
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decimal_partition_high_precision_values_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "decimal-partition-high-precision",
+            HIGH_PRECISION_DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["amount"]"#,
+            &[
+                r#""partitionValues":{"amount":"1.230000000000000000"}"#,
+                r#""partitionValues":{"amount":"12345678901234567890.123456789012345678"}"#,
+                r#""partitionValues":{"amount":"-1.230000000000000000"}"#,
+                r#""partitionValues":{"amount":null}"#,
+                r#""partitionValues":{"amount":"not-a-decimal"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let small_amount = Expr::Literal(
+            ScalarValue::Decimal128(Some(1_230_000_000_000_000_000), 38, 18),
+            None,
+        );
+        let large_amount = Expr::Literal(
+            ScalarValue::Decimal128(
+                Some(12_345_678_901_234_567_890_123_456_789_012_345_678),
+                38,
+                18,
+            ),
+            None,
+        );
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 38, 18), None);
+        let cases = [
+            (
+                "high precision equality",
+                datafusion::logical_expr::col("amount").eq(large_amount.clone()),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "high precision ordering",
+                datafusion::logical_expr::col("amount").gt(zero.clone()),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "high precision between",
+                datafusion::logical_expr::col("amount").between(zero, large_amount),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "high precision not in",
+                datafusion::logical_expr::col("amount").in_list(vec![small_amount], true),
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
             assert_eq!(
                 scan.scan_plan().pushed_filter_plan.residual_filter_count,
                 0,

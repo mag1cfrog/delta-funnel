@@ -490,7 +490,7 @@ mod tests {
         );
         assert_eq!(decimal.normalize_decimal_literal(12_346, 10, 3), None);
         assert_eq!(
-            decimal.normalize_decimal_literal(1_234_567_890_1, 11, 2),
+            decimal.normalize_decimal_literal(12_345_678_901, 11, 2),
             None
         );
         assert_eq!(decimal.normalize_decimal_literal(12_345, 10, -1), None);
