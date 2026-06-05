@@ -242,6 +242,7 @@ fn is_supported_partition_literal_for_column(
             Expr::Literal(ScalarValue::Utf8(Some(value)), _)
             | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _),
         ) => !value.is_empty(),
+        (DataType::Boolean, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) => true,
         (data_type, literal) => signed_integer_bounds(data_type)
             .zip(signed_integer_literal_value(literal))
             .is_some_and(|((min, max), value)| min <= value && value <= max),
@@ -470,6 +471,68 @@ mod tests {
                 && !decision.residual
                 && decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
         }));
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_boolean_equality_and_membership() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let filters = [
+            col("is_current").eq(lit(true)),
+            lit(false).eq(col("is_current")),
+            col("is_current").not_eq(lit(false)),
+            col("is_current").in_list(vec![lit(true), lit(false), lit(true)], false),
+            col("is_current").in_list(vec![lit(true)], true),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+        }));
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_unproven_boolean_literal_shapes() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let filters = [
+            col("is_current").eq(lit("true")),
+            col("is_current").eq(Expr::Literal(ScalarValue::Boolean(None), None)),
+            col("is_current").in_list(
+                vec![lit(true), Expr::Literal(ScalarValue::Boolean(None), None)],
+                false,
+            ),
+            col("is_current").in_list(vec![lit(true), lit("false")], false),
+            col("is_current").in_list(vec![col("region")], false),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
     }
 
     #[test]

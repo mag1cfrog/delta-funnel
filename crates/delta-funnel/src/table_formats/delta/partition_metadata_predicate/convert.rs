@@ -343,9 +343,12 @@ fn convert_partition_literal(
                 .map(PartitionScalar::SignedInteger)
                 .ok_or(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
         }
-        PartitionMetadataValueKind::Boolean => {
-            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
-        }
+        PartitionMetadataValueKind::Boolean => match expr {
+            Expr::Literal(ScalarValue::Boolean(Some(value)), _) => {
+                Ok(PartitionScalar::Boolean(*value))
+            }
+            _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+        },
     }
 }
 
@@ -469,6 +472,60 @@ mod tests {
         assert!(matches_scan_file(&is_not_null, &raw_empty));
         assert!(matches_scan_file(&is_not_null, &invalid_boolean));
         assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_boolean_equality_and_in_lists_with_typed_metadata_semantics() {
+        let eq = predicate_expr(&col("is_current").eq(lit(true)), &["is_current"]).unwrap();
+        let reversed = predicate_expr(&lit(false).eq(col("is_current")), &["is_current"]).unwrap();
+        let not_eq = predicate_expr(&col("is_current").not_eq(lit(true)), &["is_current"]).unwrap();
+        let in_list = predicate_expr(
+            &col("is_current").in_list(vec![lit(true), lit(false), lit(true)], false),
+            &["is_current"],
+        )
+        .unwrap();
+        let not_in = predicate_expr(
+            &col("is_current").in_list(vec![lit(true)], true),
+            &["is_current"],
+        )
+        .unwrap();
+        let raw_true = values(&[("is_current", "true")]);
+        let raw_false = values(&[("is_current", "false")]);
+        let raw_empty = values(&[("is_current", "")]);
+        let invalid_boolean = values(&[("is_current", "not-a-boolean")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&eq, &raw_true));
+        assert!(!matches_scan_file(&eq, &raw_false));
+        assert!(!matches_scan_file(&eq, &raw_empty));
+        assert!(!matches_scan_file(&eq, &invalid_boolean));
+        assert!(!matches_scan_file(&eq, &missing));
+        assert!(matches_scan_file(&reversed, &raw_false));
+        assert!(!matches_scan_file(&reversed, &raw_true));
+        assert!(!matches_scan_file(&not_eq, &raw_true));
+        assert!(matches_scan_file(&not_eq, &raw_false));
+        assert!(!matches_scan_file(&not_eq, &raw_empty));
+        assert!(!matches_scan_file(&not_eq, &invalid_boolean));
+        assert!(!matches_scan_file(&not_eq, &missing));
+        assert!(matches_scan_file(&in_list, &raw_true));
+        assert!(matches_scan_file(&in_list, &raw_false));
+        assert!(!matches_scan_file(&not_in, &raw_true));
+        assert!(matches_scan_file(&not_in, &raw_false));
+        assert!(!matches_scan_file(&not_in, &raw_empty));
+        assert!(!matches_scan_file(&not_in, &invalid_boolean));
+        assert!(!matches_scan_file(&not_in, &missing));
+
+        assert_eq!(
+            predicate_expr(&col("is_current").eq(lit("true")), &["is_current"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("is_current").eq(Expr::Literal(ScalarValue::Boolean(None), None)),
+                &["is_current"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
     }
 
     #[test]

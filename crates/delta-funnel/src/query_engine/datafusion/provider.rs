@@ -2284,6 +2284,174 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn boolean_partition_equality_and_membership_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "boolean-partition-equality-membership",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            &[
+                r#""partitionValues":{"is_current":"true"}"#,
+                r#""partitionValues":{"is_current":"false"}"#,
+                r#""partitionValues":{"is_current":null}"#,
+                r#""partitionValues":{"is_current":""}"#,
+                r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "equality true",
+                datafusion::logical_expr::col("is_current").eq(datafusion::logical_expr::lit(true)),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed equality false",
+                datafusion::logical_expr::lit(false)
+                    .eq(datafusion::logical_expr::col("is_current")),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "inequality",
+                datafusion::logical_expr::col("is_current")
+                    .not_eq(datafusion::logical_expr::lit(true)),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "in list",
+                datafusion::logical_expr::col("is_current").in_list(
+                    vec![
+                        datafusion::logical_expr::lit(true),
+                        datafusion::logical_expr::lit(false),
+                        datafusion::logical_expr::lit(true),
+                    ],
+                    false,
+                ),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not in list",
+                datafusion::logical_expr::col("is_current")
+                    .in_list(vec![datafusion::logical_expr::lit(true)], true),
+                vec!["part-00001.parquet"],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boolean_partition_unsafe_literal_shapes_are_rejected_at_scan_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "boolean-partition-unsafe-literal-shapes",
+            BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["is_current"]"#,
+            r#""partitionValues":{"is_current":"true"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filters = vec![
+            (
+                "string literal equality",
+                datafusion::logical_expr::col("is_current")
+                    .eq(datafusion::logical_expr::lit("true")),
+            ),
+            (
+                "null equality",
+                datafusion::logical_expr::col("is_current")
+                    .eq(Expr::Literal(ScalarValue::Boolean(None), None)),
+            ),
+            (
+                "null in",
+                datafusion::logical_expr::col("is_current").in_list(
+                    vec![
+                        datafusion::logical_expr::lit(true),
+                        Expr::Literal(ScalarValue::Boolean(None), None),
+                    ],
+                    false,
+                ),
+            ),
+            (
+                "mixed string boolean in",
+                datafusion::logical_expr::col("is_current").in_list(
+                    vec![
+                        datafusion::logical_expr::lit(true),
+                        datafusion::logical_expr::lit("false"),
+                    ],
+                    false,
+                ),
+            ),
+            (
+                "non literal in",
+                datafusion::logical_expr::col("is_current")
+                    .in_list(vec![datafusion::logical_expr::col("id")], false),
+            ),
+        ];
+        let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn integer_partition_uncoerced_literals_remain_unsupported()
     -> Result<(), Box<dyn std::error::Error>> {
