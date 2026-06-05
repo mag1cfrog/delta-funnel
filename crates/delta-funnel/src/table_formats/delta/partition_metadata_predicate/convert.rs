@@ -416,6 +416,7 @@ mod tests {
             Field::new("region", DataType::Utf8, true),
             Field::new("day", DataType::LargeUtf8, true),
             Field::new("is_current", DataType::Boolean, true),
+            Field::new("event_date", DataType::Date32, true),
         ]))
     }
 
@@ -558,6 +559,96 @@ mod tests {
             predicate_expr(
                 &col("is_current").eq(Expr::Literal(ScalarValue::Boolean(None), None)),
                 &["is_current"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+    }
+
+    #[test]
+    fn converts_date_equality_and_in_lists_with_typed_metadata_semantics() {
+        let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let leap_day_2024 = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
+        let pre_epoch_day = Expr::Literal(ScalarValue::Date32(Some(-1)), None);
+        let eq = predicate_expr(
+            &col("event_date").eq(new_year_2026.clone()),
+            &["event_date"],
+        )
+        .unwrap();
+        let reversed = predicate_expr(
+            &pre_epoch_day.clone().eq(col("event_date")),
+            &["event_date"],
+        )
+        .unwrap();
+        let not_eq = predicate_expr(
+            &col("event_date").not_eq(new_year_2026.clone()),
+            &["event_date"],
+        )
+        .unwrap();
+        let in_list = predicate_expr(
+            &col("event_date").in_list(
+                vec![
+                    new_year_2026.clone(),
+                    leap_day_2024.clone(),
+                    new_year_2026.clone(),
+                ],
+                false,
+            ),
+            &["event_date"],
+        )
+        .unwrap();
+        let not_in = predicate_expr(
+            &col("event_date").in_list(vec![new_year_2026.clone()], true),
+            &["event_date"],
+        )
+        .unwrap();
+        let raw_new_year_2026 = values(&[("event_date", "2026-01-01")]);
+        let raw_leap_day_2024 = values(&[("event_date", "2024-02-29")]);
+        let raw_pre_epoch_day = values(&[("event_date", "1969-12-31")]);
+        let raw_empty = values(&[("event_date", "")]);
+        let invalid_date = values(&[("event_date", "not-a-date")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&eq, &raw_new_year_2026));
+        assert!(!matches_scan_file(&eq, &raw_leap_day_2024));
+        assert!(!matches_scan_file(&eq, &raw_empty));
+        assert!(!matches_scan_file(&eq, &invalid_date));
+        assert!(!matches_scan_file(&eq, &missing));
+        assert!(matches_scan_file(&reversed, &raw_pre_epoch_day));
+        assert!(!matches_scan_file(&reversed, &raw_new_year_2026));
+        assert!(!matches_scan_file(&not_eq, &raw_new_year_2026));
+        assert!(matches_scan_file(&not_eq, &raw_leap_day_2024));
+        assert!(matches_scan_file(&not_eq, &raw_pre_epoch_day));
+        assert!(!matches_scan_file(&not_eq, &raw_empty));
+        assert!(!matches_scan_file(&not_eq, &invalid_date));
+        assert!(!matches_scan_file(&not_eq, &missing));
+        assert!(matches_scan_file(&in_list, &raw_new_year_2026));
+        assert!(matches_scan_file(&in_list, &raw_leap_day_2024));
+        assert!(!matches_scan_file(&in_list, &raw_pre_epoch_day));
+        assert!(!matches_scan_file(&not_in, &raw_new_year_2026));
+        assert!(matches_scan_file(&not_in, &raw_leap_day_2024));
+        assert!(matches_scan_file(&not_in, &raw_pre_epoch_day));
+        assert!(!matches_scan_file(&not_in, &raw_empty));
+        assert!(!matches_scan_file(&not_in, &invalid_date));
+        assert!(!matches_scan_file(&not_in, &missing));
+
+        assert_eq!(
+            predicate_expr(&col("event_date").eq(lit("2026-01-01")), &["event_date"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("event_date").eq(Expr::Literal(ScalarValue::Date32(None), None)),
+                &["event_date"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("event_date").eq(Expr::Literal(
+                    ScalarValue::Date64(Some(1_767_225_600_000)),
+                    None
+                )),
+                &["event_date"]
             ),
             Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
         );
