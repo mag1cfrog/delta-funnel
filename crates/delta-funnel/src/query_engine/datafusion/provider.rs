@@ -3625,6 +3625,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_floating_partition_unsafe_literal_filters_keep_residual_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-floating-partition-unsafe-literal-residuals",
+            FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["float_part","double_part"]"#,
+            &[
+                r#""partitionValues":{"float_part":"1.5","double_part":"-2.25"}"#,
+                r#""partitionValues":{"float_part":"-0.0","double_part":"0.0"}"#,
+                r#""partitionValues":{"float_part":"0.0","double_part":"1.0"}"#,
+                r#""partitionValues":{"float_part":null,"double_part":null}"#,
+                r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+                r#""partitionValues":{"float_part":"NaN","double_part":"Infinity"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+        let cases = [
+            (
+                "nan equality",
+                "select id from orders where float_part = cast('NaN' as float)",
+            ),
+            (
+                "infinity ordering",
+                "select id from orders where double_part > cast('Infinity' as double)",
+            ),
+            (
+                "null in list",
+                "select id from orders where float_part in (cast(1.5 as float), cast(null as float))",
+            ),
+            (
+                "wrong width equality",
+                "select id from orders where float_part = cast(1.5 as double)",
+            ),
+        ];
+
+        for (name, sql) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
+                "{name}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn decimal_partition_comparisons_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
