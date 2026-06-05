@@ -20,6 +20,7 @@ use convert::convert_expr;
 use expr::{PartitionMetadataExpr, SqlBool};
 pub(crate) use names::DeltaPartitionNameMap;
 use value::PartitionMetadataValueKind;
+pub(crate) use value::normalize_decimal_partition_literal;
 
 /// Returns whether this provider can evaluate a Delta partition column type from metadata.
 ///
@@ -118,11 +119,15 @@ mod tests {
             DataType::Int8,
             DataType::Boolean,
             DataType::Date32,
+            DataType::Decimal128(10, 2),
+            DataType::Decimal128(38, 18),
         ];
         let unsupported = [
             DataType::Float32,
             DataType::Float64,
-            DataType::Decimal128(10, 2),
+            DataType::Decimal128(10, -1),
+            DataType::Decimal128(10, 11),
+            DataType::Decimal128(39, 2),
             DataType::Binary,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             DataType::Timestamp(TimeUnit::Microsecond, None),
