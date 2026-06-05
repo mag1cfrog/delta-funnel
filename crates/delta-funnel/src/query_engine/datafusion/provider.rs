@@ -2695,7 +2695,6 @@ mod tests {
         let double_nan = Expr::Literal(ScalarValue::Float64(Some(f64::NAN)), None);
         let double_infinity = Expr::Literal(ScalarValue::Float64(Some(f64::INFINITY)), None);
         let double_low = Expr::Literal(ScalarValue::Float64(Some(-3.0)), None);
-        let double_high = Expr::Literal(ScalarValue::Float64(Some(0.0)), None);
         let filters = vec![
             (
                 "float nan equality",
@@ -2703,7 +2702,7 @@ mod tests {
             ),
             (
                 "float infinity equality",
-                datafusion::logical_expr::col("float_part").eq(float_infinity),
+                datafusion::logical_expr::col("float_part").eq(float_infinity.clone()),
             ),
             (
                 "float null equality",
@@ -2717,38 +2716,30 @@ mod tests {
             (
                 "float nan in list",
                 datafusion::logical_expr::col("float_part")
-                    .in_list(vec![float_value.clone(), float_nan], false),
+                    .in_list(vec![float_value.clone(), float_nan.clone()], false),
             ),
             (
                 "float null in list",
                 datafusion::logical_expr::col("float_part")
-                    .in_list(vec![float_value.clone(), float_null], false),
+                    .in_list(vec![float_value.clone(), float_null.clone()], false),
             ),
             (
-                "float less than",
-                datafusion::logical_expr::col("float_part").lt(float_value.clone()),
+                "float nan ordering",
+                datafusion::logical_expr::col("float_part").lt(float_nan.clone()),
             ),
             (
-                "float less than or equal",
-                datafusion::logical_expr::col("float_part").lt_eq(float_value.clone()),
+                "float infinity ordering",
+                datafusion::logical_expr::col("float_part").gt(float_infinity),
             ),
             (
-                "float greater than",
-                datafusion::logical_expr::col("float_part").gt(float_value.clone()),
-            ),
-            (
-                "float greater than or equal",
-                datafusion::logical_expr::col("float_part").gt_eq(float_value.clone()),
-            ),
-            (
-                "float between",
+                "float nan between",
                 datafusion::logical_expr::col("float_part")
-                    .between(float_low.clone(), float_value.clone()),
+                    .between(float_low.clone(), float_nan.clone()),
             ),
             (
-                "float not between",
+                "float null between",
                 datafusion::logical_expr::col("float_part")
-                    .not_between(float_low, float_value.clone()),
+                    .not_between(float_low, float_null.clone()),
             ),
             (
                 "double nan equality",
@@ -2756,49 +2747,38 @@ mod tests {
             ),
             (
                 "double infinity equality",
-                datafusion::logical_expr::col("double_part").eq(double_infinity),
+                datafusion::logical_expr::col("double_part").eq(double_infinity.clone()),
             ),
             (
                 "double nan in list",
                 datafusion::logical_expr::col("double_part")
-                    .in_list(vec![double_value.clone(), double_nan], false),
+                    .in_list(vec![double_value.clone(), double_nan.clone()], false),
             ),
             (
-                "double less than",
-                datafusion::logical_expr::col("double_part").lt(double_value.clone()),
+                "double nan ordering",
+                datafusion::logical_expr::col("double_part").lt(double_nan),
             ),
             (
-                "double less than or equal",
-                datafusion::logical_expr::col("double_part").lt_eq(double_value.clone()),
-            ),
-            (
-                "double greater than",
-                datafusion::logical_expr::col("double_part").gt(double_value.clone()),
-            ),
-            (
-                "double greater than or equal",
-                datafusion::logical_expr::col("double_part").gt_eq(double_value.clone()),
-            ),
-            (
-                "double between",
+                "double infinity between",
                 datafusion::logical_expr::col("double_part")
-                    .between(double_low.clone(), double_high.clone()),
+                    .between(double_low.clone(), double_infinity.clone()),
             ),
             (
-                "double not between",
-                datafusion::logical_expr::col("double_part").not_between(double_low, double_high),
+                "double wrong width between",
+                datafusion::logical_expr::col("double_part")
+                    .not_between(double_low, float_value.clone()),
             ),
             (
                 "and composition",
                 datafusion::logical_expr::col("float_part")
-                    .lt(float_value.clone())
+                    .lt(float_null)
                     .and(datafusion::logical_expr::col("double_part").eq(double_value.clone())),
             ),
             (
                 "or composition",
                 datafusion::logical_expr::col("float_part")
-                    .eq(float_value)
-                    .or(datafusion::logical_expr::col("double_part").gt(double_value)),
+                    .eq(float_nan)
+                    .or(datafusion::logical_expr::col("double_part").gt(double_infinity)),
             ),
         ];
         let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
@@ -2905,6 +2885,121 @@ mod tests {
                 "double not in list",
                 datafusion::logical_expr::col("double_part").in_list(vec![double_value], true),
                 vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.unsupported_count,
+                0,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn floating_partition_comparisons_and_between_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "floating-partition-comparisons-between",
+            FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["float_part","double_part"]"#,
+            &[
+                r#""partitionValues":{"float_part":"1.5","double_part":"-2.25"}"#,
+                r#""partitionValues":{"float_part":"-0.0","double_part":"0.0"}"#,
+                r#""partitionValues":{"float_part":"0.0","double_part":"1.0"}"#,
+                r#""partitionValues":{"float_part":null,"double_part":null}"#,
+                r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+                r#""partitionValues":{"float_part":"NaN","double_part":"Infinity"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let negative_zero_float = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let positive_zero_float = Expr::Literal(ScalarValue::Float32(Some(0.0)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let double_high = Expr::Literal(ScalarValue::Float64(Some(0.0)), None);
+        let cases = [
+            (
+                "float less than",
+                datafusion::logical_expr::col("float_part").lt(float_value.clone()),
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+            (
+                "float less than or equal negative zero",
+                datafusion::logical_expr::col("float_part").lt_eq(negative_zero_float.clone()),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "float greater than negative zero",
+                datafusion::logical_expr::col("float_part").gt(negative_zero_float.clone()),
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "reversed float greater than or equal",
+                float_value
+                    .clone()
+                    .lt_eq(datafusion::logical_expr::col("float_part")),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "float between includes signed zero order",
+                datafusion::logical_expr::col("float_part")
+                    .between(negative_zero_float.clone(), float_value.clone()),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                ],
+            ),
+            (
+                "float not between",
+                datafusion::logical_expr::col("float_part")
+                    .not_between(positive_zero_float, float_value),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "double between",
+                datafusion::logical_expr::col("double_part")
+                    .between(double_value.clone(), double_high.clone()),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "double not between",
+                datafusion::logical_expr::col("double_part").not_between(double_value, double_high),
+                vec!["part-00002.parquet"],
             ),
         ];
 
@@ -3250,6 +3345,111 @@ mod tests {
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
                 1,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_floating_partition_comparisons_and_between_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-floating-partition-comparisons-between",
+            FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["float_part","double_part"]"#,
+            &[
+                r#""partitionValues":{"float_part":"1.5","double_part":"-2.25"}"#,
+                r#""partitionValues":{"float_part":"-0.0","double_part":"0.0"}"#,
+                r#""partitionValues":{"float_part":"0.0","double_part":"1.0"}"#,
+                r#""partitionValues":{"float_part":null,"double_part":null}"#,
+                r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+                r#""partitionValues":{"float_part":"NaN","double_part":"Infinity"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+        let sql_cases = [
+            (
+                "float less than",
+                "select id from orders where float_part < cast(1.5 as float)",
+                1,
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+            (
+                "float between",
+                "select id from orders where float_part between cast(-0.0 as float) and cast(1.5 as float)",
+                2,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                ],
+            ),
+            (
+                "float not between",
+                "select id from orders where float_part not between cast(0.0 as float) and cast(1.5 as float)",
+                1,
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "double between",
+                "select id from orders where double_part between -2.25 and 0.0",
+                2,
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "double not between",
+                "select id from orders where double_part not between -2.25 and 0.0",
+                1,
+                vec!["part-00002.parquet"],
+            ),
+        ];
+
+        for (name, sql, expected_exact_count, expected_paths) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
                 "{name}: {plan_display}"
             );
             assert_eq!(

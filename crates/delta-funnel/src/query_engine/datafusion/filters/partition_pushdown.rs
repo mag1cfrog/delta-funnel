@@ -303,6 +303,8 @@ fn is_supported_ordering_literal_for_column(
             | DataType::Int64
             | DataType::Date32
             | DataType::Decimal128(_, _)
+            | DataType::Float32
+            | DataType::Float64
     )
 }
 
@@ -678,6 +680,40 @@ mod tests {
             col("float_part").in_list(vec![float_value], true),
             col("double_part").eq(double_value.clone()),
             col("double_part").in_list(vec![double_value.clone(), double_value], false),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_finite_floating_comparisons_and_between() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["float_part", "double_part"]);
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let negative_zero = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let double_high = Expr::Literal(ScalarValue::Float64(Some(0.0)), None);
+        let filters = [
+            col("float_part").lt(float_value.clone()),
+            col("float_part").lt_eq(negative_zero.clone()),
+            col("float_part").gt(negative_zero.clone()),
+            float_value.clone().lt_eq(col("float_part")),
+            col("float_part").between(negative_zero.clone(), float_value.clone()),
+            col("float_part").not_between(negative_zero, float_value),
+            col("double_part").gt_eq(double_value.clone()),
+            col("double_part").between(double_value, double_high),
         ];
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(

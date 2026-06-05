@@ -734,6 +734,83 @@ mod tests {
     }
 
     #[test]
+    fn converts_finite_floating_comparisons_with_typed_ordering_semantics() {
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let negative_zero_float = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let double_high = Expr::Literal(ScalarValue::Float64(Some(0.0)), None);
+        let lt =
+            predicate_expr(&col("float_part").lt(float_value.clone()), &["float_part"]).unwrap();
+        let lt_eq = predicate_expr(
+            &col("float_part").lt_eq(negative_zero_float.clone()),
+            &["float_part"],
+        )
+        .unwrap();
+        let gt = predicate_expr(
+            &col("float_part").gt(negative_zero_float.clone()),
+            &["float_part"],
+        )
+        .unwrap();
+        let gt_eq = predicate_expr(
+            &float_value.clone().lt_eq(col("float_part")),
+            &["float_part"],
+        )
+        .unwrap();
+        let between = predicate_expr(
+            &col("float_part").between(negative_zero_float.clone(), float_value.clone()),
+            &["float_part"],
+        )
+        .unwrap();
+        let not_between = predicate_expr(
+            &col("double_part").not_between(double_value.clone(), double_high.clone()),
+            &["double_part"],
+        )
+        .unwrap();
+        let raw_float = values(&[("float_part", "1.5")]);
+        let raw_negative_zero_float = values(&[("float_part", "-0.0")]);
+        let raw_positive_zero_float = values(&[("float_part", "0.0")]);
+        let raw_nan_float = values(&[("float_part", "NaN")]);
+        let raw_double = values(&[("double_part", "-2.25")]);
+        let raw_other_double = values(&[("double_part", "1.0")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&lt, &raw_float));
+        assert!(matches_scan_file(&lt, &raw_negative_zero_float));
+        assert!(matches_scan_file(&lt, &raw_positive_zero_float));
+        assert!(matches_scan_file(&lt_eq, &raw_negative_zero_float));
+        assert!(!matches_scan_file(&lt_eq, &raw_positive_zero_float));
+        assert!(matches_scan_file(&gt, &raw_positive_zero_float));
+        assert!(!matches_scan_file(&gt, &raw_negative_zero_float));
+        assert!(matches_scan_file(&gt_eq, &raw_float));
+        assert!(!matches_scan_file(&gt_eq, &raw_positive_zero_float));
+        assert!(matches_scan_file(&between, &raw_float));
+        assert!(matches_scan_file(&between, &raw_negative_zero_float));
+        assert!(matches_scan_file(&between, &raw_positive_zero_float));
+        assert!(!matches_scan_file(&between, &raw_nan_float));
+        assert!(!matches_scan_file(&between, &missing));
+        assert!(!matches_scan_file(&not_between, &raw_double));
+        assert!(matches_scan_file(&not_between, &raw_other_double));
+
+        assert_eq!(
+            predicate_expr(
+                &col("float_part").lt(Expr::Literal(ScalarValue::Float32(Some(f32::NAN)), None)),
+                &["float_part"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("float_part").between(
+                    negative_zero_float,
+                    Expr::Literal(ScalarValue::Float32(Some(f32::INFINITY)), None)
+                ),
+                &["float_part"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+    }
+
+    #[test]
     fn converts_decimal_comparisons_with_typed_ordering_semantics() {
         let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
         let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);

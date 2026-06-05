@@ -64,15 +64,25 @@ impl PartitionMetadataValueKind {
 
     pub(super) fn supports_ordering(self) -> bool {
         match self {
-            Self::String | Self::SignedInteger { .. } | Self::Date | Self::Decimal { .. } => true,
-            Self::Boolean | Self::Float32 | Self::Float64 => false,
+            Self::String
+            | Self::SignedInteger { .. }
+            | Self::Date
+            | Self::Decimal { .. }
+            | Self::Float32
+            | Self::Float64 => true,
+            Self::Boolean => false,
         }
     }
 
     pub(super) fn supports_between(self) -> bool {
         match self {
-            Self::String | Self::SignedInteger { .. } | Self::Date | Self::Decimal { .. } => true,
-            Self::Boolean | Self::Float32 | Self::Float64 => false,
+            Self::String
+            | Self::SignedInteger { .. }
+            | Self::Date
+            | Self::Decimal { .. }
+            | Self::Float32
+            | Self::Float64 => true,
+            Self::Boolean => false,
         }
     }
 
@@ -280,6 +290,12 @@ impl PartitionScalar {
             (Self::SignedInteger(left), Self::SignedInteger(right)) => Some(left.cmp(right)),
             (Self::Date(left), Self::Date(right)) => Some(left.cmp(right)),
             (Self::Decimal(left), Self::Decimal(right)) => Some(left.cmp(right)),
+            (Self::Float32(left), Self::Float32(right)) => {
+                Some(f32::from_bits(*left).total_cmp(&f32::from_bits(*right)))
+            }
+            (Self::Float64(left), Self::Float64(right)) => {
+                Some(f64::from_bits(*left).total_cmp(&f64::from_bits(*right)))
+            }
             _ => None,
         }
     }
@@ -572,10 +588,30 @@ mod tests {
                 None
             );
         }
-        assert!(!PartitionMetadataValueKind::Float32.supports_ordering());
-        assert!(!PartitionMetadataValueKind::Float32.supports_between());
-        assert!(!PartitionMetadataValueKind::Float64.supports_ordering());
-        assert!(!PartitionMetadataValueKind::Float64.supports_between());
+        assert!(PartitionMetadataValueKind::Float32.supports_ordering());
+        assert!(PartitionMetadataValueKind::Float32.supports_between());
+        assert!(PartitionMetadataValueKind::Float64.supports_ordering());
+        assert!(PartitionMetadataValueKind::Float64.supports_between());
+    }
+
+    #[test]
+    fn floating_scalars_compare_with_total_ordering() {
+        let negative_zero = PartitionScalar::Float32((-0.0_f32).to_bits());
+        let positive_zero = PartitionScalar::Float32(0.0_f32.to_bits());
+        let positive_one = PartitionScalar::Float32(1.0_f32.to_bits());
+        let negative_double = PartitionScalar::Float64((-2.25_f64).to_bits());
+        let positive_double = PartitionScalar::Float64(0.0_f64.to_bits());
+
+        assert_eq!(negative_zero.compare(&positive_zero), Some(Ordering::Less));
+        assert_eq!(
+            positive_zero.compare(&negative_zero),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(positive_zero.compare(&positive_one), Some(Ordering::Less));
+        assert_eq!(
+            negative_double.compare(&positive_double),
+            Some(Ordering::Less)
+        );
     }
 
     #[test]
