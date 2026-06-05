@@ -18,6 +18,8 @@ pub(super) enum PartitionMetadataValueKind {
     Boolean,
     Date,
     Decimal { precision: u8, scale: i8 },
+    Float32,
+    Float64,
 }
 
 impl PartitionMetadataValueKind {
@@ -50,6 +52,8 @@ impl PartitionMetadataValueKind {
                     scale: *scale,
                 })
             }
+            DataType::Float32 => Some(Self::Float32),
+            DataType::Float64 => Some(Self::Float64),
             _ => None,
         }
     }
@@ -60,14 +64,24 @@ impl PartitionMetadataValueKind {
 
     pub(super) fn supports_ordering(self) -> bool {
         match self {
-            Self::String | Self::SignedInteger { .. } | Self::Date | Self::Decimal { .. } => true,
+            Self::String
+            | Self::SignedInteger { .. }
+            | Self::Date
+            | Self::Decimal { .. }
+            | Self::Float32
+            | Self::Float64 => true,
             Self::Boolean => false,
         }
     }
 
     pub(super) fn supports_between(self) -> bool {
         match self {
-            Self::String | Self::SignedInteger { .. } | Self::Date | Self::Decimal { .. } => true,
+            Self::String
+            | Self::SignedInteger { .. }
+            | Self::Date
+            | Self::Decimal { .. }
+            | Self::Float32
+            | Self::Float64 => true,
             Self::Boolean => false,
         }
     }
@@ -85,6 +99,8 @@ impl PartitionMetadataValueKind {
             Self::Decimal { precision, scale } => {
                 parse_delta_decimal(raw_value, precision, scale).map(PartitionScalar::Decimal)
             }
+            Self::Float32 => parse_float32(raw_value).map(PartitionScalar::Float32),
+            Self::Float64 => parse_float64(raw_value).map(PartitionScalar::Float64),
         }
     }
 
@@ -235,6 +251,32 @@ fn pow10(exponent: u8) -> Option<i128> {
     (0..exponent).try_fold(1_i128, |value, _| value.checked_mul(10))
 }
 
+fn parse_float32(raw_value: &str) -> Option<u32> {
+    match raw_value {
+        "NaN" => Some(f32::NAN.to_bits()),
+        "Infinity" => Some(f32::INFINITY.to_bits()),
+        "-Infinity" => Some(f32::NEG_INFINITY.to_bits()),
+        _ => raw_value
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(f32::to_bits),
+    }
+}
+
+fn parse_float64(raw_value: &str) -> Option<u64> {
+    match raw_value {
+        "NaN" => Some(f64::NAN.to_bits()),
+        "Infinity" => Some(f64::INFINITY.to_bits()),
+        "-Infinity" => Some(f64::NEG_INFINITY.to_bits()),
+        _ => raw_value
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(f64::to_bits),
+    }
+}
+
 /// Typed literal or parsed raw partition metadata value.
 ///
 /// The evaluator compares values only after both sides have been converted into
@@ -247,6 +289,8 @@ pub(super) enum PartitionScalar {
     Boolean(bool),
     Date(i32),
     Decimal(i128),
+    Float32(u32),
+    Float64(u64),
 }
 
 impl PartitionScalar {
@@ -256,6 +300,12 @@ impl PartitionScalar {
             (Self::SignedInteger(left), Self::SignedInteger(right)) => Some(left.cmp(right)),
             (Self::Date(left), Self::Date(right)) => Some(left.cmp(right)),
             (Self::Decimal(left), Self::Decimal(right)) => Some(left.cmp(right)),
+            (Self::Float32(left), Self::Float32(right)) => {
+                Some(f32::from_bits(*left).total_cmp(&f32::from_bits(*right)))
+            }
+            (Self::Float64(left), Self::Float64(right)) => {
+                Some(f64::from_bits(*left).total_cmp(&f64::from_bits(*right)))
+            }
             _ => None,
         }
     }
@@ -336,8 +386,12 @@ mod tests {
             None
         );
         assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Float32),
+            Some(PartitionMetadataValueKind::Float32)
+        );
+        assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Float64),
-            None
+            Some(PartitionMetadataValueKind::Float64)
         );
     }
 
@@ -505,6 +559,114 @@ mod tests {
         assert_eq!(decimal.parse_raw("not-a-decimal"), None);
         assert!(decimal.supports_ordering());
         assert!(decimal.supports_between());
+    }
+
+    #[test]
+    fn floating_value_kinds_parse_delta_metadata_text_to_bits() {
+        assert_eq!(
+            PartitionMetadataValueKind::Float32.parse_raw("1.5"),
+            Some(PartitionScalar::Float32(1.5_f32.to_bits()))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float32.parse_raw("-0.0"),
+            Some(PartitionScalar::Float32((-0.0_f32).to_bits()))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float32.parse_raw("0.0"),
+            Some(PartitionScalar::Float32(0.0_f32.to_bits()))
+        );
+        assert_ne!(
+            PartitionMetadataValueKind::Float32.parse_raw("-0.0"),
+            PartitionMetadataValueKind::Float32.parse_raw("0.0")
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float64.parse_raw("-2.25"),
+            Some(PartitionScalar::Float64((-2.25_f64).to_bits()))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float64.parse_raw("1.25E-2"),
+            Some(PartitionScalar::Float64(1.25E-2_f64.to_bits()))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float32.parse_raw("Infinity"),
+            Some(PartitionScalar::Float32(f32::INFINITY.to_bits()))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float32.parse_raw("-Infinity"),
+            Some(PartitionScalar::Float32(f32::NEG_INFINITY.to_bits()))
+        );
+        assert!(
+            matches!(
+                PartitionMetadataValueKind::Float32.parse_raw("NaN"),
+                Some(PartitionScalar::Float32(value)) if f32::from_bits(value).is_nan()
+            ),
+            "raw NaN should stay comparable instead of becoming metadata null"
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float64.parse_raw("Infinity"),
+            Some(PartitionScalar::Float64(f64::INFINITY.to_bits()))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Float64.parse_raw("-Infinity"),
+            Some(PartitionScalar::Float64(f64::NEG_INFINITY.to_bits()))
+        );
+        assert!(
+            matches!(
+                PartitionMetadataValueKind::Float64.parse_raw("NaN"),
+                Some(PartitionScalar::Float64(value)) if f64::from_bits(value).is_nan()
+            ),
+            "raw NaN should stay comparable instead of becoming metadata null"
+        );
+
+        for raw_value in ["", "not-a-float", "inf", "-inf", "nan"] {
+            assert_eq!(
+                PartitionMetadataValueKind::Float32.parse_raw(raw_value),
+                None
+            );
+            assert_eq!(
+                PartitionMetadataValueKind::Float64.parse_raw(raw_value),
+                None
+            );
+        }
+        assert!(PartitionMetadataValueKind::Float32.supports_ordering());
+        assert!(PartitionMetadataValueKind::Float32.supports_between());
+        assert!(PartitionMetadataValueKind::Float64.supports_ordering());
+        assert!(PartitionMetadataValueKind::Float64.supports_between());
+    }
+
+    #[test]
+    fn floating_scalars_compare_with_total_ordering() {
+        let negative_zero = PartitionScalar::Float32((-0.0_f32).to_bits());
+        let positive_zero = PartitionScalar::Float32(0.0_f32.to_bits());
+        let positive_one = PartitionScalar::Float32(1.0_f32.to_bits());
+        let positive_infinity = PartitionScalar::Float32(f32::INFINITY.to_bits());
+        let positive_nan = PartitionScalar::Float32(f32::NAN.to_bits());
+        let negative_infinity = PartitionScalar::Float64(f64::NEG_INFINITY.to_bits());
+        let negative_double = PartitionScalar::Float64((-2.25_f64).to_bits());
+        let positive_double = PartitionScalar::Float64(0.0_f64.to_bits());
+
+        assert_eq!(
+            negative_infinity.compare(&negative_double),
+            Some(Ordering::Less)
+        );
+        assert_eq!(negative_zero.compare(&positive_zero), Some(Ordering::Less));
+        assert_eq!(
+            positive_zero.compare(&negative_zero),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(positive_zero.compare(&positive_one), Some(Ordering::Less));
+        assert_eq!(
+            negative_double.compare(&positive_double),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            positive_one.compare(&positive_infinity),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            positive_infinity.compare(&positive_nan),
+            Some(Ordering::Less)
+        );
     }
 
     #[test]

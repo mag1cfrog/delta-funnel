@@ -400,6 +400,18 @@ fn convert_partition_literal(
                 .ok_or(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
+        PartitionMetadataValueKind::Float32 => match expr {
+            Expr::Literal(ScalarValue::Float32(Some(value)), _) if value.is_finite() => {
+                Ok(PartitionScalar::Float32(value.to_bits()))
+            }
+            _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+        },
+        PartitionMetadataValueKind::Float64 => match expr {
+            Expr::Literal(ScalarValue::Float64(Some(value)), _) if value.is_finite() => {
+                Ok(PartitionScalar::Float64(value.to_bits()))
+            }
+            _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+        },
     }
 }
 
@@ -434,6 +446,8 @@ mod tests {
             Field::new("is_current", DataType::Boolean, true),
             Field::new("event_date", DataType::Date32, true),
             Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new("float_part", DataType::Float32, true),
+            Field::new("double_part", DataType::Float64, true),
         ]))
     }
 
@@ -622,6 +636,187 @@ mod tests {
         );
         assert_eq!(
             predicate_expr(&col("amount").eq(lit("123.45")), &["amount"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+    }
+
+    #[test]
+    fn converts_finite_floating_equality_and_in_lists_with_typed_metadata_semantics() {
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let negative_zero_float = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let positive_zero_float = Expr::Literal(ScalarValue::Float32(Some(0.0)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let eq =
+            predicate_expr(&col("float_part").eq(float_value.clone()), &["float_part"]).unwrap();
+        let reversed = predicate_expr(
+            &negative_zero_float.clone().eq(col("float_part")),
+            &["float_part"],
+        )
+        .unwrap();
+        let not_eq = predicate_expr(
+            &col("float_part").not_eq(float_value.clone()),
+            &["float_part"],
+        )
+        .unwrap();
+        let in_list = predicate_expr(
+            &col("float_part").in_list(
+                vec![float_value.clone(), negative_zero_float.clone()],
+                false,
+            ),
+            &["float_part"],
+        )
+        .unwrap();
+        let not_in = predicate_expr(
+            &col("double_part").in_list(vec![double_value.clone()], true),
+            &["double_part"],
+        )
+        .unwrap();
+        let raw_float = values(&[("float_part", "1.5")]);
+        let raw_negative_zero_float = values(&[("float_part", "-0.0")]);
+        let raw_positive_zero_float = values(&[("float_part", "0.0")]);
+        let raw_nan_float = values(&[("float_part", "NaN")]);
+        let raw_infinity_float = values(&[("float_part", "Infinity")]);
+        let raw_invalid_float = values(&[("float_part", "not-a-float")]);
+        let raw_double = values(&[("double_part", "-2.25")]);
+        let raw_other_double = values(&[("double_part", "0.0")]);
+        let raw_infinity_double = values(&[("double_part", "Infinity")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&eq, &raw_float));
+        assert!(!matches_scan_file(&eq, &raw_negative_zero_float));
+        assert!(!matches_scan_file(&eq, &raw_nan_float));
+        assert!(!matches_scan_file(&eq, &raw_infinity_float));
+        assert!(!matches_scan_file(&eq, &raw_invalid_float));
+        assert!(!matches_scan_file(&eq, &missing));
+        assert!(matches_scan_file(&reversed, &raw_negative_zero_float));
+        assert!(!matches_scan_file(&reversed, &raw_positive_zero_float));
+        assert!(matches_scan_file(
+            &predicate_expr(&col("float_part").eq(positive_zero_float), &["float_part"]).unwrap(),
+            &raw_positive_zero_float
+        ));
+        assert!(!matches_scan_file(&not_eq, &raw_float));
+        assert!(matches_scan_file(&not_eq, &raw_negative_zero_float));
+        assert!(matches_scan_file(&not_eq, &raw_positive_zero_float));
+        assert!(matches_scan_file(&not_eq, &raw_nan_float));
+        assert!(matches_scan_file(&not_eq, &raw_infinity_float));
+        assert!(matches_scan_file(&in_list, &raw_float));
+        assert!(matches_scan_file(&in_list, &raw_negative_zero_float));
+        assert!(!matches_scan_file(&in_list, &raw_positive_zero_float));
+        assert!(!matches_scan_file(&not_in, &raw_double));
+        assert!(matches_scan_file(&not_in, &raw_other_double));
+        assert!(matches_scan_file(&not_in, &raw_infinity_double));
+
+        assert_eq!(
+            predicate_expr(
+                &col("float_part").eq(Expr::Literal(ScalarValue::Float32(Some(f32::NAN)), None)),
+                &["float_part"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("float_part").eq(Expr::Literal(
+                    ScalarValue::Float32(Some(f32::INFINITY)),
+                    None
+                )),
+                &["float_part"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("float_part").eq(Expr::Literal(ScalarValue::Float32(None), None)),
+                &["float_part"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(&col("float_part").eq(double_value), &["float_part"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+    }
+
+    #[test]
+    fn converts_finite_floating_comparisons_with_typed_ordering_semantics() {
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let negative_zero_float = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let double_high = Expr::Literal(ScalarValue::Float64(Some(0.0)), None);
+        let lt =
+            predicate_expr(&col("float_part").lt(float_value.clone()), &["float_part"]).unwrap();
+        let lt_eq = predicate_expr(
+            &col("float_part").lt_eq(negative_zero_float.clone()),
+            &["float_part"],
+        )
+        .unwrap();
+        let gt = predicate_expr(
+            &col("float_part").gt(negative_zero_float.clone()),
+            &["float_part"],
+        )
+        .unwrap();
+        let gt_eq = predicate_expr(
+            &float_value.clone().lt_eq(col("float_part")),
+            &["float_part"],
+        )
+        .unwrap();
+        let between = predicate_expr(
+            &col("float_part").between(negative_zero_float.clone(), float_value.clone()),
+            &["float_part"],
+        )
+        .unwrap();
+        let not_between = predicate_expr(
+            &col("double_part").not_between(double_value.clone(), double_high.clone()),
+            &["double_part"],
+        )
+        .unwrap();
+        let raw_float = values(&[("float_part", "1.5")]);
+        let raw_negative_zero_float = values(&[("float_part", "-0.0")]);
+        let raw_positive_zero_float = values(&[("float_part", "0.0")]);
+        let raw_nan_float = values(&[("float_part", "NaN")]);
+        let raw_infinity_float = values(&[("float_part", "Infinity")]);
+        let raw_double = values(&[("double_part", "-2.25")]);
+        let raw_other_double = values(&[("double_part", "1.0")]);
+        let raw_nan_double = values(&[("double_part", "NaN")]);
+        let raw_infinity_double = values(&[("double_part", "Infinity")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&lt, &raw_float));
+        assert!(matches_scan_file(&lt, &raw_negative_zero_float));
+        assert!(matches_scan_file(&lt, &raw_positive_zero_float));
+        assert!(!matches_scan_file(&lt, &raw_infinity_float));
+        assert!(matches_scan_file(&lt_eq, &raw_negative_zero_float));
+        assert!(!matches_scan_file(&lt_eq, &raw_positive_zero_float));
+        assert!(matches_scan_file(&gt, &raw_positive_zero_float));
+        assert!(matches_scan_file(&gt, &raw_nan_float));
+        assert!(matches_scan_file(&gt, &raw_infinity_float));
+        assert!(!matches_scan_file(&gt, &raw_negative_zero_float));
+        assert!(matches_scan_file(&gt_eq, &raw_float));
+        assert!(!matches_scan_file(&gt_eq, &raw_positive_zero_float));
+        assert!(matches_scan_file(&between, &raw_float));
+        assert!(matches_scan_file(&between, &raw_negative_zero_float));
+        assert!(matches_scan_file(&between, &raw_positive_zero_float));
+        assert!(!matches_scan_file(&between, &raw_nan_float));
+        assert!(!matches_scan_file(&between, &missing));
+        assert!(!matches_scan_file(&not_between, &raw_double));
+        assert!(matches_scan_file(&not_between, &raw_other_double));
+        assert!(matches_scan_file(&not_between, &raw_nan_double));
+        assert!(matches_scan_file(&not_between, &raw_infinity_double));
+
+        assert_eq!(
+            predicate_expr(
+                &col("float_part").lt(Expr::Literal(ScalarValue::Float32(Some(f32::NAN)), None)),
+                &["float_part"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("float_part").between(
+                    negative_zero_float,
+                    Expr::Literal(ScalarValue::Float32(Some(f32::INFINITY)), None)
+                ),
+                &["float_part"]
+            ),
             Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
         );
     }

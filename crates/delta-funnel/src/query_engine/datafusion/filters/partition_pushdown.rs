@@ -268,6 +268,12 @@ fn is_supported_partition_literal_for_column(
             *column_scale,
         )
         .is_some(),
+        (DataType::Float32, Expr::Literal(ScalarValue::Float32(Some(value)), _)) => {
+            value.is_finite()
+        }
+        (DataType::Float64, Expr::Literal(ScalarValue::Float64(Some(value)), _)) => {
+            value.is_finite()
+        }
         (data_type, literal) => signed_integer_bounds(data_type)
             .zip(signed_integer_literal_value(literal))
             .is_some_and(|((min, max), value)| min <= value && value <= max),
@@ -297,6 +303,8 @@ fn is_supported_ordering_literal_for_column(
             | DataType::Int64
             | DataType::Date32
             | DataType::Decimal128(_, _)
+            | DataType::Float32
+            | DataType::Float64
     )
 }
 
@@ -338,6 +346,8 @@ mod tests {
             Field::new("is_current", DataType::Boolean, true),
             Field::new("event_date", DataType::Date32, true),
             Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new("float_part", DataType::Float32, true),
+            Field::new("double_part", DataType::Float64, true),
         ]))
     }
 
@@ -612,6 +622,102 @@ mod tests {
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
             &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_floating_null_checks_as_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["float_part", "double_part"]);
+        let filters = [
+            col("float_part").is_null(),
+            col("float_part").is_not_null(),
+            col("double_part").is_null(),
+            col("double_part").is_not_null(),
+            col("float_part")
+                .is_null()
+                .and(col("double_part").is_not_null()),
+            Expr::Not(Box::new(col("float_part").is_null())),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_finite_floating_equality_and_membership() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["float_part", "double_part"]);
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let negative_zero = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let filters = [
+            col("float_part").eq(float_value.clone()),
+            float_value.clone().eq(col("float_part")),
+            col("float_part").not_eq(float_value.clone()),
+            col("float_part").in_list(vec![float_value.clone(), negative_zero], false),
+            col("float_part").in_list(vec![float_value], true),
+            col("double_part").eq(double_value.clone()),
+            col("double_part").in_list(vec![double_value.clone(), double_value], false),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_finite_floating_comparisons_and_between() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["float_part", "double_part"]);
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let negative_zero = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let double_high = Expr::Literal(ScalarValue::Float64(Some(0.0)), None);
+        let filters = [
+            col("float_part").lt(float_value.clone()),
+            col("float_part").lt_eq(negative_zero.clone()),
+            col("float_part").gt(negative_zero.clone()),
+            float_value.clone().lt_eq(col("float_part")),
+            col("float_part").between(negative_zero.clone(), float_value.clone()),
+            col("float_part").not_between(negative_zero, float_value),
+            col("double_part").gt_eq(double_value.clone()),
+            col("double_part").between(double_value, double_high),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
             &schema,
             &partition_columns,
         );
