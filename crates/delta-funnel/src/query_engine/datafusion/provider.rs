@@ -2887,7 +2887,11 @@ mod tests {
             (
                 "float inequality",
                 datafusion::logical_expr::col("float_part").not_eq(float_value.clone()),
-                vec!["part-00001.parquet", "part-00002.parquet"],
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00005.parquet",
+                ],
             ),
             (
                 "float in list",
@@ -2901,7 +2905,11 @@ mod tests {
                 "float not in list",
                 datafusion::logical_expr::col("float_part")
                     .in_list(vec![float_value.clone()], true),
-                vec!["part-00001.parquet", "part-00002.parquet"],
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00005.parquet",
+                ],
             ),
             (
                 "double equality",
@@ -2911,7 +2919,11 @@ mod tests {
             (
                 "double not in list",
                 datafusion::logical_expr::col("double_part").in_list(vec![double_value], true),
-                vec!["part-00001.parquet", "part-00002.parquet"],
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00005.parquet",
+                ],
             ),
         ];
 
@@ -2992,14 +3004,18 @@ mod tests {
             (
                 "float greater than negative zero",
                 datafusion::logical_expr::col("float_part").gt(negative_zero_float.clone()),
-                vec!["part-00000.parquet", "part-00002.parquet"],
+                vec![
+                    "part-00000.parquet",
+                    "part-00002.parquet",
+                    "part-00005.parquet",
+                ],
             ),
             (
                 "reversed float greater than or equal",
                 float_value
                     .clone()
                     .lt_eq(datafusion::logical_expr::col("float_part")),
-                vec!["part-00000.parquet"],
+                vec!["part-00000.parquet", "part-00005.parquet"],
             ),
             (
                 "float between includes signed zero order",
@@ -3015,7 +3031,7 @@ mod tests {
                 "float not between",
                 datafusion::logical_expr::col("float_part")
                     .not_between(positive_zero_float, float_value),
-                vec!["part-00001.parquet"],
+                vec!["part-00001.parquet", "part-00005.parquet"],
             ),
             (
                 "double between",
@@ -3026,7 +3042,7 @@ mod tests {
             (
                 "double not between",
                 datafusion::logical_expr::col("double_part").not_between(double_value, double_high),
-                vec!["part-00002.parquet"],
+                vec!["part-00002.parquet", "part-00005.parquet"],
             ),
         ];
 
@@ -3144,6 +3160,7 @@ mod tests {
                     "part-00001.parquet",
                     "part-00002.parquet",
                     "part-00003.parquet",
+                    "part-00006.parquet",
                 ],
             ),
         ];
@@ -3468,7 +3485,11 @@ mod tests {
             (
                 "float inequality",
                 "select id from orders where float_part != cast(1.5 as float)",
-                vec!["part-00001.parquet", "part-00002.parquet"],
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00005.parquet",
+                ],
             ),
             (
                 "double equality",
@@ -3478,7 +3499,11 @@ mod tests {
             (
                 "double not in",
                 "select id from orders where double_part not in (-2.25)",
-                vec!["part-00001.parquet", "part-00002.parquet"],
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00005.parquet",
+                ],
             ),
         ];
 
@@ -3571,7 +3596,7 @@ mod tests {
                 "float not between",
                 "select id from orders where float_part not between cast(0.0 as float) and cast(1.5 as float)",
                 1,
-                vec!["part-00001.parquet"],
+                vec!["part-00001.parquet", "part-00005.parquet"],
             ),
             (
                 "double between",
@@ -3583,7 +3608,7 @@ mod tests {
                 "double not between",
                 "select id from orders where double_part not between -2.25 and 0.0",
                 1,
-                vec!["part-00002.parquet"],
+                vec!["part-00002.parquet", "part-00005.parquet"],
             ),
         ];
 

@@ -679,6 +679,7 @@ mod tests {
         let raw_invalid_float = values(&[("float_part", "not-a-float")]);
         let raw_double = values(&[("double_part", "-2.25")]);
         let raw_other_double = values(&[("double_part", "0.0")]);
+        let raw_infinity_double = values(&[("double_part", "Infinity")]);
         let missing = HashMap::new();
 
         assert!(matches_scan_file(&eq, &raw_float));
@@ -696,12 +697,14 @@ mod tests {
         assert!(!matches_scan_file(&not_eq, &raw_float));
         assert!(matches_scan_file(&not_eq, &raw_negative_zero_float));
         assert!(matches_scan_file(&not_eq, &raw_positive_zero_float));
-        assert!(!matches_scan_file(&not_eq, &raw_nan_float));
+        assert!(matches_scan_file(&not_eq, &raw_nan_float));
+        assert!(matches_scan_file(&not_eq, &raw_infinity_float));
         assert!(matches_scan_file(&in_list, &raw_float));
         assert!(matches_scan_file(&in_list, &raw_negative_zero_float));
         assert!(!matches_scan_file(&in_list, &raw_positive_zero_float));
         assert!(!matches_scan_file(&not_in, &raw_double));
         assert!(matches_scan_file(&not_in, &raw_other_double));
+        assert!(matches_scan_file(&not_in, &raw_infinity_double));
 
         assert_eq!(
             predicate_expr(
@@ -770,16 +773,22 @@ mod tests {
         let raw_negative_zero_float = values(&[("float_part", "-0.0")]);
         let raw_positive_zero_float = values(&[("float_part", "0.0")]);
         let raw_nan_float = values(&[("float_part", "NaN")]);
+        let raw_infinity_float = values(&[("float_part", "Infinity")]);
         let raw_double = values(&[("double_part", "-2.25")]);
         let raw_other_double = values(&[("double_part", "1.0")]);
+        let raw_nan_double = values(&[("double_part", "NaN")]);
+        let raw_infinity_double = values(&[("double_part", "Infinity")]);
         let missing = HashMap::new();
 
         assert!(!matches_scan_file(&lt, &raw_float));
         assert!(matches_scan_file(&lt, &raw_negative_zero_float));
         assert!(matches_scan_file(&lt, &raw_positive_zero_float));
+        assert!(!matches_scan_file(&lt, &raw_infinity_float));
         assert!(matches_scan_file(&lt_eq, &raw_negative_zero_float));
         assert!(!matches_scan_file(&lt_eq, &raw_positive_zero_float));
         assert!(matches_scan_file(&gt, &raw_positive_zero_float));
+        assert!(matches_scan_file(&gt, &raw_nan_float));
+        assert!(matches_scan_file(&gt, &raw_infinity_float));
         assert!(!matches_scan_file(&gt, &raw_negative_zero_float));
         assert!(matches_scan_file(&gt_eq, &raw_float));
         assert!(!matches_scan_file(&gt_eq, &raw_positive_zero_float));
@@ -790,6 +799,8 @@ mod tests {
         assert!(!matches_scan_file(&between, &missing));
         assert!(!matches_scan_file(&not_between, &raw_double));
         assert!(matches_scan_file(&not_between, &raw_other_double));
+        assert!(matches_scan_file(&not_between, &raw_nan_double));
+        assert!(matches_scan_file(&not_between, &raw_infinity_double));
 
         assert_eq!(
             predicate_expr(
