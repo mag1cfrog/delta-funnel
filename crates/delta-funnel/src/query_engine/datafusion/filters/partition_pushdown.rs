@@ -296,6 +296,7 @@ fn is_supported_ordering_literal_for_column(
             | DataType::Int32
             | DataType::Int64
             | DataType::Date32
+            | DataType::Decimal128(_, _)
     )
 }
 
@@ -595,6 +596,63 @@ mod tests {
     }
 
     #[test]
+    fn partition_operator_planner_accepts_decimal_comparisons() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["amount"]);
+        let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-1_230), 12, 3), None);
+        let filters = [
+            col("amount").lt(amount.clone()),
+            col("amount").lt_eq(negative),
+            col("amount").gt(zero),
+            amount.clone().lt_eq(col("amount")),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_decimal_between() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["amount"]);
+        let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let filters = [
+            col("amount").between(zero.clone(), amount.clone()),
+            col("amount").not_between(zero, amount),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
     fn partition_operator_planner_rejects_unproven_decimal_literal_shapes() {
         let schema = schema();
         let partition_columns = partition_columns(&["amount"]);
@@ -603,9 +661,9 @@ mod tests {
         let non_exact_scale = Expr::Literal(ScalarValue::Decimal128(Some(12_346), 10, 3), None);
         let filters = [
             col("amount").eq(non_exact_scale.clone()),
-            col("amount").in_list(vec![amount.clone(), non_exact_scale], false),
-            col("amount").lt(amount.clone()),
-            col("amount").between(zero, amount.clone()),
+            col("amount").in_list(vec![amount.clone(), non_exact_scale.clone()], false),
+            col("amount").lt(non_exact_scale.clone()),
+            col("amount").between(zero, non_exact_scale),
             col("amount").eq(lit("123.45")),
             col("amount").eq(lit(123_i64)),
             col("amount").eq(lit(123.45_f64)),

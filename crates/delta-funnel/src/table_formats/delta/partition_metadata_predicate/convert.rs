@@ -201,6 +201,16 @@ fn convert_between(
     partition_columns: &HashSet<String>,
     physical_name_lookup: &DeltaPartitionNameMap,
 ) -> Result<PartitionMetadataExpr, DeltaPartitionMetadataPredicateError> {
+    let partition_column = convert_column(
+        column,
+        logical_schema,
+        partition_columns,
+        physical_name_lookup,
+    )?;
+    if !partition_column.value_kind().supports_between() {
+        return Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator);
+    }
+
     // BETWEEN is inclusive. Expressing it through the same comparison nodes
     // keeps ordering and SQL null behavior in one place.
     let lower_bound = convert_comparison(
@@ -617,6 +627,48 @@ mod tests {
     }
 
     #[test]
+    fn converts_decimal_comparisons_with_typed_ordering_semantics() {
+        let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-1_230), 12, 3), None);
+        let lt = predicate_expr(&col("amount").lt(amount.clone()), &["amount"]).unwrap();
+        let lt_eq = predicate_expr(&col("amount").lt_eq(negative), &["amount"]).unwrap();
+        let gt = predicate_expr(&col("amount").gt(zero), &["amount"]).unwrap();
+        let gt_eq = predicate_expr(&amount.clone().lt_eq(col("amount")), &["amount"]).unwrap();
+        let raw_amount = values(&[("amount", "123.45")]);
+        let raw_zero = values(&[("amount", "0.00")]);
+        let raw_negative = values(&[("amount", "-1.23")]);
+        let raw_empty = values(&[("amount", "")]);
+        let invalid_decimal = values(&[("amount", "not-a-decimal")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&lt, &raw_amount));
+        assert!(matches_scan_file(&lt, &raw_zero));
+        assert!(matches_scan_file(&lt, &raw_negative));
+        assert!(matches_scan_file(&lt_eq, &raw_negative));
+        assert!(!matches_scan_file(&lt_eq, &raw_zero));
+        assert!(matches_scan_file(&gt, &raw_amount));
+        assert!(!matches_scan_file(&gt, &raw_zero));
+        assert!(!matches_scan_file(&gt, &raw_negative));
+        assert!(matches_scan_file(&gt_eq, &raw_amount));
+        assert!(!matches_scan_file(&gt_eq, &raw_zero));
+        assert!(!matches_scan_file(&lt, &raw_empty));
+        assert!(!matches_scan_file(&lt, &invalid_decimal));
+        assert!(!matches_scan_file(&lt, &missing));
+
+        assert_eq!(
+            predicate_expr(
+                &col("amount").lt(Expr::Literal(
+                    ScalarValue::Decimal128(Some(12_346), 10, 3),
+                    None
+                )),
+                &["amount"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+    }
+
+    #[test]
     fn converts_boolean_equality_and_in_lists_with_typed_metadata_semantics() {
         let eq = predicate_expr(&col("is_current").eq(lit(true)), &["is_current"]).unwrap();
         let reversed = predicate_expr(&lit(false).eq(col("is_current")), &["is_current"]).unwrap();
@@ -927,6 +979,38 @@ mod tests {
             ),
             Err(DeltaPartitionMetadataPredicateError::UnsupportedOperator)
         );
+    }
+
+    #[test]
+    fn converts_decimal_between_with_inclusive_and_negated_semantics() {
+        let low = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let high = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let between = predicate_expr(
+            &col("amount").between(low.clone(), high.clone()),
+            &["amount"],
+        )
+        .unwrap();
+        let not_between =
+            predicate_expr(&col("amount").not_between(low, high), &["amount"]).unwrap();
+        let raw_amount = values(&[("amount", "123.45")]);
+        let raw_zero = values(&[("amount", "0.00")]);
+        let raw_negative = values(&[("amount", "-1.23")]);
+        let raw_empty = values(&[("amount", "")]);
+        let invalid_decimal = values(&[("amount", "not-a-decimal")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&between, &raw_amount));
+        assert!(matches_scan_file(&between, &raw_zero));
+        assert!(!matches_scan_file(&between, &raw_negative));
+        assert!(!matches_scan_file(&between, &raw_empty));
+        assert!(!matches_scan_file(&between, &invalid_decimal));
+        assert!(!matches_scan_file(&between, &missing));
+        assert!(!matches_scan_file(&not_between, &raw_amount));
+        assert!(!matches_scan_file(&not_between, &raw_zero));
+        assert!(matches_scan_file(&not_between, &raw_negative));
+        assert!(!matches_scan_file(&not_between, &raw_empty));
+        assert!(!matches_scan_file(&not_between, &invalid_decimal));
+        assert!(!matches_scan_file(&not_between, &missing));
     }
 
     #[test]

@@ -60,8 +60,15 @@ impl PartitionMetadataValueKind {
 
     pub(super) fn supports_ordering(self) -> bool {
         match self {
-            Self::String | Self::SignedInteger { .. } | Self::Date => true,
-            Self::Boolean | Self::Decimal { .. } => false,
+            Self::String | Self::SignedInteger { .. } | Self::Date | Self::Decimal { .. } => true,
+            Self::Boolean => false,
+        }
+    }
+
+    pub(super) fn supports_between(self) -> bool {
+        match self {
+            Self::String | Self::SignedInteger { .. } | Self::Date | Self::Decimal { .. } => true,
+            Self::Boolean => false,
         }
     }
 
@@ -227,6 +234,7 @@ impl PartitionScalar {
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
             (Self::SignedInteger(left), Self::SignedInteger(right)) => Some(left.cmp(right)),
             (Self::Date(left), Self::Date(right)) => Some(left.cmp(right)),
+            (Self::Decimal(left), Self::Decimal(right)) => Some(left.cmp(right)),
             _ => None,
         }
     }
@@ -457,7 +465,8 @@ mod tests {
         assert_eq!(decimal.parse_raw("1."), None);
         assert_eq!(decimal.parse_raw("+1.23"), None);
         assert_eq!(decimal.parse_raw("not-a-decimal"), None);
-        assert!(!decimal.supports_ordering());
+        assert!(decimal.supports_ordering());
+        assert!(decimal.supports_between());
     }
 
     #[test]
