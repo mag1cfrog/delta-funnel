@@ -134,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn integer_value_kind_parses_signed_decimal_text_with_width_bounds() {
+    fn integer_value_kind_parses_signed_base10_text_with_width_bounds() {
         let byte_kind = PartitionMetadataValueKind::SignedInteger {
             min: i64::from(i8::MIN),
             max: i64::from(i8::MAX),

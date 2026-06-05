@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn comparison_operator_matches_and_reverses_string_orderings() {
+    fn comparison_operator_matches_and_reverses_orderings() {
         assert!(PartitionComparisonOperator::Lt.matches(Ordering::Less));
         assert!(PartitionComparisonOperator::LtEq.matches(Ordering::Equal));
         assert!(PartitionComparisonOperator::Gt.matches(Ordering::Greater));
