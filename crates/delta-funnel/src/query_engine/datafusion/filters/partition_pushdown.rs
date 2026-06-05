@@ -15,12 +15,11 @@ use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilter
 ///
 /// A filter can be exact here only when it is partition-only and accepted by
 /// the provider metadata semantics policy. The proven exact subset includes
-/// supported string-like and signed integer-like logical partition columns for
-/// equality, inequality, range comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`,
-/// `NOT IN`, `IS NULL`, `IS NOT NULL`, negation, and boolean composition of
-/// exact partition predicates. Additional types and operators should be added
-/// only with semantic tests. All other shapes stay `Unsupported` so DataFusion
-/// keeps them as residual filters.
+/// supported logical partition column types for equality, inequality, range
+/// comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`, `NOT IN`, `IS NULL`, `IS NOT
+/// NULL`, negation, and boolean composition of exact partition predicates.
+/// Additional types and operators should be added only with semantic tests. All
+/// other shapes stay `Unsupported` so DataFusion keeps them as residual filters.
 pub(super) fn plan_partition_operator_pushdown(
     filters: &[&Expr],
     schema: &SchemaRef,

@@ -6,8 +6,8 @@ use datafusion::arrow::datatypes::DataType;
 ///
 /// Delta stores partition values as text in add-file metadata. Exact provider
 /// pruning still has to evaluate those raw strings through the column's logical
-/// type. This enum is the small central switch that additional decimal,
-/// boolean, date, and timestamp support should extend.
+/// type. This enum is the small central switch that additional logical
+/// partition metadata types should extend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PartitionMetadataValueKind {
     String,

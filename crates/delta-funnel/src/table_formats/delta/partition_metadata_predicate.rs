@@ -24,11 +24,9 @@ use value::PartitionMetadataValueKind;
 /// Returns whether this provider can evaluate a Delta partition column type from metadata.
 ///
 /// Delta stores partition values as serialized text in add-file metadata, but
-/// exact SQL pushdown also depends on the logical schema type. The promoted set
-/// includes string-like and signed integer-like partition columns. When decimal,
-/// boolean, binary, date, and timestamp partition columns are promoted, this
-/// function is the single type gate to update for both support planning and
-/// metadata evaluation.
+/// exact SQL pushdown also depends on the logical schema type. This function is
+/// the single type gate to update when a new logical partition metadata type is
+/// promoted for both support planning and metadata evaluation.
 #[must_use]
 pub(crate) fn supports_partition_metadata_logical_type(data_type: &DataType) -> bool {
     PartitionMetadataValueKind::from_supported_data_type(data_type).is_some()
@@ -48,12 +46,12 @@ pub(crate) struct DeltaPartitionMetadataPredicate {
 impl DeltaPartitionMetadataPredicate {
     /// Converts a supported DataFusion expression into a metadata predicate.
     ///
-    /// The provider policy supports string-like and signed integer-like
-    /// partition columns for equality, inequality, range comparisons, `BETWEEN`,
-    /// `NOT BETWEEN`, `IN`, `NOT IN`, `IS NULL`, `IS NOT NULL`, negation, and
-    /// boolean composition over supported child predicates. Unsupported
-    /// expressions return a typed error so the caller can keep DataFusion
-    /// residual filtering instead of guessing.
+    /// The provider policy supports promoted logical partition types for
+    /// equality, inequality, range comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`,
+    /// `NOT IN`, `IS NULL`, `IS NOT NULL`, negation, and boolean composition
+    /// over supported child predicates. Unsupported expressions return a typed
+    /// error so the caller can keep DataFusion residual filtering instead of
+    /// guessing.
     pub(crate) fn from_datafusion_expr(
         expr: &Expr,
         logical_schema: &SchemaRef,
