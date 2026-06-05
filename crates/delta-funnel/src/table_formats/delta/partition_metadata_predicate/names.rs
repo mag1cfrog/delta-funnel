@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
+use super::value::PartitionMetadataValueKind;
+
 /// Logical-to-physical partition column names for Delta scan metadata.
 ///
-/// Delta scan files expose partition values by physical column name. Most
-/// currently supported tables use the logical name as the physical name, but
-/// keeping the lookup explicit prevents future column-mapping support from
-/// leaking into provider planning code.
+/// Delta scan files expose partition values by physical column name. Tables
+/// without column mapping use the logical name as the physical name, but keeping
+/// the lookup explicit prevents column-mapping support from leaking into
+/// provider planning code.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DeltaPartitionNameMap {
     logical_to_physical: HashMap<String, String>,
@@ -41,11 +43,19 @@ impl DeltaPartitionNameMap {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PhysicalPartitionColumn {
     physical_name: String,
+    value_kind: PartitionMetadataValueKind,
 }
 
 impl PhysicalPartitionColumn {
-    pub(super) fn new(physical_name: String) -> Self {
-        Self { physical_name }
+    pub(super) fn new(physical_name: String, value_kind: PartitionMetadataValueKind) -> Self {
+        Self {
+            physical_name,
+            value_kind,
+        }
+    }
+
+    pub(super) fn value_kind(&self) -> PartitionMetadataValueKind {
+        self.value_kind
     }
 
     pub(super) fn value<'a>(
@@ -77,15 +87,20 @@ mod tests {
 
     #[test]
     fn physical_partition_column_reads_raw_metadata_values() {
-        let column = PhysicalPartitionColumn::new("col-physical-region".to_owned());
+        let column = PhysicalPartitionColumn::new(
+            "col-physical-region".to_owned(),
+            PartitionMetadataValueKind::String,
+        );
         let values = HashMap::from([
             ("col-physical-region".to_owned(), "us-west".to_owned()),
             ("region".to_owned(), "us-east".to_owned()),
         ]);
 
         assert_eq!(column.value(&values), Some("us-west"));
+        assert_eq!(column.value_kind(), PartitionMetadataValueKind::String);
         assert_eq!(
-            PhysicalPartitionColumn::new("missing".to_owned()).value(&values),
+            PhysicalPartitionColumn::new("missing".to_owned(), PartitionMetadataValueKind::String)
+                .value(&values),
             None
         );
     }

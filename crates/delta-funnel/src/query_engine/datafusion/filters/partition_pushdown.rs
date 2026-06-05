@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::{Expr, Operator};
 
@@ -14,13 +14,12 @@ use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilter
 /// Plans the exact static partition operator policy.
 ///
 /// A filter can be exact here only when it is partition-only and accepted by
-/// the current provider metadata semantics policy. The proven exact subset
-/// currently includes non-empty, non-null logical string equality, inequality,
-/// range comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`, `NOT IN`, `IS NULL`,
-/// `IS NOT NULL`, negation, and boolean composition of exact partition
-/// predicates. It can expand one operator class at a time after semantic
-/// tests. All other shapes stay `Unsupported` so DataFusion keeps them as
-/// residual filters.
+/// the provider metadata semantics policy. The proven exact subset includes
+/// supported logical partition column types for equality, inequality, range
+/// comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`, `NOT IN`, `IS NULL`, `IS NOT
+/// NULL`, negation, and boolean composition of exact partition predicates.
+/// Additional types and operators should be added only with semantic tests. All
+/// other shapes stay `Unsupported` so DataFusion keeps them as residual filters.
 pub(super) fn plan_partition_operator_pushdown(
     filters: &[&Expr],
     schema: &SchemaRef,
@@ -72,7 +71,7 @@ fn partition_operator_decision(
     }
 }
 
-/// Checks whether the expression shape is supported by the current exact
+/// Checks whether the expression shape is supported by the provider exact
 /// partition operator policy.
 ///
 /// Column membership is intentionally checked by `analyze_filter_for_pushdown`;
@@ -125,12 +124,16 @@ fn is_supported_partition_operator_filter(filter: &Expr, schema: &SchemaRef) -> 
     }
 }
 
-/// Accepts one column/literal range comparison if the current type policy can prove it.
+/// Accepts one column/literal range comparison if the metadata type policy can prove it.
 fn is_supported_partition_comparison(column: &Expr, literal: &Expr, schema: &SchemaRef) -> bool {
-    is_supported_partition_column_literal_pair(column, literal, schema)
+    let Expr::Column(column) = column else {
+        return false;
+    };
+
+    is_supported_partition_literal_for_column(column, literal, schema)
 }
 
-/// Accepts inclusive string partition ranges with proven non-empty literal bounds.
+/// Accepts inclusive partition ranges when both literal bounds are proven.
 fn is_supported_partition_between(filter: &Expr, schema: &SchemaRef) -> bool {
     let Expr::Between(between) = filter else {
         return false;
@@ -139,12 +142,11 @@ fn is_supported_partition_between(filter: &Expr, schema: &SchemaRef) -> bool {
         return false;
     };
 
-    is_supported_partition_column_type(column, schema)
-        && is_supported_partition_literal(between.low.as_ref())
-        && is_supported_partition_literal(between.high.as_ref())
+    is_supported_partition_literal_for_column(column, between.low.as_ref(), schema)
+        && is_supported_partition_literal_for_column(column, between.high.as_ref(), schema)
 }
 
-/// Accepts one column/literal equality if the current type policy can prove it.
+/// Accepts one column/literal equality if the metadata type policy can prove it.
 fn is_supported_partition_equality(column: &Expr, literal: &Expr, schema: &SchemaRef) -> bool {
     is_supported_partition_column_literal_pair(column, literal, schema)
 }
@@ -159,17 +161,16 @@ fn is_supported_partition_column_literal_pair(
         return false;
     };
 
-    is_supported_partition_column_type(column, schema) && is_supported_partition_literal(literal)
+    is_supported_partition_literal_for_column(column, literal, schema)
 }
 
-/// Accepts an `IN` or `NOT IN` list for non-empty string partition literals.
+/// Accepts an `IN` or `NOT IN` list for proven partition literals.
 ///
-/// `IN` is the first operator promoted after equality because it is equivalent
-/// to a disjunction of equality checks for this non-empty, non-null string
-/// literal subset. `NOT IN` is represented by the provider metadata evaluator
-/// as `NOT(IN(...))`, preserving SQL null propagation. Empty, null-containing,
-/// empty-string, or non-literal lists remain unsupported until their metadata
-/// semantics are proven.
+/// `IN` is exact for the same non-empty, non-null literal subset as equality:
+/// it is equivalent to a disjunction of equality checks. `NOT IN` is represented
+/// by the provider metadata evaluator as `NOT(IN(...))`, preserving SQL null
+/// propagation. Empty, null-containing, empty-string, mixed-type, or non-literal
+/// lists stay unsupported unless their metadata semantics are proven.
 fn is_supported_partition_in_list(filter: &Expr, schema: &SchemaRef) -> bool {
     let Expr::InList(in_list) = filter else {
         return false;
@@ -180,7 +181,10 @@ fn is_supported_partition_in_list(filter: &Expr, schema: &SchemaRef) -> bool {
 
     !in_list.list.is_empty()
         && is_supported_partition_column_type(column, schema)
-        && in_list.list.iter().all(is_supported_partition_literal)
+        && in_list
+            .list
+            .iter()
+            .all(|literal| is_supported_partition_literal_for_column(column, literal, schema))
 }
 
 /// Accepts null checks only for logical partition columns whose metadata
@@ -198,7 +202,7 @@ fn is_supported_partition_null_check(expr: &Expr, schema: &SchemaRef) -> bool {
     is_supported_partition_column_type(column, schema)
 }
 
-/// Restricts current exactness to string-typed logical partition columns.
+/// Restricts exactness to supported logical partition column types.
 ///
 /// Delta serializes all partition values as text in the log, but this check is
 /// about the logical table schema type. The supported type set is centralized
@@ -214,16 +218,53 @@ fn is_supported_partition_column_type(column: &Column, schema: &SchemaRef) -> bo
         .is_ok_and(|field| supports_partition_metadata_logical_type(field.data_type()))
 }
 
-/// Restricts current exactness to non-empty, non-null string literals.
+/// Restricts operators to type/literal pairs whose exactness is proven.
 ///
 /// This must evolve together with `is_supported_partition_column_type`; exact
 /// pushdown should only be claimed for type pairs whose Delta partition
 /// metadata semantics are tested.
-fn is_supported_partition_literal(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(value)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _) => !value.is_empty(),
-        _ => false,
+fn is_supported_partition_literal_for_column(
+    column: &Column,
+    literal: &Expr,
+    schema: &SchemaRef,
+) -> bool {
+    if !is_supported_partition_column_type(column, schema) {
+        return false;
+    }
+
+    let Ok(field) = schema.field_with_name(&column.name) else {
+        return false;
+    };
+
+    match (field.data_type(), literal) {
+        (
+            DataType::Utf8 | DataType::LargeUtf8,
+            Expr::Literal(ScalarValue::Utf8(Some(value)), _)
+            | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _),
+        ) => !value.is_empty(),
+        (data_type, literal) => signed_integer_bounds(data_type)
+            .zip(signed_integer_literal_value(literal))
+            .is_some_and(|((min, max), value)| min <= value && value <= max),
+    }
+}
+
+fn signed_integer_bounds(data_type: &DataType) -> Option<(i64, i64)> {
+    match data_type {
+        DataType::Int8 => Some((i64::from(i8::MIN), i64::from(i8::MAX))),
+        DataType::Int16 => Some((i64::from(i16::MIN), i64::from(i16::MAX))),
+        DataType::Int32 => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+        DataType::Int64 => Some((i64::MIN, i64::MAX)),
+        _ => None,
+    }
+}
+
+fn signed_integer_literal_value(literal: &Expr) -> Option<i64> {
+    match literal {
+        Expr::Literal(ScalarValue::Int8(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::Int16(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::Int32(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::Int64(Some(value)), _) => Some(*value),
+        _ => None,
     }
 }
 
@@ -491,12 +532,46 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_accepts_string_partition_between() {
+    fn partition_operator_planner_accepts_integer_partition_comparisons() {
         let schema = schema();
-        let partition_columns = partition_columns(&["region"]);
+        let partition_columns = partition_columns(&["id"]);
+        let filters = [
+            col("id").lt(lit(10_i64)),
+            col("id").lt_eq(lit(10_i64)),
+            col("id").gt(lit(-10_i64)),
+            col("id").gt_eq(lit(-10_i64)),
+            lit(10_i64).gt(col("id")),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+                && decision.kernel_predicate.adapter_error.is_none()
+        }));
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_string_and_integer_partition_between() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["region", "id"]);
         let filters = [
             col("region").between(lit("a"), lit("z")),
             col("region").not_between(lit("a"), lit("z")),
+            col("id").between(lit(1_i64), lit(9_i64)),
+            col("id").not_between(lit(1_i64), lit(9_i64)),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
@@ -612,10 +687,14 @@ mod tests {
             col("region").between(Expr::Literal(ScalarValue::Utf8(None), None), lit("us-west"));
         let numeric_comparison = col("region").lt(lit(7_i64));
         let numeric_between = col("region").between(lit(7_i64), lit("us-west"));
-        let non_string_partition_between = col("id").between(lit("1"), lit("9"));
+        let integer_partition_with_string_between = col("id").between(lit("1"), lit("9"));
         let non_literal_between = col("region").between(col("day"), lit("us-west"));
-        let mixed_and = col("region").eq(lit("us-west")).and(col("id").gt(lit(10)));
-        let mixed_or = col("region").eq(lit("us-west")).or(col("id").gt(lit(10)));
+        let mixed_and = col("region")
+            .eq(lit("us-west"))
+            .and(col("day").gt(lit("2026-01-01")));
+        let mixed_or = col("region")
+            .eq(lit("us-west"))
+            .or(col("day").gt(lit("2026-01-01")));
         let not_filter = Expr::Not(Box::new(col("id").eq(lit("7"))));
         let null_literal = col("region").eq(Expr::Literal(ScalarValue::Utf8(None), None));
 
@@ -628,7 +707,7 @@ mod tests {
                 &null_between,
                 &numeric_comparison,
                 &numeric_between,
-                &non_string_partition_between,
+                &integer_partition_with_string_between,
                 &non_literal_between,
                 &mixed_and,
                 &mixed_or,

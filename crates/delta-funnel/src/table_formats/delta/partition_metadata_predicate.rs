@@ -1,7 +1,8 @@
 //! SQL-compatible Delta partition metadata predicate evaluation.
 
-// Scan plans can carry this predicate before scan metadata expansion consumes
-// it, so keep dead-code warnings quiet until file-level pruning calls it.
+// The planning and scan-file pruning paths use this predicate before the full
+// read path consumes those pruned files end to end, so keep dead-code warnings
+// quiet for helper surfaces that are only exercised by planning paths.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
@@ -12,23 +13,23 @@ use datafusion::logical_expr::Expr;
 mod convert;
 mod expr;
 mod names;
+mod value;
 
 pub(crate) use convert::DeltaPartitionMetadataPredicateError;
 use convert::convert_expr;
 use expr::{PartitionMetadataExpr, SqlBool};
 pub(crate) use names::DeltaPartitionNameMap;
+use value::PartitionMetadataValueKind;
 
 /// Returns whether this provider can evaluate a Delta partition column type from metadata.
 ///
 /// Delta stores partition values as serialized text in add-file metadata, but
-/// exact SQL pushdown also depends on the logical schema type. Today only
-/// string-like partition columns have proven metadata semantics in this
-/// provider. When numeric, decimal, boolean, binary, date, and timestamp
-/// partition columns are promoted, this function is the single type gate to
-/// update for both support planning and metadata evaluation.
+/// exact SQL pushdown also depends on the logical schema type. This function is
+/// the single type gate to update when a new logical partition metadata type is
+/// promoted for both support planning and metadata evaluation.
 #[must_use]
 pub(crate) fn supports_partition_metadata_logical_type(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Utf8 | DataType::LargeUtf8)
+    PartitionMetadataValueKind::from_supported_data_type(data_type).is_some()
 }
 
 /// Provider-owned predicate over serialized Delta partition metadata.
@@ -45,12 +46,12 @@ pub(crate) struct DeltaPartitionMetadataPredicate {
 impl DeltaPartitionMetadataPredicate {
     /// Converts a supported DataFusion expression into a metadata predicate.
     ///
-    /// The current policy supports string partition columns, string equality,
-    /// string inequality, string range comparisons, `BETWEEN`, `NOT BETWEEN`,
-    /// `IN`, `NOT IN`, `IS NULL`, `IS NOT NULL`, negation, and boolean
-    /// composition over supported child predicates. Unsupported expressions
-    /// return a typed error so the caller can keep DataFusion residual
-    /// filtering instead of guessing.
+    /// The provider policy supports promoted logical partition types for
+    /// equality, inequality, range comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`,
+    /// `NOT IN`, `IS NULL`, `IS NOT NULL`, negation, and boolean composition
+    /// over supported child predicates. Unsupported expressions return a typed
+    /// error so the caller can keep DataFusion residual filtering instead of
+    /// guessing.
     pub(crate) fn from_datafusion_expr(
         expr: &Expr,
         logical_schema: &SchemaRef,
@@ -107,13 +108,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_type_policy_documents_current_string_only_scope() {
-        let supported = [DataType::Utf8, DataType::LargeUtf8];
-        let unsupported = [
+    fn metadata_type_policy_documents_promoted_scope() {
+        let supported = [
+            DataType::Utf8,
+            DataType::LargeUtf8,
             DataType::Int64,
             DataType::Int32,
             DataType::Int16,
             DataType::Int8,
+        ];
+        let unsupported = [
             DataType::Float32,
             DataType::Float64,
             DataType::Decimal128(10, 2),
