@@ -6,8 +6,8 @@ use datafusion::arrow::datatypes::DataType;
 ///
 /// Delta stores partition values as text in add-file metadata. Exact provider
 /// pruning still has to evaluate those raw strings through the column's logical
-/// type. This enum is the small central switch that future decimal, boolean,
-/// date, and timestamp support should extend.
+/// type. This enum is the small central switch that additional decimal,
+/// boolean, date, and timestamp support should extend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PartitionMetadataValueKind {
     String,
@@ -53,8 +53,8 @@ impl PartitionMetadataValueKind {
 /// Typed literal or parsed raw partition metadata value.
 ///
 /// The evaluator compares values only after both sides have been converted into
-/// this representation. That avoids accidental raw string ordering when
-/// non-string partition types are added.
+/// this representation, so raw string ordering is never reused for typed
+/// partition values.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum PartitionScalar {
     String(String),
@@ -78,7 +78,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn value_kind_tracks_current_supported_logical_types() {
+    fn value_kind_tracks_supported_logical_types() {
         assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Utf8),
             Some(PartitionMetadataValueKind::String)

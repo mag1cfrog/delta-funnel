@@ -14,13 +14,13 @@ use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilter
 /// Plans the exact static partition operator policy.
 ///
 /// A filter can be exact here only when it is partition-only and accepted by
-/// the current provider metadata semantics policy. The proven exact subset
-/// currently includes non-empty, non-null logical string equality, inequality,
-/// range comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`, `NOT IN`, `IS NULL`,
-/// `IS NOT NULL`, negation, and boolean composition of exact partition
-/// predicates. It can expand one operator class at a time after semantic
-/// tests. All other shapes stay `Unsupported` so DataFusion keeps them as
-/// residual filters.
+/// the provider metadata semantics policy. The proven exact subset includes
+/// supported string-like and signed integer-like logical partition columns for
+/// equality, inequality, range comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`,
+/// `NOT IN`, `IS NULL`, `IS NOT NULL`, negation, and boolean composition of
+/// exact partition predicates. Additional types and operators should be added
+/// only with semantic tests. All other shapes stay `Unsupported` so DataFusion
+/// keeps them as residual filters.
 pub(super) fn plan_partition_operator_pushdown(
     filters: &[&Expr],
     schema: &SchemaRef,
@@ -72,7 +72,7 @@ fn partition_operator_decision(
     }
 }
 
-/// Checks whether the expression shape is supported by the current exact
+/// Checks whether the expression shape is supported by the provider exact
 /// partition operator policy.
 ///
 /// Column membership is intentionally checked by `analyze_filter_for_pushdown`;
@@ -125,7 +125,7 @@ fn is_supported_partition_operator_filter(filter: &Expr, schema: &SchemaRef) -> 
     }
 }
 
-/// Accepts one column/literal range comparison if the current type policy can prove it.
+/// Accepts one column/literal range comparison if the metadata type policy can prove it.
 fn is_supported_partition_comparison(column: &Expr, literal: &Expr, schema: &SchemaRef) -> bool {
     let Expr::Column(column) = column else {
         return false;
@@ -147,7 +147,7 @@ fn is_supported_partition_between(filter: &Expr, schema: &SchemaRef) -> bool {
         && is_supported_partition_literal_for_column(column, between.high.as_ref(), schema)
 }
 
-/// Accepts one column/literal equality if the current type policy can prove it.
+/// Accepts one column/literal equality if the metadata type policy can prove it.
 fn is_supported_partition_equality(column: &Expr, literal: &Expr, schema: &SchemaRef) -> bool {
     is_supported_partition_column_literal_pair(column, literal, schema)
 }
@@ -167,12 +167,11 @@ fn is_supported_partition_column_literal_pair(
 
 /// Accepts an `IN` or `NOT IN` list for proven partition literals.
 ///
-/// `IN` is the first operator promoted after equality because it is equivalent
-/// to a disjunction of equality checks for this non-empty, non-null literal
-/// subset. `NOT IN` is represented by the provider metadata evaluator as
-/// `NOT(IN(...))`, preserving SQL null propagation. Empty, null-containing,
-/// empty-string, mixed-type, or non-literal lists remain unsupported until
-/// their metadata semantics are proven.
+/// `IN` is exact for the same non-empty, non-null literal subset as equality:
+/// it is equivalent to a disjunction of equality checks. `NOT IN` is represented
+/// by the provider metadata evaluator as `NOT(IN(...))`, preserving SQL null
+/// propagation. Empty, null-containing, empty-string, mixed-type, or non-literal
+/// lists stay unsupported unless their metadata semantics are proven.
 fn is_supported_partition_in_list(filter: &Expr, schema: &SchemaRef) -> bool {
     let Expr::InList(in_list) = filter else {
         return false;
@@ -204,7 +203,7 @@ fn is_supported_partition_null_check(expr: &Expr, schema: &SchemaRef) -> bool {
     is_supported_partition_column_type(column, schema)
 }
 
-/// Restricts current exactness to supported logical partition column types.
+/// Restricts exactness to supported logical partition column types.
 ///
 /// Delta serializes all partition values as text in the log, but this check is
 /// about the logical table schema type. The supported type set is centralized

@@ -4,10 +4,10 @@ use super::value::PartitionMetadataValueKind;
 
 /// Logical-to-physical partition column names for Delta scan metadata.
 ///
-/// Delta scan files expose partition values by physical column name. Most
-/// currently supported tables use the logical name as the physical name, but
-/// keeping the lookup explicit prevents future column-mapping support from
-/// leaking into provider planning code.
+/// Delta scan files expose partition values by physical column name. Tables
+/// without column mapping use the logical name as the physical name, but keeping
+/// the lookup explicit prevents column-mapping support from leaking into
+/// provider planning code.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DeltaPartitionNameMap {
     logical_to_physical: HashMap<String, String>,
