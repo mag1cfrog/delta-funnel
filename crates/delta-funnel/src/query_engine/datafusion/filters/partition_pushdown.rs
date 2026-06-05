@@ -323,6 +323,7 @@ mod tests {
             Field::new("day", DataType::Utf8, true),
             Field::new("is_current", DataType::Boolean, true),
             Field::new("event_date", DataType::Date32, true),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
         ]))
     }
 
@@ -509,6 +510,72 @@ mod tests {
                 && !decision.residual
                 && decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
         }));
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_decimal_null_checks_as_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["amount"]);
+        let filters = [col("amount").is_null(), col("amount").is_not_null()];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+        assert_eq!(plan.exact_count, 2);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Exact
+                && !decision.residual
+                && decision.kernel_predicate.scope == DeltaKernelPredicateScope::PartitionOnly
+        }));
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_unproven_decimal_literal_shapes() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["amount"]);
+        let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let different_scale = Expr::Literal(ScalarValue::Decimal128(Some(123_450), 12, 3), None);
+        let filters = [
+            col("amount").eq(amount.clone()),
+            amount.clone().eq(col("amount")),
+            col("amount").not_eq(amount.clone()),
+            col("amount").in_list(vec![amount.clone(), different_scale], false),
+            col("amount").lt(amount.clone()),
+            col("amount").between(zero, amount.clone()),
+            col("amount").eq(lit("123.45")),
+            col("amount").eq(lit(123_i64)),
+            col("amount").eq(lit(123.45_f64)),
+            col("amount").eq(Expr::Literal(ScalarValue::Decimal128(None, 10, 2), None)),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
     }
 
     #[test]

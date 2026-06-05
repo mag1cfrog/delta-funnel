@@ -2520,10 +2520,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decimal_partition_filters_remain_unsupported_before_promotion()
+    async fn decimal_partition_literal_filters_remain_unsupported_before_literal_promotion()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
-            "decimal-partition-unsupported-boundary",
+            "decimal-partition-literal-unsupported-boundary",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             r#""partitionValues":{"amount":"123.45"}"#,
@@ -2558,11 +2558,6 @@ mod tests {
                 vec![datafusion::logical_expr::col("amount")],
             ));
         let filters = vec![
-            ("is null", datafusion::logical_expr::col("amount").is_null()),
-            (
-                "is not null",
-                datafusion::logical_expr::col("amount").is_not_null(),
-            ),
             (
                 "decimal equality",
                 datafusion::logical_expr::col("amount").eq(amount.clone()),
@@ -2642,6 +2637,83 @@ mod tests {
                     .contains("pushed filters must be exact partition predicates")),
                 "{name} should be rejected"
             );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decimal_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "decimal-partition-null-checks",
+            DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["amount"]"#,
+            &[
+                r#""partitionValues":{"amount":"123.45"}"#,
+                r#""partitionValues":{"amount":"0.00"}"#,
+                r#""partitionValues":{"amount":"-1.23"}"#,
+                r#""partitionValues":{"amount":null}"#,
+                r#""partitionValues":{"amount":""}"#,
+                r#""partitionValues":{"amount":"not-a-decimal"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "is null",
+                datafusion::logical_expr::col("amount").is_null(),
+                vec!["part-00003.parquet", "part-00006.parquet"],
+            ),
+            (
+                "is not null",
+                datafusion::logical_expr::col("amount").is_not_null(),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00004.parquet",
+                    "part-00005.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.unsupported_count,
+                0,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
@@ -4303,11 +4375,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_decimal_partition_filters_keep_residual_before_promotion()
+    async fn sql_decimal_partition_literal_filters_keep_residual_before_literal_promotion()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-decimal-partition-residuals",
+            "sql-decimal-partition-literal-residuals",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -4359,11 +4431,6 @@ mod tests {
                 "decimal literal between",
                 "select id from orders where amount between DECIMAL '0.00' and DECIMAL '123.45'",
             ),
-            ("is null", "select id from orders where amount is null"),
-            (
-                "is not null",
-                "select id from orders where amount is not null",
-            ),
         ];
 
         for (name, sql) in cases {
@@ -4394,6 +4461,92 @@ mod tests {
                 scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_decimal_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-decimal-partition-null-checks",
+            DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["amount"]"#,
+            &[
+                r#""partitionValues":{"amount":"123.45"}"#,
+                r#""partitionValues":{"amount":"0.00"}"#,
+                r#""partitionValues":{"amount":"-1.23"}"#,
+                r#""partitionValues":{"amount":null}"#,
+                r#""partitionValues":{"amount":""}"#,
+                r#""partitionValues":{"amount":"not-a-decimal"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+        let cases = [
+            (
+                "is null",
+                "select id from orders where amount is null",
+                vec!["part-00003.parquet", "part-00006.parquet"],
+            ),
+            (
+                "is not null",
+                "select id from orders where amount is not null",
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00004.parquet",
+                    "part-00005.parquet",
+                ],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                1,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
         }
 
         Ok(())

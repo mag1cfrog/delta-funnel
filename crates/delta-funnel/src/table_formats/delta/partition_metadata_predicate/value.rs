@@ -17,6 +17,7 @@ pub(super) enum PartitionMetadataValueKind {
     SignedInteger { min: i64, max: i64 },
     Boolean,
     Date,
+    Decimal { precision: u8, scale: i8 },
 }
 
 impl PartitionMetadataValueKind {
@@ -41,6 +42,14 @@ impl PartitionMetadataValueKind {
             }),
             DataType::Boolean => Some(Self::Boolean),
             DataType::Date32 => Some(Self::Date),
+            DataType::Decimal128(precision, scale)
+                if *precision <= 38 && 0 <= *scale && *scale <= *precision as i8 =>
+            {
+                Some(Self::Decimal {
+                    precision: *precision,
+                    scale: *scale,
+                })
+            }
             _ => None,
         }
     }
@@ -52,7 +61,7 @@ impl PartitionMetadataValueKind {
     pub(super) fn supports_ordering(self) -> bool {
         match self {
             Self::String | Self::SignedInteger { .. } | Self::Date => true,
-            Self::Boolean => false,
+            Self::Boolean | Self::Decimal { .. } => false,
         }
     }
 
@@ -66,6 +75,9 @@ impl PartitionMetadataValueKind {
                 .map(PartitionScalar::SignedInteger),
             Self::Boolean => raw_value.parse::<bool>().ok().map(PartitionScalar::Boolean),
             Self::Date => parse_delta_date(raw_value).map(PartitionScalar::Date),
+            Self::Decimal { precision, scale } => {
+                parse_delta_decimal(raw_value, precision, scale).map(PartitionScalar::Decimal)
+            }
         }
     }
 }
@@ -87,6 +99,46 @@ fn parse_delta_date(raw_value: &str) -> Option<i32> {
         .map(|date| date.num_days_from_ce() - UNIX_EPOCH_DAYS_FROM_CE)
 }
 
+fn parse_delta_decimal(raw_value: &str, precision: u8, scale: i8) -> Option<i128> {
+    let scale = u8::try_from(scale).ok()?;
+    if precision == 0 || 38 < precision || precision < scale {
+        return None;
+    }
+    let (negative, unsigned) = raw_value
+        .strip_prefix('-')
+        .map_or((false, raw_value), |value| (true, value));
+    if unsigned.is_empty() {
+        return None;
+    }
+    if unsigned.ends_with('.') {
+        return None;
+    }
+    let mut parts = unsigned.split('.');
+    let integer = parts.next()?;
+    let fraction = parts.next().unwrap_or("");
+    if parts.next().is_some()
+        || integer.is_empty()
+        || (scale as usize) < fraction.len()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let digits = format!("{integer}{fraction:0<width$}", width = scale as usize);
+    let significant_digits = digits.trim_start_matches('0').len();
+    if (precision as usize) < significant_digits {
+        return None;
+    }
+
+    let value = digits.parse::<i128>().ok()?;
+    if negative {
+        value.checked_neg()
+    } else {
+        Some(value)
+    }
+}
+
 /// Typed literal or parsed raw partition metadata value.
 ///
 /// The evaluator compares values only after both sides have been converted into
@@ -98,6 +150,7 @@ pub(super) enum PartitionScalar {
     SignedInteger(i64),
     Boolean(bool),
     Date(i32),
+    Decimal(i128),
 }
 
 impl PartitionScalar {
@@ -162,6 +215,28 @@ mod tests {
         assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Date32),
             Some(PartitionMetadataValueKind::Date)
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Decimal128(10, 2)),
+            Some(PartitionMetadataValueKind::Decimal {
+                precision: 10,
+                scale: 2
+            })
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Decimal128(38, 18)),
+            Some(PartitionMetadataValueKind::Decimal {
+                precision: 38,
+                scale: 18
+            })
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Decimal128(10, -1)),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Decimal128(10, 11)),
+            None
         );
         assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Float64),
@@ -271,5 +346,49 @@ mod tests {
             None
         );
         assert!(PartitionMetadataValueKind::Date.supports_ordering());
+    }
+
+    #[test]
+    fn decimal_value_kind_parses_delta_metadata_text_to_scaled_i128() {
+        let decimal = PartitionMetadataValueKind::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        let high_precision_decimal = PartitionMetadataValueKind::Decimal {
+            precision: 38,
+            scale: 18,
+        };
+
+        assert_eq!(
+            decimal.parse_raw("123.45"),
+            Some(PartitionScalar::Decimal(12_345))
+        );
+        assert_eq!(
+            decimal.parse_raw("-1.23"),
+            Some(PartitionScalar::Decimal(-123))
+        );
+        assert_eq!(decimal.parse_raw("0.00"), Some(PartitionScalar::Decimal(0)));
+        assert_eq!(
+            decimal.parse_raw("1.0"),
+            Some(PartitionScalar::Decimal(100))
+        );
+        assert_eq!(decimal.parse_raw("1"), Some(PartitionScalar::Decimal(100)));
+        assert_eq!(
+            decimal.parse_raw("12345678.90"),
+            Some(PartitionScalar::Decimal(1_234_567_890))
+        );
+        assert_eq!(
+            high_precision_decimal.parse_raw("1.230000000000000000"),
+            Some(PartitionScalar::Decimal(1_230_000_000_000_000_000))
+        );
+        assert_eq!(decimal.parse_raw("123456789.01"), None);
+        assert_eq!(decimal.parse_raw("1.234"), None);
+        assert_eq!(decimal.parse_raw(""), None);
+        assert_eq!(decimal.parse_raw("-"), None);
+        assert_eq!(decimal.parse_raw(".12"), None);
+        assert_eq!(decimal.parse_raw("1."), None);
+        assert_eq!(decimal.parse_raw("+1.23"), None);
+        assert_eq!(decimal.parse_raw("not-a-decimal"), None);
+        assert!(!decimal.supports_ordering());
     }
 }

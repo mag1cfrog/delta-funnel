@@ -384,6 +384,9 @@ fn convert_partition_literal(
             Expr::Literal(ScalarValue::Date32(Some(value)), _) => Ok(PartitionScalar::Date(*value)),
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
+        PartitionMetadataValueKind::Decimal { .. } => {
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        }
     }
 }
 
@@ -417,6 +420,7 @@ mod tests {
             Field::new("day", DataType::LargeUtf8, true),
             Field::new("is_current", DataType::Boolean, true),
             Field::new("event_date", DataType::Date32, true),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
         ]))
     }
 
@@ -507,6 +511,25 @@ mod tests {
         assert!(matches_scan_file(&is_not_null, &raw_false));
         assert!(matches_scan_file(&is_not_null, &raw_empty));
         assert!(matches_scan_file(&is_not_null, &invalid_boolean));
+        assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_decimal_null_checks_with_sql_metadata_semantics() {
+        let is_null = predicate_expr(&col("amount").is_null(), &["amount"]).unwrap();
+        let is_not_null = predicate_expr(&col("amount").is_not_null(), &["amount"]).unwrap();
+        let normal = values(&[("amount", "123.45")]);
+        let raw_empty = values(&[("amount", "")]);
+        let invalid_decimal = values(&[("amount", "not-a-decimal")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&is_null, &normal));
+        assert!(!matches_scan_file(&is_null, &raw_empty));
+        assert!(!matches_scan_file(&is_null, &invalid_decimal));
+        assert!(matches_scan_file(&is_null, &missing));
+        assert!(matches_scan_file(&is_not_null, &normal));
+        assert!(matches_scan_file(&is_not_null, &raw_empty));
+        assert!(matches_scan_file(&is_not_null, &invalid_decimal));
         assert!(!matches_scan_file(&is_not_null, &missing));
     }
 
