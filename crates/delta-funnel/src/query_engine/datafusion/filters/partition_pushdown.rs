@@ -15,9 +15,9 @@ use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilter
 ///
 /// A filter can be exact here only when it is partition-only and accepted by
 /// the provider metadata semantics policy. The proven exact subset includes
-/// supported logical partition column types for equality, inequality, range
-/// comparisons, `BETWEEN`, `NOT BETWEEN`, `IN`, `NOT IN`, `IS NULL`, `IS NOT
-/// NULL`, negation, and boolean composition of exact partition predicates.
+/// supported logical partition column types for operators whose literal or
+/// ordering semantics are proven. Range comparisons, `BETWEEN`, and `NOT
+/// BETWEEN` are exact only for supported types with proven ordering semantics.
 /// Additional types and operators should be added only with semantic tests. All
 /// other shapes stay `Unsupported` so DataFusion keeps them as residual filters.
 pub(super) fn plan_partition_operator_pushdown(
