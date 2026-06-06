@@ -332,7 +332,7 @@ fn signed_integer_literal_value(literal: &Expr) -> Option<i64> {
 mod tests {
     use std::sync::Arc;
 
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, col, lit};
 
@@ -348,6 +348,11 @@ mod tests {
             Field::new("amount", DataType::Decimal128(10, 2), true),
             Field::new("float_part", DataType::Float32, true),
             Field::new("double_part", DataType::Float64, true),
+            Field::new(
+                "event_ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
         ]))
     }
 
@@ -663,6 +668,65 @@ mod tests {
         assert_eq!(plan.exact_count, filters.len());
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_timestamp_null_checks_as_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_ts"]);
+        let filters = [
+            col("event_ts").is_null(),
+            col("event_ts").is_not_null(),
+            Expr::Not(Box::new(col("event_ts").is_null())),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_timestamp_literal_filters() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_ts"]);
+        let timestamp = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
+            None,
+        );
+        let low = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_000_000), Some("UTC".into())),
+            None,
+        );
+        let filters = [
+            col("event_ts").eq(timestamp.clone()),
+            col("event_ts").in_list(vec![timestamp.clone()], false),
+            col("event_ts").gt(low.clone()),
+            col("event_ts").between(low, timestamp),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
     }
 
     #[test]

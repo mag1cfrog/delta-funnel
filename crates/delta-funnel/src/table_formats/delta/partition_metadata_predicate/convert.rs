@@ -412,6 +412,9 @@ fn convert_partition_literal(
             }
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
+        PartitionMetadataValueKind::TimestampUtc => {
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        }
     }
 }
 

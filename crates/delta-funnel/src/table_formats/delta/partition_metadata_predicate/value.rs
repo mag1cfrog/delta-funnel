@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
 use chrono::{Datelike, NaiveDate};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
 const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
 
@@ -20,6 +20,7 @@ pub(super) enum PartitionMetadataValueKind {
     Decimal { precision: u8, scale: i8 },
     Float32,
     Float64,
+    TimestampUtc,
 }
 
 impl PartitionMetadataValueKind {
@@ -54,6 +55,11 @@ impl PartitionMetadataValueKind {
             }
             DataType::Float32 => Some(Self::Float32),
             DataType::Float64 => Some(Self::Float64),
+            DataType::Timestamp(TimeUnit::Microsecond, Some(timezone))
+                if timezone.as_ref() == "UTC" =>
+            {
+                Some(Self::TimestampUtc)
+            }
             _ => None,
         }
     }
@@ -70,7 +76,7 @@ impl PartitionMetadataValueKind {
             | Self::Decimal { .. }
             | Self::Float32
             | Self::Float64 => true,
-            Self::Boolean => false,
+            Self::Boolean | Self::TimestampUtc => false,
         }
     }
 
@@ -82,7 +88,7 @@ impl PartitionMetadataValueKind {
             | Self::Decimal { .. }
             | Self::Float32
             | Self::Float64 => true,
-            Self::Boolean => false,
+            Self::Boolean | Self::TimestampUtc => false,
         }
     }
 
@@ -101,6 +107,7 @@ impl PartitionMetadataValueKind {
             }
             Self::Float32 => parse_float32(raw_value).map(PartitionScalar::Float32),
             Self::Float64 => parse_float64(raw_value).map(PartitionScalar::Float64),
+            Self::TimestampUtc => None,
         }
     }
 
@@ -313,7 +320,7 @@ impl PartitionScalar {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
     use super::*;
 
@@ -392,6 +399,34 @@ mod tests {
         assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Float64),
             Some(PartitionMetadataValueKind::Float64)
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into())
+            )),
+            Some(PartitionMetadataValueKind::TimestampUtc)
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
+                TimeUnit::Millisecond,
+                Some("UTC".into())
+            )),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("America/Phoenix".into())
+            )),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                None
+            )),
+            None
         );
     }
 
