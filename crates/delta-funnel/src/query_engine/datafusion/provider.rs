@@ -387,7 +387,7 @@ impl TableProvider for DeltaTableProvider {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::{DataFusionError, ScalarValue};
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::datasource::{TableProvider, TableType};
@@ -412,6 +412,7 @@ mod tests {
     const DECIMAL_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]"#;
     const HIGH_PRECISION_DECIMAL_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(38,18)\",\"nullable\":true,\"metadata\":{}}]"#;
     const FLOATING_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"float_part\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_part\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]"#;
+    const TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -2298,6 +2299,33 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn timestamp_partition_schema_maps_delta_type_to_arrow_timestamp_microseconds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "timestamp-partition-schema",
+            TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_ts"]"#,
+            r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let schema = provider.schema();
+
+        assert_eq!(
+            schema.field_with_name("event_ts")?.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn date_partition_null_checks_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2663,6 +2691,234 @@ mod tests {
                     .to_string()
                     .contains("pushed filters must be exact partition predicates")),
                 "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timestamp_partition_filters_remain_unsupported_at_scan_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "timestamp-partition-unsupported-boundary",
+            TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_ts"]"#,
+            r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let timestamp_utc = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_123_456),
+                Some(Arc::<str>::from("UTC")),
+            ),
+            None,
+        );
+        let timestamp_null = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(None, Some(Arc::<str>::from("UTC"))),
+            None,
+        );
+        let timestamp_low = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_000_000),
+                Some(Arc::<str>::from("UTC")),
+            ),
+            None,
+        );
+        let scalar_udf = create_udf(
+            "timestamp_identity_for_pushdown_boundary",
+            vec![DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )],
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            Volatility::Immutable,
+            Arc::new(|_| {
+                Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
+                    Some(1_767_225_600_123_456),
+                    Some(Arc::<str>::from("UTC")),
+                )))
+            }),
+        );
+        let scalar_function =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![datafusion::logical_expr::col("event_ts")],
+            ));
+        let filters = vec![
+            (
+                "timestamp equality",
+                datafusion::logical_expr::col("event_ts").eq(timestamp_utc.clone()),
+            ),
+            (
+                "timestamp null check",
+                datafusion::logical_expr::col("event_ts").is_null(),
+            ),
+            (
+                "timestamp not null check",
+                datafusion::logical_expr::col("event_ts").is_not_null(),
+            ),
+            (
+                "timestamp in list",
+                datafusion::logical_expr::col("event_ts")
+                    .in_list(vec![timestamp_utc.clone()], false),
+            ),
+            (
+                "timestamp ordering",
+                datafusion::logical_expr::col("event_ts").gt(timestamp_low.clone()),
+            ),
+            (
+                "timestamp between",
+                datafusion::logical_expr::col("event_ts")
+                    .between(timestamp_low.clone(), timestamp_utc.clone()),
+            ),
+            (
+                "timestamp null literal",
+                datafusion::logical_expr::col("event_ts").eq(timestamp_null.clone()),
+            ),
+            (
+                "cast operand",
+                datafusion::logical_expr::col("event_ts").eq(datafusion::logical_expr::cast(
+                    timestamp_utc.clone(),
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                )),
+            ),
+            (
+                "scalar function operand",
+                datafusion::logical_expr::col("event_ts").eq(scalar_function),
+            ),
+            (
+                "mixed partition data equality",
+                datafusion::logical_expr::col("event_ts").eq(datafusion::logical_expr::col("id")),
+            ),
+            (
+                "and composition",
+                datafusion::logical_expr::col("event_ts")
+                    .eq(timestamp_utc)
+                    .and(datafusion::logical_expr::col("event_ts").is_not_null()),
+            ),
+        ];
+        let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_timestamp_partition_filters_keep_residual_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-timestamp-partition-residuals",
+            TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_ts"]"#,
+            &[
+                r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
+                r#""partitionValues":{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
+                r#""partitionValues":{"event_ts":null}"#,
+                r#""partitionValues":{"event_ts":""}"#,
+                r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let cases = [
+            (
+                "timestamp equality",
+                "select id from orders where event_ts = timestamp '2026-01-01 00:00:00.123456'",
+            ),
+            (
+                "timestamp null check",
+                "select id from orders where event_ts is null",
+            ),
+            (
+                "timestamp not null check",
+                "select id from orders where event_ts is not null",
+            ),
+            (
+                "timestamp ordering",
+                "select id from orders where event_ts > timestamp '2025-12-31 23:59:59.999999'",
+            ),
+            (
+                "timestamp between",
+                "select id from orders where event_ts between timestamp '2025-12-31 23:59:59.999999' and timestamp '2026-01-01 00:00:00.123456'",
+            ),
+            (
+                "timestamp in list",
+                "select id from orders where event_ts in (timestamp '2026-01-01 00:00:00.123456')",
+            ),
+        ];
+
+        for (name, sql) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
+                "{name}"
             );
         }
 
