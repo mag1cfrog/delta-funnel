@@ -2698,7 +2698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timestamp_partition_filters_remain_unsupported_at_scan_boundary()
+    async fn timestamp_partition_unsafe_filters_are_rejected_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "timestamp-partition-unsupported-boundary",
@@ -2754,13 +2754,8 @@ mod tests {
             ));
         let filters = vec![
             (
-                "timestamp equality",
-                datafusion::logical_expr::col("event_ts").eq(timestamp_utc.clone()),
-            ),
-            (
-                "timestamp in list",
-                datafusion::logical_expr::col("event_ts")
-                    .in_list(vec![timestamp_utc.clone()], false),
+                "timestamp null in list",
+                datafusion::logical_expr::col("event_ts").in_list(vec![timestamp_null], false),
             ),
             (
                 "timestamp ordering",
@@ -2773,7 +2768,10 @@ mod tests {
             ),
             (
                 "timestamp null literal",
-                datafusion::logical_expr::col("event_ts").eq(timestamp_null.clone()),
+                datafusion::logical_expr::col("event_ts").eq(Expr::Literal(
+                    ScalarValue::TimestampMicrosecond(None, Some(Arc::<str>::from("UTC"))),
+                    None,
+                )),
             ),
             (
                 "cast operand",
@@ -2821,6 +2819,115 @@ mod tests {
                     .contains("pushed filters must be exact partition predicates")),
                 "{name} should be rejected"
             );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timestamp_partition_equality_and_membership_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "timestamp-partition-equality-membership",
+            TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_ts"]"#,
+            &[
+                r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
+                r#""partitionValues":{"event_ts":"2026-01-01 00:00:00.123456"}"#,
+                r#""partitionValues":{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
+                r#""partitionValues":{"event_ts":null}"#,
+                r#""partitionValues":{"event_ts":""}"#,
+                r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let timestamp = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_123_456),
+                Some(Arc::<str>::from("UTC")),
+            ),
+            None,
+        );
+        let low = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_599_999_999),
+                Some(Arc::<str>::from("UTC")),
+            ),
+            None,
+        );
+        let cases = [
+            (
+                "timestamp equality",
+                datafusion::logical_expr::col("event_ts").eq(timestamp.clone()),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "reversed timestamp equality",
+                timestamp
+                    .clone()
+                    .eq(datafusion::logical_expr::col("event_ts")),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "timestamp inequality",
+                datafusion::logical_expr::col("event_ts").not_eq(timestamp.clone()),
+                vec!["part-00002.parquet"],
+            ),
+            (
+                "timestamp in list",
+                datafusion::logical_expr::col("event_ts").in_list(
+                    vec![timestamp.clone(), low.clone(), timestamp.clone()],
+                    false,
+                ),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                ],
+            ),
+            (
+                "timestamp not in list",
+                datafusion::logical_expr::col("event_ts").in_list(vec![timestamp], true),
+                vec!["part-00002.parquet"],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.unsupported_count,
+                0,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
@@ -2934,20 +3041,12 @@ mod tests {
 
         let cases = [
             (
-                "timestamp equality",
-                "select id from orders where event_ts = timestamp '2026-01-01 00:00:00.123456'",
-            ),
-            (
                 "timestamp ordering",
                 "select id from orders where event_ts > timestamp '2025-12-31 23:59:59.999999'",
             ),
             (
                 "timestamp between",
                 "select id from orders where event_ts between timestamp '2025-12-31 23:59:59.999999' and timestamp '2026-01-01 00:00:00.123456'",
-            ),
-            (
-                "timestamp in list",
-                "select id from orders where event_ts in (timestamp '2026-01-01 00:00:00.123456')",
             ),
         ];
 
@@ -2979,6 +3078,101 @@ mod tests {
                 scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_timestamp_partition_equality_and_membership_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-timestamp-partition-equality-membership",
+            TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_ts"]"#,
+            &[
+                r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
+                r#""partitionValues":{"event_ts":"2026-01-01 00:00:00.123456"}"#,
+                r#""partitionValues":{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
+                r#""partitionValues":{"event_ts":null}"#,
+                r#""partitionValues":{"event_ts":""}"#,
+                r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+        let cases = [
+            (
+                "timestamp equality",
+                "select id from orders where event_ts = timestamp '2026-01-01 00:00:00.123456'",
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "timestamp inequality",
+                "select id from orders where event_ts != timestamp '2026-01-01 00:00:00.123456'",
+                vec!["part-00002.parquet"],
+            ),
+            (
+                "timestamp in list",
+                "select id from orders where event_ts in (timestamp '2026-01-01 00:00:00.123456', timestamp '2025-12-31 23:59:59.999999')",
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                ],
+            ),
+            (
+                "timestamp not in list",
+                "select id from orders where event_ts not in (timestamp '2026-01-01 00:00:00.123456')",
+                vec!["part-00002.parquet"],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                1,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
         }
 
         Ok(())

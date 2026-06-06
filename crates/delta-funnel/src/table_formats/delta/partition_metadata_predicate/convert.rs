@@ -412,9 +412,14 @@ fn convert_partition_literal(
             }
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
-        PartitionMetadataValueKind::TimestampUtc => {
-            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
-        }
+        PartitionMetadataValueKind::TimestampUtc => match expr {
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(value), Some(timezone)), _)
+                if timezone.as_ref() == "UTC" =>
+            {
+                Ok(PartitionScalar::TimestampUtc(*value))
+            }
+            _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+        },
     }
 }
 
