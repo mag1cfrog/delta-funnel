@@ -309,6 +309,7 @@ fn is_supported_ordering_literal_for_column(
             | DataType::Decimal128(_, _)
             | DataType::Float32
             | DataType::Float64
+            | DataType::Timestamp(TimeUnit::Microsecond, Some(_))
     )
 }
 
@@ -700,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_accepts_timestamp_equality_and_membership() {
+    fn partition_operator_planner_accepts_timestamp_equality_membership_and_ranges() {
         let schema = schema();
         let partition_columns = partition_columns(&["event_ts"]);
         let timestamp = Expr::Literal(
@@ -716,7 +717,11 @@ mod tests {
             timestamp.clone().eq(col("event_ts")),
             col("event_ts").not_eq(timestamp.clone()),
             col("event_ts").in_list(vec![timestamp.clone(), other], false),
-            col("event_ts").in_list(vec![timestamp], true),
+            col("event_ts").in_list(vec![timestamp.clone()], true),
+            col("event_ts").gt(timestamp.clone()),
+            timestamp.clone().gt(col("event_ts")),
+            col("event_ts").between(timestamp.clone(), timestamp.clone()),
+            col("event_ts").not_between(timestamp.clone(), timestamp),
         ];
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
@@ -755,10 +760,11 @@ mod tests {
             None,
         );
         let filters = [
-            col("event_ts").eq(timestamp_without_timezone),
-            col("event_ts").eq(null_timestamp),
-            col("event_ts").gt(low.clone()),
-            col("event_ts").between(low, timestamp),
+            col("event_ts").eq(timestamp_without_timezone.clone()),
+            col("event_ts").eq(null_timestamp.clone()),
+            col("event_ts").gt(timestamp_without_timezone),
+            col("event_ts").between(low, null_timestamp),
+            col("event_ts").between(col("id"), timestamp),
         ];
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(

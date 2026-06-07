@@ -75,8 +75,9 @@ impl PartitionMetadataValueKind {
             | Self::Date
             | Self::Decimal { .. }
             | Self::Float32
-            | Self::Float64 => true,
-            Self::Boolean | Self::TimestampUtc => false,
+            | Self::Float64
+            | Self::TimestampUtc => true,
+            Self::Boolean => false,
         }
     }
 
@@ -87,8 +88,9 @@ impl PartitionMetadataValueKind {
             | Self::Date
             | Self::Decimal { .. }
             | Self::Float32
-            | Self::Float64 => true,
-            Self::Boolean | Self::TimestampUtc => false,
+            | Self::Float64
+            | Self::TimestampUtc => true,
+            Self::Boolean => false,
         }
     }
 
@@ -603,8 +605,8 @@ mod tests {
             None
         );
         assert_eq!(PartitionMetadataValueKind::TimestampUtc.parse_raw(""), None);
-        assert!(!PartitionMetadataValueKind::TimestampUtc.supports_ordering());
-        assert!(!PartitionMetadataValueKind::TimestampUtc.supports_between());
+        assert!(PartitionMetadataValueKind::TimestampUtc.supports_ordering());
+        assert!(PartitionMetadataValueKind::TimestampUtc.supports_between());
     }
 
     #[test]
