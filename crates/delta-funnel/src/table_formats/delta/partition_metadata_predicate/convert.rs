@@ -1176,6 +1176,19 @@ mod tests {
         assert!(!matches_scan_file(&lt, &raw_empty));
         assert!(!matches_scan_file(&lt, &invalid_timestamp));
         assert!(!matches_scan_file(&lt, &missing));
+        assert_eq!(
+            predicate_expr(
+                &col("event_ts").eq(Expr::Literal(
+                    ScalarValue::TimestampMicrosecond(
+                        Some(1_767_225_600_123_456),
+                        Some(Arc::<str>::from("America/Phoenix")),
+                    ),
+                    None,
+                )),
+                &["event_ts"],
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
     }
 
     #[test]

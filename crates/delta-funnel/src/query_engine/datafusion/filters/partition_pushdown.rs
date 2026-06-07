@@ -755,14 +755,23 @@ mod tests {
             ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), None),
             None,
         );
+        let timestamp_non_utc_timezone = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_123_456),
+                Some("America/Phoenix".into()),
+            ),
+            None,
+        );
         let null_timestamp = Expr::Literal(
             ScalarValue::TimestampMicrosecond(None, Some("UTC".into())),
             None,
         );
         let filters = [
             col("event_ts").eq(timestamp_without_timezone.clone()),
+            col("event_ts").eq(timestamp_non_utc_timezone.clone()),
             col("event_ts").eq(null_timestamp.clone()),
             col("event_ts").gt(timestamp_without_timezone),
+            col("event_ts").gt(timestamp_non_utc_timezone),
             col("event_ts").between(low, null_timestamp),
             col("event_ts").between(col("id"), timestamp),
         ];

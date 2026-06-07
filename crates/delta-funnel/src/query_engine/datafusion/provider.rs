@@ -2721,6 +2721,13 @@ mod tests {
             ),
             None,
         );
+        let timestamp_non_utc_timezone = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_123_456),
+                Some(Arc::<str>::from("America/Phoenix")),
+            ),
+            None,
+        );
         let timestamp_null = Expr::Literal(
             ScalarValue::TimestampMicrosecond(None, Some(Arc::<str>::from("UTC"))),
             None,
@@ -2749,6 +2756,10 @@ mod tests {
             (
                 "timestamp null in list",
                 datafusion::logical_expr::col("event_ts").in_list(vec![timestamp_null], false),
+            ),
+            (
+                "timestamp non utc timezone literal",
+                datafusion::logical_expr::col("event_ts").eq(timestamp_non_utc_timezone),
             ),
             (
                 "timestamp null literal",
