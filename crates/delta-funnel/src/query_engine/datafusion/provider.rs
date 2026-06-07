@@ -413,6 +413,7 @@ mod tests {
     const HIGH_PRECISION_DECIMAL_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(38,18)\",\"nullable\":true,\"metadata\":{}}]"#;
     const FLOATING_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"float_part\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_part\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]"#;
     const TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]"#;
+    const BINARY_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -2326,6 +2327,33 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn binary_partition_schema_maps_delta_type_to_arrow_binary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "binary-partition-schema",
+            BINARY_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["payload"]"#,
+            r#""partitionValues":{"payload":"hello"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let schema = provider.schema();
+
+        assert_eq!(
+            schema.field_with_name("payload")?.data_type(),
+            &DataType::Binary
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn date_partition_null_checks_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2782,6 +2810,132 @@ mod tests {
             (
                 "mixed partition data equality",
                 datafusion::logical_expr::col("event_ts").eq(datafusion::logical_expr::col("id")),
+            ),
+        ];
+        let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binary_partition_filters_are_rejected_at_scan_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "binary-partition-unsupported-boundary",
+            BINARY_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["payload"]"#,
+            r#""partitionValues":{"payload":"hello"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let payload = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+        let payload_null = Expr::Literal(ScalarValue::Binary(None), None);
+        let scalar_udf = create_udf(
+            "binary_identity_for_pushdown_boundary",
+            vec![DataType::Binary],
+            DataType::Binary,
+            Volatility::Immutable,
+            Arc::new(|_| {
+                Ok(ColumnarValue::Scalar(ScalarValue::Binary(Some(
+                    b"hello".to_vec(),
+                ))))
+            }),
+        );
+        let scalar_function =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![datafusion::logical_expr::col("payload")],
+            ));
+        let filters = vec![
+            (
+                "binary equality",
+                datafusion::logical_expr::col("payload").eq(payload.clone()),
+            ),
+            (
+                "binary reversed equality",
+                payload.clone().eq(datafusion::logical_expr::col("payload")),
+            ),
+            (
+                "binary inequality",
+                datafusion::logical_expr::col("payload").not_eq(payload.clone()),
+            ),
+            (
+                "binary in list",
+                datafusion::logical_expr::col("payload")
+                    .in_list(vec![payload.clone(), payload.clone()], false),
+            ),
+            (
+                "binary not in list",
+                datafusion::logical_expr::col("payload").in_list(vec![payload.clone()], true),
+            ),
+            (
+                "binary null check",
+                datafusion::logical_expr::col("payload").is_null(),
+            ),
+            (
+                "binary not null check",
+                datafusion::logical_expr::col("payload").is_not_null(),
+            ),
+            (
+                "binary ordering",
+                datafusion::logical_expr::col("payload").gt(payload.clone()),
+            ),
+            (
+                "binary between",
+                datafusion::logical_expr::col("payload").between(payload.clone(), payload.clone()),
+            ),
+            (
+                "binary null literal",
+                datafusion::logical_expr::col("payload").eq(payload_null),
+            ),
+            (
+                "string literal",
+                datafusion::logical_expr::col("payload").eq(datafusion::logical_expr::lit("hello")),
+            ),
+            (
+                "cast operand",
+                datafusion::logical_expr::col("payload").eq(datafusion::logical_expr::cast(
+                    payload.clone(),
+                    DataType::Binary,
+                )),
+            ),
+            (
+                "scalar function operand",
+                datafusion::logical_expr::col("payload").eq(scalar_function),
+            ),
+            (
+                "mixed partition data equality",
+                datafusion::logical_expr::col("payload").eq(datafusion::logical_expr::col("id")),
             ),
         ];
         let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();

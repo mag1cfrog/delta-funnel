@@ -358,6 +358,7 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 true,
             ),
+            Field::new("payload", DataType::Binary, true),
         ]))
     }
 
@@ -1501,6 +1502,43 @@ mod tests {
             partition_in.clone().or(col("ghost").eq(lit("x"))),
             partition_in.or(col("profile.age").eq(lit(1_i64))),
             exact_partition_or.and(col("id").gt(lit(1_i64))),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| decision.residual));
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_binary_filters_until_encoding_is_promoted() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["payload"]);
+        let payload = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+        let filters = [
+            col("payload").eq(payload.clone()),
+            payload.clone().eq(col("payload")),
+            col("payload").not_eq(payload.clone()),
+            col("payload").in_list(vec![payload.clone(), payload.clone()], false),
+            col("payload").in_list(vec![payload.clone()], true),
+            col("payload").is_null(),
+            col("payload").is_not_null(),
+            col("payload").gt(payload.clone()),
+            col("payload").between(payload.clone(), payload.clone()),
+            col("payload").eq(Expr::Literal(ScalarValue::Binary(None), None)),
+            col("payload").eq(lit("hello")),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
