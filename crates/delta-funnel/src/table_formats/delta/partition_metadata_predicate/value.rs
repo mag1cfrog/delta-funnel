@@ -21,6 +21,7 @@ pub(super) enum PartitionMetadataValueKind {
     Float32,
     Float64,
     TimestampUtc,
+    Binary,
 }
 
 impl PartitionMetadataValueKind {
@@ -60,6 +61,7 @@ impl PartitionMetadataValueKind {
             {
                 Some(Self::TimestampUtc)
             }
+            DataType::Binary => Some(Self::Binary),
             _ => None,
         }
     }
@@ -77,7 +79,7 @@ impl PartitionMetadataValueKind {
             | Self::Float32
             | Self::Float64
             | Self::TimestampUtc => true,
-            Self::Boolean => false,
+            Self::Boolean | Self::Binary => false,
         }
     }
 
@@ -90,7 +92,7 @@ impl PartitionMetadataValueKind {
             | Self::Float32
             | Self::Float64
             | Self::TimestampUtc => true,
-            Self::Boolean => false,
+            Self::Boolean | Self::Binary => false,
         }
     }
 
@@ -112,6 +114,7 @@ impl PartitionMetadataValueKind {
             Self::TimestampUtc => {
                 parse_delta_timestamp_utc(raw_value).map(PartitionScalar::TimestampUtc)
             }
+            Self::Binary => None,
         }
     }
 
@@ -440,6 +443,10 @@ mod tests {
             Some(PartitionMetadataValueKind::TimestampUtc)
         );
         assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Binary),
+            Some(PartitionMetadataValueKind::Binary)
+        );
+        assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
                 TimeUnit::Millisecond,
                 Some("UTC".into())
@@ -607,6 +614,14 @@ mod tests {
         assert_eq!(PartitionMetadataValueKind::TimestampUtc.parse_raw(""), None);
         assert!(PartitionMetadataValueKind::TimestampUtc.supports_ordering());
         assert!(PartitionMetadataValueKind::TimestampUtc.supports_between());
+    }
+
+    #[test]
+    fn binary_value_kind_is_promoted_only_for_null_checks() {
+        assert_eq!(PartitionMetadataValueKind::Binary.parse_raw("hello"), None);
+        assert_eq!(PartitionMetadataValueKind::Binary.parse_raw(""), None);
+        assert!(!PartitionMetadataValueKind::Binary.supports_ordering());
+        assert!(!PartitionMetadataValueKind::Binary.supports_between());
     }
 
     #[test]

@@ -420,6 +420,9 @@ fn convert_partition_literal(
             }
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
+        PartitionMetadataValueKind::Binary => {
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        }
     }
 }
 
@@ -461,6 +464,7 @@ mod tests {
             Field::new("amount", DataType::Decimal128(10, 2), true),
             Field::new("float_part", DataType::Float32, true),
             Field::new("double_part", DataType::Float64, true),
+            Field::new("payload", DataType::Binary, true),
         ]))
     }
 
@@ -577,6 +581,22 @@ mod tests {
         assert!(matches_scan_file(&is_not_null, &normal));
         assert!(matches_scan_file(&is_not_null, &raw_empty));
         assert!(matches_scan_file(&is_not_null, &invalid_decimal));
+        assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_binary_null_checks_with_sql_metadata_semantics() {
+        let is_null = predicate_expr(&col("payload").is_null(), &["payload"]).unwrap();
+        let is_not_null = predicate_expr(&col("payload").is_not_null(), &["payload"]).unwrap();
+        let normal = values(&[("payload", "hello")]);
+        let raw_empty = values(&[("payload", "")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&is_null, &normal));
+        assert!(!matches_scan_file(&is_null, &raw_empty));
+        assert!(matches_scan_file(&is_null, &missing));
+        assert!(matches_scan_file(&is_not_null, &normal));
+        assert!(matches_scan_file(&is_not_null, &raw_empty));
         assert!(!matches_scan_file(&is_not_null, &missing));
     }
 

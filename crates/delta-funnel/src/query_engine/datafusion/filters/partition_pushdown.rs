@@ -702,6 +702,31 @@ mod tests {
     }
 
     #[test]
+    fn partition_operator_planner_accepts_binary_null_checks_as_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["payload"]);
+        let filters = [
+            col("payload").is_null(),
+            col("payload").is_not_null(),
+            Expr::Not(Box::new(col("payload").is_null())),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
     fn partition_operator_planner_accepts_timestamp_equality_membership_and_ranges() {
         let schema = schema();
         let partition_columns = partition_columns(&["event_ts"]);
@@ -1523,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_rejects_binary_filters_until_encoding_is_promoted() {
+    fn partition_operator_planner_rejects_binary_literal_filters_until_encoding_is_promoted() {
         let schema = schema();
         let partition_columns = partition_columns(&["payload"]);
         let payload = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
@@ -1533,8 +1558,6 @@ mod tests {
             col("payload").not_eq(payload.clone()),
             col("payload").in_list(vec![payload.clone(), payload.clone()], false),
             col("payload").in_list(vec![payload.clone()], true),
-            col("payload").is_null(),
-            col("payload").is_not_null(),
             col("payload").gt(payload.clone()),
             col("payload").between(payload.clone(), payload.clone()),
             col("payload").eq(Expr::Literal(ScalarValue::Binary(None), None)),

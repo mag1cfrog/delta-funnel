@@ -124,12 +124,12 @@ mod tests {
             DataType::Float32,
             DataType::Float64,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Binary,
         ];
         let unsupported = [
             DataType::Decimal128(10, -1),
             DataType::Decimal128(10, 11),
             DataType::Decimal128(39, 2),
-            DataType::Binary,
             DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
             DataType::Timestamp(TimeUnit::Microsecond, Some("America/Phoenix".into())),
             DataType::Timestamp(TimeUnit::Microsecond, None),
