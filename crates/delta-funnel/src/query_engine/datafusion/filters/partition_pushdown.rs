@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::{Expr, Operator};
 
@@ -274,6 +274,10 @@ fn is_supported_partition_literal_for_column(
         (DataType::Float64, Expr::Literal(ScalarValue::Float64(Some(value)), _)) => {
             value.is_finite()
         }
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, Some(column_timezone)),
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(_), Some(literal_timezone)), _),
+        ) if column_timezone.as_ref() == "UTC" && literal_timezone.as_ref() == "UTC" => true,
         (data_type, literal) => signed_integer_bounds(data_type)
             .zip(signed_integer_literal_value(literal))
             .is_some_and(|((min, max), value)| min <= value && value <= max),
@@ -305,6 +309,7 @@ fn is_supported_ordering_literal_for_column(
             | DataType::Decimal128(_, _)
             | DataType::Float32
             | DataType::Float64
+            | DataType::Timestamp(TimeUnit::Microsecond, Some(_))
     )
 }
 
@@ -332,7 +337,7 @@ fn signed_integer_literal_value(literal: &Expr) -> Option<i64> {
 mod tests {
     use std::sync::Arc;
 
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, col, lit};
 
@@ -348,6 +353,11 @@ mod tests {
             Field::new("amount", DataType::Decimal128(10, 2), true),
             Field::new("float_part", DataType::Float32, true),
             Field::new("double_part", DataType::Float64, true),
+            Field::new(
+                "event_ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
         ]))
     }
 
@@ -663,6 +673,122 @@ mod tests {
         assert_eq!(plan.exact_count, filters.len());
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_timestamp_null_checks_as_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_ts"]);
+        let filters = [
+            col("event_ts").is_null(),
+            col("event_ts").is_not_null(),
+            Expr::Not(Box::new(col("event_ts").is_null())),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_timestamp_equality_membership_and_ranges() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_ts"]);
+        let timestamp = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
+            None,
+        );
+        let other = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_000_000), Some("UTC".into())),
+            None,
+        );
+        let filters = [
+            col("event_ts").eq(timestamp.clone()),
+            timestamp.clone().eq(col("event_ts")),
+            col("event_ts").not_eq(timestamp.clone()),
+            col("event_ts").in_list(vec![timestamp.clone(), other], false),
+            col("event_ts").in_list(vec![timestamp.clone()], true),
+            col("event_ts").gt(timestamp.clone()),
+            timestamp.clone().gt(col("event_ts")),
+            col("event_ts").between(timestamp.clone(), timestamp.clone()),
+            col("event_ts").not_between(timestamp.clone(), timestamp),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_unproven_timestamp_literal_filters() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_ts"]);
+        let timestamp = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
+            None,
+        );
+        let low = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_000_000), Some("UTC".into())),
+            None,
+        );
+        let timestamp_without_timezone = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), None),
+            None,
+        );
+        let timestamp_non_utc_timezone = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_123_456),
+                Some("America/Phoenix".into()),
+            ),
+            None,
+        );
+        let null_timestamp = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(None, Some("UTC".into())),
+            None,
+        );
+        let filters = [
+            col("event_ts").eq(timestamp_without_timezone.clone()),
+            col("event_ts").eq(timestamp_non_utc_timezone.clone()),
+            col("event_ts").eq(null_timestamp.clone()),
+            col("event_ts").gt(timestamp_without_timezone),
+            col("event_ts").gt(timestamp_non_utc_timezone),
+            col("event_ts").between(low, null_timestamp),
+            col("event_ts").between(col("id"), timestamp),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
     }
 
     #[test]

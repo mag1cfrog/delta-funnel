@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
-use chrono::{Datelike, NaiveDate};
-use datafusion::arrow::datatypes::DataType;
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime};
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
 const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
 
@@ -20,6 +20,7 @@ pub(super) enum PartitionMetadataValueKind {
     Decimal { precision: u8, scale: i8 },
     Float32,
     Float64,
+    TimestampUtc,
 }
 
 impl PartitionMetadataValueKind {
@@ -54,6 +55,11 @@ impl PartitionMetadataValueKind {
             }
             DataType::Float32 => Some(Self::Float32),
             DataType::Float64 => Some(Self::Float64),
+            DataType::Timestamp(TimeUnit::Microsecond, Some(timezone))
+                if timezone.as_ref() == "UTC" =>
+            {
+                Some(Self::TimestampUtc)
+            }
             _ => None,
         }
     }
@@ -69,7 +75,8 @@ impl PartitionMetadataValueKind {
             | Self::Date
             | Self::Decimal { .. }
             | Self::Float32
-            | Self::Float64 => true,
+            | Self::Float64
+            | Self::TimestampUtc => true,
             Self::Boolean => false,
         }
     }
@@ -81,7 +88,8 @@ impl PartitionMetadataValueKind {
             | Self::Date
             | Self::Decimal { .. }
             | Self::Float32
-            | Self::Float64 => true,
+            | Self::Float64
+            | Self::TimestampUtc => true,
             Self::Boolean => false,
         }
     }
@@ -101,6 +109,9 @@ impl PartitionMetadataValueKind {
             }
             Self::Float32 => parse_float32(raw_value).map(PartitionScalar::Float32),
             Self::Float64 => parse_float64(raw_value).map(PartitionScalar::Float64),
+            Self::TimestampUtc => {
+                parse_delta_timestamp_utc(raw_value).map(PartitionScalar::TimestampUtc)
+            }
         }
     }
 
@@ -138,6 +149,32 @@ fn parse_delta_date(raw_value: &str) -> Option<i32> {
     NaiveDate::parse_from_str(raw_value, "%Y-%m-%d")
         .ok()
         .map(|date| date.num_days_from_ce() - UNIX_EPOCH_DAYS_FROM_CE)
+}
+
+fn parse_delta_timestamp_utc(raw_value: &str) -> Option<i64> {
+    if raw_value.contains('T') {
+        let timestamp = DateTime::parse_from_rfc3339(raw_value).ok()?;
+        if timestamp.offset().local_minus_utc() != 0 {
+            return None;
+        }
+        microsecond_exact_timestamp(timestamp.timestamp(), timestamp.timestamp_subsec_nanos())
+    } else {
+        let timestamp = NaiveDateTime::parse_from_str(raw_value, "%Y-%m-%d %H:%M:%S%.f").ok()?;
+        microsecond_exact_timestamp(
+            timestamp.and_utc().timestamp(),
+            timestamp.and_utc().timestamp_subsec_nanos(),
+        )
+    }
+}
+
+fn microsecond_exact_timestamp(seconds: i64, nanos: u32) -> Option<i64> {
+    if !nanos.is_multiple_of(1_000) {
+        return None;
+    }
+
+    seconds
+        .checked_mul(1_000_000)?
+        .checked_add(i64::from(nanos / 1_000))
 }
 
 fn parse_delta_decimal(raw_value: &str, precision: u8, scale: i8) -> Option<i128> {
@@ -291,6 +328,7 @@ pub(super) enum PartitionScalar {
     Decimal(i128),
     Float32(u32),
     Float64(u64),
+    TimestampUtc(i64),
 }
 
 impl PartitionScalar {
@@ -306,6 +344,7 @@ impl PartitionScalar {
             (Self::Float64(left), Self::Float64(right)) => {
                 Some(f64::from_bits(*left).total_cmp(&f64::from_bits(*right)))
             }
+            (Self::TimestampUtc(left), Self::TimestampUtc(right)) => Some(left.cmp(right)),
             _ => None,
         }
     }
@@ -313,7 +352,7 @@ impl PartitionScalar {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
     use super::*;
 
@@ -392,6 +431,34 @@ mod tests {
         assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Float64),
             Some(PartitionMetadataValueKind::Float64)
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into())
+            )),
+            Some(PartitionMetadataValueKind::TimestampUtc)
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
+                TimeUnit::Millisecond,
+                Some("UTC".into())
+            )),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("America/Phoenix".into())
+            )),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                None
+            )),
+            None
         );
     }
 
@@ -497,6 +564,49 @@ mod tests {
             None
         );
         assert!(PartitionMetadataValueKind::Date.supports_ordering());
+    }
+
+    #[test]
+    fn timestamp_value_kind_parses_utc_metadata_text_to_microseconds() {
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampUtc.parse_raw("1970-01-01T00:00:00Z"),
+            Some(PartitionScalar::TimestampUtc(0))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampUtc.parse_raw("2026-01-01T00:00:00.123456Z"),
+            Some(PartitionScalar::TimestampUtc(1_767_225_600_123_456))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampUtc.parse_raw("2026-01-01 00:00:00.123456"),
+            Some(PartitionScalar::TimestampUtc(1_767_225_600_123_456))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampUtc.parse_raw("1969-12-31 23:59:59.999999"),
+            Some(PartitionScalar::TimestampUtc(-1))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampUtc.parse_raw("2026-01-01T00:00:00+00:00"),
+            Some(PartitionScalar::TimestampUtc(1_767_225_600_000_000))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampUtc.parse_raw("2026-01-01T00:00:00+01:00"),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampUtc.parse_raw("2026-01-01T00:00:00.123456789Z"),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampUtc.parse_raw("2026-01-01 00:00:00.123456789"),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampUtc.parse_raw("2026-01-01"),
+            None
+        );
+        assert_eq!(PartitionMetadataValueKind::TimestampUtc.parse_raw(""), None);
+        assert!(PartitionMetadataValueKind::TimestampUtc.supports_ordering());
+        assert!(PartitionMetadataValueKind::TimestampUtc.supports_between());
     }
 
     #[test]

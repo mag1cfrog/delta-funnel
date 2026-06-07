@@ -412,6 +412,14 @@ fn convert_partition_literal(
             }
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
+        PartitionMetadataValueKind::TimestampUtc => match expr {
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(value), Some(timezone)), _)
+                if timezone.as_ref() == "UTC" =>
+            {
+                Ok(PartitionScalar::TimestampUtc(*value))
+            }
+            _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+        },
     }
 }
 
@@ -430,7 +438,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::{col, lit};
 
@@ -445,6 +453,11 @@ mod tests {
             Field::new("day", DataType::LargeUtf8, true),
             Field::new("is_current", DataType::Boolean, true),
             Field::new("event_date", DataType::Date32, true),
+            Field::new(
+                "event_ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
             Field::new("amount", DataType::Decimal128(10, 2), true),
             Field::new("float_part", DataType::Float32, true),
             Field::new("double_part", DataType::Float64, true),
@@ -464,6 +477,13 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    fn timestamp_utc_micros(value: i64) -> Expr {
+        Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(value), Some(Arc::<str>::from("UTC"))),
+            None,
+        )
     }
 
     fn predicate_expr(
@@ -1122,6 +1142,106 @@ mod tests {
         assert!(!matches_scan_file(
             &contradictory_not_between,
             &invalid_date
+        ));
+        assert!(!matches_scan_file(&contradictory_not_between, &missing));
+    }
+
+    #[test]
+    fn converts_timestamp_comparisons_with_typed_ordering_semantics() {
+        let target = timestamp_utc_micros(1_767_225_600_123_456);
+        let low = timestamp_utc_micros(1_767_225_599_999_999);
+        let high = timestamp_utc_micros(1_767_225_600_123_457);
+        let lt = predicate_expr(&col("event_ts").lt(target.clone()), &["event_ts"]).unwrap();
+        let lt_eq = predicate_expr(&col("event_ts").lt_eq(low.clone()), &["event_ts"]).unwrap();
+        let gt = predicate_expr(&col("event_ts").gt(low), &["event_ts"]).unwrap();
+        let gt_eq = predicate_expr(&col("event_ts").gt_eq(target.clone()), &["event_ts"]).unwrap();
+        let reversed = predicate_expr(&high.gt(col("event_ts")), &["event_ts"]).unwrap();
+        let raw_target = values(&[("event_ts", "2026-01-01T00:00:00.123456Z")]);
+        let raw_target_space = values(&[("event_ts", "2026-01-01 00:00:00.123456")]);
+        let raw_low = values(&[("event_ts", "2025-12-31T23:59:59.999999Z")]);
+        let raw_empty = values(&[("event_ts", "")]);
+        let invalid_timestamp = values(&[("event_ts", "not-a-timestamp")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&lt, &raw_target));
+        assert!(matches_scan_file(&lt, &raw_low));
+        assert!(matches_scan_file(&lt_eq, &raw_low));
+        assert!(!matches_scan_file(&lt_eq, &raw_target));
+        assert!(matches_scan_file(&gt, &raw_target));
+        assert!(matches_scan_file(&gt, &raw_target_space));
+        assert!(!matches_scan_file(&gt, &raw_low));
+        assert!(matches_scan_file(&gt_eq, &raw_target));
+        assert!(!matches_scan_file(&gt_eq, &raw_low));
+        assert!(matches_scan_file(&reversed, &raw_target));
+        assert!(!matches_scan_file(&lt, &raw_empty));
+        assert!(!matches_scan_file(&lt, &invalid_timestamp));
+        assert!(!matches_scan_file(&lt, &missing));
+        assert_eq!(
+            predicate_expr(
+                &col("event_ts").eq(Expr::Literal(
+                    ScalarValue::TimestampMicrosecond(
+                        Some(1_767_225_600_123_456),
+                        Some(Arc::<str>::from("America/Phoenix")),
+                    ),
+                    None,
+                )),
+                &["event_ts"],
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+    }
+
+    #[test]
+    fn converts_timestamp_between_with_inclusive_and_negated_semantics() {
+        let target = timestamp_utc_micros(1_767_225_600_123_456);
+        let low = timestamp_utc_micros(1_767_225_599_999_999);
+        let high = timestamp_utc_micros(1_767_225_600_123_457);
+        let between = predicate_expr(
+            &col("event_ts").between(low.clone(), target.clone()),
+            &["event_ts"],
+        )
+        .unwrap();
+        let not_between = predicate_expr(
+            &col("event_ts").not_between(low.clone(), target.clone()),
+            &["event_ts"],
+        )
+        .unwrap();
+        let contradictory_between = predicate_expr(
+            &col("event_ts").between(high.clone(), low.clone()),
+            &["event_ts"],
+        )
+        .unwrap();
+        let contradictory_not_between =
+            predicate_expr(&col("event_ts").not_between(high, low), &["event_ts"]).unwrap();
+        let raw_target = values(&[("event_ts", "2026-01-01T00:00:00.123456Z")]);
+        let raw_low = values(&[("event_ts", "2025-12-31T23:59:59.999999Z")]);
+        let raw_high = values(&[("event_ts", "2026-01-01T00:00:00.123457Z")]);
+        let raw_empty = values(&[("event_ts", "")]);
+        let invalid_timestamp = values(&[("event_ts", "not-a-timestamp")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&between, &raw_target));
+        assert!(matches_scan_file(&between, &raw_low));
+        assert!(!matches_scan_file(&between, &raw_high));
+        assert!(!matches_scan_file(&between, &raw_empty));
+        assert!(!matches_scan_file(&between, &invalid_timestamp));
+        assert!(!matches_scan_file(&between, &missing));
+        assert!(!matches_scan_file(&not_between, &raw_target));
+        assert!(!matches_scan_file(&not_between, &raw_low));
+        assert!(matches_scan_file(&not_between, &raw_high));
+        assert!(!matches_scan_file(&not_between, &raw_empty));
+        assert!(!matches_scan_file(&not_between, &invalid_timestamp));
+        assert!(!matches_scan_file(&not_between, &missing));
+        assert!(!matches_scan_file(&contradictory_between, &raw_target));
+        assert!(!matches_scan_file(&contradictory_between, &raw_low));
+        assert!(!matches_scan_file(&contradictory_between, &raw_high));
+        assert!(matches_scan_file(&contradictory_not_between, &raw_target));
+        assert!(matches_scan_file(&contradictory_not_between, &raw_low));
+        assert!(matches_scan_file(&contradictory_not_between, &raw_high));
+        assert!(!matches_scan_file(&contradictory_not_between, &raw_empty));
+        assert!(!matches_scan_file(
+            &contradictory_not_between,
+            &invalid_timestamp
         ));
         assert!(!matches_scan_file(&contradictory_not_between, &missing));
     }
