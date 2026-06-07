@@ -274,6 +274,7 @@ fn is_supported_partition_literal_for_column(
         (DataType::Float64, Expr::Literal(ScalarValue::Float64(Some(value)), _)) => {
             value.is_finite()
         }
+        (DataType::Binary, Expr::Literal(ScalarValue::Binary(Some(value)), _)) => !value.is_empty(),
         (
             DataType::Timestamp(TimeUnit::Microsecond, Some(column_timezone)),
             Expr::Literal(ScalarValue::TimestampMicrosecond(Some(_), Some(literal_timezone)), _),
@@ -709,6 +710,35 @@ mod tests {
             col("payload").is_null(),
             col("payload").is_not_null(),
             Expr::Not(Box::new(col("payload").is_null())),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_binary_equality_and_membership() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["payload"]);
+        let payload = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+        let other = Expr::Literal(ScalarValue::Binary(Some(b"/=%".to_vec())), None);
+        let filters = [
+            col("payload").eq(payload.clone()),
+            payload.clone().eq(col("payload")),
+            col("payload").not_eq(payload.clone()),
+            col("payload").in_list(vec![payload.clone(), other, payload.clone()], false),
+            col("payload").in_list(vec![payload], true),
         ];
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
@@ -1548,19 +1578,22 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_rejects_binary_literal_filters_until_encoding_is_promoted() {
+    fn partition_operator_planner_rejects_unproven_binary_literal_filters() {
         let schema = schema();
         let partition_columns = partition_columns(&["payload"]);
         let payload = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
         let filters = [
-            col("payload").eq(payload.clone()),
-            payload.clone().eq(col("payload")),
-            col("payload").not_eq(payload.clone()),
-            col("payload").in_list(vec![payload.clone(), payload.clone()], false),
-            col("payload").in_list(vec![payload.clone()], true),
             col("payload").gt(payload.clone()),
             col("payload").between(payload.clone(), payload.clone()),
+            col("payload").in_list(
+                vec![
+                    payload.clone(),
+                    Expr::Literal(ScalarValue::Binary(Some(Vec::new())), None),
+                ],
+                false,
+            ),
             col("payload").eq(Expr::Literal(ScalarValue::Binary(None), None)),
+            col("payload").eq(Expr::Literal(ScalarValue::Binary(Some(Vec::new())), None)),
             col("payload").eq(lit("hello")),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();

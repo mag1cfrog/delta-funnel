@@ -114,7 +114,8 @@ impl PartitionMetadataValueKind {
             Self::TimestampUtc => {
                 parse_delta_timestamp_utc(raw_value).map(PartitionScalar::TimestampUtc)
             }
-            Self::Binary => None,
+            Self::Binary => (!raw_value.is_empty())
+                .then(|| PartitionScalar::Binary(raw_value.as_bytes().to_vec())),
         }
     }
 
@@ -332,6 +333,7 @@ pub(super) enum PartitionScalar {
     Float32(u32),
     Float64(u64),
     TimestampUtc(i64),
+    Binary(Vec<u8>),
 }
 
 impl PartitionScalar {
@@ -617,8 +619,15 @@ mod tests {
     }
 
     #[test]
-    fn binary_value_kind_is_promoted_only_for_null_checks() {
-        assert_eq!(PartitionMetadataValueKind::Binary.parse_raw("hello"), None);
+    fn binary_value_kind_parses_utf8_delta_metadata_text_to_bytes() {
+        assert_eq!(
+            PartitionMetadataValueKind::Binary.parse_raw("hello"),
+            Some(PartitionScalar::Binary(b"hello".to_vec()))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::Binary.parse_raw("/=%"),
+            Some(PartitionScalar::Binary(b"/=%".to_vec()))
+        );
         assert_eq!(PartitionMetadataValueKind::Binary.parse_raw(""), None);
         assert!(!PartitionMetadataValueKind::Binary.supports_ordering());
         assert!(!PartitionMetadataValueKind::Binary.supports_between());
