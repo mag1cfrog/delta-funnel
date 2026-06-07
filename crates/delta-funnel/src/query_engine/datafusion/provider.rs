@@ -3068,6 +3068,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timestamp_partition_boolean_composition_and_projection_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "timestamp-partition-boolean-composition",
+            TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_ts"]"#,
+            &[
+                r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
+                r#""partitionValues":{"event_ts":"2026-01-01 00:00:00.123456"}"#,
+                r#""partitionValues":{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
+                r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123457Z"}"#,
+                r#""partitionValues":{"event_ts":null}"#,
+                r#""partitionValues":{"event_ts":""}"#,
+                r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let target = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_123_456),
+                Some(Arc::<str>::from("UTC")),
+            ),
+            None,
+        );
+        let low = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_599_999_999),
+                Some(Arc::<str>::from("UTC")),
+            ),
+            None,
+        );
+        let high = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_123_457),
+                Some(Arc::<str>::from("UTC")),
+            ),
+            None,
+        );
+        let separate_and_filters = vec![
+            datafusion::logical_expr::col("event_ts").gt_eq(low.clone()),
+            datafusion::logical_expr::col("event_ts").lt(high.clone()),
+        ];
+        let whole_and_filter = datafusion::logical_expr::col("event_ts")
+            .gt_eq(low.clone())
+            .and(datafusion::logical_expr::col("event_ts").lt(high.clone()));
+        let whole_or_filter = datafusion::logical_expr::col("event_ts")
+            .eq(target.clone())
+            .or(datafusion::logical_expr::col("event_ts").eq(high.clone()));
+        let whole_not_filter = Expr::Not(Box::new(
+            datafusion::logical_expr::col("event_ts").eq(target),
+        ));
+        let cases = [
+            (
+                "separate filters combine with and",
+                separate_and_filters,
+                2,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                ],
+            ),
+            (
+                "whole and",
+                vec![whole_and_filter],
+                1,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                ],
+            ),
+            (
+                "whole or",
+                vec![whole_or_filter],
+                1,
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "whole not",
+                vec![whole_not_filter],
+                1,
+                vec!["part-00002.parquet", "part-00003.parquet"],
+            ),
+        ];
+
+        for (name, filters, expected_exact_count, expected_paths) in cases {
+            let filter_refs = filters.iter().collect::<Vec<_>>();
+            let support = provider.supports_filters_pushdown(&filter_refs)?;
+            assert_eq!(
+                support,
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().projected_schema.field(0).name(),
+                "id",
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn timestamp_partition_null_checks_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
