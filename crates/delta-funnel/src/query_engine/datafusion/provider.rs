@@ -413,6 +413,7 @@ mod tests {
     const HIGH_PRECISION_DECIMAL_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(38,18)\",\"nullable\":true,\"metadata\":{}}]"#;
     const FLOATING_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"float_part\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_part\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]"#;
     const TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]"#;
+    const BINARY_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -2326,6 +2327,33 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn binary_partition_schema_maps_delta_type_to_arrow_binary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "binary-partition-schema",
+            BINARY_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["payload"]"#,
+            r#""partitionValues":{"payload":"hello"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let schema = provider.schema();
+
+        assert_eq!(
+            schema.field_with_name("payload")?.data_type(),
+            &DataType::Binary
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn date_partition_null_checks_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2782,6 +2810,399 @@ mod tests {
             (
                 "mixed partition data equality",
                 datafusion::logical_expr::col("event_ts").eq(datafusion::logical_expr::col("id")),
+            ),
+        ];
+        let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
+
+        let support = provider.supports_filters_pushdown(&filter_refs)?;
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+
+        for (name, filter) in filters {
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binary_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "binary-partition-null-checks",
+            BINARY_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["payload"]"#,
+            &[
+                r#""partitionValues":{"payload":"hello"}"#,
+                r#""partitionValues":{"payload":"world"}"#,
+                r#""partitionValues":{"payload":null}"#,
+                r#""partitionValues":{"payload":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "is null",
+                datafusion::logical_expr::col("payload").is_null(),
+                vec!["part-00002.parquet", "part-00004.parquet"],
+            ),
+            (
+                "is not null",
+                datafusion::logical_expr::col("payload").is_not_null(),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.unsupported_count,
+                0,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binary_partition_equality_and_membership_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "binary-partition-equality-membership",
+            BINARY_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["payload"]"#,
+            &[
+                r#""partitionValues":{"payload":"hello"}"#,
+                r#""partitionValues":{"payload":"world"}"#,
+                r#""partitionValues":{"payload":"/=%"}"#,
+                r#""partitionValues":{"payload":null}"#,
+                r#""partitionValues":{"payload":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let hello = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+        let world = Expr::Literal(ScalarValue::Binary(Some(b"world".to_vec())), None);
+        let slash_equals_percent = Expr::Literal(ScalarValue::Binary(Some(b"/=%".to_vec())), None);
+        let cases = [
+            (
+                "equality",
+                datafusion::logical_expr::col("payload").eq(hello.clone()),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed equality",
+                slash_equals_percent
+                    .clone()
+                    .eq(datafusion::logical_expr::col("payload")),
+                vec!["part-00002.parquet"],
+            ),
+            (
+                "inequality",
+                datafusion::logical_expr::col("payload").not_eq(hello.clone()),
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+            (
+                "in list",
+                datafusion::logical_expr::col("payload").in_list(
+                    vec![hello.clone(), slash_equals_percent.clone(), hello.clone()],
+                    false,
+                ),
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "not in list",
+                datafusion::logical_expr::col("payload").in_list(vec![world], true),
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.unsupported_count,
+                0,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binary_partition_boolean_composition_and_projection_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "binary-partition-boolean-composition",
+            BINARY_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["payload"]"#,
+            &[
+                r#""partitionValues":{"payload":"hello"}"#,
+                r#""partitionValues":{"payload":"world"}"#,
+                r#""partitionValues":{"payload":"/=%"}"#,
+                r#""partitionValues":{"payload":null}"#,
+                r#""partitionValues":{"payload":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let hello = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+        let world = Expr::Literal(ScalarValue::Binary(Some(b"world".to_vec())), None);
+        let slash_equals_percent = Expr::Literal(ScalarValue::Binary(Some(b"/=%".to_vec())), None);
+        let separate_and_filters = vec![
+            datafusion::logical_expr::col("payload").is_not_null(),
+            datafusion::logical_expr::col("payload").not_eq(world.clone()),
+        ];
+        let whole_and_filter = datafusion::logical_expr::col("payload")
+            .in_list(
+                vec![hello.clone(), slash_equals_percent.clone(), hello.clone()],
+                false,
+            )
+            .and(datafusion::logical_expr::col("payload").is_not_null());
+        let whole_or_filter = datafusion::logical_expr::col("payload")
+            .eq(hello.clone())
+            .or(datafusion::logical_expr::col("payload").is_null());
+        let whole_not_filter =
+            Expr::Not(Box::new(datafusion::logical_expr::col("payload").eq(hello)));
+        let cases = [
+            (
+                "separate filters combine with and",
+                separate_and_filters,
+                2,
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "whole and",
+                vec![whole_and_filter],
+                1,
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "whole or",
+                vec![whole_or_filter],
+                1,
+                vec![
+                    "part-00000.parquet",
+                    "part-00003.parquet",
+                    "part-00005.parquet",
+                ],
+            ),
+            (
+                "whole not",
+                vec![whole_not_filter],
+                1,
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, filters, expected_exact_count, expected_paths) in cases {
+            let filter_refs = filters.iter().collect::<Vec<_>>();
+            let support = provider.supports_filters_pushdown(&filter_refs)?;
+            assert_eq!(
+                support,
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().projected_schema.field(0).name(),
+                "id",
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.exact_count,
+                expected_exact_count,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                0,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binary_partition_unsafe_filters_are_rejected_at_scan_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "binary-partition-unsupported-boundary",
+            BINARY_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["payload"]"#,
+            r#""partitionValues":{"payload":"hello"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let payload = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+        let payload_null = Expr::Literal(ScalarValue::Binary(None), None);
+        let scalar_udf = create_udf(
+            "binary_identity_for_pushdown_boundary",
+            vec![DataType::Binary],
+            DataType::Binary,
+            Volatility::Immutable,
+            Arc::new(|_| {
+                Ok(ColumnarValue::Scalar(ScalarValue::Binary(Some(
+                    b"hello".to_vec(),
+                ))))
+            }),
+        );
+        let scalar_function =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![datafusion::logical_expr::col("payload")],
+            ));
+        let filters = vec![
+            (
+                "binary ordering",
+                datafusion::logical_expr::col("payload").gt(payload.clone()),
+            ),
+            (
+                "binary between",
+                datafusion::logical_expr::col("payload").between(payload.clone(), payload.clone()),
+            ),
+            (
+                "binary null literal",
+                datafusion::logical_expr::col("payload").eq(payload_null),
+            ),
+            (
+                "binary empty literal",
+                datafusion::logical_expr::col("payload")
+                    .eq(Expr::Literal(ScalarValue::Binary(Some(Vec::new())), None)),
+            ),
+            (
+                "binary empty literal in list",
+                datafusion::logical_expr::col("payload").in_list(
+                    vec![
+                        payload.clone(),
+                        Expr::Literal(ScalarValue::Binary(Some(Vec::new())), None),
+                    ],
+                    false,
+                ),
+            ),
+            (
+                "string literal",
+                datafusion::logical_expr::col("payload").eq(datafusion::logical_expr::lit("hello")),
+            ),
+            (
+                "cast operand",
+                datafusion::logical_expr::col("payload").eq(datafusion::logical_expr::cast(
+                    payload.clone(),
+                    DataType::Binary,
+                )),
+            ),
+            (
+                "scalar function operand",
+                datafusion::logical_expr::col("payload").eq(scalar_function),
+            ),
+            (
+                "mixed partition data equality",
+                datafusion::logical_expr::col("payload").eq(datafusion::logical_expr::col("id")),
             ),
         ];
         let filter_refs = filters.iter().map(|(_, filter)| filter).collect::<Vec<_>>();
@@ -6751,6 +7172,180 @@ mod tests {
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_binary_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-binary-partition-null-checks",
+            BINARY_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["payload"]"#,
+            &[
+                r#""partitionValues":{"payload":"hello"}"#,
+                r#""partitionValues":{"payload":"world"}"#,
+                r#""partitionValues":{"payload":null}"#,
+                r#""partitionValues":{"payload":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let cases = [
+            (
+                "is null",
+                "select id from orders where payload is null",
+                vec!["part-00002.parquet", "part-00004.parquet"],
+            ),
+            (
+                "is not null",
+                "select id from orders where payload is not null",
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_binary_partition_equality_and_membership_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-binary-partition-equality-membership",
+            BINARY_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["payload"]"#,
+            &[
+                r#""partitionValues":{"payload":"hello"}"#,
+                r#""partitionValues":{"payload":"world"}"#,
+                r#""partitionValues":{"payload":"/=%"}"#,
+                r#""partitionValues":{"payload":null}"#,
+                r#""partitionValues":{"payload":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let cases = [
+            (
+                "binary literal equality",
+                "select id from orders where payload = X'68656C6C6F'",
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed binary literal equality",
+                "select id from orders where X'2F3D25' = payload",
+                vec!["part-00002.parquet"],
+            ),
+            (
+                "binary literal inequality",
+                "select id from orders where payload != X'68656C6C6F'",
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+            (
+                "binary literal in list",
+                "select id from orders where payload in (X'68656C6C6F', X'2F3D25', X'68656C6C6F')",
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "binary literal not in list",
+                "select id from orders where payload not in (X'776F726C64')",
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                1,
+                "{name}: {plan_display}"
+            );
             assert_eq!(
                 scans[0]
                     .scan_plan()

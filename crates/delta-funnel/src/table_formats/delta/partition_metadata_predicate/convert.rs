@@ -420,6 +420,12 @@ fn convert_partition_literal(
             }
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
+        PartitionMetadataValueKind::Binary => match expr {
+            Expr::Literal(ScalarValue::Binary(Some(value)), _) if !value.is_empty() => {
+                Ok(PartitionScalar::Binary(value.clone()))
+            }
+            _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
+        },
     }
 }
 
@@ -461,6 +467,7 @@ mod tests {
             Field::new("amount", DataType::Decimal128(10, 2), true),
             Field::new("float_part", DataType::Float32, true),
             Field::new("double_part", DataType::Float64, true),
+            Field::new("payload", DataType::Binary, true),
         ]))
     }
 
@@ -578,6 +585,95 @@ mod tests {
         assert!(matches_scan_file(&is_not_null, &raw_empty));
         assert!(matches_scan_file(&is_not_null, &invalid_decimal));
         assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_binary_null_checks_with_sql_metadata_semantics() {
+        let is_null = predicate_expr(&col("payload").is_null(), &["payload"]).unwrap();
+        let is_not_null = predicate_expr(&col("payload").is_not_null(), &["payload"]).unwrap();
+        let normal = values(&[("payload", "hello")]);
+        let raw_empty = values(&[("payload", "")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&is_null, &normal));
+        assert!(!matches_scan_file(&is_null, &raw_empty));
+        assert!(matches_scan_file(&is_null, &missing));
+        assert!(matches_scan_file(&is_not_null, &normal));
+        assert!(matches_scan_file(&is_not_null, &raw_empty));
+        assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_binary_equality_and_in_lists_with_typed_metadata_semantics() {
+        let hello = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+        let slash_equals_percent = Expr::Literal(ScalarValue::Binary(Some(b"/=%".to_vec())), None);
+        let world = Expr::Literal(ScalarValue::Binary(Some(b"world".to_vec())), None);
+        let eq = predicate_expr(&col("payload").eq(hello.clone()), &["payload"]).unwrap();
+        let reversed = predicate_expr(
+            &slash_equals_percent.clone().eq(col("payload")),
+            &["payload"],
+        )
+        .unwrap();
+        let not_eq = predicate_expr(&col("payload").not_eq(hello.clone()), &["payload"]).unwrap();
+        let in_list = predicate_expr(
+            &col("payload").in_list(
+                vec![hello.clone(), slash_equals_percent.clone(), hello.clone()],
+                false,
+            ),
+            &["payload"],
+        )
+        .unwrap();
+        let not_in = predicate_expr(
+            &col("payload").in_list(vec![hello.clone()], true),
+            &["payload"],
+        )
+        .unwrap();
+        let raw_hello = values(&[("payload", "hello")]);
+        let raw_slash_equals_percent = values(&[("payload", "/=%")]);
+        let raw_world = values(&[("payload", "world")]);
+        let raw_empty = values(&[("payload", "")]);
+        let missing = HashMap::new();
+
+        assert!(matches_scan_file(&eq, &raw_hello));
+        assert!(!matches_scan_file(&eq, &raw_world));
+        assert!(!matches_scan_file(&eq, &raw_empty));
+        assert!(!matches_scan_file(&eq, &missing));
+        assert!(matches_scan_file(&reversed, &raw_slash_equals_percent));
+        assert!(!matches_scan_file(&reversed, &raw_hello));
+        assert!(!matches_scan_file(&not_eq, &raw_hello));
+        assert!(matches_scan_file(&not_eq, &raw_world));
+        assert!(!matches_scan_file(&not_eq, &raw_empty));
+        assert!(!matches_scan_file(&not_eq, &missing));
+        assert!(matches_scan_file(&in_list, &raw_hello));
+        assert!(matches_scan_file(&in_list, &raw_slash_equals_percent));
+        assert!(!matches_scan_file(&in_list, &raw_world));
+        assert!(!matches_scan_file(&not_in, &raw_hello));
+        assert!(matches_scan_file(&not_in, &raw_world));
+        assert!(!matches_scan_file(&not_in, &raw_empty));
+        assert!(!matches_scan_file(&not_in, &missing));
+
+        assert_eq!(
+            predicate_expr(&col("payload").eq(world), &["region"]),
+            Err(DeltaPartitionMetadataPredicateError::NonPartitionColumn)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("payload").eq(Expr::Literal(ScalarValue::Binary(Some(Vec::new())), None)),
+                &["payload"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(
+                &col("payload").eq(Expr::Literal(ScalarValue::Binary(None), None)),
+                &["payload"]
+            ),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
+        assert_eq!(
+            predicate_expr(&col("payload").eq(lit("hello")), &["payload"]),
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        );
     }
 
     #[test]
