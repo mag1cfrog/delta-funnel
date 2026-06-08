@@ -13,9 +13,7 @@ use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{
     DeltaKernelPredicate, DeltaKernelPredicateAdapterError, datafusion_expr_to_kernel_predicate,
 };
-pub(crate) use partition_metadata_predicate::{
-    DeltaPartitionMetadataPredicate, DeltaPartitionNameMap,
-};
+pub(crate) use partition_metadata_predicate::DeltaPartitionMetadataPredicate;
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };
@@ -243,9 +241,10 @@ mod tests {
 
     use datafusion::logical_expr::{col, lit};
 
+    use super::partition_metadata_predicate::DeltaPartitionNameMap;
     use super::{
-        DeltaPartitionMetadataPredicate, DeltaPartitionNameMap, DeltaSourceConfig,
-        ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
+        DeltaPartitionMetadataPredicate, DeltaSourceConfig, ProjectedDeltaScan,
+        build_projected_delta_scan, build_projected_predicated_delta_scan,
         datafusion_expr_to_kernel_predicate, load_delta_source, load_delta_sources,
     };
     use crate::DeltaFunnelError;

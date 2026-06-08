@@ -89,13 +89,12 @@ impl ProviderScanPlan {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
 
     use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
 
-    use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+    use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     use super::super::provider::DeltaTableProvider;
     use super::*;
@@ -201,25 +200,12 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.unsupported_count, 0);
         assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 2);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
-        assert!(plan.partition_metadata_filter.is_some());
-        assert!(
-            plan.partition_metadata_filter
-                .as_ref()
-                .unwrap()
-                .matches_scan_file(&HashMap::from([
-                    ("region".to_owned(), "us-west".to_owned()),
-                    ("day".to_owned(), "2026-05-31".to_owned()),
-                ]))
-        );
-        assert!(
-            !plan
-                .partition_metadata_filter
-                .as_ref()
-                .unwrap()
-                .matches_scan_file(&HashMap::from([
-                    ("region".to_owned(), "us-west".to_owned()),
-                    ("day".to_owned(), "2026-06-01".to_owned()),
-                ]))
+        assert!(plan.partition_metadata_filter.is_none());
+        assert!(plan.kernel_partition_predicate.is_some());
+        assert_eq!(
+            plan.kernel_scan()
+                .scan_file_paths(&plan.table_uri, plan.partition_metadata_filter.as_ref())?,
+            vec!["part-00000.parquet"]
         );
         assert_eq!(plan.projected_schema.field(0).name(), "id");
         let kernel_names = plan
@@ -228,7 +214,7 @@ mod tests {
             .fields()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
-        assert_eq!(kernel_names, vec!["id"]);
+        assert_eq!(kernel_names, vec!["id", "region", "day"]);
 
         Ok(())
     }
@@ -269,18 +255,12 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.exact_count, 2);
         assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 2);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
-        let partition_metadata_filter = plan.partition_metadata_filter.as_ref().unwrap();
-        assert!(
-            partition_metadata_filter.matches_scan_file(&HashMap::from([(
-                "region".to_owned(),
-                "us-west".to_owned(),
-            )]))
-        );
-        assert!(
-            !partition_metadata_filter.matches_scan_file(&HashMap::from([(
-                "region".to_owned(),
-                "us-east".to_owned(),
-            )]))
+        assert!(plan.partition_metadata_filter.is_none());
+        assert!(plan.kernel_partition_predicate.is_some());
+        assert_eq!(
+            plan.kernel_scan()
+                .scan_file_paths(&plan.table_uri, plan.partition_metadata_filter.as_ref())?,
+            vec!["part-00000.parquet"]
         );
 
         Ok(())
@@ -320,20 +300,13 @@ mod tests {
         );
         assert_eq!(plan.pushed_filter_plan.exact_count, 2);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
-        let partition_metadata_filter = plan.partition_metadata_filter.as_ref().unwrap();
+        assert!(plan.partition_metadata_filter.is_none());
+        assert!(plan.kernel_partition_predicate.is_some());
         assert!(
-            !partition_metadata_filter.matches_scan_file(&HashMap::from([(
-                "region".to_owned(),
-                "us-west".to_owned(),
-            )]))
+            plan.kernel_scan()
+                .scan_file_paths(&plan.table_uri, plan.partition_metadata_filter.as_ref())?
+                .is_empty()
         );
-        assert!(
-            !partition_metadata_filter.matches_scan_file(&HashMap::from([(
-                "region".to_owned(),
-                "us-east".to_owned(),
-            )]))
-        );
-        assert!(!partition_metadata_filter.matches_scan_file(&HashMap::new()));
 
         Ok(())
     }
@@ -371,14 +344,15 @@ mod tests {
             .fields()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
-        assert_eq!(kernel_names, vec!["id"]);
-        assert!(plan.partition_metadata_filter.is_some());
+        assert_eq!(kernel_names, vec!["id", "region"]);
+        assert!(plan.partition_metadata_filter.is_none());
+        assert!(plan.kernel_partition_predicate.is_some());
 
         Ok(())
     }
 
     #[test]
-    fn scan_plan_builds_partition_metadata_filter_for_exact_in()
+    fn scan_plan_rejects_partition_in_until_operator_child()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "exact-in-partition-metadata-filter",
@@ -394,33 +368,17 @@ mod tests {
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
 
-        let plan = provider.plan_scan(ProviderScanPlanRequest {
+        let result = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: Some(vec![0]),
             pushed_filters: vec![
                 col("region").in_list(vec![lit("us-west"), lit("us-east")], false),
             ],
-        })?;
+        });
 
-        let partition_metadata_filter = plan.partition_metadata_filter.as_ref().unwrap();
         assert!(
-            partition_metadata_filter.matches_scan_file(&HashMap::from([(
-                "region".to_owned(),
-                "us-west".to_owned()
-            )]))
+            matches!(result, Err(DeltaFunnelError::DeltaScanFilter { reason, .. })
+                if reason.contains("pushed filters must be exact partition predicates"))
         );
-        assert!(
-            partition_metadata_filter.matches_scan_file(&HashMap::from([(
-                "region".to_owned(),
-                "us-east".to_owned()
-            )]))
-        );
-        assert!(
-            !partition_metadata_filter.matches_scan_file(&HashMap::from([(
-                "region".to_owned(),
-                "eu-central".to_owned()
-            )]))
-        );
-        assert!(!partition_metadata_filter.matches_scan_file(&HashMap::new()));
 
         Ok(())
     }

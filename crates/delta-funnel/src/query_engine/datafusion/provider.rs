@@ -18,8 +18,8 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
     table_formats::{
-        DeltaPartitionMetadataPredicate, DeltaPartitionNameMap, ProjectedDeltaScan,
-        build_projected_predicated_delta_scan, delta_source_arrow_schema,
+        DeltaKernelPredicate, ProjectedDeltaScan, build_projected_predicated_delta_scan,
+        datafusion_expr_to_kernel_predicate, delta_source_arrow_schema,
     },
 };
 
@@ -98,10 +98,9 @@ impl DeltaTableProvider {
     #[allow(dead_code)]
     /// Builds the complete provider scan plan for DataFusion's scan callback.
     ///
-    /// Filter planning and scan planning intentionally stay separate here. The
-    /// kernel scan is only responsible for snapshot/projection planning, while
-    /// exact partition filters are converted into a provider-owned metadata
-    /// predicate and carried on `ProviderScanPlan` for scan-file pruning.
+    /// Filter planning and scan planning intentionally stay separate here. Exact
+    /// partition filters are converted into a kernel predicate and passed into
+    /// the official delta_kernel scan path.
     pub(crate) fn plan_scan(
         &self,
         request: ProviderScanPlanRequest,
@@ -122,18 +121,14 @@ impl DeltaTableProvider {
             &scan_projection,
             &pushed_filter_plan,
         )?;
-        // Build the provider-side predicate before constructing the kernel
-        // scan. This makes the partition pruning contract explicit: the exact
-        // filters are accepted only because this predicate can later be applied
-        // to scan-file partition metadata.
-        let partition_metadata_filter = self.build_provider_partition_metadata_filter(
-            &normalized_pushed_filters,
-            &pushed_filter_plan,
+        let kernel_partition_predicate =
+            self.build_kernel_partition_predicate(&pushed_filter_plan)?;
+        let kernel_projected_column_names =
+            Self::kernel_projected_column_names(projected_column_names, &pushed_filter_plan);
+        let kernel_scan = self.build_kernel_scan(
+            kernel_projected_column_names.as_deref(),
+            kernel_partition_predicate.clone(),
         )?;
-        // Do not pass partition predicates to delta_kernel. The kernel scan
-        // should enumerate files for the requested projection; provider-owned
-        // metadata pruning is applied after scan metadata expansion.
-        let kernel_scan = self.build_kernel_scan(projected_column_names.as_deref())?;
 
         Ok(ProviderScanPlan::from_parts(ProviderScanPlanParts {
             source_name: self.source_name().to_owned(),
@@ -143,8 +138,8 @@ impl DeltaTableProvider {
             protocol: self.protocol.clone(),
             scan_projection,
             pushed_filter_plan,
-            partition_metadata_filter,
-            kernel_partition_predicate: None,
+            partition_metadata_filter: None,
+            kernel_partition_predicate,
             kernel_scan,
         }))
     }
@@ -180,18 +175,20 @@ impl DeltaTableProvider {
 
     /// Rejects pushed filters that this provider cannot safely use.
     ///
-    /// Exact filters are fully provider-owned. Inexact filters are accepted only
-    /// when planning attached a provider-owned partition metadata expression; the
-    /// original filter remains DataFusion's residual work.
+    /// Exact filters must have a partition expression that can be converted to
+    /// a kernel predicate. This issue does not accept inexact pushed filters.
     fn reject_unaccepted_pushed_filters(
         &self,
         pushed_filter_plan: &DeltaFilterPushdownPlan,
     ) -> Result<(), DeltaFunnelError> {
-        let missing_provider_predicate = pushed_filter_plan.decisions.iter().any(|decision| {
+        let missing_partition_expression = pushed_filter_plan.decisions.iter().any(|decision| {
             decision.outcome != DeltaFilterPushdownOutcome::Unsupported
                 && decision.partition_metadata_filter.is_none()
         });
-        if pushed_filter_plan.unsupported_count > 0 || missing_provider_predicate {
+        if pushed_filter_plan.unsupported_count > 0
+            || pushed_filter_plan.inexact_count > 0
+            || missing_partition_expression
+        {
             return Err(DeltaFunnelError::DeltaScanFilter {
                 source_name: self.source_name().to_owned(),
                 table_uri: self.source.table_uri().to_owned(),
@@ -234,20 +231,15 @@ impl DeltaTableProvider {
         Ok(())
     }
 
-    /// Builds the provider-owned partition metadata predicate for accepted filters.
+    /// Builds the kernel partition predicate for accepted exact filters.
     ///
-    /// The resulting predicate is stored on `ProviderScanPlan` next to the
-    /// unfiltered kernel scan state. Scan-file expansion applies it to
-    /// `ScanFile.partition_values` before any file paths are handed to the read
-    /// path, so partition pruning stays under provider SQL semantics instead of
-    /// delta_kernel predicate semantics.
-    fn build_provider_partition_metadata_filter(
+    /// Accepted exact filters must be enforced by the same predicate passed into
+    /// `ScanBuilder::with_predicate`; the provider-owned metadata evaluator is
+    /// not a fallback for this migration slice.
+    fn build_kernel_partition_predicate(
         &self,
-        normalized_pushed_filters: &[Expr],
         pushed_filter_plan: &DeltaFilterPushdownPlan,
-    ) -> Result<Option<DeltaPartitionMetadataPredicate>, DeltaFunnelError> {
-        let partition_columns = self.partition_columns();
-        let physical_name_lookup = DeltaPartitionNameMap::identity(&partition_columns);
+    ) -> Result<Option<DeltaKernelPredicate>, DeltaFunnelError> {
         let predicates = pushed_filter_plan
             .decisions
             .iter()
@@ -257,53 +249,60 @@ impl DeltaTableProvider {
                     .as_ref()
                     .map(|filter| (decision, filter))
             })
-            .map(|(decision, partition_metadata_filter)| {
-                let _filter = normalized_pushed_filters.get(decision.input_index).ok_or_else(|| {
+            .map(|(_decision, partition_metadata_filter)| {
+                datafusion_expr_to_kernel_predicate(partition_metadata_filter).map_err(|error| {
                     DeltaFunnelError::DeltaScanFilter {
                         source_name: self.source_name().to_owned(),
                         table_uri: self.source.table_uri().to_owned(),
-                        reason: "exact pushed filter index was not found".to_owned(),
+                        reason: format!(
+                            "exact pushed filter cannot be converted to kernel predicate: {error}"
+                        ),
                     }
-                })?;
-
-                DeltaPartitionMetadataPredicate::from_datafusion_expr(
-                    partition_metadata_filter,
-                    &self.schema,
-                    &partition_columns,
-                    &physical_name_lookup,
-                )
-                .map_err(|error| DeltaFunnelError::DeltaScanFilter {
-                    source_name: self.source_name().to_owned(),
-                    table_uri: self.source.table_uri().to_owned(),
-                    reason: format!(
-                        "exact pushed filter cannot be converted to partition metadata predicate: {error}"
-                    ),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(DeltaPartitionMetadataPredicate::and_from(predicates))
+        Ok(DeltaKernelPredicate::and_from(predicates))
+    }
+
+    /// Expands the kernel scan schema with exact predicate columns.
+    ///
+    /// DataFusion output projection stays governed by `projected_schema` and
+    /// `scan_projection`; this only gives delta_kernel enough schema context to
+    /// validate and evaluate partition predicates during scan planning.
+    fn kernel_projected_column_names(
+        projected_column_names: Option<Vec<String>>,
+        pushed_filter_plan: &DeltaFilterPushdownPlan,
+    ) -> Option<Vec<String>> {
+        let mut projected_column_names = projected_column_names?;
+
+        for decision in &pushed_filter_plan.decisions {
+            if decision.outcome != DeltaFilterPushdownOutcome::Exact {
+                continue;
+            }
+
+            for column in &decision.filter_analysis.partition_columns {
+                if !projected_column_names.contains(column) {
+                    projected_column_names.push(column.clone());
+                }
+            }
+        }
+
+        Some(projected_column_names)
     }
 
     /// Builds the delta_kernel scan state for a projected provider scan.
-    ///
-    /// Partition pushdown is provider-owned and applied to Delta scan-file
-    /// metadata after kernel scan planning. This keeps delta_kernel out of
-    /// partition predicate semantics and lets the kernel scan schema match the
-    /// requested projection.
     fn build_kernel_scan(
         &self,
         projected_column_names: Option<&[String]>,
+        kernel_partition_predicate: Option<DeltaKernelPredicate>,
     ) -> Result<ProjectedDeltaScan, DeltaFunnelError> {
         let kernel_projected_column_names = projected_column_names.map(|names| names.to_vec());
 
         build_projected_predicated_delta_scan(
             &self.source,
             kernel_projected_column_names.as_deref(),
-            // Exact partition pushdown is represented by
-            // `ProviderScanPlan::partition_metadata_filter`, not by
-            // delta_kernel's predicate path.
-            None,
+            kernel_partition_predicate,
         )
         .map_err(|source| DeltaFunnelError::DeltaScanConstruction {
             source_name: self.source_name().to_owned(),
