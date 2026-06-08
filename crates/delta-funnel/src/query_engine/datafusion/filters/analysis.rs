@@ -12,22 +12,43 @@ use crate::table_formats::{
 use super::DeltaFilterPushdownRejectionReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DeltaKernelPredicateScope {
+/// Classification of which provider schema columns a filter references.
+///
+/// This is diagnostic and policy input. It does not by itself mean the provider
+/// can enforce the filter exactly.
+pub(crate) enum DeltaFilterColumnScope {
+    /// The filter references only Delta partition columns.
     PartitionOnly,
+    /// The filter references only non-partition data columns.
     DataOnly,
+    /// The filter references both partition and non-partition data columns.
     PartitionAndData,
+    /// The filter has unknown, internal, nested, or otherwise unsupported references.
     Unsupported,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct DeltaKernelPredicateAnalysis {
-    pub(crate) scope: DeltaKernelPredicateScope,
+/// Reusable analysis for one DataFusion filter at the provider boundary.
+///
+/// The policy layer uses this to decide whether a filter is exact, inexact, or
+/// unsupported. The optional kernel predicate remains diagnostic only for static
+/// partition metadata pushdown; provider-owned pruning uses
+/// `DeltaFilterPushdownDecision::partition_metadata_filter`.
+pub(crate) struct DeltaFilterAnalysis {
+    /// Broad partition/data/unsupported classification for referenced columns.
+    pub(crate) scope: DeltaFilterColumnScope,
+    /// Sorted unique column references as they appeared in the DataFusion expression.
     pub(crate) referenced_columns: Vec<String>,
+    /// Referenced columns that match Delta partition columns after schema lookup.
     pub(crate) partition_columns: Vec<String>,
+    /// Referenced columns that match provider data columns after schema lookup.
     pub(crate) data_columns: Vec<String>,
+    /// Referenced columns that cannot be resolved against the provider schema.
     pub(crate) unknown_columns: Vec<String>,
-    pub(crate) predicate: Option<DeltaKernelPredicate>,
-    pub(crate) adapter_error: Option<DeltaKernelPredicateAdapterError>,
+    /// Delta kernel adapter conversion result, retained for diagnostics only.
+    pub(crate) kernel_predicate: Option<DeltaKernelPredicate>,
+    /// Delta kernel adapter conversion error, retained for diagnostics only.
+    pub(crate) kernel_adapter_error: Option<DeltaKernelPredicateAdapterError>,
 }
 
 /// Builds reusable diagnostics for a candidate DataFusion filter.
@@ -40,10 +61,7 @@ pub(super) fn analyze_filter_for_pushdown(
     filter: &Expr,
     schema: &SchemaRef,
     partition_columns: &HashSet<String>,
-) -> (
-    DeltaKernelPredicateAnalysis,
-    DeltaFilterPushdownRejectionReason,
-) {
+) -> (DeltaFilterAnalysis, DeltaFilterPushdownRejectionReason) {
     let mut referenced_columns = filter
         .column_refs()
         .iter()
@@ -77,10 +95,10 @@ pub(super) fn analyze_filter_for_pushdown(
         .collect::<Vec<_>>();
 
     let rejection_reason = filter_pushdown_rejection_reason(filter, &unknown_columns);
-    let (predicate, adapter_error) =
-        if rejection_reason == DeltaFilterPushdownRejectionReason::InitialPolicy {
+    let (kernel_predicate, kernel_adapter_error) =
+        if rejection_reason == DeltaFilterPushdownRejectionReason::UnsupportedByPolicy {
             match datafusion_expr_to_kernel_predicate(filter) {
-                Ok(predicate) => (Some(predicate), None),
+                Ok(kernel_predicate) => (Some(kernel_predicate), None),
                 Err(error) => (None, Some(error)),
             }
         } else {
@@ -88,8 +106,8 @@ pub(super) fn analyze_filter_for_pushdown(
         };
 
     (
-        DeltaKernelPredicateAnalysis {
-            scope: kernel_predicate_scope(
+        DeltaFilterAnalysis {
+            scope: filter_analysis_scope(
                 rejection_reason,
                 &referenced_partition_columns,
                 &data_columns,
@@ -98,8 +116,8 @@ pub(super) fn analyze_filter_for_pushdown(
             partition_columns: referenced_partition_columns,
             data_columns,
             unknown_columns,
-            predicate,
-            adapter_error,
+            kernel_predicate,
+            kernel_adapter_error,
         },
         rejection_reason,
     )
@@ -159,35 +177,35 @@ fn filter_pushdown_rejection_reason(
         return DeltaFilterPushdownRejectionReason::UnknownColumn;
     }
 
-    if is_kernel_predicate_candidate(filter) {
-        DeltaFilterPushdownRejectionReason::InitialPolicy
+    if is_filter_analysis_candidate(filter) {
+        DeltaFilterPushdownRejectionReason::UnsupportedByPolicy
     } else {
         DeltaFilterPushdownRejectionReason::ExpressionShape
     }
 }
 
-fn kernel_predicate_scope(
+fn filter_analysis_scope(
     rejection_reason: DeltaFilterPushdownRejectionReason,
     partition_columns: &[String],
     data_columns: &[String],
-) -> DeltaKernelPredicateScope {
-    if rejection_reason != DeltaFilterPushdownRejectionReason::InitialPolicy {
-        return DeltaKernelPredicateScope::Unsupported;
+) -> DeltaFilterColumnScope {
+    if rejection_reason != DeltaFilterPushdownRejectionReason::UnsupportedByPolicy {
+        return DeltaFilterColumnScope::Unsupported;
     }
 
     match (partition_columns.is_empty(), data_columns.is_empty()) {
-        (false, true) => DeltaKernelPredicateScope::PartitionOnly,
-        (true, false) => DeltaKernelPredicateScope::DataOnly,
-        (false, false) => DeltaKernelPredicateScope::PartitionAndData,
-        (true, true) => DeltaKernelPredicateScope::Unsupported,
+        (false, true) => DeltaFilterColumnScope::PartitionOnly,
+        (true, false) => DeltaFilterColumnScope::DataOnly,
+        (false, false) => DeltaFilterColumnScope::PartitionAndData,
+        (true, true) => DeltaFilterColumnScope::Unsupported,
     }
 }
 
-fn is_kernel_predicate_candidate(filter: &Expr) -> bool {
+fn is_filter_analysis_candidate(filter: &Expr) -> bool {
     match filter {
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
-            is_kernel_predicate_candidate(binary.left.as_ref())
-                && is_kernel_predicate_candidate(binary.right.as_ref())
+            is_filter_analysis_candidate(binary.left.as_ref())
+                && is_filter_analysis_candidate(binary.right.as_ref())
         }
         Expr::BinaryExpr(binary)
             if matches!(
@@ -203,7 +221,7 @@ fn is_kernel_predicate_candidate(filter: &Expr) -> bool {
             is_column_or_literal(binary.left.as_ref())
                 && is_column_or_literal(binary.right.as_ref())
         }
-        Expr::Not(inner) => is_kernel_predicate_candidate(inner.as_ref()),
+        Expr::Not(inner) => is_filter_analysis_candidate(inner.as_ref()),
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => is_column_or_literal(inner.as_ref()),
         Expr::Between(between) => {
             is_column_or_literal(between.expr.as_ref())
@@ -303,46 +321,51 @@ mod tests {
         assert!(!plan.decisions[0].residual);
         assert!(plan.decisions[0].rejection_reason.is_none());
         assert_eq!(
-            plan.decisions[0].kernel_predicate.referenced_columns,
+            plan.decisions[0].filter_analysis.referenced_columns,
             vec!["region"]
         );
         assert_eq!(
-            plan.decisions[0].kernel_predicate.partition_columns,
+            plan.decisions[0].filter_analysis.partition_columns,
             vec!["region"]
         );
-        assert!(plan.decisions[0].kernel_predicate.data_columns.is_empty());
+        assert!(plan.decisions[0].filter_analysis.data_columns.is_empty());
+        assert!(plan.decisions[0].filter_analysis.unknown_columns.is_empty());
+        assert_eq!(
+            plan.decisions[0].filter_analysis.scope,
+            DeltaFilterColumnScope::PartitionOnly
+        );
+        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_some());
         assert!(
             plan.decisions[0]
-                .kernel_predicate
-                .unknown_columns
-                .is_empty()
+                .filter_analysis
+                .kernel_adapter_error
+                .is_none()
         );
-        assert_eq!(
-            plan.decisions[0].kernel_predicate.scope,
-            DeltaKernelPredicateScope::PartitionOnly
-        );
-        assert!(plan.decisions[0].kernel_predicate.predicate.is_some());
-        assert!(plan.decisions[0].kernel_predicate.adapter_error.is_none());
 
         assert_eq!(
-            plan.decisions[1].kernel_predicate.referenced_columns,
+            plan.decisions[1].filter_analysis.referenced_columns,
             vec!["id"]
         );
-        assert_eq!(plan.decisions[1].kernel_predicate.data_columns, vec!["id"]);
+        assert_eq!(plan.decisions[1].filter_analysis.data_columns, vec!["id"]);
         assert!(
             plan.decisions[1]
-                .kernel_predicate
+                .filter_analysis
                 .partition_columns
                 .is_empty()
         );
         assert_eq!(
-            plan.decisions[1].kernel_predicate.scope,
-            DeltaKernelPredicateScope::DataOnly
+            plan.decisions[1].filter_analysis.scope,
+            DeltaFilterColumnScope::DataOnly
         );
-        assert!(plan.decisions[1].kernel_predicate.predicate.is_some());
-        assert!(plan.decisions[1].kernel_predicate.adapter_error.is_none());
+        assert!(plan.decisions[1].filter_analysis.kernel_predicate.is_some());
+        assert!(
+            plan.decisions[1]
+                .filter_analysis
+                .kernel_adapter_error
+                .is_none()
+        );
         assert_eq!(
-            plan.decisions[2].kernel_predicate.referenced_columns,
+            plan.decisions[2].filter_analysis.referenced_columns,
             vec!["id"]
         );
         assert_eq!(
@@ -350,38 +373,48 @@ mod tests {
             Some(DeltaFilterPushdownRejectionReason::UnknownColumn)
         );
         assert_eq!(
-            plan.decisions[3].kernel_predicate.unknown_columns,
+            plan.decisions[3].filter_analysis.unknown_columns,
             vec!["ghost_column"]
         );
         assert_eq!(
-            plan.decisions[3].kernel_predicate.scope,
-            DeltaKernelPredicateScope::Unsupported
+            plan.decisions[3].filter_analysis.scope,
+            DeltaFilterColumnScope::Unsupported
         );
-        assert!(plan.decisions[3].kernel_predicate.predicate.is_none());
-        assert!(plan.decisions[3].kernel_predicate.adapter_error.is_none());
+        assert!(plan.decisions[3].filter_analysis.kernel_predicate.is_none());
+        assert!(
+            plan.decisions[3]
+                .filter_analysis
+                .kernel_adapter_error
+                .is_none()
+        );
         assert_eq!(
             plan.decisions[4].rejection_reason,
             Some(DeltaFilterPushdownRejectionReason::InternalColumn)
         );
         assert_eq!(
-            plan.decisions[4].kernel_predicate.unknown_columns,
+            plan.decisions[4].filter_analysis.unknown_columns,
             vec!["__delta_funnel_file_id"]
         );
         assert_eq!(
-            plan.decisions[4].kernel_predicate.scope,
-            DeltaKernelPredicateScope::Unsupported
+            plan.decisions[4].filter_analysis.scope,
+            DeltaFilterColumnScope::Unsupported
         );
-        assert!(plan.decisions[4].kernel_predicate.predicate.is_none());
-        assert!(plan.decisions[4].kernel_predicate.adapter_error.is_none());
+        assert!(plan.decisions[4].filter_analysis.kernel_predicate.is_none());
+        assert!(
+            plan.decisions[4]
+                .filter_analysis
+                .kernel_adapter_error
+                .is_none()
+        );
 
         Ok(())
     }
 
     #[test]
-    fn kernel_predicate_scope_classifies_mixed_partition_and_data_columns_without_pushdown()
+    fn filter_analysis_scope_classifies_mixed_partition_and_data_columns_without_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
-            "mixed-predicate-analysis",
+            "mixed-filter-analysis",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
@@ -407,30 +440,30 @@ mod tests {
         assert_eq!(plan.pushed_filter_count, 0);
         assert_eq!(plan.residual_filter_count, 1);
         assert_eq!(
-            plan.decisions[0].kernel_predicate.scope,
-            DeltaKernelPredicateScope::PartitionAndData
+            plan.decisions[0].filter_analysis.scope,
+            DeltaFilterColumnScope::PartitionAndData
         );
         assert_eq!(
-            plan.decisions[0].kernel_predicate.referenced_columns,
+            plan.decisions[0].filter_analysis.referenced_columns,
             vec!["id", "region"]
         );
         assert_eq!(
-            plan.decisions[0].kernel_predicate.partition_columns,
+            plan.decisions[0].filter_analysis.partition_columns,
             vec!["region"]
         );
-        assert_eq!(plan.decisions[0].kernel_predicate.data_columns, vec!["id"]);
-        assert!(
-            plan.decisions[0]
-                .kernel_predicate
-                .unknown_columns
-                .is_empty()
-        );
+        assert_eq!(plan.decisions[0].filter_analysis.data_columns, vec!["id"]);
+        assert!(plan.decisions[0].filter_analysis.unknown_columns.is_empty());
         assert_eq!(
             plan.decisions[0].rejection_reason,
-            Some(DeltaFilterPushdownRejectionReason::InitialPolicy)
+            Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
         );
-        assert!(plan.decisions[0].kernel_predicate.predicate.is_some());
-        assert!(plan.decisions[0].kernel_predicate.adapter_error.is_none());
+        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_some());
+        assert!(
+            plan.decisions[0]
+                .filter_analysis
+                .kernel_adapter_error
+                .is_none()
+        );
 
         Ok(())
     }
@@ -468,15 +501,13 @@ mod tests {
         assert!(
             plan.decisions
                 .iter()
-                .all(|decision| decision.kernel_predicate.scope
-                    == DeltaKernelPredicateScope::Unsupported)
+                .all(|decision| decision.filter_analysis.scope
+                    == DeltaFilterColumnScope::Unsupported)
         );
-        assert!(
-            plan.decisions
-                .iter()
-                .all(|decision| decision.kernel_predicate.predicate.is_none()
-                    && decision.kernel_predicate.adapter_error.is_none())
-        );
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.filter_analysis.kernel_predicate.is_none()
+                && decision.filter_analysis.kernel_adapter_error.is_none()
+        }));
         assert_eq!(
             plan.decisions
                 .iter()
@@ -492,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_plan_records_supported_kernel_predicate_shapes_with_only_in_pushed()
+    fn filter_plan_records_supported_filter_analysis_shapes_with_only_in_pushed()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "supported-kernel-filter-plan",
@@ -530,7 +561,7 @@ mod tests {
         assert_eq!(
             plan.datafusion_pushdowns(),
             vec![
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Exact,
@@ -539,52 +570,52 @@ mod tests {
             ]
         );
         assert_eq!(plan.exact_count, 1);
-        assert_eq!(plan.inexact_count, 0);
-        assert_eq!(plan.unsupported_count, 5);
-        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 4);
+        assert_eq!(plan.pushed_filter_count, 2);
         assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(plan.decisions[0].rejection_reason, None);
         assert_eq!(plan.decisions[3].rejection_reason, None);
         assert!(!plan.decisions[3].residual);
-        assert!(plan.decisions[..3].iter().all(|decision| {
-            decision.rejection_reason == Some(DeltaFilterPushdownRejectionReason::InitialPolicy)
+        assert!(plan.decisions[1..3].iter().all(|decision| {
+            decision.rejection_reason
+                == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
         }));
         assert!(plan.decisions[4..].iter().all(|decision| {
-            decision.rejection_reason == Some(DeltaFilterPushdownRejectionReason::InitialPolicy)
+            decision.rejection_reason
+                == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
         }));
         assert_eq!(
-            plan.decisions[0].kernel_predicate.scope,
-            DeltaKernelPredicateScope::PartitionAndData
+            plan.decisions[0].filter_analysis.scope,
+            DeltaFilterColumnScope::PartitionAndData
         );
         assert_eq!(
-            plan.decisions[1].kernel_predicate.scope,
-            DeltaKernelPredicateScope::DataOnly
+            plan.decisions[1].filter_analysis.scope,
+            DeltaFilterColumnScope::DataOnly
         );
         assert_eq!(
-            plan.decisions[2].kernel_predicate.scope,
-            DeltaKernelPredicateScope::DataOnly
+            plan.decisions[2].filter_analysis.scope,
+            DeltaFilterColumnScope::DataOnly
         );
         assert_eq!(
-            plan.decisions[3].kernel_predicate.scope,
-            DeltaKernelPredicateScope::PartitionOnly
+            plan.decisions[3].filter_analysis.scope,
+            DeltaFilterColumnScope::PartitionOnly
         );
         assert_eq!(
-            plan.decisions[4].kernel_predicate.scope,
-            DeltaKernelPredicateScope::DataOnly
+            plan.decisions[4].filter_analysis.scope,
+            DeltaFilterColumnScope::DataOnly
         );
         assert_eq!(
-            plan.decisions[5].kernel_predicate.scope,
-            DeltaKernelPredicateScope::PartitionOnly
+            plan.decisions[5].filter_analysis.scope,
+            DeltaFilterColumnScope::PartitionOnly
         );
-        assert!(
-            plan.decisions[..5].iter().all(|decision| decision
-                .kernel_predicate
-                .predicate
-                .is_some()
-                && decision.kernel_predicate.adapter_error.is_none())
-        );
-        assert!(plan.decisions[5].kernel_predicate.predicate.is_none());
+        assert!(plan.decisions[..5].iter().all(|decision| {
+            decision.filter_analysis.kernel_predicate.is_some()
+                && decision.filter_analysis.kernel_adapter_error.is_none()
+        }));
+        assert!(plan.decisions[5].filter_analysis.kernel_predicate.is_none());
         assert_eq!(
-            plan.decisions[5].kernel_predicate.adapter_error,
+            plan.decisions[5].filter_analysis.kernel_adapter_error,
             Some(DeltaKernelPredicateAdapterError::NullLiteral)
         );
 
@@ -620,23 +651,28 @@ mod tests {
             Some(DeltaFilterPushdownRejectionReason::UnknownColumn)
         );
         assert_eq!(
-            plan.decisions[0].kernel_predicate.scope,
-            DeltaKernelPredicateScope::Unsupported
+            plan.decisions[0].filter_analysis.scope,
+            DeltaFilterColumnScope::Unsupported
         );
         assert_eq!(
-            plan.decisions[0].kernel_predicate.referenced_columns,
+            plan.decisions[0].filter_analysis.referenced_columns,
             vec!["ghost_column", "region"]
         );
         assert_eq!(
-            plan.decisions[0].kernel_predicate.partition_columns,
+            plan.decisions[0].filter_analysis.partition_columns,
             vec!["region"]
         );
         assert_eq!(
-            plan.decisions[0].kernel_predicate.unknown_columns,
+            plan.decisions[0].filter_analysis.unknown_columns,
             vec!["ghost_column"]
         );
-        assert!(plan.decisions[0].kernel_predicate.predicate.is_none());
-        assert!(plan.decisions[0].kernel_predicate.adapter_error.is_none());
+        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_none());
+        assert!(
+            plan.decisions[0]
+                .filter_analysis
+                .kernel_adapter_error
+                .is_none()
+        );
 
         Ok(())
     }
@@ -671,19 +707,24 @@ mod tests {
         assert_eq!(plan.pushed_filter_count, 0);
         assert_eq!(plan.residual_filter_count, 1);
         assert_eq!(
-            plan.decisions[0].kernel_predicate.referenced_columns,
+            plan.decisions[0].filter_analysis.referenced_columns,
             vec!["profile.age"]
         );
         assert_eq!(
-            plan.decisions[0].kernel_predicate.unknown_columns,
+            plan.decisions[0].filter_analysis.unknown_columns,
             vec!["profile.age"]
         );
         assert_eq!(
             plan.decisions[0].rejection_reason,
             Some(DeltaFilterPushdownRejectionReason::UnknownColumn)
         );
-        assert!(plan.decisions[0].kernel_predicate.predicate.is_none());
-        assert!(plan.decisions[0].kernel_predicate.adapter_error.is_none());
+        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_none());
+        assert!(
+            plan.decisions[0]
+                .filter_analysis
+                .kernel_adapter_error
+                .is_none()
+        );
 
         Ok(())
     }
@@ -711,20 +752,25 @@ mod tests {
         assert_eq!(plan.unsupported_count, 1);
         assert_eq!(plan.residual_filter_count, 1);
         assert_eq!(
-            plan.decisions[0].kernel_predicate.referenced_columns,
+            plan.decisions[0].filter_analysis.referenced_columns,
             vec!["profile.address.city"]
         );
         assert_eq!(
-            plan.decisions[0].kernel_predicate.unknown_columns,
+            plan.decisions[0].filter_analysis.unknown_columns,
             vec!["profile.address.city"]
         );
-        assert!(plan.decisions[0].kernel_predicate.data_columns.is_empty());
+        assert!(plan.decisions[0].filter_analysis.data_columns.is_empty());
         assert_eq!(
             plan.decisions[0].rejection_reason,
             Some(DeltaFilterPushdownRejectionReason::UnknownColumn)
         );
-        assert!(plan.decisions[0].kernel_predicate.predicate.is_none());
-        assert!(plan.decisions[0].kernel_predicate.adapter_error.is_none());
+        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_none());
+        assert!(
+            plan.decisions[0]
+                .filter_analysis
+                .kernel_adapter_error
+                .is_none()
+        );
 
         Ok(())
     }
@@ -750,11 +796,11 @@ mod tests {
         assert!(analysis.unknown_columns.is_empty());
         assert_eq!(
             rejection_reason,
-            DeltaFilterPushdownRejectionReason::InitialPolicy
+            DeltaFilterPushdownRejectionReason::UnsupportedByPolicy
         );
-        assert!(analysis.predicate.is_none());
+        assert!(analysis.kernel_predicate.is_none());
         assert_eq!(
-            analysis.adapter_error,
+            analysis.kernel_adapter_error,
             Some(DeltaKernelPredicateAdapterError::UnsupportedColumnReference)
         );
 
