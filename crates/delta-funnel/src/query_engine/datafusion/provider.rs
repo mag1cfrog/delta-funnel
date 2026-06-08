@@ -118,6 +118,7 @@ impl DeltaTableProvider {
         let normalized_pushed_filters = self.normalize_provider_filters(pushed_filters);
         let pushed_filter_plan = self.plan_normalized_provider_filters(&normalized_pushed_filters);
         self.reject_unaccepted_pushed_filters(&pushed_filter_plan)?;
+        self.reject_projected_inexact_pushed_filters(&scan_projection, &pushed_filter_plan)?;
         // Build the provider-side predicate before constructing the kernel
         // scan. This makes the partition pruning contract explicit: the exact
         // filters are accepted only because this predicate can later be applied
@@ -173,26 +174,40 @@ impl DeltaTableProvider {
         )
     }
 
-    /// Rejects pushed filters that this provider cannot fully apply.
+    /// Rejects pushed filters that this provider cannot safely use.
     ///
-    /// DataFusion treats pushed filters as provider-owned work. If any pushed
-    /// filter is unsupported, inexact, or residual, accepting the scan would
-    /// risk dropping part of the original filter.
+    /// Exact filters are fully provider-owned. Inexact filters are accepted only
+    /// when planning attached a provider-owned partition metadata expression; the
+    /// original filter remains DataFusion's residual work.
     fn reject_unaccepted_pushed_filters(
         &self,
         pushed_filter_plan: &DeltaFilterPushdownPlan,
     ) -> Result<(), DeltaFunnelError> {
-        // The scan contract can only accept filters that are fully applied by
-        // this provider. Anything unsupported, inexact, or residual must be
-        // rejected instead of being passed to delta_kernel partially.
-        if pushed_filter_plan.unsupported_count > 0
-            || pushed_filter_plan.inexact_count > 0
-            || pushed_filter_plan.residual_filter_count > 0
-        {
+        let missing_provider_predicate = pushed_filter_plan.decisions.iter().any(|decision| {
+            decision.outcome != DeltaFilterPushdownOutcome::Unsupported
+                && decision.partition_metadata_filter.is_none()
+        });
+        if pushed_filter_plan.unsupported_count > 0 || missing_provider_predicate {
             return Err(DeltaFunnelError::DeltaScanFilter {
                 source_name: self.source_name().to_owned(),
                 table_uri: self.source.table_uri().to_owned(),
                 reason: "pushed filters must be exact partition predicates".to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn reject_projected_inexact_pushed_filters(
+        &self,
+        scan_projection: &Option<Vec<usize>>,
+        pushed_filter_plan: &DeltaFilterPushdownPlan,
+    ) -> Result<(), DeltaFunnelError> {
+        if pushed_filter_plan.inexact_count > 0 && scan_projection.is_some() {
+            return Err(DeltaFunnelError::DeltaScanFilter {
+                source_name: self.source_name().to_owned(),
+                table_uri: self.source.table_uri().to_owned(),
+                reason: "projected inexact pushed filters are not yet supported".to_owned(),
             });
         }
 
@@ -216,9 +231,14 @@ impl DeltaTableProvider {
         let predicates = pushed_filter_plan
             .decisions
             .iter()
-            .filter(|decision| decision.outcome == DeltaFilterPushdownOutcome::Exact)
-            .map(|decision| {
-                let filter = normalized_pushed_filters.get(decision.input_index).ok_or_else(|| {
+            .filter_map(|decision| {
+                decision
+                    .partition_metadata_filter
+                    .as_ref()
+                    .map(|filter| (decision, filter))
+            })
+            .map(|(decision, partition_metadata_filter)| {
+                let _filter = normalized_pushed_filters.get(decision.input_index).ok_or_else(|| {
                     DeltaFunnelError::DeltaScanFilter {
                         source_name: self.source_name().to_owned(),
                         table_uri: self.source.table_uri().to_owned(),
@@ -227,7 +247,7 @@ impl DeltaTableProvider {
                 })?;
 
                 DeltaPartitionMetadataPredicate::from_datafusion_expr(
-                    filter,
+                    partition_metadata_filter,
                     &self.schema,
                     &partition_columns,
                     &physical_name_lookup,
@@ -1082,7 +1102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_provider_scan_rejects_mixed_boolean_partition_filters()
+    async fn table_provider_scan_handles_mixed_boolean_partition_filters()
     -> Result<(), Box<dyn std::error::Error>> {
         const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"day\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
         let table = DeltaLogTable::new_with_schema(
@@ -1116,6 +1136,7 @@ mod tests {
                 partition_in.clone().and(
                     datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1_i64)),
                 ),
+                true,
             ),
             (
                 "partition in or data",
@@ -1123,6 +1144,7 @@ mod tests {
                     .clone()
                     .or(datafusion::logical_expr::col("id")
                         .eq(datafusion::logical_expr::lit(1_i64))),
+                false,
             ),
             (
                 "partition equality or data",
@@ -1130,6 +1152,7 @@ mod tests {
                     .eq(datafusion::logical_expr::lit("us-west"))
                     .or(datafusion::logical_expr::col("id")
                         .eq(datafusion::logical_expr::lit(1_i64))),
+                false,
             ),
             (
                 "partition in or unknown",
@@ -1137,6 +1160,7 @@ mod tests {
                     .clone()
                     .or(datafusion::logical_expr::col("ghost")
                         .eq(datafusion::logical_expr::lit("x"))),
+                false,
             ),
             (
                 "partition in or nested field",
@@ -1144,26 +1168,51 @@ mod tests {
                     .clone()
                     .or(datafusion::logical_expr::col("profile.age")
                         .eq(datafusion::logical_expr::lit(1_i64))),
+                false,
             ),
             (
                 "nested exact partition or and data",
                 exact_partition_or.and(
                     datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1_i64)),
                 ),
+                true,
             ),
         ];
 
-        for (name, filter) in filters {
+        for (name, filter, should_accept) in filters {
             let result = provider
                 .scan(&state, None, std::slice::from_ref(&filter), None)
                 .await;
 
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            if should_accept {
+                let plan = result?;
+                let scan = plan
+                    .as_any()
+                    .downcast_ref::<DeltaScanPlanningExec>()
+                    .ok_or("expected DeltaScanPlanningExec")?;
+                assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0, "{name}");
+                assert_eq!(
+                    scan.scan_plan().pushed_filter_plan.inexact_count,
+                    1,
+                    "{name}"
+                );
+                assert_eq!(
+                    scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                    1,
+                    "{name}"
+                );
+                assert!(
+                    scan.scan_plan().partition_metadata_filter.is_some(),
+                    "{name}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(DataFusionError::External(error)) if error
+                        .to_string()
+                        .contains("pushed filters must be exact partition predicates")),
+                    "{name} should be rejected"
+                );
+            }
         }
 
         Ok(())
@@ -1204,7 +1253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_provider_scan_rejects_convertible_filter_injection()
+    async fn table_provider_scan_accepts_convertible_mixed_partition_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "table-provider-convertible-filter-injection",
@@ -1233,12 +1282,51 @@ mod tests {
                 datafusion::logical_expr::lit(20),
             ));
 
-        let result = provider.scan(&state, None, &[filter], None).await;
+        let plan = provider.scan(&state, None, &[filter], None).await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().partition_metadata_filter.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_projected_inexact_mixed_partition_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "table-provider-projected-inexact-mixed-partition-filter",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![0];
+        let filter = datafusion::logical_expr::col("region")
+            .eq(datafusion::logical_expr::lit("us-west"))
+            .and(datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1)));
+
+        let result = provider
+            .scan(&state, Some(&projection), &[filter], None)
+            .await;
 
         assert!(
             matches!(result, Err(DataFusionError::External(error)) if error
-            .to_string()
-            .contains("pushed filters must be exact partition predicates"))
+                .to_string()
+                .contains("projected inexact pushed filters are not yet supported"))
         );
 
         Ok(())
