@@ -1272,6 +1272,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_provider_scan_rejects_ambiguous_partition_column_references()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DOTTED_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"address.city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
+        struct RejectedReferenceProbe {
+            name: &'static str,
+            schema_fields_json: &'static str,
+            partition_columns_json: &'static str,
+            add_partition_values_json: &'static str,
+            filter: Expr,
+        }
+
+        let cases = [
+            RejectedReferenceProbe {
+                name: "wrong-case partition reference",
+                schema_fields_json: PARTITIONED_SCHEMA_FIELDS_JSON,
+                partition_columns_json: r#"["region"]"#,
+                add_partition_values_json: r#""partitionValues":{"region":"us-west"}"#,
+                filter: Expr::Column(datafusion::common::Column::new_unqualified("Region"))
+                    .eq(datafusion::logical_expr::lit("us-west")),
+            },
+            RejectedReferenceProbe {
+                name: "dotted partition reference",
+                schema_fields_json: DOTTED_PARTITION_SCHEMA_FIELDS_JSON,
+                partition_columns_json: r#"["address.city"]"#,
+                add_partition_values_json: r#""partitionValues":{"address.city":"Phoenix"}"#,
+                filter: datafusion::logical_expr::col("address.city")
+                    .eq(datafusion::logical_expr::lit("Phoenix")),
+            },
+            RejectedReferenceProbe {
+                name: "nested data field reference",
+                schema_fields_json: NESTED_SCHEMA_FIELDS_JSON,
+                partition_columns_json: "[]",
+                add_partition_values_json: r#""partitionValues":{}"#,
+                filter: datafusion::logical_expr::col("profile.age")
+                    .gt(datafusion::logical_expr::lit(21)),
+            },
+        ];
+
+        for case in cases {
+            let table = DeltaLogTable::new_with_schema(
+                case.name,
+                case.schema_fields_json,
+                case.partition_columns_json,
+                case.add_partition_values_json,
+            )?;
+            let source = load_delta_source(DeltaSourceConfig {
+                name: "orders".to_owned(),
+                table_uri: table.path().to_string_lossy().to_string(),
+                version: None,
+            })?;
+            let preflight = preflight_delta_protocol(&source)?;
+            let provider = DeltaTableProvider::try_new(source, preflight)?;
+            let state = SessionContext::new().state();
+
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&case.filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{} should be rejected",
+                case.name
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn table_provider_scan_accepts_convertible_mixed_partition_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
