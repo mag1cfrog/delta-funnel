@@ -160,6 +160,30 @@ fn residual_term_is_safe(
             .column_refs()
             .iter()
             .all(|column| schema.field_with_name(&column.name).is_ok())
+        && residual_term_has_valid_boolean_shorthand(term, schema)
+}
+
+fn residual_term_has_valid_boolean_shorthand(term: &Expr, schema: &SchemaRef) -> bool {
+    match term {
+        Expr::Column(column) => is_schema_column_boolean(column, schema),
+        Expr::Not(inner) => residual_term_has_valid_boolean_shorthand(inner.as_ref(), schema),
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
+            residual_term_has_valid_boolean_shorthand(binary.left.as_ref(), schema)
+                && residual_term_has_valid_boolean_shorthand(binary.right.as_ref(), schema)
+        }
+        Expr::BinaryExpr(_)
+        | Expr::Between(_)
+        | Expr::InList(_)
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_) => true,
+        _ => false,
+    }
+}
+
+fn is_schema_column_boolean(column: &Column, schema: &SchemaRef) -> bool {
+    schema
+        .field_with_name(&column.name)
+        .is_ok_and(|field| matches!(field.data_type(), DataType::Boolean))
 }
 
 /// Checks whether the expression shape is supported by the provider exact
@@ -221,9 +245,7 @@ fn is_supported_partition_boolean_shorthand(column: &Column, schema: &SchemaRef)
         return false;
     }
 
-    schema
-        .field_with_name(&column.name)
-        .is_ok_and(|field| matches!(field.data_type(), DataType::Boolean))
+    is_schema_column_boolean(column, schema)
 }
 
 /// Accepts one column/literal range comparison if the metadata type policy can prove it.
@@ -1714,6 +1736,37 @@ mod tests {
     }
 
     #[test]
+    fn partition_operator_planner_accepts_boolean_data_shorthand_residuals() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["region"]);
+        let partition_filter = col("region").eq(lit("us-west"));
+        let filters = [
+            partition_filter.clone().and(col("is_current")),
+            partition_filter.and(Expr::Not(Box::new(col("is_current")))),
+        ];
+
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Inexact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Inexact
+                && decision.partition_metadata_filter.is_some()
+        }));
+    }
+
+    #[test]
     fn partition_operator_planner_rejects_unsafe_mixed_extraction_shapes() {
         let schema = schema();
         let partition_columns = partition_columns(&["region"]);
@@ -1745,6 +1798,8 @@ mod tests {
             partition_filter
                 .clone()
                 .and(col("id").gt(lit(1_i64)).alias("id_is_large")),
+            partition_filter.clone().and(col("id")),
+            partition_filter.clone().and(Expr::Not(Box::new(col("id")))),
             partition_filter.and(scalar_function_filter),
         ];
 
