@@ -124,6 +124,7 @@ mod tests {
             DataType::Float32,
             DataType::Float64,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
             DataType::Binary,
         ];
         let unsupported = [
@@ -132,7 +133,6 @@ mod tests {
             DataType::Decimal128(39, 2),
             DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
             DataType::Timestamp(TimeUnit::Microsecond, Some("America/Phoenix".into())),
-            DataType::Timestamp(TimeUnit::Microsecond, None),
         ];
 
         assert!(

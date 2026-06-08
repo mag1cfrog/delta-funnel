@@ -21,6 +21,7 @@ pub(super) enum PartitionMetadataValueKind {
     Float32,
     Float64,
     TimestampUtc,
+    TimestampNtz,
     Binary,
 }
 
@@ -61,6 +62,7 @@ impl PartitionMetadataValueKind {
             {
                 Some(Self::TimestampUtc)
             }
+            DataType::Timestamp(TimeUnit::Microsecond, None) => Some(Self::TimestampNtz),
             DataType::Binary => Some(Self::Binary),
             _ => None,
         }
@@ -78,7 +80,8 @@ impl PartitionMetadataValueKind {
             | Self::Decimal { .. }
             | Self::Float32
             | Self::Float64
-            | Self::TimestampUtc => true,
+            | Self::TimestampUtc
+            | Self::TimestampNtz => true,
             Self::Boolean | Self::Binary => false,
         }
     }
@@ -91,7 +94,8 @@ impl PartitionMetadataValueKind {
             | Self::Decimal { .. }
             | Self::Float32
             | Self::Float64
-            | Self::TimestampUtc => true,
+            | Self::TimestampUtc
+            | Self::TimestampNtz => true,
             Self::Boolean | Self::Binary => false,
         }
     }
@@ -113,6 +117,9 @@ impl PartitionMetadataValueKind {
             Self::Float64 => parse_float64(raw_value).map(PartitionScalar::Float64),
             Self::TimestampUtc => {
                 parse_delta_timestamp_utc(raw_value).map(PartitionScalar::TimestampUtc)
+            }
+            Self::TimestampNtz => {
+                parse_delta_timestamp_ntz(raw_value).map(PartitionScalar::TimestampNtz)
             }
             Self::Binary => (!raw_value.is_empty())
                 .then(|| PartitionScalar::Binary(raw_value.as_bytes().to_vec())),
@@ -169,6 +176,15 @@ fn parse_delta_timestamp_utc(raw_value: &str) -> Option<i64> {
             timestamp.and_utc().timestamp_subsec_nanos(),
         )
     }
+}
+
+fn parse_delta_timestamp_ntz(raw_value: &str) -> Option<i64> {
+    let timestamp = NaiveDateTime::parse_from_str(raw_value, "%Y-%m-%d %H:%M:%S%.f").ok()?;
+
+    microsecond_exact_timestamp(
+        timestamp.and_utc().timestamp(),
+        timestamp.and_utc().timestamp_subsec_nanos(),
+    )
 }
 
 fn microsecond_exact_timestamp(seconds: i64, nanos: u32) -> Option<i64> {
@@ -333,6 +349,7 @@ pub(super) enum PartitionScalar {
     Float32(u32),
     Float64(u64),
     TimestampUtc(i64),
+    TimestampNtz(i64),
     Binary(Vec<u8>),
 }
 
@@ -350,6 +367,7 @@ impl PartitionScalar {
                 Some(f64::from_bits(*left).total_cmp(&f64::from_bits(*right)))
             }
             (Self::TimestampUtc(left), Self::TimestampUtc(right)) => Some(left.cmp(right)),
+            (Self::TimestampNtz(left), Self::TimestampNtz(right)) => Some(left.cmp(right)),
             _ => None,
         }
     }
@@ -445,6 +463,13 @@ mod tests {
             Some(PartitionMetadataValueKind::TimestampUtc)
         );
         assert_eq!(
+            PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                None
+            )),
+            Some(PartitionMetadataValueKind::TimestampNtz)
+        );
+        assert_eq!(
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Binary),
             Some(PartitionMetadataValueKind::Binary)
         );
@@ -459,13 +484,6 @@ mod tests {
             PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
                 TimeUnit::Microsecond,
                 Some("America/Phoenix".into())
-            )),
-            None
-        );
-        assert_eq!(
-            PartitionMetadataValueKind::from_supported_data_type(&DataType::Timestamp(
-                TimeUnit::Microsecond,
-                None
             )),
             None
         );
@@ -616,6 +634,45 @@ mod tests {
         assert_eq!(PartitionMetadataValueKind::TimestampUtc.parse_raw(""), None);
         assert!(PartitionMetadataValueKind::TimestampUtc.supports_ordering());
         assert!(PartitionMetadataValueKind::TimestampUtc.supports_between());
+    }
+
+    #[test]
+    fn timestamp_ntz_value_kind_parses_metadata_text_to_microseconds() {
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampNtz.parse_raw("1970-01-01 00:00:00"),
+            Some(PartitionScalar::TimestampNtz(0))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampNtz.parse_raw("1970-01-01 00:00:00.000000"),
+            Some(PartitionScalar::TimestampNtz(0))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampNtz.parse_raw("2026-01-01 00:00:00.123456"),
+            Some(PartitionScalar::TimestampNtz(1_767_225_600_123_456))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampNtz.parse_raw("1969-12-31 23:59:59.999999"),
+            Some(PartitionScalar::TimestampNtz(-1))
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampNtz.parse_raw("2026-01-01T00:00:00.123456Z"),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampNtz.parse_raw("2026-01-01T00:00:00+00:00"),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampNtz.parse_raw("2026-01-01 00:00:00.123456789"),
+            None
+        );
+        assert_eq!(
+            PartitionMetadataValueKind::TimestampNtz.parse_raw("2026-01-01"),
+            None
+        );
+        assert_eq!(PartitionMetadataValueKind::TimestampNtz.parse_raw(""), None);
+        assert!(PartitionMetadataValueKind::TimestampNtz.supports_ordering());
+        assert!(PartitionMetadataValueKind::TimestampNtz.supports_between());
     }
 
     #[test]

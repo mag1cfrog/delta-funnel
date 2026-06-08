@@ -75,6 +75,22 @@ mod test_support {
             partition_columns_json: &str,
             add_partition_values_jsons: &[&str],
         ) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_schema_protocol_and_adds(
+                name,
+                PROTOCOL_JSON,
+                schema_fields_json,
+                partition_columns_json,
+                add_partition_values_jsons,
+            )
+        }
+
+        pub(crate) fn new_with_schema_protocol_and_adds(
+            name: &str,
+            protocol_json: &str,
+            schema_fields_json: &str,
+            partition_columns_json: &str,
+            add_partition_values_jsons: &[&str],
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let path = Path::new("target")
                 .join("delta-funnel-datafusion-provider-tests")
                 .join(unique_name(name)?);
@@ -84,7 +100,7 @@ mod test_support {
                 log_path.join("00000000000000000000.json"),
                 format!(
                     "{}\n{}\n",
-                    PROTOCOL_JSON,
+                    protocol_json,
                     metadata_json(schema_fields_json, partition_columns_json)
                 ),
             )?;
