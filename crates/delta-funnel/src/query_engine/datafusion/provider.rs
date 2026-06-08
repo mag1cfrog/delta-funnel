@@ -1495,6 +1495,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_partition_pruning_keeps_residual_column_below_final_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MIXED_FILTER_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema(
+            "mixed-partition-pruning-residual-projection",
+            MIXED_FILTER_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql("select id from orders where region = 'us-west' and customer_name = 'alice'")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert_eq!(physical_plan.schema().fields().len(), 1);
+        assert_eq!(physical_plan.schema().field(0).name(), "id");
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0, 1]));
+        assert_eq!(scans[0].schema().fields().len(), 2);
+        assert_eq!(scans[0].schema().field(0).name(), "id");
+        assert_eq!(scans[0].schema().field(1).name(), "customer_name");
+        assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+        assert_eq!(scans[0].scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .residual_filter_count,
+            0
+        );
+        assert!(scans[0].scan_plan().partition_metadata_filter.is_some());
+        let kernel_names = scans[0]
+            .scan_plan()
+            .kernel_scan()
+            .kernel_schema()
+            .fields()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kernel_names, vec!["id", "customer_name"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sql_exact_partition_filter_is_pushed_without_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
