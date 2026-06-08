@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_pushdown_accepts_string_null_checks_and_rejects_other_shapes()
+    fn filter_pushdown_rejects_string_null_checks_and_other_unsupported_shapes()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "filter-pushdown-partition-in",
@@ -289,13 +289,13 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Unsupported,
             ]
         );
-        assert_eq!(plan.exact_count, 1);
+        assert_eq!(plan.exact_count, 0);
         assert_eq!(plan.inexact_count, 0);
-        assert_eq!(plan.unsupported_count, 5);
-        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(plan.unsupported_count, 6);
+        assert_eq!(plan.residual_filter_count, 6);
 
         Ok(())
     }

@@ -643,11 +643,14 @@ mod tests {
     #[tokio::test]
     async fn table_provider_scan_accepts_exact_partition_equality_filter()
     -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new_with_schema(
+        let table = DeltaLogTable::new_with_schema_and_adds(
             "table-provider-exact-partition-filter",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
-            r#""partitionValues":{"region":"us-west"}"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+            ],
         )?;
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
@@ -670,15 +673,18 @@ mod tests {
         assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.pushed_filter_count, 1);
+        assert!(scan.scan_plan().partition_metadata_filter.is_none());
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn table_provider_scan_accepts_exact_partition_in_filter()
+    async fn table_provider_scan_rejects_partition_in_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
-            "table-provider-exact-partition-in-filter",
+            "table-provider-rejected-partition-in-filter",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
@@ -699,25 +705,22 @@ mod tests {
             false,
         );
 
-        let plan = provider.scan(&state, None, &[filter], None).await?;
-        let scan = plan
-            .as_any()
-            .downcast_ref::<DeltaScanPlanningExec>()
-            .ok_or("expected DeltaScanPlanningExec")?;
+        let result = provider.scan(&state, None, &[filter], None).await;
 
-        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 0);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.pushed_filter_count, 1);
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+                .to_string()
+                .contains("pushed filters must be exact partition predicates"))
+        );
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn exact_partition_predicates_prune_null_missing_and_empty_values_distinctly()
+    async fn exact_string_partition_predicates_use_kernel_pruning()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "exact-partition-null-missing-empty-pruning",
+            "exact-string-partition-kernel-pruning",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             &[
@@ -744,125 +747,14 @@ mod tests {
                 vec!["part-00000.parquet"],
             ),
             (
-                "in list with non-empty values",
-                datafusion::logical_expr::col("region").in_list(
-                    vec![
-                        datafusion::logical_expr::lit("us-west"),
-                        datafusion::logical_expr::lit("us-east"),
-                    ],
-                    false,
-                ),
-                vec!["part-00000.parquet", "part-00001.parquet"],
-            ),
-            (
-                "is null",
-                datafusion::logical_expr::col("region").is_null(),
-                vec!["part-00002.parquet", "part-00004.parquet"],
-            ),
-            (
-                "is not null",
-                datafusion::logical_expr::col("region").is_not_null(),
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00003.parquet",
-                ],
-            ),
-            (
-                "not equality",
+                "equality terms in top-level and",
                 datafusion::logical_expr::col("region")
-                    .not_eq(datafusion::logical_expr::lit("us-west")),
-                vec!["part-00001.parquet", "part-00003.parquet"],
-            ),
-            (
-                "not equality expression",
-                Expr::Not(Box::new(
-                    datafusion::logical_expr::col("region")
-                        .eq(datafusion::logical_expr::lit("us-west")),
-                )),
-                vec!["part-00001.parquet", "part-00003.parquet"],
-            ),
-            (
-                "not in list",
-                datafusion::logical_expr::col("region").in_list(
-                    vec![
-                        datafusion::logical_expr::lit("us-west"),
-                        datafusion::logical_expr::lit("us-east"),
-                    ],
-                    true,
-                ),
-                vec!["part-00003.parquet"],
-            ),
-            (
-                "not in expression",
-                Expr::Not(Box::new(datafusion::logical_expr::col("region").in_list(
-                    vec![
-                        datafusion::logical_expr::lit("us-west"),
-                        datafusion::logical_expr::lit("us-east"),
-                    ],
-                    false,
-                ))),
-                vec!["part-00003.parquet"],
-            ),
-            (
-                "less than",
-                datafusion::logical_expr::col("region")
-                    .lt(datafusion::logical_expr::lit("us-west")),
-                vec!["part-00001.parquet", "part-00003.parquet"],
-            ),
-            (
-                "less than or equal",
-                datafusion::logical_expr::col("region")
-                    .lt_eq(datafusion::logical_expr::lit("us-east")),
-                vec!["part-00001.parquet", "part-00003.parquet"],
-            ),
-            (
-                "greater than",
-                datafusion::logical_expr::col("region")
-                    .gt(datafusion::logical_expr::lit("us-east")),
+                    .eq(datafusion::logical_expr::lit("us-west"))
+                    .and(
+                        datafusion::logical_expr::col("region")
+                            .eq(datafusion::logical_expr::lit("us-west")),
+                    ),
                 vec!["part-00000.parquet"],
-            ),
-            (
-                "greater than or equal",
-                datafusion::logical_expr::col("region")
-                    .gt_eq(datafusion::logical_expr::lit("us-west")),
-                vec!["part-00000.parquet"],
-            ),
-            (
-                "between",
-                datafusion::logical_expr::col("region").between(
-                    datafusion::logical_expr::lit("us-east"),
-                    datafusion::logical_expr::lit("us-west"),
-                ),
-                vec!["part-00000.parquet", "part-00001.parquet"],
-            ),
-            (
-                "not between",
-                datafusion::logical_expr::col("region").not_between(
-                    datafusion::logical_expr::lit("us-east"),
-                    datafusion::logical_expr::lit("us-west"),
-                ),
-                vec!["part-00003.parquet"],
-            ),
-            (
-                "contradictory between",
-                datafusion::logical_expr::col("region").between(
-                    datafusion::logical_expr::lit("z"),
-                    datafusion::logical_expr::lit("a"),
-                ),
-                Vec::new(),
-            ),
-            (
-                "contradictory not between",
-                datafusion::logical_expr::col("region").not_between(
-                    datafusion::logical_expr::lit("z"),
-                    datafusion::logical_expr::lit("a"),
-                ),
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00003.parquet",
-                ],
             ),
         ];
 
@@ -882,7 +774,11 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scan.scan_plan().partition_metadata_filter.is_some(),
+                scan.scan_plan().partition_metadata_filter.is_none(),
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
@@ -892,10 +788,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_provider_scan_rejects_empty_string_partition_literals()
+    async fn table_provider_scan_rejects_unsupported_string_partition_shapes()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "table-provider-empty-string-partition-literals",
+            "table-provider-unsupported-string-partition-shapes",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             &[
@@ -915,6 +811,11 @@ mod tests {
             (
                 "empty string equality",
                 datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("")),
+            ),
+            ("is null", datafusion::logical_expr::col("region").is_null()),
+            (
+                "is not null",
+                datafusion::logical_expr::col("region").is_not_null(),
             ),
             (
                 "empty string in",

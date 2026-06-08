@@ -44,8 +44,8 @@ pub(crate) struct ProviderScanPlan {
     pub(crate) partition_metadata_filter: Option<DeltaPartitionMetadataPredicate>,
     /// Kernel predicate passed to delta_kernel scan planning for partition pruning.
     ///
-    /// This is empty until the kernel-native #64 migration slices replace the
-    /// provider-owned metadata predicate path for accepted pushdown filters.
+    /// This is set when accepted exact partition filters are enforced by the
+    /// kernel scan path instead of the provider-owned metadata predicate path.
     pub(crate) kernel_partition_predicate: Option<DeltaKernelPredicate>,
     kernel_scan: ProjectedDeltaScan,
 }
