@@ -1,4 +1,4 @@
-//! Static partition predicate pushdown policy.
+//! Static partition filter pushdown policy.
 
 use std::collections::HashSet;
 
@@ -10,9 +10,7 @@ use crate::table_formats::{
     normalize_decimal_partition_literal, supports_partition_metadata_logical_type,
 };
 
-use super::analysis::{
-    DeltaFilterPredicateAnalysis, DeltaFilterPredicateScope, analyze_filter_for_pushdown,
-};
+use super::analysis::{DeltaFilterAnalysis, DeltaFilterColumnScope, analyze_filter_for_pushdown};
 use super::{
     DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan,
     DeltaFilterPushdownRejectionReason,
@@ -57,7 +55,7 @@ fn partition_operator_decision(
 ) -> DeltaFilterPushdownDecision {
     let (filter_analysis, rejection_reason) =
         analyze_filter_for_pushdown(filter, schema, partition_columns);
-    let is_partition_only = filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly;
+    let is_partition_only = filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly;
 
     if is_partition_only && is_supported_partition_operator_filter(filter, schema) {
         return DeltaFilterPushdownDecision {
@@ -113,7 +111,7 @@ fn extract_top_level_and_partition_metadata_filter(
     for term in terms {
         let (term_analysis, term_rejection_reason) =
             analyze_filter_for_pushdown(term, schema, partition_columns);
-        if term_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
+        if term_analysis.scope == DeltaFilterColumnScope::PartitionOnly
             && is_supported_partition_operator_filter(term, schema)
         {
             extracted_terms.push(term.clone());
@@ -146,7 +144,7 @@ fn collect_top_level_and_terms<'a>(filter: &'a Expr, terms: &mut Vec<&'a Expr>) 
 fn residual_term_is_safe(
     term: &Expr,
     schema: &SchemaRef,
-    term_analysis: &DeltaFilterPredicateAnalysis,
+    term_analysis: &DeltaFilterAnalysis,
     rejection_reason: DeltaFilterPushdownRejectionReason,
 ) -> bool {
     // Mixed extraction can leave only policy-rejected predicates as residuals.
@@ -516,9 +514,9 @@ mod tests {
         assert_eq!(plan.decisions[0].partition_metadata_filter, Some(filter));
         assert_eq!(
             plan.decisions[0].filter_analysis.scope,
-            DeltaFilterPredicateScope::PartitionOnly
+            DeltaFilterColumnScope::PartitionOnly
         );
-        assert!(plan.decisions[0].filter_analysis.predicate.is_some());
+        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_some());
     }
 
     #[test]
@@ -569,13 +567,13 @@ mod tests {
         assert_eq!(plan.residual_filter_count, 0);
         assert_eq!(
             plan.decisions[0].filter_analysis.scope,
-            DeltaFilterPredicateScope::PartitionOnly
+            DeltaFilterColumnScope::PartitionOnly
         );
         assert_eq!(
             plan.decisions[0].filter_analysis.partition_columns,
             vec!["region"]
         );
-        assert!(plan.decisions[0].filter_analysis.predicate.is_some());
+        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_some());
     }
 
     #[test]
@@ -601,9 +599,9 @@ mod tests {
         assert_eq!(plan.residual_filter_count, 0);
         assert_eq!(
             plan.decisions[0].filter_analysis.scope,
-            DeltaFilterPredicateScope::PartitionOnly
+            DeltaFilterColumnScope::PartitionOnly
         );
-        assert!(plan.decisions[0].filter_analysis.predicate.is_some());
+        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_some());
     }
 
     #[test]
@@ -635,9 +633,9 @@ mod tests {
             decision.outcome == DeltaFilterPushdownOutcome::Exact
                 && !decision.residual
                 && decision.rejection_reason.is_none()
-                && decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
-                && decision.filter_analysis.predicate.is_some()
-                && decision.filter_analysis.adapter_error.is_none()
+                && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
+                && decision.filter_analysis.kernel_predicate.is_some()
+                && decision.filter_analysis.kernel_adapter_error.is_none()
         }));
     }
 
@@ -667,7 +665,7 @@ mod tests {
         assert!(plan.decisions.iter().all(|decision| {
             decision.outcome == DeltaFilterPushdownOutcome::Exact
                 && !decision.residual
-                && decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
+                && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
         }));
     }
 
@@ -697,7 +695,7 @@ mod tests {
         assert!(plan.decisions.iter().all(|decision| {
             decision.outcome == DeltaFilterPushdownOutcome::Exact
                 && !decision.residual
-                && decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
+                && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
         }));
     }
 
@@ -736,7 +734,7 @@ mod tests {
         assert!(plan.decisions.iter().all(|decision| {
             decision.outcome == DeltaFilterPushdownOutcome::Exact
                 && !decision.residual
-                && decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
+                && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
         }));
     }
 
@@ -1222,7 +1220,7 @@ mod tests {
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
         assert!(plan.decisions.iter().all(|decision| {
-            decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
+            decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
         }));
     }
 
@@ -1278,7 +1276,7 @@ mod tests {
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
         assert!(plan.decisions.iter().all(|decision| {
-            decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
+            decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
         }));
     }
 
@@ -1365,7 +1363,7 @@ mod tests {
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
         assert!(plan.decisions.iter().all(|decision| {
-            decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
+            decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
         }));
     }
 
@@ -1484,7 +1482,7 @@ mod tests {
         assert_eq!(plan.residual_filter_count, 0);
         assert_eq!(
             plan.decisions[0].filter_analysis.scope,
-            DeltaFilterPredicateScope::PartitionOnly
+            DeltaFilterColumnScope::PartitionOnly
         );
     }
 
@@ -1516,8 +1514,8 @@ mod tests {
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
         assert!(plan.decisions.iter().all(|decision| {
-            decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
-                && decision.filter_analysis.adapter_error.is_none()
+            decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
+                && decision.filter_analysis.kernel_adapter_error.is_none()
         }));
     }
 
@@ -1548,8 +1546,8 @@ mod tests {
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
         assert!(plan.decisions.iter().all(|decision| {
-            decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
-                && decision.filter_analysis.adapter_error.is_none()
+            decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
+                && decision.filter_analysis.kernel_adapter_error.is_none()
         }));
     }
 
@@ -1580,8 +1578,8 @@ mod tests {
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
         assert!(plan.decisions.iter().all(|decision| {
-            decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
-                && decision.filter_analysis.adapter_error.is_none()
+            decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
+                && decision.filter_analysis.kernel_adapter_error.is_none()
         }));
     }
 
@@ -1611,8 +1609,8 @@ mod tests {
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
         assert!(plan.decisions.iter().all(|decision| {
-            decision.filter_analysis.scope == DeltaFilterPredicateScope::PartitionOnly
-                && decision.filter_analysis.adapter_error.is_none()
+            decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
+                && decision.filter_analysis.kernel_adapter_error.is_none()
         }));
     }
 
@@ -1996,7 +1994,7 @@ mod tests {
         );
         assert_eq!(plan.unsupported_count, 2);
         assert_eq!(plan.residual_filter_count, 2);
-        assert!(plan.decisions[0].filter_analysis.predicate.is_none());
-        assert!(plan.decisions[1].filter_analysis.predicate.is_none());
+        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_none());
+        assert!(plan.decisions[1].filter_analysis.kernel_predicate.is_none());
     }
 }

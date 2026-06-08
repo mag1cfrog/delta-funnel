@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
-use self::analysis::DeltaFilterPredicateAnalysis;
+use self::analysis::DeltaFilterAnalysis;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeltaFilterPushdownOutcome {
@@ -67,7 +67,7 @@ pub(crate) struct DeltaFilterPushdownDecision {
     /// Conservative rejection reason when the filter is unsupported.
     pub(crate) rejection_reason: Option<DeltaFilterPushdownRejectionReason>,
     /// Provider-boundary diagnostics and column classification for the original filter.
-    pub(crate) filter_analysis: DeltaFilterPredicateAnalysis,
+    pub(crate) filter_analysis: DeltaFilterAnalysis,
     /// Provider-owned partition metadata expression used for scan-file pruning.
     ///
     /// For exact filters this is the original filter. For inexact mixed filters
