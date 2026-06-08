@@ -6037,10 +6037,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decimal_partition_comparisons_are_exact_metadata_pushdown()
+    async fn decimal_partition_comparisons_are_rejected_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "decimal-partition-comparisons",
+            "decimal-partition-comparisons-boundary",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -6069,58 +6069,47 @@ mod tests {
             (
                 "less than",
                 datafusion::logical_expr::col("amount").lt(amount.clone()),
-                vec!["part-00001.parquet", "part-00002.parquet"],
             ),
             (
                 "less than or equal",
                 datafusion::logical_expr::col("amount").lt_eq(negative_different_scale),
-                vec!["part-00002.parquet"],
             ),
             (
                 "greater than",
                 datafusion::logical_expr::col("amount").gt(zero.clone()),
-                vec!["part-00000.parquet"],
             ),
             (
                 "reversed greater than or equal",
                 amount.lt_eq(datafusion::logical_expr::col("amount")),
-                vec!["part-00000.parquet"],
             ),
         ];
 
-        for (name, filter, expected_paths) in cases {
+        for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
-
-            let plan = provider
-                .scan(&state, Some(&vec![0]), &[filter], None)
-                .await?;
-            let scan = plan
-                .as_any()
-                .downcast_ref::<DeltaScanPlanningExec>()
-                .ok_or("expected DeltaScanPlanningExec")?;
-
-            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
             assert_eq!(
-                scan.scan_plan().pushed_filter_plan.residual_filter_count,
-                0,
+                support,
+                vec![TableProviderFilterPushDown::Unsupported],
                 "{name}"
             );
+
+            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
+
             assert!(
-                scan.scan_plan().partition_metadata_filter.is_some(),
-                "{name}"
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
             );
-            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_between_is_exact_metadata_pushdown()
+    async fn decimal_partition_between_filters_are_rejected_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "decimal-partition-between",
+            "decimal-partition-between-boundary",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -6147,48 +6136,39 @@ mod tests {
             (
                 "between inclusive",
                 datafusion::logical_expr::col("amount").between(zero.clone(), amount.clone()),
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "not between",
                 datafusion::logical_expr::col("amount").not_between(zero, amount),
-                vec!["part-00002.parquet"],
             ),
         ];
 
-        for (name, filter, expected_paths) in cases {
+        for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
-
-            let plan = provider
-                .scan(&state, Some(&vec![0]), &[filter], None)
-                .await?;
-            let scan = plan
-                .as_any()
-                .downcast_ref::<DeltaScanPlanningExec>()
-                .ok_or("expected DeltaScanPlanningExec")?;
-
-            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
             assert_eq!(
-                scan.scan_plan().pushed_filter_plan.residual_filter_count,
-                0,
+                support,
+                vec![TableProviderFilterPushDown::Unsupported],
                 "{name}"
             );
+
+            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
+
             assert!(
-                scan.scan_plan().partition_metadata_filter.is_some(),
-                "{name}"
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
             );
-            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_boolean_composition_and_projection_are_exact_metadata_pushdown()
+    async fn decimal_partition_boolean_composition_and_projection_are_rejected_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "decimal-partition-boolean-composition",
+            "decimal-partition-boolean-composition-boundary",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -6225,79 +6205,39 @@ mod tests {
         let whole_not_filter =
             Expr::Not(Box::new(datafusion::logical_expr::col("amount").eq(amount)));
         let cases = [
-            (
-                "separate filters combine with and",
-                separate_and_filters,
-                2,
-                vec!["part-00001.parquet"],
-            ),
-            (
-                "whole and",
-                vec![whole_and_filter],
-                1,
-                vec!["part-00001.parquet"],
-            ),
-            (
-                "whole or",
-                vec![whole_or_filter],
-                1,
-                vec!["part-00000.parquet", "part-00002.parquet"],
-            ),
-            (
-                "whole not",
-                vec![whole_not_filter],
-                1,
-                vec!["part-00001.parquet", "part-00002.parquet"],
-            ),
+            ("separate filters combine with and", separate_and_filters),
+            ("whole and", vec![whole_and_filter]),
+            ("whole or", vec![whole_or_filter]),
+            ("whole not", vec![whole_not_filter]),
         ];
 
-        for (name, filters, expected_exact_count, expected_paths) in cases {
+        for (name, filters) in cases {
             let filter_refs = filters.iter().collect::<Vec<_>>();
             let support = provider.supports_filters_pushdown(&filter_refs)?;
             assert_eq!(
                 support,
-                vec![TableProviderFilterPushDown::Exact; filters.len()],
+                vec![TableProviderFilterPushDown::Unsupported; filters.len()],
                 "{name}"
             );
 
-            let plan = provider
-                .scan(&state, Some(&vec![0]), &filters, None)
-                .await?;
-            let scan = plan
-                .as_any()
-                .downcast_ref::<DeltaScanPlanningExec>()
-                .ok_or("expected DeltaScanPlanningExec")?;
+            let result = provider.scan(&state, Some(&vec![0]), &filters, None).await;
 
-            assert_eq!(
-                scan.scan_plan().projected_schema.field(0).name(),
-                "id",
-                "{name}"
-            );
-            assert_eq!(
-                scan.scan_plan().pushed_filter_plan.exact_count,
-                expected_exact_count,
-                "{name}"
-            );
-            assert_eq!(
-                scan.scan_plan().pushed_filter_plan.residual_filter_count,
-                0,
-                "{name}"
-            );
             assert!(
-                scan.scan_plan().partition_metadata_filter.is_some(),
-                "{name}"
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
             );
-            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_high_precision_values_are_exact_metadata_pushdown()
+    async fn decimal_partition_high_precision_values_are_rejected_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "decimal-partition-high-precision",
+            "decimal-partition-high-precision-boundary",
             HIGH_PRECISION_DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -6334,57 +6274,47 @@ mod tests {
             (
                 "high precision equality",
                 datafusion::logical_expr::col("amount").eq(large_amount.clone()),
-                vec!["part-00001.parquet"],
             ),
             (
                 "high precision ordering",
                 datafusion::logical_expr::col("amount").gt(zero.clone()),
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "high precision between",
                 datafusion::logical_expr::col("amount").between(zero, large_amount),
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "high precision not in",
                 datafusion::logical_expr::col("amount").in_list(vec![small_amount], true),
-                vec!["part-00001.parquet", "part-00002.parquet"],
             ),
         ];
 
-        for (name, filter, expected_paths) in cases {
+        for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
-
-            let plan = provider
-                .scan(&state, Some(&vec![0]), &[filter], None)
-                .await?;
-            let scan = plan
-                .as_any()
-                .downcast_ref::<DeltaScanPlanningExec>()
-                .ok_or("expected DeltaScanPlanningExec")?;
-
             assert_eq!(
-                scan.scan_plan().pushed_filter_plan.residual_filter_count,
-                0,
+                support,
+                vec![TableProviderFilterPushDown::Unsupported],
                 "{name}"
             );
+
+            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
+
             assert!(
-                scan.scan_plan().partition_metadata_filter.is_some(),
-                "{name}"
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
             );
-            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_exponent_metadata_is_exact_metadata_pushdown()
+    async fn decimal_partition_exponent_metadata_is_rejected_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "decimal-partition-exponent-metadata",
+            "decimal-partition-exponent-metadata-boundary",
             HIGH_PRECISION_DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -6406,29 +6336,24 @@ mod tests {
         let filter = datafusion::logical_expr::col("amount").eq(tiny_amount);
 
         let support = provider.supports_filters_pushdown(&[&filter])?;
-        assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
+        assert_eq!(support, vec![TableProviderFilterPushDown::Unsupported]);
 
-        let plan = provider
-            .scan(&state, Some(&vec![0]), &[filter], None)
-            .await?;
-        let scan = plan
-            .as_any()
-            .downcast_ref::<DeltaScanPlanningExec>()
-            .ok_or("expected DeltaScanPlanningExec")?;
+        let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
 
-        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 0);
-        assert!(scan.scan_plan().partition_metadata_filter.is_some());
-        assert_eq!(scan_file_paths(scan)?, vec!["part-00001.parquet"]);
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+                .to_string()
+                .contains("pushed filters must be exact partition predicates"))
+        );
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_equality_and_membership_are_exact_metadata_pushdown()
+    async fn decimal_partition_equality_and_membership_are_rejected_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "decimal-partition-equality-membership",
+            "decimal-partition-equality-membership-boundary",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -6459,17 +6384,14 @@ mod tests {
             (
                 "equality",
                 datafusion::logical_expr::col("amount").eq(amount.clone()),
-                vec!["part-00000.parquet"],
             ),
             (
                 "reversed equality different scale",
                 negative_different_scale.eq(datafusion::logical_expr::col("amount")),
-                vec!["part-00002.parquet"],
             ),
             (
                 "inequality",
                 datafusion::logical_expr::col("amount").not_eq(amount.clone()),
-                vec!["part-00001.parquet", "part-00002.parquet"],
             ),
             (
                 "in list",
@@ -6477,48 +6399,39 @@ mod tests {
                     vec![amount.clone(), zero.clone(), same_amount_different_scale],
                     false,
                 ),
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "not in list",
                 datafusion::logical_expr::col("amount").in_list(vec![amount.clone()], true),
-                vec!["part-00001.parquet", "part-00002.parquet"],
             ),
         ];
 
-        for (name, filter, expected_paths) in cases {
+        for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
-
-            let plan = provider
-                .scan(&state, Some(&vec![0]), &[filter], None)
-                .await?;
-            let scan = plan
-                .as_any()
-                .downcast_ref::<DeltaScanPlanningExec>()
-                .ok_or("expected DeltaScanPlanningExec")?;
-
-            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
             assert_eq!(
-                scan.scan_plan().pushed_filter_plan.residual_filter_count,
-                0,
+                support,
+                vec![TableProviderFilterPushDown::Unsupported],
                 "{name}"
             );
+
+            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
+
             assert!(
-                scan.scan_plan().partition_metadata_filter.is_some(),
-                "{name}"
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
             );
-            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_null_checks_are_exact_metadata_pushdown()
+    async fn decimal_partition_null_checks_are_rejected_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "decimal-partition-null-checks",
+            "decimal-partition-null-checks-boundary",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -6540,52 +6453,29 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
         let cases = [
-            (
-                "is null",
-                datafusion::logical_expr::col("amount").is_null(),
-                vec!["part-00003.parquet", "part-00006.parquet"],
-            ),
+            ("is null", datafusion::logical_expr::col("amount").is_null()),
             (
                 "is not null",
                 datafusion::logical_expr::col("amount").is_not_null(),
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                    "part-00004.parquet",
-                    "part-00005.parquet",
-                ],
             ),
         ];
 
-        for (name, filter, expected_paths) in cases {
+        for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
-
-            let plan = provider
-                .scan(&state, Some(&vec![0]), &[filter], None)
-                .await?;
-            let scan = plan
-                .as_any()
-                .downcast_ref::<DeltaScanPlanningExec>()
-                .ok_or("expected DeltaScanPlanningExec")?;
-
-            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1, "{name}");
             assert_eq!(
-                scan.scan_plan().pushed_filter_plan.unsupported_count,
-                0,
+                support,
+                vec![TableProviderFilterPushDown::Unsupported],
                 "{name}"
             );
-            assert_eq!(
-                scan.scan_plan().pushed_filter_plan.residual_filter_count,
-                0,
-                "{name}"
-            );
+
+            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
+
             assert!(
-                scan.scan_plan().partition_metadata_filter.is_some(),
-                "{name}"
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
             );
-            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
