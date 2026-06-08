@@ -118,7 +118,10 @@ impl DeltaTableProvider {
         let normalized_pushed_filters = self.normalize_provider_filters(pushed_filters);
         let pushed_filter_plan = self.plan_normalized_provider_filters(&normalized_pushed_filters);
         self.reject_unaccepted_pushed_filters(&pushed_filter_plan)?;
-        self.reject_projected_inexact_pushed_filters(&scan_projection, &pushed_filter_plan)?;
+        self.reject_projected_inexact_pushed_filters_without_residual_columns(
+            &scan_projection,
+            &pushed_filter_plan,
+        )?;
         // Build the provider-side predicate before constructing the kernel
         // scan. This makes the partition pruning contract explicit: the exact
         // filters are accepted only because this predicate can later be applied
@@ -198,16 +201,32 @@ impl DeltaTableProvider {
         Ok(())
     }
 
-    fn reject_projected_inexact_pushed_filters(
+    fn reject_projected_inexact_pushed_filters_without_residual_columns(
         &self,
         scan_projection: &Option<Vec<usize>>,
         pushed_filter_plan: &DeltaFilterPushdownPlan,
     ) -> Result<(), DeltaFunnelError> {
-        if pushed_filter_plan.inexact_count > 0 && scan_projection.is_some() {
+        let Some(scan_projection) = scan_projection else {
+            return Ok(());
+        };
+
+        let projected_columns = scan_projection
+            .iter()
+            .map(|index| self.schema.field(*index).name().as_str())
+            .collect::<HashSet<_>>();
+
+        let missing_residual_column = pushed_filter_plan
+            .decisions
+            .iter()
+            .filter(|decision| decision.outcome == DeltaFilterPushdownOutcome::Inexact)
+            .flat_map(|decision| decision.kernel_predicate.referenced_columns.iter())
+            .any(|column| !projected_columns.contains(column.as_str()));
+
+        if missing_residual_column {
             return Err(DeltaFunnelError::DeltaScanFilter {
                 source_name: self.source_name().to_owned(),
                 table_uri: self.source.table_uri().to_owned(),
-                reason: "projected inexact pushed filters are not yet supported".to_owned(),
+                reason: "inexact pushed filter residual columns must be projected".to_owned(),
             });
         }
 
@@ -1326,8 +1345,46 @@ mod tests {
         assert!(
             matches!(result, Err(DataFusionError::External(error)) if error
                 .to_string()
-                .contains("projected inexact pushed filters are not yet supported"))
+                .contains("inexact pushed filter residual columns must be projected"))
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_accepts_projected_inexact_mixed_partition_filter_when_residual_columns_are_projected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "table-provider-projected-inexact-mixed-partition-filter-accepted",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![0, 1];
+        let filter = datafusion::logical_expr::col("region")
+            .eq(datafusion::logical_expr::lit("us-west"))
+            .and(datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1)));
+
+        let plan = provider
+            .scan(&state, Some(&projection), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().scan_projection, Some(vec![0, 1]));
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().partition_metadata_filter.is_some());
 
         Ok(())
     }
