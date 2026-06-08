@@ -8000,7 +8000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_integer_partition_null_checks_are_exact_metadata_pushdown()
+    async fn sql_integer_partition_null_checks_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -8030,23 +8030,14 @@ mod tests {
         )?;
 
         let cases = [
-            (
-                "is null",
-                "select id from orders where long_part is null",
-                vec!["part-00002.parquet", "part-00004.parquet"],
-            ),
+            ("is null", "select id from orders where long_part is null"),
             (
                 "is not null",
                 "select id from orders where long_part is not null",
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00003.parquet",
-                ],
             ),
         ];
 
-        for (name, sql, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -8056,11 +8047,15 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0
+            );
             assert_eq!(
                 scans[0]
                     .scan_plan()
@@ -8069,10 +8064,13 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
@@ -9164,7 +9162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_integer_partition_literal_operators_are_exact_metadata_pushdown()
+    async fn sql_integer_partition_literal_operators_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -9196,79 +9194,44 @@ mod tests {
         )?;
 
         let cases = [
-            (
-                "equality",
-                "select id from orders where long_part = 7",
-                1,
-                vec!["part-00000.parquet"],
-            ),
+            ("equality", "select id from orders where long_part = 7"),
             (
                 "reversed equality",
                 "select id from orders where 7 = long_part",
-                1,
-                vec!["part-00000.parquet"],
             ),
             (
                 "in list",
                 "select id from orders where long_part in (7, -1)",
-                1,
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
-            (
-                "less than",
-                "select id from orders where long_part < 7",
-                1,
-                vec!["part-00001.parquet"],
-            ),
+            ("less than", "select id from orders where long_part < 7"),
             (
                 "less than or equal",
                 "select id from orders where long_part <= -1",
-                1,
-                vec!["part-00001.parquet"],
             ),
-            (
-                "greater than",
-                "select id from orders where long_part > -1",
-                1,
-                vec!["part-00000.parquet", "part-00002.parquet"],
-            ),
+            ("greater than", "select id from orders where long_part > -1"),
             (
                 "reversed greater than",
                 "select id from orders where 7 > long_part",
-                1,
-                vec!["part-00001.parquet"],
             ),
             (
                 "between inclusive",
                 "select id from orders where long_part between -1 and 7",
-                2,
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "not between",
                 "select id from orders where long_part not between -1 and 7",
-                1,
-                vec!["part-00002.parquet"],
             ),
             (
                 "contradictory between",
                 "select id from orders where long_part between 10 and -10",
-                2,
-                Vec::<&str>::new(),
             ),
             (
                 "contradictory not between",
                 "select id from orders where long_part not between 10 and -10",
-                1,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                ],
             ),
         ];
 
-        for (name, sql, expected_exact_count, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -9278,13 +9241,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                expected_exact_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -9295,10 +9263,13 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
