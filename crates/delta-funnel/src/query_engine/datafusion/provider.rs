@@ -1557,6 +1557,28 @@ mod tests {
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
         )?;
+        let probe_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let probe_preflight = preflight_delta_protocol(&probe_source)?;
+        let provider = DeltaTableProvider::try_new(probe_source, probe_preflight)?;
+        let mixed_filter = datafusion::logical_expr::col("region")
+            .eq(datafusion::logical_expr::lit("us-west"))
+            .and(
+                datafusion::logical_expr::col("customer_name")
+                    .eq(datafusion::logical_expr::lit("alice")),
+            );
+
+        // Direct support pins the provider's mixed-AND status. DataFusion's
+        // optimizer then proves the SQL residual contract below by splitting
+        // the top-level AND and keeping the data filter above the scan.
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&mixed_filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
@@ -1571,6 +1593,23 @@ mod tests {
             }],
         )?;
 
+        let optimized_dataframe = ctx
+            .sql("select id from orders where region = 'us-west' and customer_name = 'alice'")
+            .await?;
+        let optimized_plan = optimized_dataframe.into_optimized_plan()?;
+        let optimized_display = optimized_plan.display_indent().to_string();
+
+        assert!(optimized_display.contains("Filter:"), "{optimized_display}");
+        assert!(
+            optimized_display.contains("customer_name"),
+            "{optimized_display}"
+        );
+        assert!(
+            optimized_display.contains("full_filters"),
+            "{optimized_display}"
+        );
+        assert!(optimized_display.contains("region"), "{optimized_display}");
+
         let dataframe = ctx
             .sql("select id from orders where region = 'us-west' and customer_name = 'alice'")
             .await?;
@@ -1582,6 +1621,7 @@ mod tests {
         super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert!(plan_display.contains("customer_name"), "{plan_display}");
         assert_eq!(physical_plan.schema().fields().len(), 1);
         assert_eq!(physical_plan.schema().field(0).name(), "id");
         assert_eq!(scans.len(), 1);
