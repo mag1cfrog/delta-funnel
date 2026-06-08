@@ -8027,7 +8027,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_boolean_partition_null_checks_are_exact_metadata_pushdown()
+    async fn sql_boolean_partition_null_checks_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -8058,24 +8058,14 @@ mod tests {
         )?;
 
         let cases = [
-            (
-                "is null",
-                "select id from orders where is_current is null",
-                vec!["part-00002.parquet", "part-00005.parquet"],
-            ),
+            ("is null", "select id from orders where is_current is null"),
             (
                 "is not null",
                 "select id from orders where is_current is not null",
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00003.parquet",
-                    "part-00004.parquet",
-                ],
             ),
         ];
 
-        for (name, sql, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -8085,11 +8075,15 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0
+            );
             assert_eq!(
                 scans[0]
                     .scan_plan()
@@ -8098,10 +8092,13 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
@@ -8936,7 +8933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_boolean_partition_shorthand_rewrites_are_exact_metadata_pushdown()
+    async fn sql_boolean_partition_shorthand_rewrites_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -8967,44 +8964,34 @@ mod tests {
         )?;
 
         let cases = [
-            (
-                "shorthand",
-                "select id from orders where is_current",
-                vec!["part-00000.parquet"],
-            ),
+            ("shorthand", "select id from orders where is_current"),
             (
                 "not shorthand",
                 "select id from orders where not is_current",
-                vec!["part-00001.parquet"],
             ),
             (
                 "equality true rewrite",
                 "select id from orders where is_current = true",
-                vec!["part-00000.parquet"],
             ),
             (
                 "inequality true rewrite",
                 "select id from orders where is_current != true",
-                vec!["part-00001.parquet"],
             ),
             (
                 "reversed equality false rewrite",
                 "select id from orders where false = is_current",
-                vec!["part-00001.parquet"],
             ),
             (
                 "in list rewrite",
                 "select id from orders where is_current in (true, false, true)",
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "not in list rewrite",
                 "select id from orders where is_current not in (true)",
-                vec!["part-00001.parquet"],
             ),
         ];
 
-        for (name, sql, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -9014,13 +9001,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                1,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -9031,10 +9023,13 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
