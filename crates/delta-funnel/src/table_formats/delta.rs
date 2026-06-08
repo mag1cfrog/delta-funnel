@@ -338,6 +338,38 @@ mod tests {
         Ok(paths)
     }
 
+    fn kernel_partition_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-partition-characterization",
+            PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("region-us-west.parquet", r#"{"region":"us-west"}"#),
+                partitioned_add_json("region-us-east.parquet", r#"{"region":"us-east"}"#),
+                partitioned_add_json("region-null.parquet", r#"{"region":null}"#),
+                partitioned_add_json("region-missing.parquet", r#"{}"#),
+                partitioned_add_json("region-empty-string.parquet", r#"{"region":""}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_predicated_file_paths(
+        source: &super::PlannedDeltaSource,
+        filter: &datafusion::logical_expr::Expr,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let predicate = datafusion_expr_to_kernel_predicate(filter)?;
+        let scan = build_projected_predicated_delta_scan(source, None, Some(predicate))?;
+
+        kernel_scan_file_paths(&scan, source.table_uri())
+    }
+
     #[test]
     fn kernel_partition_characterization_uses_official_delta_kernel_0_23_0() {
         let manifest = include_str!("../../Cargo.toml");
@@ -379,6 +411,68 @@ mod tests {
         assert_eq!(
             kernel_scan_file_paths(&predicated_scan, source.table_uri())?,
             vec!["region-us-west.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_string_null_and_empty_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_partition_characterization_source()?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec![
+                "region-empty-string.parquet",
+                "region-missing.parquet",
+                "region-null.parquet",
+                "region-us-east.parquet",
+                "region-us-west.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("region").is_null())?,
+            vec![
+                "region-empty-string.parquet",
+                "region-missing.parquet",
+                "region-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("region").is_not_null())?,
+            vec!["region-us-east.parquet", "region-us-west.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("region").eq(lit("us-west")))?,
+            vec!["region-us-west.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("region").not_eq(lit("us-west")))?,
+            vec!["region-us-east.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("region").eq(lit("")))?,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("region").not_eq(lit("")))?,
+            vec!["region-us-east.parquet", "region-us-west.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("region").in_list(vec![lit("us-west"), lit("")], false),
+            )?,
+            vec!["region-us-west.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("region").in_list(vec![lit("us-west"), lit("")], true),
+            )?,
+            vec!["region-us-east.parquet"]
         );
 
         Ok(())
