@@ -99,7 +99,7 @@ pub(super) fn analyze_filter_for_pushdown(
 
     let rejection_reason = filter_pushdown_rejection_reason(filter, &unknown_columns);
     let (predicate, adapter_error) =
-        if rejection_reason == DeltaFilterPushdownRejectionReason::InitialPolicy {
+        if rejection_reason == DeltaFilterPushdownRejectionReason::UnsupportedByPolicy {
             match datafusion_expr_to_kernel_predicate(filter) {
                 Ok(predicate) => (Some(predicate), None),
                 Err(error) => (None, Some(error)),
@@ -181,7 +181,7 @@ fn filter_pushdown_rejection_reason(
     }
 
     if is_filter_analysis_candidate(filter) {
-        DeltaFilterPushdownRejectionReason::InitialPolicy
+        DeltaFilterPushdownRejectionReason::UnsupportedByPolicy
     } else {
         DeltaFilterPushdownRejectionReason::ExpressionShape
     }
@@ -192,7 +192,7 @@ fn filter_analysis_scope(
     partition_columns: &[String],
     data_columns: &[String],
 ) -> DeltaFilterPredicateScope {
-    if rejection_reason != DeltaFilterPushdownRejectionReason::InitialPolicy {
+    if rejection_reason != DeltaFilterPushdownRejectionReason::UnsupportedByPolicy {
         return DeltaFilterPredicateScope::Unsupported;
     }
 
@@ -438,7 +438,7 @@ mod tests {
         assert!(plan.decisions[0].filter_analysis.unknown_columns.is_empty());
         assert_eq!(
             plan.decisions[0].rejection_reason,
-            Some(DeltaFilterPushdownRejectionReason::InitialPolicy)
+            Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
         );
         assert!(plan.decisions[0].filter_analysis.predicate.is_some());
         assert!(plan.decisions[0].filter_analysis.adapter_error.is_none());
@@ -555,10 +555,12 @@ mod tests {
         assert_eq!(plan.decisions[3].rejection_reason, None);
         assert!(!plan.decisions[3].residual);
         assert!(plan.decisions[1..3].iter().all(|decision| {
-            decision.rejection_reason == Some(DeltaFilterPushdownRejectionReason::InitialPolicy)
+            decision.rejection_reason
+                == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
         }));
         assert!(plan.decisions[4..].iter().all(|decision| {
-            decision.rejection_reason == Some(DeltaFilterPushdownRejectionReason::InitialPolicy)
+            decision.rejection_reason
+                == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
         }));
         assert_eq!(
             plan.decisions[0].filter_analysis.scope,
@@ -758,7 +760,7 @@ mod tests {
         assert!(analysis.unknown_columns.is_empty());
         assert_eq!(
             rejection_reason,
-            DeltaFilterPushdownRejectionReason::InitialPolicy
+            DeltaFilterPushdownRejectionReason::UnsupportedByPolicy
         );
         assert!(analysis.predicate.is_none());
         assert_eq!(

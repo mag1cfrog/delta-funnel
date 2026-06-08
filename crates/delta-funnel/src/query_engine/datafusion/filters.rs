@@ -27,11 +27,18 @@ impl DeltaFilterPushdownOutcome {
     }
 }
 
+/// Conservative reason a provider-boundary filter was not accepted for pushdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeltaFilterPushdownRejectionReason {
-    InitialPolicy,
+    /// The expression uses known provider columns and an understood predicate
+    /// shape, but current pushdown policy does not accept it as provider-enforced.
+    UnsupportedByPolicy,
+    /// The expression shape is outside the supported provider filter grammar.
     ExpressionShape,
+    /// The expression references a provider-internal synthetic column.
     InternalColumn,
+    /// The expression references at least one column that the provider schema
+    /// cannot resolve as a top-level field.
     UnknownColumn,
 }
 
@@ -40,7 +47,7 @@ impl DeltaFilterPushdownRejectionReason {
     #[must_use]
     pub(crate) fn code(self) -> &'static str {
         match self {
-            Self::InitialPolicy => "unsupported_initial_policy",
+            Self::UnsupportedByPolicy => "unsupported_by_policy",
             Self::ExpressionShape => "unsupported_expression_shape",
             Self::InternalColumn => "unsupported_internal_column",
             Self::UnknownColumn => "unsupported_unknown_column",

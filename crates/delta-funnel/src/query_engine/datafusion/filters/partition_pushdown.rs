@@ -149,11 +149,9 @@ fn residual_term_is_safe(
     term_analysis: &DeltaFilterPredicateAnalysis,
     rejection_reason: DeltaFilterPushdownRejectionReason,
 ) -> bool {
-    if matches!(
-        rejection_reason,
-        DeltaFilterPushdownRejectionReason::InternalColumn
-            | DeltaFilterPushdownRejectionReason::UnknownColumn
-    ) {
+    // Mixed extraction can leave only policy-rejected predicates as residuals.
+    // Shape and column rejections have not been proven safe at this boundary.
+    if rejection_reason != DeltaFilterPushdownRejectionReason::UnsupportedByPolicy {
         return false;
     }
 
@@ -435,7 +433,9 @@ mod tests {
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::ScalarValue;
-    use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, col, lit};
+    use datafusion::logical_expr::{
+        ColumnarValue, Expr, TableProviderFilterPushDown, Volatility, col, create_udf, lit,
+    };
 
     use super::*;
 
@@ -1718,13 +1718,34 @@ mod tests {
         let schema = schema();
         let partition_columns = partition_columns(&["region"]);
         let partition_filter = col("region").eq(lit("us-west"));
+        let scalar_udf = create_udf(
+            "is_interesting",
+            vec![DataType::Int64],
+            DataType::Boolean,
+            Volatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))))),
+        );
+        let scalar_function_filter =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(scalar_udf),
+                vec![col("id")],
+            ));
         let filters = [
             partition_filter.clone().or(col("id").gt(lit(1_i64))),
             Expr::Not(Box::new(
                 partition_filter.clone().and(col("id").gt(lit(1_i64))),
             )),
             partition_filter.clone().and(col("ghost").gt(lit(1_i64))),
-            partition_filter.and(col("profile.age").gt(lit(1_i64))),
+            partition_filter
+                .clone()
+                .and(col("profile.age").gt(lit(1_i64))),
+            partition_filter
+                .clone()
+                .and(datafusion::logical_expr::cast(col("id"), DataType::Int64).gt(lit(1_i64))),
+            partition_filter
+                .clone()
+                .and(col("id").gt(lit(1_i64)).alias("id_is_large")),
+            partition_filter.and(scalar_function_filter),
         ];
 
         let filter_refs = filters.iter().collect::<Vec<_>>();
