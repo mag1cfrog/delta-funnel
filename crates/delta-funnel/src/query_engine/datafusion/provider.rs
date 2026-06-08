@@ -144,6 +144,7 @@ impl DeltaTableProvider {
             scan_projection,
             pushed_filter_plan,
             partition_metadata_filter,
+            kernel_partition_predicate: None,
             kernel_scan,
         }))
     }

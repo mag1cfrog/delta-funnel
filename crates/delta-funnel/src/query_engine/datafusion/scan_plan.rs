@@ -5,7 +5,7 @@ use datafusion::logical_expr::Expr;
 
 use crate::{
     DeltaProtocolReport,
-    table_formats::{DeltaPartitionMetadataPredicate, ProjectedDeltaScan},
+    table_formats::{DeltaKernelPredicate, DeltaPartitionMetadataPredicate, ProjectedDeltaScan},
 };
 
 use super::filters::DeltaFilterPushdownPlan;
@@ -42,6 +42,11 @@ pub(crate) struct ProviderScanPlan {
     /// delta_kernel enumerates candidate files, then this predicate prunes those
     /// files by evaluating their `ScanFile.partition_values`.
     pub(crate) partition_metadata_filter: Option<DeltaPartitionMetadataPredicate>,
+    /// Kernel predicate passed to delta_kernel scan planning for partition pruning.
+    ///
+    /// This is empty until the kernel-native #64 migration slices replace the
+    /// provider-owned metadata predicate path for accepted pushdown filters.
+    pub(crate) kernel_partition_predicate: Option<DeltaKernelPredicate>,
     kernel_scan: ProjectedDeltaScan,
 }
 
@@ -54,6 +59,7 @@ pub(super) struct ProviderScanPlanParts {
     pub(super) scan_projection: Option<Vec<usize>>,
     pub(super) pushed_filter_plan: DeltaFilterPushdownPlan,
     pub(super) partition_metadata_filter: Option<DeltaPartitionMetadataPredicate>,
+    pub(super) kernel_partition_predicate: Option<DeltaKernelPredicate>,
     pub(super) kernel_scan: ProjectedDeltaScan,
 }
 
@@ -68,6 +74,7 @@ impl ProviderScanPlan {
             scan_projection: parts.scan_projection,
             pushed_filter_plan: parts.pushed_filter_plan,
             partition_metadata_filter: parts.partition_metadata_filter,
+            kernel_partition_predicate: parts.kernel_partition_predicate,
             kernel_scan: parts.kernel_scan,
         }
     }
@@ -121,6 +128,7 @@ mod tests {
         assert_eq!(plan.projected_schema.field(1).name(), "customer_name");
         assert_eq!(plan.kernel_scan().kernel_schema().num_fields(), 2);
         assert!(plan.partition_metadata_filter.is_none());
+        assert!(plan.kernel_partition_predicate.is_none());
         let _ = plan.kernel_scan().kernel_scan();
 
         Ok(())
@@ -150,6 +158,7 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 0);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
         assert!(plan.partition_metadata_filter.is_none());
+        assert!(plan.kernel_partition_predicate.is_none());
 
         Ok(())
     }
