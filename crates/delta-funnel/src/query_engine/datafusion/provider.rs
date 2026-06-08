@@ -1317,6 +1317,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_provider_scan_ands_provider_predicates_from_mixed_and_exact_filters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-mixed-and-exact-filter-pruning",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":"eu-central"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let mixed_filter = datafusion::logical_expr::col("region")
+            .in_list(
+                vec![
+                    datafusion::logical_expr::lit("us-west"),
+                    datafusion::logical_expr::lit("us-east"),
+                ],
+                false,
+            )
+            .and(datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1000)));
+        let exact_filter = datafusion::logical_expr::col("region")
+            .not_eq(datafusion::logical_expr::lit("us-east"));
+
+        let plan = provider
+            .scan(&state, None, &[mixed_filter, exact_filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().partition_metadata_filter.is_some());
+        assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn table_provider_scan_rejects_projected_inexact_mixed_partition_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
