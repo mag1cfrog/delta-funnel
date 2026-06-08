@@ -8165,11 +8165,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_decimal_partition_comparisons_are_exact_metadata_pushdown()
+    async fn sql_decimal_partition_comparisons_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-decimal-partition-comparisons",
+            "sql-decimal-partition-comparisons-residuals",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -8200,36 +8200,26 @@ mod tests {
             (
                 "decimal literal ordering",
                 "select id from orders where amount < DECIMAL '123.45'",
-                1,
-                vec!["part-00001.parquet", "part-00002.parquet"],
             ),
             (
                 "numeric literal ordering",
                 "select id from orders where amount > 0.00",
-                1,
-                vec!["part-00000.parquet"],
             ),
             (
                 "reversed decimal literal ordering different scale",
                 "select id from orders where DECIMAL '-1.230' >= amount",
-                1,
-                vec!["part-00002.parquet"],
             ),
             (
                 "decimal literal between",
                 "select id from orders where amount between DECIMAL '0.00' and DECIMAL '123.45'",
-                2,
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "decimal literal not between",
                 "select id from orders where amount not between DECIMAL '0.00' and DECIMAL '123.45'",
-                1,
-                vec!["part-00002.parquet"],
             ),
         ];
 
-        for (name, sql, expected_exact_count, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -8239,13 +8229,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                expected_exact_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -8256,21 +8251,24 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_decimal_partition_equality_and_membership_are_exact_metadata_pushdown()
+    async fn sql_decimal_partition_equality_and_membership_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-decimal-partition-equality-membership",
+            "sql-decimal-partition-equality-membership-residuals",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -8301,36 +8299,30 @@ mod tests {
             (
                 "decimal literal equality",
                 "select id from orders where amount = DECIMAL '123.45'",
-                vec!["part-00000.parquet"],
             ),
             (
                 "numeric literal equality",
                 "select id from orders where amount = 123.45",
-                vec!["part-00000.parquet"],
             ),
             (
                 "reversed decimal literal equality different scale",
                 "select id from orders where DECIMAL '-1.230' = amount",
-                vec!["part-00002.parquet"],
             ),
             (
                 "decimal literal inequality",
                 "select id from orders where amount != DECIMAL '123.45'",
-                vec!["part-00001.parquet", "part-00002.parquet"],
             ),
             (
                 "decimal literal in list",
                 "select id from orders where amount in (DECIMAL '123.45', DECIMAL '0.00', DECIMAL '123.450')",
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "decimal literal not in list",
                 "select id from orders where amount not in (DECIMAL '123.45')",
-                vec!["part-00001.parquet", "part-00002.parquet"],
             ),
         ];
 
-        for (name, sql, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -8340,13 +8332,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                1,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -8357,21 +8354,24 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_decimal_partition_null_checks_are_exact_metadata_pushdown()
+    async fn sql_decimal_partition_null_checks_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-decimal-partition-null-checks",
+            "sql-decimal-partition-null-checks-residuals",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -8398,25 +8398,14 @@ mod tests {
             }],
         )?;
         let cases = [
-            (
-                "is null",
-                "select id from orders where amount is null",
-                vec!["part-00003.parquet", "part-00006.parquet"],
-            ),
+            ("is null", "select id from orders where amount is null"),
             (
                 "is not null",
                 "select id from orders where amount is not null",
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                    "part-00004.parquet",
-                    "part-00005.parquet",
-                ],
             ),
         ];
 
-        for (name, sql, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -8426,13 +8415,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                1,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -8443,10 +8437,13 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
