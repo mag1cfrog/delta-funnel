@@ -279,6 +279,10 @@ fn is_supported_partition_literal_for_column(
             DataType::Timestamp(TimeUnit::Microsecond, Some(column_timezone)),
             Expr::Literal(ScalarValue::TimestampMicrosecond(Some(_), Some(literal_timezone)), _),
         ) if column_timezone.as_ref() == "UTC" && literal_timezone.as_ref() == "UTC" => true,
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(_), None), _),
+        ) => true,
         (data_type, literal) => signed_integer_bounds(data_type)
             .zip(signed_integer_literal_value(literal))
             .is_some_and(|((min, max), value)| min <= value && value <= max),
@@ -310,7 +314,7 @@ fn is_supported_ordering_literal_for_column(
             | DataType::Decimal128(_, _)
             | DataType::Float32
             | DataType::Float64
-            | DataType::Timestamp(TimeUnit::Microsecond, Some(_))
+            | DataType::Timestamp(TimeUnit::Microsecond, _)
     )
 }
 
@@ -826,6 +830,45 @@ mod tests {
     }
 
     #[test]
+    fn partition_operator_planner_accepts_timestamp_ntz_equality_membership_and_ranges() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_ts_ntz"]);
+        let timestamp = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), None),
+            None,
+        );
+        let other = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_000_000), None),
+            None,
+        );
+        let filters = [
+            col("event_ts_ntz").eq(timestamp.clone()),
+            timestamp.clone().eq(col("event_ts_ntz")),
+            col("event_ts_ntz").not_eq(timestamp.clone()),
+            col("event_ts_ntz").in_list(vec![timestamp.clone(), other], false),
+            col("event_ts_ntz").in_list(vec![timestamp.clone()], true),
+            col("event_ts_ntz").gt(timestamp.clone()),
+            timestamp.clone().gt(col("event_ts_ntz")),
+            col("event_ts_ntz").between(timestamp.clone(), timestamp.clone()),
+            col("event_ts_ntz").not_between(timestamp.clone(), timestamp),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
     fn partition_operator_planner_rejects_unproven_timestamp_literal_filters() {
         let schema = schema();
         let partition_columns = partition_columns(&["event_ts"]);
@@ -860,6 +903,40 @@ mod tests {
             col("event_ts").gt(timestamp_non_utc_timezone),
             col("event_ts").between(low, null_timestamp),
             col("event_ts").between(col("id"), timestamp),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_unproven_timestamp_ntz_literal_filters() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_ts_ntz"]);
+        let timestamp = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), None),
+            None,
+        );
+        let timestamp_utc = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
+            None,
+        );
+        let null_timestamp = Expr::Literal(ScalarValue::TimestampMicrosecond(None, None), None);
+        let filters = [
+            col("event_ts_ntz").eq(timestamp_utc.clone()),
+            col("event_ts_ntz").gt(timestamp_utc),
+            col("event_ts_ntz").between(timestamp, null_timestamp),
         ];
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
