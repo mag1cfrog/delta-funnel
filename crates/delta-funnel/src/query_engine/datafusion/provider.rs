@@ -4378,6 +4378,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_timestamp_ntz_partition_equality_and_membership_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_protocol_and_adds(
+            "sql-timestamp-ntz-partition-equality-membership",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TIMESTAMP_NTZ_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_ts_ntz"]"#,
+            &[
+                r#""partitionValues":{"event_ts_ntz":"2026-01-01 00:00:00.123456"}"#,
+                r#""partitionValues":{"event_ts_ntz":"2026-01-01T00:00:00.123456Z"}"#,
+                r#""partitionValues":{"event_ts_ntz":"2025-12-31 23:59:59.999999"}"#,
+                r#""partitionValues":{"event_ts_ntz":null}"#,
+                r#""partitionValues":{"event_ts_ntz":""}"#,
+                r#""partitionValues":{"event_ts_ntz":"not-a-timestamp"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+        let cases = [
+            (
+                "timestamp_ntz equality",
+                "select id from orders where event_ts_ntz = timestamp '2026-01-01 00:00:00.123456'",
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "timestamp_ntz inequality",
+                "select id from orders where event_ts_ntz != timestamp '2026-01-01 00:00:00.123456'",
+                vec!["part-00002.parquet"],
+            ),
+            (
+                "timestamp_ntz in list",
+                "select id from orders where event_ts_ntz in (timestamp '2026-01-01 00:00:00.123456', timestamp '2025-12-31 23:59:59.999999')",
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "timestamp_ntz not in list",
+                "select id from orders where event_ts_ntz not in (timestamp '2026-01-01 00:00:00.123456')",
+                vec!["part-00002.parquet"],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                1,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sql_timestamp_partition_null_checks_are_exact_metadata_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
@@ -4416,6 +4508,92 @@ mod tests {
             (
                 "timestamp is not null",
                 "select id from orders where event_ts is not null",
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+        ];
+
+        for (name, sql, expected_paths) in cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            assert!(
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+            );
+            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count,
+                1,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0]
+                    .scan_plan()
+                    .pushed_filter_plan
+                    .residual_filter_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert!(
+                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_timestamp_ntz_partition_null_checks_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_protocol_and_adds(
+            "sql-timestamp-ntz-partition-null-checks",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TIMESTAMP_NTZ_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_ts_ntz"]"#,
+            &[
+                r#""partitionValues":{"event_ts_ntz":"2026-01-01 00:00:00.123456"}"#,
+                r#""partitionValues":{"event_ts_ntz":"2025-12-31 23:59:59.999999"}"#,
+                r#""partitionValues":{"event_ts_ntz":null}"#,
+                r#""partitionValues":{"event_ts_ntz":""}"#,
+                r#""partitionValues":{"event_ts_ntz":"not-a-timestamp"}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+        let cases = [
+            (
+                "timestamp_ntz is null",
+                "select id from orders where event_ts_ntz is null",
+                vec!["part-00002.parquet", "part-00005.parquet"],
+            ),
+            (
+                "timestamp_ntz is not null",
+                "select id from orders where event_ts_ntz is not null",
                 vec![
                     "part-00000.parquet",
                     "part-00001.parquet",
