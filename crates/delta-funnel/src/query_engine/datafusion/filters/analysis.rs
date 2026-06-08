@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_plan_records_supported_filter_analysis_shapes_with_only_in_pushed()
+    fn filter_plan_records_filter_analysis_shapes_without_overclaiming_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "supported-kernel-filter-plan",
@@ -561,27 +561,20 @@ mod tests {
         assert_eq!(
             plan.datafusion_pushdowns(),
             vec![
-                TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
             ]
         );
-        assert_eq!(plan.exact_count, 1);
-        assert_eq!(plan.inexact_count, 1);
-        assert_eq!(plan.unsupported_count, 4);
-        assert_eq!(plan.pushed_filter_count, 2);
-        assert_eq!(plan.residual_filter_count, 5);
-        assert_eq!(plan.decisions[0].rejection_reason, None);
-        assert_eq!(plan.decisions[3].rejection_reason, None);
-        assert!(!plan.decisions[3].residual);
-        assert!(plan.decisions[1..3].iter().all(|decision| {
-            decision.rejection_reason
-                == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
-        }));
-        assert!(plan.decisions[4..].iter().all(|decision| {
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, 6);
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, 6);
+        assert!(plan.decisions.iter().all(|decision| {
             decision.rejection_reason
                 == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
         }));

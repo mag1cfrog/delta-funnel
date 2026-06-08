@@ -14,8 +14,7 @@ pub(crate) use kernel::{
     DeltaKernelPredicate, DeltaKernelPredicateAdapterError, datafusion_expr_to_kernel_predicate,
 };
 pub(crate) use partition_metadata_predicate::{
-    DeltaPartitionMetadataPredicate, DeltaPartitionNameMap, normalize_decimal_partition_literal,
-    supports_partition_metadata_logical_type,
+    DeltaPartitionMetadataPredicate, DeltaPartitionNameMap,
 };
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,

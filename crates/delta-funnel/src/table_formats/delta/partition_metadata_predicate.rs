@@ -20,7 +20,6 @@ use convert::convert_expr;
 use expr::{PartitionMetadataExpr, SqlBool};
 pub(crate) use names::DeltaPartitionNameMap;
 use value::PartitionMetadataValueKind;
-pub(crate) use value::normalize_decimal_partition_literal;
 
 /// Returns whether this provider can evaluate a Delta partition column type from metadata.
 ///
