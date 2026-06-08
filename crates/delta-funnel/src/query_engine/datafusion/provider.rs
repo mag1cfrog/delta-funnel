@@ -1564,10 +1564,11 @@ mod tests {
 
         // Direct support pins the provider's mixed-AND status. DataFusion's
         // optimizer then proves the SQL residual contract below by splitting
-        // the top-level AND and keeping the data filter above the scan.
+        // the top-level AND, pushing the exact partition equality, and keeping
+        // the data filter above the scan.
         assert_eq!(
             provider.supports_filters_pushdown(&[&mixed_filter])?,
-            vec![TableProviderFilterPushDown::Inexact]
+            vec![TableProviderFilterPushDown::Unsupported]
         );
 
         let source = load_delta_source(DeltaSourceConfig {
@@ -1629,7 +1630,8 @@ mod tests {
                 .residual_filter_count,
             0
         );
-        assert!(scans[0].scan_plan().partition_metadata_filter.is_some());
+        assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
+        assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
         let kernel_names = scans[0]
             .scan_plan()
             .kernel_scan()
@@ -1637,7 +1639,7 @@ mod tests {
             .fields()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
-        assert_eq!(kernel_names, vec!["id", "customer_name"]);
+        assert_eq!(kernel_names, vec!["id", "customer_name", "region"]);
 
         Ok(())
     }
@@ -1692,6 +1694,9 @@ mod tests {
         );
         assert_eq!(scans[0].schema().fields().len(), 1);
         assert_eq!(scans[0].schema().field(0).name(), "id");
+        assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
+        assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(scan_file_paths(scans[0])?, vec!["part-00000.parquet"]);
         let kernel_names = scans[0]
             .scan_plan()
             .kernel_scan()
@@ -1699,17 +1704,17 @@ mod tests {
             .fields()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
-        assert_eq!(kernel_names, vec!["id"]);
+        assert_eq!(kernel_names, vec!["id", "region"]);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_exact_partition_in_filter_is_pushed_without_residual_filter()
+    async fn sql_partition_in_filter_remains_residual_without_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema(
-            "sql-exact-partition-in-filter",
+            "sql-residual-partition-in-filter",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
@@ -1738,13 +1743,16 @@ mod tests {
         let mut scans = Vec::new();
         super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
-        assert!(!plan_display.contains("FilterExec"), "{plan_display}");
+        assert!(plan_display.contains("FilterExec"), "{plan_display}");
         assert_eq!(physical_plan.schema().fields().len(), 1);
         assert_eq!(physical_plan.schema().field(0).name(), "id");
         assert_eq!(scans.len(), 1);
-        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0]));
-        assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
-        assert_eq!(scans[0].scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0, 1]));
+        assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+        assert_eq!(
+            scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+            0
+        );
         assert_eq!(
             scans[0]
                 .scan_plan()
@@ -1752,6 +1760,8 @@ mod tests {
                 .residual_filter_count,
             0
         );
+        assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
+        assert!(scans[0].scan_plan().kernel_partition_predicate.is_none());
         let kernel_names = scans[0]
             .scan_plan()
             .kernel_scan()
@@ -1759,13 +1769,13 @@ mod tests {
             .fields()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
-        assert_eq!(kernel_names, vec!["id"]);
+        assert_eq!(kernel_names, vec!["id", "region"]);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_duplicate_and_contradictory_partition_filters_are_exact_metadata_pushdown()
+    async fn sql_duplicate_and_contradictory_partition_filters_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -1848,7 +1858,11 @@ mod tests {
                         "{name}: {plan_display}"
                     );
                     assert!(
-                        scans[0].scan_plan().partition_metadata_filter.is_some(),
+                        scans[0].scan_plan().partition_metadata_filter.is_none(),
+                        "{name}: {plan_display}"
+                    );
+                    assert!(
+                        scans[0].scan_plan().kernel_partition_predicate.is_some(),
                         "{name}: {plan_display}"
                     );
                     assert_eq!(scan_file_paths(scans[0])?, paths, "{name}");
@@ -2078,7 +2092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_null_partition_filters_are_exact_metadata_pushdown()
+    async fn sql_null_partition_filters_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -2110,12 +2124,16 @@ mod tests {
             (
                 "is null",
                 "select id from orders where region is null",
-                vec!["part-00001.parquet", "part-00003.parquet"],
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
             ),
             (
                 "is not null",
                 "select id from orders where region is not null",
-                vec!["part-00000.parquet", "part-00002.parquet"],
+                vec!["part-00000.parquet"],
             ),
         ];
 
@@ -2143,7 +2161,11 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
+                "{name}"
+            );
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
             assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
@@ -2155,7 +2177,7 @@ mod tests {
                 .fields()
                 .map(|field| field.name().as_str())
                 .collect::<Vec<_>>();
-            assert_eq!(kernel_names, vec!["id"], "{name}");
+            assert_eq!(kernel_names, vec!["id", "region"], "{name}");
         }
 
         Ok(())
@@ -2370,7 +2392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_empty_string_partition_filters_stay_residual_without_kernel_pruning()
+    async fn sql_empty_string_partition_filters_follow_kernel_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -2398,65 +2420,35 @@ mod tests {
             }],
         )?;
 
+        enum ExpectedEmptyStringSql {
+            ExactKernel { paths: Vec<&'static str> },
+            Residual,
+        }
+
         let sql_cases = [
             (
-                "empty string",
+                "empty string equality",
                 "select id from orders where region = ''",
-                0,
-                0,
-                false,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                    "part-00003.parquet",
-                ],
+                ExpectedEmptyStringSql::ExactKernel { paths: Vec::new() },
             ),
             (
                 "empty string in",
                 "select id from orders where region in ('us-west', '')",
-                0,
-                0,
-                false,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                    "part-00003.parquet",
-                ],
+                ExpectedEmptyStringSql::Residual,
             ),
             (
                 "empty string comparison",
                 "select id from orders where region < ''",
-                0,
-                0,
-                false,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                    "part-00003.parquet",
-                ],
+                ExpectedEmptyStringSql::Residual,
             ),
             (
                 "empty string between",
                 "select id from orders where region between '' and 'us-west'",
-                1,
-                1,
-                true,
-                vec!["part-00000.parquet", "part-00002.parquet"],
+                ExpectedEmptyStringSql::Residual,
             ),
         ];
 
-        for (
-            name,
-            sql,
-            expected_exact_count,
-            expected_pushed_filter_count,
-            expected_metadata_filter,
-            expected_paths,
-        ) in sql_cases
-        {
+        for (name, sql, expectation) in sql_cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -2465,27 +2457,37 @@ mod tests {
             let mut scans = Vec::new();
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
-            assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
-            );
-            assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.exact_count,
-                expected_exact_count,
-                "{name}: {plan_display}"
-            );
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                expected_pushed_filter_count,
-                "{name}: {plan_display}"
-            );
-            assert_eq!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
-                expected_metadata_filter,
-                "{name}: {plan_display}"
-            );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            match expectation {
+                ExpectedEmptyStringSql::ExactKernel { paths } => {
+                    assert!(
+                        !plan_display.contains("FilterExec"),
+                        "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                    );
+                    assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+                    assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+                    assert_eq!(
+                        scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                        1
+                    );
+                    assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
+                    assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
+                    assert_eq!(scan_file_paths(scans[0])?, paths, "{name}");
+                }
+                ExpectedEmptyStringSql::Residual => {
+                    assert!(
+                        plan_display.contains("FilterExec"),
+                        "{name} unexpectedly became exact:\n{plan_display}"
+                    );
+                    assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+                    assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+                    assert_eq!(
+                        scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                        0
+                    );
+                    assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
+                    assert!(scans[0].scan_plan().kernel_partition_predicate.is_none());
+                }
+            }
         }
 
         Ok(())
