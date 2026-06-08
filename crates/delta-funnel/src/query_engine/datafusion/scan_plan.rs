@@ -225,6 +225,150 @@ mod tests {
     }
 
     #[test]
+    fn scan_plan_preserves_duplicate_exact_filters_as_distinct_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "duplicate-exact-pushed-filter-report",
+            crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: vec![
+                col("region").eq(lit("us-west")),
+                col("region").eq(lit("us-west")),
+            ],
+        })?;
+
+        assert_eq!(
+            plan.pushed_filter_plan.datafusion_pushdowns(),
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+        assert_eq!(plan.pushed_filter_plan.decisions.len(), 2);
+        assert_eq!(plan.pushed_filter_plan.exact_count, 2);
+        assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 2);
+        assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
+        let partition_metadata_filter = plan.partition_metadata_filter.as_ref().unwrap();
+        assert!(
+            partition_metadata_filter.matches_scan_file(&HashMap::from([(
+                "region".to_owned(),
+                "us-west".to_owned(),
+            )]))
+        );
+        assert!(
+            !partition_metadata_filter.matches_scan_file(&HashMap::from([(
+                "region".to_owned(),
+                "us-east".to_owned(),
+            )]))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_plan_multiple_exact_filters_preserve_contradictory_and_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "contradictory-exact-pushed-filter-report",
+            crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: vec![
+                col("region").eq(lit("us-west")),
+                col("region").eq(lit("us-east")),
+            ],
+        })?;
+
+        assert_eq!(
+            plan.pushed_filter_plan.datafusion_pushdowns(),
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+        assert_eq!(plan.pushed_filter_plan.exact_count, 2);
+        assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
+        let partition_metadata_filter = plan.partition_metadata_filter.as_ref().unwrap();
+        assert!(
+            !partition_metadata_filter.matches_scan_file(&HashMap::from([(
+                "region".to_owned(),
+                "us-west".to_owned(),
+            )]))
+        );
+        assert!(
+            !partition_metadata_filter.matches_scan_file(&HashMap::from([(
+                "region".to_owned(),
+                "us-east".to_owned(),
+            )]))
+        );
+        assert!(!partition_metadata_filter.matches_scan_file(&HashMap::new()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_plan_exact_partition_filter_allows_projection_omission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "exact-partition-filter-projection-omission",
+            crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: vec![col("region").eq(lit("us-west"))],
+        })?;
+
+        assert_eq!(plan.pushed_filter_plan.exact_count, 1);
+        assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
+        assert_eq!(plan.projected_schema.fields().len(), 1);
+        assert_eq!(plan.projected_schema.field(0).name(), "id");
+        assert_eq!(plan.scan_projection, Some(vec![0]));
+        let kernel_names = plan
+            .kernel_scan()
+            .kernel_schema()
+            .fields()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kernel_names, vec!["id"]);
+        assert!(plan.partition_metadata_filter.is_some());
+
+        Ok(())
+    }
+
+    #[test]
     fn scan_plan_builds_partition_metadata_filter_for_exact_in()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(

@@ -1272,6 +1272,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_provider_scan_rejects_ambiguous_partition_column_references()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DOTTED_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"address.city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
+        struct RejectedReferenceProbe {
+            name: &'static str,
+            schema_fields_json: &'static str,
+            partition_columns_json: &'static str,
+            add_partition_values_json: &'static str,
+            filter: Expr,
+        }
+
+        let cases = [
+            RejectedReferenceProbe {
+                name: "wrong-case partition reference",
+                schema_fields_json: PARTITIONED_SCHEMA_FIELDS_JSON,
+                partition_columns_json: r#"["region"]"#,
+                add_partition_values_json: r#""partitionValues":{"region":"us-west"}"#,
+                filter: Expr::Column(datafusion::common::Column::new_unqualified("Region"))
+                    .eq(datafusion::logical_expr::lit("us-west")),
+            },
+            RejectedReferenceProbe {
+                name: "dotted partition reference",
+                schema_fields_json: DOTTED_PARTITION_SCHEMA_FIELDS_JSON,
+                partition_columns_json: r#"["address.city"]"#,
+                add_partition_values_json: r#""partitionValues":{"address.city":"Phoenix"}"#,
+                filter: datafusion::logical_expr::col("address.city")
+                    .eq(datafusion::logical_expr::lit("Phoenix")),
+            },
+            RejectedReferenceProbe {
+                name: "nested data field reference",
+                schema_fields_json: NESTED_SCHEMA_FIELDS_JSON,
+                partition_columns_json: "[]",
+                add_partition_values_json: r#""partitionValues":{}"#,
+                filter: datafusion::logical_expr::col("profile.age")
+                    .gt(datafusion::logical_expr::lit(21)),
+            },
+        ];
+
+        for case in cases {
+            let table = DeltaLogTable::new_with_schema(
+                case.name,
+                case.schema_fields_json,
+                case.partition_columns_json,
+                case.add_partition_values_json,
+            )?;
+            let source = load_delta_source(DeltaSourceConfig {
+                name: "orders".to_owned(),
+                table_uri: table.path().to_string_lossy().to_string(),
+                version: None,
+            })?;
+            let preflight = preflight_delta_protocol(&source)?;
+            let provider = DeltaTableProvider::try_new(source, preflight)?;
+            let state = SessionContext::new().state();
+
+            let result = provider
+                .scan(&state, None, std::slice::from_ref(&case.filter), None)
+                .await;
+
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{} should be rejected",
+                case.name
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn table_provider_scan_accepts_convertible_mixed_partition_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
@@ -1769,6 +1841,105 @@ mod tests {
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
         assert_eq!(kernel_names, vec!["id"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_duplicate_and_contradictory_partition_filters_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-duplicate-contradictory-partition-filters",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{"region":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        enum ExpectedSqlPartitionEdge {
+            ExactScan {
+                exact_count: usize,
+                paths: Vec<&'static str>,
+            },
+            EmptyBeforeScan,
+        }
+
+        let sql_cases = [
+            (
+                "duplicate equality",
+                "select id from orders where region = 'us-west' and region = 'us-west'",
+                ExpectedSqlPartitionEdge::ExactScan {
+                    exact_count: 1,
+                    paths: vec!["part-00000.parquet"],
+                },
+            ),
+            (
+                "contradictory equality",
+                "select id from orders where region = 'us-west' and region = 'us-east'",
+                ExpectedSqlPartitionEdge::EmptyBeforeScan,
+            ),
+        ];
+
+        for (name, sql, expectation) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            match expectation {
+                ExpectedSqlPartitionEdge::ExactScan { exact_count, paths } => {
+                    assert!(
+                        !plan_display.contains("FilterExec"),
+                        "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                    );
+                    assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+                    assert_eq!(
+                        scans[0].scan_plan().pushed_filter_plan.exact_count,
+                        exact_count,
+                        "{name}: {plan_display}"
+                    );
+                    assert_eq!(
+                        scans[0]
+                            .scan_plan()
+                            .pushed_filter_plan
+                            .residual_filter_count,
+                        0,
+                        "{name}: {plan_display}"
+                    );
+                    assert!(
+                        scans[0].scan_plan().partition_metadata_filter.is_some(),
+                        "{name}: {plan_display}"
+                    );
+                    assert_eq!(scan_file_paths(scans[0])?, paths, "{name}");
+                }
+                ExpectedSqlPartitionEdge::EmptyBeforeScan => {
+                    assert!(plan_display.contains("EmptyExec"), "{name}: {plan_display}");
+                    assert!(scans.is_empty(), "{name}: {plan_display}");
+                }
+            }
+        }
 
         Ok(())
     }
