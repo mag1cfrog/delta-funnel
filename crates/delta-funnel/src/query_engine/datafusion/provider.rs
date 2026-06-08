@@ -1040,7 +1040,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_provider_scan_handles_mixed_boolean_partition_filters()
+    async fn table_provider_scan_rejects_mixed_boolean_partition_filters()
     -> Result<(), Box<dyn std::error::Error>> {
         const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"day\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
         let table = DeltaLogTable::new_with_schema(
@@ -1074,7 +1074,6 @@ mod tests {
                 partition_in.clone().and(
                     datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1_i64)),
                 ),
-                true,
             ),
             (
                 "partition in or data",
@@ -1082,7 +1081,6 @@ mod tests {
                     .clone()
                     .or(datafusion::logical_expr::col("id")
                         .eq(datafusion::logical_expr::lit(1_i64))),
-                false,
             ),
             (
                 "partition equality or data",
@@ -1090,7 +1088,6 @@ mod tests {
                     .eq(datafusion::logical_expr::lit("us-west"))
                     .or(datafusion::logical_expr::col("id")
                         .eq(datafusion::logical_expr::lit(1_i64))),
-                false,
             ),
             (
                 "partition in or unknown",
@@ -1098,7 +1095,6 @@ mod tests {
                     .clone()
                     .or(datafusion::logical_expr::col("ghost")
                         .eq(datafusion::logical_expr::lit("x"))),
-                false,
             ),
             (
                 "partition in or nested field",
@@ -1106,51 +1102,26 @@ mod tests {
                     .clone()
                     .or(datafusion::logical_expr::col("profile.age")
                         .eq(datafusion::logical_expr::lit(1_i64))),
-                false,
             ),
             (
                 "nested exact partition or and data",
                 exact_partition_or.and(
                     datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1_i64)),
                 ),
-                true,
             ),
         ];
 
-        for (name, filter, should_accept) in filters {
+        for (name, filter) in filters {
             let result = provider
                 .scan(&state, None, std::slice::from_ref(&filter), None)
                 .await;
 
-            if should_accept {
-                let plan = result?;
-                let scan = plan
-                    .as_any()
-                    .downcast_ref::<DeltaScanPlanningExec>()
-                    .ok_or("expected DeltaScanPlanningExec")?;
-                assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0, "{name}");
-                assert_eq!(
-                    scan.scan_plan().pushed_filter_plan.inexact_count,
-                    1,
-                    "{name}"
-                );
-                assert_eq!(
-                    scan.scan_plan().pushed_filter_plan.residual_filter_count,
-                    1,
-                    "{name}"
-                );
-                assert!(
-                    scan.scan_plan().partition_metadata_filter.is_some(),
-                    "{name}"
-                );
-            } else {
-                assert!(
-                    matches!(result, Err(DataFusionError::External(error)) if error
-                        .to_string()
-                        .contains("pushed filters must be exact partition predicates")),
-                    "{name} should be rejected"
-                );
-            }
+            assert!(
+                matches!(result, Err(DataFusionError::External(error)) if error
+                    .to_string()
+                    .contains("pushed filters must be exact partition predicates")),
+                "{name} should be rejected"
+            );
         }
 
         Ok(())
@@ -1263,10 +1234,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_provider_scan_accepts_convertible_mixed_partition_filter()
+    async fn table_provider_scan_rejects_mixed_partition_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
-            "table-provider-convertible-filter-injection",
+            "table-provider-mixed-partition-filter-rejection",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
@@ -1292,26 +1263,22 @@ mod tests {
                 datafusion::logical_expr::lit(20),
             ));
 
-        let plan = provider.scan(&state, None, &[filter], None).await?;
-        let scan = plan
-            .as_any()
-            .downcast_ref::<DeltaScanPlanningExec>()
-            .ok_or("expected DeltaScanPlanningExec")?;
+        let result = provider.scan(&state, None, &[filter], None).await;
 
-        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan.scan_plan().partition_metadata_filter.is_some());
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+                .to_string()
+                .contains("pushed filters must be exact partition predicates"))
+        );
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn table_provider_scan_ands_provider_predicates_from_mixed_and_exact_filters()
+    async fn table_provider_scan_rejects_mixed_and_exact_filter_batch()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "table-provider-mixed-and-exact-filter-pruning",
+            "table-provider-mixed-and-exact-filter-rejection",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             &[
@@ -1337,23 +1304,18 @@ mod tests {
                 false,
             )
             .and(datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1000)));
-        let exact_filter = datafusion::logical_expr::col("region")
-            .not_eq(datafusion::logical_expr::lit("us-east"));
+        let exact_filter =
+            datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("us-east"));
 
-        let plan = provider
+        let result = provider
             .scan(&state, None, &[mixed_filter, exact_filter], None)
-            .await?;
-        let scan = plan
-            .as_any()
-            .downcast_ref::<DeltaScanPlanningExec>()
-            .ok_or("expected DeltaScanPlanningExec")?;
+            .await;
 
-        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan.scan_plan().partition_metadata_filter.is_some());
-        assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+                .to_string()
+                .contains("pushed filters must be exact partition predicates"))
+        );
 
         Ok(())
     }
@@ -1387,17 +1349,17 @@ mod tests {
         assert!(
             matches!(result, Err(DataFusionError::External(error)) if error
                 .to_string()
-                .contains("inexact pushed filter residual columns must be projected"))
+                .contains("pushed filters must be exact partition predicates"))
         );
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn table_provider_scan_accepts_projected_inexact_mixed_partition_filter_when_residual_columns_are_projected()
+    async fn table_provider_scan_rejects_projected_mixed_partition_filter_when_residual_columns_are_projected()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
-            "table-provider-projected-inexact-mixed-partition-filter-accepted",
+            "table-provider-projected-mixed-partition-filter-rejected",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
@@ -1415,18 +1377,15 @@ mod tests {
             .eq(datafusion::logical_expr::lit("us-west"))
             .and(datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1)));
 
-        let plan = provider
+        let result = provider
             .scan(&state, Some(&projection), &[filter], None)
-            .await?;
-        let scan = plan
-            .as_any()
-            .downcast_ref::<DeltaScanPlanningExec>()
-            .ok_or("expected DeltaScanPlanningExec")?;
+            .await;
 
-        assert_eq!(scan.scan_plan().scan_projection, Some(vec![0, 1]));
-        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
-        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan.scan_plan().partition_metadata_filter.is_some());
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+                .to_string()
+                .contains("pushed filters must be exact partition predicates"))
+        );
 
         Ok(())
     }
@@ -2033,7 +1992,7 @@ mod tests {
             SqlMixedBooleanProbe {
                 name: "partition in and data",
                 sql: "select id from orders where region in ('us-west', 'us-east') and id > 1",
-                exact_count: 1,
+                exact_count: 0,
             },
             SqlMixedBooleanProbe {
                 name: "partition in or data",
@@ -2049,7 +2008,7 @@ mod tests {
                 name: "partition in or nested exact partition and data",
                 sql: "select id from orders where (region in ('us-west', 'us-east') \
                       or region = 'eu-central') and id > 1",
-                exact_count: 1,
+                exact_count: 0,
             },
         ];
 
