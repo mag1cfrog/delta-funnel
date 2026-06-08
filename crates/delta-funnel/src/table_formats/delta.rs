@@ -246,7 +246,8 @@ mod tests {
 
     use super::{
         DeltaPartitionMetadataPredicate, DeltaPartitionNameMap, DeltaSourceConfig,
-        build_projected_delta_scan, load_delta_source, load_delta_sources,
+        ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
+        datafusion_expr_to_kernel_predicate, load_delta_source, load_delta_sources,
     };
     use crate::DeltaFunnelError;
 
@@ -309,6 +310,78 @@ mod tests {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
 
         Ok(format!("{}-{}-{nanos}", std::process::id(), name))
+    }
+
+    fn kernel_scan_file_paths(
+        scan: &ProjectedDeltaScan,
+        table_uri: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        fn collect_scan_file(
+            files: &mut Vec<super::kernel::ScanFile>,
+            file: super::kernel::ScanFile,
+        ) {
+            files.push(file);
+        }
+
+        let table_url = super::kernel::try_parse_uri(table_uri)?;
+        let store =
+            super::kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
+        let engine = super::kernel::DefaultEngineBuilder::new(store).build();
+        let mut files = Vec::new();
+
+        for scan_metadata in scan.kernel_scan().scan_metadata(&engine)? {
+            files = scan_metadata?.visit_scan_files(files, collect_scan_file)?;
+        }
+
+        let mut paths = files.into_iter().map(|file| file.path).collect::<Vec<_>>();
+        paths.sort();
+        Ok(paths)
+    }
+
+    #[test]
+    fn kernel_partition_characterization_uses_official_delta_kernel_0_23_0() {
+        let manifest = include_str!("../../Cargo.toml");
+        let lockfile = include_str!("../../../../Cargo.lock");
+
+        assert!(manifest.contains(r#"delta_kernel = { version = "0.23.0""#));
+        assert!(lockfile.contains(
+            "name = \"delta_kernel\"\nversion = \"0.23.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
+        ));
+        assert!(!manifest.contains("deltalake"));
+        assert!(!manifest.contains("buoyant_kernel"));
+    }
+
+    #[test]
+    fn kernel_predicated_scan_prunes_files_without_provider_metadata_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-predicated-scan-files",
+            PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("region-us-west.parquet", r#"{"region":"us-west"}"#),
+                partitioned_add_json("region-us-east.parquet", r#"{"region":"us-east"}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+        let predicate = datafusion_expr_to_kernel_predicate(&col("region").eq(lit("us-west")))?;
+        let predicated_scan =
+            build_projected_predicated_delta_scan(&source, None, Some(predicate))?;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec!["region-us-east.parquet", "region-us-west.parquet"]
+        );
+        assert_eq!(
+            kernel_scan_file_paths(&predicated_scan, source.table_uri())?,
+            vec!["region-us-west.parquet"]
+        );
+
+        Ok(())
     }
 
     #[test]
