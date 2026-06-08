@@ -414,6 +414,8 @@ mod tests {
     const FLOATING_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"float_part\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_part\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]"#;
     const TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]"#;
     const BINARY_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]"#;
+    const TIMESTAMP_NTZ_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]"#;
+    const TIMESTAMP_NTZ_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -2322,6 +2324,34 @@ mod tests {
         assert_eq!(
             schema.field_with_name("event_ts")?.data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn timestamp_ntz_partition_schema_maps_delta_type_to_arrow_timestamp_microseconds_without_timezone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_protocol_and_adds(
+            "timestamp-ntz-partition-schema",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TIMESTAMP_NTZ_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_ts_ntz"]"#,
+            &[r#""partitionValues":{"event_ts_ntz":"2026-01-01 00:00:00.123456"}"#],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let schema = provider.schema();
+
+        assert_eq!(
+            schema.field_with_name("event_ts_ntz")?.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
 
         Ok(())

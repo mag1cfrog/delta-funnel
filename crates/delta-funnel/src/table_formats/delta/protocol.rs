@@ -8,11 +8,11 @@ use super::kernel::{
     DeltaKernelProtocol, TABLE_FEATURES_MIN_READER_VERSION, Version, snapshot_protocol_report,
 };
 
-// Reader features are Delta correctness requirements. Keep this allowlist
-// empty until the provider execution path proves support for each feature.
-// For example, `deletionVectors` must remain rejected until rows are masked
-// before reaching DataFusion.
-const SUPPORTED_READER_FEATURES: &[&str] = &[];
+// Reader features are Delta correctness requirements. Add features only after
+// the provider path proves the relevant semantics. For example,
+// `deletionVectors` must remain rejected until rows are masked before reaching
+// DataFusion.
+const SUPPORTED_READER_FEATURES: &[&str] = &["timestampNtz"];
 
 /// Protocol details for one named Delta source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +210,7 @@ mod tests {
     const LEGACY_PROTOCOL_JSON: &str =
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     const WRITER_ONLY_FEATURE_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["inCommitTimestamp"]}}"#;
+    const TIMESTAMP_NTZ_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
     const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
     const UNKNOWN_READER_FEATURE_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["madeUpFeature"],"writerFeatures":["madeUpFeature"]}}"#;
     const LEGACY_COLUMN_MAPPING_PROTOCOL_JSON: &str =
@@ -296,6 +297,19 @@ mod tests {
             preflight.protocol.writer_features,
             vec!["inCommitTimestamp"]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_allows_timestamp_ntz_reader_feature() -> Result<(), Box<dyn std::error::Error>> {
+        let source = load_source("orders", TIMESTAMP_NTZ_PROTOCOL_JSON)?;
+
+        let preflight = preflight_delta_protocol(&source)?;
+
+        assert_eq!(preflight.protocol.min_reader_version, 3);
+        assert_eq!(preflight.protocol.reader_features, vec!["timestampNtz"]);
+        assert_eq!(preflight.protocol.writer_features, vec!["timestampNtz"]);
 
         Ok(())
     }
