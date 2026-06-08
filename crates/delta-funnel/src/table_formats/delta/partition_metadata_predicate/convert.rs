@@ -420,6 +420,9 @@ fn convert_partition_literal(
             }
             _ => Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral),
         },
+        PartitionMetadataValueKind::TimestampNtz => {
+            Err(DeltaPartitionMetadataPredicateError::UnsupportedLiteral)
+        }
         PartitionMetadataValueKind::Binary => match expr {
             Expr::Literal(ScalarValue::Binary(Some(value)), _) if !value.is_empty() => {
                 Ok(PartitionScalar::Binary(value.clone()))
@@ -462,6 +465,11 @@ mod tests {
             Field::new(
                 "event_ts",
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "event_ts_ntz",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
                 true,
             ),
             Field::new("amount", DataType::Decimal128(10, 2), true),
@@ -600,6 +608,26 @@ mod tests {
         assert!(matches_scan_file(&is_null, &missing));
         assert!(matches_scan_file(&is_not_null, &normal));
         assert!(matches_scan_file(&is_not_null, &raw_empty));
+        assert!(!matches_scan_file(&is_not_null, &missing));
+    }
+
+    #[test]
+    fn converts_timestamp_ntz_null_checks_with_sql_metadata_semantics() {
+        let is_null = predicate_expr(&col("event_ts_ntz").is_null(), &["event_ts_ntz"]).unwrap();
+        let is_not_null =
+            predicate_expr(&col("event_ts_ntz").is_not_null(), &["event_ts_ntz"]).unwrap();
+        let normal = values(&[("event_ts_ntz", "2026-01-01 00:00:00.123456")]);
+        let raw_empty = values(&[("event_ts_ntz", "")]);
+        let invalid_timestamp = values(&[("event_ts_ntz", "not-a-timestamp")]);
+        let missing = HashMap::new();
+
+        assert!(!matches_scan_file(&is_null, &normal));
+        assert!(!matches_scan_file(&is_null, &raw_empty));
+        assert!(!matches_scan_file(&is_null, &invalid_timestamp));
+        assert!(matches_scan_file(&is_null, &missing));
+        assert!(matches_scan_file(&is_not_null, &normal));
+        assert!(matches_scan_file(&is_not_null, &raw_empty));
+        assert!(matches_scan_file(&is_not_null, &invalid_timestamp));
         assert!(!matches_scan_file(&is_not_null, &missing));
     }
 

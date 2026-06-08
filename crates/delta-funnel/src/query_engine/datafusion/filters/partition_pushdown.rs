@@ -359,6 +359,11 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 true,
             ),
+            Field::new(
+                "event_ts_ntz",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
             Field::new("payload", DataType::Binary, true),
         ]))
     }
@@ -685,6 +690,31 @@ mod tests {
             col("event_ts").is_null(),
             col("event_ts").is_not_null(),
             Expr::Not(Box::new(col("event_ts").is_null())),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_timestamp_ntz_null_checks_as_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_ts_ntz"]);
+        let filters = [
+            col("event_ts_ntz").is_null(),
+            col("event_ts_ntz").is_not_null(),
+            Expr::Not(Box::new(col("event_ts_ntz").is_null())),
         ];
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
