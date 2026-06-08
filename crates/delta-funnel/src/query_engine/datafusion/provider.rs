@@ -1846,6 +1846,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_duplicate_and_contradictory_partition_filters_are_exact_metadata_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "sql-duplicate-contradictory-partition-filters",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{"region":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        enum ExpectedSqlPartitionEdge {
+            ExactScan {
+                exact_count: usize,
+                paths: Vec<&'static str>,
+            },
+            EmptyBeforeScan,
+        }
+
+        let sql_cases = [
+            (
+                "duplicate equality",
+                "select id from orders where region = 'us-west' and region = 'us-west'",
+                ExpectedSqlPartitionEdge::ExactScan {
+                    exact_count: 1,
+                    paths: vec!["part-00000.parquet"],
+                },
+            ),
+            (
+                "contradictory equality",
+                "select id from orders where region = 'us-west' and region = 'us-east'",
+                ExpectedSqlPartitionEdge::EmptyBeforeScan,
+            ),
+        ];
+
+        for (name, sql, expectation) in sql_cases {
+            let dataframe = ctx.sql(sql).await?;
+            let physical_plan = dataframe.create_physical_plan().await?;
+            let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            let mut scans = Vec::new();
+            super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+            match expectation {
+                ExpectedSqlPartitionEdge::ExactScan { exact_count, paths } => {
+                    assert!(
+                        !plan_display.contains("FilterExec"),
+                        "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                    );
+                    assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+                    assert_eq!(
+                        scans[0].scan_plan().pushed_filter_plan.exact_count,
+                        exact_count,
+                        "{name}: {plan_display}"
+                    );
+                    assert_eq!(
+                        scans[0]
+                            .scan_plan()
+                            .pushed_filter_plan
+                            .residual_filter_count,
+                        0,
+                        "{name}: {plan_display}"
+                    );
+                    assert!(
+                        scans[0].scan_plan().partition_metadata_filter.is_some(),
+                        "{name}: {plan_display}"
+                    );
+                    assert_eq!(scan_file_paths(scans[0])?, paths, "{name}");
+                }
+                ExpectedSqlPartitionEdge::EmptyBeforeScan => {
+                    assert!(plan_display.contains("EmptyExec"), "{name}: {plan_display}");
+                    assert!(scans.is_empty(), "{name}: {plan_display}");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sql_partition_in_edge_variants_document_rewrite_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"day\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
