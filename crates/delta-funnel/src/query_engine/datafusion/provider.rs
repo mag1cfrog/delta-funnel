@@ -219,7 +219,7 @@ impl DeltaTableProvider {
             .decisions
             .iter()
             .filter(|decision| decision.outcome == DeltaFilterPushdownOutcome::Inexact)
-            .flat_map(|decision| decision.kernel_predicate.referenced_columns.iter())
+            .flat_map(|decision| decision.filter_analysis.referenced_columns.iter())
             .any(|column| !projected_columns.contains(column.as_str()));
 
         if missing_residual_column {

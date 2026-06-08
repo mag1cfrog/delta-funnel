@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
-use self::analysis::DeltaKernelPredicateAnalysis;
+use self::analysis::DeltaFilterPredicateAnalysis;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeltaFilterPushdownOutcome {
@@ -49,22 +49,39 @@ impl DeltaFilterPushdownRejectionReason {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// Provider decision for one input filter, preserving input order.
 pub(crate) struct DeltaFilterPushdownDecision {
+    /// Position of this decision in the original DataFusion filter input slice.
     pub(crate) input_index: usize,
+    /// Pushdown status reported back to DataFusion for this input filter.
     pub(crate) outcome: DeltaFilterPushdownOutcome,
+    /// Whether DataFusion must still evaluate the original filter above the scan.
     pub(crate) residual: bool,
+    /// Conservative rejection reason when the filter is unsupported.
     pub(crate) rejection_reason: Option<DeltaFilterPushdownRejectionReason>,
-    pub(crate) kernel_predicate: DeltaKernelPredicateAnalysis,
+    /// Provider-boundary diagnostics and column classification for the original filter.
+    pub(crate) filter_analysis: DeltaFilterPredicateAnalysis,
+    /// Provider-owned partition metadata expression used for scan-file pruning.
+    ///
+    /// For exact filters this is the original filter. For inexact mixed filters
+    /// this is only the extracted partition-safe portion.
     pub(crate) partition_metadata_filter: Option<Expr>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+/// Ordered provider pushdown plan for a batch of DataFusion input filters.
 pub(crate) struct DeltaFilterPushdownPlan {
+    /// One decision per input filter, preserving input order.
     pub(crate) decisions: Vec<DeltaFilterPushdownDecision>,
+    /// Number of filters reported as exact.
     pub(crate) exact_count: usize,
+    /// Number of filters reported as inexact.
     pub(crate) inexact_count: usize,
+    /// Number of filters reported as unsupported.
     pub(crate) unsupported_count: usize,
+    /// Number of filters accepted for provider-side work.
     pub(crate) pushed_filter_count: usize,
+    /// Number of filters DataFusion must keep as residual filters.
     pub(crate) residual_filter_count: usize,
 }
 
