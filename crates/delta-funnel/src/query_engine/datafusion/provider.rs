@@ -747,6 +747,25 @@ mod tests {
                 vec!["part-00000.parquet"],
             ),
             (
+                "empty value equality",
+                datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("")),
+                Vec::new(),
+            ),
+            (
+                "is null",
+                datafusion::logical_expr::col("region").is_null(),
+                vec![
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "is not null",
+                datafusion::logical_expr::col("region").is_not_null(),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
                 "equality terms in top-level and",
                 datafusion::logical_expr::col("region")
                     .eq(datafusion::logical_expr::lit("us-west"))
@@ -754,6 +773,14 @@ mod tests {
                         datafusion::logical_expr::col("region")
                             .eq(datafusion::logical_expr::lit("us-west")),
                     ),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "null check and equality in top-level and",
+                datafusion::logical_expr::col("region").is_not_null().and(
+                    datafusion::logical_expr::col("region")
+                        .eq(datafusion::logical_expr::lit("us-west")),
+                ),
                 vec!["part-00000.parquet"],
             ),
         ];
@@ -808,15 +835,6 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
         let filters = vec![
-            (
-                "empty string equality",
-                datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("")),
-            ),
-            ("is null", datafusion::logical_expr::col("region").is_null()),
-            (
-                "is not null",
-                datafusion::logical_expr::col("region").is_not_null(),
-            ),
             (
                 "empty string in",
                 datafusion::logical_expr::col("region").in_list(

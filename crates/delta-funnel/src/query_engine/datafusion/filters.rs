@@ -247,13 +247,16 @@ mod tests {
     }
 
     #[test]
-    fn filter_pushdown_rejects_string_null_checks_and_other_unsupported_shapes()
+    fn filter_pushdown_accepts_string_null_checks_and_rejects_other_shapes()
     -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new_with_schema(
+        let table = DeltaLogTable::new_with_schema_and_adds(
             "filter-pushdown-partition-in",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
-            r#""partitionValues":{"region":"us-west"}"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":""}"#,
+            ],
         )?;
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
@@ -289,13 +292,13 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
             ]
         );
-        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.exact_count, 1);
         assert_eq!(plan.inexact_count, 0);
-        assert_eq!(plan.unsupported_count, 6);
-        assert_eq!(plan.residual_filter_count, 6);
+        assert_eq!(plan.unsupported_count, 5);
+        assert_eq!(plan.residual_filter_count, 5);
 
         Ok(())
     }
