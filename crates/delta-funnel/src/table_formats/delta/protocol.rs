@@ -212,6 +212,7 @@ mod tests {
     const WRITER_ONLY_FEATURE_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["inCommitTimestamp"]}}"#;
     const TIMESTAMP_NTZ_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
     const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
+    const COLUMN_MAPPING_FEATURE_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#;
     const UNKNOWN_READER_FEATURE_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["madeUpFeature"],"writerFeatures":["madeUpFeature"]}}"#;
     const LEGACY_COLUMN_MAPPING_PROTOCOL_JSON: &str =
         r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":5}}"#;
@@ -362,6 +363,23 @@ mod tests {
                 reason,
                 ..
             }) if reason.contains("minReaderVersion 2")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_rejects_column_mapping_reader_feature() -> Result<(), Box<dyn std::error::Error>> {
+        let source = load_source("orders", COLUMN_MAPPING_FEATURE_PROTOCOL_JSON)?;
+
+        let result = preflight_delta_protocol(&source);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaProtocolCompatibility {
+                reason,
+                ..
+            }) if reason.contains("columnMapping")
         ));
 
         Ok(())
