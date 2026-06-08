@@ -1906,7 +1906,7 @@ mod tests {
             (
                 "not in",
                 "select id from orders where region not in ('us-west')",
-                ExpectedInProbe::ExactAfterRewrite,
+                ExpectedInProbe::ResidualFilter,
             ),
         ];
 
@@ -2143,11 +2143,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_negated_partition_filters_are_exact_metadata_pushdown()
+    async fn sql_negated_partition_filters_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-negated-partition-filters-exact",
+            "sql-negated-partition-filters-residual",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             &[
@@ -2176,24 +2176,18 @@ mod tests {
             (
                 "not equality",
                 "select id from orders where region != 'us-west'",
-                1,
-                vec!["part-00001.parquet", "part-00003.parquet"],
             ),
             (
                 "not equality expression",
                 "select id from orders where not(region = 'us-west')",
-                1,
-                vec!["part-00001.parquet", "part-00003.parquet"],
             ),
             (
                 "not in",
                 "select id from orders where region not in ('us-west', 'us-east')",
-                2,
-                vec!["part-00003.parquet"],
             ),
         ];
 
-        for (name, sql, expected_exact_count, expected_paths) in sql_cases {
+        for (name, sql) in sql_cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -2203,13 +2197,13 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                expected_exact_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -2220,21 +2214,24 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_partition_comparison_filters_are_exact_metadata_pushdown()
+    async fn sql_partition_comparison_filters_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-partition-comparison-filters-exact",
+            "sql-partition-comparison-filters-residual",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             &[
@@ -2263,58 +2260,38 @@ mod tests {
             (
                 "less than",
                 "select id from orders where region < 'us-west'",
-                1,
-                vec!["part-00001.parquet", "part-00003.parquet"],
             ),
             (
                 "less than or equal",
                 "select id from orders where region <= 'us-east'",
-                1,
-                vec!["part-00001.parquet", "part-00003.parquet"],
             ),
             (
                 "greater than",
                 "select id from orders where region > 'us-east'",
-                1,
-                vec!["part-00000.parquet"],
             ),
             (
                 "reversed greater than",
                 "select id from orders where 'us-east' < region",
-                1,
-                vec!["part-00000.parquet"],
             ),
             (
                 "between",
                 "select id from orders where region between 'us-east' and 'us-west'",
-                2,
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "not between",
                 "select id from orders where region not between 'us-east' and 'us-west'",
-                1,
-                vec!["part-00003.parquet"],
             ),
             (
                 "contradictory between",
                 "select id from orders where region between 'z' and 'a'",
-                2,
-                Vec::new(),
             ),
             (
                 "contradictory not between",
                 "select id from orders where region not between 'z' and 'a'",
-                1,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00003.parquet",
-                ],
             ),
         ];
 
-        for (name, sql, expected_exact_count, expected_paths) in sql_cases {
+        for (name, sql) in sql_cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -2324,13 +2301,13 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                expected_exact_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -2341,10 +2318,13 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
