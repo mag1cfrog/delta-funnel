@@ -292,6 +292,7 @@ mod tests {
     const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
     const INTEGER_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["byte_part","short_part","int_part","long_part"],"configuration":{},"createdTime":1587968585495}}"#;
+    const BOOLEAN_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["is_current"],"configuration":{},"createdTime":1587968585495}}"#;
 
     fn add_json(path: &str) -> String {
         format!(
@@ -394,6 +395,28 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_boolean_partition_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-boolean-partition-characterization",
+            BOOLEAN_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("boolean-true.parquet", r#"{"is_current":"true"}"#),
+                partitioned_add_json("boolean-false.parquet", r#"{"is_current":"false"}"#),
+                partitioned_add_json("boolean-null.parquet", r#"{"is_current":null}"#),
+                partitioned_add_json("boolean-empty.parquet", r#"{"is_current":""}"#),
+                partitioned_add_json("boolean-missing.parquet", r#"{}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_predicated_file_paths(
         source: &super::PlannedDeltaSource,
         filter: &datafusion::logical_expr::Expr,
@@ -420,6 +443,10 @@ mod tests {
         Expr::Literal(ScalarValue::Int64(Some(value)), None)
     }
 
+    fn bool_lit(value: bool) -> Expr {
+        Expr::Literal(ScalarValue::Boolean(Some(value)), None)
+    }
+
     fn assert_invalid_integer_partition_error(
         result: Result<Vec<String>, Box<dyn std::error::Error>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -435,6 +462,25 @@ mod tests {
         let debug_message = format!("{error:?}");
         assert!(message.contains("not-an-integer"));
         assert!(debug_message.contains("Primitive(Long)"));
+
+        Ok(())
+    }
+
+    fn assert_invalid_boolean_partition_error(
+        result: Result<Vec<String>, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = match result {
+            Ok(paths) => {
+                return Err(
+                    format!("invalid boolean metadata should fail kernel scan: {paths:?}").into(),
+                );
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let debug_message = format!("{error:?}");
+        assert!(message.contains("not-a-boolean"));
+        assert!(debug_message.contains("Primitive(Boolean)"));
 
         Ok(())
     }
@@ -543,6 +589,136 @@ mod tests {
             )?,
             vec!["region-us-east.parquet"]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_boolean_null_and_empty_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_boolean_partition_characterization_source()?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec![
+                "boolean-empty.parquet",
+                "boolean-false.parquet",
+                "boolean-missing.parquet",
+                "boolean-null.parquet",
+                "boolean-true.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("is_current").is_null())?,
+            vec![
+                "boolean-empty.parquet",
+                "boolean-missing.parquet",
+                "boolean-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("is_current").is_not_null())?,
+            vec!["boolean-false.parquet", "boolean-true.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("is_current").eq(bool_lit(true)))?,
+            vec!["boolean-true.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("is_current").eq(bool_lit(false)))?,
+            vec!["boolean-false.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("is_current").not_eq(bool_lit(true)))?,
+            vec!["boolean-false.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_boolean_membership_and_composition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_boolean_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("is_current").in_list(vec![bool_lit(true), bool_lit(false)], false),
+            )?,
+            vec!["boolean-false.parquet", "boolean-true.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("is_current").in_list(vec![bool_lit(true)], true),
+            )?,
+            vec!["boolean-false.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("is_current")
+                    .eq(bool_lit(true))
+                    .or(col("is_current").is_null()),
+            )?,
+            vec![
+                "boolean-empty.parquet",
+                "boolean-missing.parquet",
+                "boolean-null.parquet",
+                "boolean-true.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("is_current")
+                    .eq(bool_lit(true))
+                    .and(col("is_current").is_not_null()),
+            )?,
+            vec!["boolean-true.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &Expr::Not(Box::new(col("is_current").eq(bool_lit(true)))),
+            )?,
+            vec!["boolean-false.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_invalid_boolean_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-invalid-boolean-characterization",
+            BOOLEAN_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("boolean-valid.parquet", r#"{"is_current":"true"}"#),
+                partitioned_add_json(
+                    "boolean-invalid.parquet",
+                    r#"{"is_current":"not-a-boolean"}"#,
+                ),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_invalid_boolean_partition_error(kernel_scan_file_paths(
+            &unfiltered_scan,
+            source.table_uri(),
+        ))?;
+        assert_invalid_boolean_partition_error(kernel_predicated_file_paths(
+            &source,
+            &col("is_current").eq(bool_lit(true)),
+        ))?;
 
         Ok(())
     }
