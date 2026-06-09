@@ -5873,6 +5873,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binary_partition_mixed_and_filter_uses_kernel_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "binary-partition-mixed-and-kernel-pruning",
+            BINARY_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["payload"]"#,
+            &[
+                r#""partitionValues":{"payload":"hello"}"#,
+                r#""partitionValues":{"payload":"world"}"#,
+                r#""partitionValues":{"payload":"/=%"}"#,
+                r#""partitionValues":{"payload":null}"#,
+                r#""partitionValues":{"payload":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let hello = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+        let filter = datafusion::logical_expr::col("payload")
+            .eq(hello)
+            .and(datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(10)));
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider.scan(&state, None, &[filter], None).await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+        let scan_plan = scan.scan_plan();
+
+        assert_eq!(scan_plan.pushed_filter_plan.exact_count, 0);
+        assert_eq!(scan_plan.pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan_plan.pushed_filter_plan.pushed_filter_count, 1);
+        assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan_plan.partition_metadata_filter.is_none());
+        assert!(scan_plan.kernel_partition_predicate.is_some());
+        assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sql_floating_partition_null_checks_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
