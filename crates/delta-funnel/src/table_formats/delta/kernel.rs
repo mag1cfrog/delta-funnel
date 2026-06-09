@@ -361,6 +361,8 @@ fn feature_name(feature: &TableFeature) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         ArrowEngineData, ColumnName, DefaultEngineBuilder, DeltaKernelPredicate,
         DeltaKernelPredicateAdapterError, DvInfo, EngineDataArrowExt, Expression, Predicate,
@@ -382,6 +384,12 @@ mod tests {
 
     fn kernel_column(name: &str) -> Expression {
         Expression::Column(ColumnName::new([name]))
+    }
+
+    fn convert_datafusion_scalar(
+        value: &ScalarValue,
+    ) -> Result<Scalar, DeltaKernelPredicateAdapterError> {
+        super::datafusion_scalar_to_kernel_scalar(value)
     }
 
     fn collect_scan_file(files: &mut Vec<ScanFile>, file: ScanFile) {
@@ -540,6 +548,88 @@ mod tests {
                 Expression::Literal(Scalar::String("value".to_owned()))
             ))
         );
+    }
+
+    #[test]
+    fn datafusion_predicate_adapter_documents_scalar_type_boundary() {
+        let supported = [
+            (ScalarValue::Boolean(Some(true)), Scalar::Boolean(true)),
+            (ScalarValue::Int8(Some(7)), Scalar::Byte(7)),
+            (ScalarValue::Int16(Some(7)), Scalar::Short(7)),
+            (ScalarValue::Int32(Some(7)), Scalar::Integer(7)),
+            (ScalarValue::Int64(Some(7)), Scalar::Long(7)),
+            (ScalarValue::Float32(Some(7.5)), Scalar::Float(7.5)),
+            (ScalarValue::Float64(Some(7.5)), Scalar::Double(7.5)),
+            (
+                ScalarValue::Utf8(Some("value".to_owned())),
+                Scalar::String("value".to_owned()),
+            ),
+            (
+                ScalarValue::LargeUtf8(Some("value".to_owned())),
+                Scalar::String("value".to_owned()),
+            ),
+        ];
+
+        for (datafusion_scalar, kernel_scalar) in supported {
+            assert_eq!(
+                convert_datafusion_scalar(&datafusion_scalar),
+                Ok(kernel_scalar),
+                "{datafusion_scalar:?}"
+            );
+        }
+
+        let unsupported_literals = [
+            ScalarValue::Decimal32(Some(12345), 10, 2),
+            ScalarValue::Decimal64(Some(12345), 10, 2),
+            ScalarValue::Decimal128(Some(12345), 10, 2),
+            ScalarValue::Decimal256(Some(12345.into()), 10, 2),
+            ScalarValue::UInt8(Some(7)),
+            ScalarValue::UInt16(Some(7)),
+            ScalarValue::UInt32(Some(7)),
+            ScalarValue::UInt64(Some(7)),
+            ScalarValue::Utf8View(Some("value".to_owned())),
+            ScalarValue::Binary(Some(vec![1, 2, 3])),
+            ScalarValue::BinaryView(Some(vec![1, 2, 3])),
+            ScalarValue::FixedSizeBinary(3, Some(vec![1, 2, 3])),
+            ScalarValue::LargeBinary(Some(vec![1, 2, 3])),
+            ScalarValue::Date32(Some(7)),
+            ScalarValue::Date64(Some(7)),
+            ScalarValue::Time32Second(Some(7)),
+            ScalarValue::Time32Millisecond(Some(7)),
+            ScalarValue::Time64Microsecond(Some(7)),
+            ScalarValue::Time64Nanosecond(Some(7)),
+            ScalarValue::TimestampSecond(Some(7), None),
+            ScalarValue::TimestampMillisecond(Some(7), None),
+            ScalarValue::TimestampMicrosecond(Some(7), None),
+            ScalarValue::TimestampNanosecond(Some(7), None),
+            ScalarValue::TimestampMicrosecond(Some(7), Some(Arc::from("UTC"))),
+        ];
+
+        for datafusion_scalar in unsupported_literals {
+            assert_eq!(
+                convert_datafusion_scalar(&datafusion_scalar),
+                Err(DeltaKernelPredicateAdapterError::UnsupportedLiteral),
+                "{datafusion_scalar:?}"
+            );
+        }
+
+        let null_literals = [
+            ScalarValue::Null,
+            ScalarValue::Boolean(None),
+            ScalarValue::Int32(None),
+            ScalarValue::Utf8(None),
+            ScalarValue::Decimal128(None, 10, 2),
+            ScalarValue::Binary(None),
+            ScalarValue::TimestampMicrosecond(None, None),
+        ];
+
+        for datafusion_scalar in null_literals {
+            assert_eq!(
+                convert_datafusion_scalar(&datafusion_scalar),
+                Err(DeltaKernelPredicateAdapterError::NullLiteral),
+                "{datafusion_scalar:?}"
+            );
+        }
     }
 
     #[test]
