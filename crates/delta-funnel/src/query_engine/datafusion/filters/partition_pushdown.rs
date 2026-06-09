@@ -231,6 +231,17 @@ fn is_boolean_column(column: &Column, schema: &SchemaRef) -> bool {
 
 fn exact_partition_kernel_expr(filter: &Expr, schema: &SchemaRef) -> Option<Expr> {
     match filter {
+        Expr::Column(column) => {
+            if is_kernel_exact_partition_column_for_operator(
+                column,
+                schema,
+                KernelPartitionOperatorFamily::BooleanShorthand,
+            ) {
+                Some(filter.clone().eq(lit(true)))
+            } else {
+                None
+            }
+        }
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
             let left = exact_partition_kernel_expr(binary.left.as_ref(), schema)?;
             let right = exact_partition_kernel_expr(binary.right.as_ref(), schema)?;
@@ -486,6 +497,10 @@ fn is_supported_partition_literal_for_column(
                 DataType::Int64,
                 Expr::Literal(ScalarValue::Int64(Some(_)), _),
             )
+            | (
+                DataType::Boolean,
+                Expr::Literal(ScalarValue::Boolean(Some(_)), _),
+            )
     )
 }
 
@@ -517,9 +532,7 @@ fn kernel_partition_policy(
             BooleanShorthand => Unsupported,
         },
         Boolean => match operator_family {
-            Equality | Membership | NullCheck | BooleanShorthand | Composition => {
-                TypedRestorePending
-            }
+            Equality | Membership | NullCheck | BooleanShorthand | Composition => KernelExact,
             Ordering | Between => Unsupported,
         },
         Binary => match operator_family {
@@ -694,13 +707,13 @@ mod tests {
             (Composition, KernelExact),
         ];
         let boolean_policy = [
-            (Equality, TypedRestorePending),
+            (Equality, KernelExact),
             (Ordering, Unsupported),
-            (Membership, TypedRestorePending),
+            (Membership, KernelExact),
             (Between, Unsupported),
-            (NullCheck, TypedRestorePending),
-            (BooleanShorthand, TypedRestorePending),
-            (Composition, TypedRestorePending),
+            (NullCheck, KernelExact),
+            (BooleanShorthand, KernelExact),
+            (Composition, KernelExact),
         ];
         let binary_policy = [
             (Equality, TypedRestorePending),
@@ -1023,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_boolean_null_checks_until_typed_child() {
+    fn partition_operator_planner_accepts_boolean_null_checks_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["is_current"]);
         let filters = [col("is_current").is_null(), col("is_current").is_not_null()];
@@ -1035,7 +1048,10 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
@@ -1474,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_boolean_equality_and_membership_until_typed_child() {
+    fn partition_operator_planner_accepts_boolean_equality_and_membership_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["is_current"]);
         let filters = [
@@ -1492,7 +1508,10 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
@@ -1508,6 +1527,9 @@ mod tests {
             ),
             col("is_current").in_list(vec![lit(true), lit("false")], false),
             col("is_current").in_list(vec![col("region")], false),
+            col("is_current").in_list(Vec::<Expr>::new(), false),
+            col("is_current").in_list(Vec::<Expr>::new(), true),
+            datafusion::logical_expr::cast(col("is_current"), DataType::Boolean).eq(lit(true)),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
@@ -1527,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_boolean_shorthand_until_typed_child() {
+    fn partition_operator_planner_accepts_boolean_shorthand_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["is_current"]);
         let filters = [col("is_current"), Expr::Not(Box::new(col("is_current")))];
@@ -1539,7 +1561,84 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        let expected_filters = [
+            col("is_current").eq(lit(true)),
+            Expr::Not(Box::new(col("is_current").eq(lit(true)))),
+        ];
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, filters.len());
+        assert_eq!(plan.residual_filter_count, 0);
+        for (decision, filter) in plan.decisions.iter().zip(expected_filters.iter()) {
+            assert_eq!(decision.outcome, DeltaFilterPushdownOutcome::Exact);
+            assert!(!decision.residual);
+            assert!(decision.rejection_reason.is_none());
+            assert!(decision.kernel_scan_filter.is_some());
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_boolean_composition_as_kernel_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let filters = [
+            col("is_current")
+                .eq(lit(true))
+                .or(col("is_current").is_null()),
+            col("is_current")
+                .not_eq(lit(false))
+                .and(col("is_current").is_not_null()),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
+    }
+
+    #[test]
+    fn partition_operator_planner_extracts_boolean_partition_term_from_mixed_and() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["is_current"]);
+        let partition_filter = col("is_current").eq(lit(true));
+        let data_filter = col("region").eq(lit("us-west"));
+        let filter = partition_filter.clone().and(data_filter);
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &[&filter],
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert!(plan.decisions[0].residual);
+        assert_eq!(
+            kernel_scan_expr(&plan.decisions[0]),
+            Some(&partition_filter)
+        );
+        assert!(plan.decisions[0].kernel_scan_filter.is_some());
     }
 
     #[test]
