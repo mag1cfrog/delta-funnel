@@ -13,7 +13,6 @@ use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{
     DeltaKernelPredicate, DeltaKernelPredicateAdapterError, datafusion_expr_to_kernel_predicate,
 };
-pub(crate) use partition_metadata_predicate::DeltaPartitionMetadataPredicate;
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };
@@ -59,16 +58,10 @@ impl ProjectedDeltaScan {
     }
 
     #[cfg(test)]
-    /// Returns scan file paths after kernel scan planning and optional metadata filtering.
-    ///
-    /// The kernel scan may already carry a delta_kernel predicate. Tests may
-    /// also pass a provider-owned metadata predicate to mirror legacy pruning:
-    /// expand kernel scan metadata first, then optionally evaluate the provider
-    /// predicate against each `ScanFile`'s partition values.
+    /// Returns scan file paths after kernel scan planning.
     pub(crate) fn scan_file_paths(
         &self,
         table_uri: &str,
-        partition_metadata_filter: Option<&DeltaPartitionMetadataPredicate>,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         fn collect_scan_file(files: &mut Vec<kernel::ScanFile>, file: kernel::ScanFile) {
             files.push(file);
@@ -83,17 +76,7 @@ impl ProjectedDeltaScan {
             files = scan_metadata?.visit_scan_files(files, collect_scan_file)?;
         }
 
-        let mut paths = files
-            .into_iter()
-            .filter(|file| {
-                // This is the provider-owned partition pruning step. A file is
-                // kept only when there is no pushed partition predicate or when
-                // that predicate evaluates to SQL TRUE for the file metadata.
-                partition_metadata_filter
-                    .is_none_or(|predicate| predicate.matches_scan_file(&file.partition_values))
-            })
-            .map(|file| file.path)
-            .collect::<Vec<_>>();
+        let mut paths = files.into_iter().map(|file| file.path).collect::<Vec<_>>();
         paths.sort();
         Ok(paths)
     }
@@ -233,7 +216,6 @@ fn load_delta_source_after_name_validation(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -242,11 +224,10 @@ mod tests {
     use datafusion::logical_expr::{Expr, col, lit};
 
     use super::kernel::{ColumnName, Expression, Predicate, Scalar};
-    use super::partition_metadata_predicate::DeltaPartitionNameMap;
     use super::{
-        DeltaKernelPredicate, DeltaPartitionMetadataPredicate, DeltaSourceConfig,
-        ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
-        datafusion_expr_to_kernel_predicate, load_delta_source, load_delta_sources,
+        DeltaKernelPredicate, DeltaSourceConfig, ProjectedDeltaScan, build_projected_delta_scan,
+        build_projected_predicated_delta_scan, datafusion_expr_to_kernel_predicate,
+        load_delta_source, load_delta_sources,
     };
     use crate::DeltaFunnelError;
 
@@ -2806,49 +2787,6 @@ mod tests {
         assert!(source.table_uri().starts_with("file://"));
         assert_eq!(source.version(), 1);
         assert_eq!(source.loaded_snapshot().version(), 1);
-
-        Ok(())
-    }
-
-    #[test]
-    fn scan_file_paths_can_apply_partition_metadata_filter()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new_with_metadata_and_adds(
-            "partition-metadata-filtered-scan-files",
-            PARTITIONED_METADATA_JSON,
-            &[
-                partitioned_add_json("part-00000.parquet", r#"{"region":"us-west"}"#),
-                partitioned_add_json("part-00001.parquet", r#"{"region":""}"#),
-                partitioned_add_json("part-00002.parquet", r#"{}"#),
-            ],
-        )?;
-        let source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: table.path.to_string_lossy().to_string(),
-            version: None,
-        })?;
-        let partition_columns = HashSet::from(["region".to_owned()]);
-        let physical_name_lookup = DeltaPartitionNameMap::identity(&partition_columns);
-        let metadata_filter = DeltaPartitionMetadataPredicate::from_datafusion_expr(
-            &col("region").eq(lit("")),
-            &super::delta_source_arrow_schema(&source)?,
-            &partition_columns,
-            &physical_name_lookup,
-        )?;
-        let scan = build_projected_delta_scan(&source, None)?;
-
-        assert_eq!(
-            scan.scan_file_paths(source.table_uri(), None)?,
-            vec![
-                "part-00000.parquet",
-                "part-00001.parquet",
-                "part-00002.parquet",
-            ]
-        );
-        assert_eq!(
-            scan.scan_file_paths(source.table_uri(), Some(&metadata_filter))?,
-            vec!["part-00001.parquet"]
-        );
 
         Ok(())
     }

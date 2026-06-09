@@ -138,7 +138,6 @@ impl DeltaTableProvider {
             protocol: self.protocol.clone(),
             scan_projection,
             pushed_filter_plan,
-            partition_metadata_filter: None,
             kernel_partition_predicate,
             kernel_scan,
         }))
@@ -443,10 +442,9 @@ mod tests {
         scan: &DeltaScanPlanningExec,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let scan_plan = scan.scan_plan();
-        scan_plan.kernel_scan().scan_file_paths(
-            &scan_plan.table_uri,
-            scan_plan.partition_metadata_filter.as_ref(),
-        )
+        scan_plan
+            .kernel_scan()
+            .scan_file_paths(&scan_plan.table_uri)
     }
 
     #[test]
@@ -656,7 +654,6 @@ mod tests {
         assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.pushed_filter_count, 1);
-        assert!(scan.scan_plan().partition_metadata_filter.is_none());
         assert!(scan.scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
 
@@ -702,7 +699,6 @@ mod tests {
         assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.pushed_filter_count, 1);
-        assert!(scan.scan_plan().partition_metadata_filter.is_none());
         assert!(scan.scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(
             scan_file_paths(scan)?,
@@ -960,10 +956,6 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scan.scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scan.scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -1049,10 +1041,6 @@ mod tests {
             assert_eq!(
                 scan.scan_plan().pushed_filter_plan.residual_filter_count,
                 1,
-                "{name}"
-            );
-            assert!(
-                scan.scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
             assert!(
@@ -1364,10 +1352,6 @@ mod tests {
                         "{name}"
                     );
                     assert!(
-                        scan.scan_plan().partition_metadata_filter.is_none(),
-                        "{name}"
-                    );
-                    assert!(
                         scan.scan_plan().kernel_partition_predicate.is_some(),
                         "{name}"
                     );
@@ -1533,7 +1517,6 @@ mod tests {
         assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
         assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan.scan_plan().partition_metadata_filter.is_none());
         assert!(scan.scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
 
@@ -1585,7 +1568,6 @@ mod tests {
         assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
         assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan.scan_plan().partition_metadata_filter.is_none());
         assert!(scan.scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, vec!["part-00001.parquet"]);
 
@@ -1662,7 +1644,6 @@ mod tests {
         assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
         assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan.scan_plan().partition_metadata_filter.is_none());
         assert!(scan.scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
 
@@ -1864,7 +1845,6 @@ mod tests {
                 .residual_filter_count,
             0
         );
-        assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
         assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
         let kernel_names = scans[0]
             .scan_plan()
@@ -1929,7 +1909,6 @@ mod tests {
         );
         assert_eq!(scans[0].schema().fields().len(), 1);
         assert_eq!(scans[0].schema().field(0).name(), "id");
-        assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
         assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scans[0])?, vec!["part-00000.parquet"]);
         let kernel_names = scans[0]
@@ -1999,7 +1978,6 @@ mod tests {
                 .residual_filter_count,
             0
         );
-        assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
         assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(
             scan_file_paths(scans[0])?,
@@ -2098,10 +2076,6 @@ mod tests {
                             .pushed_filter_plan
                             .residual_filter_count,
                         0,
-                        "{name}: {plan_display}"
-                    );
-                    assert!(
-                        scans[0].scan_plan().partition_metadata_filter.is_none(),
                         "{name}: {plan_display}"
                     );
                     assert!(
@@ -2404,10 +2378,6 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -2517,10 +2487,6 @@ mod tests {
                             .pushed_filter_plan
                             .residual_filter_count,
                         0
-                    );
-                    assert!(
-                        scans[0].scan_plan().partition_metadata_filter.is_none(),
-                        "{name}"
                     );
                     assert!(
                         scans[0].scan_plan().kernel_partition_predicate.is_some(),
@@ -2633,10 +2599,6 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -2730,7 +2692,6 @@ mod tests {
                         scans[0].scan_plan().pushed_filter_plan.pushed_filter_count > 0,
                         "{name}: {plan_display}"
                     );
-                    assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
                     assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
                     assert_eq!(scan_file_paths(scans[0])?, paths, "{name}");
                 }
@@ -3554,7 +3515,6 @@ mod tests {
             assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
             assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 0);
             assert_eq!(scan_plan.pushed_filter_plan.pushed_filter_count, 1);
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -3647,7 +3607,6 @@ mod tests {
             assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
             assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 0);
             assert_eq!(scan_plan.pushed_filter_plan.pushed_filter_count, 1);
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -3758,7 +3717,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count,
                 filters.len()
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -4104,7 +4062,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count, 1,
                 "{name}"
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -4202,7 +4159,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count, 1,
                 "{name}"
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -4344,7 +4300,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count, 1,
                 "{name}"
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -4480,7 +4435,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count, 1,
                 "{name}"
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -4598,7 +4552,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count,
                 filters.len()
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -4708,7 +4661,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count,
                 filters.len()
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -4780,7 +4732,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count, 1,
                 "{name}"
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -4853,7 +4804,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count, 1,
                 "{name}"
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -4950,10 +4900,6 @@ mod tests {
                     .residual_filter_count,
                 0,
                 "{name}: {plan_display}"
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
             assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
@@ -5055,10 +5001,6 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -5156,10 +5098,6 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -5249,10 +5187,6 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -5335,10 +5269,6 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -5419,10 +5349,6 @@ mod tests {
                     .residual_filter_count,
                 0,
                 "{name}: {plan_display}"
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
             assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
@@ -6102,7 +6028,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count,
                 filters.len()
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -6156,7 +6081,6 @@ mod tests {
         assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan_plan.pushed_filter_plan.pushed_filter_count, 1);
         assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan_plan.partition_metadata_filter.is_none());
         assert!(scan_plan.kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
 
@@ -6215,7 +6139,6 @@ mod tests {
         assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan_plan.pushed_filter_plan.pushed_filter_count, 1);
         assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan_plan.partition_metadata_filter.is_none());
         assert!(scan_plan.kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
 
@@ -6272,7 +6195,6 @@ mod tests {
         assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan_plan.pushed_filter_plan.pushed_filter_count, 1);
         assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan_plan.partition_metadata_filter.is_none());
         assert!(scan_plan.kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
 
@@ -6325,7 +6247,6 @@ mod tests {
         assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan_plan.pushed_filter_plan.pushed_filter_count, 1);
         assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan_plan.partition_metadata_filter.is_none());
         assert!(scan_plan.kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
 
@@ -6412,10 +6333,6 @@ mod tests {
                     .residual_filter_count,
                 0,
                 "{name}: {plan_display}"
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
             assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
@@ -6509,10 +6426,6 @@ mod tests {
                     .residual_filter_count,
                 0,
                 "{name}: {plan_display}"
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
             assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
@@ -6610,10 +6523,6 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_none(),
                 "{name}"
             );
@@ -6695,10 +6604,6 @@ mod tests {
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
                 0,
                 "{name}: {plan_display}"
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
         }
 
@@ -7306,7 +7211,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count,
                 filters.len()
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -7360,7 +7264,6 @@ mod tests {
         assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan_plan.pushed_filter_plan.pushed_filter_count, 1);
         assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 1);
-        assert!(scan_plan.partition_metadata_filter.is_none());
         assert!(scan_plan.kernel_partition_predicate.is_some());
         assert_eq!(
             scan_file_paths(scan)?,
@@ -7769,7 +7672,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count,
                 filters.len()
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -7946,7 +7848,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count,
                 filters.len()
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -8483,7 +8384,6 @@ mod tests {
                 scan_plan.pushed_filter_plan.pushed_filter_count,
                 filters.len()
             );
-            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
             assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
@@ -8928,10 +8828,6 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -9006,10 +8902,6 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -9081,10 +8973,6 @@ mod tests {
                     .pushed_filter_plan
                     .residual_filter_count,
                 0
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
             assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
@@ -9179,10 +9067,6 @@ mod tests {
                     .pushed_filter_plan
                     .residual_filter_count,
                 0
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
             assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
@@ -9281,10 +9165,6 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -9353,10 +9233,6 @@ mod tests {
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
                 0,
                 "{name}: {plan_display}"
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
         }
 
@@ -9446,10 +9322,6 @@ mod tests {
                     .pushed_filter_plan
                     .residual_filter_count,
                 0
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
             assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
@@ -9549,10 +9421,6 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -9630,10 +9498,6 @@ mod tests {
                     .pushed_filter_plan
                     .residual_filter_count,
                 0
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
             assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
@@ -9733,10 +9597,6 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -9813,10 +9673,6 @@ mod tests {
                     .pushed_filter_plan
                     .residual_filter_count,
                 0
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
             assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
@@ -9928,10 +9784,6 @@ mod tests {
                 0
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
-            );
-            assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
@@ -10001,10 +9853,6 @@ mod tests {
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
                 0
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
         }
 
@@ -10123,10 +9971,6 @@ mod tests {
                     .pushed_filter_plan
                     .residual_filter_count,
                 0
-            );
-            assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_none(),
-                "{name}"
             );
             assert!(
                 scans[0].scan_plan().kernel_partition_predicate.is_some(),

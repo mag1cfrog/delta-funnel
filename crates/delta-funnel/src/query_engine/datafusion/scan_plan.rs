@@ -5,7 +5,7 @@ use datafusion::logical_expr::Expr;
 
 use crate::{
     DeltaProtocolReport,
-    table_formats::{DeltaKernelPredicate, DeltaPartitionMetadataPredicate, ProjectedDeltaScan},
+    table_formats::{DeltaKernelPredicate, ProjectedDeltaScan},
 };
 
 use super::filters::DeltaFilterPushdownPlan;
@@ -36,16 +36,7 @@ pub(crate) struct ProviderScanPlan {
     pub(crate) scan_projection: Option<Vec<usize>>,
     /// Structured report for filters pushed into this scan.
     pub(crate) pushed_filter_plan: DeltaFilterPushdownPlan,
-    /// Provider-owned SQL-compatible partition metadata predicate for this scan.
-    ///
-    /// This is deliberately separate from the private kernel scan state below.
-    /// delta_kernel enumerates candidate files, then this predicate prunes those
-    /// files by evaluating their `ScanFile.partition_values`.
-    pub(crate) partition_metadata_filter: Option<DeltaPartitionMetadataPredicate>,
     /// Kernel predicate passed to delta_kernel scan planning for partition pruning.
-    ///
-    /// This is set when accepted exact partition filters are enforced by the
-    /// kernel scan path instead of the provider-owned metadata predicate path.
     pub(crate) kernel_partition_predicate: Option<DeltaKernelPredicate>,
     kernel_scan: ProjectedDeltaScan,
 }
@@ -58,7 +49,6 @@ pub(super) struct ProviderScanPlanParts {
     pub(super) protocol: DeltaProtocolReport,
     pub(super) scan_projection: Option<Vec<usize>>,
     pub(super) pushed_filter_plan: DeltaFilterPushdownPlan,
-    pub(super) partition_metadata_filter: Option<DeltaPartitionMetadataPredicate>,
     pub(super) kernel_partition_predicate: Option<DeltaKernelPredicate>,
     pub(super) kernel_scan: ProjectedDeltaScan,
 }
@@ -73,7 +63,6 @@ impl ProviderScanPlan {
             protocol: parts.protocol,
             scan_projection: parts.scan_projection,
             pushed_filter_plan: parts.pushed_filter_plan,
-            partition_metadata_filter: parts.partition_metadata_filter,
             kernel_partition_predicate: parts.kernel_partition_predicate,
             kernel_scan: parts.kernel_scan,
         }
@@ -126,7 +115,6 @@ mod tests {
         assert_eq!(plan.projected_schema.field(0).name(), "id");
         assert_eq!(plan.projected_schema.field(1).name(), "customer_name");
         assert_eq!(plan.kernel_scan().kernel_schema().num_fields(), 2);
-        assert!(plan.partition_metadata_filter.is_none());
         assert!(plan.kernel_partition_predicate.is_none());
         let _ = plan.kernel_scan().kernel_scan();
 
@@ -156,7 +144,6 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.unsupported_count, 0);
         assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 0);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
-        assert!(plan.partition_metadata_filter.is_none());
         assert!(plan.kernel_partition_predicate.is_none());
 
         Ok(())
@@ -200,11 +187,9 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.unsupported_count, 0);
         assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 2);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
-        assert!(plan.partition_metadata_filter.is_none());
         assert!(plan.kernel_partition_predicate.is_some());
         assert_eq!(
-            plan.kernel_scan()
-                .scan_file_paths(&plan.table_uri, plan.partition_metadata_filter.as_ref())?,
+            plan.kernel_scan().scan_file_paths(&plan.table_uri)?,
             vec!["part-00000.parquet"]
         );
         assert_eq!(plan.projected_schema.field(0).name(), "id");
@@ -255,11 +240,9 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.exact_count, 2);
         assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 2);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
-        assert!(plan.partition_metadata_filter.is_none());
         assert!(plan.kernel_partition_predicate.is_some());
         assert_eq!(
-            plan.kernel_scan()
-                .scan_file_paths(&plan.table_uri, plan.partition_metadata_filter.as_ref())?,
+            plan.kernel_scan().scan_file_paths(&plan.table_uri)?,
             vec!["part-00000.parquet"]
         );
 
@@ -300,11 +283,10 @@ mod tests {
         );
         assert_eq!(plan.pushed_filter_plan.exact_count, 2);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
-        assert!(plan.partition_metadata_filter.is_none());
         assert!(plan.kernel_partition_predicate.is_some());
         assert!(
             plan.kernel_scan()
-                .scan_file_paths(&plan.table_uri, plan.partition_metadata_filter.as_ref())?
+                .scan_file_paths(&plan.table_uri)?
                 .is_empty()
         );
 
@@ -345,7 +327,6 @@ mod tests {
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
         assert_eq!(kernel_names, vec!["id", "region"]);
-        assert!(plan.partition_metadata_filter.is_none());
         assert!(plan.kernel_partition_predicate.is_some());
 
         Ok(())
@@ -386,11 +367,9 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.unsupported_count, 0);
         assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 1);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
-        assert!(plan.partition_metadata_filter.is_none());
         assert!(plan.kernel_partition_predicate.is_some());
         assert_eq!(
-            plan.kernel_scan()
-                .scan_file_paths(&plan.table_uri, plan.partition_metadata_filter.as_ref())?,
+            plan.kernel_scan().scan_file_paths(&plan.table_uri)?,
             vec!["part-00000.parquet", "part-00001.parquet"]
         );
 
