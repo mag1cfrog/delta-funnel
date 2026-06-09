@@ -7775,7 +7775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_boolean_partition_null_checks_keep_residual_filter()
+    async fn sql_boolean_partition_null_checks_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -7823,14 +7823,14 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0
+                1
             );
             assert_eq!(
                 scans[0]
@@ -7844,7 +7844,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
@@ -8665,7 +8665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_boolean_partition_shorthand_rewrites_keep_residual_filter()
+    async fn sql_boolean_partition_literal_operators_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -8721,6 +8721,18 @@ mod tests {
                 "not in list rewrite",
                 "select id from orders where is_current not in (true)",
             ),
+            (
+                "whole and",
+                "select id from orders where is_current = true and is_current is not null",
+            ),
+            (
+                "whole or",
+                "select id from orders where is_current = true or is_current is null",
+            ),
+            (
+                "not equality",
+                "select id from orders where not is_current = true",
+            ),
         ];
 
         for (name, sql) in cases {
@@ -8733,18 +8745,16 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count > 0,
                 "{name}: {plan_display}"
             );
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count > 0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -8759,7 +8769,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
