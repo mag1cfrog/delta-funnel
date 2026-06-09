@@ -270,6 +270,15 @@ mod tests {
             metadata_json: &str,
             add_jsons: &[String],
         ) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_protocol_metadata_and_adds(name, PROTOCOL_JSON, metadata_json, add_jsons)
+        }
+
+        fn new_with_protocol_metadata_and_adds(
+            name: &str,
+            protocol_json: &str,
+            metadata_json: &str,
+            add_jsons: &[String],
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let path = Path::new("target")
                 .join("delta-funnel-named-source-tests")
                 .join(unique_name(name)?);
@@ -277,7 +286,7 @@ mod tests {
             fs::create_dir_all(&log_path)?;
             fs::write(
                 log_path.join("00000000000000000000.json"),
-                format!("{PROTOCOL_JSON}\n{metadata_json}\n"),
+                format!("{protocol_json}\n{metadata_json}\n"),
             )?;
             fs::write(log_path.join("00000000000000000001.json"), {
                 let mut actions = add_jsons.join("\n");
@@ -299,6 +308,8 @@ mod tests {
     const FLOATING_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"float_part\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_part\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["float_part","double_part"],"configuration":{},"createdTime":1587968585495}}"#;
     const BINARY_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["payload"],"configuration":{},"createdTime":1587968585495}}"#;
     const TIMESTAMP_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["event_ts"],"configuration":{},"createdTime":1587968585495}}"#;
+    const TIMESTAMP_NTZ_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
+    const TIMESTAMP_NTZ_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["event_ts_ntz"],"configuration":{},"createdTime":1587968585495}}"#;
 
     fn add_json(path: &str) -> String {
         format!(
@@ -577,6 +588,43 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_timestamp_ntz_partition_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "kernel-timestamp-ntz-partition-characterization",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TIMESTAMP_NTZ_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json(
+                    "timestamp-ntz-pre-epoch.parquet",
+                    r#"{"event_ts_ntz":"1969-12-31 23:59:59.999999"}"#,
+                ),
+                partitioned_add_json(
+                    "timestamp-ntz-low-space.parquet",
+                    r#"{"event_ts_ntz":"2025-12-31 23:59:59.999999"}"#,
+                ),
+                partitioned_add_json(
+                    "timestamp-ntz-target-space.parquet",
+                    r#"{"event_ts_ntz":"2026-01-01 00:00:00.123456"}"#,
+                ),
+                partitioned_add_json(
+                    "timestamp-ntz-high.parquet",
+                    r#"{"event_ts_ntz":"2026-01-01 00:00:00.123457"}"#,
+                ),
+                partitioned_add_json("timestamp-ntz-null.parquet", r#"{"event_ts_ntz":null}"#),
+                partitioned_add_json("timestamp-ntz-empty.parquet", r#"{"event_ts_ntz":""}"#),
+                partitioned_add_json("timestamp-ntz-missing.parquet", r#"{}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_predicated_file_paths(
         source: &super::PlannedDeltaSource,
         filter: &datafusion::logical_expr::Expr,
@@ -671,6 +719,28 @@ mod tests {
         DeltaKernelPredicate::new(Predicate::ne(
             timestamp_partition_column(),
             timestamp_partition_value(value),
+        ))
+    }
+
+    fn timestamp_ntz_partition_column() -> Expression {
+        Expression::Column(ColumnName::new(["event_ts_ntz"]))
+    }
+
+    fn timestamp_ntz_partition_value(value: i64) -> Expression {
+        Expression::Literal(Scalar::TimestampNtz(value))
+    }
+
+    fn timestamp_ntz_partition_eq(value: i64) -> DeltaKernelPredicate {
+        DeltaKernelPredicate::new(Predicate::eq(
+            timestamp_ntz_partition_column(),
+            timestamp_ntz_partition_value(value),
+        ))
+    }
+
+    fn timestamp_ntz_partition_ne(value: i64) -> DeltaKernelPredicate {
+        DeltaKernelPredicate::new(Predicate::ne(
+            timestamp_ntz_partition_column(),
+            timestamp_ntz_partition_value(value),
         ))
     }
 
@@ -803,6 +873,30 @@ mod tests {
             message.contains("not-a-timestamp")
                 || debug_message.contains("not-a-timestamp")
                 || debug_message.contains("Timestamp"),
+            "{message}\n{debug_message}"
+        );
+
+        Ok(())
+    }
+
+    fn assert_invalid_timestamp_ntz_partition_error(
+        result: Result<Vec<String>, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = match result {
+            Ok(paths) => {
+                return Err(format!(
+                    "invalid timestamp_ntz metadata should fail kernel scan: {paths:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let debug_message = format!("{error:?}");
+        assert!(
+            message.contains("not-a-timestamp")
+                || debug_message.contains("not-a-timestamp")
+                || debug_message.contains("TimestampNtz"),
             "{message}\n{debug_message}"
         );
 
@@ -1921,6 +2015,269 @@ mod tests {
     }
 
     #[test]
+    fn kernel_partition_characterization_documents_timestamp_ntz_ordering_and_formatting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_timestamp_ntz_partition_characterization_source()?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+        let pre_epoch = -1_i64;
+        let low = 1_767_225_599_999_999_i64;
+        let target = 1_767_225_600_123_456_i64;
+        let high = 1_767_225_600_123_457_i64;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec![
+                "timestamp-ntz-empty.parquet",
+                "timestamp-ntz-high.parquet",
+                "timestamp-ntz-low-space.parquet",
+                "timestamp-ntz-missing.parquet",
+                "timestamp-ntz-null.parquet",
+                "timestamp-ntz-pre-epoch.parquet",
+                "timestamp-ntz-target-space.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::lt(
+                    timestamp_ntz_partition_column(),
+                    timestamp_ntz_partition_value(target),
+                )),
+            )?,
+            vec![
+                "timestamp-ntz-low-space.parquet",
+                "timestamp-ntz-pre-epoch.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::ge(
+                    timestamp_ntz_partition_column(),
+                    timestamp_ntz_partition_value(target),
+                )),
+            )?,
+            vec![
+                "timestamp-ntz-high.parquet",
+                "timestamp-ntz-target-space.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::gt(
+                    timestamp_ntz_partition_value(high),
+                    timestamp_ntz_partition_column(),
+                )),
+            )?,
+            vec![
+                "timestamp-ntz-low-space.parquet",
+                "timestamp-ntz-pre-epoch.parquet",
+                "timestamp-ntz-target-space.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, timestamp_ntz_partition_eq(pre_epoch))?,
+            vec!["timestamp-ntz-pre-epoch.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, timestamp_ntz_partition_eq(target))?,
+            vec!["timestamp-ntz-target-space.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, timestamp_ntz_partition_ne(target))?,
+            vec![
+                "timestamp-ntz-high.parquet",
+                "timestamp-ntz-low-space.parquet",
+                "timestamp-ntz-pre-epoch.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, timestamp_ntz_partition_eq(high))?,
+            vec!["timestamp-ntz-high.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, timestamp_ntz_partition_eq(low))?,
+            vec!["timestamp-ntz-low-space.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_timestamp_ntz_null_empty_and_membership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_timestamp_ntz_partition_characterization_source()?;
+        let low = 1_767_225_599_999_999_i64;
+        let target = 1_767_225_600_123_456_i64;
+
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::is_null(timestamp_ntz_partition_column())),
+            )?,
+            vec![
+                "timestamp-ntz-empty.parquet",
+                "timestamp-ntz-missing.parquet",
+                "timestamp-ntz-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::is_not_null(timestamp_ntz_partition_column())),
+            )?,
+            vec![
+                "timestamp-ntz-high.parquet",
+                "timestamp-ntz-low-space.parquet",
+                "timestamp-ntz-pre-epoch.parquet",
+                "timestamp-ntz-target-space.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::or(
+                    Predicate::eq(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(low)
+                    ),
+                    Predicate::eq(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(target)
+                    ),
+                )),
+            )?,
+            vec![
+                "timestamp-ntz-low-space.parquet",
+                "timestamp-ntz-target-space.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::and(
+                    Predicate::ne(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(low)
+                    ),
+                    Predicate::ne(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(target)
+                    ),
+                )),
+            )?,
+            vec![
+                "timestamp-ntz-high.parquet",
+                "timestamp-ntz-pre-epoch.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_timestamp_ntz_between_and_composition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_timestamp_ntz_partition_characterization_source()?;
+        let low = 1_767_225_599_999_999_i64;
+        let target = 1_767_225_600_123_456_i64;
+        let high = 1_767_225_600_123_457_i64;
+
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::and(
+                    Predicate::ge(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(low)
+                    ),
+                    Predicate::le(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(target)
+                    ),
+                )),
+            )?,
+            vec![
+                "timestamp-ntz-low-space.parquet",
+                "timestamp-ntz-target-space.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::or(
+                    Predicate::lt(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(low)
+                    ),
+                    Predicate::gt(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(target)
+                    ),
+                )),
+            )?,
+            vec![
+                "timestamp-ntz-high.parquet",
+                "timestamp-ntz-pre-epoch.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::and(
+                    Predicate::gt(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(low)
+                    ),
+                    Predicate::le(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(high)
+                    ),
+                )),
+            )?,
+            vec![
+                "timestamp-ntz-high.parquet",
+                "timestamp-ntz-target-space.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::or(
+                    Predicate::eq(
+                        timestamp_ntz_partition_column(),
+                        timestamp_ntz_partition_value(low)
+                    ),
+                    Predicate::is_null(timestamp_ntz_partition_column()),
+                )),
+            )?,
+            vec![
+                "timestamp-ntz-empty.parquet",
+                "timestamp-ntz-low-space.parquet",
+                "timestamp-ntz-missing.parquet",
+                "timestamp-ntz-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::not(Predicate::eq(
+                    timestamp_ntz_partition_column(),
+                    timestamp_ntz_partition_value(target),
+                ))),
+            )?,
+            vec![
+                "timestamp-ntz-high.parquet",
+                "timestamp-ntz-low-space.parquet",
+                "timestamp-ntz-pre-epoch.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn kernel_partition_characterization_documents_invalid_timestamp_metadata()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_metadata_and_adds(
@@ -1951,6 +2308,105 @@ mod tests {
         assert_invalid_timestamp_partition_error(kernel_predicate_file_paths(
             &source,
             timestamp_partition_eq(1_767_225_600_123_456),
+        ))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_invalid_timestamp_ntz_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let invalid_text_table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "kernel-invalid-timestamp-ntz-characterization",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TIMESTAMP_NTZ_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json(
+                    "timestamp-ntz-valid.parquet",
+                    r#"{"event_ts_ntz":"2026-01-01 00:00:00.123456"}"#,
+                ),
+                partitioned_add_json(
+                    "timestamp-ntz-invalid.parquet",
+                    r#"{"event_ts_ntz":"not-a-timestamp"}"#,
+                ),
+            ],
+        )?;
+        let invalid_text_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: invalid_text_table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&invalid_text_source, None)?;
+
+        assert_invalid_timestamp_ntz_partition_error(kernel_scan_file_paths(
+            &unfiltered_scan,
+            invalid_text_source.table_uri(),
+        ))?;
+        assert_invalid_timestamp_ntz_partition_error(kernel_predicate_file_paths(
+            &invalid_text_source,
+            timestamp_ntz_partition_eq(1_767_225_600_123_456),
+        ))?;
+
+        let t_separator_table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "kernel-t-separator-timestamp-ntz-characterization",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TIMESTAMP_NTZ_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json(
+                    "timestamp-ntz-valid.parquet",
+                    r#"{"event_ts_ntz":"2026-01-01 00:00:00.123456"}"#,
+                ),
+                partitioned_add_json(
+                    "timestamp-ntz-t-separator.parquet",
+                    r#"{"event_ts_ntz":"2026-01-01T00:00:00.123456"}"#,
+                ),
+            ],
+        )?;
+        let t_separator_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: t_separator_table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&t_separator_source, None)?;
+
+        assert_invalid_timestamp_ntz_partition_error(kernel_scan_file_paths(
+            &unfiltered_scan,
+            t_separator_source.table_uri(),
+        ))?;
+        assert_invalid_timestamp_ntz_partition_error(kernel_predicate_file_paths(
+            &t_separator_source,
+            timestamp_ntz_partition_eq(1_767_225_600_123_456),
+        ))?;
+
+        let zone_table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "kernel-zone-timestamp-ntz-characterization",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TIMESTAMP_NTZ_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json(
+                    "timestamp-ntz-valid.parquet",
+                    r#"{"event_ts_ntz":"2026-01-01 00:00:00.123456"}"#,
+                ),
+                partitioned_add_json(
+                    "timestamp-ntz-zone.parquet",
+                    r#"{"event_ts_ntz":"2026-01-01T00:00:00.123456Z"}"#,
+                ),
+            ],
+        )?;
+        let zone_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: zone_table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&zone_source, None)?;
+
+        assert_invalid_timestamp_ntz_partition_error(kernel_scan_file_paths(
+            &unfiltered_scan,
+            zone_source.table_uri(),
+        ))?;
+        assert_invalid_timestamp_ntz_partition_error(kernel_predicate_file_paths(
+            &zone_source,
+            timestamp_ntz_partition_eq(1_767_225_600_123_456),
         ))?;
 
         Ok(())
