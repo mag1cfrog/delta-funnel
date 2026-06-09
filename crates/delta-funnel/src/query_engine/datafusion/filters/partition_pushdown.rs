@@ -30,7 +30,6 @@ enum KernelPartitionTypeGroup {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum KernelPartitionOperatorFamily {
     Equality,
     Ordering,
@@ -38,14 +37,6 @@ enum KernelPartitionOperatorFamily {
     Between,
     NullCheck,
     BooleanShorthand,
-    Composition,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KernelPartitionPolicyOutcome {
-    KernelExact,
-    TypedRestorePending,
-    Unsupported,
 }
 
 /// Plans the static partition operator policy for kernel-native pruning.
@@ -61,10 +52,7 @@ pub(super) fn plan_partition_operator_pushdown(
 ) -> DeltaFilterPushdownPlan {
     let decisions = filters
         .iter()
-        .enumerate()
-        .map(|(input_index, filter)| {
-            partition_operator_decision(input_index, filter, schema, partition_columns)
-        })
+        .map(|filter| partition_operator_decision(filter, schema, partition_columns))
         .collect::<Vec<_>>();
 
     DeltaFilterPushdownPlan::from_decisions(decisions)
@@ -77,7 +65,6 @@ pub(super) fn plan_partition_operator_pushdown(
 /// remain useful, but unsupported predicates are not accepted and must not
 /// affect kernel scan planning.
 fn partition_operator_decision(
-    input_index: usize,
     filter: &Expr,
     schema: &SchemaRef,
     partition_columns: &HashSet<String>,
@@ -90,7 +77,6 @@ fn partition_operator_decision(
         && let Some(kernel_scan_filter) = try_exact_partition_kernel_filter(filter, schema)
     {
         return DeltaFilterPushdownDecision {
-            input_index,
             outcome: DeltaFilterPushdownOutcome::Exact,
             residual: false,
             rejection_reason: None,
@@ -104,7 +90,6 @@ fn partition_operator_decision(
             try_mixed_and_partition_kernel_filter(filter, schema, partition_columns)
     {
         return DeltaFilterPushdownDecision {
-            input_index,
             outcome: DeltaFilterPushdownOutcome::Inexact,
             residual: true,
             rejection_reason: None,
@@ -114,7 +99,6 @@ fn partition_operator_decision(
     }
 
     DeltaFilterPushdownDecision {
-        input_index,
         outcome: DeltaFilterPushdownOutcome::Unsupported,
         residual: true,
         rejection_reason: Some(rejection_reason),
@@ -450,8 +434,7 @@ fn is_kernel_exact_partition_column_for_operator(
     }
 
     schema.field_with_name(&column.name).is_ok_and(|field| {
-        kernel_partition_policy(field.data_type(), operator_family)
-            == KernelPartitionPolicyOutcome::KernelExact
+        is_supported_kernel_partition_operator(field.data_type(), operator_family)
     })
 }
 
@@ -524,14 +507,13 @@ fn is_supported_partition_literal_for_column(
     }
 }
 
-fn kernel_partition_policy(
+fn is_supported_kernel_partition_operator(
     data_type: &DataType,
     operator_family: KernelPartitionOperatorFamily,
-) -> KernelPartitionPolicyOutcome {
+) -> bool {
     use KernelPartitionOperatorFamily::{
-        Between, BooleanShorthand, Composition, Equality, Membership, NullCheck, Ordering,
+        Between, BooleanShorthand, Equality, Membership, NullCheck, Ordering,
     };
-    use KernelPartitionPolicyOutcome::{KernelExact, TypedRestorePending, Unsupported};
     use KernelPartitionTypeGroup::{
         Binary, Boolean, Date, Decimal, Decimal256, Floating, Integer, String, Timestamp,
         TimestampNtz,
@@ -539,44 +521,39 @@ fn kernel_partition_policy(
 
     match kernel_partition_type_group(data_type) {
         String => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
-            BooleanShorthand => Unsupported,
+            Equality | Ordering | Membership | Between | NullCheck => true,
+            BooleanShorthand => false,
         },
         Integer => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
-            BooleanShorthand => Unsupported,
+            Equality | Ordering | Membership | Between | NullCheck => true,
+            BooleanShorthand => false,
         },
         Date => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
-            BooleanShorthand => Unsupported,
+            Equality | Ordering | Membership | Between | NullCheck => true,
+            BooleanShorthand => false,
         },
         Decimal => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
-            BooleanShorthand => Unsupported,
+            Equality | Ordering | Membership | Between | NullCheck => true,
+            BooleanShorthand => false,
         },
-        Decimal256 => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => {
-                TypedRestorePending
-            }
-            BooleanShorthand => Unsupported,
-        },
+        Decimal256 => false,
         Timestamp | TimestampNtz => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
-            BooleanShorthand => Unsupported,
+            Equality | Ordering | Membership | Between | NullCheck => true,
+            BooleanShorthand => false,
         },
         Floating => match operator_family {
-            Equality | Membership | NullCheck | Composition => KernelExact,
-            Ordering | Between | BooleanShorthand => Unsupported,
+            Equality | Membership | NullCheck => true,
+            Ordering | Between | BooleanShorthand => false,
         },
         Boolean => match operator_family {
-            Equality | Membership | NullCheck | BooleanShorthand | Composition => KernelExact,
-            Ordering | Between => Unsupported,
+            Equality | Membership | NullCheck | BooleanShorthand => true,
+            Ordering | Between => false,
         },
         Binary => match operator_family {
-            Equality | Membership | NullCheck | Composition => KernelExact,
-            Ordering | Between | BooleanShorthand => Unsupported,
+            Equality | Membership | NullCheck => true,
+            Ordering | Between | BooleanShorthand => false,
         },
-        KernelPartitionTypeGroup::Unsupported => Unsupported,
+        KernelPartitionTypeGroup::Unsupported => false,
     }
 }
 
@@ -685,132 +662,111 @@ mod tests {
                 && !decision.residual
                 && decision.rejection_reason.is_none()
                 && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
-                && decision.filter_analysis.kernel_predicate.is_some()
-                && decision.filter_analysis.kernel_adapter_error.is_none()
                 && decision.kernel_scan_filter.is_some()
         }));
     }
 
-    fn assert_type_policy(
+    fn assert_type_operator_admission(
         data_type: DataType,
         expected_group: KernelPartitionTypeGroup,
-        expected_policy: &[(KernelPartitionOperatorFamily, KernelPartitionPolicyOutcome)],
+        expected_admission: &[(KernelPartitionOperatorFamily, bool)],
     ) {
         assert_eq!(kernel_partition_type_group(&data_type), expected_group);
 
-        for (operator_family, outcome) in expected_policy {
+        for (operator_family, supported) in expected_admission {
             assert_eq!(
-                kernel_partition_policy(&data_type, *operator_family),
-                *outcome,
+                is_supported_kernel_partition_operator(&data_type, *operator_family),
+                *supported,
                 "{data_type:?} {operator_family:?}"
             );
         }
     }
 
     #[test]
-    fn kernel_partition_policy_documents_current_type_operator_matrix() {
+    fn kernel_partition_admission_documents_supported_type_operator_families() {
         use KernelPartitionOperatorFamily::{
-            Between, BooleanShorthand, Composition, Equality, Membership, NullCheck, Ordering,
+            Between, BooleanShorthand, Equality, Membership, NullCheck, Ordering,
         };
-        use KernelPartitionPolicyOutcome::{KernelExact, TypedRestorePending, Unsupported};
         use KernelPartitionTypeGroup::{
             Binary, Boolean, Date, Decimal, Decimal256, Floating, Integer, String, Timestamp,
             TimestampNtz,
         };
 
-        let string_policy = [
-            (Equality, KernelExact),
-            (Ordering, KernelExact),
-            (Membership, KernelExact),
-            (Between, KernelExact),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+        let string_admission = [
+            (Equality, true),
+            (Ordering, true),
+            (Membership, true),
+            (Between, true),
+            (NullCheck, true),
+            (BooleanShorthand, false),
         ];
-        let ordered_typed_restore_policy = [
-            (Equality, TypedRestorePending),
-            (Ordering, TypedRestorePending),
-            (Membership, TypedRestorePending),
-            (Between, TypedRestorePending),
-            (NullCheck, TypedRestorePending),
-            (BooleanShorthand, Unsupported),
-            (Composition, TypedRestorePending),
+        let integer_admission = [
+            (Equality, true),
+            (Ordering, true),
+            (Membership, true),
+            (Between, true),
+            (NullCheck, true),
+            (BooleanShorthand, false),
         ];
-        let integer_policy = [
-            (Equality, KernelExact),
-            (Ordering, KernelExact),
-            (Membership, KernelExact),
-            (Between, KernelExact),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+        let boolean_admission = [
+            (Equality, true),
+            (Ordering, false),
+            (Membership, true),
+            (Between, false),
+            (NullCheck, true),
+            (BooleanShorthand, true),
         ];
-        let boolean_policy = [
-            (Equality, KernelExact),
-            (Ordering, Unsupported),
-            (Membership, KernelExact),
-            (Between, Unsupported),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, KernelExact),
-            (Composition, KernelExact),
+        let floating_admission = [
+            (Equality, true),
+            (Ordering, false),
+            (Membership, true),
+            (Between, false),
+            (NullCheck, true),
+            (BooleanShorthand, false),
         ];
-        let floating_policy = [
-            (Equality, KernelExact),
-            (Ordering, Unsupported),
-            (Membership, KernelExact),
-            (Between, Unsupported),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+        let date_admission = [
+            (Equality, true),
+            (Ordering, true),
+            (Membership, true),
+            (Between, true),
+            (NullCheck, true),
+            (BooleanShorthand, false),
         ];
-        let date_policy = [
-            (Equality, KernelExact),
-            (Ordering, KernelExact),
-            (Membership, KernelExact),
-            (Between, KernelExact),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+        let decimal_admission = [
+            (Equality, true),
+            (Ordering, true),
+            (Membership, true),
+            (Between, true),
+            (NullCheck, true),
+            (BooleanShorthand, false),
         ];
-        let decimal_policy = [
-            (Equality, KernelExact),
-            (Ordering, KernelExact),
-            (Membership, KernelExact),
-            (Between, KernelExact),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+        let timestamp_admission = [
+            (Equality, true),
+            (Ordering, true),
+            (Membership, true),
+            (Between, true),
+            (NullCheck, true),
+            (BooleanShorthand, false),
         ];
-        let timestamp_policy = [
-            (Equality, KernelExact),
-            (Ordering, KernelExact),
-            (Membership, KernelExact),
-            (Between, KernelExact),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+        let binary_admission = [
+            (Equality, true),
+            (Ordering, false),
+            (Membership, true),
+            (Between, false),
+            (NullCheck, true),
+            (BooleanShorthand, false),
         ];
-        let binary_policy = [
-            (Equality, KernelExact),
-            (Ordering, Unsupported),
-            (Membership, KernelExact),
-            (Between, Unsupported),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
-        ];
-        let unsupported_policy = [
-            (Equality, Unsupported),
-            (Ordering, Unsupported),
-            (Membership, Unsupported),
-            (Between, Unsupported),
-            (NullCheck, Unsupported),
-            (BooleanShorthand, Unsupported),
-            (Composition, Unsupported),
+        let unsupported_admission = [
+            (Equality, false),
+            (Ordering, false),
+            (Membership, false),
+            (Between, false),
+            (NullCheck, false),
+            (BooleanShorthand, false),
         ];
 
         for data_type in [DataType::Utf8, DataType::LargeUtf8] {
-            assert_type_policy(data_type, String, &string_policy);
+            assert_type_operator_admission(data_type, String, &string_admission);
         }
         for data_type in [
             DataType::Int8,
@@ -818,60 +774,60 @@ mod tests {
             DataType::Int32,
             DataType::Int64,
         ] {
-            assert_type_policy(data_type, Integer, &integer_policy);
+            assert_type_operator_admission(data_type, Integer, &integer_admission);
         }
-        assert_type_policy(DataType::Boolean, Boolean, &boolean_policy);
-        assert_type_policy(DataType::Date32, Date, &date_policy);
-        assert_type_policy(DataType::Decimal128(10, 2), Decimal, &decimal_policy);
-        assert_type_policy(
+        assert_type_operator_admission(DataType::Boolean, Boolean, &boolean_admission);
+        assert_type_operator_admission(DataType::Date32, Date, &date_admission);
+        assert_type_operator_admission(DataType::Decimal128(10, 2), Decimal, &decimal_admission);
+        assert_type_operator_admission(
             DataType::Decimal256(38, 18),
             Decimal256,
-            &ordered_typed_restore_policy,
+            &unsupported_admission,
         );
         for data_type in [DataType::Float32, DataType::Float64] {
-            assert_type_policy(data_type, Floating, &floating_policy);
+            assert_type_operator_admission(data_type, Floating, &floating_admission);
         }
         for data_type in [
             DataType::Binary,
             DataType::LargeBinary,
             DataType::FixedSizeBinary(16),
         ] {
-            assert_type_policy(data_type, Binary, &binary_policy);
+            assert_type_operator_admission(data_type, Binary, &binary_admission);
         }
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             Timestamp,
-            &timestamp_policy,
+            &timestamp_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Timestamp(TimeUnit::Microsecond, None),
             TimestampNtz,
-            &timestamp_policy,
+            &timestamp_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Timestamp(TimeUnit::Microsecond, Some("".into())),
             TimestampNtz,
-            &timestamp_policy,
+            &timestamp_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
             KernelPartitionTypeGroup::Unsupported,
-            &unsupported_policy,
+            &unsupported_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Null,
             KernelPartitionTypeGroup::Unsupported,
-            &unsupported_policy,
+            &unsupported_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Struct(vec![Field::new("child", DataType::Utf8, true)].into()),
             KernelPartitionTypeGroup::Unsupported,
-            &unsupported_policy,
+            &unsupported_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             KernelPartitionTypeGroup::Unsupported,
-            &unsupported_policy,
+            &unsupported_admission,
         );
     }
 
@@ -904,7 +860,6 @@ mod tests {
             plan.decisions[0].filter_analysis.scope,
             DeltaFilterColumnScope::PartitionOnly
         );
-        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_some());
     }
 
     #[test]
@@ -969,8 +924,6 @@ mod tests {
                 && !decision.residual
                 && decision.rejection_reason.is_none()
                 && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
-                && decision.filter_analysis.kernel_predicate.is_some()
-                && decision.filter_analysis.kernel_adapter_error.is_none()
                 && decision.kernel_scan_filter.is_some()
         }));
     }
@@ -1018,7 +971,6 @@ mod tests {
             decision.outcome == DeltaFilterPushdownOutcome::Exact
                 && !decision.residual
                 && decision.filter_analysis.partition_columns == vec!["large_region"]
-                && decision.filter_analysis.kernel_predicate.is_some()
                 && decision.kernel_scan_filter.is_some()
         }));
     }
@@ -1110,8 +1062,6 @@ mod tests {
                 && !decision.residual
                 && decision.rejection_reason.is_none()
                 && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
-                && decision.filter_analysis.kernel_predicate.is_some()
-                && decision.filter_analysis.kernel_adapter_error.is_none()
                 && decision.kernel_scan_filter.is_some()
         }));
     }
@@ -2318,7 +2268,6 @@ mod tests {
         assert!(plan.decisions.iter().all(|decision| {
             decision.outcome == DeltaFilterPushdownOutcome::Exact
                 && !decision.residual
-                && decision.filter_analysis.kernel_predicate.is_some()
                 && decision.kernel_scan_filter.is_some()
         }));
     }
@@ -2627,13 +2576,9 @@ mod tests {
         assert_eq!(plan.unsupported_count, 1);
         assert_eq!(plan.pushed_filter_count, 2);
         assert_eq!(plan.residual_filter_count, 1);
-        assert_eq!(
-            plan.decisions
-                .iter()
-                .map(|decision| decision.input_index)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
+        assert_eq!(kernel_scan_expr(&plan.decisions[0]), Some(&exact));
+        assert!(plan.decisions[1].kernel_scan_filter.is_none());
+        assert_eq!(kernel_scan_expr(&plan.decisions[2]), Some(&duplicate_exact));
     }
 
     #[test]
@@ -2922,7 +2867,7 @@ mod tests {
         );
         assert_eq!(plan.unsupported_count, 2);
         assert_eq!(plan.residual_filter_count, 2);
-        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_none());
-        assert!(plan.decisions[1].filter_analysis.kernel_predicate.is_none());
+        assert!(plan.decisions[0].kernel_scan_filter.is_none());
+        assert!(plan.decisions[1].kernel_scan_filter.is_none());
     }
 }

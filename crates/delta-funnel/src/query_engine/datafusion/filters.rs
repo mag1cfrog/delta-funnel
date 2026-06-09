@@ -68,8 +68,6 @@ pub(crate) struct ExactPartitionKernelFilter {
 #[derive(Clone, Debug, PartialEq)]
 /// Provider decision for one input filter, preserving input order.
 pub(crate) struct DeltaFilterPushdownDecision {
-    /// Position of this decision in the original DataFusion filter input slice.
-    pub(crate) input_index: usize,
     /// Pushdown status reported back to DataFusion for this input filter.
     pub(crate) outcome: DeltaFilterPushdownOutcome,
     /// Whether DataFusion must still evaluate the original filter above the scan.
