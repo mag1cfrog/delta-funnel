@@ -68,11 +68,14 @@ pub(crate) struct DeltaFilterPushdownDecision {
     pub(crate) rejection_reason: Option<DeltaFilterPushdownRejectionReason>,
     /// Provider-boundary diagnostics and column classification for the original filter.
     pub(crate) filter_analysis: DeltaFilterAnalysis,
-    /// Provider-owned partition metadata expression used for scan-file pruning.
+    /// DataFusion expression converted to a Delta kernel predicate for scan
+    /// planning.
     ///
-    /// For exact filters this is the original filter. For inexact mixed filters
-    /// this is only the extracted partition-safe portion.
-    pub(crate) partition_metadata_filter: Option<Expr>,
+    /// For most exact filters this is the original filter. Some exact filters
+    /// use an equivalent expression, such as empty list predicates whose
+    /// kernel-safe form must preserve null partition behavior. If this is
+    /// present, scan construction converts it to a Delta kernel predicate.
+    pub(crate) kernel_scan_filter: Option<Expr>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -31,9 +31,8 @@ pub(crate) enum DeltaFilterColumnScope {
 /// Reusable analysis for one DataFusion filter at the provider boundary.
 ///
 /// The policy layer uses this to decide whether a filter is exact, inexact, or
-/// unsupported. The optional kernel predicate remains diagnostic only for static
-/// partition metadata pushdown; provider-owned pruning uses
-/// `DeltaFilterPushdownDecision::partition_metadata_filter`.
+/// unsupported. The optional kernel predicate remains diagnostic only; kernel
+/// scan planning uses `DeltaFilterPushdownDecision::kernel_scan_filter`.
 pub(crate) struct DeltaFilterAnalysis {
     /// Broad partition/data/unsupported classification for referenced columns.
     pub(crate) scope: DeltaFilterColumnScope,

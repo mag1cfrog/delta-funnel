@@ -175,15 +175,16 @@ impl DeltaTableProvider {
 
     /// Rejects pushed filters that this provider cannot safely use.
     ///
-    /// Exact filters must have a partition expression that can be converted to
-    /// a kernel predicate. This issue does not accept inexact pushed filters.
+    /// Exact filters must have a kernel scan filter expression that can be
+    /// converted to a kernel predicate. This issue does not accept inexact
+    /// pushed filters.
     fn reject_unaccepted_pushed_filters(
         &self,
         pushed_filter_plan: &DeltaFilterPushdownPlan,
     ) -> Result<(), DeltaFunnelError> {
         let missing_partition_expression = pushed_filter_plan.decisions.iter().any(|decision| {
             decision.outcome != DeltaFilterPushdownOutcome::Unsupported
-                && decision.partition_metadata_filter.is_none()
+                && decision.kernel_scan_filter.is_none()
         });
         if pushed_filter_plan.unsupported_count > 0
             || pushed_filter_plan.inexact_count > 0
@@ -234,8 +235,8 @@ impl DeltaTableProvider {
     /// Builds the kernel partition predicate for accepted exact filters.
     ///
     /// Accepted exact filters must be enforced by the same predicate passed into
-    /// `ScanBuilder::with_predicate`; the provider-owned metadata evaluator is
-    /// not a fallback for this migration slice.
+    /// `ScanBuilder::with_predicate`; the legacy metadata evaluator is not a
+    /// fallback for this migration slice.
     fn build_kernel_partition_predicate(
         &self,
         pushed_filter_plan: &DeltaFilterPushdownPlan,
@@ -245,12 +246,12 @@ impl DeltaTableProvider {
             .iter()
             .filter_map(|decision| {
                 decision
-                    .partition_metadata_filter
+                    .kernel_scan_filter
                     .as_ref()
                     .map(|filter| (decision, filter))
             })
-            .map(|(_decision, partition_metadata_filter)| {
-                datafusion_expr_to_kernel_predicate(partition_metadata_filter).map_err(|error| {
+            .map(|(_decision, kernel_scan_filter)| {
+                datafusion_expr_to_kernel_predicate(kernel_scan_filter).map_err(|error| {
                     DeltaFunnelError::DeltaScanFilter {
                         source_name: self.source_name().to_owned(),
                         table_uri: self.source.table_uri().to_owned(),
@@ -813,6 +814,11 @@ mod tests {
                 vec!["part-00000.parquet"],
             ),
             (
+                "empty in",
+                datafusion::logical_expr::col("region").in_list(Vec::<Expr>::new(), false),
+                Vec::new(),
+            ),
+            (
                 "not in non-empty values",
                 datafusion::logical_expr::col("region").in_list(
                     vec![
@@ -833,6 +839,11 @@ mod tests {
                     true,
                 ),
                 vec!["part-00001.parquet"],
+            ),
+            (
+                "empty not in",
+                datafusion::logical_expr::col("region").in_list(Vec::<Expr>::new(), true),
+                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "less than",
@@ -1052,10 +1063,6 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
         let filters = vec![
-            (
-                "empty in",
-                datafusion::logical_expr::col("region").in_list(Vec::<Expr>::new(), false),
-            ),
             (
                 "null in",
                 datafusion::logical_expr::col("region")
