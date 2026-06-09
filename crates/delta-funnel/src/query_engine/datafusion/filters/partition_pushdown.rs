@@ -41,12 +41,6 @@ enum KernelPartitionOperatorFamily {
     Composition,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KernelPartitionPolicyOutcome {
-    KernelExact,
-    Unsupported,
-}
-
 /// Plans the static partition operator policy for kernel-native pruning.
 ///
 /// A filter can be exact only when it is partition-only and accepted by the
@@ -449,8 +443,7 @@ fn is_kernel_exact_partition_column_for_operator(
     }
 
     schema.field_with_name(&column.name).is_ok_and(|field| {
-        kernel_partition_policy(field.data_type(), operator_family)
-            == KernelPartitionPolicyOutcome::KernelExact
+        is_supported_kernel_partition_operator(field.data_type(), operator_family)
     })
 }
 
@@ -523,14 +516,13 @@ fn is_supported_partition_literal_for_column(
     }
 }
 
-fn kernel_partition_policy(
+fn is_supported_kernel_partition_operator(
     data_type: &DataType,
     operator_family: KernelPartitionOperatorFamily,
-) -> KernelPartitionPolicyOutcome {
+) -> bool {
     use KernelPartitionOperatorFamily::{
         Between, BooleanShorthand, Composition, Equality, Membership, NullCheck, Ordering,
     };
-    use KernelPartitionPolicyOutcome::{KernelExact, Unsupported};
     use KernelPartitionTypeGroup::{
         Binary, Boolean, Date, Decimal, Decimal256, Floating, Integer, String, Timestamp,
         TimestampNtz,
@@ -538,39 +530,39 @@ fn kernel_partition_policy(
 
     match kernel_partition_type_group(data_type) {
         String => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
-            BooleanShorthand => Unsupported,
+            Equality | Ordering | Membership | Between | NullCheck | Composition => true,
+            BooleanShorthand => false,
         },
         Integer => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
-            BooleanShorthand => Unsupported,
+            Equality | Ordering | Membership | Between | NullCheck | Composition => true,
+            BooleanShorthand => false,
         },
         Date => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
-            BooleanShorthand => Unsupported,
+            Equality | Ordering | Membership | Between | NullCheck | Composition => true,
+            BooleanShorthand => false,
         },
         Decimal => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
-            BooleanShorthand => Unsupported,
+            Equality | Ordering | Membership | Between | NullCheck | Composition => true,
+            BooleanShorthand => false,
         },
-        Decimal256 => Unsupported,
+        Decimal256 => false,
         Timestamp | TimestampNtz => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
-            BooleanShorthand => Unsupported,
+            Equality | Ordering | Membership | Between | NullCheck | Composition => true,
+            BooleanShorthand => false,
         },
         Floating => match operator_family {
-            Equality | Membership | NullCheck | Composition => KernelExact,
-            Ordering | Between | BooleanShorthand => Unsupported,
+            Equality | Membership | NullCheck | Composition => true,
+            Ordering | Between | BooleanShorthand => false,
         },
         Boolean => match operator_family {
-            Equality | Membership | NullCheck | BooleanShorthand | Composition => KernelExact,
-            Ordering | Between => Unsupported,
+            Equality | Membership | NullCheck | BooleanShorthand | Composition => true,
+            Ordering | Between => false,
         },
         Binary => match operator_family {
-            Equality | Membership | NullCheck | Composition => KernelExact,
-            Ordering | Between | BooleanShorthand => Unsupported,
+            Equality | Membership | NullCheck | Composition => true,
+            Ordering | Between | BooleanShorthand => false,
         },
-        KernelPartitionTypeGroup::Unsupported => Unsupported,
+        KernelPartitionTypeGroup::Unsupported => false,
     }
 }
 
@@ -688,14 +680,14 @@ mod tests {
     fn assert_type_policy(
         data_type: DataType,
         expected_group: KernelPartitionTypeGroup,
-        expected_policy: &[(KernelPartitionOperatorFamily, KernelPartitionPolicyOutcome)],
+        expected_policy: &[(KernelPartitionOperatorFamily, bool)],
     ) {
         assert_eq!(kernel_partition_type_group(&data_type), expected_group);
 
-        for (operator_family, outcome) in expected_policy {
+        for (operator_family, supported) in expected_policy {
             assert_eq!(
-                kernel_partition_policy(&data_type, *operator_family),
-                *outcome,
+                is_supported_kernel_partition_operator(&data_type, *operator_family),
+                *supported,
                 "{data_type:?} {operator_family:?}"
             );
         }
@@ -706,92 +698,91 @@ mod tests {
         use KernelPartitionOperatorFamily::{
             Between, BooleanShorthand, Composition, Equality, Membership, NullCheck, Ordering,
         };
-        use KernelPartitionPolicyOutcome::{KernelExact, Unsupported};
         use KernelPartitionTypeGroup::{
             Binary, Boolean, Date, Decimal, Decimal256, Floating, Integer, String, Timestamp,
             TimestampNtz,
         };
 
         let string_policy = [
-            (Equality, KernelExact),
-            (Ordering, KernelExact),
-            (Membership, KernelExact),
-            (Between, KernelExact),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+            (Equality, true),
+            (Ordering, true),
+            (Membership, true),
+            (Between, true),
+            (NullCheck, true),
+            (BooleanShorthand, false),
+            (Composition, true),
         ];
         let integer_policy = [
-            (Equality, KernelExact),
-            (Ordering, KernelExact),
-            (Membership, KernelExact),
-            (Between, KernelExact),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+            (Equality, true),
+            (Ordering, true),
+            (Membership, true),
+            (Between, true),
+            (NullCheck, true),
+            (BooleanShorthand, false),
+            (Composition, true),
         ];
         let boolean_policy = [
-            (Equality, KernelExact),
-            (Ordering, Unsupported),
-            (Membership, KernelExact),
-            (Between, Unsupported),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, KernelExact),
-            (Composition, KernelExact),
+            (Equality, true),
+            (Ordering, false),
+            (Membership, true),
+            (Between, false),
+            (NullCheck, true),
+            (BooleanShorthand, true),
+            (Composition, true),
         ];
         let floating_policy = [
-            (Equality, KernelExact),
-            (Ordering, Unsupported),
-            (Membership, KernelExact),
-            (Between, Unsupported),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+            (Equality, true),
+            (Ordering, false),
+            (Membership, true),
+            (Between, false),
+            (NullCheck, true),
+            (BooleanShorthand, false),
+            (Composition, true),
         ];
         let date_policy = [
-            (Equality, KernelExact),
-            (Ordering, KernelExact),
-            (Membership, KernelExact),
-            (Between, KernelExact),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+            (Equality, true),
+            (Ordering, true),
+            (Membership, true),
+            (Between, true),
+            (NullCheck, true),
+            (BooleanShorthand, false),
+            (Composition, true),
         ];
         let decimal_policy = [
-            (Equality, KernelExact),
-            (Ordering, KernelExact),
-            (Membership, KernelExact),
-            (Between, KernelExact),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+            (Equality, true),
+            (Ordering, true),
+            (Membership, true),
+            (Between, true),
+            (NullCheck, true),
+            (BooleanShorthand, false),
+            (Composition, true),
         ];
         let timestamp_policy = [
-            (Equality, KernelExact),
-            (Ordering, KernelExact),
-            (Membership, KernelExact),
-            (Between, KernelExact),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+            (Equality, true),
+            (Ordering, true),
+            (Membership, true),
+            (Between, true),
+            (NullCheck, true),
+            (BooleanShorthand, false),
+            (Composition, true),
         ];
         let binary_policy = [
-            (Equality, KernelExact),
-            (Ordering, Unsupported),
-            (Membership, KernelExact),
-            (Between, Unsupported),
-            (NullCheck, KernelExact),
-            (BooleanShorthand, Unsupported),
-            (Composition, KernelExact),
+            (Equality, true),
+            (Ordering, false),
+            (Membership, true),
+            (Between, false),
+            (NullCheck, true),
+            (BooleanShorthand, false),
+            (Composition, true),
         ];
         let unsupported_policy = [
-            (Equality, Unsupported),
-            (Ordering, Unsupported),
-            (Membership, Unsupported),
-            (Between, Unsupported),
-            (NullCheck, Unsupported),
-            (BooleanShorthand, Unsupported),
-            (Composition, Unsupported),
+            (Equality, false),
+            (Ordering, false),
+            (Membership, false),
+            (Between, false),
+            (NullCheck, false),
+            (BooleanShorthand, false),
+            (Composition, false),
         ];
 
         for data_type in [DataType::Utf8, DataType::LargeUtf8] {
