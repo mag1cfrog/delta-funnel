@@ -336,6 +336,9 @@ fn datafusion_scalar_to_kernel_scalar(
         {
             Ok(Scalar::Binary(value.clone()))
         }
+        ScalarValue::TimestampMicrosecond(Some(value), Some(timezone)) if !timezone.is_empty() => {
+            Ok(Scalar::Timestamp(*value))
+        }
         _ => Err(DeltaKernelPredicateAdapterError::UnsupportedLiteral),
     }
 }
@@ -601,6 +604,16 @@ mod tests {
                 Expression::Literal(Scalar::Binary(vec![1, 2, 3]))
             ))
         );
+        assert_eq!(
+            convert_datafusion_predicate(&col("event_ts").eq(Expr::Literal(
+                ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
+                None
+            ))),
+            Ok(Predicate::eq(
+                kernel_column("event_ts"),
+                Expression::Literal(Scalar::Timestamp(1_767_225_600_123_456))
+            ))
+        );
 
         Ok(())
     }
@@ -641,6 +654,17 @@ mod tests {
                 ScalarValue::FixedSizeBinary(3, Some(vec![1, 2, 3])),
                 Scalar::Binary(vec![1, 2, 3]),
             ),
+            (
+                ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
+                Scalar::Timestamp(1_767_225_600_123_456),
+            ),
+            (
+                ScalarValue::TimestampMicrosecond(
+                    Some(1_767_225_600_123_456),
+                    Some("America/Phoenix".into()),
+                ),
+                Scalar::Timestamp(1_767_225_600_123_456),
+            ),
         ];
 
         for (datafusion_scalar, kernel_scalar) in supported {
@@ -675,11 +699,11 @@ mod tests {
             ScalarValue::Time32Millisecond(Some(7)),
             ScalarValue::Time64Microsecond(Some(7)),
             ScalarValue::Time64Nanosecond(Some(7)),
-            ScalarValue::TimestampSecond(Some(7), None),
-            ScalarValue::TimestampMillisecond(Some(7), None),
+            ScalarValue::TimestampSecond(Some(7), Some(Arc::from("UTC"))),
+            ScalarValue::TimestampMillisecond(Some(7), Some(Arc::from("UTC"))),
             ScalarValue::TimestampMicrosecond(Some(7), None),
-            ScalarValue::TimestampNanosecond(Some(7), None),
-            ScalarValue::TimestampMicrosecond(Some(7), Some(Arc::from("UTC"))),
+            ScalarValue::TimestampMicrosecond(Some(7), Some(Arc::from(""))),
+            ScalarValue::TimestampNanosecond(Some(7), Some(Arc::from("UTC"))),
         ];
 
         for datafusion_scalar in unsupported_literals {
@@ -713,7 +737,8 @@ mod tests {
 
     #[test]
     fn datafusion_predicate_adapter_rejects_unproven_literal_types() {
-        let timestamp = Expr::Literal(ScalarValue::TimestampMicrosecond(Some(12345), None), None);
+        let timestamp_ntz =
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(12345), None), None);
         let float_nan = Expr::Literal(ScalarValue::Float32(Some(f32::NAN)), None);
         let double_infinity = Expr::Literal(ScalarValue::Float64(Some(f64::INFINITY)), None);
         let decimal256 = Expr::Literal(ScalarValue::Decimal256(Some(12345.into()), 10, 2), None);
@@ -724,7 +749,7 @@ mod tests {
         let cast_filter = cast(col("id"), DataType::Int64).eq(lit(7_i64));
 
         for literal in [
-            timestamp,
+            timestamp_ntz,
             float_nan,
             double_infinity,
             decimal256,
