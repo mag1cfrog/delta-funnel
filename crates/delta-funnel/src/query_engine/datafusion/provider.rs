@@ -974,6 +974,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_provider_scan_mixed_string_null_and_empty_terms_use_kernel_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "mixed-string-null-empty-kernel-pruning",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":null}"#,
+                r#""partitionValues":{"region":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let residual_filter =
+            datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1_i64));
+        let cases = vec![
+            (
+                "is null",
+                datafusion::logical_expr::col("region")
+                    .is_null()
+                    .and(residual_filter.clone()),
+                vec![
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "is not null",
+                datafusion::logical_expr::col("region")
+                    .is_not_null()
+                    .and(residual_filter.clone()),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "empty value equality",
+                datafusion::logical_expr::col("region")
+                    .eq(datafusion::logical_expr::lit(""))
+                    .and(residual_filter),
+                Vec::new(),
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            let plan = provider
+                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0, "{name}");
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.inexact_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.unsupported_count,
+                0,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                1,
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().partition_metadata_filter.is_none(),
+                "{name}"
+            );
+            assert!(
+                scan.scan_plan().kernel_partition_predicate.is_some(),
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn table_provider_scan_rejects_unsupported_string_partition_shapes()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
