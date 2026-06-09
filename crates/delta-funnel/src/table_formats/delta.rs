@@ -3,7 +3,6 @@
 use crate::DeltaFunnelError;
 
 mod kernel;
-mod partition_metadata_predicate;
 mod protocol;
 mod snapshot;
 mod uri;
