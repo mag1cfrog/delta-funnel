@@ -21,6 +21,7 @@ enum KernelPartitionTypeGroup {
     Boolean,
     Date,
     Decimal,
+    Decimal256,
     Floating,
     Binary,
     Timestamp,
@@ -478,34 +479,23 @@ fn is_supported_partition_literal_for_column(
         return false;
     };
 
-    matches!(
-        (field.data_type(), literal),
+    match (field.data_type(), literal) {
         (
             DataType::Utf8 | DataType::LargeUtf8,
-            Expr::Literal(ScalarValue::Utf8(Some(_)), _)
-                | Expr::Literal(ScalarValue::LargeUtf8(Some(_)), _),
-        ) | (DataType::Int8, Expr::Literal(ScalarValue::Int8(Some(_)), _),)
-            | (
-                DataType::Int16,
-                Expr::Literal(ScalarValue::Int16(Some(_)), _),
-            )
-            | (
-                DataType::Int32,
-                Expr::Literal(ScalarValue::Int32(Some(_)), _),
-            )
-            | (
-                DataType::Int64,
-                Expr::Literal(ScalarValue::Int64(Some(_)), _),
-            )
-            | (
-                DataType::Boolean,
-                Expr::Literal(ScalarValue::Boolean(Some(_)), _),
-            )
-            | (
-                DataType::Date32,
-                Expr::Literal(ScalarValue::Date32(Some(_)), _),
-            )
-    )
+            Expr::Literal(ScalarValue::Utf8(Some(_)) | ScalarValue::LargeUtf8(Some(_)), _),
+        )
+        | (DataType::Int8, Expr::Literal(ScalarValue::Int8(Some(_)), _))
+        | (DataType::Int16, Expr::Literal(ScalarValue::Int16(Some(_)), _))
+        | (DataType::Int32, Expr::Literal(ScalarValue::Int32(Some(_)), _))
+        | (DataType::Int64, Expr::Literal(ScalarValue::Int64(Some(_)), _))
+        | (DataType::Boolean, Expr::Literal(ScalarValue::Boolean(Some(_)), _))
+        | (DataType::Date32, Expr::Literal(ScalarValue::Date32(Some(_)), _)) => true,
+        (
+            DataType::Decimal128(precision, scale),
+            Expr::Literal(ScalarValue::Decimal128(Some(_), literal_precision, literal_scale), _),
+        ) => precision == literal_precision && scale == literal_scale,
+        _ => false,
+    }
 }
 
 fn kernel_partition_policy(
@@ -517,7 +507,8 @@ fn kernel_partition_policy(
     };
     use KernelPartitionPolicyOutcome::{KernelExact, TypedRestorePending, Unsupported};
     use KernelPartitionTypeGroup::{
-        Binary, Boolean, Date, Decimal, Floating, Integer, String, Timestamp, TimestampNtz,
+        Binary, Boolean, Date, Decimal, Decimal256, Floating, Integer, String, Timestamp,
+        TimestampNtz,
     };
 
     match kernel_partition_type_group(data_type) {
@@ -533,7 +524,11 @@ fn kernel_partition_policy(
             Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
             BooleanShorthand => Unsupported,
         },
-        Decimal | Floating | Timestamp | TimestampNtz => match operator_family {
+        Decimal => match operator_family {
+            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
+            BooleanShorthand => Unsupported,
+        },
+        Decimal256 | Floating | Timestamp | TimestampNtz => match operator_family {
             Equality | Ordering | Membership | Between | NullCheck | Composition => {
                 TypedRestorePending
             }
@@ -559,9 +554,8 @@ fn kernel_partition_type_group(data_type: &DataType) -> KernelPartitionTypeGroup
         }
         DataType::Boolean => KernelPartitionTypeGroup::Boolean,
         DataType::Date32 => KernelPartitionTypeGroup::Date,
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
-            KernelPartitionTypeGroup::Decimal
-        }
+        DataType::Decimal128(_, _) => KernelPartitionTypeGroup::Decimal,
+        DataType::Decimal256(_, _) => KernelPartitionTypeGroup::Decimal256,
         DataType::Float32 | DataType::Float64 => KernelPartitionTypeGroup::Floating,
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
             KernelPartitionTypeGroup::Binary
@@ -684,7 +678,8 @@ mod tests {
         };
         use KernelPartitionPolicyOutcome::{KernelExact, TypedRestorePending, Unsupported};
         use KernelPartitionTypeGroup::{
-            Binary, Boolean, Date, Decimal, Floating, Integer, String, Timestamp, TimestampNtz,
+            Binary, Boolean, Date, Decimal, Decimal256, Floating, Integer, String, Timestamp,
+            TimestampNtz,
         };
 
         let string_policy = [
@@ -732,6 +727,15 @@ mod tests {
             (BooleanShorthand, Unsupported),
             (Composition, KernelExact),
         ];
+        let decimal_policy = [
+            (Equality, KernelExact),
+            (Ordering, KernelExact),
+            (Membership, KernelExact),
+            (Between, KernelExact),
+            (NullCheck, KernelExact),
+            (BooleanShorthand, Unsupported),
+            (Composition, KernelExact),
+        ];
         let binary_policy = [
             (Equality, TypedRestorePending),
             (Ordering, Unsupported),
@@ -764,14 +768,10 @@ mod tests {
         }
         assert_type_policy(DataType::Boolean, Boolean, &boolean_policy);
         assert_type_policy(DataType::Date32, Date, &date_policy);
-        assert_type_policy(
-            DataType::Decimal128(10, 2),
-            Decimal,
-            &ordered_typed_restore_policy,
-        );
+        assert_type_policy(DataType::Decimal128(10, 2), Decimal, &decimal_policy);
         assert_type_policy(
             DataType::Decimal256(38, 18),
-            Decimal,
+            Decimal256,
             &ordered_typed_restore_policy,
         );
         for data_type in [DataType::Float32, DataType::Float64] {
@@ -1095,10 +1095,14 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_decimal_null_checks_until_typed_child() {
+    fn partition_operator_planner_accepts_decimal_null_checks_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["amount"]);
-        let filters = [col("amount").is_null(), col("amount").is_not_null()];
+        let filters = [
+            col("amount").is_null(),
+            col("amount").is_not_null(),
+            Expr::Not(Box::new(col("amount").is_null())),
+        ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
@@ -1107,24 +1111,25 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_decimal_equality_and_membership_until_typed_child() {
+    fn partition_operator_planner_accepts_decimal_equality_and_membership_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["amount"]);
         let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
-        let same_amount_different_scale =
-            Expr::Literal(ScalarValue::Decimal128(Some(123_450), 12, 3), None);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-123), 10, 2), None);
         let filters = [
             col("amount").eq(amount.clone()),
             amount.clone().eq(col("amount")),
             col("amount").not_eq(amount.clone()),
-            col("amount").in_list(
-                vec![amount.clone(), same_amount_different_scale, amount.clone()],
-                false,
-            ),
+            col("amount").in_list(vec![amount.clone(), zero, amount.clone()], false),
+            negative.eq(col("amount")),
             col("amount").in_list(vec![amount], true),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
@@ -1135,16 +1140,19 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_decimal_comparisons_until_typed_child() {
+    fn partition_operator_planner_accepts_decimal_comparisons_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["amount"]);
         let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
         let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
-        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-1_230), 12, 3), None);
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-123), 10, 2), None);
         let filters = [
             col("amount").lt(amount.clone()),
             col("amount").lt_eq(negative),
@@ -1159,7 +1167,10 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
@@ -1475,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_decimal_between_until_typed_child() {
+    fn partition_operator_planner_accepts_decimal_between_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["amount"]);
         let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
@@ -1492,7 +1503,72 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_decimal_composition_as_kernel_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["amount"]);
+        let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-123), 10, 2), None);
+        let filters = [
+            col("amount")
+                .gt_eq(zero.clone())
+                .and(col("amount").lt(amount.clone())),
+            col("amount")
+                .eq(amount.clone())
+                .or(col("amount").eq(negative)),
+            Expr::Not(Box::new(col("amount").eq(amount))),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
+    }
+
+    #[test]
+    fn partition_operator_planner_extracts_decimal_partition_term_from_mixed_and() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["amount"]);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let partition_filter = col("amount").gt_eq(zero);
+        let data_filter = col("region").eq(lit("us-west"));
+        let filter = partition_filter.clone().and(data_filter);
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &[&filter],
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert!(plan.decisions[0].residual);
+        assert_eq!(
+            kernel_scan_expr(&plan.decisions[0]),
+            Some(&partition_filter)
+        );
+        assert!(plan.decisions[0].kernel_scan_filter.is_some());
     }
 
     #[test]
@@ -1507,10 +1583,16 @@ mod tests {
             col("amount").in_list(vec![amount.clone(), non_exact_scale.clone()], false),
             col("amount").lt(non_exact_scale.clone()),
             col("amount").between(zero, non_exact_scale),
+            col("amount").in_list(Vec::<Expr>::new(), false),
+            col("amount").in_list(Vec::<Expr>::new(), true),
             col("amount").eq(lit("123.45")),
             col("amount").eq(lit(123_i64)),
             col("amount").eq(lit(123.45_f64)),
             col("amount").eq(Expr::Literal(ScalarValue::Decimal128(None, 10, 2), None)),
+            col("amount").eq(Expr::Literal(
+                ScalarValue::Decimal256(Some(12_345.into()), 10, 2),
+                None,
+            )),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 

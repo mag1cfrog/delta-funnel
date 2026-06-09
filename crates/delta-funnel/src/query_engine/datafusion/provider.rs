@@ -3251,6 +3251,7 @@ mod tests {
         let state = SessionContext::new().state();
         let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
         let non_exact_scale = Expr::Literal(ScalarValue::Decimal128(Some(12_346), 10, 3), None);
+        let decimal256 = Expr::Literal(ScalarValue::Decimal256(Some(12_345.into()), 10, 2), None);
         let scalar_udf = create_udf(
             "decimal_identity_for_pushdown_boundary",
             vec![DataType::Decimal128(10, 2)],
@@ -3289,6 +3290,18 @@ mod tests {
                     Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None),
                     non_exact_scale.clone(),
                 ),
+            ),
+            (
+                "decimal256 equality",
+                datafusion::logical_expr::col("amount").eq(decimal256),
+            ),
+            (
+                "empty in list",
+                datafusion::logical_expr::col("amount").in_list(vec![], false),
+            ),
+            (
+                "empty not in list",
+                datafusion::logical_expr::col("amount").in_list(vec![], true),
             ),
             (
                 "string equality",
@@ -5937,7 +5950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decimal_partition_comparisons_are_rejected_at_scan_boundary()
+    async fn decimal_partition_comparisons_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "decimal-partition-comparisons-boundary",
@@ -5963,8 +5976,7 @@ mod tests {
         let state = SessionContext::new().state();
         let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
         let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
-        let negative_different_scale =
-            Expr::Literal(ScalarValue::Decimal128(Some(-1_230), 12, 3), None);
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-123), 10, 2), None);
         let cases = [
             (
                 "less than",
@@ -5972,7 +5984,7 @@ mod tests {
             ),
             (
                 "less than or equal",
-                datafusion::logical_expr::col("amount").lt_eq(negative_different_scale),
+                datafusion::logical_expr::col("amount").lt_eq(negative),
             ),
             (
                 "greater than",
@@ -5986,27 +5998,18 @@ mod tests {
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
-                "{name}"
-            );
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_between_filters_are_rejected_at_scan_boundary()
+    async fn decimal_partition_between_filters_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "decimal-partition-between-boundary",
@@ -6045,27 +6048,18 @@ mod tests {
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
-                "{name}"
-            );
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_boolean_composition_and_projection_are_rejected_at_scan_boundary()
+    async fn decimal_partition_boolean_composition_and_projection_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "decimal-partition-boolean-composition-boundary",
@@ -6116,25 +6110,20 @@ mod tests {
             let support = provider.supports_filters_pushdown(&filter_refs)?;
             assert_eq!(
                 support,
-                vec![TableProviderFilterPushDown::Unsupported; filters.len()],
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
                 "{name}"
             );
 
-            let result = provider.scan(&state, Some(&vec![0]), &filters, None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_high_precision_values_are_rejected_at_scan_boundary()
+    async fn decimal_partition_high_precision_values_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "decimal-partition-high-precision-boundary",
@@ -6191,27 +6180,18 @@ mod tests {
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
-                "{name}"
-            );
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_exponent_metadata_is_rejected_at_scan_boundary()
+    async fn decimal_partition_exponent_metadata_is_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "decimal-partition-exponent-metadata-boundary",
@@ -6236,21 +6216,17 @@ mod tests {
         let filter = datafusion::logical_expr::col("amount").eq(tiny_amount);
 
         let support = provider.supports_filters_pushdown(&[&filter])?;
-        assert_eq!(support, vec![TableProviderFilterPushDown::Unsupported]);
+        assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
 
-        let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-        assert!(
-            matches!(result, Err(DataFusionError::External(error)) if error
-                .to_string()
-                .contains("pushed filters must be exact partition predicates"))
-        );
+        provider
+            .scan(&state, Some(&vec![0]), &[filter], None)
+            .await?;
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_equality_and_membership_are_rejected_at_scan_boundary()
+    async fn decimal_partition_equality_and_membership_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "decimal-partition-equality-membership-boundary",
@@ -6276,18 +6252,15 @@ mod tests {
         let state = SessionContext::new().state();
         let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
         let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
-        let negative_different_scale =
-            Expr::Literal(ScalarValue::Decimal128(Some(-1_230), 12, 3), None);
-        let same_amount_different_scale =
-            Expr::Literal(ScalarValue::Decimal128(Some(123_450), 12, 3), None);
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-123), 10, 2), None);
         let cases = [
             (
                 "equality",
                 datafusion::logical_expr::col("amount").eq(amount.clone()),
             ),
             (
-                "reversed equality different scale",
-                negative_different_scale.eq(datafusion::logical_expr::col("amount")),
+                "reversed equality",
+                negative.eq(datafusion::logical_expr::col("amount")),
             ),
             (
                 "inequality",
@@ -6295,10 +6268,8 @@ mod tests {
             ),
             (
                 "in list",
-                datafusion::logical_expr::col("amount").in_list(
-                    vec![amount.clone(), zero.clone(), same_amount_different_scale],
-                    false,
-                ),
+                datafusion::logical_expr::col("amount")
+                    .in_list(vec![amount.clone(), zero.clone(), amount.clone()], false),
             ),
             (
                 "not in list",
@@ -6308,27 +6279,18 @@ mod tests {
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
-                "{name}"
-            );
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn decimal_partition_null_checks_are_rejected_at_scan_boundary()
+    async fn decimal_partition_null_checks_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "decimal-partition-null-checks-boundary",
@@ -6362,21 +6324,292 @@ mod tests {
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decimal_partition_exact_filters_prune_files_through_kernel_scan_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "decimal-partition-kernel-scan-pruning",
+            DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["amount"]"#,
+            &[
+                r#""partitionValues":{"amount":"123.45"}"#,
+                r#""partitionValues":{"amount":"0.00"}"#,
+                r#""partitionValues":{"amount":"-1.23"}"#,
+                r#""partitionValues":{"amount":"2.00"}"#,
+                r#""partitionValues":{"amount":"10.00"}"#,
+                r#""partitionValues":{"amount":null}"#,
+                r#""partitionValues":{"amount":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let amount_123 = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(-123), 10, 2), None);
+        let two = Expr::Literal(ScalarValue::Decimal128(Some(200), 10, 2), None);
+        let ten = Expr::Literal(ScalarValue::Decimal128(Some(1_000), 10, 2), None);
+        let cases: Vec<(&str, Vec<Expr>, Vec<&str>)> = vec![
+            (
+                "equality",
+                vec![datafusion::logical_expr::col("amount").eq(amount_123.clone())],
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "reversed equality",
+                vec![negative.clone().eq(datafusion::logical_expr::col("amount"))],
+                vec!["part-00002.parquet"],
+            ),
+            (
+                "inequality",
+                vec![datafusion::logical_expr::col("amount").not_eq(amount_123.clone())],
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "in list",
+                vec![datafusion::logical_expr::col("amount").in_list(
+                    vec![amount_123.clone(), zero.clone(), amount_123.clone()],
+                    false,
+                )],
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not in list",
+                vec![
+                    datafusion::logical_expr::col("amount").in_list(vec![amount_123.clone()], true),
+                ],
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "less than",
+                vec![datafusion::logical_expr::col("amount").lt(ten.clone())],
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "less than or equal",
+                vec![datafusion::logical_expr::col("amount").lt_eq(negative.clone())],
+                vec!["part-00002.parquet"],
+            ),
+            (
+                "greater than",
+                vec![datafusion::logical_expr::col("amount").gt(two.clone())],
+                vec!["part-00000.parquet", "part-00004.parquet"],
+            ),
+            (
+                "greater than or equal",
+                vec![datafusion::logical_expr::col("amount").gt_eq(amount_123.clone())],
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "between",
+                vec![
+                    datafusion::logical_expr::col("amount").between(negative.clone(), two.clone()),
+                ],
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "not between",
+                vec![
+                    datafusion::logical_expr::col("amount")
+                        .not_between(negative.clone(), two.clone()),
+                ],
+                vec!["part-00000.parquet", "part-00004.parquet"],
+            ),
+            (
+                "is null",
+                vec![datafusion::logical_expr::col("amount").is_null()],
+                vec![
+                    "part-00005.parquet",
+                    "part-00006.parquet",
+                    "part-00007.parquet",
+                ],
+            ),
+            (
+                "is not null",
+                vec![datafusion::logical_expr::col("amount").is_not_null()],
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "separate filters combine with and",
+                vec![
+                    datafusion::logical_expr::col("amount").gt_eq(zero.clone()),
+                    datafusion::logical_expr::col("amount").lt(amount_123.clone()),
+                ],
+                vec![
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "whole and",
+                vec![
+                    datafusion::logical_expr::col("amount")
+                        .gt_eq(zero.clone())
+                        .and(datafusion::logical_expr::col("amount").lt(amount_123.clone())),
+                ],
+                vec![
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "whole or",
+                vec![
+                    datafusion::logical_expr::col("amount")
+                        .eq(amount_123.clone())
+                        .or(datafusion::logical_expr::col("amount").eq(negative)),
+                ],
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "not",
+                vec![Expr::Not(Box::new(
+                    datafusion::logical_expr::col("amount").eq(two),
+                ))],
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filters, expected_paths) in cases {
+            let filter_refs = filters.iter().collect::<Vec<_>>();
+            let support = provider.supports_filters_pushdown(&filter_refs)?;
             assert_eq!(
                 support,
-                vec![TableProviderFilterPushDown::Unsupported],
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
                 "{name}"
             );
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+            let scan_plan = scan.scan_plan();
+            let kernel_names = scan_plan
+                .kernel_scan()
+                .kernel_schema()
+                .fields()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>();
 
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
+            assert_eq!(scan_plan.projected_schema.field(0).name(), "id", "{name}");
+            assert_eq!(kernel_names, vec!["id", "amount"], "{name}");
+            assert_eq!(scan_plan.pushed_filter_plan.exact_count, filters.len());
+            assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
+            assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 0);
+            assert_eq!(
+                scan_plan.pushed_filter_plan.pushed_filter_count,
+                filters.len()
             );
+            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
+            assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decimal_partition_mixed_and_filter_uses_kernel_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "decimal-partition-mixed-and-kernel-pruning",
+            DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["amount"]"#,
+            &[
+                r#""partitionValues":{"amount":"123.45"}"#,
+                r#""partitionValues":{"amount":"0.00"}"#,
+                r#""partitionValues":{"amount":"-1.23"}"#,
+                r#""partitionValues":{"amount":null}"#,
+                r#""partitionValues":{"amount":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let filter = datafusion::logical_expr::col("amount")
+            .gt_eq(zero)
+            .and(datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(10)));
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider.scan(&state, None, &[filter], None).await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+        let scan_plan = scan.scan_plan();
+
+        assert_eq!(scan_plan.pushed_filter_plan.exact_count, 0);
+        assert_eq!(scan_plan.pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan_plan.pushed_filter_plan.pushed_filter_count, 1);
+        assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan_plan.partition_metadata_filter.is_none());
+        assert!(scan_plan.kernel_partition_predicate.is_some());
+        assert_eq!(
+            scan_file_paths(scan)?,
+            vec!["part-00000.parquet", "part-00001.parquet"]
+        );
 
         Ok(())
     }
@@ -8375,11 +8608,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_decimal_partition_comparisons_keep_residual_filter()
+    async fn sql_decimal_partition_comparisons_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-decimal-partition-comparisons-residuals",
+            "sql-decimal-partition-comparisons",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -8439,18 +8672,16 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count > 0,
                 "{name}: {plan_display}"
             );
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count > 0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -8465,7 +8696,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
@@ -8474,11 +8705,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_decimal_partition_equality_and_membership_keep_residual_filter()
+    async fn sql_decimal_partition_equality_and_membership_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-decimal-partition-equality-membership-residuals",
+            "sql-decimal-partition-equality-membership",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -8542,18 +8773,16 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count > 0,
                 "{name}: {plan_display}"
             );
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count > 0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -8568,7 +8797,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
@@ -8577,11 +8806,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_decimal_partition_null_checks_keep_residual_filter()
+    async fn sql_decimal_partition_null_checks_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-decimal-partition-null-checks-residuals",
+            "sql-decimal-partition-null-checks",
             DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["amount"]"#,
             &[
@@ -8625,18 +8854,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+                1,
                 "{name}: {plan_display}"
             );
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0,
+                1,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -8651,7 +8880,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
