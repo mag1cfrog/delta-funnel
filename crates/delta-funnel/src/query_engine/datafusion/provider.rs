@@ -813,6 +813,113 @@ mod tests {
                 vec!["part-00000.parquet"],
             ),
             (
+                "not in non-empty values",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        datafusion::logical_expr::lit("us-east"),
+                    ],
+                    true,
+                ),
+                Vec::new(),
+            ),
+            (
+                "not in with empty literal",
+                datafusion::logical_expr::col("region").in_list(
+                    vec![
+                        datafusion::logical_expr::lit("us-west"),
+                        datafusion::logical_expr::lit(""),
+                    ],
+                    true,
+                ),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "less than",
+                datafusion::logical_expr::col("region")
+                    .lt(datafusion::logical_expr::lit("us-west")),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "reversed less than",
+                datafusion::logical_expr::lit("us-east")
+                    .lt(datafusion::logical_expr::col("region")),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "greater than empty string literal",
+                datafusion::logical_expr::col("region").gt(datafusion::logical_expr::lit("")),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "less than empty string literal",
+                datafusion::logical_expr::col("region").lt(datafusion::logical_expr::lit("")),
+                Vec::new(),
+            ),
+            (
+                "between empty and z",
+                datafusion::logical_expr::col("region").between(
+                    datafusion::logical_expr::lit(""),
+                    datafusion::logical_expr::lit("z"),
+                ),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not between empty and z",
+                datafusion::logical_expr::col("region").not_between(
+                    datafusion::logical_expr::lit(""),
+                    datafusion::logical_expr::lit("z"),
+                ),
+                Vec::new(),
+            ),
+            (
+                "contradictory between",
+                datafusion::logical_expr::col("region").between(
+                    datafusion::logical_expr::lit("z"),
+                    datafusion::logical_expr::lit("a"),
+                ),
+                Vec::new(),
+            ),
+            (
+                "contradictory not between",
+                datafusion::logical_expr::col("region").not_between(
+                    datafusion::logical_expr::lit("z"),
+                    datafusion::logical_expr::lit("a"),
+                ),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not equality wrapper",
+                Expr::Not(Box::new(
+                    datafusion::logical_expr::col("region")
+                        .eq(datafusion::logical_expr::lit("us-west")),
+                )),
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "not empty equality wrapper",
+                Expr::Not(Box::new(
+                    datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("")),
+                )),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not is null wrapper",
+                Expr::Not(Box::new(datafusion::logical_expr::col("region").is_null())),
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not is not null wrapper",
+                Expr::Not(Box::new(
+                    datafusion::logical_expr::col("region").is_not_null(),
+                )),
+                vec![
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
                 "partition-only or",
                 datafusion::logical_expr::col("region")
                     .eq(datafusion::logical_expr::lit("us-west"))
@@ -894,17 +1001,6 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
         let filters = vec![
-            (
-                "empty string comparison",
-                datafusion::logical_expr::col("region").lt(datafusion::logical_expr::lit("")),
-            ),
-            (
-                "empty string between",
-                datafusion::logical_expr::col("region").between(
-                    datafusion::logical_expr::lit(""),
-                    datafusion::logical_expr::lit("us-west"),
-                ),
-            ),
             (
                 "null between",
                 datafusion::logical_expr::col("region").between(
@@ -1048,29 +1144,11 @@ mod tests {
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
-        let filters = vec![
-            (
-                "not empty string equality",
-                Expr::Not(Box::new(
-                    datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("")),
-                )),
-            ),
-            (
-                "empty string not in",
-                datafusion::logical_expr::col("region").in_list(
-                    vec![
-                        datafusion::logical_expr::lit("us-west"),
-                        datafusion::logical_expr::lit(""),
-                    ],
-                    true,
-                ),
-            ),
-            (
-                "non literal not in",
-                datafusion::logical_expr::col("region")
-                    .in_list(vec![datafusion::logical_expr::col("id")], true),
-            ),
-        ];
+        let filters = vec![(
+            "non literal not in",
+            datafusion::logical_expr::col("region")
+                .in_list(vec![datafusion::logical_expr::col("id")], true),
+        )];
 
         for (name, filter) in filters {
             let result = provider
@@ -2308,11 +2386,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_partition_comparison_filters_keep_residual_filter()
+    async fn sql_partition_comparison_filters_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-partition-comparison-filters-residual",
+            "sql-partition-comparison-filters-exact",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             &[
@@ -2341,38 +2419,46 @@ mod tests {
             (
                 "less than",
                 "select id from orders where region < 'us-west'",
+                vec!["part-00001.parquet"],
             ),
             (
                 "less than or equal",
                 "select id from orders where region <= 'us-east'",
+                vec!["part-00001.parquet"],
             ),
             (
                 "greater than",
                 "select id from orders where region > 'us-east'",
+                vec!["part-00000.parquet"],
             ),
             (
                 "reversed greater than",
                 "select id from orders where 'us-east' < region",
+                vec!["part-00000.parquet"],
             ),
             (
                 "between",
                 "select id from orders where region between 'us-east' and 'us-west'",
+                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "not between",
                 "select id from orders where region not between 'us-east' and 'us-west'",
+                Vec::new(),
             ),
             (
                 "contradictory between",
                 "select id from orders where region between 'z' and 'a'",
+                Vec::new(),
             ),
             (
                 "contradictory not between",
                 "select id from orders where region not between 'z' and 'a'",
+                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
         ];
 
-        for (name, sql) in sql_cases {
+        for (name, sql, expected_paths) in sql_cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -2382,13 +2468,12 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} unexpectedly kept a residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count > 0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -2403,9 +2488,10 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
+            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
         }
 
         Ok(())
@@ -2442,7 +2528,6 @@ mod tests {
 
         enum ExpectedEmptyStringSql {
             ExactKernel { paths: Vec<&'static str> },
-            Residual,
         }
 
         let sql_cases = [
@@ -2461,12 +2546,14 @@ mod tests {
             (
                 "empty string comparison",
                 "select id from orders where region < ''",
-                ExpectedEmptyStringSql::Residual,
+                ExpectedEmptyStringSql::ExactKernel { paths: Vec::new() },
             ),
             (
                 "empty string between",
                 "select id from orders where region between '' and 'us-west'",
-                ExpectedEmptyStringSql::Residual,
+                ExpectedEmptyStringSql::ExactKernel {
+                    paths: vec!["part-00000.parquet"],
+                },
             ),
         ];
 
@@ -2486,28 +2573,17 @@ mod tests {
                         "{name} unexpectedly kept a residual filter:\n{plan_display}"
                     );
                     assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-                    assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
-                    assert_eq!(
-                        scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                        1
+                    assert!(
+                        scans[0].scan_plan().pushed_filter_plan.exact_count > 0,
+                        "{name}: {plan_display}"
+                    );
+                    assert!(
+                        scans[0].scan_plan().pushed_filter_plan.pushed_filter_count > 0,
+                        "{name}: {plan_display}"
                     );
                     assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
                     assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
                     assert_eq!(scan_file_paths(scans[0])?, paths, "{name}");
-                }
-                ExpectedEmptyStringSql::Residual => {
-                    assert!(
-                        plan_display.contains("FilterExec"),
-                        "{name} unexpectedly became exact:\n{plan_display}"
-                    );
-                    assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-                    assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
-                    assert_eq!(
-                        scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                        0
-                    );
-                    assert!(scans[0].scan_plan().partition_metadata_filter.is_none());
-                    assert!(scans[0].scan_plan().kernel_partition_predicate.is_none());
                 }
             }
         }
