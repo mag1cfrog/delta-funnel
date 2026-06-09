@@ -4188,11 +4188,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_timestamp_partition_comparisons_and_between_are_exact_metadata_pushdown()
+    async fn sql_timestamp_partition_comparisons_and_between_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-timestamp-partition-comparisons-between",
+            "sql-timestamp-partition-comparisons-between-residuals",
             TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["event_ts"]"#,
             &[
@@ -4224,54 +4224,30 @@ mod tests {
             (
                 "timestamp less than",
                 "select id from orders where event_ts < timestamp '2026-01-01 00:00:00.123456'",
-                1,
-                vec!["part-00002.parquet"],
             ),
             (
                 "timestamp less than or equal",
                 "select id from orders where event_ts <= timestamp '2025-12-31 23:59:59.999999'",
-                1,
-                vec!["part-00002.parquet"],
             ),
             (
                 "timestamp greater than",
                 "select id from orders where event_ts > timestamp '2025-12-31 23:59:59.999999'",
-                1,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00003.parquet",
-                ],
             ),
             (
                 "timestamp greater than or equal",
                 "select id from orders where event_ts >= timestamp '2026-01-01 00:00:00.123456'",
-                1,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00003.parquet",
-                ],
             ),
             (
                 "timestamp between inclusive",
                 "select id from orders where event_ts between timestamp '2025-12-31 23:59:59.999999' and timestamp '2026-01-01 00:00:00.123456'",
-                2,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                ],
             ),
             (
                 "timestamp not between",
                 "select id from orders where event_ts not between timestamp '2025-12-31 23:59:59.999999' and timestamp '2026-01-01 00:00:00.123456'",
-                1,
-                vec!["part-00003.parquet"],
             ),
         ];
 
-        for (name, sql, expected_exact_count, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -4281,13 +4257,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                expected_exact_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -4299,21 +4280,24 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_timestamp_ntz_partition_comparisons_and_between_are_exact_metadata_pushdown()
+    async fn sql_timestamp_ntz_partition_comparisons_and_between_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_protocol_and_adds(
-            "sql-timestamp-ntz-partition-comparisons-between",
+            "sql-timestamp-ntz-partition-comparisons-between-residuals",
             TIMESTAMP_NTZ_PROTOCOL_JSON,
             TIMESTAMP_NTZ_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["event_ts_ntz"]"#,
@@ -4346,42 +4330,30 @@ mod tests {
             (
                 "timestamp_ntz less than",
                 "select id from orders where event_ts_ntz < timestamp '2026-01-01 00:00:00.123456'",
-                1,
-                vec!["part-00002.parquet"],
             ),
             (
                 "timestamp_ntz less than or equal",
                 "select id from orders where event_ts_ntz <= timestamp '2025-12-31 23:59:59.999999'",
-                1,
-                vec!["part-00002.parquet"],
             ),
             (
                 "timestamp_ntz greater than",
                 "select id from orders where event_ts_ntz > timestamp '2025-12-31 23:59:59.999999'",
-                1,
-                vec!["part-00000.parquet", "part-00003.parquet"],
             ),
             (
                 "timestamp_ntz greater than or equal",
                 "select id from orders where event_ts_ntz >= timestamp '2026-01-01 00:00:00.123456'",
-                1,
-                vec!["part-00000.parquet", "part-00003.parquet"],
             ),
             (
                 "timestamp_ntz between inclusive",
                 "select id from orders where event_ts_ntz between timestamp '2025-12-31 23:59:59.999999' and timestamp '2026-01-01 00:00:00.123456'",
-                2,
-                vec!["part-00000.parquet", "part-00002.parquet"],
             ),
             (
                 "timestamp_ntz not between",
                 "select id from orders where event_ts_ntz not between timestamp '2025-12-31 23:59:59.999999' and timestamp '2026-01-01 00:00:00.123456'",
-                1,
-                vec!["part-00003.parquet"],
             ),
         ];
 
-        for (name, sql, expected_exact_count, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -4391,13 +4363,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                expected_exact_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -4409,21 +4386,24 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_timestamp_partition_equality_and_membership_are_exact_metadata_pushdown()
+    async fn sql_timestamp_partition_equality_and_membership_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-timestamp-partition-equality-membership",
+            "sql-timestamp-partition-equality-membership-residuals",
             TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["event_ts"]"#,
             &[
@@ -4453,30 +4433,22 @@ mod tests {
             (
                 "timestamp equality",
                 "select id from orders where event_ts = timestamp '2026-01-01 00:00:00.123456'",
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "timestamp inequality",
                 "select id from orders where event_ts != timestamp '2026-01-01 00:00:00.123456'",
-                vec!["part-00002.parquet"],
             ),
             (
                 "timestamp in list",
                 "select id from orders where event_ts in (timestamp '2026-01-01 00:00:00.123456', timestamp '2025-12-31 23:59:59.999999')",
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                ],
             ),
             (
                 "timestamp not in list",
                 "select id from orders where event_ts not in (timestamp '2026-01-01 00:00:00.123456')",
-                vec!["part-00002.parquet"],
             ),
         ];
 
-        for (name, sql, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -4486,13 +4458,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                1,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -4504,21 +4481,24 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_timestamp_ntz_partition_equality_and_membership_are_exact_metadata_pushdown()
+    async fn sql_timestamp_ntz_partition_equality_and_membership_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_protocol_and_adds(
-            "sql-timestamp-ntz-partition-equality-membership",
+            "sql-timestamp-ntz-partition-equality-membership-residuals",
             TIMESTAMP_NTZ_PROTOCOL_JSON,
             TIMESTAMP_NTZ_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["event_ts_ntz"]"#,
@@ -4549,26 +4529,22 @@ mod tests {
             (
                 "timestamp_ntz equality",
                 "select id from orders where event_ts_ntz = timestamp '2026-01-01 00:00:00.123456'",
-                vec!["part-00000.parquet"],
             ),
             (
                 "timestamp_ntz inequality",
                 "select id from orders where event_ts_ntz != timestamp '2026-01-01 00:00:00.123456'",
-                vec!["part-00002.parquet"],
             ),
             (
                 "timestamp_ntz in list",
                 "select id from orders where event_ts_ntz in (timestamp '2026-01-01 00:00:00.123456', timestamp '2025-12-31 23:59:59.999999')",
-                vec!["part-00000.parquet", "part-00002.parquet"],
             ),
             (
                 "timestamp_ntz not in list",
                 "select id from orders where event_ts_ntz not in (timestamp '2026-01-01 00:00:00.123456')",
-                vec!["part-00002.parquet"],
             ),
         ];
 
-        for (name, sql, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -4578,13 +4554,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                1,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -4596,21 +4577,24 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_timestamp_partition_null_checks_are_exact_metadata_pushdown()
+    async fn sql_timestamp_partition_null_checks_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-timestamp-partition-null-checks",
+            "sql-timestamp-partition-null-checks-residuals",
             TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["event_ts"]"#,
             &[
@@ -4639,21 +4623,14 @@ mod tests {
             (
                 "timestamp is null",
                 "select id from orders where event_ts is null",
-                vec!["part-00002.parquet", "part-00005.parquet"],
             ),
             (
                 "timestamp is not null",
                 "select id from orders where event_ts is not null",
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00003.parquet",
-                    "part-00004.parquet",
-                ],
             ),
         ];
 
-        for (name, sql, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -4663,13 +4640,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                1,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -4681,21 +4663,24 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_timestamp_ntz_partition_null_checks_are_exact_metadata_pushdown()
+    async fn sql_timestamp_ntz_partition_null_checks_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_protocol_and_adds(
-            "sql-timestamp-ntz-partition-null-checks",
+            "sql-timestamp-ntz-partition-null-checks-residuals",
             TIMESTAMP_NTZ_PROTOCOL_JSON,
             TIMESTAMP_NTZ_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["event_ts_ntz"]"#,
@@ -4725,21 +4710,14 @@ mod tests {
             (
                 "timestamp_ntz is null",
                 "select id from orders where event_ts_ntz is null",
-                vec!["part-00002.parquet", "part-00005.parquet"],
             ),
             (
                 "timestamp_ntz is not null",
                 "select id from orders where event_ts_ntz is not null",
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00003.parquet",
-                    "part-00004.parquet",
-                ],
             ),
         ];
 
-        for (name, sql, expected_paths) in cases {
+        for (name, sql) in cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -4749,13 +4727,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                1,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -4767,10 +4750,13 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
