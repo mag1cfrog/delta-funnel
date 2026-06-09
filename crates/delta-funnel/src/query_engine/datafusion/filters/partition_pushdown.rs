@@ -30,7 +30,6 @@ enum KernelPartitionTypeGroup {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum KernelPartitionOperatorFamily {
     Equality,
     Ordering,
