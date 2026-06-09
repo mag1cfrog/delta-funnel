@@ -7166,7 +7166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integer_partition_between_filters_are_rejected_at_scan_boundary()
+    async fn integer_partition_between_filters_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "integer-partition-between-boundary",
@@ -7223,27 +7223,18 @@ mod tests {
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
-                "{name}"
-            );
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn integer_partition_boolean_composition_and_projection_are_rejected_at_scan_boundary()
+    async fn integer_partition_boolean_composition_and_projection_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "integer-partition-boolean-composition-boundary",
@@ -7296,25 +7287,20 @@ mod tests {
             let support = provider.supports_filters_pushdown(&filter_refs)?;
             assert_eq!(
                 support,
-                vec![TableProviderFilterPushDown::Unsupported; filters.len()],
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
                 "{name}"
             );
 
-            let result = provider.scan(&state, Some(&vec![0]), &filters, None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn integer_partition_comparisons_are_rejected_at_scan_boundary()
+    async fn integer_partition_comparisons_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "integer-partition-comparisons-boundary",
@@ -7365,27 +7351,18 @@ mod tests {
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
-                "{name}"
-            );
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn integer_partition_equality_and_membership_are_rejected_at_scan_boundary()
+    async fn integer_partition_equality_and_membership_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "integer-partition-equality-membership-boundary",
@@ -7441,20 +7418,11 @@ mod tests {
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
-                "{name}"
-            );
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
         }
 
         Ok(())
@@ -7512,8 +7480,8 @@ mod tests {
         let in_range_plan = provider.plan_supports_filters_pushdown(&in_range_refs);
         let unsupported_plan = provider.plan_supports_filters_pushdown(&unsupported_refs);
 
-        assert_eq!(in_range_plan.exact_count, 0);
-        assert_eq!(in_range_plan.unsupported_count, in_range_filters.len());
+        assert_eq!(in_range_plan.exact_count, in_range_filters.len());
+        assert_eq!(in_range_plan.unsupported_count, 0);
         assert_eq!(unsupported_plan.exact_count, 0);
         assert_eq!(
             unsupported_plan.unsupported_count,
@@ -7524,7 +7492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integer_partition_null_checks_are_rejected_at_scan_boundary()
+    async fn integer_partition_null_checks_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "integer-partition-null-checks-boundary",
@@ -7559,27 +7527,18 @@ mod tests {
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
-                "{name}"
-            );
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_integer_partition_null_checks_keep_residual_filter()
+    async fn sql_integer_partition_null_checks_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -7626,14 +7585,14 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 0);
+            assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0
+                1
             );
             assert_eq!(
                 scans[0]
@@ -7647,7 +7606,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
@@ -8720,7 +8679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_integer_partition_literal_operators_keep_residual_filter()
+    async fn sql_integer_partition_literal_operators_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -8799,18 +8758,16 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count > 0,
                 "{name}: {plan_display}"
             );
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count > 0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -8825,7 +8782,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }

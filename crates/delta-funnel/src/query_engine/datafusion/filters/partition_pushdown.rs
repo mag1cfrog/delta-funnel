@@ -292,11 +292,7 @@ fn exact_partition_kernel_expr(filter: &Expr, schema: &SchemaRef) -> Option<Expr
                 return None;
             };
 
-            if !is_kernel_exact_partition_column_for_operator(
-                column,
-                schema,
-                KernelPartitionOperatorFamily::Membership,
-            ) {
+            if !is_supported_string_empty_in_rewrite_column(column, schema) {
                 return None;
             }
 
@@ -447,6 +443,16 @@ fn is_kernel_exact_partition_column_for_operator(
     })
 }
 
+fn is_supported_string_empty_in_rewrite_column(column: &Column, schema: &SchemaRef) -> bool {
+    if column.relation.is_some() || column.name.contains('.') {
+        return false;
+    }
+
+    schema
+        .field_with_name(&column.name)
+        .is_ok_and(|field| matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8))
+}
+
 fn is_supported_partition_literal_for_column(
     column: &Column,
     literal: &Expr,
@@ -467,7 +473,19 @@ fn is_supported_partition_literal_for_column(
             DataType::Utf8 | DataType::LargeUtf8,
             Expr::Literal(ScalarValue::Utf8(Some(_)), _)
                 | Expr::Literal(ScalarValue::LargeUtf8(Some(_)), _),
-        )
+        ) | (DataType::Int8, Expr::Literal(ScalarValue::Int8(Some(_)), _),)
+            | (
+                DataType::Int16,
+                Expr::Literal(ScalarValue::Int16(Some(_)), _),
+            )
+            | (
+                DataType::Int32,
+                Expr::Literal(ScalarValue::Int32(Some(_)), _),
+            )
+            | (
+                DataType::Int64,
+                Expr::Literal(ScalarValue::Int64(Some(_)), _),
+            )
     )
 }
 
@@ -488,7 +506,11 @@ fn kernel_partition_policy(
             Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
             BooleanShorthand => Unsupported,
         },
-        Integer | Date | Decimal | Floating | Timestamp | TimestampNtz => match operator_family {
+        Integer => match operator_family {
+            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
+            BooleanShorthand => Unsupported,
+        },
+        Date | Decimal | Floating | Timestamp | TimestampNtz => match operator_family {
             Equality | Ordering | Membership | Between | NullCheck | Composition => {
                 TypedRestorePending
             }
@@ -544,6 +566,9 @@ mod tests {
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
+            Field::new("byte_part", DataType::Int8, true),
+            Field::new("short_part", DataType::Int16, true),
+            Field::new("int_part", DataType::Int32, true),
             Field::new("region", DataType::Utf8, true),
             Field::new("large_region", DataType::LargeUtf8, true),
             Field::new("day", DataType::Utf8, true),
@@ -594,6 +619,27 @@ mod tests {
         }));
     }
 
+    fn assert_all_exact(plan: &DeltaFilterPushdownPlan, len: usize) {
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact; len]
+        );
+        assert_eq!(plan.exact_count, len);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, len);
+        assert_eq!(plan.residual_filter_count, 0);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Exact
+                && !decision.residual
+                && decision.rejection_reason.is_none()
+                && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
+                && decision.filter_analysis.kernel_predicate.is_some()
+                && decision.filter_analysis.kernel_adapter_error.is_none()
+                && decision.kernel_scan_filter.is_some()
+        }));
+    }
+
     fn assert_type_policy(
         data_type: DataType,
         expected_group: KernelPartitionTypeGroup,
@@ -638,6 +684,15 @@ mod tests {
             (BooleanShorthand, Unsupported),
             (Composition, TypedRestorePending),
         ];
+        let integer_policy = [
+            (Equality, KernelExact),
+            (Ordering, KernelExact),
+            (Membership, KernelExact),
+            (Between, KernelExact),
+            (NullCheck, KernelExact),
+            (BooleanShorthand, Unsupported),
+            (Composition, KernelExact),
+        ];
         let boolean_policy = [
             (Equality, TypedRestorePending),
             (Ordering, Unsupported),
@@ -675,7 +730,7 @@ mod tests {
             DataType::Int32,
             DataType::Int64,
         ] {
-            assert_type_policy(data_type, Integer, &ordered_typed_restore_policy);
+            assert_type_policy(data_type, Integer, &integer_policy);
         }
         assert_type_policy(DataType::Boolean, Boolean, &boolean_policy);
         assert_type_policy(DataType::Date32, Date, &ordered_typed_restore_policy);
@@ -1734,7 +1789,72 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_integer_partition_comparisons_until_typed_child() {
+    fn partition_operator_planner_accepts_integer_equality_and_membership_as_kernel_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["byte_part", "short_part", "int_part", "id"]);
+        let byte_value = Expr::Literal(ScalarValue::Int8(Some(i8::MIN)), None);
+        let short_value = Expr::Literal(ScalarValue::Int16(Some(-1024)), None);
+        let int_value = Expr::Literal(ScalarValue::Int32(Some(0)), None);
+        let long_value = Expr::Literal(ScalarValue::Int64(Some(i64::MAX)), None);
+        let filters = [
+            col("byte_part").eq(byte_value.clone()),
+            byte_value.eq(col("byte_part")),
+            col("byte_part").not_eq(Expr::Literal(ScalarValue::Int8(Some(i8::MAX)), None)),
+            col("short_part").in_list(
+                vec![
+                    short_value.clone(),
+                    Expr::Literal(ScalarValue::Int16(Some(0)), None),
+                    short_value,
+                ],
+                false,
+            ),
+            col("int_part").in_list(vec![int_value.clone()], true),
+            col("id").eq(long_value.clone()),
+            col("id").in_list(
+                vec![Expr::Literal(ScalarValue::Int64(Some(0)), None), long_value],
+                false,
+            ),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_integer_null_checks_as_kernel_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["byte_part", "short_part", "int_part", "id"]);
+        let filters = [
+            col("byte_part").is_null(),
+            col("short_part").is_not_null(),
+            Expr::Not(Box::new(col("int_part").is_null())),
+            col("id").is_null().or(col("id").eq(lit(7_i64))),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_integer_partition_comparisons_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["id"]);
         let filters = [
@@ -1752,11 +1872,14 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
-    fn partition_operator_planner_accepts_string_between_and_rejects_integer_between() {
+    fn partition_operator_planner_accepts_string_and_integer_between_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["region", "id"]);
         let filters = [
@@ -1780,13 +1903,50 @@ mod tests {
                 TableProviderFilterPushDown::Exact,
                 TableProviderFilterPushDown::Exact,
                 TableProviderFilterPushDown::Exact,
-                TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact,
             ]
         );
-        assert_eq!(plan.exact_count, 3);
-        assert_eq!(plan.unsupported_count, 2);
-        assert_eq!(plan.residual_filter_count, 2);
+        assert_eq!(plan.exact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.residual_filter_count, 0);
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_unproven_integer_literal_shapes() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["byte_part", "short_part", "int_part", "id"]);
+        let filters = [
+            col("byte_part").eq(Expr::Literal(ScalarValue::Int16(Some(7)), None)),
+            col("short_part").eq(Expr::Literal(ScalarValue::Int32(Some(7)), None)),
+            col("int_part").eq(lit(7_i64)),
+            col("id").eq(Expr::Literal(ScalarValue::Int32(Some(7)), None)),
+            col("id").eq(lit("7")),
+            col("id").eq(Expr::Literal(ScalarValue::Int64(None), None)),
+            col("id").in_list(Vec::<Expr>::new(), false),
+            col("id").in_list(Vec::<Expr>::new(), true),
+            col("id").in_list(
+                vec![
+                    Expr::Literal(ScalarValue::Int64(Some(7)), None),
+                    Expr::Literal(ScalarValue::Int32(Some(8)), None),
+                ],
+                false,
+            ),
+            col("id").between(
+                Expr::Literal(ScalarValue::Int32(Some(1)), None),
+                Expr::Literal(ScalarValue::Int64(Some(9)), None),
+            ),
+            datafusion::logical_expr::cast(col("id"), DataType::Int64).eq(lit(7_i64)),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_all_unsupported(&plan, filters.len());
     }
 
     #[test]
