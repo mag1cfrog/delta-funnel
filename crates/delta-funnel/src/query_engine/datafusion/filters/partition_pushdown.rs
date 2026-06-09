@@ -501,6 +501,10 @@ fn is_supported_partition_literal_for_column(
                 DataType::Boolean,
                 Expr::Literal(ScalarValue::Boolean(Some(_)), _),
             )
+            | (
+                DataType::Date32,
+                Expr::Literal(ScalarValue::Date32(Some(_)), _),
+            )
     )
 }
 
@@ -525,7 +529,11 @@ fn kernel_partition_policy(
             Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
             BooleanShorthand => Unsupported,
         },
-        Date | Decimal | Floating | Timestamp | TimestampNtz => match operator_family {
+        Date => match operator_family {
+            Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
+            BooleanShorthand => Unsupported,
+        },
+        Decimal | Floating | Timestamp | TimestampNtz => match operator_family {
             Equality | Ordering | Membership | Between | NullCheck | Composition => {
                 TypedRestorePending
             }
@@ -715,6 +723,15 @@ mod tests {
             (BooleanShorthand, KernelExact),
             (Composition, KernelExact),
         ];
+        let date_policy = [
+            (Equality, KernelExact),
+            (Ordering, KernelExact),
+            (Membership, KernelExact),
+            (Between, KernelExact),
+            (NullCheck, KernelExact),
+            (BooleanShorthand, Unsupported),
+            (Composition, KernelExact),
+        ];
         let binary_policy = [
             (Equality, TypedRestorePending),
             (Ordering, Unsupported),
@@ -746,7 +763,7 @@ mod tests {
             assert_type_policy(data_type, Integer, &integer_policy);
         }
         assert_type_policy(DataType::Boolean, Boolean, &boolean_policy);
-        assert_type_policy(DataType::Date32, Date, &ordered_typed_restore_policy);
+        assert_type_policy(DataType::Date32, Date, &date_policy);
         assert_type_policy(
             DataType::Decimal128(10, 2),
             Decimal,
@@ -1040,6 +1057,29 @@ mod tests {
         let schema = schema();
         let partition_columns = partition_columns(&["is_current"]);
         let filters = [col("is_current").is_null(), col("is_current").is_not_null()];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_date_null_checks_as_kernel_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_date"]);
+        let filters = [
+            col("event_date").is_null(),
+            col("event_date").is_not_null(),
+            Expr::Not(Box::new(col("event_date").is_null())),
+        ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
@@ -1693,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_date_equality_and_membership_until_typed_child() {
+    fn partition_operator_planner_accepts_date_equality_and_membership_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["event_date"]);
         let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
@@ -1716,7 +1756,10 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
@@ -1731,12 +1774,17 @@ mod tests {
                 ScalarValue::Date64(Some(1_767_225_600_000)),
                 None,
             )),
+            datafusion::logical_expr::cast(col("event_date"), DataType::Date32).eq(date.clone()),
+            col("event_date").in_list(Vec::<Expr>::new(), false),
+            col("event_date").in_list(Vec::<Expr>::new(), true),
             col("event_date").in_list(
                 vec![date.clone(), Expr::Literal(ScalarValue::Date32(None), None)],
                 false,
             ),
             col("event_date").in_list(vec![date.clone(), lit("2024-02-29")], false),
             col("event_date").in_list(vec![col("day")], false),
+            col("event_date").between(Expr::Literal(ScalarValue::Date32(None), None), date.clone()),
+            col("event_date").between(col("day"), date),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
 
@@ -1756,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_date_partition_comparisons_until_typed_child() {
+    fn partition_operator_planner_accepts_date_partition_comparisons_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["event_date"]);
         let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
@@ -1777,11 +1825,14 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_date_partition_between_until_typed_child() {
+    fn partition_operator_planner_accepts_date_partition_between_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["event_date"]);
         let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
@@ -1798,7 +1849,72 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
+    }
+
+    #[test]
+    fn partition_operator_planner_accepts_date_composition_as_kernel_exact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_date"]);
+        let new_year_2026 = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let leap_day_2024 = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
+        let next_day = Expr::Literal(ScalarValue::Date32(Some(20_455)), None);
+        let filters = [
+            col("event_date")
+                .eq(new_year_2026.clone())
+                .or(col("event_date").is_null()),
+            col("event_date")
+                .gt_eq(leap_day_2024)
+                .and(col("event_date").lt(next_day)),
+            Expr::Not(Box::new(col("event_date").eq(new_year_2026))),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filter_refs,
+            &schema,
+            &partition_columns,
+        );
+
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
+    }
+
+    #[test]
+    fn partition_operator_planner_extracts_date_partition_term_from_mixed_and() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_date"]);
+        let leap_day_2024 = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
+        let partition_filter = col("event_date").gt_eq(leap_day_2024);
+        let data_filter = col("region").eq(lit("us-west"));
+        let filter = partition_filter.clone().and(data_filter);
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &[&filter],
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert!(plan.decisions[0].residual);
+        assert_eq!(
+            kernel_scan_expr(&plan.decisions[0]),
+            Some(&partition_filter)
+        );
+        assert!(plan.decisions[0].kernel_scan_filter.is_some());
     }
 
     #[test]

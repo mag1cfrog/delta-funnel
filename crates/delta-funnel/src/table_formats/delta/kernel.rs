@@ -319,6 +319,7 @@ fn datafusion_scalar_to_kernel_scalar(
         ScalarValue::Int64(Some(value)) => Ok(Scalar::Long(*value)),
         ScalarValue::Float32(Some(value)) => Ok(Scalar::Float(*value)),
         ScalarValue::Float64(Some(value)) => Ok(Scalar::Double(*value)),
+        ScalarValue::Date32(Some(value)) => Ok(Scalar::Date(*value)),
         ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => {
             Ok(Scalar::String(value.clone()))
         }
@@ -498,6 +499,15 @@ mod tests {
             convert_datafusion_predicate(&col("id").gt_eq(lit(7_i32))),
             Ok(Predicate::ge(id, Expression::Literal(Scalar::Integer(7))))
         );
+        assert_eq!(
+            convert_datafusion_predicate(
+                &col("event_date").eq(Expr::Literal(ScalarValue::Date32(Some(20_454)), None))
+            ),
+            Ok(Predicate::eq(
+                kernel_column("event_date"),
+                Expression::Literal(Scalar::Date(20_454))
+            ))
+        );
     }
 
     #[test]
@@ -548,6 +558,15 @@ mod tests {
                 Expression::Literal(Scalar::String("value".to_owned()))
             ))
         );
+        assert_eq!(
+            convert_datafusion_predicate(
+                &col("event_date").eq(Expr::Literal(ScalarValue::Date32(Some(20_454)), None))
+            ),
+            Ok(Predicate::eq(
+                kernel_column("event_date"),
+                Expression::Literal(Scalar::Date(20_454))
+            ))
+        );
     }
 
     #[test]
@@ -560,6 +579,7 @@ mod tests {
             (ScalarValue::Int64(Some(7)), Scalar::Long(7)),
             (ScalarValue::Float32(Some(7.5)), Scalar::Float(7.5)),
             (ScalarValue::Float64(Some(7.5)), Scalar::Double(7.5)),
+            (ScalarValue::Date32(Some(7)), Scalar::Date(7)),
             (
                 ScalarValue::Utf8(Some("value".to_owned())),
                 Scalar::String("value".to_owned()),
@@ -592,7 +612,6 @@ mod tests {
             ScalarValue::BinaryView(Some(vec![1, 2, 3])),
             ScalarValue::FixedSizeBinary(3, Some(vec![1, 2, 3])),
             ScalarValue::LargeBinary(Some(vec![1, 2, 3])),
-            ScalarValue::Date32(Some(7)),
             ScalarValue::Date64(Some(7)),
             ScalarValue::Time32Second(Some(7)),
             ScalarValue::Time32Millisecond(Some(7)),
@@ -636,13 +655,12 @@ mod tests {
     fn datafusion_predicate_adapter_rejects_unproven_literal_types() {
         let decimal = Expr::Literal(ScalarValue::Decimal128(Some(12345), 10, 2), None);
         let timestamp = Expr::Literal(ScalarValue::TimestampMicrosecond(Some(12345), None), None);
-        let date = Expr::Literal(ScalarValue::Date32(Some(7)), None);
         let binary = Expr::Literal(ScalarValue::Binary(Some(vec![1, 2, 3])), None);
         let decimal_null = Expr::Literal(ScalarValue::Decimal128(None, 10, 2), None);
         let timestamp_null = Expr::Literal(ScalarValue::TimestampMicrosecond(None, None), None);
         let cast_filter = cast(col("id"), DataType::Int64).eq(lit(7_i64));
 
-        for literal in [decimal, timestamp, date, binary] {
+        for literal in [decimal, timestamp, binary] {
             assert_eq!(
                 convert_datafusion_predicate(&col("value").eq(literal)),
                 Err(DeltaKernelPredicateAdapterError::UnsupportedLiteral)
