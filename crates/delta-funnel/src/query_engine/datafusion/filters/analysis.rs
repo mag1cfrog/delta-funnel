@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(
             plan.datafusion_pushdowns(),
             vec![
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Exact,
@@ -569,10 +569,16 @@ mod tests {
             ]
         );
         assert_eq!(plan.exact_count, 1);
-        assert_eq!(plan.inexact_count, 0);
-        assert_eq!(plan.unsupported_count, 5);
-        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 4);
+        assert_eq!(plan.pushed_filter_count, 2);
         assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(
+            plan.decisions[0].outcome,
+            DeltaFilterPushdownOutcome::Inexact
+        );
+        assert!(plan.decisions[0].rejection_reason.is_none());
+        assert!(plan.decisions[0].kernel_scan_filter.is_some());
         assert_eq!(plan.decisions[3].outcome, DeltaFilterPushdownOutcome::Exact);
         assert!(plan.decisions[3].rejection_reason.is_none());
         assert!(plan.decisions[3].filter_analysis.kernel_predicate.is_some());
@@ -580,7 +586,7 @@ mod tests {
             plan.decisions
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| *index != 3)
+                .filter(|(index, _)| !matches!(*index, 0 | 3))
                 .all(|(_, decision)| decision.rejection_reason
                     == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy))
         );
