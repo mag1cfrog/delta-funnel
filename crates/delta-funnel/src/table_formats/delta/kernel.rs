@@ -339,6 +339,7 @@ fn datafusion_scalar_to_kernel_scalar(
         ScalarValue::TimestampMicrosecond(Some(value), Some(timezone)) if !timezone.is_empty() => {
             Ok(Scalar::Timestamp(*value))
         }
+        ScalarValue::TimestampMicrosecond(Some(value), None) => Ok(Scalar::TimestampNtz(*value)),
         _ => Err(DeltaKernelPredicateAdapterError::UnsupportedLiteral),
     }
 }
@@ -614,6 +615,16 @@ mod tests {
                 Expression::Literal(Scalar::Timestamp(1_767_225_600_123_456))
             ))
         );
+        assert_eq!(
+            convert_datafusion_predicate(&col("event_ts_ntz").eq(Expr::Literal(
+                ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), None),
+                None
+            ))),
+            Ok(Predicate::eq(
+                kernel_column("event_ts_ntz"),
+                Expression::Literal(Scalar::TimestampNtz(1_767_225_600_123_456))
+            ))
+        );
 
         Ok(())
     }
@@ -672,6 +683,10 @@ mod tests {
                 ),
                 Scalar::Timestamp(1_767_225_600_123_456),
             ),
+            (
+                ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), None),
+                Scalar::TimestampNtz(1_767_225_600_123_456),
+            ),
         ];
 
         for (datafusion_scalar, kernel_scalar) in supported {
@@ -708,7 +723,6 @@ mod tests {
             ScalarValue::Time64Nanosecond(Some(7)),
             ScalarValue::TimestampSecond(Some(7), Some(Arc::from("UTC"))),
             ScalarValue::TimestampMillisecond(Some(7), Some(Arc::from("UTC"))),
-            ScalarValue::TimestampMicrosecond(Some(7), None),
             ScalarValue::TimestampMicrosecond(Some(7), Some(Arc::from(""))),
             ScalarValue::TimestampNanosecond(Some(7), Some(Arc::from("UTC"))),
         ];
@@ -744,8 +758,10 @@ mod tests {
 
     #[test]
     fn datafusion_predicate_adapter_rejects_unproven_literal_types() {
-        let timestamp_ntz =
-            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(12345), None), None);
+        let timestamp_empty_timezone = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(12345), Some(Arc::from(""))),
+            None,
+        );
         let float_nan = Expr::Literal(ScalarValue::Float32(Some(f32::NAN)), None);
         let double_infinity = Expr::Literal(ScalarValue::Float64(Some(f64::INFINITY)), None);
         let decimal256 = Expr::Literal(ScalarValue::Decimal256(Some(12345.into()), 10, 2), None);
@@ -756,7 +772,7 @@ mod tests {
         let cast_filter = cast(col("id"), DataType::Int64).eq(lit(7_i64));
 
         for literal in [
-            timestamp_ntz,
+            timestamp_empty_timezone,
             float_nan,
             double_infinity,
             decimal256,
