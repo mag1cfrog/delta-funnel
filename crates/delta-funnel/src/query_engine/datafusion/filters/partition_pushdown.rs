@@ -1426,6 +1426,41 @@ mod tests {
     }
 
     #[test]
+    fn partition_operator_planner_extracts_timestamp_partition_term_from_mixed_and() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["event_ts"]);
+        let timestamp = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
+            None,
+        );
+        let partition_filter = col("event_ts").eq(timestamp);
+        let data_filter = col("id").gt(lit(10_i32));
+        let filter = partition_filter.clone().and(data_filter);
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &[&filter],
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert!(plan.decisions[0].residual);
+        assert_eq!(
+            kernel_scan_expr(&plan.decisions[0]),
+            Some(&partition_filter)
+        );
+        assert!(plan.decisions[0].kernel_scan_filter.is_some());
+    }
+
+    #[test]
     fn partition_operator_planner_downgrades_timestamp_ntz_equality_membership_and_ranges_until_typed_child()
      {
         let schema = schema();
