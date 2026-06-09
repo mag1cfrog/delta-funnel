@@ -422,15 +422,21 @@ mod tests {
 
     fn assert_invalid_integer_partition_error(
         result: Result<Vec<String>, Box<dyn std::error::Error>>,
-    ) {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let error = match result {
-            Ok(paths) => panic!("invalid integer metadata should fail kernel scan: {paths:?}"),
+            Ok(paths) => {
+                return Err(
+                    format!("invalid integer metadata should fail kernel scan: {paths:?}").into(),
+                );
+            }
             Err(error) => error,
         };
         let message = error.to_string();
         let debug_message = format!("{error:?}");
         assert!(message.contains("not-an-integer"));
         assert!(debug_message.contains("Primitive(Long)"));
+
+        Ok(())
     }
 
     #[test]
@@ -744,11 +750,11 @@ mod tests {
         assert_invalid_integer_partition_error(kernel_scan_file_paths(
             &unfiltered_scan,
             source.table_uri(),
-        ));
+        ))?;
         assert_invalid_integer_partition_error(kernel_predicated_file_paths(
             &source,
             &col("long_part").eq(int64_lit(7)),
-        ));
+        ))?;
 
         Ok(())
     }
