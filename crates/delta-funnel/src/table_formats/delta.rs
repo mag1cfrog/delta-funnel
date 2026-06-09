@@ -298,6 +298,7 @@ mod tests {
     const DECIMAL_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["amount"],"configuration":{},"createdTime":1587968585495}}"#;
     const FLOATING_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"float_part\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_part\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["float_part","double_part"],"configuration":{},"createdTime":1587968585495}}"#;
     const BINARY_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["payload"],"configuration":{},"createdTime":1587968585495}}"#;
+    const TIMESTAMP_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["event_ts"],"configuration":{},"createdTime":1587968585495}}"#;
 
     fn add_json(path: &str) -> String {
         format!(
@@ -540,6 +541,42 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_timestamp_partition_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-timestamp-partition-characterization",
+            TIMESTAMP_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json(
+                    "timestamp-pre-epoch.parquet",
+                    r#"{"event_ts":"1969-12-31T23:59:59.999999Z"}"#,
+                ),
+                partitioned_add_json(
+                    "timestamp-low.parquet",
+                    r#"{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
+                ),
+                partitioned_add_json(
+                    "timestamp-target.parquet",
+                    r#"{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
+                ),
+                partitioned_add_json(
+                    "timestamp-high.parquet",
+                    r#"{"event_ts":"2026-01-01T00:00:00.123457Z"}"#,
+                ),
+                partitioned_add_json("timestamp-null.parquet", r#"{"event_ts":null}"#),
+                partitioned_add_json("timestamp-empty.parquet", r#"{"event_ts":""}"#),
+                partitioned_add_json("timestamp-missing.parquet", r#"{}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_predicated_file_paths(
         source: &super::PlannedDeltaSource,
         filter: &datafusion::logical_expr::Expr,
@@ -612,6 +649,28 @@ mod tests {
         DeltaKernelPredicate::new(Predicate::ne(
             binary_partition_column(),
             binary_partition_value(value),
+        ))
+    }
+
+    fn timestamp_partition_column() -> Expression {
+        Expression::Column(ColumnName::new(["event_ts"]))
+    }
+
+    fn timestamp_partition_value(value: i64) -> Expression {
+        Expression::Literal(Scalar::Timestamp(value))
+    }
+
+    fn timestamp_partition_eq(value: i64) -> DeltaKernelPredicate {
+        DeltaKernelPredicate::new(Predicate::eq(
+            timestamp_partition_column(),
+            timestamp_partition_value(value),
+        ))
+    }
+
+    fn timestamp_partition_ne(value: i64) -> DeltaKernelPredicate {
+        DeltaKernelPredicate::new(Predicate::ne(
+            timestamp_partition_column(),
+            timestamp_partition_value(value),
         ))
     }
 
@@ -720,6 +779,30 @@ mod tests {
                 || message.contains("not-a-double")
                 || debug_message.contains("InvalidFloat")
                 || debug_message.contains("ParseFloatError"),
+            "{message}\n{debug_message}"
+        );
+
+        Ok(())
+    }
+
+    fn assert_invalid_timestamp_partition_error(
+        result: Result<Vec<String>, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = match result {
+            Ok(paths) => {
+                return Err(format!(
+                    "invalid timestamp metadata should fail kernel scan: {paths:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let debug_message = format!("{error:?}");
+        assert!(
+            message.contains("not-a-timestamp")
+                || debug_message.contains("not-a-timestamp")
+                || debug_message.contains("Timestamp"),
             "{message}\n{debug_message}"
         );
 
@@ -1609,6 +1692,266 @@ mod tests {
                 "binary-special.parquet",
             ]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_timestamp_ordering_and_precision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_timestamp_partition_characterization_source()?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+        let pre_epoch = -1_i64;
+        let low = 1_767_225_599_999_999_i64;
+        let target = 1_767_225_600_123_456_i64;
+        let high = 1_767_225_600_123_457_i64;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec![
+                "timestamp-empty.parquet",
+                "timestamp-high.parquet",
+                "timestamp-low.parquet",
+                "timestamp-missing.parquet",
+                "timestamp-null.parquet",
+                "timestamp-pre-epoch.parquet",
+                "timestamp-target.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::lt(
+                    timestamp_partition_column(),
+                    timestamp_partition_value(target),
+                )),
+            )?,
+            vec!["timestamp-low.parquet", "timestamp-pre-epoch.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::ge(
+                    timestamp_partition_column(),
+                    timestamp_partition_value(target),
+                )),
+            )?,
+            vec!["timestamp-high.parquet", "timestamp-target.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::gt(
+                    timestamp_partition_value(high),
+                    timestamp_partition_column(),
+                )),
+            )?,
+            vec![
+                "timestamp-low.parquet",
+                "timestamp-pre-epoch.parquet",
+                "timestamp-target.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, timestamp_partition_eq(pre_epoch))?,
+            vec!["timestamp-pre-epoch.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, timestamp_partition_eq(target))?,
+            vec!["timestamp-target.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, timestamp_partition_ne(target))?,
+            vec![
+                "timestamp-high.parquet",
+                "timestamp-low.parquet",
+                "timestamp-pre-epoch.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, timestamp_partition_eq(target + 1))?,
+            vec!["timestamp-high.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, timestamp_partition_eq(low))?,
+            vec!["timestamp-low.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_timestamp_null_empty_and_membership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_timestamp_partition_characterization_source()?;
+        let low = 1_767_225_599_999_999_i64;
+        let target = 1_767_225_600_123_456_i64;
+
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::is_null(timestamp_partition_column())),
+            )?,
+            vec![
+                "timestamp-empty.parquet",
+                "timestamp-missing.parquet",
+                "timestamp-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::is_not_null(timestamp_partition_column())),
+            )?,
+            vec![
+                "timestamp-high.parquet",
+                "timestamp-low.parquet",
+                "timestamp-pre-epoch.parquet",
+                "timestamp-target.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::or(
+                    Predicate::eq(timestamp_partition_column(), timestamp_partition_value(low)),
+                    Predicate::eq(
+                        timestamp_partition_column(),
+                        timestamp_partition_value(target)
+                    ),
+                )),
+            )?,
+            vec!["timestamp-low.parquet", "timestamp-target.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::and(
+                    Predicate::ne(timestamp_partition_column(), timestamp_partition_value(low)),
+                    Predicate::ne(
+                        timestamp_partition_column(),
+                        timestamp_partition_value(target)
+                    ),
+                )),
+            )?,
+            vec!["timestamp-high.parquet", "timestamp-pre-epoch.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_timestamp_between_and_composition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_timestamp_partition_characterization_source()?;
+        let low = 1_767_225_599_999_999_i64;
+        let target = 1_767_225_600_123_456_i64;
+        let high = 1_767_225_600_123_457_i64;
+
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::and(
+                    Predicate::ge(timestamp_partition_column(), timestamp_partition_value(low)),
+                    Predicate::le(
+                        timestamp_partition_column(),
+                        timestamp_partition_value(target)
+                    ),
+                )),
+            )?,
+            vec!["timestamp-low.parquet", "timestamp-target.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::or(
+                    Predicate::lt(timestamp_partition_column(), timestamp_partition_value(low)),
+                    Predicate::gt(
+                        timestamp_partition_column(),
+                        timestamp_partition_value(target)
+                    ),
+                )),
+            )?,
+            vec!["timestamp-high.parquet", "timestamp-pre-epoch.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::and(
+                    Predicate::gt(timestamp_partition_column(), timestamp_partition_value(low)),
+                    Predicate::le(
+                        timestamp_partition_column(),
+                        timestamp_partition_value(high)
+                    ),
+                )),
+            )?,
+            vec!["timestamp-high.parquet", "timestamp-target.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::or(
+                    Predicate::eq(timestamp_partition_column(), timestamp_partition_value(low)),
+                    Predicate::is_null(timestamp_partition_column()),
+                )),
+            )?,
+            vec![
+                "timestamp-empty.parquet",
+                "timestamp-low.parquet",
+                "timestamp-missing.parquet",
+                "timestamp-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::not(Predicate::eq(
+                    timestamp_partition_column(),
+                    timestamp_partition_value(target),
+                ))),
+            )?,
+            vec![
+                "timestamp-high.parquet",
+                "timestamp-low.parquet",
+                "timestamp-pre-epoch.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_invalid_timestamp_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-invalid-timestamp-characterization",
+            TIMESTAMP_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json(
+                    "timestamp-valid.parquet",
+                    r#"{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
+                ),
+                partitioned_add_json(
+                    "timestamp-invalid.parquet",
+                    r#"{"event_ts":"not-a-timestamp"}"#,
+                ),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_invalid_timestamp_partition_error(kernel_scan_file_paths(
+            &unfiltered_scan,
+            source.table_uri(),
+        ))?;
+        assert_invalid_timestamp_partition_error(kernel_predicate_file_paths(
+            &source,
+            timestamp_partition_eq(1_767_225_600_123_456),
+        ))?;
 
         Ok(())
     }
