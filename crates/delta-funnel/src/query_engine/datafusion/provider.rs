@@ -5590,7 +5590,13 @@ mod tests {
         let float_negative = Expr::Literal(ScalarValue::Float32(Some(-1.5)), None);
         let double_two = Expr::Literal(ScalarValue::Float64(Some(2.25)), None);
         let double_four = Expr::Literal(ScalarValue::Float64(Some(4.0)), None);
-        let cases: Vec<(&str, Vec<Expr>, Vec<&str>, Vec<&str>)> = vec![
+        type FloatingPruningCase = (
+            &'static str,
+            Vec<Expr>,
+            Vec<&'static str>,
+            Vec<&'static str>,
+        );
+        let cases: Vec<FloatingPruningCase> = vec![
             (
                 "float equality",
                 vec![datafusion::logical_expr::col("float_part").eq(float_one.clone())],

@@ -241,10 +241,11 @@ mod tests {
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Expr, col, lit};
 
+    use super::kernel::{ColumnName, Expression, Predicate, Scalar};
     use super::partition_metadata_predicate::DeltaPartitionNameMap;
     use super::{
-        DeltaPartitionMetadataPredicate, DeltaSourceConfig, ProjectedDeltaScan,
-        build_projected_delta_scan, build_projected_predicated_delta_scan,
+        DeltaKernelPredicate, DeltaPartitionMetadataPredicate, DeltaSourceConfig,
+        ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
         datafusion_expr_to_kernel_predicate, load_delta_source, load_delta_sources,
     };
     use crate::DeltaFunnelError;
@@ -520,6 +521,13 @@ mod tests {
         filter: &datafusion::logical_expr::Expr,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let predicate = datafusion_expr_to_kernel_predicate(filter)?;
+        kernel_predicate_file_paths(source, predicate)
+    }
+
+    fn kernel_predicate_file_paths(
+        source: &super::PlannedDeltaSource,
+        predicate: DeltaKernelPredicate,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let scan = build_projected_predicated_delta_scan(source, None, Some(predicate))?;
 
         kernel_scan_file_paths(&scan, source.table_uri())
@@ -1497,7 +1505,13 @@ mod tests {
             vec!["floating-neg-inf.parquet"]
         );
         assert_eq!(
-            kernel_predicated_file_paths(&source, &col("float_part").eq(float32_lit(f32::NAN)))?,
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::eq(
+                    Expression::Column(ColumnName::new(["float_part"])),
+                    Expression::Literal(Scalar::Float(f32::NAN)),
+                )),
+            )?,
             vec!["floating-nan.parquet"]
         );
 
