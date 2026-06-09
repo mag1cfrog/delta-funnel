@@ -149,7 +149,7 @@ impl DeltaTableProvider {
     /// DataFusion may present relation-qualified expressions to the support
     /// callback and unqualified expressions to `scan`. This helper owns the
     /// normalization step for both entry points before strict partition
-    /// pushdown planning or metadata predicate conversion.
+    /// pushdown planning or kernel predicate conversion.
     fn normalize_provider_filters(&self, filters: impl IntoIterator<Item = Expr>) -> Vec<Expr> {
         filters
             .into_iter()
