@@ -6223,6 +6223,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timestamp_ntz_partition_mixed_and_filter_uses_kernel_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_protocol_and_adds(
+            "timestamp-ntz-partition-mixed-and-kernel-pruning",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TIMESTAMP_NTZ_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["event_ts_ntz"]"#,
+            &[
+                r#""partitionValues":{"event_ts_ntz":"2026-01-01 00:00:00.123456"}"#,
+                r#""partitionValues":{"event_ts_ntz":"2025-12-31 23:59:59.999999"}"#,
+                r#""partitionValues":{"event_ts_ntz":"2026-01-01 00:00:00.123457"}"#,
+                r#""partitionValues":{"event_ts_ntz":null}"#,
+                r#""partitionValues":{"event_ts_ntz":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let timestamp = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), None),
+            None,
+        );
+        let filter = datafusion::logical_expr::col("event_ts_ntz")
+            .eq(timestamp)
+            .and(datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(10)));
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider.scan(&state, None, &[filter], None).await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+        let scan_plan = scan.scan_plan();
+
+        assert_eq!(scan_plan.pushed_filter_plan.exact_count, 0);
+        assert_eq!(scan_plan.pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan_plan.pushed_filter_plan.pushed_filter_count, 1);
+        assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan_plan.partition_metadata_filter.is_none());
+        assert!(scan_plan.kernel_partition_predicate.is_some());
+        assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn binary_partition_mixed_and_filter_uses_kernel_pruning()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
