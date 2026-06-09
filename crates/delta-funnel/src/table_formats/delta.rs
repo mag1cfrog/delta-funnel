@@ -293,6 +293,7 @@ mod tests {
     const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
     const INTEGER_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["byte_part","short_part","int_part","long_part"],"configuration":{},"createdTime":1587968585495}}"#;
     const BOOLEAN_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["is_current"],"configuration":{},"createdTime":1587968585495}}"#;
+    const DATE_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["event_date"],"configuration":{},"createdTime":1587968585495}}"#;
 
     fn add_json(path: &str) -> String {
         format!(
@@ -417,6 +418,30 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_date_partition_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-date-partition-characterization",
+            DATE_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("date-pre-epoch.parquet", r#"{"event_date":"1969-12-31"}"#),
+                partitioned_add_json("date-epoch.parquet", r#"{"event_date":"1970-01-01"}"#),
+                partitioned_add_json("date-leap-day.parquet", r#"{"event_date":"2024-02-29"}"#),
+                partitioned_add_json("date-new-year.parquet", r#"{"event_date":"2026-01-01"}"#),
+                partitioned_add_json("date-null.parquet", r#"{"event_date":null}"#),
+                partitioned_add_json("date-empty.parquet", r#"{"event_date":""}"#),
+                partitioned_add_json("date-missing.parquet", r#"{}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_predicated_file_paths(
         source: &super::PlannedDeltaSource,
         filter: &datafusion::logical_expr::Expr,
@@ -445,6 +470,10 @@ mod tests {
 
     fn bool_lit(value: bool) -> Expr {
         Expr::Literal(ScalarValue::Boolean(Some(value)), None)
+    }
+
+    fn date_lit(value: i32) -> Expr {
+        Expr::Literal(ScalarValue::Date32(Some(value)), None)
     }
 
     fn assert_invalid_integer_partition_error(
@@ -481,6 +510,25 @@ mod tests {
         let debug_message = format!("{error:?}");
         assert!(message.contains("not-a-boolean"));
         assert!(debug_message.contains("Primitive(Boolean)"));
+
+        Ok(())
+    }
+
+    fn assert_invalid_date_partition_error(
+        result: Result<Vec<String>, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = match result {
+            Ok(paths) => {
+                return Err(
+                    format!("invalid date metadata should fail kernel scan: {paths:?}").into(),
+                );
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let debug_message = format!("{error:?}");
+        assert!(message.contains("not-a-date"));
+        assert!(debug_message.contains("Primitive(Date)"));
 
         Ok(())
     }
@@ -686,6 +734,186 @@ mod tests {
             )?,
             vec!["boolean-false.parquet"]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_date_ordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_date_partition_characterization_source()?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec![
+                "date-empty.parquet",
+                "date-epoch.parquet",
+                "date-leap-day.parquet",
+                "date-missing.parquet",
+                "date-new-year.parquet",
+                "date-null.parquet",
+                "date-pre-epoch.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("event_date").gt(date_lit(19_782)))?,
+            vec!["date-new-year.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("event_date").lt_eq(date_lit(0)))?,
+            vec!["date-epoch.parquet", "date-pre-epoch.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &date_lit(20_454).gt(col("event_date")))?,
+            vec![
+                "date-epoch.parquet",
+                "date-leap-day.parquet",
+                "date-pre-epoch.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_date_null_and_empty_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_date_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("event_date").is_null())?,
+            vec![
+                "date-empty.parquet",
+                "date-missing.parquet",
+                "date-null.parquet"
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("event_date").is_not_null())?,
+            vec![
+                "date-epoch.parquet",
+                "date-leap-day.parquet",
+                "date-new-year.parquet",
+                "date-pre-epoch.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("event_date").eq(date_lit(20_454)))?,
+            vec!["date-new-year.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("event_date").not_eq(date_lit(20_454)))?,
+            vec![
+                "date-epoch.parquet",
+                "date-leap-day.parquet",
+                "date-pre-epoch.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_date_membership_between_and_composition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_date_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("event_date").in_list(vec![date_lit(-1), date_lit(20_454)], false),
+            )?,
+            vec!["date-new-year.parquet", "date-pre-epoch.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("event_date").in_list(vec![date_lit(19_782)], true),
+            )?,
+            vec![
+                "date-epoch.parquet",
+                "date-new-year.parquet",
+                "date-pre-epoch.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("event_date").between(date_lit(-1), date_lit(19_782)),
+            )?,
+            vec![
+                "date-epoch.parquet",
+                "date-leap-day.parquet",
+                "date-pre-epoch.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("event_date").not_between(date_lit(-1), date_lit(19_782)),
+            )?,
+            vec!["date-new-year.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("event_date")
+                    .gt_eq(date_lit(0))
+                    .and(col("event_date").lt(date_lit(20_454))),
+            )?,
+            vec!["date-epoch.parquet", "date-leap-day.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("event_date")
+                    .eq(date_lit(-1))
+                    .or(col("event_date").eq(date_lit(20_454))),
+            )?,
+            vec!["date-new-year.parquet", "date-pre-epoch.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &Expr::Not(Box::new(col("event_date").eq(date_lit(19_782)))),
+            )?,
+            vec![
+                "date-epoch.parquet",
+                "date-new-year.parquet",
+                "date-pre-epoch.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_invalid_date_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-invalid-date-characterization",
+            DATE_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("date-valid.parquet", r#"{"event_date":"2026-01-01"}"#),
+                partitioned_add_json("date-invalid.parquet", r#"{"event_date":"not-a-date"}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_invalid_date_partition_error(kernel_scan_file_paths(
+            &unfiltered_scan,
+            source.table_uri(),
+        ))?;
+        assert_invalid_date_partition_error(kernel_predicated_file_paths(
+            &source,
+            &col("event_date").eq(date_lit(20_454)),
+        ))?;
 
         Ok(())
     }
