@@ -8925,9 +8925,14 @@ mod tests {
                 "reversed equality",
                 "select id from orders where 7 = long_part",
             ),
+            ("inequality", "select id from orders where long_part != 7"),
             (
                 "in list",
                 "select id from orders where long_part in (7, -1)",
+            ),
+            (
+                "not in list",
+                "select id from orders where long_part not in (7)",
             ),
             ("less than", "select id from orders where long_part < 7"),
             (
@@ -8955,6 +8960,15 @@ mod tests {
                 "contradictory not between",
                 "select id from orders where long_part not between 10 and -10",
             ),
+            (
+                "whole and",
+                "select id from orders where long_part >= -1 and long_part < 20",
+            ),
+            (
+                "whole or",
+                "select id from orders where long_part = 7 or long_part = 20",
+            ),
+            ("not", "select id from orders where not long_part = 7"),
         ];
 
         for (name, sql) in cases {
