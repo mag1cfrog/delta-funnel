@@ -54,10 +54,7 @@ pub(super) fn plan_partition_operator_pushdown(
 ) -> DeltaFilterPushdownPlan {
     let decisions = filters
         .iter()
-        .enumerate()
-        .map(|(input_index, filter)| {
-            partition_operator_decision(input_index, filter, schema, partition_columns)
-        })
+        .map(|filter| partition_operator_decision(filter, schema, partition_columns))
         .collect::<Vec<_>>();
 
     DeltaFilterPushdownPlan::from_decisions(decisions)
@@ -70,7 +67,6 @@ pub(super) fn plan_partition_operator_pushdown(
 /// remain useful, but unsupported predicates are not accepted and must not
 /// affect kernel scan planning.
 fn partition_operator_decision(
-    input_index: usize,
     filter: &Expr,
     schema: &SchemaRef,
     partition_columns: &HashSet<String>,
@@ -83,7 +79,6 @@ fn partition_operator_decision(
         && let Some(kernel_scan_filter) = try_exact_partition_kernel_filter(filter, schema)
     {
         return DeltaFilterPushdownDecision {
-            input_index,
             outcome: DeltaFilterPushdownOutcome::Exact,
             residual: false,
             rejection_reason: None,
@@ -97,7 +92,6 @@ fn partition_operator_decision(
             try_mixed_and_partition_kernel_filter(filter, schema, partition_columns)
     {
         return DeltaFilterPushdownDecision {
-            input_index,
             outcome: DeltaFilterPushdownOutcome::Inexact,
             residual: true,
             rejection_reason: None,
@@ -107,7 +101,6 @@ fn partition_operator_decision(
     }
 
     DeltaFilterPushdownDecision {
-        input_index,
         outcome: DeltaFilterPushdownOutcome::Unsupported,
         residual: true,
         rejection_reason: Some(rejection_reason),
@@ -671,8 +664,6 @@ mod tests {
                 && !decision.residual
                 && decision.rejection_reason.is_none()
                 && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
-                && decision.filter_analysis.kernel_predicate.is_some()
-                && decision.filter_analysis.kernel_adapter_error.is_none()
                 && decision.kernel_scan_filter.is_some()
         }));
     }
@@ -880,7 +871,6 @@ mod tests {
             plan.decisions[0].filter_analysis.scope,
             DeltaFilterColumnScope::PartitionOnly
         );
-        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_some());
     }
 
     #[test]
@@ -945,8 +935,6 @@ mod tests {
                 && !decision.residual
                 && decision.rejection_reason.is_none()
                 && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
-                && decision.filter_analysis.kernel_predicate.is_some()
-                && decision.filter_analysis.kernel_adapter_error.is_none()
                 && decision.kernel_scan_filter.is_some()
         }));
     }
@@ -994,7 +982,6 @@ mod tests {
             decision.outcome == DeltaFilterPushdownOutcome::Exact
                 && !decision.residual
                 && decision.filter_analysis.partition_columns == vec!["large_region"]
-                && decision.filter_analysis.kernel_predicate.is_some()
                 && decision.kernel_scan_filter.is_some()
         }));
     }
@@ -1086,8 +1073,6 @@ mod tests {
                 && !decision.residual
                 && decision.rejection_reason.is_none()
                 && decision.filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly
-                && decision.filter_analysis.kernel_predicate.is_some()
-                && decision.filter_analysis.kernel_adapter_error.is_none()
                 && decision.kernel_scan_filter.is_some()
         }));
     }
@@ -2294,7 +2279,6 @@ mod tests {
         assert!(plan.decisions.iter().all(|decision| {
             decision.outcome == DeltaFilterPushdownOutcome::Exact
                 && !decision.residual
-                && decision.filter_analysis.kernel_predicate.is_some()
                 && decision.kernel_scan_filter.is_some()
         }));
     }
@@ -2603,13 +2587,9 @@ mod tests {
         assert_eq!(plan.unsupported_count, 1);
         assert_eq!(plan.pushed_filter_count, 2);
         assert_eq!(plan.residual_filter_count, 1);
-        assert_eq!(
-            plan.decisions
-                .iter()
-                .map(|decision| decision.input_index)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
+        assert_eq!(kernel_scan_expr(&plan.decisions[0]), Some(&exact));
+        assert!(plan.decisions[1].kernel_scan_filter.is_none());
+        assert_eq!(kernel_scan_expr(&plan.decisions[2]), Some(&duplicate_exact));
     }
 
     #[test]
@@ -2898,7 +2878,7 @@ mod tests {
         );
         assert_eq!(plan.unsupported_count, 2);
         assert_eq!(plan.residual_filter_count, 2);
-        assert!(plan.decisions[0].filter_analysis.kernel_predicate.is_none());
-        assert!(plan.decisions[1].filter_analysis.kernel_predicate.is_none());
+        assert!(plan.decisions[0].kernel_scan_filter.is_none());
+        assert!(plan.decisions[1].kernel_scan_filter.is_none());
     }
 }
