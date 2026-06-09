@@ -13,10 +13,7 @@ use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{
     DeltaKernelPredicate, DeltaKernelPredicateAdapterError, datafusion_expr_to_kernel_predicate,
 };
-pub(crate) use partition_metadata_predicate::{
-    DeltaPartitionMetadataPredicate, DeltaPartitionNameMap, normalize_decimal_partition_literal,
-    supports_partition_metadata_logical_type,
-};
+pub(crate) use partition_metadata_predicate::DeltaPartitionMetadataPredicate;
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };
@@ -64,11 +61,10 @@ impl ProjectedDeltaScan {
     #[cfg(test)]
     /// Returns scan file paths after kernel scan planning and optional metadata filtering.
     ///
-    /// The provider builds partition pushdown as a metadata predicate stored on
-    /// `ProviderScanPlan`, not as a delta_kernel scan predicate. This
-    /// helper mirrors the intended read path: expand kernel scan metadata first,
-    /// then evaluate the provider predicate against each `ScanFile`'s partition
-    /// values before returning file paths.
+    /// The kernel scan may already carry a delta_kernel predicate. Tests may
+    /// also pass a provider-owned metadata predicate to mirror legacy pruning:
+    /// expand kernel scan metadata first, then optionally evaluate the provider
+    /// predicate against each `ScanFile`'s partition values.
     pub(crate) fn scan_file_paths(
         &self,
         table_uri: &str,
@@ -244,9 +240,10 @@ mod tests {
 
     use datafusion::logical_expr::{col, lit};
 
+    use super::partition_metadata_predicate::DeltaPartitionNameMap;
     use super::{
-        DeltaPartitionMetadataPredicate, DeltaPartitionNameMap, DeltaSourceConfig,
-        ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
+        DeltaPartitionMetadataPredicate, DeltaSourceConfig, ProjectedDeltaScan,
+        build_projected_delta_scan, build_projected_predicated_delta_scan,
         datafusion_expr_to_kernel_predicate, load_delta_source, load_delta_sources,
     };
     use crate::DeltaFunnelError;
