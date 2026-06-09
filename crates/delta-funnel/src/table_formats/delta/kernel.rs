@@ -317,8 +317,8 @@ fn datafusion_scalar_to_kernel_scalar(
         ScalarValue::Int16(Some(value)) => Ok(Scalar::Short(*value)),
         ScalarValue::Int32(Some(value)) => Ok(Scalar::Integer(*value)),
         ScalarValue::Int64(Some(value)) => Ok(Scalar::Long(*value)),
-        ScalarValue::Float32(Some(value)) => Ok(Scalar::Float(*value)),
-        ScalarValue::Float64(Some(value)) => Ok(Scalar::Double(*value)),
+        ScalarValue::Float32(Some(value)) if value.is_finite() => Ok(Scalar::Float(*value)),
+        ScalarValue::Float64(Some(value)) if value.is_finite() => Ok(Scalar::Double(*value)),
         ScalarValue::Date32(Some(value)) => Ok(Scalar::Date(*value)),
         ScalarValue::Decimal128(Some(value), precision, scale) => {
             let scale = u8::try_from(*scale)
@@ -623,6 +623,12 @@ mod tests {
         }
 
         let unsupported_literals = [
+            ScalarValue::Float32(Some(f32::NAN)),
+            ScalarValue::Float32(Some(f32::INFINITY)),
+            ScalarValue::Float32(Some(f32::NEG_INFINITY)),
+            ScalarValue::Float64(Some(f64::NAN)),
+            ScalarValue::Float64(Some(f64::INFINITY)),
+            ScalarValue::Float64(Some(f64::NEG_INFINITY)),
             ScalarValue::Decimal32(Some(12345), 10, 2),
             ScalarValue::Decimal64(Some(12345), 10, 2),
             ScalarValue::Decimal256(Some(12345.into()), 10, 2),
@@ -680,6 +686,8 @@ mod tests {
     fn datafusion_predicate_adapter_rejects_unproven_literal_types() {
         let timestamp = Expr::Literal(ScalarValue::TimestampMicrosecond(Some(12345), None), None);
         let binary = Expr::Literal(ScalarValue::Binary(Some(vec![1, 2, 3])), None);
+        let float_nan = Expr::Literal(ScalarValue::Float32(Some(f32::NAN)), None);
+        let double_infinity = Expr::Literal(ScalarValue::Float64(Some(f64::INFINITY)), None);
         let decimal256 = Expr::Literal(ScalarValue::Decimal256(Some(12345.into()), 10, 2), None);
         let negative_scale_decimal =
             Expr::Literal(ScalarValue::Decimal128(Some(12345), 10, -2), None);
@@ -687,7 +695,14 @@ mod tests {
         let timestamp_null = Expr::Literal(ScalarValue::TimestampMicrosecond(None, None), None);
         let cast_filter = cast(col("id"), DataType::Int64).eq(lit(7_i64));
 
-        for literal in [timestamp, binary, decimal256, negative_scale_decimal] {
+        for literal in [
+            timestamp,
+            binary,
+            float_nan,
+            double_infinity,
+            decimal256,
+            negative_scale_decimal,
+        ] {
             assert_eq!(
                 convert_datafusion_predicate(&col("value").eq(literal)),
                 Err(DeltaKernelPredicateAdapterError::UnsupportedLiteral)

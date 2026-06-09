@@ -490,6 +490,12 @@ fn is_supported_partition_literal_for_column(
         | (DataType::Int64, Expr::Literal(ScalarValue::Int64(Some(_)), _))
         | (DataType::Boolean, Expr::Literal(ScalarValue::Boolean(Some(_)), _))
         | (DataType::Date32, Expr::Literal(ScalarValue::Date32(Some(_)), _)) => true,
+        (DataType::Float32, Expr::Literal(ScalarValue::Float32(Some(value)), _)) => {
+            value.is_finite() && *value != 0.0
+        }
+        (DataType::Float64, Expr::Literal(ScalarValue::Float64(Some(value)), _)) => {
+            value.is_finite() && *value != 0.0
+        }
         (
             DataType::Decimal128(precision, scale),
             Expr::Literal(ScalarValue::Decimal128(Some(_), literal_precision, literal_scale), _),
@@ -528,11 +534,15 @@ fn kernel_partition_policy(
             Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
             BooleanShorthand => Unsupported,
         },
-        Decimal256 | Floating | Timestamp | TimestampNtz => match operator_family {
+        Decimal256 | Timestamp | TimestampNtz => match operator_family {
             Equality | Ordering | Membership | Between | NullCheck | Composition => {
                 TypedRestorePending
             }
             BooleanShorthand => Unsupported,
+        },
+        Floating => match operator_family {
+            Equality | Membership | NullCheck | Composition => KernelExact,
+            Ordering | Between | BooleanShorthand => Unsupported,
         },
         Boolean => match operator_family {
             Equality | Membership | NullCheck | BooleanShorthand | Composition => KernelExact,
@@ -718,6 +728,15 @@ mod tests {
             (BooleanShorthand, KernelExact),
             (Composition, KernelExact),
         ];
+        let floating_policy = [
+            (Equality, KernelExact),
+            (Ordering, Unsupported),
+            (Membership, KernelExact),
+            (Between, Unsupported),
+            (NullCheck, KernelExact),
+            (BooleanShorthand, Unsupported),
+            (Composition, KernelExact),
+        ];
         let date_policy = [
             (Equality, KernelExact),
             (Ordering, KernelExact),
@@ -775,7 +794,7 @@ mod tests {
             &ordered_typed_restore_policy,
         );
         for data_type in [DataType::Float32, DataType::Float64] {
-            assert_type_policy(data_type, Floating, &ordered_typed_restore_policy);
+            assert_type_policy(data_type, Floating, &floating_policy);
         }
         for data_type in [
             DataType::Binary,
@@ -1174,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_floating_null_checks_until_typed_child() {
+    fn partition_operator_planner_accepts_floating_null_checks_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["float_part", "double_part"]);
         let filters = [
@@ -1194,7 +1213,10 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
@@ -1432,20 +1454,21 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_floating_equality_and_membership_until_typed_child() {
+    fn partition_operator_planner_accepts_floating_equality_and_membership_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["float_part", "double_part"]);
         let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
-        let negative_zero = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let negative_float = Expr::Literal(ScalarValue::Float32(Some(-1.5)), None);
         let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let double_other = Expr::Literal(ScalarValue::Float64(Some(4.0)), None);
         let filters = [
             col("float_part").eq(float_value.clone()),
             float_value.clone().eq(col("float_part")),
             col("float_part").not_eq(float_value.clone()),
-            col("float_part").in_list(vec![float_value.clone(), negative_zero], false),
+            col("float_part").in_list(vec![float_value.clone(), negative_float], false),
             col("float_part").in_list(vec![float_value], true),
             col("double_part").eq(double_value.clone()),
-            col("double_part").in_list(vec![double_value.clone(), double_value], false),
+            col("double_part").in_list(vec![double_value.clone(), double_other], false),
         ];
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
@@ -1454,11 +1477,14 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_floating_comparisons_and_between_until_typed_child() {
+    fn partition_operator_planner_rejects_floating_comparisons_and_between() {
         let schema = schema();
         let partition_columns = partition_columns(&["float_part", "double_part"]);
         let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
@@ -1474,6 +1500,43 @@ mod tests {
             col("float_part").not_between(negative_zero, float_value),
             col("double_part").gt_eq(double_value.clone()),
             col("double_part").between(double_value, double_high),
+        ];
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &filters.iter().collect::<Vec<_>>(),
+            &schema,
+            &partition_columns,
+        );
+
+        assert_all_unsupported(&plan, filters.len());
+    }
+
+    #[test]
+    fn partition_operator_planner_rejects_unproven_floating_literal_shapes() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["float_part", "double_part"]);
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let positive_zero = Expr::Literal(ScalarValue::Float32(Some(0.0)), None);
+        let negative_zero = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let float_nan = Expr::Literal(ScalarValue::Float32(Some(f32::NAN)), None);
+        let float_infinity = Expr::Literal(ScalarValue::Float32(Some(f32::INFINITY)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(1.5)), None);
+        let filters = [
+            col("float_part").eq(positive_zero.clone()),
+            col("float_part").eq(negative_zero.clone()),
+            col("float_part").eq(float_nan.clone()),
+            col("float_part").eq(float_infinity.clone()),
+            col("float_part").eq(Expr::Literal(ScalarValue::Float32(None), None)),
+            col("float_part").eq(double_value),
+            col("double_part").eq(float_value.clone()),
+            col("float_part").eq(lit("1.5")),
+            col("float_part").eq(lit(1_i64)),
+            col("float_part").in_list(vec![float_value.clone(), positive_zero], false),
+            col("float_part").in_list(vec![float_value.clone(), negative_zero], true),
+            col("float_part").in_list(vec![float_value.clone(), float_nan], false),
+            col("float_part").in_list(vec![float_value, float_infinity], true),
+            col("float_part").in_list(vec![], false),
+            col("float_part").in_list(vec![], true),
         ];
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
