@@ -5085,6 +5085,8 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
         let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let negative_zero_float = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let positive_zero_float = Expr::Literal(ScalarValue::Float32(Some(0.0)), None);
         let float_nan = Expr::Literal(ScalarValue::Float32(Some(f32::NAN)), None);
         let float_infinity = Expr::Literal(ScalarValue::Float32(Some(f32::INFINITY)), None);
         let float_null = Expr::Literal(ScalarValue::Float32(None), None);
@@ -5107,6 +5109,14 @@ mod tests {
             ));
         let filters = vec![
             (
+                "float negative zero equality",
+                datafusion::logical_expr::col("float_part").eq(negative_zero_float.clone()),
+            ),
+            (
+                "float positive zero equality",
+                datafusion::logical_expr::col("float_part").eq(positive_zero_float.clone()),
+            ),
+            (
                 "float nan equality",
                 datafusion::logical_expr::col("float_part").eq(float_nan.clone()),
             ),
@@ -5122,6 +5132,16 @@ mod tests {
                 "float width mismatch",
                 datafusion::logical_expr::col("float_part")
                     .eq(Expr::Literal(ScalarValue::Float64(Some(1.5)), None)),
+            ),
+            (
+                "float zero in list",
+                datafusion::logical_expr::col("float_part")
+                    .in_list(vec![float_value.clone(), positive_zero_float], false),
+            ),
+            (
+                "float negative zero not in list",
+                datafusion::logical_expr::col("float_part")
+                    .in_list(vec![float_value.clone(), negative_zero_float], true),
             ),
             (
                 "float nan in list",
@@ -5236,7 +5256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn floating_partition_equality_and_membership_are_rejected_at_scan_boundary()
+    async fn floating_partition_equality_and_membership_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "floating-partition-equality-membership-boundary",
@@ -5261,23 +5281,19 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
         let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
-        let negative_zero_float = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
-        let positive_zero_float = Expr::Literal(ScalarValue::Float32(Some(0.0)), None);
+        let negative_float = Expr::Literal(ScalarValue::Float32(Some(-1.5)), None);
         let double_value = Expr::Literal(ScalarValue::Float64(Some(-2.25)), None);
+        let double_other = Expr::Literal(ScalarValue::Float64(Some(4.0)), None);
         let cases = [
             (
                 "float equality",
                 datafusion::logical_expr::col("float_part").eq(float_value.clone()),
             ),
             (
-                "float reversed equality negative zero",
-                negative_zero_float
+                "float reversed equality",
+                negative_float
                     .clone()
                     .eq(datafusion::logical_expr::col("float_part")),
-            ),
-            (
-                "float positive zero does not match negative zero",
-                datafusion::logical_expr::col("float_part").eq(positive_zero_float.clone()),
             ),
             (
                 "float inequality",
@@ -5285,10 +5301,8 @@ mod tests {
             ),
             (
                 "float in list",
-                datafusion::logical_expr::col("float_part").in_list(
-                    vec![float_value.clone(), negative_zero_float.clone()],
-                    false,
-                ),
+                datafusion::logical_expr::col("float_part")
+                    .in_list(vec![float_value.clone(), negative_float.clone()], false),
             ),
             (
                 "float not in list",
@@ -5301,26 +5315,17 @@ mod tests {
             ),
             (
                 "double not in list",
-                datafusion::logical_expr::col("double_part").in_list(vec![double_value], true),
+                datafusion::logical_expr::col("double_part").in_list(vec![double_other], true),
             ),
         ];
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
-                "{name}"
-            );
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
         }
 
         Ok(())
@@ -5418,7 +5423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn floating_partition_boolean_composition_and_projection_are_rejected_at_scan_boundary()
+    async fn floating_partition_boolean_composition_and_projection_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "floating-partition-boolean-composition-boundary",
@@ -5444,24 +5449,20 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
         let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
-        let negative_zero_float = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
-        let double_other = Expr::Literal(ScalarValue::Float64(Some(1.0)), None);
+        let float_other = Expr::Literal(ScalarValue::Float32(Some(3.0)), None);
+        let double_other = Expr::Literal(ScalarValue::Float64(Some(4.0)), None);
         let separate_and_filters = vec![
-            datafusion::logical_expr::col("float_part").gt_eq(negative_zero_float.clone()),
-            datafusion::logical_expr::col("float_part")
-                .lt(Expr::Literal(ScalarValue::Float32(Some(3.0)), None)),
+            datafusion::logical_expr::col("float_part").eq(float_value.clone()),
+            datafusion::logical_expr::col("double_part").eq(double_other.clone()),
         ];
         let whole_and_filter = datafusion::logical_expr::col("float_part")
-            .gt_eq(negative_zero_float.clone())
-            .and(
-                datafusion::logical_expr::col("float_part")
-                    .lt(Expr::Literal(ScalarValue::Float32(Some(3.0)), None)),
-            );
+            .eq(float_value.clone())
+            .and(datafusion::logical_expr::col("double_part").eq(double_other.clone()));
         let whole_or_filter = datafusion::logical_expr::col("float_part")
             .eq(float_value.clone())
             .or(datafusion::logical_expr::col("double_part").eq(double_other));
         let whole_not_filter = Expr::Not(Box::new(
-            datafusion::logical_expr::col("float_part").eq(float_value),
+            datafusion::logical_expr::col("float_part").eq(float_other),
         ));
         let cases = [
             ("separate filters combine with and", separate_and_filters),
@@ -5475,25 +5476,20 @@ mod tests {
             let support = provider.supports_filters_pushdown(&filter_refs)?;
             assert_eq!(
                 support,
-                vec![TableProviderFilterPushDown::Unsupported; filters.len()],
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
                 "{name}"
             );
 
-            let result = provider.scan(&state, Some(&vec![0]), &filters, None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn floating_partition_null_checks_are_rejected_at_scan_boundary()
+    async fn floating_partition_null_checks_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "floating-partition-null-checks-boundary",
@@ -5555,31 +5551,199 @@ mod tests {
 
         for (name, filter) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
-            assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
-                "{name}"
-            );
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
 
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
-            );
+            provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_floating_partition_null_checks_keep_residual_filter()
+    async fn floating_partition_exact_filters_prune_files_through_kernel_scan_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "floating-partition-kernel-scan-pruning",
+            FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["float_part","double_part"]"#,
+            &[
+                r#""partitionValues":{"float_part":"1.5","double_part":"2.25"}"#,
+                r#""partitionValues":{"float_part":"3.0","double_part":"4.0"}"#,
+                r#""partitionValues":{"float_part":"-1.5","double_part":"-2.25"}"#,
+                r#""partitionValues":{"float_part":null,"double_part":null}"#,
+                r#""partitionValues":{"float_part":"","double_part":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let float_one = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let float_three = Expr::Literal(ScalarValue::Float32(Some(3.0)), None);
+        let float_negative = Expr::Literal(ScalarValue::Float32(Some(-1.5)), None);
+        let double_two = Expr::Literal(ScalarValue::Float64(Some(2.25)), None);
+        let double_four = Expr::Literal(ScalarValue::Float64(Some(4.0)), None);
+        let cases: Vec<(&str, Vec<Expr>, Vec<&str>, Vec<&str>)> = vec![
+            (
+                "float equality",
+                vec![datafusion::logical_expr::col("float_part").eq(float_one.clone())],
+                vec!["part-00000.parquet"],
+                vec!["float_part", "id"],
+            ),
+            (
+                "float reversed equality",
+                vec![
+                    float_negative
+                        .clone()
+                        .eq(datafusion::logical_expr::col("float_part")),
+                ],
+                vec!["part-00002.parquet"],
+                vec!["float_part", "id"],
+            ),
+            (
+                "float inequality",
+                vec![datafusion::logical_expr::col("float_part").not_eq(float_one.clone())],
+                vec!["part-00001.parquet", "part-00002.parquet"],
+                vec!["float_part", "id"],
+            ),
+            (
+                "float in list",
+                vec![datafusion::logical_expr::col("float_part").in_list(
+                    vec![float_one.clone(), float_negative.clone(), float_one.clone()],
+                    false,
+                )],
+                vec!["part-00000.parquet", "part-00002.parquet"],
+                vec!["float_part", "id"],
+            ),
+            (
+                "float not in list",
+                vec![
+                    datafusion::logical_expr::col("float_part")
+                        .in_list(vec![float_three.clone()], true),
+                ],
+                vec!["part-00000.parquet", "part-00002.parquet"],
+                vec!["float_part", "id"],
+            ),
+            (
+                "double equality",
+                vec![datafusion::logical_expr::col("double_part").eq(double_two.clone())],
+                vec!["part-00000.parquet"],
+                vec!["double_part", "id"],
+            ),
+            (
+                "float is null",
+                vec![datafusion::logical_expr::col("float_part").is_null()],
+                vec![
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                    "part-00005.parquet",
+                ],
+                vec!["float_part", "id"],
+            ),
+            (
+                "double is not null",
+                vec![datafusion::logical_expr::col("double_part").is_not_null()],
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                ],
+                vec!["double_part", "id"],
+            ),
+            (
+                "separate filters combine with and",
+                vec![
+                    datafusion::logical_expr::col("float_part").eq(float_one.clone()),
+                    datafusion::logical_expr::col("double_part").eq(double_two.clone()),
+                ],
+                vec!["part-00000.parquet"],
+                vec!["double_part", "float_part", "id"],
+            ),
+            (
+                "whole and",
+                vec![
+                    datafusion::logical_expr::col("float_part")
+                        .eq(float_one.clone())
+                        .and(datafusion::logical_expr::col("double_part").eq(double_two)),
+                ],
+                vec!["part-00000.parquet"],
+                vec!["double_part", "float_part", "id"],
+            ),
+            (
+                "whole or",
+                vec![
+                    datafusion::logical_expr::col("float_part")
+                        .eq(float_negative)
+                        .or(datafusion::logical_expr::col("double_part").eq(double_four)),
+                ],
+                vec!["part-00001.parquet", "part-00002.parquet"],
+                vec!["double_part", "float_part", "id"],
+            ),
+            (
+                "not",
+                vec![Expr::Not(Box::new(
+                    datafusion::logical_expr::col("float_part").eq(float_three),
+                ))],
+                vec!["part-00000.parquet", "part-00002.parquet"],
+                vec!["float_part", "id"],
+            ),
+        ];
+
+        for (name, filters, expected_paths, expected_kernel_names) in cases {
+            let filter_refs = filters.iter().collect::<Vec<_>>();
+            let support = provider.supports_filters_pushdown(&filter_refs)?;
+            assert_eq!(
+                support,
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+            let scan_plan = scan.scan_plan();
+            let mut kernel_names = scan_plan
+                .kernel_scan()
+                .kernel_schema()
+                .fields()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>();
+            kernel_names.sort_unstable();
+
+            assert_eq!(scan_plan.projected_schema.field(0).name(), "id", "{name}");
+            assert_eq!(kernel_names, expected_kernel_names, "{name}");
+            assert_eq!(scan_plan.pushed_filter_plan.exact_count, filters.len());
+            assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
+            assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 0);
+            assert_eq!(
+                scan_plan.pushed_filter_plan.pushed_filter_count,
+                filters.len()
+            );
+            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
+            assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_floating_partition_null_checks_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-floating-partition-null-checks-residuals",
+            "sql-floating-partition-null-checks",
             FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["float_part","double_part"]"#,
             &[
@@ -5633,18 +5797,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+                1,
                 "{name}: {plan_display}"
             );
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0,
+                1,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -5660,7 +5824,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
@@ -5669,11 +5833,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_floating_partition_equality_and_membership_keep_residual_filter()
+    async fn sql_floating_partition_equality_and_membership_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-floating-partition-equality-membership-residuals",
+            "sql-floating-partition-equality-membership",
             FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["float_part","double_part"]"#,
             &[
@@ -5706,7 +5870,7 @@ mod tests {
             ),
             (
                 "float in list",
-                "select id from orders where float_part in (cast(1.5 as float), cast(-0.0 as float))",
+                "select id from orders where float_part in (cast(1.5 as float), cast(-1.5 as float))",
             ),
             (
                 "float inequality",
@@ -5732,18 +5896,16 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count > 0,
                 "{name}: {plan_display}"
             );
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count > 0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -5759,7 +5921,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
