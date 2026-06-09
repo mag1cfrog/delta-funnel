@@ -3251,6 +3251,7 @@ mod tests {
         let state = SessionContext::new().state();
         let amount = Expr::Literal(ScalarValue::Decimal128(Some(12_345), 10, 2), None);
         let non_exact_scale = Expr::Literal(ScalarValue::Decimal128(Some(12_346), 10, 3), None);
+        let decimal256 = Expr::Literal(ScalarValue::Decimal256(Some(12_345.into()), 10, 2), None);
         let scalar_udf = create_udf(
             "decimal_identity_for_pushdown_boundary",
             vec![DataType::Decimal128(10, 2)],
@@ -3289,6 +3290,18 @@ mod tests {
                     Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None),
                     non_exact_scale.clone(),
                 ),
+            ),
+            (
+                "decimal256 equality",
+                datafusion::logical_expr::col("amount").eq(decimal256),
+            ),
+            (
+                "empty in list",
+                datafusion::logical_expr::col("amount").in_list(vec![], false),
+            ),
+            (
+                "empty not in list",
+                datafusion::logical_expr::col("amount").in_list(vec![], true),
             ),
             (
                 "string equality",
