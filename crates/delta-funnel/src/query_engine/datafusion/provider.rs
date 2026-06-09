@@ -160,8 +160,8 @@ impl DeltaTableProvider {
     /// Plans provider-boundary filters after normalization has been applied.
     ///
     /// Keeping this as a separate step lets scan planning reuse the same
-    /// normalized expressions when building the provider-owned metadata
-    /// predicate, so filter classification and metadata conversion cannot see
+    /// normalized expressions when converting accepted filters to kernel
+    /// predicates, so filter classification and kernel conversion cannot see
     /// different column names.
     fn plan_normalized_provider_filters(&self, filters: &[Expr]) -> DeltaFilterPushdownPlan {
         let filter_refs = filters.iter().collect::<Vec<_>>();
