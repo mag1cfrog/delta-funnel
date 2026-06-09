@@ -297,6 +297,7 @@ mod tests {
     const DATE_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["event_date"],"configuration":{},"createdTime":1587968585495}}"#;
     const DECIMAL_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["amount"],"configuration":{},"createdTime":1587968585495}}"#;
     const FLOATING_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"float_part\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_part\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["float_part","double_part"],"configuration":{},"createdTime":1587968585495}}"#;
+    const BINARY_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["payload"],"configuration":{},"createdTime":1587968585495}}"#;
 
     fn add_json(path: &str) -> String {
         format!(
@@ -516,6 +517,29 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_binary_partition_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-binary-partition-characterization",
+            BINARY_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("binary-HELLO.parquet", r#"{"payload":"HELLO"}"#),
+                partitioned_add_json("binary-hello.parquet", r#"{"payload":"hello"}"#),
+                partitioned_add_json("binary-special.parquet", r#"{"payload":"/=%"}"#),
+                partitioned_add_json("binary-null.parquet", r#"{"payload":null}"#),
+                partitioned_add_json("binary-empty.parquet", r#"{"payload":""}"#),
+                partitioned_add_json("binary-missing.parquet", r#"{}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_predicated_file_paths(
         source: &super::PlannedDeltaSource,
         filter: &datafusion::logical_expr::Expr,
@@ -567,6 +591,28 @@ mod tests {
 
     fn float64_lit(value: f64) -> Expr {
         Expr::Literal(ScalarValue::Float64(Some(value)), None)
+    }
+
+    fn binary_partition_column() -> Expression {
+        Expression::Column(ColumnName::new(["payload"]))
+    }
+
+    fn binary_partition_value(value: &[u8]) -> Expression {
+        Expression::Literal(Scalar::Binary(value.to_vec()))
+    }
+
+    fn binary_partition_eq(value: &[u8]) -> DeltaKernelPredicate {
+        DeltaKernelPredicate::new(Predicate::eq(
+            binary_partition_column(),
+            binary_partition_value(value),
+        ))
+    }
+
+    fn binary_partition_ne(value: &[u8]) -> DeltaKernelPredicate {
+        DeltaKernelPredicate::new(Predicate::ne(
+            binary_partition_column(),
+            binary_partition_value(value),
+        ))
     }
 
     fn assert_invalid_integer_partition_error(
@@ -1409,6 +1455,158 @@ mod tests {
                 "floating-neg.parquet",
                 "floating-pos-zero.parquet",
                 "floating-ten.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_binary_null_empty_and_equality_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_binary_partition_characterization_source()?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec![
+                "binary-HELLO.parquet",
+                "binary-empty.parquet",
+                "binary-hello.parquet",
+                "binary-missing.parquet",
+                "binary-null.parquet",
+                "binary-special.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::is_null(binary_partition_column())),
+            )?,
+            vec![
+                "binary-empty.parquet",
+                "binary-missing.parquet",
+                "binary-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::is_not_null(binary_partition_column())),
+            )?,
+            vec![
+                "binary-HELLO.parquet",
+                "binary-hello.parquet",
+                "binary-special.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, binary_partition_eq(b"HELLO"))?,
+            vec!["binary-HELLO.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, binary_partition_eq(b"hello"))?,
+            vec!["binary-hello.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, binary_partition_ne(b"hello"))?,
+            vec!["binary-HELLO.parquet", "binary-special.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, binary_partition_eq(&[]))?,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, binary_partition_ne(&[]))?,
+            vec![
+                "binary-HELLO.parquet",
+                "binary-hello.parquet",
+                "binary-special.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_binary_membership_and_composition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_binary_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::or(
+                    Predicate::eq(binary_partition_column(), binary_partition_value(b"HELLO")),
+                    Predicate::eq(binary_partition_column(), binary_partition_value(b"/=%")),
+                )),
+            )?,
+            vec!["binary-HELLO.parquet", "binary-special.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::and(
+                    Predicate::ne(binary_partition_column(), binary_partition_value(b"hello")),
+                    Predicate::ne(binary_partition_column(), binary_partition_value(b"/=%")),
+                )),
+            )?,
+            vec!["binary-HELLO.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::and(
+                    Predicate::is_not_null(binary_partition_column()),
+                    Predicate::ne(binary_partition_column(), binary_partition_value(b"HELLO")),
+                )),
+            )?,
+            vec!["binary-hello.parquet", "binary-special.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::or(
+                    Predicate::eq(binary_partition_column(), binary_partition_value(b"HELLO")),
+                    Predicate::is_null(binary_partition_column()),
+                )),
+            )?,
+            vec![
+                "binary-HELLO.parquet",
+                "binary-empty.parquet",
+                "binary-missing.parquet",
+                "binary-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::not(Predicate::eq(
+                    binary_partition_column(),
+                    binary_partition_value(b"hello"),
+                ))),
+            )?,
+            vec!["binary-HELLO.parquet", "binary-special.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_non_utf8_binary_literals_do_not_match()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_binary_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicate_file_paths(&source, binary_partition_eq(&[0xDE, 0xAD, 0xBE, 0xEF]))?,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(&source, binary_partition_ne(&[0xDE, 0xAD, 0xBE, 0xEF]))?,
+            vec![
+                "binary-HELLO.parquet",
+                "binary-hello.parquet",
+                "binary-special.parquet",
             ]
         );
 
