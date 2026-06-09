@@ -5481,11 +5481,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_floating_partition_null_checks_are_exact_metadata_pushdown()
+    async fn sql_floating_partition_null_checks_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-floating-partition-null-checks",
+            "sql-floating-partition-null-checks-residuals",
             FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["float_part","double_part"]"#,
             &[
@@ -5514,43 +5514,22 @@ mod tests {
             (
                 "float is null",
                 "select id from orders where float_part is null",
-                vec![
-                    "part-00001.parquet",
-                    "part-00003.parquet",
-                    "part-00005.parquet",
-                ],
             ),
             (
                 "double is not null",
                 "select id from orders where double_part is not null",
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00004.parquet",
-                ],
             ),
             (
                 "null check or",
                 "select id from orders where float_part is null or double_part is null",
-                vec![
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                    "part-00003.parquet",
-                    "part-00005.parquet",
-                ],
             ),
             (
                 "not null check",
                 "select id from orders where not(float_part is null)",
-                vec![
-                    "part-00000.parquet",
-                    "part-00002.parquet",
-                    "part-00004.parquet",
-                ],
             ),
         ];
 
-        for (name, sql, expected_paths) in sql_cases {
+        for (name, sql) in sql_cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -5560,13 +5539,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                1,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -5578,21 +5562,24 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_floating_partition_equality_and_membership_are_exact_metadata_pushdown()
+    async fn sql_floating_partition_equality_and_membership_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-floating-partition-equality-membership",
+            "sql-floating-partition-equality-membership-residuals",
             FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["float_part","double_part"]"#,
             &[
@@ -5622,39 +5609,26 @@ mod tests {
             (
                 "float equality",
                 "select id from orders where float_part = cast(1.5 as float)",
-                vec!["part-00000.parquet"],
             ),
             (
                 "float in list",
                 "select id from orders where float_part in (cast(1.5 as float), cast(-0.0 as float))",
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "float inequality",
                 "select id from orders where float_part != cast(1.5 as float)",
-                vec![
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                    "part-00005.parquet",
-                ],
             ),
             (
                 "double equality",
                 "select id from orders where double_part = -2.25",
-                vec!["part-00000.parquet"],
             ),
             (
                 "double not in",
                 "select id from orders where double_part not in (-2.25)",
-                vec![
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                    "part-00005.parquet",
-                ],
             ),
         ];
 
-        for (name, sql, expected_paths) in sql_cases {
+        for (name, sql) in sql_cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -5664,13 +5638,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                1,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -5682,21 +5661,24 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn sql_floating_partition_comparisons_and_between_are_exact_metadata_pushdown()
+    async fn sql_floating_partition_comparisons_and_between_keep_residual_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-floating-partition-comparisons-between",
+            "sql-floating-partition-comparisons-between-residuals",
             FLOATING_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["float_part","double_part"]"#,
             &[
@@ -5726,40 +5708,26 @@ mod tests {
             (
                 "float less than",
                 "select id from orders where float_part < cast(1.5 as float)",
-                1,
-                vec!["part-00001.parquet", "part-00002.parquet"],
             ),
             (
                 "float between",
                 "select id from orders where float_part between cast(-0.0 as float) and cast(1.5 as float)",
-                2,
-                vec![
-                    "part-00000.parquet",
-                    "part-00001.parquet",
-                    "part-00002.parquet",
-                ],
             ),
             (
                 "float not between",
                 "select id from orders where float_part not between cast(0.0 as float) and cast(1.5 as float)",
-                1,
-                vec!["part-00001.parquet", "part-00005.parquet"],
             ),
             (
                 "double between",
                 "select id from orders where double_part between -2.25 and 0.0",
-                2,
-                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "double not between",
                 "select id from orders where double_part not between -2.25 and 0.0",
-                1,
-                vec!["part-00002.parquet", "part-00005.parquet"],
             ),
         ];
 
-        for (name, sql, expected_exact_count, expected_paths) in sql_cases {
+        for (name, sql) in sql_cases {
             let dataframe = ctx.sql(sql).await?;
             let physical_plan = dataframe.create_physical_plan().await?;
             let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -5769,13 +5737,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                !plan_display.contains("FilterExec"),
-                "{name} unexpectedly kept a residual filter:\n{plan_display}"
+                plan_display.contains("FilterExec"),
+                "{name} unexpectedly became exact:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                expected_exact_count,
+                0,
+                "{name}: {plan_display}"
+            );
+            assert_eq!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+                0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -5787,10 +5760,13 @@ mod tests {
                 "{name}: {plan_display}"
             );
             assert!(
-                scans[0].scan_plan().partition_metadata_filter.is_some(),
+                scans[0].scan_plan().partition_metadata_filter.is_none(),
                 "{name}"
             );
-            assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+            assert!(
+                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                "{name}"
+            );
         }
 
         Ok(())
