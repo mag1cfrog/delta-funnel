@@ -167,6 +167,9 @@ fn datafusion_expr_to_kernel_predicate_inner(
     filter: &DataFusionExpr,
 ) -> Result<Predicate, DeltaKernelPredicateAdapterError> {
     match filter {
+        DataFusionExpr::Literal(ScalarValue::Boolean(Some(value)), _) => {
+            Ok(Predicate::literal(*value))
+        }
         DataFusionExpr::BinaryExpr(binary) => match binary.op {
             DataFusionOperator::And => Ok(Predicate::and(
                 datafusion_expr_to_kernel_predicate_inner(binary.left.as_ref())?,
@@ -237,7 +240,13 @@ fn datafusion_in_list_to_kernel_predicate(
     in_list: &datafusion::logical_expr::expr::InList,
 ) -> Result<Predicate, DeltaKernelPredicateAdapterError> {
     if in_list.list.is_empty() {
-        return Ok(Predicate::literal(in_list.negated));
+        return if in_list.negated {
+            Ok(Predicate::is_not_null(
+                datafusion_expr_to_kernel_expression(in_list.expr.as_ref())?,
+            ))
+        } else {
+            Ok(Predicate::literal(false))
+        };
     }
 
     let expr = datafusion_expr_to_kernel_expression(in_list.expr.as_ref())?;
@@ -571,6 +580,10 @@ mod tests {
         let active_predicate = Predicate::eq(kernel_column("active"), Expression::literal(true));
 
         assert_eq!(
+            convert_datafusion_predicate(&lit(false)),
+            Ok(Predicate::literal(false))
+        );
+        assert_eq!(
             convert_datafusion_predicate(&id_eq.clone().and(active_eq.clone())),
             Ok(Predicate::and(
                 id_predicate.clone(),
@@ -621,7 +634,7 @@ mod tests {
         );
         assert_eq!(
             convert_datafusion_predicate(&col("part").in_list(Vec::<Expr>::new(), true)),
-            Ok(Predicate::literal(true))
+            Ok(Predicate::is_not_null(part))
         );
     }
 

@@ -9,6 +9,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use self::analysis::DeltaFilterAnalysis;
+use crate::table_formats::DeltaKernelPredicate;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeltaFilterPushdownOutcome {
@@ -56,6 +57,15 @@ impl DeltaFilterPushdownRejectionReason {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// Exact partition filter payload used by kernel scan planning.
+pub(crate) struct ExactPartitionKernelFilter {
+    /// DataFusion expression after any kernel-safe rewrites.
+    pub(crate) datafusion_expr: Expr,
+    /// Converted Delta kernel predicate for the same expression.
+    pub(crate) kernel_predicate: DeltaKernelPredicate,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 /// Provider decision for one input filter, preserving input order.
 pub(crate) struct DeltaFilterPushdownDecision {
     /// Position of this decision in the original DataFusion filter input slice.
@@ -68,11 +78,12 @@ pub(crate) struct DeltaFilterPushdownDecision {
     pub(crate) rejection_reason: Option<DeltaFilterPushdownRejectionReason>,
     /// Provider-boundary diagnostics and column classification for the original filter.
     pub(crate) filter_analysis: DeltaFilterAnalysis,
-    /// Provider-owned partition metadata expression used for scan-file pruning.
+    /// Exact partition filter converted for Delta kernel scan planning.
     ///
-    /// For exact filters this is the original filter. For inexact mixed filters
-    /// this is only the extracted partition-safe portion.
-    pub(crate) partition_metadata_filter: Option<Expr>,
+    /// For most exact filters this is the original filter. Some exact filters
+    /// use an equivalent expression, such as empty list predicates whose
+    /// kernel-safe form must preserve null partition behavior.
+    pub(crate) kernel_scan_filter: Option<ExactPartitionKernelFilter>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -287,7 +298,7 @@ mod tests {
         assert_eq!(
             support,
             vec![
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
@@ -295,10 +306,10 @@ mod tests {
                 TableProviderFilterPushDown::Exact,
             ]
         );
-        assert_eq!(plan.exact_count, 1);
+        assert_eq!(plan.exact_count, 2);
         assert_eq!(plan.inexact_count, 0);
-        assert_eq!(plan.unsupported_count, 5);
-        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(plan.unsupported_count, 4);
+        assert_eq!(plan.residual_filter_count, 4);
 
         Ok(())
     }
