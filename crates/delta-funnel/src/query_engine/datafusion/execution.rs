@@ -210,4 +210,56 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn mixed_partition_filter_execution_still_stops_at_scan_stub()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema(
+            "execution-stub-mixed-partition-filter",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let sql = "select id from orders where region = 'us-west' and id > 1";
+        let plan_dataframe = ctx.sql(sql).await?;
+        let physical_plan = plan_dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert_eq!(scans.len(), 1);
+        assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+        assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 0);
+
+        let collect_dataframe = ctx.sql(sql).await?;
+        let result = collect_dataframe.collect().await;
+
+        assert!(matches!(
+            result,
+            Err(error) if error
+                .to_string()
+                .contains("Delta scan read execution is owned by #17 and #4")
+        ));
+
+        Ok(())
+    }
 }
