@@ -288,6 +288,7 @@ mod tests {
     const TIMESTAMP_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["event_ts"],"configuration":{},"createdTime":1587968585495}}"#;
     const TIMESTAMP_NTZ_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
     const TIMESTAMP_NTZ_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["event_ts_ntz"],"configuration":{},"createdTime":1587968585495}}"#;
+    const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
 
     fn add_json(path: &str) -> String {
         format!(
@@ -298,6 +299,12 @@ mod tests {
     fn partitioned_add_json(path: &str, partition_values_json: &str) -> String {
         format!(
             r#"{{"add":{{"path":"{path}","partitionValues":{partition_values_json},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+        )
+    }
+
+    fn partitioned_dv_add_json(path: &str, partition_values_json: &str) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{partition_values_json},"size":0,"modificationTime":1587968586000,"dataChange":true,"deletionVector":{{"storageType":"u","pathOrInlineDv":"vBn[lx{{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}}}}"#
         )
     }
 
@@ -340,6 +347,40 @@ mod tests {
         let mut paths = files.into_iter().map(|file| file.path).collect::<Vec<_>>();
         paths.sort();
         Ok(paths)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct KernelScanFileBoundary {
+        path: String,
+        has_deletion_vector: bool,
+    }
+
+    fn kernel_scan_file_boundaries(
+        scan: &ProjectedDeltaScan,
+        table_uri: &str,
+    ) -> Result<Vec<KernelScanFileBoundary>, Box<dyn std::error::Error>> {
+        fn collect_scan_file(
+            files: &mut Vec<KernelScanFileBoundary>,
+            file: super::kernel::ScanFile,
+        ) {
+            files.push(KernelScanFileBoundary {
+                path: file.path,
+                has_deletion_vector: file.dv_info.has_vector(),
+            });
+        }
+
+        let table_url = super::kernel::try_parse_uri(table_uri)?;
+        let store =
+            super::kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
+        let engine = super::kernel::DefaultEngineBuilder::new(store).build();
+        let mut files = Vec::new();
+
+        for scan_metadata in scan.kernel_scan().scan_metadata(&engine)? {
+            files = scan_metadata?.visit_scan_files(files, collect_scan_file)?;
+        }
+
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
     }
 
     fn kernel_partition_characterization_source()
@@ -921,6 +962,68 @@ mod tests {
         assert_eq!(
             kernel_scan_file_paths(&predicated_scan, source.table_uri())?,
             vec!["region-us-west.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_predicated_scan_preserves_dv_metadata_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "kernel-dv-partition-boundary",
+            DELETION_VECTOR_PROTOCOL_JSON,
+            PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_dv_add_json("region-us-west-dv.parquet", r#"{"region":"us-west"}"#),
+                partitioned_add_json("region-us-west-plain.parquet", r#"{"region":"us-west"}"#),
+                partitioned_dv_add_json("region-us-east-dv.parquet", r#"{"region":"us-east"}"#),
+                partitioned_add_json("region-us-east-plain.parquet", r#"{"region":"us-east"}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+        let predicate = datafusion_expr_to_kernel_predicate(&col("region").eq(lit("us-west")))?;
+        let predicated_scan =
+            build_projected_predicated_delta_scan(&source, None, Some(predicate))?;
+
+        assert_eq!(
+            kernel_scan_file_boundaries(&unfiltered_scan, source.table_uri())?,
+            vec![
+                KernelScanFileBoundary {
+                    path: "region-us-east-dv.parquet".to_owned(),
+                    has_deletion_vector: true,
+                },
+                KernelScanFileBoundary {
+                    path: "region-us-east-plain.parquet".to_owned(),
+                    has_deletion_vector: false,
+                },
+                KernelScanFileBoundary {
+                    path: "region-us-west-dv.parquet".to_owned(),
+                    has_deletion_vector: true,
+                },
+                KernelScanFileBoundary {
+                    path: "region-us-west-plain.parquet".to_owned(),
+                    has_deletion_vector: false,
+                },
+            ]
+        );
+        assert_eq!(
+            kernel_scan_file_boundaries(&predicated_scan, source.table_uri())?,
+            vec![
+                KernelScanFileBoundary {
+                    path: "region-us-west-dv.parquet".to_owned(),
+                    has_deletion_vector: true,
+                },
+                KernelScanFileBoundary {
+                    path: "region-us-west-plain.parquet".to_owned(),
+                    has_deletion_vector: false,
+                },
+            ]
         );
 
         Ok(())
