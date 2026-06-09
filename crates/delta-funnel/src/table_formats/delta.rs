@@ -238,7 +238,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::{Expr, col, lit};
 
     use super::partition_metadata_predicate::DeltaPartitionNameMap;
     use super::{
@@ -290,6 +291,7 @@ mod tests {
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
+    const INTEGER_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["byte_part","short_part","int_part","long_part"],"configuration":{},"createdTime":1587968585495}}"#;
 
     fn add_json(path: &str) -> String {
         format!(
@@ -300,6 +302,15 @@ mod tests {
     fn partitioned_add_json(path: &str, partition_values_json: &str) -> String {
         format!(
             r#"{{"add":{{"path":"{path}","partitionValues":{partition_values_json},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+        )
+    }
+
+    fn integer_partitioned_add_json(path: &str, value: &str) -> String {
+        partitioned_add_json(
+            path,
+            &format!(
+                r#"{{"byte_part":"{value}","short_part":"{value}","int_part":"{value}","long_part":"{value}"}}"#
+            ),
         )
     }
 
@@ -357,6 +368,32 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_integer_partition_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-integer-partition-characterization",
+            INTEGER_PARTITIONED_METADATA_JSON,
+            &[
+                integer_partitioned_add_json("integer--1.parquet", "-1"),
+                integer_partitioned_add_json("integer-2.parquet", "2"),
+                integer_partitioned_add_json("integer-10.parquet", "10"),
+                partitioned_add_json(
+                    "integer-null.parquet",
+                    r#"{"byte_part":null,"short_part":null,"int_part":null,"long_part":null}"#,
+                ),
+                integer_partitioned_add_json("integer-empty.parquet", ""),
+                partitioned_add_json("integer-missing.parquet", r#"{}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_predicated_file_paths(
         source: &super::PlannedDeltaSource,
         filter: &datafusion::logical_expr::Expr,
@@ -365,6 +402,35 @@ mod tests {
         let scan = build_projected_predicated_delta_scan(source, None, Some(predicate))?;
 
         kernel_scan_file_paths(&scan, source.table_uri())
+    }
+
+    fn int8_lit(value: i8) -> Expr {
+        Expr::Literal(ScalarValue::Int8(Some(value)), None)
+    }
+
+    fn int16_lit(value: i16) -> Expr {
+        Expr::Literal(ScalarValue::Int16(Some(value)), None)
+    }
+
+    fn int32_lit(value: i32) -> Expr {
+        Expr::Literal(ScalarValue::Int32(Some(value)), None)
+    }
+
+    fn int64_lit(value: i64) -> Expr {
+        Expr::Literal(ScalarValue::Int64(Some(value)), None)
+    }
+
+    fn assert_invalid_integer_partition_error(
+        result: Result<Vec<String>, Box<dyn std::error::Error>>,
+    ) {
+        let error = match result {
+            Ok(paths) => panic!("invalid integer metadata should fail kernel scan: {paths:?}"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let debug_message = format!("{error:?}");
+        assert!(message.contains("not-an-integer"));
+        assert!(debug_message.contains("Primitive(Long)"));
     }
 
     #[test]
@@ -471,6 +537,218 @@ mod tests {
             )?,
             vec!["region-us-east.parquet"]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_integer_numeric_ordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_integer_partition_characterization_source()?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec![
+                "integer--1.parquet",
+                "integer-10.parquet",
+                "integer-2.parquet",
+                "integer-empty.parquet",
+                "integer-missing.parquet",
+                "integer-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("long_part").gt(int64_lit(2)))?,
+            vec!["integer-10.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("long_part").lt(int64_lit(10)))?,
+            vec!["integer--1.parquet", "integer-2.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &int64_lit(10).gt(col("long_part")))?,
+            vec!["integer--1.parquet", "integer-2.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_integer_null_and_empty_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_integer_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("long_part").is_null())?,
+            vec![
+                "integer-empty.parquet",
+                "integer-missing.parquet",
+                "integer-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("long_part").is_not_null())?,
+            vec![
+                "integer--1.parquet",
+                "integer-10.parquet",
+                "integer-2.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("long_part").eq(int64_lit(2)))?,
+            vec!["integer-2.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("long_part").not_eq(int64_lit(2)))?,
+            vec!["integer--1.parquet", "integer-10.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_integer_membership_between_and_composition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_integer_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("long_part").in_list(vec![int64_lit(-1), int64_lit(10)], false),
+            )?,
+            vec!["integer--1.parquet", "integer-10.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("long_part").in_list(vec![int64_lit(2)], true),
+            )?,
+            vec!["integer--1.parquet", "integer-10.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("long_part").between(int64_lit(-1), int64_lit(2)),
+            )?,
+            vec!["integer--1.parquet", "integer-2.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("long_part").not_between(int64_lit(-1), int64_lit(2)),
+            )?,
+            vec!["integer-10.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("long_part")
+                    .gt_eq(int64_lit(-1))
+                    .and(col("long_part").lt(int64_lit(10))),
+            )?,
+            vec!["integer--1.parquet", "integer-2.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("long_part")
+                    .eq(int64_lit(-1))
+                    .or(col("long_part").eq(int64_lit(10))),
+            )?,
+            vec!["integer--1.parquet", "integer-10.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &Expr::Not(Box::new(col("long_part").eq(int64_lit(2)))),
+            )?,
+            vec!["integer--1.parquet", "integer-10.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_integer_width_scalars()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-integer-width-characterization",
+            INTEGER_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json(
+                    "width-byte-min.parquet",
+                    r#"{"byte_part":"-128","short_part":"0","int_part":"0","long_part":"0"}"#,
+                ),
+                partitioned_add_json(
+                    "width-short-max.parquet",
+                    r#"{"byte_part":"0","short_part":"32767","int_part":"0","long_part":"0"}"#,
+                ),
+                partitioned_add_json(
+                    "width-int-max.parquet",
+                    r#"{"byte_part":"0","short_part":"0","int_part":"2147483647","long_part":"0"}"#,
+                ),
+                partitioned_add_json(
+                    "width-long-max.parquet",
+                    r#"{"byte_part":"0","short_part":"0","int_part":"0","long_part":"9223372036854775807"}"#,
+                ),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("byte_part").eq(int8_lit(i8::MIN)))?,
+            vec!["width-byte-min.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("short_part").eq(int16_lit(i16::MAX)))?,
+            vec!["width-short-max.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("int_part").eq(int32_lit(i32::MAX)))?,
+            vec!["width-int-max.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("long_part").eq(int64_lit(i64::MAX)))?,
+            vec!["width-long-max.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_invalid_integer_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-invalid-integer-characterization",
+            INTEGER_PARTITIONED_METADATA_JSON,
+            &[
+                integer_partitioned_add_json("integer-valid.parquet", "7"),
+                partitioned_add_json(
+                    "integer-invalid.parquet",
+                    r#"{"byte_part":"0","short_part":"0","int_part":"0","long_part":"not-an-integer"}"#,
+                ),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_invalid_integer_partition_error(kernel_scan_file_paths(
+            &unfiltered_scan,
+            source.table_uri(),
+        ));
+        assert_invalid_integer_partition_error(kernel_predicated_file_paths(
+            &source,
+            &col("long_part").eq(int64_lit(7)),
+        ));
 
         Ok(())
     }
