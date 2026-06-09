@@ -897,8 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_predicated_scan_prunes_files_without_provider_metadata_filter()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn kernel_predicated_scan_prunes_files() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_metadata_and_adds(
             "kernel-predicated-scan-files",
             PARTITIONED_METADATA_JSON,

@@ -231,8 +231,7 @@ impl DeltaTableProvider {
     /// Builds the kernel partition predicate for accepted exact and inexact filters.
     ///
     /// Accepted filters must be enforced by the same predicate passed into
-    /// `ScanBuilder::with_predicate`; the legacy metadata evaluator is not a
-    /// fallback for this migration.
+    /// `ScanBuilder::with_predicate`.
     fn build_kernel_partition_predicate(
         &self,
         pushed_filter_plan: &DeltaFilterPushdownPlan,
