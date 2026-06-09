@@ -564,20 +564,27 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
             ]
         );
-        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.exact_count, 1);
         assert_eq!(plan.inexact_count, 0);
-        assert_eq!(plan.unsupported_count, 6);
-        assert_eq!(plan.pushed_filter_count, 0);
-        assert_eq!(plan.residual_filter_count, 6);
-        assert!(plan.decisions.iter().all(|decision| {
-            decision.rejection_reason
-                == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
-        }));
+        assert_eq!(plan.unsupported_count, 5);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(plan.decisions[3].outcome, DeltaFilterPushdownOutcome::Exact);
+        assert!(plan.decisions[3].rejection_reason.is_none());
+        assert!(plan.decisions[3].filter_analysis.kernel_predicate.is_some());
+        assert!(
+            plan.decisions
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != 3)
+                .all(|(_, decision)| decision.rejection_reason
+                    == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy))
+        );
         assert_eq!(
             plan.decisions[0].filter_analysis.scope,
             DeltaFilterColumnScope::PartitionAndData

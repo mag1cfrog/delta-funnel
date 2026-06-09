@@ -287,7 +287,7 @@ mod tests {
         assert_eq!(
             support,
             vec![
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
@@ -295,10 +295,10 @@ mod tests {
                 TableProviderFilterPushDown::Exact,
             ]
         );
-        assert_eq!(plan.exact_count, 1);
+        assert_eq!(plan.exact_count, 2);
         assert_eq!(plan.inexact_count, 0);
-        assert_eq!(plan.unsupported_count, 5);
-        assert_eq!(plan.residual_filter_count, 5);
+        assert_eq!(plan.unsupported_count, 4);
+        assert_eq!(plan.residual_filter_count, 4);
 
         Ok(())
     }

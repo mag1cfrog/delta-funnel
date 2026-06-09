@@ -94,7 +94,7 @@ mod tests {
 
     use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
 
-    use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+    use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     use super::super::provider::DeltaTableProvider;
     use super::*;
@@ -352,13 +352,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_plan_rejects_partition_in_until_operator_child()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new_with_schema(
+    fn scan_plan_accepts_exact_partition_in_filter() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
             "exact-in-partition-metadata-filter",
             crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
-            r#""partitionValues":{"region":"us-west"}"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":"eu-central"}"#,
+            ],
         )?;
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
@@ -368,16 +371,27 @@ mod tests {
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
 
-        let result = provider.plan_scan(ProviderScanPlanRequest {
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
             requested_projection: Some(vec![0]),
             pushed_filters: vec![
                 col("region").in_list(vec![lit("us-west"), lit("us-east")], false),
             ],
-        });
+        })?;
 
-        assert!(
-            matches!(result, Err(DeltaFunnelError::DeltaScanFilter { reason, .. })
-                if reason.contains("pushed filters must be exact partition predicates"))
+        assert_eq!(
+            plan.pushed_filter_plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Exact]
+        );
+        assert_eq!(plan.pushed_filter_plan.exact_count, 1);
+        assert_eq!(plan.pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 1);
+        assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
+        assert!(plan.partition_metadata_filter.is_none());
+        assert!(plan.kernel_partition_predicate.is_some());
+        assert_eq!(
+            plan.kernel_scan()
+                .scan_file_paths(&plan.table_uri, plan.partition_metadata_filter.as_ref())?,
+            vec!["part-00000.parquet", "part-00001.parquet"]
         );
 
         Ok(())
