@@ -1694,9 +1694,28 @@ mod tests {
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
         )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let probe_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table_uri.clone(),
+            version: None,
+        })?;
+        let probe_preflight = preflight_delta_protocol(&probe_source)?;
+        let provider = DeltaTableProvider::try_new(probe_source, probe_preflight)?;
+        let mixed_filter = datafusion::logical_expr::col("region")
+            .eq(datafusion::logical_expr::lit("us-west"))
+            .and(
+                datafusion::logical_expr::col("customer_name")
+                    .eq(datafusion::logical_expr::lit("alice")),
+            );
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&mixed_filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
-            table_uri: table.path().to_string_lossy().to_string(),
+            table_uri,
             version: None,
         })?;
         let preflight = preflight_delta_protocol(&source)?;
@@ -1763,6 +1782,7 @@ mod tests {
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
         assert_eq!(kernel_names, vec!["id", "customer_name", "region"]);
+        assert_eq!(scan_file_paths(scans[0])?, vec!["part-00000.parquet"]);
 
         Ok(())
     }
