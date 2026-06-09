@@ -677,14 +677,14 @@ mod tests {
         }));
     }
 
-    fn assert_type_policy(
+    fn assert_type_operator_admission(
         data_type: DataType,
         expected_group: KernelPartitionTypeGroup,
-        expected_policy: &[(KernelPartitionOperatorFamily, bool)],
+        expected_admission: &[(KernelPartitionOperatorFamily, bool)],
     ) {
         assert_eq!(kernel_partition_type_group(&data_type), expected_group);
 
-        for (operator_family, supported) in expected_policy {
+        for (operator_family, supported) in expected_admission {
             assert_eq!(
                 is_supported_kernel_partition_operator(&data_type, *operator_family),
                 *supported,
@@ -694,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_partition_policy_documents_current_type_operator_matrix() {
+    fn kernel_partition_admission_documents_supported_type_operator_families() {
         use KernelPartitionOperatorFamily::{
             Between, BooleanShorthand, Composition, Equality, Membership, NullCheck, Ordering,
         };
@@ -703,7 +703,7 @@ mod tests {
             TimestampNtz,
         };
 
-        let string_policy = [
+        let string_admission = [
             (Equality, true),
             (Ordering, true),
             (Membership, true),
@@ -712,7 +712,7 @@ mod tests {
             (BooleanShorthand, false),
             (Composition, true),
         ];
-        let integer_policy = [
+        let integer_admission = [
             (Equality, true),
             (Ordering, true),
             (Membership, true),
@@ -721,7 +721,7 @@ mod tests {
             (BooleanShorthand, false),
             (Composition, true),
         ];
-        let boolean_policy = [
+        let boolean_admission = [
             (Equality, true),
             (Ordering, false),
             (Membership, true),
@@ -730,7 +730,7 @@ mod tests {
             (BooleanShorthand, true),
             (Composition, true),
         ];
-        let floating_policy = [
+        let floating_admission = [
             (Equality, true),
             (Ordering, false),
             (Membership, true),
@@ -739,7 +739,7 @@ mod tests {
             (BooleanShorthand, false),
             (Composition, true),
         ];
-        let date_policy = [
+        let date_admission = [
             (Equality, true),
             (Ordering, true),
             (Membership, true),
@@ -748,7 +748,7 @@ mod tests {
             (BooleanShorthand, false),
             (Composition, true),
         ];
-        let decimal_policy = [
+        let decimal_admission = [
             (Equality, true),
             (Ordering, true),
             (Membership, true),
@@ -757,7 +757,7 @@ mod tests {
             (BooleanShorthand, false),
             (Composition, true),
         ];
-        let timestamp_policy = [
+        let timestamp_admission = [
             (Equality, true),
             (Ordering, true),
             (Membership, true),
@@ -766,7 +766,7 @@ mod tests {
             (BooleanShorthand, false),
             (Composition, true),
         ];
-        let binary_policy = [
+        let binary_admission = [
             (Equality, true),
             (Ordering, false),
             (Membership, true),
@@ -775,7 +775,7 @@ mod tests {
             (BooleanShorthand, false),
             (Composition, true),
         ];
-        let unsupported_policy = [
+        let unsupported_admission = [
             (Equality, false),
             (Ordering, false),
             (Membership, false),
@@ -786,7 +786,7 @@ mod tests {
         ];
 
         for data_type in [DataType::Utf8, DataType::LargeUtf8] {
-            assert_type_policy(data_type, String, &string_policy);
+            assert_type_operator_admission(data_type, String, &string_admission);
         }
         for data_type in [
             DataType::Int8,
@@ -794,60 +794,60 @@ mod tests {
             DataType::Int32,
             DataType::Int64,
         ] {
-            assert_type_policy(data_type, Integer, &integer_policy);
+            assert_type_operator_admission(data_type, Integer, &integer_admission);
         }
-        assert_type_policy(DataType::Boolean, Boolean, &boolean_policy);
-        assert_type_policy(DataType::Date32, Date, &date_policy);
-        assert_type_policy(DataType::Decimal128(10, 2), Decimal, &decimal_policy);
-        assert_type_policy(
+        assert_type_operator_admission(DataType::Boolean, Boolean, &boolean_admission);
+        assert_type_operator_admission(DataType::Date32, Date, &date_admission);
+        assert_type_operator_admission(DataType::Decimal128(10, 2), Decimal, &decimal_admission);
+        assert_type_operator_admission(
             DataType::Decimal256(38, 18),
             Decimal256,
-            &unsupported_policy,
+            &unsupported_admission,
         );
         for data_type in [DataType::Float32, DataType::Float64] {
-            assert_type_policy(data_type, Floating, &floating_policy);
+            assert_type_operator_admission(data_type, Floating, &floating_admission);
         }
         for data_type in [
             DataType::Binary,
             DataType::LargeBinary,
             DataType::FixedSizeBinary(16),
         ] {
-            assert_type_policy(data_type, Binary, &binary_policy);
+            assert_type_operator_admission(data_type, Binary, &binary_admission);
         }
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             Timestamp,
-            &timestamp_policy,
+            &timestamp_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Timestamp(TimeUnit::Microsecond, None),
             TimestampNtz,
-            &timestamp_policy,
+            &timestamp_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Timestamp(TimeUnit::Microsecond, Some("".into())),
             TimestampNtz,
-            &timestamp_policy,
+            &timestamp_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
             KernelPartitionTypeGroup::Unsupported,
-            &unsupported_policy,
+            &unsupported_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Null,
             KernelPartitionTypeGroup::Unsupported,
-            &unsupported_policy,
+            &unsupported_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::Struct(vec![Field::new("child", DataType::Utf8, true)].into()),
             KernelPartitionTypeGroup::Unsupported,
-            &unsupported_policy,
+            &unsupported_admission,
         );
-        assert_type_policy(
+        assert_type_operator_admission(
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             KernelPartitionTypeGroup::Unsupported,
-            &unsupported_policy,
+            &unsupported_admission,
         );
     }
 
