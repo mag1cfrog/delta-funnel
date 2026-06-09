@@ -294,6 +294,7 @@ mod tests {
     const INTEGER_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["byte_part","short_part","int_part","long_part"],"configuration":{},"createdTime":1587968585495}}"#;
     const BOOLEAN_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["is_current"],"configuration":{},"createdTime":1587968585495}}"#;
     const DATE_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["event_date"],"configuration":{},"createdTime":1587968585495}}"#;
+    const DECIMAL_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["amount"],"configuration":{},"createdTime":1587968585495}}"#;
 
     fn add_json(path: &str) -> String {
         format!(
@@ -442,6 +443,31 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_decimal_partition_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-decimal-partition-characterization",
+            DECIMAL_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("decimal-negative.parquet", r#"{"amount":"-1.23"}"#),
+                partitioned_add_json("decimal-zero.parquet", r#"{"amount":"0.00"}"#),
+                partitioned_add_json("decimal-two.parquet", r#"{"amount":"2.00"}"#),
+                partitioned_add_json("decimal-ten.parquet", r#"{"amount":"10.00"}"#),
+                partitioned_add_json("decimal-large.parquet", r#"{"amount":"123.45"}"#),
+                partitioned_add_json("decimal-null.parquet", r#"{"amount":null}"#),
+                partitioned_add_json("decimal-empty.parquet", r#"{"amount":""}"#),
+                partitioned_add_json("decimal-missing.parquet", r#"{}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_predicated_file_paths(
         source: &super::PlannedDeltaSource,
         filter: &datafusion::logical_expr::Expr,
@@ -474,6 +500,10 @@ mod tests {
 
     fn date_lit(value: i32) -> Expr {
         Expr::Literal(ScalarValue::Date32(Some(value)), None)
+    }
+
+    fn decimal_lit(value: i128) -> Expr {
+        Expr::Literal(ScalarValue::Decimal128(Some(value), 10, 2), None)
     }
 
     fn assert_invalid_integer_partition_error(
@@ -529,6 +559,35 @@ mod tests {
         let debug_message = format!("{error:?}");
         assert!(message.contains("not-a-date"));
         assert!(debug_message.contains("Primitive(Date)"));
+
+        Ok(())
+    }
+
+    fn assert_invalid_decimal_partition_error(
+        result: Result<Vec<String>, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = match result {
+            Ok(paths) => {
+                return Err(
+                    format!("invalid decimal metadata should fail kernel scan: {paths:?}").into(),
+                );
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let debug_message = format!("{error:?}");
+        assert!(
+            message.contains("not-a-decimal")
+                || message.contains("123.450")
+                || message.contains("Could not parse int")
+                || debug_message.contains("ParseIntError")
+                || debug_message.contains("InvalidDecimal"),
+            "{message}\n{debug_message}"
+        );
+        assert!(
+            debug_message.contains("Decimal") || debug_message.contains("ParseIntError"),
+            "{debug_message}"
+        );
 
         Ok(())
     }
@@ -884,6 +943,218 @@ mod tests {
                 "date-pre-epoch.parquet",
             ]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_decimal_numeric_ordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_decimal_partition_characterization_source()?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec![
+                "decimal-empty.parquet",
+                "decimal-large.parquet",
+                "decimal-missing.parquet",
+                "decimal-negative.parquet",
+                "decimal-null.parquet",
+                "decimal-ten.parquet",
+                "decimal-two.parquet",
+                "decimal-zero.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("amount").gt(decimal_lit(200)))?,
+            vec!["decimal-large.parquet", "decimal-ten.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("amount").lt(decimal_lit(1000)))?,
+            vec![
+                "decimal-negative.parquet",
+                "decimal-two.parquet",
+                "decimal-zero.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &decimal_lit(1000).gt(col("amount")))?,
+            vec![
+                "decimal-negative.parquet",
+                "decimal-two.parquet",
+                "decimal-zero.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_decimal_null_and_empty_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_decimal_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("amount").is_null())?,
+            vec![
+                "decimal-empty.parquet",
+                "decimal-missing.parquet",
+                "decimal-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("amount").is_not_null())?,
+            vec![
+                "decimal-large.parquet",
+                "decimal-negative.parquet",
+                "decimal-ten.parquet",
+                "decimal-two.parquet",
+                "decimal-zero.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("amount").eq(decimal_lit(12_345)))?,
+            vec!["decimal-large.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("amount").not_eq(decimal_lit(12_345)))?,
+            vec![
+                "decimal-negative.parquet",
+                "decimal-ten.parquet",
+                "decimal-two.parquet",
+                "decimal-zero.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_decimal_membership_between_and_composition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_decimal_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("amount").in_list(vec![decimal_lit(-123), decimal_lit(12_345)], false),
+            )?,
+            vec!["decimal-large.parquet", "decimal-negative.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("amount").in_list(vec![decimal_lit(200)], true),
+            )?,
+            vec![
+                "decimal-large.parquet",
+                "decimal-negative.parquet",
+                "decimal-ten.parquet",
+                "decimal-zero.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("amount").between(decimal_lit(-123), decimal_lit(200)),
+            )?,
+            vec![
+                "decimal-negative.parquet",
+                "decimal-two.parquet",
+                "decimal-zero.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("amount").not_between(decimal_lit(-123), decimal_lit(200)),
+            )?,
+            vec!["decimal-large.parquet", "decimal-ten.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("amount")
+                    .gt_eq(decimal_lit(0))
+                    .and(col("amount").lt(decimal_lit(12345))),
+            )?,
+            vec![
+                "decimal-ten.parquet",
+                "decimal-two.parquet",
+                "decimal-zero.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("amount")
+                    .eq(decimal_lit(-123))
+                    .or(col("amount").eq(decimal_lit(12_345))),
+            )?,
+            vec!["decimal-large.parquet", "decimal-negative.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &Expr::Not(Box::new(col("amount").eq(decimal_lit(200)))),
+            )?,
+            vec![
+                "decimal-large.parquet",
+                "decimal-negative.parquet",
+                "decimal-ten.parquet",
+                "decimal-zero.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_invalid_decimal_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let invalid_text_table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-invalid-decimal-characterization",
+            DECIMAL_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("decimal-valid.parquet", r#"{"amount":"123.45"}"#),
+                partitioned_add_json("decimal-invalid.parquet", r#"{"amount":"not-a-decimal"}"#),
+            ],
+        )?;
+        let invalid_text_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: invalid_text_table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&invalid_text_source, None)?;
+
+        assert_invalid_decimal_partition_error(kernel_scan_file_paths(
+            &unfiltered_scan,
+            invalid_text_source.table_uri(),
+        ))?;
+        assert_invalid_decimal_partition_error(kernel_predicated_file_paths(
+            &invalid_text_source,
+            &col("amount").eq(decimal_lit(12_345)),
+        ))?;
+
+        let scale_mismatch_table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-invalid-decimal-scale-characterization",
+            DECIMAL_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json("decimal-valid.parquet", r#"{"amount":"123.45"}"#),
+                partitioned_add_json("decimal-scale.parquet", r#"{"amount":"123.450"}"#),
+            ],
+        )?;
+        let scale_mismatch_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: scale_mismatch_table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        assert_invalid_decimal_partition_error(kernel_predicated_file_paths(
+            &scale_mismatch_source,
+            &col("amount").eq(decimal_lit(12_345)),
+        ))?;
 
         Ok(())
     }
