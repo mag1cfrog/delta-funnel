@@ -19,7 +19,7 @@ use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
     table_formats::{
         DeltaKernelPredicate, ProjectedDeltaScan, build_projected_predicated_delta_scan,
-        datafusion_expr_to_kernel_predicate, delta_source_arrow_schema,
+        delta_source_arrow_schema,
     },
 };
 
@@ -244,24 +244,9 @@ impl DeltaTableProvider {
         let predicates = pushed_filter_plan
             .decisions
             .iter()
-            .filter_map(|decision| {
-                decision
-                    .kernel_scan_filter
-                    .as_ref()
-                    .map(|filter| (decision, filter))
-            })
-            .map(|(_decision, kernel_scan_filter)| {
-                datafusion_expr_to_kernel_predicate(kernel_scan_filter).map_err(|error| {
-                    DeltaFunnelError::DeltaScanFilter {
-                        source_name: self.source_name().to_owned(),
-                        table_uri: self.source.table_uri().to_owned(),
-                        reason: format!(
-                            "exact pushed filter cannot be converted to kernel predicate: {error}"
-                        ),
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|decision| decision.kernel_scan_filter.as_ref())
+            .map(|kernel_scan_filter| kernel_scan_filter.kernel_predicate.clone())
+            .collect::<Vec<_>>();
 
         Ok(DeltaKernelPredicate::and_from(predicates))
     }

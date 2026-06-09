@@ -6,8 +6,13 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::{Expr, Operator, lit};
 
+use crate::table_formats::datafusion_expr_to_kernel_predicate;
+
 use super::analysis::{DeltaFilterColumnScope, analyze_filter_for_pushdown};
-use super::{DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
+use super::{
+    DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan,
+    ExactPartitionKernelFilter,
+};
 
 /// Plans the exact static partition operator policy for kernel-native pruning.
 ///
@@ -37,8 +42,8 @@ pub(super) fn plan_partition_operator_pushdown(
 /// conservative unsupported decision.
 ///
 /// Filter analysis is still preserved for unsupported decisions so diagnostics
-/// remain useful, but unsupported predicates are not provider owned and must not
-/// affect scan planning.
+/// remain useful, but unsupported predicates are not accepted and must not
+/// affect kernel scan planning.
 fn partition_operator_decision(
     input_index: usize,
     filter: &Expr,
@@ -50,8 +55,7 @@ fn partition_operator_decision(
     let is_partition_only = filter_analysis.scope == DeltaFilterColumnScope::PartitionOnly;
 
     if is_partition_only
-        && let Some(kernel_scan_filter) =
-            supported_partition_operator_kernel_scan_filter(filter, schema)
+        && let Some(kernel_scan_filter) = try_exact_partition_kernel_filter(filter, schema)
     {
         return DeltaFilterPushdownDecision {
             input_index,
@@ -73,27 +77,80 @@ fn partition_operator_decision(
     }
 }
 
-/// Returns the DataFusion expression that should be converted and passed to
-/// kernel scan planning for an exact partition filter. Most accepted filters
-/// are passed through unchanged, but empty `IN` and `NOT IN` lists need
-/// explicit rewrites so `NOT IN ()` does not become a literal true predicate
-/// that includes null partitions.
-fn supported_partition_operator_kernel_scan_filter(
+/// Builds the exact filter payload for kernel scan planning. Most accepted
+/// filters are passed through unchanged, but empty `IN` and `NOT IN` lists
+/// need explicit rewrites so `NOT IN ()` does not become a literal true
+/// predicate that includes null partitions.
+fn try_exact_partition_kernel_filter(
     filter: &Expr,
     schema: &SchemaRef,
-) -> Option<Expr> {
+) -> Option<ExactPartitionKernelFilter> {
+    let datafusion_expr = exact_partition_kernel_expr(filter, schema)?;
+    let kernel_predicate = datafusion_expr_to_kernel_predicate(&datafusion_expr).ok()?;
+
+    Some(ExactPartitionKernelFilter {
+        datafusion_expr,
+        kernel_predicate,
+    })
+}
+
+fn exact_partition_kernel_expr(filter: &Expr, schema: &SchemaRef) -> Option<Expr> {
     match filter {
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
-            let left =
-                supported_partition_operator_kernel_scan_filter(binary.left.as_ref(), schema)?;
-            let right =
-                supported_partition_operator_kernel_scan_filter(binary.right.as_ref(), schema)?;
+            let left = exact_partition_kernel_expr(binary.left.as_ref(), schema)?;
+            let right = exact_partition_kernel_expr(binary.right.as_ref(), schema)?;
 
             Some(match binary.op {
                 Operator::And => left.and(right),
                 Operator::Or => left.or(right),
                 _ => return None,
             })
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            if is_supported_partition_equality(binary.left.as_ref(), binary.right.as_ref(), schema)
+                || is_supported_partition_equality(
+                    binary.right.as_ref(),
+                    binary.left.as_ref(),
+                    schema,
+                )
+            {
+                Some(filter.clone())
+            } else {
+                None
+            }
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::NotEq => {
+            if is_supported_partition_equality(binary.left.as_ref(), binary.right.as_ref(), schema)
+                || is_supported_partition_equality(
+                    binary.right.as_ref(),
+                    binary.left.as_ref(),
+                    schema,
+                )
+            {
+                Some(filter.clone())
+            } else {
+                None
+            }
+        }
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+            ) =>
+        {
+            if is_supported_partition_comparison(
+                binary.left.as_ref(),
+                binary.right.as_ref(),
+                schema,
+            ) || is_supported_partition_comparison(
+                binary.right.as_ref(),
+                binary.left.as_ref(),
+                schema,
+            ) {
+                Some(filter.clone())
+            } else {
+                None
+            }
         }
         Expr::InList(in_list) if in_list.list.is_empty() => {
             let Expr::Column(column) = in_list.expr.as_ref() else {
@@ -110,65 +167,32 @@ fn supported_partition_operator_kernel_scan_filter(
                 Some(lit(false))
             }
         }
+        Expr::InList(in_list) => {
+            if is_supported_partition_in_list(in_list, schema) {
+                Some(filter.clone())
+            } else {
+                None
+            }
+        }
+        Expr::Between(between) => {
+            if is_supported_partition_between(between, schema) {
+                Some(filter.clone())
+            } else {
+                None
+            }
+        }
         Expr::Not(inner) => {
-            let inner = supported_partition_operator_kernel_scan_filter(inner.as_ref(), schema)?;
+            let inner = exact_partition_kernel_expr(inner.as_ref(), schema)?;
             Some(Expr::Not(Box::new(inner)))
         }
-        _ if is_supported_partition_operator_filter(filter, schema) => Some(filter.clone()),
-        _ => None,
-    }
-}
-
-/// Checks whether the expression shape is supported by the kernel-native exact
-/// partition operator policy for this migration slice.
-///
-/// Column membership is intentionally checked by `analyze_filter_for_pushdown`;
-/// this helper verifies accepted leaf predicates or boolean composition whose
-/// leaves are accepted predicates. The production subset stays narrow: string
-/// equality, inequality, ordering, `IN`, `NOT IN`, `BETWEEN`, `NOT BETWEEN`,
-/// `NOT`, string null checks, and boolean `AND`/`OR` composition only.
-fn is_supported_partition_operator_filter(filter: &Expr, schema: &SchemaRef) -> bool {
-    match filter {
-        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
-            is_supported_partition_operator_filter(binary.left.as_ref(), schema)
-                && is_supported_partition_operator_filter(binary.right.as_ref(), schema)
-        }
-        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
-            is_supported_partition_equality(binary.left.as_ref(), binary.right.as_ref(), schema)
-                || is_supported_partition_equality(
-                    binary.right.as_ref(),
-                    binary.left.as_ref(),
-                    schema,
-                )
-        }
-        Expr::BinaryExpr(binary) if binary.op == Operator::NotEq => {
-            is_supported_partition_equality(binary.left.as_ref(), binary.right.as_ref(), schema)
-                || is_supported_partition_equality(
-                    binary.right.as_ref(),
-                    binary.left.as_ref(),
-                    schema,
-                )
-        }
-        Expr::BinaryExpr(binary)
-            if matches!(
-                binary.op,
-                Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
-            ) =>
-        {
-            is_supported_partition_comparison(binary.left.as_ref(), binary.right.as_ref(), schema)
-                || is_supported_partition_comparison(
-                    binary.right.as_ref(),
-                    binary.left.as_ref(),
-                    schema,
-                )
-        }
-        Expr::InList(in_list) => is_supported_partition_in_list(in_list, schema),
-        Expr::Between(between) => is_supported_partition_between(between, schema),
-        Expr::Not(inner) => is_supported_partition_operator_filter(inner.as_ref(), schema),
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            is_supported_partition_null_check(inner.as_ref(), schema)
+            if is_supported_partition_null_check(inner.as_ref(), schema) {
+                Some(filter.clone())
+            } else {
+                None
+            }
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -311,6 +335,13 @@ mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
+    fn kernel_scan_expr(decision: &DeltaFilterPushdownDecision) -> Option<&Expr> {
+        decision
+            .kernel_scan_filter
+            .as_ref()
+            .map(|filter| &filter.datafusion_expr)
+    }
+
     fn assert_all_unsupported(plan: &DeltaFilterPushdownPlan, len: usize) {
         assert_eq!(
             plan.datafusion_pushdowns(),
@@ -352,7 +383,7 @@ mod tests {
         assert_eq!(plan.decisions[0].outcome, DeltaFilterPushdownOutcome::Exact);
         assert!(!plan.decisions[0].residual);
         assert!(plan.decisions[0].rejection_reason.is_none());
-        assert_eq!(plan.decisions[0].kernel_scan_filter, Some(filter));
+        assert_eq!(kernel_scan_expr(&plan.decisions[0]), Some(&filter));
         assert_eq!(
             plan.decisions[0].filter_analysis.scope,
             DeltaFilterColumnScope::PartitionOnly
@@ -530,7 +561,7 @@ mod tests {
         assert_eq!(plan.exact_count, 1);
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
-        assert_eq!(plan.decisions[0].kernel_scan_filter, Some(filter));
+        assert_eq!(kernel_scan_expr(&plan.decisions[0]), Some(&filter));
     }
 
     #[test]
@@ -1268,7 +1299,7 @@ mod tests {
         assert_eq!(plan.exact_count, 1);
         assert_eq!(plan.unsupported_count, 0);
         assert_eq!(plan.residual_filter_count, 0);
-        assert_eq!(plan.decisions[0].kernel_scan_filter, Some(filter));
+        assert_eq!(kernel_scan_expr(&plan.decisions[0]), Some(&filter));
     }
 
     #[test]
@@ -1454,19 +1485,19 @@ mod tests {
         assert!(!plan.decisions[3].residual);
         assert!(!plan.decisions[4].residual);
         assert!(!plan.decisions[5].residual);
-        assert_eq!(plan.decisions[0].kernel_scan_filter, Some(lit(false)));
+        assert_eq!(kernel_scan_expr(&plan.decisions[0]), Some(&lit(false)));
         assert_eq!(
-            plan.decisions[1].kernel_scan_filter,
-            Some(col("region").is_not_null())
+            kernel_scan_expr(&plan.decisions[1]),
+            Some(&col("region").is_not_null())
         );
         assert_eq!(
-            plan.decisions[3].kernel_scan_filter,
-            Some(empty_string_equality)
+            kernel_scan_expr(&plan.decisions[3]),
+            Some(&empty_string_equality)
         );
-        assert_eq!(plan.decisions[4].kernel_scan_filter, Some(empty_string_in));
+        assert_eq!(kernel_scan_expr(&plan.decisions[4]), Some(&empty_string_in));
         assert_eq!(
-            plan.decisions[5].kernel_scan_filter,
-            Some(empty_string_not_in)
+            kernel_scan_expr(&plan.decisions[5]),
+            Some(&empty_string_not_in)
         );
         assert!(
             plan.decisions
