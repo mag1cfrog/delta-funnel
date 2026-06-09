@@ -7166,6 +7166,215 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integer_partition_exact_filters_prune_files_through_kernel_scan_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "integer-partition-kernel-scan-pruning",
+            INTEGER_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["long_part"]"#,
+            &[
+                r#""partitionValues":{"long_part":"7"}"#,
+                r#""partitionValues":{"long_part":"-1"}"#,
+                r#""partitionValues":{"long_part":"20"}"#,
+                r#""partitionValues":{"long_part":null}"#,
+                r#""partitionValues":{"long_part":""}"#,
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases: Vec<(&str, Vec<Expr>, Vec<&str>)> = vec![
+            (
+                "equality",
+                vec![
+                    datafusion::logical_expr::col("long_part")
+                        .eq(datafusion::logical_expr::lit(7_i64)),
+                ],
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "inequality",
+                vec![
+                    datafusion::logical_expr::col("long_part")
+                        .not_eq(datafusion::logical_expr::lit(7_i64)),
+                ],
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+            (
+                "in list",
+                vec![datafusion::logical_expr::col("long_part").in_list(
+                    vec![
+                        datafusion::logical_expr::lit(7_i64),
+                        datafusion::logical_expr::lit(-1_i64),
+                    ],
+                    false,
+                )],
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not in list",
+                vec![
+                    datafusion::logical_expr::col("long_part")
+                        .in_list(vec![datafusion::logical_expr::lit(7_i64)], true),
+                ],
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+            (
+                "less than",
+                vec![
+                    datafusion::logical_expr::col("long_part")
+                        .lt(datafusion::logical_expr::lit(7_i64)),
+                ],
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "less than or equal",
+                vec![
+                    datafusion::logical_expr::col("long_part")
+                        .lt_eq(datafusion::logical_expr::lit(-1_i64)),
+                ],
+                vec!["part-00001.parquet"],
+            ),
+            (
+                "greater than",
+                vec![
+                    datafusion::logical_expr::col("long_part")
+                        .gt(datafusion::logical_expr::lit(-1_i64)),
+                ],
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "greater than or equal",
+                vec![
+                    datafusion::logical_expr::col("long_part")
+                        .gt_eq(datafusion::logical_expr::lit(7_i64)),
+                ],
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "between",
+                vec![datafusion::logical_expr::col("long_part").between(
+                    datafusion::logical_expr::lit(-1_i64),
+                    datafusion::logical_expr::lit(7_i64),
+                )],
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "not between",
+                vec![datafusion::logical_expr::col("long_part").not_between(
+                    datafusion::logical_expr::lit(-1_i64),
+                    datafusion::logical_expr::lit(7_i64),
+                )],
+                vec!["part-00002.parquet"],
+            ),
+            (
+                "is null",
+                vec![datafusion::logical_expr::col("long_part").is_null()],
+                vec![
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                    "part-00005.parquet",
+                ],
+            ),
+            (
+                "is not null",
+                vec![datafusion::logical_expr::col("long_part").is_not_null()],
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                ],
+            ),
+            (
+                "separate filters combine with and",
+                vec![
+                    datafusion::logical_expr::col("long_part")
+                        .gt_eq(datafusion::logical_expr::lit(-1_i64)),
+                    datafusion::logical_expr::col("long_part")
+                        .lt(datafusion::logical_expr::lit(20_i64)),
+                ],
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "whole and",
+                vec![
+                    datafusion::logical_expr::col("long_part")
+                        .gt_eq(datafusion::logical_expr::lit(-1_i64))
+                        .and(
+                            datafusion::logical_expr::col("long_part")
+                                .lt(datafusion::logical_expr::lit(20_i64)),
+                        ),
+                ],
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "whole or",
+                vec![
+                    datafusion::logical_expr::col("long_part")
+                        .eq(datafusion::logical_expr::lit(7_i64))
+                        .or(datafusion::logical_expr::col("long_part")
+                            .eq(datafusion::logical_expr::lit(20_i64))),
+                ],
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "not",
+                vec![Expr::Not(Box::new(
+                    datafusion::logical_expr::col("long_part")
+                        .eq(datafusion::logical_expr::lit(7_i64)),
+                ))],
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
+        ];
+
+        for (name, filters, expected_paths) in cases {
+            let filter_refs = filters.iter().collect::<Vec<_>>();
+            let support = provider.supports_filters_pushdown(&filter_refs)?;
+            assert_eq!(
+                support,
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+            let scan_plan = scan.scan_plan();
+            let kernel_names = scan_plan
+                .kernel_scan()
+                .kernel_schema()
+                .fields()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>();
+
+            assert_eq!(scan_plan.projected_schema.field(0).name(), "id", "{name}");
+            assert_eq!(kernel_names, vec!["id", "long_part"], "{name}");
+            assert_eq!(scan_plan.pushed_filter_plan.exact_count, filters.len());
+            assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0);
+            assert_eq!(scan_plan.pushed_filter_plan.residual_filter_count, 0);
+            assert_eq!(
+                scan_plan.pushed_filter_plan.pushed_filter_count,
+                filters.len()
+            );
+            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
+            assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn integer_partition_between_filters_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
