@@ -500,6 +500,18 @@ fn is_supported_partition_literal_for_column(
             DataType::Decimal128(precision, scale),
             Expr::Literal(ScalarValue::Decimal128(Some(_), literal_precision, literal_scale), _),
         ) => precision == literal_precision && scale == literal_scale,
+        (DataType::Binary, Expr::Literal(ScalarValue::Binary(Some(value)), _))
+        | (DataType::LargeBinary, Expr::Literal(ScalarValue::LargeBinary(Some(value)), _)) => {
+            !value.is_empty()
+        }
+        (
+            DataType::FixedSizeBinary(size),
+            Expr::Literal(ScalarValue::FixedSizeBinary(literal_size, Some(value)), _),
+        ) => {
+            size == literal_size
+                && usize::try_from(*size).is_ok_and(|size| value.len() == size)
+                && !value.is_empty()
+        }
         _ => false,
     }
 }
@@ -549,7 +561,7 @@ fn kernel_partition_policy(
             Ordering | Between => Unsupported,
         },
         Binary => match operator_family {
-            Equality | Membership | NullCheck | Composition => TypedRestorePending,
+            Equality | Membership | NullCheck | Composition => KernelExact,
             Ordering | Between | BooleanShorthand => Unsupported,
         },
         KernelPartitionTypeGroup::Unsupported => Unsupported,
@@ -756,13 +768,13 @@ mod tests {
             (Composition, KernelExact),
         ];
         let binary_policy = [
-            (Equality, TypedRestorePending),
+            (Equality, KernelExact),
             (Ordering, Unsupported),
-            (Membership, TypedRestorePending),
+            (Membership, KernelExact),
             (Between, Unsupported),
-            (NullCheck, TypedRestorePending),
+            (NullCheck, KernelExact),
             (BooleanShorthand, Unsupported),
-            (Composition, TypedRestorePending),
+            (Composition, KernelExact),
         ];
         let unsupported_policy = [
             (Equality, Unsupported),
@@ -1258,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_binary_null_checks_until_typed_child() {
+    fn partition_operator_planner_accepts_binary_null_checks_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["payload"]);
         let filters = [
@@ -1273,11 +1285,14 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_binary_equality_and_membership_until_typed_child() {
+    fn partition_operator_planner_accepts_binary_equality_and_membership_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["payload"]);
         let payload = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
@@ -1296,7 +1311,42 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
+    }
+
+    #[test]
+    fn partition_operator_planner_extracts_binary_partition_term_from_mixed_and() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["payload"]);
+        let payload = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+        let partition_filter = col("payload").eq(payload);
+        let data_filter = col("id").gt(lit(10_i32));
+        let filter = partition_filter.clone().and(data_filter);
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &[&filter],
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert!(plan.decisions[0].residual);
+        assert_eq!(
+            kernel_scan_expr(&plan.decisions[0]),
+            Some(&partition_filter)
+        );
+        assert!(plan.decisions[0].kernel_scan_filter.is_some());
     }
 
     #[test]
@@ -2666,6 +2716,14 @@ mod tests {
             ),
             col("payload").eq(Expr::Literal(ScalarValue::Binary(None), None)),
             col("payload").eq(Expr::Literal(ScalarValue::Binary(Some(Vec::new())), None)),
+            col("payload").eq(Expr::Literal(
+                ScalarValue::LargeBinary(Some(b"hello".to_vec())),
+                None,
+            )),
+            col("payload").eq(Expr::Literal(
+                ScalarValue::FixedSizeBinary(5, Some(b"hello".to_vec())),
+                None,
+            )),
             col("payload").eq(lit("hello")),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
