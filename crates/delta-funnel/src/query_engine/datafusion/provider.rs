@@ -4016,6 +4016,20 @@ mod tests {
             ),
             None,
         );
+        let timestamp_named_timezone = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_123_456),
+                Some(Arc::<str>::from("America/Phoenix")),
+            ),
+            None,
+        );
+        let timestamp_offset_timezone = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_123_456),
+                Some(Arc::<str>::from("-07:00")),
+            ),
+            None,
+        );
         let low = Expr::Literal(
             ScalarValue::TimestampMicrosecond(
                 Some(1_767_225_599_999_999),
@@ -4027,6 +4041,16 @@ mod tests {
             (
                 "timestamp equality",
                 datafusion::logical_expr::col("event_ts").eq(timestamp.clone()),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "timestamp named timezone equality",
+                datafusion::logical_expr::col("event_ts").eq(timestamp_named_timezone),
+                vec!["part-00000.parquet"],
+            ),
+            (
+                "timestamp offset timezone equality",
+                datafusion::logical_expr::col("event_ts").eq(timestamp_offset_timezone),
                 vec!["part-00000.parquet"],
             ),
             (
@@ -4672,7 +4696,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-timestamp-partition-comparisons-between-residuals",
+            "sql-timestamp-partition-comparisons-between-exact",
             TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["event_ts"]"#,
             &[
@@ -4881,7 +4905,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-timestamp-partition-equality-membership-residuals",
+            "sql-timestamp-partition-equality-membership-exact",
             TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["event_ts"]"#,
             &[
@@ -4911,6 +4935,14 @@ mod tests {
             (
                 "timestamp equality",
                 "select id from orders where event_ts = timestamp '2026-01-01 00:00:00.123456'",
+            ),
+            (
+                "timestamp utc suffix equality",
+                "select id from orders where event_ts = timestamp '2026-01-01T00:00:00.123456Z'",
+            ),
+            (
+                "timestamp offset equality",
+                "select id from orders where event_ts = timestamp '2025-12-31T17:00:00.123456-07:00'",
             ),
             (
                 "timestamp inequality",
@@ -5070,7 +5102,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
-            "sql-timestamp-partition-null-checks-residuals",
+            "sql-timestamp-partition-null-checks-exact",
             TIMESTAMP_PARTITION_SCHEMA_FIELDS_JSON,
             r#"["event_ts"]"#,
             &[

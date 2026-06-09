@@ -665,6 +665,13 @@ mod tests {
                 ),
                 Scalar::Timestamp(1_767_225_600_123_456),
             ),
+            (
+                ScalarValue::TimestampMicrosecond(
+                    Some(1_767_225_600_123_456),
+                    Some("-07:00".into()),
+                ),
+                Scalar::Timestamp(1_767_225_600_123_456),
+            ),
         ];
 
         for (datafusion_scalar, kernel_scalar) in supported {
