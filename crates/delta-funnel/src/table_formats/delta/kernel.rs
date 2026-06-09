@@ -320,6 +320,12 @@ fn datafusion_scalar_to_kernel_scalar(
         ScalarValue::Float32(Some(value)) => Ok(Scalar::Float(*value)),
         ScalarValue::Float64(Some(value)) => Ok(Scalar::Double(*value)),
         ScalarValue::Date32(Some(value)) => Ok(Scalar::Date(*value)),
+        ScalarValue::Decimal128(Some(value), precision, scale) => {
+            let scale = u8::try_from(*scale)
+                .map_err(|_| DeltaKernelPredicateAdapterError::UnsupportedLiteral)?;
+            Scalar::decimal(*value, *precision, scale)
+                .map_err(|_| DeltaKernelPredicateAdapterError::UnsupportedLiteral)
+        }
         ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => {
             Ok(Scalar::String(value.clone()))
         }
@@ -511,7 +517,8 @@ mod tests {
     }
 
     #[test]
-    fn datafusion_predicate_adapter_converts_supported_literal_types() {
+    fn datafusion_predicate_adapter_converts_supported_literal_types()
+    -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             convert_datafusion_predicate(
                 &col("byte_value").eq(Expr::Literal(ScalarValue::Int8(Some(7)), None))
@@ -567,10 +574,23 @@ mod tests {
                 Expression::Literal(Scalar::Date(20_454))
             ))
         );
+        assert_eq!(
+            convert_datafusion_predicate(&col("amount").eq(Expr::Literal(
+                ScalarValue::Decimal128(Some(12_345), 10, 2),
+                None
+            ))),
+            Ok(Predicate::eq(
+                kernel_column("amount"),
+                Expression::Literal(Scalar::decimal(12_345, 10, 2)?)
+            ))
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn datafusion_predicate_adapter_documents_scalar_type_boundary() {
+    fn datafusion_predicate_adapter_documents_scalar_type_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
         let supported = [
             (ScalarValue::Boolean(Some(true)), Scalar::Boolean(true)),
             (ScalarValue::Int8(Some(7)), Scalar::Byte(7)),
@@ -580,6 +600,10 @@ mod tests {
             (ScalarValue::Float32(Some(7.5)), Scalar::Float(7.5)),
             (ScalarValue::Float64(Some(7.5)), Scalar::Double(7.5)),
             (ScalarValue::Date32(Some(7)), Scalar::Date(7)),
+            (
+                ScalarValue::Decimal128(Some(12_345), 10, 2),
+                Scalar::decimal(12_345, 10, 2)?,
+            ),
             (
                 ScalarValue::Utf8(Some("value".to_owned())),
                 Scalar::String("value".to_owned()),
@@ -601,7 +625,6 @@ mod tests {
         let unsupported_literals = [
             ScalarValue::Decimal32(Some(12345), 10, 2),
             ScalarValue::Decimal64(Some(12345), 10, 2),
-            ScalarValue::Decimal128(Some(12345), 10, 2),
             ScalarValue::Decimal256(Some(12345.into()), 10, 2),
             ScalarValue::UInt8(Some(7)),
             ScalarValue::UInt16(Some(7)),
@@ -649,18 +672,22 @@ mod tests {
                 "{datafusion_scalar:?}"
             );
         }
+
+        Ok(())
     }
 
     #[test]
     fn datafusion_predicate_adapter_rejects_unproven_literal_types() {
-        let decimal = Expr::Literal(ScalarValue::Decimal128(Some(12345), 10, 2), None);
         let timestamp = Expr::Literal(ScalarValue::TimestampMicrosecond(Some(12345), None), None);
         let binary = Expr::Literal(ScalarValue::Binary(Some(vec![1, 2, 3])), None);
+        let decimal256 = Expr::Literal(ScalarValue::Decimal256(Some(12345.into()), 10, 2), None);
+        let negative_scale_decimal =
+            Expr::Literal(ScalarValue::Decimal128(Some(12345), 10, -2), None);
         let decimal_null = Expr::Literal(ScalarValue::Decimal128(None, 10, 2), None);
         let timestamp_null = Expr::Literal(ScalarValue::TimestampMicrosecond(None, None), None);
         let cast_filter = cast(col("id"), DataType::Int64).eq(lit(7_i64));
 
-        for literal in [decimal, timestamp, binary] {
+        for literal in [timestamp, binary, decimal256, negative_scale_decimal] {
             assert_eq!(
                 convert_datafusion_predicate(&col("value").eq(literal)),
                 Err(DeltaKernelPredicateAdapterError::UnsupportedLiteral)
