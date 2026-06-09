@@ -516,6 +516,10 @@ fn is_supported_partition_literal_for_column(
             DataType::Timestamp(TimeUnit::Microsecond, Some(_)),
             Expr::Literal(ScalarValue::TimestampMicrosecond(Some(_), Some(timezone)), _),
         ) => !timezone.is_empty(),
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(_), None), _),
+        ) => true,
         _ => false,
     }
 }
@@ -550,13 +554,13 @@ fn kernel_partition_policy(
             Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
             BooleanShorthand => Unsupported,
         },
-        Decimal256 | TimestampNtz => match operator_family {
+        Decimal256 => match operator_family {
             Equality | Ordering | Membership | Between | NullCheck | Composition => {
                 TypedRestorePending
             }
             BooleanShorthand => Unsupported,
         },
-        Timestamp => match operator_family {
+        Timestamp | TimestampNtz => match operator_family {
             Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
             BooleanShorthand => Unsupported,
         },
@@ -842,12 +846,12 @@ mod tests {
         assert_type_policy(
             DataType::Timestamp(TimeUnit::Microsecond, None),
             TimestampNtz,
-            &ordered_typed_restore_policy,
+            &timestamp_policy,
         );
         assert_type_policy(
             DataType::Timestamp(TimeUnit::Microsecond, Some("".into())),
             TimestampNtz,
-            &ordered_typed_restore_policy,
+            &timestamp_policy,
         );
         assert_type_policy(
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
@@ -1283,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_timestamp_ntz_null_checks_until_typed_child() {
+    fn partition_operator_planner_accepts_timestamp_ntz_null_checks_as_kernel_exact() {
         let schema = schema();
         let partition_columns = partition_columns(&["event_ts_ntz"]);
         let filters = [
@@ -1298,7 +1302,10 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
@@ -1461,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_operator_planner_downgrades_timestamp_ntz_equality_membership_and_ranges_until_typed_child()
+    fn partition_operator_planner_accepts_timestamp_ntz_equality_membership_ranges_and_composition_as_kernel_exact()
      {
         let schema = schema();
         let partition_columns = partition_columns(&["event_ts_ntz"]);
@@ -1477,12 +1484,19 @@ mod tests {
             col("event_ts_ntz").eq(timestamp.clone()),
             timestamp.clone().eq(col("event_ts_ntz")),
             col("event_ts_ntz").not_eq(timestamp.clone()),
-            col("event_ts_ntz").in_list(vec![timestamp.clone(), other], false),
+            col("event_ts_ntz").in_list(vec![timestamp.clone(), other.clone()], false),
             col("event_ts_ntz").in_list(vec![timestamp.clone()], true),
             col("event_ts_ntz").gt(timestamp.clone()),
             timestamp.clone().gt(col("event_ts_ntz")),
             col("event_ts_ntz").between(timestamp.clone(), timestamp.clone()),
-            col("event_ts_ntz").not_between(timestamp.clone(), timestamp),
+            col("event_ts_ntz").not_between(other.clone(), timestamp.clone()),
+            col("event_ts_ntz")
+                .gt(other.clone())
+                .and(col("event_ts_ntz").lt(timestamp.clone())),
+            col("event_ts_ntz")
+                .eq(timestamp.clone())
+                .or(col("event_ts_ntz").is_null()),
+            Expr::Not(Box::new(col("event_ts_ntz").eq(timestamp))),
         ];
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
@@ -1491,7 +1505,10 @@ mod tests {
             &partition_columns,
         );
 
-        assert_all_unsupported(&plan, filters.len());
+        assert_all_exact(&plan, filters.len());
+        for (decision, filter) in plan.decisions.iter().zip(filters.iter()) {
+            assert_eq!(kernel_scan_expr(decision), Some(filter));
+        }
     }
 
     #[test]
@@ -1567,10 +1584,26 @@ mod tests {
             ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
             None,
         );
+        let timestamp_empty_timezone = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("".into())),
+            None,
+        );
+        let timestamp_second = Expr::Literal(ScalarValue::TimestampSecond(Some(1), None), None);
+        let timestamp_nanosecond = Expr::Literal(
+            ScalarValue::TimestampNanosecond(Some(1_767_225_600_123_456_000), None),
+            None,
+        );
         let null_timestamp = Expr::Literal(ScalarValue::TimestampMicrosecond(None, None), None);
         let filters = [
             col("event_ts_ntz").eq(timestamp_utc.clone()),
+            col("event_ts_ntz").eq(timestamp_empty_timezone.clone()),
+            col("event_ts_ntz").eq(timestamp_second.clone()),
+            col("event_ts_ntz").eq(timestamp_nanosecond.clone()),
+            col("event_ts_ntz").eq(null_timestamp.clone()),
             col("event_ts_ntz").gt(timestamp_utc),
+            col("event_ts_ntz").gt(timestamp_empty_timezone),
+            col("event_ts_ntz").gt(timestamp_second),
+            col("event_ts_ntz").gt(timestamp_nanosecond),
             col("event_ts_ntz").between(timestamp, null_timestamp),
         ];
 
