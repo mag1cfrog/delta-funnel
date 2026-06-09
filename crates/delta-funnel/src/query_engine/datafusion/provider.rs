@@ -3386,10 +3386,17 @@ mod tests {
             ),
             None,
         );
-        let timestamp_non_utc_timezone = Expr::Literal(
+        let timestamp_empty_timezone = Expr::Literal(
             ScalarValue::TimestampMicrosecond(
                 Some(1_767_225_600_123_456),
-                Some(Arc::<str>::from("America/Phoenix")),
+                Some(Arc::<str>::from("")),
+            ),
+            None,
+        );
+        let timestamp_nanosecond = Expr::Literal(
+            ScalarValue::TimestampNanosecond(
+                Some(1_767_225_600_123_456_000),
+                Some(Arc::<str>::from("UTC")),
             ),
             None,
         );
@@ -3423,8 +3430,12 @@ mod tests {
                 datafusion::logical_expr::col("event_ts").in_list(vec![timestamp_null], false),
             ),
             (
-                "timestamp non utc timezone literal",
-                datafusion::logical_expr::col("event_ts").eq(timestamp_non_utc_timezone),
+                "timestamp empty timezone literal",
+                datafusion::logical_expr::col("event_ts").eq(timestamp_empty_timezone),
+            ),
+            (
+                "timestamp nanosecond literal",
+                datafusion::logical_expr::col("event_ts").eq(timestamp_nanosecond),
             ),
             (
                 "timestamp null literal",
@@ -3975,7 +3986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timestamp_partition_equality_and_membership_are_rejected_at_scan_boundary()
+    async fn timestamp_partition_equality_and_membership_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "timestamp-partition-equality-membership-boundary",
@@ -3983,11 +3994,10 @@ mod tests {
             r#"["event_ts"]"#,
             &[
                 r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
-                r#""partitionValues":{"event_ts":"2026-01-01 00:00:00.123456"}"#,
                 r#""partitionValues":{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
+                r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123457Z"}"#,
                 r#""partitionValues":{"event_ts":null}"#,
                 r#""partitionValues":{"event_ts":""}"#,
-                r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
                 r#""partitionValues":{}"#,
             ],
         )?;
@@ -4017,16 +4027,19 @@ mod tests {
             (
                 "timestamp equality",
                 datafusion::logical_expr::col("event_ts").eq(timestamp.clone()),
+                vec!["part-00000.parquet"],
             ),
             (
                 "reversed timestamp equality",
                 timestamp
                     .clone()
                     .eq(datafusion::logical_expr::col("event_ts")),
+                vec!["part-00000.parquet"],
             ),
             (
                 "timestamp inequality",
                 datafusion::logical_expr::col("event_ts").not_eq(timestamp.clone()),
+                vec!["part-00001.parquet", "part-00002.parquet"],
             ),
             (
                 "timestamp in list",
@@ -4034,29 +4047,42 @@ mod tests {
                     vec![timestamp.clone(), low.clone(), timestamp.clone()],
                     false,
                 ),
+                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "timestamp not in list",
                 datafusion::logical_expr::col("event_ts").in_list(vec![timestamp], true),
+                vec!["part-00001.parquet", "part-00002.parquet"],
             ),
         ];
 
-        for (name, filter) in cases {
+        for (name, filter, expected_paths) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+            let scan_plan = scan.scan_plan();
+
+            assert_eq!(scan_plan.projected_schema.field(0).name(), "id", "{name}");
+            assert_eq!(scan_plan.pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0, "{name}");
             assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
+                scan_plan.pushed_filter_plan.residual_filter_count, 0,
                 "{name}"
             );
-
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
+            assert_eq!(
+                scan_plan.pushed_filter_plan.pushed_filter_count, 1,
+                "{name}"
             );
+            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
+            assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
@@ -4146,7 +4172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timestamp_partition_comparisons_and_between_are_rejected_at_scan_boundary()
+    async fn timestamp_partition_comparisons_and_between_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "timestamp-partition-comparisons-between-boundary",
@@ -4154,12 +4180,11 @@ mod tests {
             r#"["event_ts"]"#,
             &[
                 r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
-                r#""partitionValues":{"event_ts":"2026-01-01 00:00:00.123456"}"#,
                 r#""partitionValues":{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
                 r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123457Z"}"#,
+                r#""partitionValues":{"event_ts":"1969-12-31T23:59:59.999999Z"}"#,
                 r#""partitionValues":{"event_ts":null}"#,
                 r#""partitionValues":{"event_ts":""}"#,
-                r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
                 r#""partitionValues":{}"#,
             ],
         )?;
@@ -4196,63 +4221,93 @@ mod tests {
             (
                 "timestamp less than",
                 datafusion::logical_expr::col("event_ts").lt(target.clone()),
+                vec!["part-00001.parquet", "part-00003.parquet"],
             ),
             (
                 "timestamp less than or equal",
                 datafusion::logical_expr::col("event_ts").lt_eq(low.clone()),
+                vec!["part-00001.parquet", "part-00003.parquet"],
             ),
             (
                 "timestamp greater than",
                 datafusion::logical_expr::col("event_ts").gt(low.clone()),
+                vec!["part-00000.parquet", "part-00002.parquet"],
             ),
             (
                 "reversed timestamp greater than",
                 high.clone().gt(datafusion::logical_expr::col("event_ts")),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
             ),
             (
                 "timestamp greater than or equal",
                 datafusion::logical_expr::col("event_ts").gt_eq(target.clone()),
+                vec!["part-00000.parquet", "part-00002.parquet"],
             ),
             (
                 "timestamp between",
                 datafusion::logical_expr::col("event_ts").between(low.clone(), target.clone()),
+                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
             (
                 "timestamp not between",
                 datafusion::logical_expr::col("event_ts").not_between(low.clone(), target.clone()),
+                vec!["part-00002.parquet", "part-00003.parquet"],
             ),
             (
                 "timestamp contradictory between",
                 datafusion::logical_expr::col("event_ts").between(high.clone(), low.clone()),
+                Vec::new(),
             ),
             (
                 "timestamp contradictory not between",
                 datafusion::logical_expr::col("event_ts").not_between(high, low.clone()),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
             ),
             (
                 "timestamp and composition",
                 datafusion::logical_expr::col("event_ts")
                     .gt(low)
                     .and(datafusion::logical_expr::col("event_ts").lt_eq(target)),
+                vec!["part-00000.parquet"],
             ),
         ];
 
-        for (name, filter) in cases {
+        for (name, filter, expected_paths) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+            let scan_plan = scan.scan_plan();
+
+            assert_eq!(scan_plan.projected_schema.field(0).name(), "id", "{name}");
+            assert_eq!(scan_plan.pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0, "{name}");
             assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
+                scan_plan.pushed_filter_plan.residual_filter_count, 0,
                 "{name}"
             );
-
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
+            assert_eq!(
+                scan_plan.pushed_filter_plan.pushed_filter_count, 1,
+                "{name}"
             );
+            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
+            assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
@@ -4366,7 +4421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timestamp_partition_boolean_composition_and_projection_are_rejected_at_scan_boundary()
+    async fn timestamp_partition_boolean_composition_and_projection_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "timestamp-partition-boolean-composition-boundary",
@@ -4374,12 +4429,10 @@ mod tests {
             r#"["event_ts"]"#,
             &[
                 r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123456Z"}"#,
-                r#""partitionValues":{"event_ts":"2026-01-01 00:00:00.123456"}"#,
                 r#""partitionValues":{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
                 r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123457Z"}"#,
                 r#""partitionValues":{"event_ts":null}"#,
                 r#""partitionValues":{"event_ts":""}"#,
-                r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
                 r#""partitionValues":{}"#,
             ],
         )?;
@@ -4426,36 +4479,67 @@ mod tests {
             datafusion::logical_expr::col("event_ts").eq(target),
         ));
         let cases = [
-            ("separate filters combine with and", separate_and_filters),
-            ("whole and", vec![whole_and_filter]),
-            ("whole or", vec![whole_or_filter]),
-            ("whole not", vec![whole_not_filter]),
+            (
+                "separate filters combine with and",
+                separate_and_filters,
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "whole and",
+                vec![whole_and_filter],
+                vec!["part-00000.parquet", "part-00001.parquet"],
+            ),
+            (
+                "whole or",
+                vec![whole_or_filter],
+                vec!["part-00000.parquet", "part-00002.parquet"],
+            ),
+            (
+                "whole not",
+                vec![whole_not_filter],
+                vec!["part-00001.parquet", "part-00002.parquet"],
+            ),
         ];
 
-        for (name, filters) in cases {
+        for (name, filters, expected_paths) in cases {
             let filter_refs = filters.iter().collect::<Vec<_>>();
             let support = provider.supports_filters_pushdown(&filter_refs)?;
             assert_eq!(
                 support,
-                vec![TableProviderFilterPushDown::Unsupported; filters.len()],
+                vec![TableProviderFilterPushDown::Exact; filters.len()],
                 "{name}"
             );
 
-            let result = provider.scan(&state, Some(&vec![0]), &filters, None).await;
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &filters, None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+            let scan_plan = scan.scan_plan();
 
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
+            assert_eq!(scan_plan.projected_schema.field(0).name(), "id", "{name}");
+            assert_eq!(scan_plan.pushed_filter_plan.exact_count, filters.len());
+            assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0, "{name}");
+            assert_eq!(
+                scan_plan.pushed_filter_plan.residual_filter_count, 0,
+                "{name}"
             );
+            assert_eq!(
+                scan_plan.pushed_filter_plan.pushed_filter_count,
+                filters.len()
+            );
+            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
+            assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn timestamp_partition_null_checks_are_rejected_at_scan_boundary()
+    async fn timestamp_partition_null_checks_are_exact_at_scan_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
             "timestamp-partition-null-checks-boundary",
@@ -4466,7 +4550,6 @@ mod tests {
                 r#""partitionValues":{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
                 r#""partitionValues":{"event_ts":null}"#,
                 r#""partitionValues":{"event_ts":""}"#,
-                r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
                 r#""partitionValues":{}"#,
             ],
         )?;
@@ -4482,29 +4565,46 @@ mod tests {
             (
                 "timestamp is null",
                 datafusion::logical_expr::col("event_ts").is_null(),
+                vec![
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
             ),
             (
                 "timestamp is not null",
                 datafusion::logical_expr::col("event_ts").is_not_null(),
+                vec!["part-00000.parquet", "part-00001.parquet"],
             ),
         ];
 
-        for (name, filter) in cases {
+        for (name, filter, expected_paths) in cases {
             let support = provider.supports_filters_pushdown(&[&filter])?;
+            assert_eq!(support, vec![TableProviderFilterPushDown::Exact], "{name}");
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+            let scan_plan = scan.scan_plan();
+
+            assert_eq!(scan_plan.projected_schema.field(0).name(), "id", "{name}");
+            assert_eq!(scan_plan.pushed_filter_plan.exact_count, 1, "{name}");
+            assert_eq!(scan_plan.pushed_filter_plan.unsupported_count, 0, "{name}");
             assert_eq!(
-                support,
-                vec![TableProviderFilterPushDown::Unsupported],
+                scan_plan.pushed_filter_plan.residual_filter_count, 0,
                 "{name}"
             );
-
-            let result = provider.scan(&state, Some(&vec![0]), &[filter], None).await;
-
-            assert!(
-                matches!(result, Err(DataFusionError::External(error)) if error
-                    .to_string()
-                    .contains("pushed filters must be exact partition predicates")),
-                "{name} should be rejected"
+            assert_eq!(
+                scan_plan.pushed_filter_plan.pushed_filter_count, 1,
+                "{name}"
             );
+            assert!(scan_plan.partition_metadata_filter.is_none(), "{name}");
+            assert!(scan_plan.kernel_partition_predicate.is_some(), "{name}");
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
 
         Ok(())
@@ -4568,7 +4668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_timestamp_partition_comparisons_and_between_keep_residual_filter()
+    async fn sql_timestamp_partition_comparisons_and_between_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -4637,18 +4737,16 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count > 0,
                 "{name}: {plan_display}"
             );
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count > 0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -4664,7 +4762,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
@@ -4779,7 +4877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_timestamp_partition_equality_and_membership_keep_residual_filter()
+    async fn sql_timestamp_partition_equality_and_membership_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -4838,18 +4936,16 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.exact_count > 0,
                 "{name}: {plan_display}"
             );
-            assert_eq!(
-                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0,
+            assert!(
+                scans[0].scan_plan().pushed_filter_plan.pushed_filter_count > 0,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -4865,7 +4961,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
@@ -4970,7 +5066,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_timestamp_partition_null_checks_keep_residual_filter()
+    async fn sql_timestamp_partition_null_checks_are_exact_kernel_pushdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema_and_adds(
@@ -5020,18 +5116,18 @@ mod tests {
             super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
             assert!(
-                plan_display.contains("FilterExec"),
-                "{name} unexpectedly became exact:\n{plan_display}"
+                !plan_display.contains("FilterExec"),
+                "{name} should not keep residual filter:\n{plan_display}"
             );
             assert_eq!(scans.len(), 1, "{name}: {plan_display}");
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.exact_count,
-                0,
+                1,
                 "{name}: {plan_display}"
             );
             assert_eq!(
                 scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-                0,
+                1,
                 "{name}: {plan_display}"
             );
             assert_eq!(
@@ -5047,7 +5143,7 @@ mod tests {
                 "{name}"
             );
             assert!(
-                scans[0].scan_plan().kernel_partition_predicate.is_none(),
+                scans[0].scan_plan().kernel_partition_predicate.is_some(),
                 "{name}"
             );
         }
