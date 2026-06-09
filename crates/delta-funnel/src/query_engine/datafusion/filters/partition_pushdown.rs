@@ -44,7 +44,6 @@ enum KernelPartitionOperatorFamily {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KernelPartitionPolicyOutcome {
     KernelExact,
-    TypedRestorePending,
     Unsupported,
 }
 
@@ -531,7 +530,7 @@ fn kernel_partition_policy(
     use KernelPartitionOperatorFamily::{
         Between, BooleanShorthand, Composition, Equality, Membership, NullCheck, Ordering,
     };
-    use KernelPartitionPolicyOutcome::{KernelExact, TypedRestorePending, Unsupported};
+    use KernelPartitionPolicyOutcome::{KernelExact, Unsupported};
     use KernelPartitionTypeGroup::{
         Binary, Boolean, Date, Decimal, Decimal256, Floating, Integer, String, Timestamp,
         TimestampNtz,
@@ -554,12 +553,7 @@ fn kernel_partition_policy(
             Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
             BooleanShorthand => Unsupported,
         },
-        Decimal256 => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => {
-                TypedRestorePending
-            }
-            BooleanShorthand => Unsupported,
-        },
+        Decimal256 => Unsupported,
         Timestamp | TimestampNtz => match operator_family {
             Equality | Ordering | Membership | Between | NullCheck | Composition => KernelExact,
             BooleanShorthand => Unsupported,
@@ -712,7 +706,7 @@ mod tests {
         use KernelPartitionOperatorFamily::{
             Between, BooleanShorthand, Composition, Equality, Membership, NullCheck, Ordering,
         };
-        use KernelPartitionPolicyOutcome::{KernelExact, TypedRestorePending, Unsupported};
+        use KernelPartitionPolicyOutcome::{KernelExact, Unsupported};
         use KernelPartitionTypeGroup::{
             Binary, Boolean, Date, Decimal, Decimal256, Floating, Integer, String, Timestamp,
             TimestampNtz,
@@ -726,15 +720,6 @@ mod tests {
             (NullCheck, KernelExact),
             (BooleanShorthand, Unsupported),
             (Composition, KernelExact),
-        ];
-        let ordered_typed_restore_policy = [
-            (Equality, TypedRestorePending),
-            (Ordering, TypedRestorePending),
-            (Membership, TypedRestorePending),
-            (Between, TypedRestorePending),
-            (NullCheck, TypedRestorePending),
-            (BooleanShorthand, Unsupported),
-            (Composition, TypedRestorePending),
         ];
         let integer_policy = [
             (Equality, KernelExact),
@@ -826,7 +811,7 @@ mod tests {
         assert_type_policy(
             DataType::Decimal256(38, 18),
             Decimal256,
-            &ordered_typed_restore_policy,
+            &unsupported_policy,
         );
         for data_type in [DataType::Float32, DataType::Float64] {
             assert_type_policy(data_type, Floating, &floating_policy);
