@@ -329,6 +329,13 @@ fn datafusion_scalar_to_kernel_scalar(
         ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => {
             Ok(Scalar::String(value.clone()))
         }
+        ScalarValue::Binary(Some(value))
+        | ScalarValue::LargeBinary(Some(value))
+        | ScalarValue::FixedSizeBinary(_, Some(value))
+            if !value.is_empty() =>
+        {
+            Ok(Scalar::Binary(value.clone()))
+        }
         _ => Err(DeltaKernelPredicateAdapterError::UnsupportedLiteral),
     }
 }
@@ -584,6 +591,16 @@ mod tests {
                 Expression::Literal(Scalar::decimal(12_345, 10, 2)?)
             ))
         );
+        assert_eq!(
+            convert_datafusion_predicate(&col("payload").eq(Expr::Literal(
+                ScalarValue::Binary(Some(vec![1, 2, 3])),
+                None
+            ))),
+            Ok(Predicate::eq(
+                kernel_column("payload"),
+                Expression::Literal(Scalar::Binary(vec![1, 2, 3]))
+            ))
+        );
 
         Ok(())
     }
@@ -612,6 +629,18 @@ mod tests {
                 ScalarValue::LargeUtf8(Some("value".to_owned())),
                 Scalar::String("value".to_owned()),
             ),
+            (
+                ScalarValue::Binary(Some(vec![1, 2, 3])),
+                Scalar::Binary(vec![1, 2, 3]),
+            ),
+            (
+                ScalarValue::LargeBinary(Some(vec![1, 2, 3])),
+                Scalar::Binary(vec![1, 2, 3]),
+            ),
+            (
+                ScalarValue::FixedSizeBinary(3, Some(vec![1, 2, 3])),
+                Scalar::Binary(vec![1, 2, 3]),
+            ),
         ];
 
         for (datafusion_scalar, kernel_scalar) in supported {
@@ -637,10 +666,10 @@ mod tests {
             ScalarValue::UInt32(Some(7)),
             ScalarValue::UInt64(Some(7)),
             ScalarValue::Utf8View(Some("value".to_owned())),
-            ScalarValue::Binary(Some(vec![1, 2, 3])),
             ScalarValue::BinaryView(Some(vec![1, 2, 3])),
-            ScalarValue::FixedSizeBinary(3, Some(vec![1, 2, 3])),
-            ScalarValue::LargeBinary(Some(vec![1, 2, 3])),
+            ScalarValue::Binary(Some(Vec::new())),
+            ScalarValue::LargeBinary(Some(Vec::new())),
+            ScalarValue::FixedSizeBinary(0, Some(Vec::new())),
             ScalarValue::Date64(Some(7)),
             ScalarValue::Time32Second(Some(7)),
             ScalarValue::Time32Millisecond(Some(7)),
@@ -685,7 +714,6 @@ mod tests {
     #[test]
     fn datafusion_predicate_adapter_rejects_unproven_literal_types() {
         let timestamp = Expr::Literal(ScalarValue::TimestampMicrosecond(Some(12345), None), None);
-        let binary = Expr::Literal(ScalarValue::Binary(Some(vec![1, 2, 3])), None);
         let float_nan = Expr::Literal(ScalarValue::Float32(Some(f32::NAN)), None);
         let double_infinity = Expr::Literal(ScalarValue::Float64(Some(f64::INFINITY)), None);
         let decimal256 = Expr::Literal(ScalarValue::Decimal256(Some(12345.into()), 10, 2), None);
@@ -697,7 +725,6 @@ mod tests {
 
         for literal in [
             timestamp,
-            binary,
             float_nan,
             double_infinity,
             decimal256,
