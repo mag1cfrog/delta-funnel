@@ -38,7 +38,6 @@ enum KernelPartitionOperatorFamily {
     Between,
     NullCheck,
     BooleanShorthand,
-    Composition,
 }
 
 /// Plans the static partition operator policy for kernel-native pruning.
@@ -514,7 +513,7 @@ fn is_supported_kernel_partition_operator(
     operator_family: KernelPartitionOperatorFamily,
 ) -> bool {
     use KernelPartitionOperatorFamily::{
-        Between, BooleanShorthand, Composition, Equality, Membership, NullCheck, Ordering,
+        Between, BooleanShorthand, Equality, Membership, NullCheck, Ordering,
     };
     use KernelPartitionTypeGroup::{
         Binary, Boolean, Date, Decimal, Decimal256, Floating, Integer, String, Timestamp,
@@ -523,36 +522,36 @@ fn is_supported_kernel_partition_operator(
 
     match kernel_partition_type_group(data_type) {
         String => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => true,
+            Equality | Ordering | Membership | Between | NullCheck => true,
             BooleanShorthand => false,
         },
         Integer => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => true,
+            Equality | Ordering | Membership | Between | NullCheck => true,
             BooleanShorthand => false,
         },
         Date => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => true,
+            Equality | Ordering | Membership | Between | NullCheck => true,
             BooleanShorthand => false,
         },
         Decimal => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => true,
+            Equality | Ordering | Membership | Between | NullCheck => true,
             BooleanShorthand => false,
         },
         Decimal256 => false,
         Timestamp | TimestampNtz => match operator_family {
-            Equality | Ordering | Membership | Between | NullCheck | Composition => true,
+            Equality | Ordering | Membership | Between | NullCheck => true,
             BooleanShorthand => false,
         },
         Floating => match operator_family {
-            Equality | Membership | NullCheck | Composition => true,
+            Equality | Membership | NullCheck => true,
             Ordering | Between | BooleanShorthand => false,
         },
         Boolean => match operator_family {
-            Equality | Membership | NullCheck | BooleanShorthand | Composition => true,
+            Equality | Membership | NullCheck | BooleanShorthand => true,
             Ordering | Between => false,
         },
         Binary => match operator_family {
-            Equality | Membership | NullCheck | Composition => true,
+            Equality | Membership | NullCheck => true,
             Ordering | Between | BooleanShorthand => false,
         },
         KernelPartitionTypeGroup::Unsupported => false,
@@ -687,7 +686,7 @@ mod tests {
     #[test]
     fn kernel_partition_admission_documents_supported_type_operator_families() {
         use KernelPartitionOperatorFamily::{
-            Between, BooleanShorthand, Composition, Equality, Membership, NullCheck, Ordering,
+            Between, BooleanShorthand, Equality, Membership, NullCheck, Ordering,
         };
         use KernelPartitionTypeGroup::{
             Binary, Boolean, Date, Decimal, Decimal256, Floating, Integer, String, Timestamp,
@@ -701,7 +700,6 @@ mod tests {
             (Between, true),
             (NullCheck, true),
             (BooleanShorthand, false),
-            (Composition, true),
         ];
         let integer_admission = [
             (Equality, true),
@@ -710,7 +708,6 @@ mod tests {
             (Between, true),
             (NullCheck, true),
             (BooleanShorthand, false),
-            (Composition, true),
         ];
         let boolean_admission = [
             (Equality, true),
@@ -719,7 +716,6 @@ mod tests {
             (Between, false),
             (NullCheck, true),
             (BooleanShorthand, true),
-            (Composition, true),
         ];
         let floating_admission = [
             (Equality, true),
@@ -728,7 +724,6 @@ mod tests {
             (Between, false),
             (NullCheck, true),
             (BooleanShorthand, false),
-            (Composition, true),
         ];
         let date_admission = [
             (Equality, true),
@@ -737,7 +732,6 @@ mod tests {
             (Between, true),
             (NullCheck, true),
             (BooleanShorthand, false),
-            (Composition, true),
         ];
         let decimal_admission = [
             (Equality, true),
@@ -746,7 +740,6 @@ mod tests {
             (Between, true),
             (NullCheck, true),
             (BooleanShorthand, false),
-            (Composition, true),
         ];
         let timestamp_admission = [
             (Equality, true),
@@ -755,7 +748,6 @@ mod tests {
             (Between, true),
             (NullCheck, true),
             (BooleanShorthand, false),
-            (Composition, true),
         ];
         let binary_admission = [
             (Equality, true),
@@ -764,7 +756,6 @@ mod tests {
             (Between, false),
             (NullCheck, true),
             (BooleanShorthand, false),
-            (Composition, true),
         ];
         let unsupported_admission = [
             (Equality, false),
@@ -773,7 +764,6 @@ mod tests {
             (Between, false),
             (NullCheck, false),
             (BooleanShorthand, false),
-            (Composition, false),
         ];
 
         for data_type in [DataType::Utf8, DataType::LargeUtf8] {
