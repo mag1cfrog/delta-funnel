@@ -241,10 +241,11 @@ mod tests {
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Expr, col, lit};
 
+    use super::kernel::{ColumnName, Expression, Predicate, Scalar};
     use super::partition_metadata_predicate::DeltaPartitionNameMap;
     use super::{
-        DeltaPartitionMetadataPredicate, DeltaSourceConfig, ProjectedDeltaScan,
-        build_projected_delta_scan, build_projected_predicated_delta_scan,
+        DeltaKernelPredicate, DeltaPartitionMetadataPredicate, DeltaSourceConfig,
+        ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
         datafusion_expr_to_kernel_predicate, load_delta_source, load_delta_sources,
     };
     use crate::DeltaFunnelError;
@@ -295,6 +296,7 @@ mod tests {
     const BOOLEAN_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["is_current"],"configuration":{},"createdTime":1587968585495}}"#;
     const DATE_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["event_date"],"configuration":{},"createdTime":1587968585495}}"#;
     const DECIMAL_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["amount"],"configuration":{},"createdTime":1587968585495}}"#;
+    const FLOATING_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"float_part\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_part\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["float_part","double_part"],"configuration":{},"createdTime":1587968585495}}"#;
 
     fn add_json(path: &str) -> String {
         format!(
@@ -468,11 +470,64 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_floating_partition_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-floating-partition-characterization",
+            FLOATING_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json(
+                    "floating-neg.parquet",
+                    r#"{"float_part":"-1.5","double_part":"-2.25"}"#,
+                ),
+                partitioned_add_json(
+                    "floating-neg-zero.parquet",
+                    r#"{"float_part":"-0.0","double_part":"-0.0"}"#,
+                ),
+                partitioned_add_json(
+                    "floating-pos-zero.parquet",
+                    r#"{"float_part":"0.0","double_part":"0.0"}"#,
+                ),
+                partitioned_add_json(
+                    "floating-one.parquet",
+                    r#"{"float_part":"1.5","double_part":"2.25"}"#,
+                ),
+                partitioned_add_json(
+                    "floating-ten.parquet",
+                    r#"{"float_part":"10.0","double_part":"10.0"}"#,
+                ),
+                partitioned_add_json(
+                    "floating-null.parquet",
+                    r#"{"float_part":null,"double_part":null}"#,
+                ),
+                partitioned_add_json(
+                    "floating-empty.parquet",
+                    r#"{"float_part":"","double_part":""}"#,
+                ),
+                partitioned_add_json("floating-missing.parquet", r#"{}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_predicated_file_paths(
         source: &super::PlannedDeltaSource,
         filter: &datafusion::logical_expr::Expr,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let predicate = datafusion_expr_to_kernel_predicate(filter)?;
+        kernel_predicate_file_paths(source, predicate)
+    }
+
+    fn kernel_predicate_file_paths(
+        source: &super::PlannedDeltaSource,
+        predicate: DeltaKernelPredicate,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let scan = build_projected_predicated_delta_scan(source, None, Some(predicate))?;
 
         kernel_scan_file_paths(&scan, source.table_uri())
@@ -504,6 +559,14 @@ mod tests {
 
     fn decimal_lit(value: i128) -> Expr {
         Expr::Literal(ScalarValue::Decimal128(Some(value), 10, 2), None)
+    }
+
+    fn float32_lit(value: f32) -> Expr {
+        Expr::Literal(ScalarValue::Float32(Some(value)), None)
+    }
+
+    fn float64_lit(value: f64) -> Expr {
+        Expr::Literal(ScalarValue::Float64(Some(value)), None)
     }
 
     fn assert_invalid_integer_partition_error(
@@ -587,6 +650,31 @@ mod tests {
         assert!(
             debug_message.contains("Decimal") || debug_message.contains("ParseIntError"),
             "{debug_message}"
+        );
+
+        Ok(())
+    }
+
+    fn assert_invalid_floating_partition_error(
+        result: Result<Vec<String>, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = match result {
+            Ok(paths) => {
+                return Err(format!(
+                    "invalid floating metadata should fail kernel scan: {paths:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let debug_message = format!("{error:?}");
+        assert!(
+            message.contains("not-a-float")
+                || message.contains("not-a-double")
+                || debug_message.contains("InvalidFloat")
+                || debug_message.contains("ParseFloatError"),
+            "{message}\n{debug_message}"
         );
 
         Ok(())
@@ -1155,6 +1243,277 @@ mod tests {
             &scale_mismatch_source,
             &col("amount").eq(decimal_lit(12_345)),
         ))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_floating_numeric_ordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_floating_partition_characterization_source()?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec![
+                "floating-empty.parquet",
+                "floating-missing.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-null.parquet",
+                "floating-one.parquet",
+                "floating-pos-zero.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("float_part").gt(float32_lit(1.5)))?,
+            vec!["floating-ten.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("double_part").lt(float64_lit(0.0)))?,
+            vec!["floating-neg-zero.parquet", "floating-neg.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &float64_lit(0.0).gt(col("double_part")))?,
+            vec!["floating-neg-zero.parquet", "floating-neg.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("float_part").lt(float32_lit(10.0)))?,
+            vec![
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-one.parquet",
+                "floating-pos-zero.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_floating_null_and_zero_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_floating_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("float_part").is_null())?,
+            vec![
+                "floating-empty.parquet",
+                "floating-missing.parquet",
+                "floating-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("double_part").is_not_null())?,
+            vec![
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-one.parquet",
+                "floating-pos-zero.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("float_part").eq(float32_lit(-0.0)))?,
+            vec!["floating-neg-zero.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("float_part").eq(float32_lit(0.0)))?,
+            vec!["floating-pos-zero.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("double_part").not_eq(float64_lit(0.0)))?,
+            vec![
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-one.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_floating_membership_between_and_composition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_floating_partition_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("float_part").in_list(vec![float32_lit(-1.5), float32_lit(1.5)], false),
+            )?,
+            vec!["floating-neg.parquet", "floating-one.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("double_part").in_list(vec![float64_lit(2.25)], true),
+            )?,
+            vec![
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-pos-zero.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("float_part").between(float32_lit(-0.0), float32_lit(1.5)),
+            )?,
+            vec![
+                "floating-neg-zero.parquet",
+                "floating-one.parquet",
+                "floating-pos-zero.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("double_part").not_between(float64_lit(0.0), float64_lit(2.25)),
+            )?,
+            vec![
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("float_part")
+                    .gt_eq(float32_lit(0.0))
+                    .and(col("float_part").lt(float32_lit(10.0))),
+            )?,
+            vec!["floating-one.parquet", "floating-pos-zero.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &col("double_part")
+                    .eq(float64_lit(-2.25))
+                    .or(col("double_part").eq(float64_lit(10.0))),
+            )?,
+            vec!["floating-neg.parquet", "floating-ten.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(
+                &source,
+                &Expr::Not(Box::new(col("float_part").eq(float32_lit(1.5)))),
+            )?,
+            vec![
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-pos-zero.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_invalid_floating_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let invalid_text_table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-invalid-floating-characterization",
+            FLOATING_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json(
+                    "floating-valid.parquet",
+                    r#"{"float_part":"1.5","double_part":"2.25"}"#,
+                ),
+                partitioned_add_json(
+                    "floating-invalid.parquet",
+                    r#"{"float_part":"not-a-float","double_part":"not-a-double"}"#,
+                ),
+            ],
+        )?;
+        let invalid_text_source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: invalid_text_table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&invalid_text_source, None)?;
+
+        assert_invalid_floating_partition_error(kernel_scan_file_paths(
+            &unfiltered_scan,
+            invalid_text_source.table_uri(),
+        ))?;
+        assert_invalid_floating_partition_error(kernel_predicated_file_paths(
+            &invalid_text_source,
+            &col("float_part").eq(float32_lit(1.5)),
+        ))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_characterization_documents_nonfinite_floating_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-nonfinite-floating-characterization",
+            FLOATING_PARTITIONED_METADATA_JSON,
+            &[
+                partitioned_add_json(
+                    "floating-valid.parquet",
+                    r#"{"float_part":"1.5","double_part":"2.25"}"#,
+                ),
+                partitioned_add_json(
+                    "floating-nan.parquet",
+                    r#"{"float_part":"NaN","double_part":"NaN"}"#,
+                ),
+                partitioned_add_json(
+                    "floating-inf.parquet",
+                    r#"{"float_part":"Infinity","double_part":"Infinity"}"#,
+                ),
+                partitioned_add_json(
+                    "floating-neg-inf.parquet",
+                    r#"{"float_part":"-Infinity","double_part":"-Infinity"}"#,
+                ),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let unfiltered_scan = build_projected_delta_scan(&source, None)?;
+
+        assert_eq!(
+            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            vec![
+                "floating-inf.parquet",
+                "floating-nan.parquet",
+                "floating-neg-inf.parquet",
+                "floating-valid.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("float_part").gt(float32_lit(0.0)))?,
+            vec![
+                "floating-inf.parquet",
+                "floating-nan.parquet",
+                "floating-valid.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_file_paths(&source, &col("double_part").lt(float64_lit(0.0)))?,
+            vec!["floating-neg-inf.parquet"]
+        );
+        assert_eq!(
+            kernel_predicate_file_paths(
+                &source,
+                DeltaKernelPredicate::new(Predicate::eq(
+                    Expression::Column(ColumnName::new(["float_part"])),
+                    Expression::Literal(Scalar::Float(f32::NAN)),
+                )),
+            )?,
+            vec!["floating-nan.parquet"]
+        );
 
         Ok(())
     }
