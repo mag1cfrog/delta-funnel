@@ -104,6 +104,27 @@ pub(crate) fn build_projected_predicated_scan(
     Ok((scan, schema))
 }
 
+/// Builds test scan state with parsed file statistics exposed in scan metadata.
+#[cfg(test)]
+pub(crate) fn build_projected_predicated_stats_scan(
+    snapshot: &SnapshotRef,
+    projected_column_names: Option<&[String]>,
+    predicate: Option<DeltaKernelPredicate>,
+) -> delta_kernel::DeltaResult<(Scan, KernelSchemaRef)> {
+    let schema = match projected_column_names {
+        Some(names) => snapshot.schema().project(names)?,
+        None => snapshot.schema(),
+    };
+    let scan = Arc::clone(snapshot)
+        .scan_builder()
+        .with_schema(Arc::clone(&schema))
+        .with_predicate(predicate.map(DeltaKernelPredicate::into_inner))
+        .include_all_stats_columns()
+        .build()?;
+
+    Ok((scan, schema))
+}
+
 /// Private wrapper around an official `delta_kernel` predicate.
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
