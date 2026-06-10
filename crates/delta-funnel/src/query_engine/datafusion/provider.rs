@@ -478,6 +478,27 @@ mod tests {
         )
     }
 
+    fn id_partial_stats_add_json(
+        num_records: i64,
+        min_value: Option<i32>,
+        max_value: Option<i32>,
+        null_count: i64,
+    ) -> String {
+        let mut stats_fields = vec![format!(r#"\"numRecords\":{num_records}"#)];
+        if let Some(min_value) = min_value {
+            stats_fields.push(format!(r#"\"minValues\":{{\"id\":{min_value}}}"#));
+        }
+        if let Some(max_value) = max_value {
+            stats_fields.push(format!(r#"\"maxValues\":{{\"id\":{max_value}}}"#));
+        }
+        stats_fields.push(format!(r#"\"nullCount\":{{\"id\":{null_count}}}"#));
+
+        format!(
+            r#""partitionValues":{{}},"stats":"{{{}}}""#,
+            stats_fields.join(",")
+        )
+    }
+
     #[test]
     fn datafusion_table_provider_api_symbols_are_available() -> datafusion::error::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -854,6 +875,87 @@ mod tests {
                     "part-00001.parquet",
                     "part-00002.parquet",
                     "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            assert_eq!(
+                provider.supports_filters_pushdown(&[&filter])?,
+                vec![TableProviderFilterPushDown::Inexact],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.inexact_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_keeps_partial_integer_stats_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let max_only_low_stats = id_partial_stats_add_json(10, None, Some(5), 0);
+        let min_only_high_stats = id_partial_stats_add_json(10, Some(8), None, 0);
+        let max_only_high_stats = id_partial_stats_add_json(10, None, Some(10), 0);
+        let min_only_low_stats = id_partial_stats_add_json(10, Some(1), None, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-integer-data-stats-partial",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                max_only_low_stats.as_str(),
+                min_only_high_stats.as_str(),
+                max_only_high_stats.as_str(),
+                min_only_low_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "greater than",
+                datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(7_i32)),
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "less than",
+                datafusion::logical_expr::col("id").lt(datafusion::logical_expr::lit(7_i32)),
+                vec![
+                    "part-00000.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
                 ],
             ),
         ];
