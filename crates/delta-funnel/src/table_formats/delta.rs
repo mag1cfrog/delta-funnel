@@ -219,6 +219,8 @@ mod tests {
 
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Expr, col, lit};
+    use delta_kernel::arrow::array::{Array, StructArray};
+    use delta_kernel::arrow::record_batch::RecordBatch;
 
     use super::kernel::{ColumnName, Expression, Predicate, Scalar};
     use super::{
@@ -299,6 +301,18 @@ mod tests {
     fn partitioned_add_json(path: &str, partition_values_json: &str) -> String {
         format!(
             r#"{{"add":{{"path":"{path}","partitionValues":{partition_values_json},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+        )
+    }
+
+    fn add_json_with_id_stats(
+        path: &str,
+        num_records: i64,
+        min_value: i32,
+        max_value: i32,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"id\":{min_value}}},\"maxValues\":{{\"id\":{max_value}}},\"nullCount\":{{\"id\":{null_count}}}}}"}}}}"#
         )
     }
 
@@ -644,6 +658,26 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-data-stats-characterization",
+            METADATA_JSON,
+            &[
+                add_json_with_id_stats("id-impossible.parquet", 10, 1, 50, 0),
+                add_json_with_id_stats("id-possible.parquet", 10, 101, 150, 0),
+                add_json("id-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_predicated_file_paths(
         source: &super::PlannedDeltaSource,
         filter: &datafusion::logical_expr::Expr,
@@ -659,6 +693,114 @@ mod tests {
         let scan = build_projected_predicated_delta_scan(source, None, Some(predicate))?;
 
         kernel_scan_file_paths(&scan, source.table_uri())
+    }
+
+    fn build_projected_predicated_stats_delta_scan(
+        source: &super::PlannedDeltaSource,
+        predicate: Option<DeltaKernelPredicate>,
+    ) -> Result<ProjectedDeltaScan, delta_kernel::Error> {
+        let (scan, kernel_schema) = super::kernel::build_projected_predicated_stats_scan(
+            source.loaded_snapshot().kernel_snapshot(),
+            None,
+            predicate,
+        )?;
+
+        Ok(ProjectedDeltaScan {
+            scan,
+            kernel_schema,
+        })
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct KernelStatsMetadataBoundary {
+        selected_rows: usize,
+        selected_stats_rows: usize,
+        selected_missing_stats_rows: usize,
+        has_id_min_values: bool,
+        has_id_max_values: bool,
+        has_id_null_count: bool,
+    }
+
+    fn kernel_stats_metadata_boundary(
+        scan: &ProjectedDeltaScan,
+        table_uri: &str,
+    ) -> Result<KernelStatsMetadataBoundary, Box<dyn std::error::Error>> {
+        let table_url = super::kernel::try_parse_uri(table_uri)?;
+        let store =
+            super::kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
+        let engine = super::kernel::DefaultEngineBuilder::new(store).build();
+        let mut boundary = KernelStatsMetadataBoundary::default();
+
+        for scan_metadata in scan.kernel_scan().scan_metadata(&engine)? {
+            let (underlying_data, selection_vector) = scan_metadata?.scan_files.into_parts();
+            let batch: RecordBatch =
+                super::kernel::ArrowEngineData::try_from_engine_data(underlying_data)?.into();
+            let stats_parsed = stats_parsed_column(&batch)?;
+            let min_values = stats_struct_child(stats_parsed, "minValues")?;
+            let max_values = stats_struct_child(stats_parsed, "maxValues")?;
+            let null_count = stats_struct_child(stats_parsed, "nullCount")?;
+            let min_id = stats_struct_child_column(min_values, "id")?;
+            let max_id = stats_struct_child_column(max_values, "id")?;
+            let null_count_id = stats_struct_child_column(null_count, "id")?;
+
+            boundary.has_id_min_values |= min_values.column_by_name("id").is_some();
+            boundary.has_id_max_values |= max_values.column_by_name("id").is_some();
+            boundary.has_id_null_count |= null_count.column_by_name("id").is_some();
+
+            for (row_index, selected) in selection_vector.iter().copied().enumerate() {
+                if selected {
+                    boundary.selected_rows += 1;
+                    if !min_id.is_null(row_index)
+                        && !max_id.is_null(row_index)
+                        && !null_count_id.is_null(row_index)
+                    {
+                        boundary.selected_stats_rows += 1;
+                    } else {
+                        boundary.selected_missing_stats_rows += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(boundary)
+    }
+
+    fn stats_parsed_column(
+        batch: &RecordBatch,
+    ) -> Result<&StructArray, Box<dyn std::error::Error>> {
+        let Some(column) = batch.column_by_name("stats_parsed") else {
+            return Err("scan metadata did not expose stats_parsed".into());
+        };
+        let Some(stats_parsed) = column.as_any().downcast_ref::<StructArray>() else {
+            return Err("scan metadata stats_parsed was not a struct array".into());
+        };
+
+        Ok(stats_parsed)
+    }
+
+    fn stats_struct_child<'a>(
+        stats_parsed: &'a StructArray,
+        name: &str,
+    ) -> Result<&'a StructArray, Box<dyn std::error::Error>> {
+        let Some(column) = stats_parsed.column_by_name(name) else {
+            return Err(format!("scan metadata stats_parsed did not expose {name}").into());
+        };
+        let Some(stats_child) = column.as_any().downcast_ref::<StructArray>() else {
+            return Err(format!("scan metadata stats_parsed.{name} was not a struct array").into());
+        };
+
+        Ok(stats_child)
+    }
+
+    fn stats_struct_child_column<'a>(
+        stats_child: &'a StructArray,
+        name: &str,
+    ) -> Result<&'a dyn Array, Box<dyn std::error::Error>> {
+        let Some(column) = stats_child.column_by_name(name) else {
+            return Err(format!("scan metadata stats_parsed child did not expose {name}").into());
+        };
+
+        Ok(column.as_ref())
     }
 
     fn int8_lit(value: i8) -> Expr {
@@ -962,6 +1104,38 @@ mod tests {
         assert_eq!(
             kernel_scan_file_paths(&predicated_scan, source.table_uri())?,
             vec!["region-us-west.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_stats_scan_metadata_exposes_parsed_file_stats_without_data_file_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (table, source) = kernel_data_stats_characterization_source()?;
+        let stats_scan = build_projected_predicated_stats_delta_scan(&source, None)?;
+
+        assert!(!table.path.join("id-impossible.parquet").exists());
+        assert!(!table.path.join("id-possible.parquet").exists());
+        assert!(!table.path.join("id-missing-stats.parquet").exists());
+        assert_eq!(
+            kernel_scan_file_paths(&stats_scan, source.table_uri())?,
+            vec![
+                "id-impossible.parquet",
+                "id-missing-stats.parquet",
+                "id-possible.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_stats_metadata_boundary(&stats_scan, source.table_uri())?,
+            KernelStatsMetadataBoundary {
+                selected_rows: 3,
+                selected_stats_rows: 2,
+                selected_missing_stats_rows: 1,
+                has_id_min_values: true,
+                has_id_max_values: true,
+                has_id_null_count: true,
+            }
         );
 
         Ok(())
