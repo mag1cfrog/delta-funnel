@@ -255,6 +255,35 @@ fn string_partial_stats_add_json(num_records: i64, null_count: Option<i64>) -> S
     )
 }
 
+fn string_partial_bounds_stats_add_json(
+    num_records: i64,
+    min_value: Option<&str>,
+    max_value: Option<&str>,
+    null_count: Option<i64>,
+) -> String {
+    let mut stats_fields = vec![format!(r#"\"numRecords\":{num_records}"#)];
+    if let Some(min_value) = min_value {
+        stats_fields.push(format!(
+            r#"\"minValues\":{{\"customer_name\":\"{min_value}\"}}"#
+        ));
+    }
+    if let Some(max_value) = max_value {
+        stats_fields.push(format!(
+            r#"\"maxValues\":{{\"customer_name\":\"{max_value}\"}}"#
+        ));
+    }
+    if let Some(null_count) = null_count {
+        stats_fields.push(format!(
+            r#"\"nullCount\":{{\"customer_name\":{null_count}}}"#
+        ));
+    }
+
+    format!(
+        r#""partitionValues":{{}},"stats":"{{{}}}""#,
+        stats_fields.join(",")
+    )
+}
+
 fn decimal_partial_stats_add_json(num_records: i64, null_count: Option<i64>) -> String {
     let mut stats_fields = vec![format!(r#"\"numRecords\":{num_records}"#)];
     if let Some(null_count) = null_count {
@@ -1378,6 +1407,62 @@ async fn table_provider_scan_uses_string_null_count_stats_pruning()
         assert!(scan.scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_keeps_partial_string_bounds_uncertain()
+-> Result<(), Box<dyn std::error::Error>> {
+    let full_impossible_stats = string_stats_add_json(10, "aaron", "bob", 0);
+    let min_only_stats = string_partial_bounds_stats_add_json(10, Some("aaron"), None, Some(0));
+    let max_only_stats = string_partial_bounds_stats_add_json(10, None, Some("bob"), Some(0));
+    let counts_only_stats = string_partial_bounds_stats_add_json(10, None, None, Some(0));
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-string-partial-bounds-data-stats",
+        DEFAULT_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[
+            full_impossible_stats.as_str(),
+            min_only_stats.as_str(),
+            max_only_stats.as_str(),
+            counts_only_stats.as_str(),
+            r#""partitionValues":{}"#,
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+    let filter =
+        datafusion::logical_expr::col("customer_name").eq(datafusion::logical_expr::lit("carol"));
+    assert_eq!(
+        provider.supports_filters_pushdown(&[&filter])?,
+        vec![TableProviderFilterPushDown::Inexact]
+    );
+
+    let plan = provider
+        .scan(&state, Some(&vec![0, 1]), &[filter], None)
+        .await?;
+    let scan = plan
+        .as_any()
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+
+    assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+    assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+    assert_eq!(
+        scan_file_paths(scan)?,
+        vec![
+            "part-00001.parquet",
+            "part-00003.parquet",
+            "part-00004.parquet"
+        ]
+    );
 
     Ok(())
 }
