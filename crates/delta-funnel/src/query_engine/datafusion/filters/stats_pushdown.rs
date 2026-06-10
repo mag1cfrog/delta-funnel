@@ -8,11 +8,11 @@ use crate::table_formats::datafusion_expr_to_kernel_predicate;
 
 use super::{ExactPartitionKernelFilter, KernelScanFilterKind};
 
-pub(super) fn try_integer_data_stats_kernel_filter(
+pub(super) fn try_data_stats_kernel_filter(
     filter: &Expr,
     schema: &SchemaRef,
 ) -> Option<ExactPartitionKernelFilter> {
-    if !is_supported_integer_data_stats_filter(filter, schema) {
+    if !is_supported_data_stats_filter(filter, schema) {
         return None;
     }
 
@@ -21,6 +21,11 @@ pub(super) fn try_integer_data_stats_kernel_filter(
         kernel_predicate: datafusion_expr_to_kernel_predicate(filter).ok()?,
         kind: KernelScanFilterKind::DataStats,
     })
+}
+
+fn is_supported_data_stats_filter(filter: &Expr, schema: &SchemaRef) -> bool {
+    is_supported_integer_data_stats_filter(filter, schema)
+        || is_supported_boolean_null_count_stats_filter(filter, schema)
 }
 
 fn is_supported_integer_data_stats_filter(filter: &Expr, schema: &SchemaRef) -> bool {
@@ -46,6 +51,29 @@ fn is_supported_integer_data_stats_filter(filter: &Expr, schema: &SchemaRef) -> 
             binary.left.as_ref(),
             schema,
         )
+}
+
+fn is_supported_boolean_null_count_stats_filter(filter: &Expr, schema: &SchemaRef) -> bool {
+    match filter {
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            is_boolean_data_column(inner.as_ref(), schema)
+        }
+        _ => false,
+    }
+}
+
+fn is_boolean_data_column(expr: &Expr, schema: &SchemaRef) -> bool {
+    let Expr::Column(column) = expr else {
+        return false;
+    };
+
+    if !is_unqualified_top_level_column(column) {
+        return false;
+    }
+
+    schema
+        .field_with_name(&column.name)
+        .is_ok_and(|field| matches!(field.data_type(), DataType::Boolean))
 }
 
 fn is_same_width_integer_data_column_literal(

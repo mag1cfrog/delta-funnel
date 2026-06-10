@@ -376,6 +376,95 @@ mod tests {
     }
 
     #[test]
+    fn filter_pushdown_accepts_boolean_null_count_data_stats_filters_as_inexact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const BOOLEAN_DATA_SCHEMA_FIELDS_JSON: &str =
+            r#"[{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-boolean-data-stats-null-counts",
+            BOOLEAN_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let filters = [col("is_current").is_null(), col("is_current").is_not_null()];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Inexact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.residual
+                && decision
+                    .kernel_scan_filter
+                    .as_ref()
+                    .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_rejects_unproven_boolean_data_stats_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const BOOLEAN_DATA_SCHEMA_FIELDS_JSON: &str =
+            r#"[{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-boolean-data-stats-unsupported",
+            BOOLEAN_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let filters = [
+            col("is_current").eq(lit(true)),
+            col("is_current").not_eq(lit(true)),
+            col("is_current"),
+            Expr::Not(Box::new(col("is_current"))),
+            col("is_current").in_list(vec![lit(true)], false),
+            col("is_current").lt(lit(true)),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Unsupported
+                && decision.residual
+                && decision.kernel_scan_filter.is_none()
+        }));
+
+        Ok(())
+    }
+
+    #[test]
     fn filter_pushdown_rejects_unproven_integer_data_stats_shapes()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("filter-pushdown-integer-data-stats-unsupported")?;
