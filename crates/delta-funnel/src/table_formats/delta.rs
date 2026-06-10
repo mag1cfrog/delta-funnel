@@ -678,6 +678,25 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_all_sufficient_data_stats_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-all-sufficient-data-stats",
+            METADATA_JSON,
+            &[
+                add_json_with_id_stats("id-low-a.parquet", 10, 1, 50, 0),
+                add_json_with_id_stats("id-low-b.parquet", 10, 51, 100, 0),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_predicated_file_paths(
         source: &super::PlannedDeltaSource,
         filter: &datafusion::logical_expr::Expr,
@@ -709,6 +728,16 @@ mod tests {
             scan,
             kernel_schema,
         })
+    }
+
+    fn kernel_predicated_stats_file_paths(
+        source: &super::PlannedDeltaSource,
+        filter: &datafusion::logical_expr::Expr,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let predicate = datafusion_expr_to_kernel_predicate(filter)?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, Some(predicate))?;
+
+        kernel_scan_file_paths(&scan, source.table_uri())
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -1136,6 +1165,32 @@ mod tests {
                 has_id_max_values: true,
                 has_id_null_count: true,
             }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_data_column_stats_pruning_keeps_possible_and_missing_stats_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("id").gt(int32_lit(100)))?,
+            vec!["id-missing-stats.parquet", "id-possible.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_data_column_stats_pruning_can_return_empty_when_all_stats_are_impossible()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_all_sufficient_data_stats_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("id").gt(int32_lit(100)))?,
+            Vec::<String>::new()
         );
 
         Ok(())
