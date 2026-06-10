@@ -229,6 +229,18 @@ fn string_stats_add_json(
     )
 }
 
+fn partitioned_string_stats_add_json(
+    partition_values_json: &str,
+    num_records: i64,
+    min_value: &str,
+    max_value: &str,
+    null_count: i64,
+) -> String {
+    format!(
+        r#""partitionValues":{partition_values_json},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"customer_name\":\"{min_value}\"}},\"maxValues\":{{\"customer_name\":\"{max_value}\"}},\"nullCount\":{{\"customer_name\":{null_count}}}}}""#
+    )
+}
+
 fn string_partial_stats_add_json(num_records: i64, null_count: Option<i64>) -> String {
     let mut stats_fields = vec![format!(r#"\"numRecords\":{num_records}"#)];
     if let Some(null_count) = null_count {
@@ -1440,6 +1452,67 @@ async fn table_provider_scan_accepts_projected_string_data_stats_when_residual_c
     assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
     assert!(scan.scan_plan().kernel_partition_predicate.is_some());
     assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_uses_top_level_and_partition_and_string_data_stats_filter()
+-> Result<(), Box<dyn std::error::Error>> {
+    const MIXED_STRING_STATS_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
+    let west_low_stats =
+        partitioned_string_stats_add_json(r#"{"region":"us-west"}"#, 10, "bob", "bob", 0);
+    let west_target_stats =
+        partitioned_string_stats_add_json(r#"{"region":"us-west"}"#, 10, "alice", "alice", 0);
+    let east_target_stats =
+        partitioned_string_stats_add_json(r#"{"region":"us-east"}"#, 10, "alice", "alice", 0);
+    let west_missing_stats = r#""partitionValues":{"region":"us-west"}"#;
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-top-level-and-partition-string-data-stats",
+        MIXED_STRING_STATS_SCHEMA_FIELDS_JSON,
+        r#"["region"]"#,
+        &[
+            west_low_stats.as_str(),
+            west_target_stats.as_str(),
+            east_target_stats.as_str(),
+            west_missing_stats,
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+    let filter = datafusion::logical_expr::col("region")
+        .eq(datafusion::logical_expr::lit("us-west"))
+        .and(
+            datafusion::logical_expr::col("customer_name")
+                .eq(datafusion::logical_expr::lit("alice")),
+        );
+    assert_eq!(
+        provider.supports_filters_pushdown(&[&filter])?,
+        vec![TableProviderFilterPushDown::Inexact]
+    );
+
+    let plan = provider.scan(&state, None, &[filter], None).await?;
+    let scan = plan
+        .as_any()
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+
+    assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
+    assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+    assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+    assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+    assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+    assert_eq!(
+        scan_file_paths(scan)?,
+        vec!["part-00001.parquet", "part-00003.parquet"]
+    );
 
     Ok(())
 }
