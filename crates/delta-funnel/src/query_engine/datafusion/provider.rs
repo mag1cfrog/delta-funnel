@@ -635,6 +635,18 @@ mod tests {
         )
     }
 
+    fn partitioned_decimal_stats_add_json(
+        partition_values_json: &str,
+        num_records: i64,
+        min_value: &str,
+        max_value: &str,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#""partitionValues":{partition_values_json},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"amount\":\"{min_value}\"}},\"maxValues\":{{\"amount\":\"{max_value}\"}},\"nullCount\":{{\"amount\":{null_count}}}}}""#
+        )
+    }
+
     fn decimal_partial_stats_add_json(num_records: i64, null_count: Option<i64>) -> String {
         let mut stats_fields = vec![format!(r#"\"numRecords\":{num_records}"#)];
         if let Some(null_count) = null_count {
@@ -1676,6 +1688,65 @@ mod tests {
         assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
         assert!(scan.scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_top_level_and_partition_and_decimal_data_stats_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MIXED_DECIMAL_STATS_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
+        let west_low_stats =
+            partitioned_decimal_stats_add_json(r#"{"region":"us-west"}"#, 10, "0.00", "0.00", 0);
+        let west_target_stats =
+            partitioned_decimal_stats_add_json(r#"{"region":"us-west"}"#, 10, "2.00", "2.00", 0);
+        let east_target_stats =
+            partitioned_decimal_stats_add_json(r#"{"region":"us-east"}"#, 10, "2.00", "2.00", 0);
+        let west_missing_stats = r#""partitionValues":{"region":"us-west"}"#;
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-top-level-and-partition-decimal-data-stats",
+            MIXED_DECIMAL_STATS_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                west_low_stats.as_str(),
+                west_target_stats.as_str(),
+                east_target_stats.as_str(),
+                west_missing_stats,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let amount = Expr::Literal(ScalarValue::Decimal128(Some(200), 10, 2), None);
+        let filter = datafusion::logical_expr::col("region")
+            .eq(datafusion::logical_expr::lit("us-west"))
+            .and(datafusion::logical_expr::col("amount").eq(amount));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider.scan(&state, None, &[filter], None).await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(
+            scan_file_paths(scan)?,
+            vec!["part-00001.parquet", "part-00003.parquet"]
+        );
 
         Ok(())
     }
