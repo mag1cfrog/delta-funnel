@@ -695,8 +695,6 @@ mod tests {
         assert!(plan.decisions.iter().all(|decision| {
             decision.outcome == DeltaFilterPushdownOutcome::Unsupported
                 && decision.residual
-                && decision.rejection_reason
-                    == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
                 && decision.kernel_scan_filter.is_none()
         }));
 
@@ -810,6 +808,8 @@ mod tests {
         assert!(plan.decisions.iter().all(|decision| {
             decision.outcome == DeltaFilterPushdownOutcome::Unsupported
                 && decision.residual
+                && decision.rejection_reason
+                    == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
                 && decision.kernel_scan_filter.is_none()
         }));
 
