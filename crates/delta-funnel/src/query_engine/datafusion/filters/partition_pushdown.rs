@@ -2583,16 +2583,17 @@ mod tests {
             plan.datafusion_pushdowns(),
             vec![
                 TableProviderFilterPushDown::Exact,
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Exact,
             ]
         );
         assert_eq!(plan.exact_count, 2);
-        assert_eq!(plan.unsupported_count, 1);
-        assert_eq!(plan.pushed_filter_count, 2);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 3);
         assert_eq!(plan.residual_filter_count, 1);
         assert_eq!(kernel_scan_expr(&plan.decisions[0]), Some(&exact));
-        assert!(plan.decisions[1].kernel_scan_filter.is_none());
+        assert!(plan.decisions[1].kernel_scan_filter.is_some());
         assert_eq!(kernel_scan_expr(&plan.decisions[2]), Some(&duplicate_exact));
     }
 

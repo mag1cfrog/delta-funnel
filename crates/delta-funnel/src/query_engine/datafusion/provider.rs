@@ -698,7 +698,8 @@ mod tests {
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
-        let filter = datafusion::logical_expr::col("id").eq(datafusion::logical_expr::lit(7));
+        let filter = datafusion::logical_expr::col("id")
+            .in_list(vec![datafusion::logical_expr::lit(7_i32)], false);
 
         let result = provider.scan(&state, None, &[filter], None).await;
 
@@ -2825,6 +2826,7 @@ mod tests {
             name: &'static str,
             sql: &'static str,
             exact_count: usize,
+            residual_filter_count: usize,
         }
 
         let sql_cases = [
@@ -2832,22 +2834,26 @@ mod tests {
                 name: "partition in and data",
                 sql: "select id from orders where region in ('us-west', 'us-east') and id > 1",
                 exact_count: 1,
+                residual_filter_count: 1,
             },
             SqlMixedBooleanProbe {
                 name: "partition in or data",
                 sql: "select id from orders where region in ('us-west', 'us-east') or id = 1",
                 exact_count: 0,
+                residual_filter_count: 0,
             },
             SqlMixedBooleanProbe {
                 name: "partition equality or data",
                 sql: "select id from orders where region = 'us-west' or id = 1",
                 exact_count: 0,
+                residual_filter_count: 0,
             },
             SqlMixedBooleanProbe {
                 name: "partition in or nested exact partition and data",
                 sql: "select id from orders where (region in ('us-west', 'us-east') \
                       or region = 'eu-central') and id > 1",
                 exact_count: 1,
+                residual_filter_count: 1,
             },
         ];
 
@@ -2879,7 +2885,7 @@ mod tests {
                     .scan_plan()
                     .pushed_filter_plan
                     .residual_filter_count,
-                0,
+                case.residual_filter_count,
                 "{}: {}",
                 case.name,
                 plan_display

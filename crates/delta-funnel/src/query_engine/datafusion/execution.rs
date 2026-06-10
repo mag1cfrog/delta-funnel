@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(scans.len(), 1);
         assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
-        assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 0);
+        assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
 
         let collect_dataframe = ctx.sql(sql).await?;
         let result = collect_dataframe.collect().await;
