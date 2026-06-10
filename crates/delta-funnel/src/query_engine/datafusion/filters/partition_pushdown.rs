@@ -1792,7 +1792,7 @@ mod tests {
         let partition_columns = partition_columns(&["amount"]);
         let zero = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
         let partition_filter = col("amount").gt_eq(zero);
-        let data_filter = col("float_part").gt(lit(1.0_f32));
+        let data_filter = col("float_part").eq(lit(0.0_f32));
         let filter = partition_filter.clone().and(data_filter);
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
@@ -1984,7 +1984,7 @@ mod tests {
         let schema = schema();
         let partition_columns = partition_columns(&["is_current"]);
         let partition_filter = col("is_current").eq(lit(true));
-        let data_filter = col("float_part").gt(lit(1.0_f32));
+        let data_filter = col("float_part").eq(lit(0.0_f32));
         let filter = partition_filter.clone().and(data_filter);
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
@@ -2220,7 +2220,7 @@ mod tests {
         let partition_columns = partition_columns(&["event_date"]);
         let leap_day_2024 = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
         let partition_filter = col("event_date").gt_eq(leap_day_2024);
-        let data_filter = col("float_part").gt(lit(1.0_f32));
+        let data_filter = col("float_part").eq(lit(0.0_f32));
         let filter = partition_filter.clone().and(data_filter);
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
@@ -2695,7 +2695,7 @@ mod tests {
         let schema = schema();
         let partition_columns = partition_columns(&["region"]);
         let stats_filter = col("id").gt(lit(1_i64));
-        let residual_filter = col("float_part").gt(lit(1.0_f32));
+        let residual_filter = col("float_part").eq(lit(0.0_f32));
         let mixed_filter = stats_filter.clone().and(residual_filter);
 
         let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(

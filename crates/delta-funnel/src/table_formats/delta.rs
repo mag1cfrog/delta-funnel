@@ -302,6 +302,7 @@ mod tests {
     const BOOLEAN_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const DATE_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const DECIMAL_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const FLOATING_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"float_score\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_score\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const STRING_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const TIMESTAMP_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const TIMESTAMP_NTZ_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
@@ -440,6 +441,56 @@ mod tests {
 
         format!(
             r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{{min_values}}},\"maxValues\":{{{max_values}}},\"nullCount\":{{{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_floating_stats(
+        path: &str,
+        num_records: i64,
+        float_min_value: &str,
+        float_max_value: &str,
+        double_min_value: &str,
+        double_max_value: &str,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"float_score\":{float_min_value},\"double_score\":{double_min_value}}},\"maxValues\":{{\"float_score\":{float_max_value},\"double_score\":{double_max_value}}},\"nullCount\":{{\"float_score\":{null_count},\"double_score\":{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_partial_floating_stats(
+        path: &str,
+        num_records: i64,
+        float_min_value: Option<&str>,
+        float_max_value: Option<&str>,
+        double_min_value: Option<&str>,
+        double_max_value: Option<&str>,
+        null_count: Option<i64>,
+    ) -> String {
+        let mut min_values = Vec::new();
+        if let Some(value) = float_min_value {
+            min_values.push(format!(r#"\"float_score\":{value}"#));
+        }
+        if let Some(value) = double_min_value {
+            min_values.push(format!(r#"\"double_score\":{value}"#));
+        }
+
+        let mut max_values = Vec::new();
+        if let Some(value) = float_max_value {
+            max_values.push(format!(r#"\"float_score\":{value}"#));
+        }
+        if let Some(value) = double_max_value {
+            max_values.push(format!(r#"\"double_score\":{value}"#));
+        }
+
+        let null_count = null_count
+            .map(|value| format!(r#"\"float_score\":{value},\"double_score\":{value}"#))
+            .unwrap_or_default();
+
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{{}}},\"maxValues\":{{{}}},\"nullCount\":{{{null_count}}}}}"}}}}"#,
+            min_values.join(","),
+            max_values.join(",")
         )
     }
 
@@ -1158,6 +1209,204 @@ mod tests {
                     None,
                 ),
                 add_json("decimal-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_floating_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-floating-data-stats-characterization",
+            FLOATING_DATA_METADATA_JSON,
+            &[
+                add_json_with_floating_stats(
+                    "floating-neg.parquet",
+                    10,
+                    "-1.5",
+                    "-1.5",
+                    "-2.25",
+                    "-2.25",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-neg-zero.parquet",
+                    10,
+                    "-0.0",
+                    "-0.0",
+                    "-0.0",
+                    "-0.0",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-pos-zero.parquet",
+                    10,
+                    "0.0",
+                    "0.0",
+                    "0.0",
+                    "0.0",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-one.parquet",
+                    10,
+                    "1.5",
+                    "1.5",
+                    "2.25",
+                    "2.25",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-range.parquet",
+                    10,
+                    "-1.0",
+                    "2.0",
+                    "-2.0",
+                    "3.0",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-ten.parquet",
+                    10,
+                    "10.0",
+                    "10.0",
+                    "10.0",
+                    "10.0",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-one-with-null.parquet",
+                    10,
+                    "1.5",
+                    "1.5",
+                    "2.25",
+                    "2.25",
+                    2,
+                ),
+                add_json_with_partial_floating_stats(
+                    "floating-all-null.parquet",
+                    10,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(10),
+                ),
+                add_json("floating-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_partial_floating_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-partial-floating-data-stats-characterization",
+            FLOATING_DATA_METADATA_JSON,
+            &[
+                add_json_with_partial_floating_stats(
+                    "floating-min-only-high.parquet",
+                    10,
+                    Some("2.0"),
+                    None,
+                    Some("2.0"),
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_floating_stats(
+                    "floating-max-only-low.parquet",
+                    10,
+                    None,
+                    Some("0.0"),
+                    None,
+                    Some("0.0"),
+                    Some(0),
+                ),
+                add_json_with_partial_floating_stats(
+                    "floating-counts-only.parquet",
+                    10,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_floating_stats(
+                    "floating-missing-null-count.parquet",
+                    10,
+                    Some("-1.0"),
+                    Some("2.0"),
+                    Some("-1.0"),
+                    Some("2.0"),
+                    None,
+                ),
+                add_json("floating-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_nonfinite_floating_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-nonfinite-floating-data-stats-characterization",
+            FLOATING_DATA_METADATA_JSON,
+            &[
+                add_json_with_floating_stats(
+                    "floating-valid.parquet",
+                    10,
+                    "1.5",
+                    "1.5",
+                    "2.25",
+                    "2.25",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-nan.parquet",
+                    10,
+                    "\\\"NaN\\\"",
+                    "\\\"NaN\\\"",
+                    "\\\"NaN\\\"",
+                    "\\\"NaN\\\"",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-inf.parquet",
+                    10,
+                    "\\\"Infinity\\\"",
+                    "\\\"Infinity\\\"",
+                    "\\\"Infinity\\\"",
+                    "\\\"Infinity\\\"",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-neg-inf.parquet",
+                    10,
+                    "\\\"-Infinity\\\"",
+                    "\\\"-Infinity\\\"",
+                    "\\\"-Infinity\\\"",
+                    "\\\"-Infinity\\\"",
+                    0,
+                ),
+                add_json("floating-missing-stats.parquet"),
             ],
         )?;
         let source = load_delta_source(DeltaSourceConfig {
@@ -2461,6 +2710,274 @@ mod tests {
                 "{message}\n{debug_message}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_floating_data_column_stats_pruning_documents_comparisons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_floating_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").gt(float32_lit(1.5)))?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-range.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("double_score").lt(float64_lit(0.0)),)?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &float64_lit(0.0).gt(col("double_score")))?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").lt(float32_lit(10.0)))?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-one-with-null.parquet",
+                "floating-one.parquet",
+                "floating-pos-zero.parquet",
+                "floating-range.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_floating_data_column_stats_pruning_documents_equality_and_signed_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_floating_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").eq(float32_lit(1.5)))?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-one-with-null.parquet",
+                "floating-one.parquet",
+                "floating-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("float_score").not_eq(float32_lit(1.5)),
+            )?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-pos-zero.parquet",
+                "floating-range.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").eq(float32_lit(-0.0)))?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").eq(float32_lit(0.0)))?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-pos-zero.parquet",
+                "floating-range.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_floating_data_column_stats_pruning_documents_signed_zero_operator_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_floating_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").lt(float32_lit(0.0)))?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("float_score").lt_eq(float32_lit(0.0)),
+            )?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-pos-zero.parquet",
+                "floating-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").gt(float32_lit(0.0)))?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-one-with-null.parquet",
+                "floating-one.parquet",
+                "floating-range.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("float_score").gt_eq(float32_lit(0.0)),
+            )?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-one-with-null.parquet",
+                "floating-one.parquet",
+                "floating-pos-zero.parquet",
+                "floating-range.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("float_score").not_eq(float32_lit(0.0)),
+            )?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-one-with-null.parquet",
+                "floating-one.parquet",
+                "floating-range.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_floating_data_column_stats_pruning_documents_null_checks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_floating_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").is_null())?,
+            vec![
+                "floating-all-null.parquet",
+                "floating-missing-stats.parquet",
+                "floating-one-with-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("double_score").is_not_null())?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-one-with-null.parquet",
+                "floating-one.parquet",
+                "floating-pos-zero.parquet",
+                "floating-range.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_floating_data_column_stats_pruning_documents_partial_stats_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_partial_floating_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").gt(float32_lit(1.0)))?,
+            vec![
+                "floating-counts-only.parquet",
+                "floating-min-only-high.parquet",
+                "floating-missing-null-count.parquet",
+                "floating-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").is_null())?,
+            vec![
+                "floating-missing-null-count.parquet",
+                "floating-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").is_not_null())?,
+            vec![
+                "floating-counts-only.parquet",
+                "floating-max-only-low.parquet",
+                "floating-min-only-high.parquet",
+                "floating-missing-null-count.parquet",
+                "floating-missing-stats.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_floating_data_column_stats_pruning_documents_nonfinite_stats_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_nonfinite_floating_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").gt(float32_lit(1.0)))?,
+            vec![
+                "floating-inf.parquet",
+                "floating-missing-stats.parquet",
+                "floating-nan.parquet",
+                "floating-valid.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("double_score").lt(float64_lit(0.0)))?,
+            vec!["floating-missing-stats.parquet", "floating-neg-inf.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").eq(float32_lit(1.5)),)?,
+            vec!["floating-missing-stats.parquet", "floating-valid.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("float_score").not_eq(float32_lit(1.5)),
+            )?,
+            vec![
+                "floating-inf.parquet",
+                "floating-missing-stats.parquet",
+                "floating-nan.parquet",
+                "floating-neg-inf.parquet",
+            ]
+        );
 
         Ok(())
     }

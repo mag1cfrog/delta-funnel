@@ -702,6 +702,121 @@ mod tests {
     }
 
     #[test]
+    fn filter_pushdown_accepts_floating_data_stats_filters_as_inexact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const FLOATING_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"float_score\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_score\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-floating-data-stats",
+            FLOATING_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(2.25)), None);
+        let filters = [
+            col("float_score").eq(float_value.clone()),
+            col("float_score").not_eq(float_value.clone()),
+            col("float_score").lt(float_value.clone()),
+            col("float_score").lt_eq(float_value.clone()),
+            col("float_score").gt(float_value.clone()),
+            col("float_score").gt_eq(float_value.clone()),
+            float_value.gt(col("float_score")),
+            col("double_score").eq(double_value.clone()),
+            col("double_score").gt_eq(double_value),
+            col("float_score").is_null(),
+            col("float_score").is_not_null(),
+            col("double_score").is_null(),
+            col("double_score").is_not_null(),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Inexact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.residual
+                && decision
+                    .kernel_scan_filter
+                    .as_ref()
+                    .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_rejects_unproven_floating_data_stats_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const FLOATING_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"float_score\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_score\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-floating-data-stats-unsupported",
+            FLOATING_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let float_zero = Expr::Literal(ScalarValue::Float32(Some(0.0)), None);
+        let float_neg_zero = Expr::Literal(ScalarValue::Float32(Some(-0.0)), None);
+        let float_nan = Expr::Literal(ScalarValue::Float32(Some(f32::NAN)), None);
+        let float_inf = Expr::Literal(ScalarValue::Float32(Some(f32::INFINITY)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(1.5)), None);
+        let filters = [
+            col("float_score").eq(float_zero.clone()),
+            col("float_score").lt(float_zero.clone()),
+            col("float_score").gt_eq(float_zero),
+            col("float_score").eq(float_neg_zero.clone()),
+            col("float_score").gt(float_neg_zero),
+            col("float_score").eq(float_nan),
+            col("float_score").gt(float_inf),
+            col("float_score").eq(double_value),
+            col("double_score").eq(lit(1_i32)),
+            col("float_score").between(lit(0.0_f32), lit(1.0_f32)),
+            col("float_score").in_list(vec![lit(1.0_f32)], false),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Unsupported
+                && decision.residual
+                && decision.rejection_reason
+                    == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
+                && decision.kernel_scan_filter.is_none()
+        }));
+
+        Ok(())
+    }
+
+    #[test]
     fn filter_pushdown_accepts_temporal_data_stats_filters_as_inexact()
     -> Result<(), Box<dyn std::error::Error>> {
         const TEMPORAL_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]"#;

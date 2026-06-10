@@ -29,6 +29,7 @@ fn is_supported_data_stats_filter(filter: &Expr, schema: &SchemaRef) -> bool {
         || is_supported_decimal_data_stats_filter(filter, schema)
         || is_supported_string_data_stats_filter(filter, schema)
         || is_supported_temporal_data_stats_filter(filter, schema)
+        || is_supported_floating_data_stats_filter(filter, schema)
 }
 
 fn is_supported_integer_data_stats_filter(filter: &Expr, schema: &SchemaRef) -> bool {
@@ -62,6 +63,60 @@ fn is_supported_boolean_null_count_stats_filter(filter: &Expr, schema: &SchemaRe
             is_data_column_with_type(inner.as_ref(), schema, |data_type| {
                 matches!(data_type, DataType::Boolean)
             })
+        }
+        _ => false,
+    }
+}
+
+fn is_supported_floating_data_stats_filter(filter: &Expr, schema: &SchemaRef) -> bool {
+    match filter {
+        Expr::BinaryExpr(binary) => {
+            if !matches!(
+                binary.op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+            ) {
+                return false;
+            }
+
+            is_same_width_finite_nonzero_floating_data_column_literal(
+                binary.left.as_ref(),
+                binary.right.as_ref(),
+                schema,
+            ) || is_same_width_finite_nonzero_floating_data_column_literal(
+                binary.right.as_ref(),
+                binary.left.as_ref(),
+                schema,
+            )
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            is_data_column_with_type(inner.as_ref(), schema, |data_type| {
+                matches!(data_type, DataType::Float32 | DataType::Float64)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn is_same_width_finite_nonzero_floating_data_column_literal(
+    column: &Expr,
+    literal: &Expr,
+    schema: &SchemaRef,
+) -> bool {
+    let Some(data_type) = data_column_type(column, schema) else {
+        return false;
+    };
+
+    match (data_type, literal) {
+        (DataType::Float32, Expr::Literal(ScalarValue::Float32(Some(value)), _)) => {
+            value.is_finite() && *value != 0.0
+        }
+        (DataType::Float64, Expr::Literal(ScalarValue::Float64(Some(value)), _)) => {
+            value.is_finite() && *value != 0.0
         }
         _ => false,
     }
