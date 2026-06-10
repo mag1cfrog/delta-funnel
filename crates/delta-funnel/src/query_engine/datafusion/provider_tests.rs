@@ -31,6 +31,7 @@ const TIMESTAMP_NTZ_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"
 const TIMESTAMP_NTZ_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
 const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
 const BOOLEAN_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]"#;
+const BINARY_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]"#;
 const DATE_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]"#;
 const DECIMAL_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]"#;
 const FLOATING_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"float_score\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_score\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]"#;
@@ -165,6 +166,18 @@ fn boolean_partial_stats_add_json(
     }
     if let Some(null_count) = null_count {
         stats_fields.push(format!(r#"\"nullCount\":{{\"is_current\":{null_count}}}"#));
+    }
+
+    format!(
+        r#""partitionValues":{{}},"stats":"{{{}}}""#,
+        stats_fields.join(",")
+    )
+}
+
+fn binary_partial_stats_add_json(num_records: i64, null_count: Option<i64>) -> String {
+    let mut stats_fields = vec![format!(r#"\"numRecords\":{num_records}"#)];
+    if let Some(null_count) = null_count {
+        stats_fields.push(format!(r#"\"nullCount\":{{\"payload\":{null_count}}}"#));
     }
 
     format!(
@@ -2368,6 +2381,88 @@ async fn table_provider_scan_keeps_missing_boolean_null_count_uncertain()
         scan_file_paths(scan)?,
         vec!["part-00001.parquet", "part-00002.parquet"]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_uses_binary_null_count_stats_pruning()
+-> Result<(), Box<dyn std::error::Error>> {
+    let non_null_stats = binary_partial_stats_add_json(10, Some(0));
+    let all_null_stats = binary_partial_stats_add_json(10, Some(10));
+    let with_null_stats = binary_partial_stats_add_json(10, Some(2));
+    let missing_null_count_stats = binary_partial_stats_add_json(10, None);
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-binary-null-count-data-stats",
+        BINARY_DATA_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[
+            non_null_stats.as_str(),
+            all_null_stats.as_str(),
+            with_null_stats.as_str(),
+            missing_null_count_stats.as_str(),
+            r#""partitionValues":{}"#,
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+    let cases = [
+        (
+            "is null",
+            datafusion::logical_expr::col("payload").is_null(),
+            vec![
+                "part-00001.parquet",
+                "part-00002.parquet",
+                "part-00003.parquet",
+                "part-00004.parquet",
+            ],
+        ),
+        (
+            "is not null",
+            datafusion::logical_expr::col("payload").is_not_null(),
+            vec![
+                "part-00000.parquet",
+                "part-00002.parquet",
+                "part-00003.parquet",
+                "part-00004.parquet",
+            ],
+        ),
+    ];
+
+    for (name, filter, expected_paths) in cases {
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact],
+            "{name}"
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0, 1]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(
+            scan.scan_plan().pushed_filter_plan.inexact_count,
+            1,
+            "{name}"
+        );
+        assert_eq!(
+            scan.scan_plan().pushed_filter_plan.residual_filter_count,
+            1,
+            "{name}"
+        );
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+    }
 
     Ok(())
 }
