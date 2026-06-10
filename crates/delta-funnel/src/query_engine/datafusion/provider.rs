@@ -24,7 +24,7 @@ use crate::{
 };
 
 use super::execution::DeltaScanPlanningExec;
-use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan, KernelScanFilterKind};
+use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
 use super::projection::{ProjectionPlan, plan_projection};
 use super::registration::reject_mismatched_preflight;
 use super::scan_plan::{ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest};
@@ -263,15 +263,11 @@ impl DeltaTableProvider {
                 continue;
             }
 
-            let columns = if decision
-                .kernel_scan_filter
-                .as_ref()
-                .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
-            {
-                &decision.filter_analysis.data_columns
-            } else {
-                &decision.filter_analysis.partition_columns
-            };
+            let columns = decision
+                .filter_analysis
+                .partition_columns
+                .iter()
+                .chain(decision.filter_analysis.data_columns.iter());
 
             for column in columns {
                 if !projected_column_names.contains(column) {
@@ -902,6 +898,63 @@ mod tests {
             .ok_or("expected DeltaScanPlanningExec")?;
 
         assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(
+            scan_file_paths(scan)?,
+            vec!["part-00001.parquet", "part-00003.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_top_level_and_partition_and_integer_data_stats_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let west_impossible_stats =
+            partitioned_id_stats_add_json(r#"{"region":"us-west"}"#, 10, 1, 50, 0);
+        let west_possible_stats =
+            partitioned_id_stats_add_json(r#"{"region":"us-west"}"#, 10, 101, 150, 0);
+        let east_possible_stats =
+            partitioned_id_stats_add_json(r#"{"region":"us-east"}"#, 10, 101, 150, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-top-level-and-partition-integer-data-stats",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                west_impossible_stats.as_str(),
+                west_possible_stats.as_str(),
+                east_possible_stats.as_str(),
+                r#""partitionValues":{"region":"us-west"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter = datafusion::logical_expr::col("region")
+            .eq(datafusion::logical_expr::lit("us-west"))
+            .and(datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(100_i32)));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0, 1]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
         assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
         assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
