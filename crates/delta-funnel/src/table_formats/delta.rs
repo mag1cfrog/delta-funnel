@@ -1197,6 +1197,32 @@ mod tests {
     }
 
     #[test]
+    fn kernel_predicated_stats_scan_exposes_stats_for_surviving_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_data_stats_characterization_source()?;
+        let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(int32_lit(100)))?;
+        let stats_scan = build_projected_predicated_stats_delta_scan(&source, Some(predicate))?;
+
+        assert_eq!(
+            kernel_scan_file_paths(&stats_scan, source.table_uri())?,
+            vec!["id-missing-stats.parquet", "id-possible.parquet"]
+        );
+        assert_eq!(
+            kernel_stats_metadata_boundary(&stats_scan, source.table_uri())?,
+            KernelStatsMetadataBoundary {
+                selected_rows: 2,
+                selected_stats_rows: 1,
+                selected_missing_stats_rows: 1,
+                has_id_min_values: true,
+                has_id_max_values: true,
+                has_id_null_count: true,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn kernel_predicated_scan_preserves_dv_metadata_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
