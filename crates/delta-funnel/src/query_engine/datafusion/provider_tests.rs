@@ -4427,6 +4427,114 @@ async fn floating_data_stats_residual_column_remains_available_below_final_proje
 }
 
 #[tokio::test]
+async fn sql_floating_data_stats_supported_filters_remain_residual()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let low_stats = floating_stats_add_json(10, "0.5", "0.5", "0.5", "0.5", 0);
+    let high_stats = floating_stats_add_json(10, "2.5", "2.5", "2.5", "2.5", 0);
+    let all_null_stats = floating_partial_stats_add_json(10, Some(10));
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "sql-floating-data-stats-supported-residuals",
+        FLOATING_DATA_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[
+            low_stats.as_str(),
+            high_stats.as_str(),
+            all_null_stats.as_str(),
+            r#""partitionValues":{}"#,
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    register_delta_sources(
+        &ctx,
+        vec![DeltaTableProviderConfig {
+            source,
+            protocol: preflight,
+        }],
+    )?;
+
+    let cases = [
+        (
+            "finite comparison",
+            "select id, float_score from orders where float_score > cast(1.5 as float)",
+            vec![0, 1],
+            vec!["id", "float_score"],
+            vec!["part-00001.parquet", "part-00003.parquet"],
+        ),
+        (
+            "null check",
+            "select id, double_score from orders where double_score is not null",
+            vec![0, 2],
+            vec!["id", "double_score"],
+            vec![
+                "part-00000.parquet",
+                "part-00001.parquet",
+                "part-00003.parquet",
+            ],
+        ),
+    ];
+
+    for (name, sql, scan_projection, field_names, expected_paths) in cases {
+        let dataframe = ctx.sql(sql).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(
+            plan_display.contains("FilterExec"),
+            "{name}: {plan_display}"
+        );
+        assert!(
+            plan_display.contains("DeltaScanPlanningExec"),
+            "{name}: {plan_display}"
+        );
+        assert_eq!(physical_plan.schema().fields().len(), 2, "{name}");
+        assert_eq!(scans.len(), 1, "{name}: {plan_display}");
+        assert_eq!(
+            scans[0].scan_plan().scan_projection,
+            Some(scan_projection),
+            "{name}"
+        );
+        assert_eq!(scans[0].schema().fields().len(), 2, "{name}");
+        for (field_index, field_name) in field_names.into_iter().enumerate() {
+            assert_eq!(
+                scans[0].schema().field(field_index).name(),
+                field_name,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            scans[0].scan_plan().pushed_filter_plan.inexact_count,
+            1,
+            "{name}"
+        );
+        assert_eq!(
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .residual_filter_count,
+            1,
+            "{name}"
+        );
+        assert!(
+            scans[0].scan_plan().kernel_partition_predicate.is_some(),
+            "{name}"
+        );
+        assert_eq!(scan_file_paths(scans[0])?, expected_paths, "{name}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn boolean_data_stats_residual_column_remains_available_below_final_projection()
 -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
