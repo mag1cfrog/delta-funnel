@@ -1298,6 +1298,36 @@ mod tests {
     }
 
     #[test]
+    fn delta_table_format_production_paths_do_not_load_dv_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("table_formats");
+        let production_source = [
+            source_root.join("delta.rs"),
+            source_root.join("delta").join("kernel.rs"),
+        ]
+        .iter()
+        .map(fs::read_to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|source| {
+            source
+                .split("\n#[cfg(test)]")
+                .next()
+                .unwrap_or(source.as_str())
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(!production_source.contains("get_selection_vector"));
+        assert!(!production_source.contains("get_row_indexes"));
+
+        Ok(())
+    }
+
+    #[test]
     fn kernel_predicated_scan_preserves_dv_metadata_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
