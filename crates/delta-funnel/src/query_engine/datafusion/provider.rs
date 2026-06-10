@@ -789,6 +789,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_provider_scan_uses_integer_stats_pruning_for_supported_operators()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let low_stats = id_stats_add_json(10, 1, 5, 0);
+        let target_stats = id_stats_add_json(10, 7, 7, 0);
+        let high_stats = id_stats_add_json(10, 8, 10, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-integer-data-stats-operators",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                low_stats.as_str(),
+                target_stats.as_str(),
+                high_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "equals",
+                datafusion::logical_expr::col("id").eq(datafusion::logical_expr::lit(7_i32)),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not equals",
+                datafusion::logical_expr::col("id").not_eq(datafusion::logical_expr::lit(7_i32)),
+                vec![
+                    "part-00000.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "less than",
+                datafusion::logical_expr::col("id").lt(datafusion::logical_expr::lit(7_i32)),
+                vec!["part-00000.parquet", "part-00003.parquet"],
+            ),
+            (
+                "less than or equal",
+                datafusion::logical_expr::col("id").lt_eq(datafusion::logical_expr::lit(7_i32)),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "greater than",
+                datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(7_i32)),
+                vec!["part-00002.parquet", "part-00003.parquet"],
+            ),
+            (
+                "greater than or equal",
+                datafusion::logical_expr::col("id").gt_eq(datafusion::logical_expr::lit(7_i32)),
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            assert_eq!(
+                provider.supports_filters_pushdown(&[&filter])?,
+                vec![TableProviderFilterPushDown::Inexact],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.inexact_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exact_string_partition_predicates_use_kernel_pruning()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(
