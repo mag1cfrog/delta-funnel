@@ -102,7 +102,7 @@ fn partition_operator_decision(
 
     if filter_analysis.scope == DeltaFilterColumnScope::DataOnly
         && let Some(kernel_scan_filter) =
-            super::stats_pushdown::try_integer_data_stats_kernel_filter(filter, schema)
+            super::stats_pushdown::try_data_stats_kernel_filter(filter, schema)
     {
         return DeltaFilterPushdownDecision {
             outcome: DeltaFilterPushdownOutcome::Inexact,
@@ -165,7 +165,7 @@ fn try_mixed_and_kernel_filter(
             }
             DeltaFilterColumnScope::DataOnly => {
                 if let Some(kernel_filter) =
-                    super::stats_pushdown::try_integer_data_stats_kernel_filter(term, schema)
+                    super::stats_pushdown::try_data_stats_kernel_filter(term, schema)
                 {
                     extracted_filters.push(kernel_filter);
                     residual_term_count = residual_term_count.saturating_add(1);
