@@ -735,7 +735,7 @@ mod tests {
         filter: &datafusion::logical_expr::Expr,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let predicate = datafusion_expr_to_kernel_predicate(filter)?;
-        let scan = build_projected_predicated_stats_delta_scan(&source, Some(predicate))?;
+        let scan = build_projected_predicated_stats_delta_scan(source, Some(predicate))?;
 
         kernel_scan_file_paths(&scan, source.table_uri())
     }
