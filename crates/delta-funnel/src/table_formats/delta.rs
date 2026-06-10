@@ -299,6 +299,7 @@ mod tests {
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const BOOLEAN_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
     const INTEGER_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["byte_part","short_part","int_part","long_part"],"configuration":{},"createdTime":1587968585495}}"#;
     const BOOLEAN_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["is_current"],"configuration":{},"createdTime":1587968585495}}"#;
@@ -332,6 +333,40 @@ mod tests {
     ) -> String {
         format!(
             r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"id\":{min_value}}},\"maxValues\":{{\"id\":{max_value}}},\"nullCount\":{{\"id\":{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_boolean_stats(
+        path: &str,
+        num_records: i64,
+        min_value: bool,
+        max_value: bool,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"is_current\":{min_value}}},\"maxValues\":{{\"is_current\":{max_value}}},\"nullCount\":{{\"is_current\":{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_partial_boolean_stats(
+        path: &str,
+        num_records: i64,
+        min_value: Option<bool>,
+        max_value: Option<bool>,
+        null_count: Option<i64>,
+    ) -> String {
+        let min_values = min_value
+            .map(|value| format!(r#"\"is_current\":{value}"#))
+            .unwrap_or_default();
+        let max_values = max_value
+            .map(|value| format!(r#"\"is_current\":{value}"#))
+            .unwrap_or_default();
+        let null_count = null_count
+            .map(|value| format!(r#"\"is_current\":{value}"#))
+            .unwrap_or_default();
+
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{{min_values}}},\"maxValues\":{{{max_values}}},\"nullCount\":{{{null_count}}}}}"}}}}"#
         )
     }
 
@@ -707,6 +742,104 @@ mod tests {
         })?;
 
         Ok((table, source))
+    }
+
+    fn kernel_boolean_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-boolean-data-stats-characterization",
+            BOOLEAN_DATA_METADATA_JSON,
+            &[
+                add_json_with_boolean_stats("boolean-false-only.parquet", 10, false, false, 0),
+                add_json_with_boolean_stats("boolean-true-only.parquet", 10, true, true, 0),
+                add_json_with_boolean_stats("boolean-mixed.parquet", 10, false, true, 0),
+                add_json_with_boolean_stats("boolean-false-with-null.parquet", 10, false, false, 2),
+                add_json_with_boolean_stats("boolean-true-with-null.parquet", 10, true, true, 2),
+                add_json_with_partial_boolean_stats(
+                    "boolean-all-null.parquet",
+                    10,
+                    None,
+                    None,
+                    Some(10),
+                ),
+                add_json("boolean-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_partial_boolean_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-partial-boolean-data-stats-characterization",
+            BOOLEAN_DATA_METADATA_JSON,
+            &[
+                add_json_with_partial_boolean_stats(
+                    "boolean-min-only-false.parquet",
+                    10,
+                    Some(false),
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_boolean_stats(
+                    "boolean-max-only-true.parquet",
+                    10,
+                    None,
+                    Some(true),
+                    Some(0),
+                ),
+                add_json_with_partial_boolean_stats(
+                    "boolean-counts-only.parquet",
+                    10,
+                    None,
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_boolean_stats(
+                    "boolean-missing-null-count.parquet",
+                    10,
+                    Some(false),
+                    Some(true),
+                    None,
+                ),
+                add_json("boolean-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn assert_boolean_stats_min_max_error(
+        result: Result<Vec<String>, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = match result {
+            Ok(paths) => {
+                return Err(format!(
+                    "boolean min/max stats predicate should fail kernel scan: {paths:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let debug_message = format!("{error:?}");
+        assert!(
+            message.contains("minValues") || debug_message.contains("minValues"),
+            "{message}\n{debug_message}"
+        );
+
+        Ok(())
     }
 
     fn kernel_all_sufficient_data_stats_source()
@@ -1222,6 +1355,86 @@ mod tests {
         assert_eq!(
             kernel_predicated_stats_file_paths(&source, &col("id").gt(int32_lit(100)))?,
             Vec::<String>::new()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_boolean_data_column_stats_pruning_documents_min_max_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_boolean_data_stats_characterization_source()?;
+
+        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("is_current").eq(bool_lit(true)),
+        ))?;
+        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("is_current").eq(bool_lit(false)),
+        ))?;
+        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("is_current").not_eq(bool_lit(true)),
+        ))?;
+        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("is_current").not_eq(bool_lit(false)),
+        ))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_boolean_data_column_stats_pruning_documents_null_checks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_boolean_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("is_current").is_null())?,
+            vec![
+                "boolean-all-null.parquet",
+                "boolean-false-with-null.parquet",
+                "boolean-missing-stats.parquet",
+                "boolean-true-with-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("is_current").is_not_null())?,
+            vec![
+                "boolean-false-only.parquet",
+                "boolean-false-with-null.parquet",
+                "boolean-missing-stats.parquet",
+                "boolean-mixed.parquet",
+                "boolean-true-only.parquet",
+                "boolean-true-with-null.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_boolean_data_column_stats_pruning_keeps_partial_null_counts_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_partial_boolean_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("is_current").is_null())?,
+            vec![
+                "boolean-missing-null-count.parquet",
+                "boolean-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("is_current").is_not_null())?,
+            vec![
+                "boolean-counts-only.parquet",
+                "boolean-max-only-true.parquet",
+                "boolean-min-only-false.parquet",
+                "boolean-missing-null-count.parquet",
+                "boolean-missing-stats.parquet",
+            ]
         );
 
         Ok(())
