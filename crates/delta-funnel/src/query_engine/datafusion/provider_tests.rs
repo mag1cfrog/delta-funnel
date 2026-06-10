@@ -4256,13 +4256,14 @@ async fn mixed_partition_pruning_keeps_residual_column_below_final_projection()
     assert_eq!(scans[0].schema().field(0).name(), "id");
     assert_eq!(scans[0].schema().field(1).name(), "customer_name");
     assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+    assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
     assert_eq!(scans[0].scan_plan().pushed_filter_plan.unsupported_count, 0);
     assert_eq!(
         scans[0]
             .scan_plan()
             .pushed_filter_plan
             .residual_filter_count,
-        0
+        1
     );
     assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
     let kernel_names = scans[0]

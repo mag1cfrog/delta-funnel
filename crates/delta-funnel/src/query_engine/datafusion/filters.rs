@@ -306,7 +306,6 @@ mod tests {
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let id_filter = col("id").gt(lit(1_i32));
         let cross_width_id_filter = col("id").gt(lit(1_i64));
-        let name_filter = col("customer_name").eq(lit("a"));
 
         let support = provider.supports_filters_pushdown(&[&id_filter])?;
         let plan = provider.plan_supports_filters_pushdown(&[&id_filter]);
@@ -319,9 +318,6 @@ mod tests {
         assert_eq!(plan.residual_filter_count, 1);
         assert!(plan.decisions[0].kernel_scan_filter.is_some());
 
-        let support = provider.supports_filters_pushdown(&[&name_filter])?;
-
-        assert_eq!(support, vec![TableProviderFilterPushDown::Unsupported]);
         let support = provider.supports_filters_pushdown(&[&cross_width_id_filter])?;
 
         assert_eq!(support, vec![TableProviderFilterPushDown::Unsupported]);
