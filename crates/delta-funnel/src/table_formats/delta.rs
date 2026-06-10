@@ -300,6 +300,7 @@ mod tests {
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const BOOLEAN_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const BINARY_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const DATE_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const DECIMAL_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const FLOATING_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"float_score\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_score\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
@@ -437,6 +438,40 @@ mod tests {
             .unwrap_or_default();
         let null_count = null_count
             .map(|value| format!(r#"\"amount\":{value}"#))
+            .unwrap_or_default();
+
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{{min_values}}},\"maxValues\":{{{max_values}}},\"nullCount\":{{{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_binary_stats(
+        path: &str,
+        num_records: i64,
+        min_value: &str,
+        max_value: &str,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"payload\":\"{min_value}\"}},\"maxValues\":{{\"payload\":\"{max_value}\"}},\"nullCount\":{{\"payload\":{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_partial_binary_stats(
+        path: &str,
+        num_records: i64,
+        min_value: Option<&str>,
+        max_value: Option<&str>,
+        null_count: Option<i64>,
+    ) -> String {
+        let min_values = min_value
+            .map(|value| format!(r#"\"payload\":\"{value}\""#))
+            .unwrap_or_default();
+        let max_values = max_value
+            .map(|value| format!(r#"\"payload\":\"{value}\""#))
+            .unwrap_or_default();
+        let null_count = null_count
+            .map(|value| format!(r#"\"payload\":{value}"#))
             .unwrap_or_default();
 
         format!(
@@ -1036,6 +1071,54 @@ mod tests {
         Ok(())
     }
 
+    fn assert_binary_stats_min_max_error(
+        result: Result<Vec<String>, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = match result {
+            Ok(paths) => {
+                return Err(format!(
+                    "binary min/max stats predicate should fail kernel scan: {paths:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let debug_message = format!("{error:?}");
+        assert!(
+            message.contains("minValues")
+                || message.contains("maxValues")
+                || debug_message.contains("minValues")
+                || debug_message.contains("maxValues"),
+            "{message}\n{debug_message}"
+        );
+
+        Ok(())
+    }
+
+    fn assert_unsupported_literal_error(
+        result: Result<Vec<String>, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = match result {
+            Ok(paths) => {
+                return Err(format!(
+                    "unsupported literal predicate should fail before kernel scan: {paths:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let debug_message = format!("{error:?}");
+        assert!(
+            message.contains("unsupported DataFusion literal")
+                || debug_message.contains("UnsupportedLiteral"),
+            "{message}\n{debug_message}"
+        );
+
+        Ok(())
+    }
+
     fn kernel_date_data_stats_characterization_source()
     -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_metadata_and_adds(
@@ -1209,6 +1292,83 @@ mod tests {
                     None,
                 ),
                 add_json("decimal-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_binary_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-binary-data-stats-characterization",
+            BINARY_DATA_METADATA_JSON,
+            &[
+                add_json_with_binary_stats("binary-HELLO.parquet", 10, "HELLO", "HELLO", 0),
+                add_json_with_binary_stats("binary-empty.parquet", 10, "", "", 0),
+                add_json_with_binary_stats("binary-hello.parquet", 10, "hello", "hello", 0),
+                add_json_with_binary_stats("binary-range.parquet", 10, "a", "z", 0),
+                add_json_with_binary_stats("binary-special.parquet", 10, "/=%", "/=%", 0),
+                add_json_with_binary_stats("binary-with-null.parquet", 10, "hello", "hello", 2),
+                add_json_with_partial_binary_stats(
+                    "binary-all-null.parquet",
+                    10,
+                    None,
+                    None,
+                    Some(10),
+                ),
+                add_json("binary-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_partial_binary_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-partial-binary-data-stats-characterization",
+            BINARY_DATA_METADATA_JSON,
+            &[
+                add_json_with_partial_binary_stats(
+                    "binary-min-only-high.parquet",
+                    10,
+                    Some("m"),
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_binary_stats(
+                    "binary-max-only-low.parquet",
+                    10,
+                    None,
+                    Some("a"),
+                    Some(0),
+                ),
+                add_json_with_partial_binary_stats(
+                    "binary-counts-only.parquet",
+                    10,
+                    None,
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_binary_stats(
+                    "binary-missing-null-count.parquet",
+                    10,
+                    Some("a"),
+                    Some("z"),
+                    None,
+                ),
+                add_json("binary-missing-stats.parquet"),
             ],
         )?;
         let source = load_delta_source(DeltaSourceConfig {
@@ -1993,6 +2153,10 @@ mod tests {
         Expr::Literal(ScalarValue::Utf8(Some(value.to_owned())), None)
     }
 
+    fn binary_lit(value: &[u8]) -> Expr {
+        Expr::Literal(ScalarValue::Binary(Some(value.to_vec())), None)
+    }
+
     fn large_string_lit(value: &str) -> Expr {
         Expr::Literal(ScalarValue::LargeUtf8(Some(value.to_owned())), None)
     }
@@ -2710,6 +2874,111 @@ mod tests {
                 "{message}\n{debug_message}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_binary_data_column_stats_pruning_documents_equality_and_empty_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_binary_data_stats_characterization_source()?;
+
+        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("payload").eq(binary_lit(b"hello")),
+        ))?;
+        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("payload").not_eq(binary_lit(b"hello")),
+        ))?;
+        assert_unsupported_literal_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("payload").eq(binary_lit(b"")),
+        ))?;
+        assert_unsupported_literal_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("payload").not_eq(binary_lit(b"")),
+        ))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_binary_data_column_stats_pruning_documents_ordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_binary_data_stats_characterization_source()?;
+
+        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("payload").gt(binary_lit(b"hello")),
+        ))?;
+        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("payload").lt(binary_lit(b"hello")),
+        ))?;
+        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
+            &source,
+            &binary_lit(b"hello").gt(col("payload")),
+        ))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_binary_data_column_stats_pruning_documents_null_checks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_binary_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").is_null())?,
+            vec![
+                "binary-all-null.parquet",
+                "binary-missing-stats.parquet",
+                "binary-with-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").is_not_null())?,
+            vec![
+                "binary-HELLO.parquet",
+                "binary-empty.parquet",
+                "binary-hello.parquet",
+                "binary-missing-stats.parquet",
+                "binary-range.parquet",
+                "binary-special.parquet",
+                "binary-with-null.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_binary_data_column_stats_pruning_documents_partial_stats_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_partial_binary_data_stats_characterization_source()?;
+
+        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
+            &source,
+            &col("payload").gt(binary_lit(b"hello")),
+        ))?;
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").is_null())?,
+            vec![
+                "binary-missing-null-count.parquet",
+                "binary-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").is_not_null())?,
+            vec![
+                "binary-counts-only.parquet",
+                "binary-max-only-low.parquet",
+                "binary-min-only-high.parquet",
+                "binary-missing-null-count.parquet",
+                "binary-missing-stats.parquet",
+            ]
+        );
 
         Ok(())
     }
