@@ -302,6 +302,7 @@ mod tests {
     const BOOLEAN_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const DATE_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const DECIMAL_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const STRING_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const TIMESTAMP_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const TIMESTAMP_NTZ_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
@@ -435,6 +436,40 @@ mod tests {
             .unwrap_or_default();
         let null_count = null_count
             .map(|value| format!(r#"\"amount\":{value}"#))
+            .unwrap_or_default();
+
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{{min_values}}},\"maxValues\":{{{max_values}}},\"nullCount\":{{{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_string_stats(
+        path: &str,
+        num_records: i64,
+        min_value: &str,
+        max_value: &str,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"customer_name\":\"{min_value}\"}},\"maxValues\":{{\"customer_name\":\"{max_value}\"}},\"nullCount\":{{\"customer_name\":{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_partial_string_stats(
+        path: &str,
+        num_records: i64,
+        min_value: Option<&str>,
+        max_value: Option<&str>,
+        null_count: Option<i64>,
+    ) -> String {
+        let min_values = min_value
+            .map(|value| format!(r#"\"customer_name\":\"{value}\""#))
+            .unwrap_or_default();
+        let max_values = max_value
+            .map(|value| format!(r#"\"customer_name\":\"{value}\""#))
+            .unwrap_or_default();
+        let null_count = null_count
+            .map(|value| format!(r#"\"customer_name\":{value}"#))
             .unwrap_or_default();
 
         format!(
@@ -1134,6 +1169,130 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_string_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-string-data-stats-characterization",
+            STRING_DATA_METADATA_JSON,
+            &[
+                add_json_with_string_stats("string-empty-only.parquet", 10, "", "", 0),
+                add_json_with_string_stats(
+                    "string-mixed-case-only.parquet",
+                    10,
+                    "Alice",
+                    "Alice",
+                    0,
+                ),
+                add_json_with_string_stats("string-alice-only.parquet", 10, "alice", "alice", 0),
+                add_json_with_string_stats("string-bob-only.parquet", 10, "bob", "bob", 0),
+                add_json_with_string_stats("string-range.parquet", 10, "alice", "morgan", 0),
+                add_json_with_string_stats("string-zed-only.parquet", 10, "zed", "zed", 0),
+                add_json_with_string_stats(
+                    "string-alice-with-null.parquet",
+                    10,
+                    "alice",
+                    "alice",
+                    2,
+                ),
+                add_json_with_partial_string_stats(
+                    "string-all-null.parquet",
+                    10,
+                    None,
+                    None,
+                    Some(10),
+                ),
+                add_json("string-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_partial_string_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-partial-string-data-stats-characterization",
+            STRING_DATA_METADATA_JSON,
+            &[
+                add_json_with_partial_string_stats(
+                    "string-min-only-morgan.parquet",
+                    10,
+                    Some("morgan"),
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_string_stats(
+                    "string-max-only-alice.parquet",
+                    10,
+                    None,
+                    Some("alice"),
+                    Some(0),
+                ),
+                add_json_with_partial_string_stats(
+                    "string-counts-only.parquet",
+                    10,
+                    None,
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_string_stats(
+                    "string-missing-null-count.parquet",
+                    10,
+                    Some("alice"),
+                    Some("morgan"),
+                    None,
+                ),
+                add_json("string-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_non_ascii_string_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-non-ascii-string-data-stats-characterization",
+            STRING_DATA_METADATA_JSON,
+            &[
+                add_json_with_string_stats("string-ascii-cafe.parquet", 10, "cafe", "cafe", 0),
+                add_json_with_string_stats("string-ascii-zulu.parquet", 10, "zulu", "zulu", 0),
+                add_json_with_string_stats(
+                    "string-eclair.parquet",
+                    10,
+                    "\\u00e9clair",
+                    "\\u00e9clair",
+                    0,
+                ),
+                add_json_with_string_stats(
+                    "string-emile.parquet",
+                    10,
+                    "\\u00e9mile",
+                    "\\u00e9mile",
+                    0,
+                ),
+                add_json("string-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_timestamp_data_stats_characterization_source()
     -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_metadata_and_adds(
@@ -1579,6 +1738,14 @@ mod tests {
 
     fn decimal_lit_with_type(value: i128, precision: u8, scale: i8) -> Expr {
         Expr::Literal(ScalarValue::Decimal128(Some(value), precision, scale), None)
+    }
+
+    fn string_lit(value: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(value.to_owned())), None)
+    }
+
+    fn large_string_lit(value: &str) -> Expr {
+        Expr::Literal(ScalarValue::LargeUtf8(Some(value.to_owned())), None)
     }
 
     fn float32_lit(value: f32) -> Expr {
@@ -2294,6 +2461,233 @@ mod tests {
                 "{message}\n{debug_message}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_string_data_column_stats_pruning_documents_comparisons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_string_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").gt(string_lit("m")),)?,
+            vec![
+                "string-missing-stats.parquet",
+                "string-range.parquet",
+                "string-zed-only.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("customer_name").gt_eq(string_lit("morgan")),
+            )?,
+            vec![
+                "string-missing-stats.parquet",
+                "string-range.parquet",
+                "string-zed-only.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("customer_name").lt_eq(string_lit("Alice")),
+            )?,
+            vec![
+                "string-empty-only.parquet",
+                "string-missing-stats.parquet",
+                "string-mixed-case-only.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &string_lit("m").gt(col("customer_name")),)?,
+            vec![
+                "string-alice-only.parquet",
+                "string-alice-with-null.parquet",
+                "string-bob-only.parquet",
+                "string-empty-only.parquet",
+                "string-missing-stats.parquet",
+                "string-mixed-case-only.parquet",
+                "string-range.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_string_data_column_stats_pruning_documents_equality_and_not_equals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_string_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("customer_name").eq(string_lit("alice")),
+            )?,
+            vec![
+                "string-alice-only.parquet",
+                "string-alice-with-null.parquet",
+                "string-missing-stats.parquet",
+                "string-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("customer_name").not_eq(string_lit("alice")),
+            )?,
+            vec![
+                "string-bob-only.parquet",
+                "string-empty-only.parquet",
+                "string-missing-stats.parquet",
+                "string-mixed-case-only.parquet",
+                "string-range.parquet",
+                "string-zed-only.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_string_data_column_stats_pruning_documents_null_checks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_string_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").is_null())?,
+            vec![
+                "string-alice-with-null.parquet",
+                "string-all-null.parquet",
+                "string-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").is_not_null())?,
+            vec![
+                "string-alice-only.parquet",
+                "string-alice-with-null.parquet",
+                "string-bob-only.parquet",
+                "string-empty-only.parquet",
+                "string-missing-stats.parquet",
+                "string-mixed-case-only.parquet",
+                "string-range.parquet",
+                "string-zed-only.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_string_data_column_stats_pruning_documents_partial_stats_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_partial_string_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").gt(string_lit("m")),)?,
+            vec![
+                "string-counts-only.parquet",
+                "string-min-only-morgan.parquet",
+                "string-missing-null-count.parquet",
+                "string-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").is_null())?,
+            vec![
+                "string-missing-null-count.parquet",
+                "string-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").is_not_null())?,
+            vec![
+                "string-counts-only.parquet",
+                "string-max-only-alice.parquet",
+                "string-min-only-morgan.parquet",
+                "string-missing-null-count.parquet",
+                "string-missing-stats.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_string_data_column_stats_pruning_documents_large_utf8_literal_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_string_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("customer_name").eq(large_string_lit("alice")),
+            )?,
+            vec![
+                "string-alice-only.parquet",
+                "string-alice-with-null.parquet",
+                "string-missing-stats.parquet",
+                "string-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("customer_name").gt(large_string_lit("m")),
+            )?,
+            vec![
+                "string-missing-stats.parquet",
+                "string-range.parquet",
+                "string-zed-only.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_string_data_column_stats_pruning_documents_non_ascii_ordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_non_ascii_string_data_stats_characterization_source()?;
+        let eclair = string_lit("\u{00e9}clair");
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").eq(eclair.clone()),)?,
+            vec!["string-eclair.parquet", "string-missing-stats.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("customer_name").eq(large_string_lit("\u{00e9}clair")),
+            )?,
+            vec!["string-eclair.parquet", "string-missing-stats.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("customer_name").gt_eq(eclair.clone()),
+            )?,
+            vec![
+                "string-eclair.parquet",
+                "string-emile.parquet",
+                "string-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").lt(eclair.clone()),)?,
+            vec![
+                "string-ascii-cafe.parquet",
+                "string-ascii-zulu.parquet",
+                "string-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").gt(eclair),)?,
+            vec!["string-emile.parquet", "string-missing-stats.parquet"]
+        );
 
         Ok(())
     }
