@@ -2763,6 +2763,7 @@ mod tests {
         let schema = schema();
         let partition_columns = partition_columns(&["region"]);
         let partition_filter = col("region").eq(lit("us-west"));
+        let stats_filter = col("id").gt(lit(1_i64));
         let scalar_udf = create_udf(
             "is_interesting",
             vec![DataType::Int64],
@@ -2777,8 +2778,19 @@ mod tests {
             ));
         let filters = [
             partition_filter.clone().or(col("id").gt(lit(1_i64))),
+            stats_filter
+                .clone()
+                .or(col("large_region").eq(lit("us-west"))),
+            stats_filter
+                .clone()
+                .or(col("id").in_list(vec![lit(1_i64)], false)),
             Expr::Not(Box::new(
                 partition_filter.clone().and(col("id").gt(lit(1_i64))),
+            )),
+            Expr::Not(Box::new(
+                stats_filter
+                    .clone()
+                    .and(col("large_region").eq(lit("us-west"))),
             )),
             partition_filter.clone().and(col("ghost").gt(lit(1_i64))),
             partition_filter
