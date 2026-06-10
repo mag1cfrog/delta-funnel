@@ -503,6 +503,28 @@ mod tests {
         format!(r#""partitionValues":{{}},"stats":"{stats_json}""#)
     }
 
+    fn id_stats_add_json_with_optional_counts(
+        num_records: Option<i64>,
+        min_value: i32,
+        max_value: i32,
+        null_count: Option<i64>,
+    ) -> String {
+        let mut stats_fields = Vec::new();
+        if let Some(num_records) = num_records {
+            stats_fields.push(format!(r#"\"numRecords\":{num_records}"#));
+        }
+        stats_fields.push(format!(r#"\"minValues\":{{\"id\":{min_value}}}"#));
+        stats_fields.push(format!(r#"\"maxValues\":{{\"id\":{max_value}}}"#));
+        if let Some(null_count) = null_count {
+            stats_fields.push(format!(r#"\"nullCount\":{{\"id\":{null_count}}}"#));
+        }
+
+        format!(
+            r#""partitionValues":{{}},"stats":"{{{}}}""#,
+            stats_fields.join(",")
+        )
+    }
+
     #[test]
     fn datafusion_table_provider_api_symbols_are_available() -> datafusion::error::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -944,6 +966,56 @@ mod tests {
             );
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_integer_stats_pruning_for_not_equals_null_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let all_literal_no_null_stats = id_stats_add_json(10, 7, 7, 0);
+        let mixed_value_stats = id_stats_add_json(10, 7, 8, 0);
+        let all_literal_with_null_stats = id_stats_add_json(10, 7, 7, 1);
+        let missing_null_count_stats = id_stats_add_json_with_optional_counts(Some(10), 7, 7, None);
+        let missing_num_records_stats = id_stats_add_json_with_optional_counts(None, 7, 7, Some(0));
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-integer-data-stats-not-equals-null-boundaries",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                all_literal_no_null_stats.as_str(),
+                mixed_value_stats.as_str(),
+                all_literal_with_null_stats.as_str(),
+                missing_null_count_stats.as_str(),
+                missing_num_records_stats.as_str(),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter =
+            datafusion::logical_expr::col("id").not_eq(datafusion::logical_expr::lit(7_i32));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert_eq!(scan_file_paths(scan)?, vec!["part-00001.parquet"]);
 
         Ok(())
     }
