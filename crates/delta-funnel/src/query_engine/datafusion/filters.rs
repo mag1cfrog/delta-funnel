@@ -179,7 +179,9 @@ impl DeltaFilterPushdownPlan {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
 
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::ScalarValue;
     use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, col, lit};
@@ -224,6 +226,10 @@ mod tests {
 
     fn decimal_lit_with_type(value: i128, precision: u8, scale: i8) -> Expr {
         Expr::Literal(ScalarValue::Decimal128(Some(value), precision, scale), None)
+    }
+
+    fn large_utf8_lit(value: &str) -> Expr {
+        Expr::Literal(ScalarValue::LargeUtf8(Some(value.to_owned())), None)
     }
 
     #[test]
@@ -570,6 +576,113 @@ mod tests {
                 ScalarValue::Decimal256(Some(200.into()), 10, 2),
                 None,
             )),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Unsupported
+                && decision.residual
+                && decision.kernel_scan_filter.is_none()
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_accepts_string_data_stats_filters_as_inexact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const STRING_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"large_customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-string-data-stats",
+            STRING_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let mut provider = DeltaTableProvider::try_new(source, preflight)?;
+        provider.set_schema_for_tests(Arc::new(Schema::new(vec![
+            Field::new("customer_name", DataType::Utf8, true),
+            Field::new("large_customer_name", DataType::LargeUtf8, true),
+        ])));
+        let name = lit("alice");
+        let large_name = large_utf8_lit("alice");
+        let filters = [
+            col("customer_name").eq(name.clone()),
+            col("customer_name").not_eq(name.clone()),
+            col("customer_name").lt(name.clone()),
+            col("customer_name").lt_eq(name.clone()),
+            col("customer_name").gt(name.clone()),
+            col("customer_name").gt_eq(name.clone()),
+            name.clone().gt(col("customer_name")),
+            col("customer_name").eq(large_name.clone()),
+            col("large_customer_name").eq(name),
+            col("customer_name").is_null(),
+            col("customer_name").is_not_null(),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Inexact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.residual
+                && decision
+                    .kernel_scan_filter
+                    .as_ref()
+                    .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_rejects_unproven_string_data_stats_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const STRING_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-string-data-stats-unsupported",
+            STRING_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let name = lit("alice");
+        let filters = [
+            col("customer_name").in_list(vec![name.clone()], false),
+            col("customer_name").between(lit("a"), name.clone()),
+            col("customer_name").like(lit("a%")),
+            col("customer_name").eq(lit(7_i32)),
+            col("customer_name")
+                .gt(lit("a"))
+                .or(col("customer_name").lt(name)),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
         let plan = provider.plan_supports_filters_pushdown(&filter_refs);
