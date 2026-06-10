@@ -1364,6 +1364,60 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_nonfinite_floating_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-nonfinite-floating-data-stats-characterization",
+            FLOATING_DATA_METADATA_JSON,
+            &[
+                add_json_with_floating_stats(
+                    "floating-valid.parquet",
+                    10,
+                    "1.5",
+                    "1.5",
+                    "2.25",
+                    "2.25",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-nan.parquet",
+                    10,
+                    "\\\"NaN\\\"",
+                    "\\\"NaN\\\"",
+                    "\\\"NaN\\\"",
+                    "\\\"NaN\\\"",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-inf.parquet",
+                    10,
+                    "\\\"Infinity\\\"",
+                    "\\\"Infinity\\\"",
+                    "\\\"Infinity\\\"",
+                    "\\\"Infinity\\\"",
+                    0,
+                ),
+                add_json_with_floating_stats(
+                    "floating-neg-inf.parquet",
+                    10,
+                    "\\\"-Infinity\\\"",
+                    "\\\"-Infinity\\\"",
+                    "\\\"-Infinity\\\"",
+                    "\\\"-Infinity\\\"",
+                    0,
+                ),
+                add_json("floating-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_string_data_stats_characterization_source()
     -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_metadata_and_adds(
@@ -2756,6 +2810,76 @@ mod tests {
     }
 
     #[test]
+    fn kernel_floating_data_column_stats_pruning_documents_signed_zero_operator_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_floating_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").lt(float32_lit(0.0)))?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("float_score").lt_eq(float32_lit(0.0)),
+            )?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-pos-zero.parquet",
+                "floating-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").gt(float32_lit(0.0)))?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-one-with-null.parquet",
+                "floating-one.parquet",
+                "floating-range.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("float_score").gt_eq(float32_lit(0.0)),
+            )?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-one-with-null.parquet",
+                "floating-one.parquet",
+                "floating-pos-zero.parquet",
+                "floating-range.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("float_score").not_eq(float32_lit(0.0)),
+            )?,
+            vec![
+                "floating-missing-stats.parquet",
+                "floating-neg-zero.parquet",
+                "floating-neg.parquet",
+                "floating-one-with-null.parquet",
+                "floating-one.parquet",
+                "floating-range.parquet",
+                "floating-ten.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn kernel_floating_data_column_stats_pruning_documents_null_checks()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, source) = kernel_floating_data_stats_characterization_source()?;
@@ -2814,6 +2938,44 @@ mod tests {
                 "floating-min-only-high.parquet",
                 "floating-missing-null-count.parquet",
                 "floating-missing-stats.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_floating_data_column_stats_pruning_documents_nonfinite_stats_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_nonfinite_floating_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").gt(float32_lit(1.0)))?,
+            vec![
+                "floating-inf.parquet",
+                "floating-missing-stats.parquet",
+                "floating-nan.parquet",
+                "floating-valid.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("double_score").lt(float64_lit(0.0)))?,
+            vec!["floating-missing-stats.parquet", "floating-neg-inf.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("float_score").eq(float32_lit(1.5)),)?,
+            vec!["floating-missing-stats.parquet", "floating-valid.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("float_score").not_eq(float32_lit(1.5)),
+            )?,
+            vec![
+                "floating-inf.parquet",
+                "floating-missing-stats.parquet",
+                "floating-nan.parquet",
+                "floating-neg-inf.parquet",
             ]
         );
 
