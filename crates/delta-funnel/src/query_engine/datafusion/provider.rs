@@ -499,6 +499,10 @@ mod tests {
         )
     }
 
+    fn stats_add_json(stats_json: &str) -> String {
+        format!(r#""partitionValues":{{}},"stats":"{stats_json}""#)
+    }
+
     #[test]
     fn datafusion_table_provider_api_symbols_are_available() -> datafusion::error::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -987,6 +991,55 @@ mod tests {
             );
             assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_keeps_invalid_integer_stats_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let impossible_stats = id_stats_add_json(10, 1, 5, 0);
+        let schema_mismatch_stats = stats_add_json(
+            r#"{\"numRecords\":10,\"minValues\":{\"id\":\"low\"},\"maxValues\":{\"id\":\"high\"},\"nullCount\":{\"id\":0}}"#,
+        );
+        let malformed_stats = stats_add_json(r#"not-json"#);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-integer-data-stats-invalid",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                impossible_stats.as_str(),
+                schema_mismatch_stats.as_str(),
+                malformed_stats.as_str(),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(7_i32));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        let paths = scan_file_paths(scan)?;
+        assert!(paths.contains(&"part-00001.parquet".to_owned()));
+        assert!(paths.contains(&"part-00002.parquet".to_owned()));
 
         Ok(())
     }
