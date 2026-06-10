@@ -180,6 +180,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use datafusion::common::ScalarValue;
     use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, col, lit};
 
@@ -189,6 +190,18 @@ mod tests {
         DeltaLogTable, PARTITIONED_SCHEMA_FIELDS_JSON,
     };
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+
+    fn int8_lit(value: i8) -> Expr {
+        Expr::Literal(ScalarValue::Int8(Some(value)), None)
+    }
+
+    fn int16_lit(value: i16) -> Expr {
+        Expr::Literal(ScalarValue::Int16(Some(value)), None)
+    }
+
+    fn int64_lit(value: i64) -> Expr {
+        Expr::Literal(ScalarValue::Int64(Some(value)), None)
+    }
 
     #[test]
     fn filter_pushdown_reports_exact_for_supported_partition_equality()
@@ -283,6 +296,51 @@ mod tests {
         let support = provider.supports_filters_pushdown(&[&cross_width_id_filter])?;
 
         assert_eq!(support, vec![TableProviderFilterPushDown::Unsupported]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_accepts_same_width_integer_data_stats_widths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const INTEGER_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"byte_count\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_count\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_count\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_count\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-integer-data-stats-widths",
+            INTEGER_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let byte_filter = col("byte_count").gt(int8_lit(1));
+        let short_filter = col("short_count").gt(int16_lit(1));
+        let int_filter = col("int_count").gt(lit(1_i32));
+        let long_filter = col("long_count").gt(int64_lit(1));
+        let cross_width_filter = col("int_count").gt(int64_lit(1));
+
+        let support = provider.supports_filters_pushdown(&[
+            &byte_filter,
+            &short_filter,
+            &int_filter,
+            &long_filter,
+            &cross_width_filter,
+        ])?;
+
+        assert_eq!(
+            support,
+            vec![
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Unsupported,
+            ]
+        );
 
         Ok(())
     }

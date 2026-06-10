@@ -54,10 +54,19 @@ fn is_same_width_integer_data_column_literal(
 
     matches!(
         (field.data_type(), literal),
-        (
-            DataType::Int32,
-            Expr::Literal(ScalarValue::Int32(Some(_)), _)
-        )
+        (DataType::Int8, Expr::Literal(ScalarValue::Int8(Some(_)), _))
+            | (
+                DataType::Int16,
+                Expr::Literal(ScalarValue::Int16(Some(_)), _)
+            )
+            | (
+                DataType::Int32,
+                Expr::Literal(ScalarValue::Int32(Some(_)), _)
+            )
+            | (
+                DataType::Int64,
+                Expr::Literal(ScalarValue::Int64(Some(_)), _)
+            )
     )
 }
 
