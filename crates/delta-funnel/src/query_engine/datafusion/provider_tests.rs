@@ -33,6 +33,7 @@ const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3
 const BOOLEAN_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]"#;
 const DATE_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]"#;
 const DECIMAL_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]"#;
+const FLOATING_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"float_score\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_score\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]"#;
 const TIMESTAMP_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]"#;
 const TIMESTAMP_NTZ_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]"#;
 
@@ -215,6 +216,33 @@ fn partitioned_decimal_stats_add_json(
 ) -> String {
     format!(
         r#""partitionValues":{partition_values_json},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"amount\":\"{min_value}\"}},\"maxValues\":{{\"amount\":\"{max_value}\"}},\"nullCount\":{{\"amount\":{null_count}}}}}""#
+    )
+}
+
+fn floating_stats_add_json(
+    num_records: i64,
+    float_min_value: &str,
+    float_max_value: &str,
+    double_min_value: &str,
+    double_max_value: &str,
+    null_count: i64,
+) -> String {
+    format!(
+        r#""partitionValues":{{}},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"float_score\":{float_min_value},\"double_score\":{double_min_value}}},\"maxValues\":{{\"float_score\":{float_max_value},\"double_score\":{double_max_value}}},\"nullCount\":{{\"float_score\":{null_count},\"double_score\":{null_count}}}}}""#
+    )
+}
+
+fn floating_partial_stats_add_json(num_records: i64, null_count: Option<i64>) -> String {
+    let mut stats_fields = vec![format!(r#"\"numRecords\":{num_records}"#)];
+    if let Some(null_count) = null_count {
+        stats_fields.push(format!(
+            r#"\"nullCount\":{{\"float_score\":{null_count},\"double_score\":{null_count}}}"#
+        ));
+    }
+
+    format!(
+        r#""partitionValues":{{}},"stats":"{{{}}}""#,
+        stats_fields.join(",")
     )
 }
 
@@ -1407,6 +1435,248 @@ async fn table_provider_scan_uses_string_null_count_stats_pruning()
         assert!(scan.scan_plan().kernel_partition_predicate.is_some());
         assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_uses_floating_stats_pruning_for_supported_operators()
+-> Result<(), Box<dyn std::error::Error>> {
+    let low_stats = floating_stats_add_json(10, "-1.5", "-1.5", "-2.25", "-2.25", 0);
+    let target_stats = floating_stats_add_json(10, "1.5", "1.5", "2.25", "2.25", 0);
+    let range_stats = floating_stats_add_json(10, "-1.0", "2.0", "-2.0", "3.0", 0);
+    let high_stats = floating_stats_add_json(10, "10.0", "10.0", "10.0", "10.0", 0);
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-floating-data-stats-operators",
+        FLOATING_DATA_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[
+            low_stats.as_str(),
+            target_stats.as_str(),
+            range_stats.as_str(),
+            high_stats.as_str(),
+            r#""partitionValues":{}"#,
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+    let float_target = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+    let double_target = Expr::Literal(ScalarValue::Float64(Some(2.25)), None);
+    let cases = [
+        (
+            "equals",
+            datafusion::logical_expr::col("float_score").eq(float_target.clone()),
+            vec![
+                "part-00001.parquet",
+                "part-00002.parquet",
+                "part-00004.parquet",
+            ],
+        ),
+        (
+            "not equals",
+            datafusion::logical_expr::col("float_score").not_eq(float_target.clone()),
+            vec![
+                "part-00000.parquet",
+                "part-00002.parquet",
+                "part-00003.parquet",
+                "part-00004.parquet",
+            ],
+        ),
+        (
+            "less than",
+            datafusion::logical_expr::col("float_score").lt(float_target.clone()),
+            vec![
+                "part-00000.parquet",
+                "part-00002.parquet",
+                "part-00004.parquet",
+            ],
+        ),
+        (
+            "less than or equal",
+            datafusion::logical_expr::col("float_score").lt_eq(float_target.clone()),
+            vec![
+                "part-00000.parquet",
+                "part-00001.parquet",
+                "part-00002.parquet",
+                "part-00004.parquet",
+            ],
+        ),
+        (
+            "greater than",
+            datafusion::logical_expr::col("float_score").gt(float_target.clone()),
+            vec![
+                "part-00002.parquet",
+                "part-00003.parquet",
+                "part-00004.parquet",
+            ],
+        ),
+        (
+            "greater than or equal",
+            datafusion::logical_expr::col("float_score").gt_eq(float_target.clone()),
+            vec![
+                "part-00001.parquet",
+                "part-00002.parquet",
+                "part-00003.parquet",
+                "part-00004.parquet",
+            ],
+        ),
+        (
+            "greater than reversed",
+            double_target.gt(datafusion::logical_expr::col("double_score")),
+            vec![
+                "part-00000.parquet",
+                "part-00002.parquet",
+                "part-00004.parquet",
+            ],
+        ),
+    ];
+
+    for (name, filter, expected_paths) in cases {
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact],
+            "{name}"
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0, 1, 2]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(
+            scan.scan_plan().pushed_filter_plan.inexact_count,
+            1,
+            "{name}"
+        );
+        assert_eq!(
+            scan.scan_plan().pushed_filter_plan.residual_filter_count,
+            1,
+            "{name}"
+        );
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_uses_floating_null_count_stats_pruning()
+-> Result<(), Box<dyn std::error::Error>> {
+    let non_null_stats = floating_stats_add_json(10, "1.5", "1.5", "2.25", "2.25", 0);
+    let all_null_stats = floating_partial_stats_add_json(10, Some(10));
+    let with_null_stats = floating_stats_add_json(10, "1.5", "1.5", "2.25", "2.25", 2);
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-floating-null-count-data-stats",
+        FLOATING_DATA_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[
+            non_null_stats.as_str(),
+            all_null_stats.as_str(),
+            with_null_stats.as_str(),
+            r#""partitionValues":{}"#,
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+    let cases = [
+        (
+            "is null",
+            datafusion::logical_expr::col("float_score").is_null(),
+            vec![
+                "part-00001.parquet",
+                "part-00002.parquet",
+                "part-00003.parquet",
+            ],
+        ),
+        (
+            "is not null",
+            datafusion::logical_expr::col("double_score").is_not_null(),
+            vec![
+                "part-00000.parquet",
+                "part-00002.parquet",
+                "part-00003.parquet",
+            ],
+        ),
+    ];
+
+    for (name, filter, expected_paths) in cases {
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact],
+            "{name}"
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0, 1, 2]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(
+            scan.scan_plan().pushed_filter_plan.inexact_count,
+            1,
+            "{name}"
+        );
+        assert_eq!(
+            scan.scan_plan().pushed_filter_plan.residual_filter_count,
+            1,
+            "{name}"
+        );
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_rejects_unproven_floating_data_stats_shapes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let stats = floating_stats_add_json(10, "-0.0", "-0.0", "-0.0", "-0.0", 0);
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-floating-data-stats-unsupported",
+        FLOATING_DATA_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[stats.as_str()],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+    let zero = Expr::Literal(ScalarValue::Float32(Some(0.0)), None);
+    let filter = datafusion::logical_expr::col("float_score").eq(zero);
+
+    let result = provider
+        .scan(&state, Some(&vec![0, 1, 2]), &[filter], None)
+        .await;
+
+    assert!(
+        matches!(result, Err(DataFusionError::External(error)) if error
+            .to_string()
+            .contains("pushed filters must be exact partition predicates"))
+    );
 
     Ok(())
 }
