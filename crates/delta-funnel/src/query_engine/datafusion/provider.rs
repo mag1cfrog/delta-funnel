@@ -611,6 +611,18 @@ mod tests {
         )
     }
 
+    fn partitioned_date_stats_add_json(
+        partition_values_json: &str,
+        num_records: i64,
+        min_value: &str,
+        max_value: &str,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#""partitionValues":{partition_values_json},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"event_date\":\"{min_value}\"}},\"maxValues\":{{\"event_date\":\"{max_value}\"}},\"nullCount\":{{\"event_date\":{null_count}}}}}""#
+        )
+    }
+
     fn timestamp_stats_add_json(
         column_name: &str,
         num_records: i64,
@@ -2023,6 +2035,80 @@ mod tests {
             matches!(result, Err(DataFusionError::External(error)) if error
                 .to_string()
                 .contains("pushed filters must be exact partition predicates"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_top_level_and_partition_and_temporal_data_stats_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MIXED_TEMPORAL_STATS_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
+        let west_low_stats = partitioned_date_stats_add_json(
+            r#"{"region":"us-west"}"#,
+            10,
+            "2024-02-29",
+            "2024-02-29",
+            0,
+        );
+        let west_target_stats = partitioned_date_stats_add_json(
+            r#"{"region":"us-west"}"#,
+            10,
+            "2026-01-01",
+            "2026-01-01",
+            0,
+        );
+        let east_target_stats = partitioned_date_stats_add_json(
+            r#"{"region":"us-east"}"#,
+            10,
+            "2026-01-01",
+            "2026-01-01",
+            0,
+        );
+        let west_missing_stats = r#""partitionValues":{"region":"us-west"}"#;
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-top-level-and-partition-temporal-data-stats",
+            MIXED_TEMPORAL_STATS_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                west_low_stats.as_str(),
+                west_target_stats.as_str(),
+                east_target_stats.as_str(),
+                west_missing_stats,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let date = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let filter = datafusion::logical_expr::col("region")
+            .eq(datafusion::logical_expr::lit("us-west"))
+            .and(datafusion::logical_expr::col("event_date").eq(date));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider.scan(&state, None, &[filter], None).await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(
+            scan_file_paths(scan)?,
+            vec!["part-00001.parquet", "part-00003.parquet"]
         );
 
         Ok(())
