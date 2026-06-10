@@ -301,6 +301,7 @@ mod tests {
     const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const BOOLEAN_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const DATE_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const DECIMAL_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const TIMESTAMP_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const TIMESTAMP_NTZ_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
@@ -400,6 +401,40 @@ mod tests {
             .unwrap_or_default();
         let null_count = null_count
             .map(|value| format!(r#"\"event_date\":{value}"#))
+            .unwrap_or_default();
+
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{{min_values}}},\"maxValues\":{{{max_values}}},\"nullCount\":{{{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_decimal_stats(
+        path: &str,
+        num_records: i64,
+        min_value: &str,
+        max_value: &str,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"amount\":\"{min_value}\"}},\"maxValues\":{{\"amount\":\"{max_value}\"}},\"nullCount\":{{\"amount\":{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_partial_decimal_stats(
+        path: &str,
+        num_records: i64,
+        min_value: Option<&str>,
+        max_value: Option<&str>,
+        null_count: Option<i64>,
+    ) -> String {
+        let min_values = min_value
+            .map(|value| format!(r#"\"amount\":\"{value}\""#))
+            .unwrap_or_default();
+        let max_values = max_value
+            .map(|value| format!(r#"\"amount\":\"{value}\""#))
+            .unwrap_or_default();
+        let null_count = null_count
+            .map(|value| format!(r#"\"amount\":{value}"#))
             .unwrap_or_default();
 
         format!(
@@ -1009,6 +1044,96 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_decimal_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-decimal-data-stats-characterization",
+            DECIMAL_DATA_METADATA_JSON,
+            &[
+                add_json_with_decimal_stats(
+                    "decimal-negative-only.parquet",
+                    10,
+                    "-1.23",
+                    "-1.23",
+                    0,
+                ),
+                add_json_with_decimal_stats("decimal-zero-only.parquet", 10, "0.00", "0.00", 0),
+                add_json_with_decimal_stats("decimal-two-only.parquet", 10, "2.00", "2.00", 0),
+                add_json_with_decimal_stats("decimal-ten-only.parquet", 10, "10.00", "10.00", 0),
+                add_json_with_decimal_stats(
+                    "decimal-large-only.parquet",
+                    10,
+                    "123.45",
+                    "123.45",
+                    0,
+                ),
+                add_json_with_decimal_stats("decimal-range.parquet", 10, "0.00", "10.00", 0),
+                add_json_with_decimal_stats("decimal-two-with-null.parquet", 10, "2.00", "2.00", 2),
+                add_json_with_partial_decimal_stats(
+                    "decimal-all-null.parquet",
+                    10,
+                    None,
+                    None,
+                    Some(10),
+                ),
+                add_json("decimal-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_partial_decimal_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-partial-decimal-data-stats-characterization",
+            DECIMAL_DATA_METADATA_JSON,
+            &[
+                add_json_with_partial_decimal_stats(
+                    "decimal-min-only-high.parquet",
+                    10,
+                    Some("10.00"),
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_decimal_stats(
+                    "decimal-max-only-low.parquet",
+                    10,
+                    None,
+                    Some("0.00"),
+                    Some(0),
+                ),
+                add_json_with_partial_decimal_stats(
+                    "decimal-counts-only.parquet",
+                    10,
+                    None,
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_decimal_stats(
+                    "decimal-missing-null-count.parquet",
+                    10,
+                    Some("0.00"),
+                    Some("10.00"),
+                    None,
+                ),
+                add_json("decimal-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_timestamp_data_stats_characterization_source()
     -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_metadata_and_adds(
@@ -1450,6 +1575,10 @@ mod tests {
 
     fn decimal_lit(value: i128) -> Expr {
         Expr::Literal(ScalarValue::Decimal128(Some(value), 10, 2), None)
+    }
+
+    fn decimal_lit_with_type(value: i128, precision: u8, scale: i8) -> Expr {
+        Expr::Literal(ScalarValue::Decimal128(Some(value), precision, scale), None)
     }
 
     fn float32_lit(value: f32) -> Expr {
@@ -2000,6 +2129,171 @@ mod tests {
                 "date-missing-stats.parquet",
             ]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_decimal_data_column_stats_pruning_documents_comparisons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_decimal_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("amount").gt(decimal_lit(200)))?,
+            vec![
+                "decimal-large-only.parquet",
+                "decimal-missing-stats.parquet",
+                "decimal-range.parquet",
+                "decimal-ten-only.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("amount").gt_eq(decimal_lit(1_000)))?,
+            vec![
+                "decimal-large-only.parquet",
+                "decimal-missing-stats.parquet",
+                "decimal-range.parquet",
+                "decimal-ten-only.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("amount").lt_eq(decimal_lit(-123)))?,
+            vec![
+                "decimal-missing-stats.parquet",
+                "decimal-negative-only.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &decimal_lit(1_000).gt(col("amount")))?,
+            vec![
+                "decimal-missing-stats.parquet",
+                "decimal-negative-only.parquet",
+                "decimal-range.parquet",
+                "decimal-two-only.parquet",
+                "decimal-two-with-null.parquet",
+                "decimal-zero-only.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_decimal_data_column_stats_pruning_documents_equality_and_not_equals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_decimal_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("amount").eq(decimal_lit(200)))?,
+            vec![
+                "decimal-missing-stats.parquet",
+                "decimal-range.parquet",
+                "decimal-two-only.parquet",
+                "decimal-two-with-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("amount").not_eq(decimal_lit(200)))?,
+            vec![
+                "decimal-large-only.parquet",
+                "decimal-missing-stats.parquet",
+                "decimal-negative-only.parquet",
+                "decimal-range.parquet",
+                "decimal-ten-only.parquet",
+                "decimal-zero-only.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_decimal_data_column_stats_pruning_documents_null_checks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_decimal_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("amount").is_null())?,
+            vec![
+                "decimal-all-null.parquet",
+                "decimal-missing-stats.parquet",
+                "decimal-two-with-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("amount").is_not_null())?,
+            vec![
+                "decimal-large-only.parquet",
+                "decimal-missing-stats.parquet",
+                "decimal-negative-only.parquet",
+                "decimal-range.parquet",
+                "decimal-ten-only.parquet",
+                "decimal-two-only.parquet",
+                "decimal-two-with-null.parquet",
+                "decimal-zero-only.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_decimal_data_column_stats_pruning_documents_partial_stats_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_partial_decimal_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("amount").gt(decimal_lit(200)))?,
+            vec![
+                "decimal-counts-only.parquet",
+                "decimal-min-only-high.parquet",
+                "decimal-missing-null-count.parquet",
+                "decimal-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("amount").is_null())?,
+            vec![
+                "decimal-missing-null-count.parquet",
+                "decimal-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("amount").is_not_null())?,
+            vec![
+                "decimal-counts-only.parquet",
+                "decimal-max-only-low.parquet",
+                "decimal-min-only-high.parquet",
+                "decimal-missing-null-count.parquet",
+                "decimal-missing-stats.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_decimal_data_column_stats_pruning_documents_precision_and_scale_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_decimal_data_stats_characterization_source()?;
+
+        for (description, literal) in [
+            ("scale mismatch", decimal_lit_with_type(2_000, 11, 3)),
+            ("precision mismatch", decimal_lit_with_type(200, 11, 2)),
+        ] {
+            let error = kernel_predicated_stats_file_paths(&source, &col("amount").eq(literal))
+                .err()
+                .ok_or_else(|| {
+                    format!("{description} decimal predicate should fail kernel scan")
+                })?;
+            let message = error.to_string();
+            let debug_message = format!("{error:?}");
+            assert!(
+                message.contains("Invalid comparison operation")
+                    || debug_message.contains("Invalid comparison operation"),
+                "{message}\n{debug_message}"
+            );
+        }
 
         Ok(())
     }
