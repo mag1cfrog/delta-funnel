@@ -453,6 +453,7 @@ mod tests {
     const BINARY_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]"#;
     const TIMESTAMP_NTZ_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]"#;
     const TIMESTAMP_NTZ_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
+    const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -839,6 +840,36 @@ mod tests {
         assert_eq!(
             scan_file_paths(scan)?,
             vec!["part-00001.parquet", "part-00002.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn datafusion_provider_preflight_rejects_deletion_vectors_before_stats_pushdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stats = id_stats_add_json(10, 101, 150, 0);
+        let table = DeltaLogTable::new_with_schema_protocol_and_adds(
+            "provider-dv-stats-preflight-rejection",
+            DELETION_VECTOR_PROTOCOL_JSON,
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[stats.as_str()],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        let result = preflight_delta_protocol(&source);
+
+        assert!(
+            matches!(result, Err(DeltaFunnelError::DeltaProtocolCompatibility {
+                source_name,
+                reason,
+                ..
+            }) if source_name == "orders" && reason.contains("deletionVectors"))
         );
 
         Ok(())

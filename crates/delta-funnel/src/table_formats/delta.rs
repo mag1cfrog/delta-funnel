@@ -335,6 +335,18 @@ mod tests {
         )
     }
 
+    fn dv_add_json_with_id_stats(
+        path: &str,
+        num_records: i64,
+        min_value: i32,
+        max_value: i32,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"id\":{min_value}}},\"maxValues\":{{\"id\":{max_value}}},\"nullCount\":{{\"id\":{null_count}}}}}","deletionVector":{{"storageType":"u","pathOrInlineDv":"vBn[lx{{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}}}}"#
+        )
+    }
+
     fn partitioned_dv_add_json(path: &str, partition_values_json: &str) -> String {
         format!(
             r#"{{"add":{{"path":"{path}","partitionValues":{partition_values_json},"size":0,"modificationTime":1587968586000,"dataChange":true,"deletionVector":{{"storageType":"u","pathOrInlineDv":"vBn[lx{{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}}}}"#
@@ -1237,6 +1249,80 @@ mod tests {
                 has_id_null_count: true,
             }
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_stats_pruning_preserves_surviving_dv_metadata_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "kernel-dv-data-stats-boundary",
+            DELETION_VECTOR_PROTOCOL_JSON,
+            METADATA_JSON,
+            &[
+                dv_add_json_with_id_stats("id-dv-impossible.parquet", 10, 1, 50, 0),
+                dv_add_json_with_id_stats("id-dv-possible.parquet", 10, 101, 150, 0),
+                add_json_with_id_stats("id-plain-impossible.parquet", 10, 1, 50, 0),
+                add_json("id-plain-missing-stats.parquet"),
+                partitioned_dv_add_json("id-dv-missing-stats.parquet", r#"{}"#),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(int32_lit(100)))?;
+        let stats_scan = build_projected_predicated_stats_delta_scan(&source, Some(predicate))?;
+
+        assert_eq!(
+            kernel_scan_file_boundaries(&stats_scan, source.table_uri())?,
+            vec![
+                KernelScanFileBoundary {
+                    path: "id-dv-missing-stats.parquet".to_owned(),
+                    has_deletion_vector: true,
+                },
+                KernelScanFileBoundary {
+                    path: "id-dv-possible.parquet".to_owned(),
+                    has_deletion_vector: true,
+                },
+                KernelScanFileBoundary {
+                    path: "id-plain-missing-stats.parquet".to_owned(),
+                    has_deletion_vector: false,
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn delta_table_format_production_paths_do_not_load_dv_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("table_formats");
+        let production_source = [
+            source_root.join("delta.rs"),
+            source_root.join("delta").join("kernel.rs"),
+        ]
+        .iter()
+        .map(fs::read_to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|source| {
+            source
+                .split("\n#[cfg(test)]")
+                .next()
+                .unwrap_or(source.as_str())
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(!production_source.contains("get_selection_vector"));
+        assert!(!production_source.contains("get_row_indexes"));
 
         Ok(())
     }
