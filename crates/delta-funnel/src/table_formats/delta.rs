@@ -300,6 +300,7 @@ mod tests {
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const BOOLEAN_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const DATE_DATA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
     const INTEGER_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["byte_part","short_part","int_part","long_part"],"configuration":{},"createdTime":1587968585495}}"#;
     const BOOLEAN_PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["is_current"],"configuration":{},"createdTime":1587968585495}}"#;
@@ -363,6 +364,40 @@ mod tests {
             .unwrap_or_default();
         let null_count = null_count
             .map(|value| format!(r#"\"is_current\":{value}"#))
+            .unwrap_or_default();
+
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{{min_values}}},\"maxValues\":{{{max_values}}},\"nullCount\":{{{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_date_stats(
+        path: &str,
+        num_records: i64,
+        min_value: &str,
+        max_value: &str,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"event_date\":\"{min_value}\"}},\"maxValues\":{{\"event_date\":\"{max_value}\"}},\"nullCount\":{{\"event_date\":{null_count}}}}}"}}}}"#
+        )
+    }
+
+    fn add_json_with_partial_date_stats(
+        path: &str,
+        num_records: i64,
+        min_value: Option<&str>,
+        max_value: Option<&str>,
+        null_count: Option<i64>,
+    ) -> String {
+        let min_values = min_value
+            .map(|value| format!(r#"\"event_date\":\"{value}\""#))
+            .unwrap_or_default();
+        let max_values = max_value
+            .map(|value| format!(r#"\"event_date\":\"{value}\""#))
+            .unwrap_or_default();
+        let null_count = null_count
+            .map(|value| format!(r#"\"event_date\":{value}"#))
             .unwrap_or_default();
 
         format!(
@@ -840,6 +875,100 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn kernel_date_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-date-data-stats-characterization",
+            DATE_DATA_METADATA_JSON,
+            &[
+                add_json_with_date_stats(
+                    "date-pre-epoch-only.parquet",
+                    10,
+                    "1969-12-31",
+                    "1969-12-31",
+                    0,
+                ),
+                add_json_with_date_stats(
+                    "date-leap-only.parquet",
+                    10,
+                    "2024-02-29",
+                    "2024-02-29",
+                    0,
+                ),
+                add_json_with_date_stats(
+                    "date-new-year-only.parquet",
+                    10,
+                    "2026-01-01",
+                    "2026-01-01",
+                    0,
+                ),
+                add_json_with_date_stats("date-range.parquet", 10, "2024-02-29", "2026-01-01", 0),
+                add_json_with_date_stats(
+                    "date-new-year-with-null.parquet",
+                    10,
+                    "2026-01-01",
+                    "2026-01-01",
+                    2,
+                ),
+                add_json_with_partial_date_stats("date-all-null.parquet", 10, None, None, Some(10)),
+                add_json("date-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
+    fn kernel_partial_date_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-partial-date-data-stats-characterization",
+            DATE_DATA_METADATA_JSON,
+            &[
+                add_json_with_partial_date_stats(
+                    "date-min-only-high.parquet",
+                    10,
+                    Some("2026-01-01"),
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_date_stats(
+                    "date-max-only-low.parquet",
+                    10,
+                    None,
+                    Some("2024-02-29"),
+                    Some(0),
+                ),
+                add_json_with_partial_date_stats(
+                    "date-counts-only.parquet",
+                    10,
+                    None,
+                    None,
+                    Some(0),
+                ),
+                add_json_with_partial_date_stats(
+                    "date-missing-null-count.parquet",
+                    10,
+                    Some("2024-02-29"),
+                    Some("2026-01-01"),
+                    None,
+                ),
+                add_json("date-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
     }
 
     fn kernel_all_sufficient_data_stats_source()
@@ -1434,6 +1563,142 @@ mod tests {
                 "boolean-min-only-false.parquet",
                 "boolean-missing-null-count.parquet",
                 "boolean-missing-stats.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_date_data_column_stats_pruning_documents_comparisons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_date_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("event_date").gt(date_lit(19_782)))?,
+            vec![
+                "date-missing-stats.parquet",
+                "date-new-year-only.parquet",
+                "date-new-year-with-null.parquet",
+                "date-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("event_date").gt_eq(date_lit(20_454)),
+            )?,
+            vec![
+                "date-missing-stats.parquet",
+                "date-new-year-only.parquet",
+                "date-new-year-with-null.parquet",
+                "date-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("event_date").lt_eq(date_lit(-1)),)?,
+            vec!["date-missing-stats.parquet", "date-pre-epoch-only.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &date_lit(20_454).gt(col("event_date")))?,
+            vec![
+                "date-leap-only.parquet",
+                "date-missing-stats.parquet",
+                "date-pre-epoch-only.parquet",
+                "date-range.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_date_data_column_stats_pruning_documents_equality_and_not_equals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_date_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("event_date").eq(date_lit(20_454)))?,
+            vec![
+                "date-missing-stats.parquet",
+                "date-new-year-only.parquet",
+                "date-new-year-with-null.parquet",
+                "date-range.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("event_date").not_eq(date_lit(20_454)),
+            )?,
+            vec![
+                "date-leap-only.parquet",
+                "date-missing-stats.parquet",
+                "date-pre-epoch-only.parquet",
+                "date-range.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_date_data_column_stats_pruning_documents_null_checks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_date_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("event_date").is_null())?,
+            vec![
+                "date-all-null.parquet",
+                "date-missing-stats.parquet",
+                "date-new-year-with-null.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("event_date").is_not_null())?,
+            vec![
+                "date-leap-only.parquet",
+                "date-missing-stats.parquet",
+                "date-new-year-only.parquet",
+                "date-new-year-with-null.parquet",
+                "date-pre-epoch-only.parquet",
+                "date-range.parquet",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_date_data_column_stats_pruning_documents_partial_stats_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_partial_date_data_stats_characterization_source()?;
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("event_date").gt(date_lit(19_782)))?,
+            vec![
+                "date-counts-only.parquet",
+                "date-min-only-high.parquet",
+                "date-missing-null-count.parquet",
+                "date-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("event_date").is_null())?,
+            vec![
+                "date-missing-null-count.parquet",
+                "date-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("event_date").is_not_null())?,
+            vec![
+                "date-counts-only.parquet",
+                "date-max-only-low.parquet",
+                "date-min-only-high.parquet",
+                "date-missing-null-count.parquet",
+                "date-missing-stats.parquet",
             ]
         );
 
