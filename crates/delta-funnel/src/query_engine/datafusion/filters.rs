@@ -346,6 +346,64 @@ mod tests {
     }
 
     #[test]
+    fn filter_pushdown_accepts_simple_integer_data_stats_operators()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-integer-data-stats-operators")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let filters = [
+            col("id").eq(lit(7_i32)),
+            col("id").not_eq(lit(7_i32)),
+            col("id").lt(lit(7_i32)),
+            col("id").lt_eq(lit(7_i32)),
+            col("id").gt(lit(7_i32)),
+            col("id").gt_eq(lit(7_i32)),
+            lit(7_i32).lt(col("id")),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Inexact; filters.len()]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_rejects_unproven_integer_data_stats_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-integer-data-stats-unsupported")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let filters = [
+            col("id").in_list(vec![lit(1_i32), lit(2_i32)], false),
+            col("id").between(lit(1_i32), lit(2_i32)),
+            col("id").is_null(),
+            col("id").is_not_null(),
+            col("id").gt(lit(1_i32)).or(col("id").lt(lit(0_i32))),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn filter_pushdown_accepts_string_null_checks_and_rejects_other_shapes()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema_and_adds(

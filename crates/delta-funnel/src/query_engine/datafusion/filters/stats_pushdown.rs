@@ -28,11 +28,24 @@ fn is_supported_integer_data_stats_filter(filter: &Expr, schema: &SchemaRef) -> 
         return false;
     };
 
-    if binary.op != Operator::Gt {
+    if !matches!(
+        binary.op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    ) {
         return false;
     }
 
     is_same_width_integer_data_column_literal(binary.left.as_ref(), binary.right.as_ref(), schema)
+        || is_same_width_integer_data_column_literal(
+            binary.right.as_ref(),
+            binary.left.as_ref(),
+            schema,
+        )
 }
 
 fn is_same_width_integer_data_column_literal(
