@@ -2468,6 +2468,45 @@ async fn table_provider_scan_uses_binary_null_count_stats_pruning()
 }
 
 #[tokio::test]
+async fn table_provider_scan_rejects_binary_data_stats_comparators()
+-> Result<(), Box<dyn std::error::Error>> {
+    let stats = binary_partial_stats_add_json(10, Some(0));
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-binary-data-stats-comparator-unsupported",
+        BINARY_DATA_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[stats.as_str()],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+    let payload = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+    let filter = datafusion::logical_expr::col("payload").eq(payload);
+
+    assert_eq!(
+        provider.supports_filters_pushdown(&[&filter])?,
+        vec![TableProviderFilterPushDown::Unsupported]
+    );
+
+    let result = provider
+        .scan(&state, Some(&vec![0, 1]), &[filter], None)
+        .await;
+
+    assert!(
+        matches!(result, Err(DataFusionError::External(error)) if error
+            .to_string()
+            .contains("pushed filters must be exact partition predicates"))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn table_provider_scan_rejects_projected_boolean_data_stats_filter()
 -> Result<(), Box<dyn std::error::Error>> {
     let stats = boolean_stats_add_json(10, false, false, 0);
