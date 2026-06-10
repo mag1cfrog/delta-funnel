@@ -1259,6 +1259,40 @@ mod tests {
         Ok((table, source))
     }
 
+    fn kernel_non_ascii_string_data_stats_characterization_source()
+    -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-non-ascii-string-data-stats-characterization",
+            STRING_DATA_METADATA_JSON,
+            &[
+                add_json_with_string_stats("string-ascii-cafe.parquet", 10, "cafe", "cafe", 0),
+                add_json_with_string_stats("string-ascii-zulu.parquet", 10, "zulu", "zulu", 0),
+                add_json_with_string_stats(
+                    "string-eclair.parquet",
+                    10,
+                    "\\u00e9clair",
+                    "\\u00e9clair",
+                    0,
+                ),
+                add_json_with_string_stats(
+                    "string-emile.parquet",
+                    10,
+                    "\\u00e9mile",
+                    "\\u00e9mile",
+                    0,
+                ),
+                add_json("string-missing-stats.parquet"),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+
+        Ok((table, source))
+    }
+
     fn kernel_timestamp_data_stats_characterization_source()
     -> Result<(DeltaLogTable, super::PlannedDeltaSource), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_metadata_and_adds(
@@ -2609,6 +2643,50 @@ mod tests {
                 "string-range.parquet",
                 "string-zed-only.parquet",
             ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_string_data_column_stats_pruning_documents_non_ascii_ordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, source) = kernel_non_ascii_string_data_stats_characterization_source()?;
+        let eclair = string_lit("\u{00e9}clair");
+
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").eq(eclair.clone()),)?,
+            vec!["string-eclair.parquet", "string-missing-stats.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("customer_name").eq(large_string_lit("\u{00e9}clair")),
+            )?,
+            vec!["string-eclair.parquet", "string-missing-stats.parquet"]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("customer_name").gt_eq(eclair.clone()),
+            )?,
+            vec![
+                "string-eclair.parquet",
+                "string-emile.parquet",
+                "string-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").lt(eclair.clone()),)?,
+            vec![
+                "string-ascii-cafe.parquet",
+                "string-ascii-zulu.parquet",
+                "string-missing-stats.parquet",
+            ]
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("customer_name").gt(eclair),)?,
+            vec!["string-emile.parquet", "string-missing-stats.parquet"]
         );
 
         Ok(())
