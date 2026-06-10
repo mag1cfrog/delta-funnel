@@ -478,6 +478,18 @@ mod tests {
         )
     }
 
+    fn partitioned_id_stats_add_json(
+        partition_values_json: &str,
+        num_records: i64,
+        min_value: i32,
+        max_value: i32,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#""partitionValues":{partition_values_json},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"id\":{min_value}}},\"maxValues\":{{\"id\":{max_value}}},\"nullCount\":{{\"id\":{null_count}}}}}""#
+        )
+    }
+
     fn id_partial_stats_add_json(
         num_records: i64,
         min_value: Option<i32>,
@@ -830,6 +842,72 @@ mod tests {
         assert_eq!(
             scan_file_paths(scan)?,
             vec!["part-00001.parquet", "part-00002.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_combines_exact_partition_and_integer_data_stats_filters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let west_impossible_stats =
+            partitioned_id_stats_add_json(r#"{"region":"us-west"}"#, 10, 1, 50, 0);
+        let west_possible_stats =
+            partitioned_id_stats_add_json(r#"{"region":"us-west"}"#, 10, 101, 150, 0);
+        let east_possible_stats =
+            partitioned_id_stats_add_json(r#"{"region":"us-east"}"#, 10, 101, 150, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-partition-and-integer-data-stats",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                west_impossible_stats.as_str(),
+                west_possible_stats.as_str(),
+                east_possible_stats.as_str(),
+                r#""partitionValues":{"region":"us-west"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let partition_filter =
+            datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("us-west"));
+        let stats_filter =
+            datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(100_i32));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&partition_filter, &stats_filter])?,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Inexact,
+            ]
+        );
+
+        let plan = provider
+            .scan(
+                &state,
+                Some(&vec![0, 1]),
+                &[partition_filter, stats_filter],
+                None,
+            )
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(
+            scan_file_paths(scan)?,
+            vec!["part-00001.parquet", "part-00003.parquet"]
         );
 
         Ok(())
