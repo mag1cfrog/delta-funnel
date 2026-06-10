@@ -968,6 +968,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_provider_scan_uses_top_level_and_integer_data_stats_with_data_residual_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let possible_stats = id_stats_add_json(10, 101, 150, 0);
+        let impossible_stats = id_stats_add_json(10, 1, 50, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-top-level-and-integer-data-stats-data-residual",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                impossible_stats.as_str(),
+                possible_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter = datafusion::logical_expr::col("id")
+            .gt(datafusion::logical_expr::lit(100_i32))
+            .and(
+                datafusion::logical_expr::col("customer_name")
+                    .eq(datafusion::logical_expr::lit("alice")),
+            );
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0, 1]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(
+            scan_file_paths(scan)?,
+            vec!["part-00001.parquet", "part-00002.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn table_provider_scan_rejects_projected_integer_data_stats_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let stats = id_stats_add_json(10, 1, 50, 0);
