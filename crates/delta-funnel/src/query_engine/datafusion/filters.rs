@@ -218,6 +218,14 @@ mod tests {
         Expr::Literal(ScalarValue::TimestampMicrosecond(Some(value), None), None)
     }
 
+    fn decimal_lit(value: i128) -> Expr {
+        Expr::Literal(ScalarValue::Decimal128(Some(value), 10, 2), None)
+    }
+
+    fn decimal_lit_with_type(value: i128, precision: u8, scale: i8) -> Expr {
+        Expr::Literal(ScalarValue::Decimal128(Some(value), precision, scale), None)
+    }
+
     #[test]
     fn filter_pushdown_reports_exact_for_supported_partition_equality()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -457,6 +465,111 @@ mod tests {
             Expr::Not(Box::new(col("is_current"))),
             col("is_current").in_list(vec![lit(true)], false),
             col("is_current").lt(lit(true)),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Unsupported
+                && decision.residual
+                && decision.kernel_scan_filter.is_none()
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_accepts_decimal_data_stats_filters_as_inexact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DECIMAL_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-decimal-data-stats",
+            DECIMAL_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let amount = decimal_lit(200);
+        let filters = [
+            col("amount").eq(amount.clone()),
+            col("amount").not_eq(amount.clone()),
+            col("amount").lt(amount.clone()),
+            col("amount").lt_eq(amount.clone()),
+            col("amount").gt(amount.clone()),
+            col("amount").gt_eq(amount.clone()),
+            amount.gt(col("amount")),
+            col("amount").is_null(),
+            col("amount").is_not_null(),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Inexact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.residual
+                && decision
+                    .kernel_scan_filter
+                    .as_ref()
+                    .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_rejects_unproven_decimal_data_stats_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DECIMAL_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-decimal-data-stats-unsupported",
+            DECIMAL_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let amount = decimal_lit(200);
+        let filters = [
+            col("amount").eq(decimal_lit_with_type(2_000, 11, 3)),
+            col("amount").eq(decimal_lit_with_type(200, 11, 2)),
+            col("amount").eq(lit("2.00")),
+            col("amount").in_list(vec![amount.clone()], false),
+            col("amount").between(decimal_lit(0), amount.clone()),
+            col("amount")
+                .gt(decimal_lit(0))
+                .or(col("amount").lt(amount.clone())),
+            col("amount").eq(Expr::Literal(
+                ScalarValue::Decimal256(Some(200.into()), 10, 2),
+                None,
+            )),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
         let plan = provider.plan_supports_filters_pushdown(&filter_refs);
