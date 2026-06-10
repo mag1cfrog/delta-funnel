@@ -444,11 +444,22 @@ mod tests {
             col("is_current").lt(lit(true)),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
 
         assert_eq!(
             provider.supports_filters_pushdown(&filter_refs)?,
             vec![TableProviderFilterPushDown::Unsupported; filters.len()]
         );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Unsupported
+                && decision.residual
+                && decision.kernel_scan_filter.is_none()
+        }));
 
         Ok(())
     }
