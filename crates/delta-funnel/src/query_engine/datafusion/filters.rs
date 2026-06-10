@@ -368,6 +368,10 @@ mod tests {
 
         assert!(!production_source.contains("with_predicate"));
         assert!(!production_source.contains("with_filter"));
+        assert!(!production_source.contains("DvInfo"));
+        assert!(!production_source.contains("deletionVector"));
+        assert!(!production_source.contains("get_selection_vector"));
+        assert!(!production_source.contains("get_row_indexes"));
         assert!(!production_source.contains("RecordBatch"));
         assert!(!production_source.to_ascii_lowercase().contains("parquet"));
 
