@@ -19,12 +19,12 @@ use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
     table_formats::{
         DeltaKernelPredicate, ProjectedDeltaScan, build_projected_predicated_delta_scan,
-        delta_source_arrow_schema,
+        build_projected_predicated_stats_delta_scan, delta_source_arrow_schema,
     },
 };
 
 use super::execution::DeltaScanPlanningExec;
-use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
+use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan, KernelScanFilterKind};
 use super::projection::{ProjectionPlan, plan_projection};
 use super::registration::reject_mismatched_preflight;
 use super::scan_plan::{ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest};
@@ -128,6 +128,7 @@ impl DeltaTableProvider {
         let kernel_scan = self.build_kernel_scan(
             kernel_projected_column_names.as_deref(),
             kernel_partition_predicate.clone(),
+            pushed_filter_plan.has_data_stats_filter(),
         )?;
 
         Ok(ProviderScanPlan::from_parts(ProviderScanPlanParts {
@@ -228,7 +229,7 @@ impl DeltaTableProvider {
         Ok(())
     }
 
-    /// Builds the kernel partition predicate for accepted exact and inexact filters.
+    /// Builds the kernel predicate for accepted exact and inexact filters.
     ///
     /// Accepted filters must be enforced by the same predicate passed into
     /// `ScanBuilder::with_predicate`.
@@ -250,7 +251,7 @@ impl DeltaTableProvider {
     ///
     /// DataFusion output projection stays governed by `projected_schema` and
     /// `scan_projection`; this only gives delta_kernel enough schema context to
-    /// validate and evaluate partition predicates during scan planning.
+    /// validate and evaluate metadata predicates during scan planning.
     fn kernel_projected_column_names(
         projected_column_names: Option<Vec<String>>,
         pushed_filter_plan: &DeltaFilterPushdownPlan,
@@ -262,7 +263,17 @@ impl DeltaTableProvider {
                 continue;
             }
 
-            for column in &decision.filter_analysis.partition_columns {
+            let columns = if decision
+                .kernel_scan_filter
+                .as_ref()
+                .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
+            {
+                &decision.filter_analysis.data_columns
+            } else {
+                &decision.filter_analysis.partition_columns
+            };
+
+            for column in columns {
                 if !projected_column_names.contains(column) {
                     projected_column_names.push(column.clone());
                 }
@@ -277,15 +288,25 @@ impl DeltaTableProvider {
         &self,
         projected_column_names: Option<&[String]>,
         kernel_partition_predicate: Option<DeltaKernelPredicate>,
+        include_stats_columns: bool,
     ) -> Result<ProjectedDeltaScan, DeltaFunnelError> {
         let kernel_projected_column_names = projected_column_names.map(|names| names.to_vec());
 
-        build_projected_predicated_delta_scan(
-            &self.source,
-            kernel_projected_column_names.as_deref(),
-            kernel_partition_predicate,
-        )
-        .map_err(|source| DeltaFunnelError::DeltaScanConstruction {
+        let result = if include_stats_columns {
+            build_projected_predicated_stats_delta_scan(
+                &self.source,
+                kernel_projected_column_names.as_deref(),
+                kernel_partition_predicate,
+            )
+        } else {
+            build_projected_predicated_delta_scan(
+                &self.source,
+                kernel_projected_column_names.as_deref(),
+                kernel_partition_predicate,
+            )
+        };
+
+        result.map_err(|source| DeltaFunnelError::DeltaScanConstruction {
             source_name: self.source_name().to_owned(),
             table_uri: self.source.table_uri().to_owned(),
             source: Box::new(source),
@@ -421,8 +442,8 @@ mod tests {
         DeltaTableProviderConfig, register_delta_sources,
     };
     use crate::query_engine::datafusion::test_support::{
-        DeltaLogTable, NESTED_SCHEMA_FIELDS_JSON, PARTITIONED_SCHEMA_FIELDS_JSON,
-        register_fixture_source,
+        DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, NESTED_SCHEMA_FIELDS_JSON,
+        PARTITIONED_SCHEMA_FIELDS_JSON, register_fixture_source,
     };
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
@@ -444,6 +465,17 @@ mod tests {
         scan_plan
             .kernel_scan()
             .scan_file_paths(&scan_plan.table_uri)
+    }
+
+    fn id_stats_add_json(
+        num_records: i64,
+        min_value: i32,
+        max_value: i32,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#""partitionValues":{{}},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"id\":{min_value}}},\"maxValues\":{{\"id\":{max_value}}},\"nullCount\":{{\"id\":{null_count}}}}}""#
+        )
     }
 
     #[test]
@@ -702,6 +734,55 @@ mod tests {
         assert_eq!(
             scan_file_paths(scan)?,
             vec!["part-00000.parquet", "part-00001.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_accepts_inexact_integer_data_stats_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let possible_stats = id_stats_add_json(10, 101, 150, 0);
+        let impossible_stats = id_stats_add_json(10, 1, 50, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-integer-data-stats-filter",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                impossible_stats.as_str(),
+                possible_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(100_i32));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(
+            scan_file_paths(scan)?,
+            vec!["part-00001.parquet", "part-00002.parquet"]
         );
 
         Ok(())

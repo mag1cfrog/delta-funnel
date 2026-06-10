@@ -148,6 +148,25 @@ pub(crate) fn build_projected_predicated_delta_scan(
     })
 }
 
+/// Builds kernel-backed scan state with parsed file stats exposed in scan metadata.
+#[allow(dead_code)]
+pub(crate) fn build_projected_predicated_stats_delta_scan(
+    source: &PlannedDeltaSource,
+    projected_column_names: Option<&[String]>,
+    predicate: Option<DeltaKernelPredicate>,
+) -> Result<ProjectedDeltaScan, delta_kernel::Error> {
+    let (scan, kernel_schema) = kernel::build_projected_predicated_stats_scan(
+        source.loaded_snapshot().kernel_snapshot(),
+        projected_column_names,
+        predicate,
+    )?;
+
+    Ok(ProjectedDeltaScan {
+        scan,
+        kernel_schema,
+    })
+}
+
 /// Loads one named Delta source.
 ///
 /// Name validation runs before URI normalization, engine construction, or

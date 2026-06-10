@@ -2,6 +2,7 @@
 
 mod analysis;
 mod partition_pushdown;
+mod stats_pushdown;
 
 use std::collections::HashSet;
 
@@ -56,13 +57,24 @@ impl DeltaFilterPushdownRejectionReason {
     }
 }
 
+/// Kind of metadata pruning payload used by kernel scan planning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KernelScanFilterKind {
+    /// Exact partition metadata pruning.
+    Partition,
+    /// Inexact data-column file-statistics pruning.
+    DataStats,
+}
+
 #[derive(Clone, Debug, PartialEq)]
-/// Exact partition filter payload used by kernel scan planning.
+/// Metadata filter payload used by kernel scan planning.
 pub(crate) struct ExactPartitionKernelFilter {
     /// DataFusion expression after any kernel-safe rewrites.
     pub(crate) datafusion_expr: Expr,
     /// Converted Delta kernel predicate for the same expression.
     pub(crate) kernel_predicate: DeltaKernelPredicate,
+    /// Metadata pruning path that owns this kernel predicate.
+    pub(crate) kind: KernelScanFilterKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,6 +163,16 @@ impl DeltaFilterPushdownPlan {
             .map(|decision| decision.outcome.to_datafusion())
             .collect()
     }
+
+    #[must_use]
+    pub(crate) fn has_data_stats_filter(&self) -> bool {
+        self.decisions.iter().any(|decision| {
+            decision
+                .kernel_scan_filter
+                .as_ref()
+                .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -230,8 +252,9 @@ mod tests {
     }
 
     #[test]
-    fn filter_pushdown_keeps_data_filters_unsupported() -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("filter-pushdown-data-unsupported")?;
+    fn filter_pushdown_accepts_integer_data_stats_filters_as_inexact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-integer-data-stats")?;
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
@@ -239,18 +262,27 @@ mod tests {
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
-        let id_filter = col("id").gt(lit(1));
+        let id_filter = col("id").gt(lit(1_i32));
+        let cross_width_id_filter = col("id").gt(lit(1_i64));
         let name_filter = col("customer_name").eq(lit("a"));
 
-        let support = provider.supports_filters_pushdown(&[&id_filter, &name_filter])?;
+        let support = provider.supports_filters_pushdown(&[&id_filter])?;
+        let plan = provider.plan_supports_filters_pushdown(&[&id_filter]);
 
-        assert_eq!(
-            support,
-            vec![
-                TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Unsupported
-            ]
-        );
+        assert_eq!(support, vec![TableProviderFilterPushDown::Inexact]);
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert!(plan.decisions[0].kernel_scan_filter.is_some());
+
+        let support = provider.supports_filters_pushdown(&[&name_filter])?;
+
+        assert_eq!(support, vec![TableProviderFilterPushDown::Unsupported]);
+        let support = provider.supports_filters_pushdown(&[&cross_width_id_filter])?;
+
+        assert_eq!(support, vec![TableProviderFilterPushDown::Unsupported]);
 
         Ok(())
     }
