@@ -276,16 +276,16 @@ mod tests {
             plan.datafusion_pushdowns(),
             vec![
                 TableProviderFilterPushDown::Exact,
-                TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Unsupported,
             ]
         );
         assert_eq!(plan.exact_count, 1);
-        assert_eq!(plan.inexact_count, 0);
-        assert_eq!(plan.unsupported_count, 4);
-        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.inexact_count, 2);
+        assert_eq!(plan.unsupported_count, 2);
+        assert_eq!(plan.pushed_filter_count, 3);
         assert_eq!(plan.residual_filter_count, 4);
         assert_eq!(plan.decisions.len(), 5);
 

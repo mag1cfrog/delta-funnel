@@ -19,12 +19,12 @@ use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
     table_formats::{
         DeltaKernelPredicate, ProjectedDeltaScan, build_projected_predicated_delta_scan,
-        delta_source_arrow_schema,
+        build_projected_predicated_stats_delta_scan, delta_source_arrow_schema,
     },
 };
 
 use super::execution::DeltaScanPlanningExec;
-use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
+use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan, KernelScanFilterKind};
 use super::projection::{ProjectionPlan, plan_projection};
 use super::registration::reject_mismatched_preflight;
 use super::scan_plan::{ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest};
@@ -128,6 +128,7 @@ impl DeltaTableProvider {
         let kernel_scan = self.build_kernel_scan(
             kernel_projected_column_names.as_deref(),
             kernel_partition_predicate.clone(),
+            pushed_filter_plan.has_data_stats_filter(),
         )?;
 
         Ok(ProviderScanPlan::from_parts(ProviderScanPlanParts {
@@ -228,7 +229,7 @@ impl DeltaTableProvider {
         Ok(())
     }
 
-    /// Builds the kernel partition predicate for accepted exact and inexact filters.
+    /// Builds the kernel predicate for accepted exact and inexact filters.
     ///
     /// Accepted filters must be enforced by the same predicate passed into
     /// `ScanBuilder::with_predicate`.
@@ -250,7 +251,7 @@ impl DeltaTableProvider {
     ///
     /// DataFusion output projection stays governed by `projected_schema` and
     /// `scan_projection`; this only gives delta_kernel enough schema context to
-    /// validate and evaluate partition predicates during scan planning.
+    /// validate and evaluate metadata predicates during scan planning.
     fn kernel_projected_column_names(
         projected_column_names: Option<Vec<String>>,
         pushed_filter_plan: &DeltaFilterPushdownPlan,
@@ -262,7 +263,17 @@ impl DeltaTableProvider {
                 continue;
             }
 
-            for column in &decision.filter_analysis.partition_columns {
+            let columns = if decision
+                .kernel_scan_filter
+                .as_ref()
+                .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
+            {
+                &decision.filter_analysis.data_columns
+            } else {
+                &decision.filter_analysis.partition_columns
+            };
+
+            for column in columns {
                 if !projected_column_names.contains(column) {
                     projected_column_names.push(column.clone());
                 }
@@ -277,15 +288,25 @@ impl DeltaTableProvider {
         &self,
         projected_column_names: Option<&[String]>,
         kernel_partition_predicate: Option<DeltaKernelPredicate>,
+        include_stats_columns: bool,
     ) -> Result<ProjectedDeltaScan, DeltaFunnelError> {
         let kernel_projected_column_names = projected_column_names.map(|names| names.to_vec());
 
-        build_projected_predicated_delta_scan(
-            &self.source,
-            kernel_projected_column_names.as_deref(),
-            kernel_partition_predicate,
-        )
-        .map_err(|source| DeltaFunnelError::DeltaScanConstruction {
+        let result = if include_stats_columns {
+            build_projected_predicated_stats_delta_scan(
+                &self.source,
+                kernel_projected_column_names.as_deref(),
+                kernel_partition_predicate,
+            )
+        } else {
+            build_projected_predicated_delta_scan(
+                &self.source,
+                kernel_projected_column_names.as_deref(),
+                kernel_partition_predicate,
+            )
+        };
+
+        result.map_err(|source| DeltaFunnelError::DeltaScanConstruction {
             source_name: self.source_name().to_owned(),
             table_uri: self.source.table_uri().to_owned(),
             source: Box::new(source),
@@ -421,8 +442,8 @@ mod tests {
         DeltaTableProviderConfig, register_delta_sources,
     };
     use crate::query_engine::datafusion::test_support::{
-        DeltaLogTable, NESTED_SCHEMA_FIELDS_JSON, PARTITIONED_SCHEMA_FIELDS_JSON,
-        register_fixture_source,
+        DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, NESTED_SCHEMA_FIELDS_JSON,
+        PARTITIONED_SCHEMA_FIELDS_JSON, register_fixture_source,
     };
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
@@ -444,6 +465,76 @@ mod tests {
         scan_plan
             .kernel_scan()
             .scan_file_paths(&scan_plan.table_uri)
+    }
+
+    fn id_stats_add_json(
+        num_records: i64,
+        min_value: i32,
+        max_value: i32,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#""partitionValues":{{}},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"id\":{min_value}}},\"maxValues\":{{\"id\":{max_value}}},\"nullCount\":{{\"id\":{null_count}}}}}""#
+        )
+    }
+
+    fn partitioned_id_stats_add_json(
+        partition_values_json: &str,
+        num_records: i64,
+        min_value: i32,
+        max_value: i32,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#""partitionValues":{partition_values_json},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"id\":{min_value}}},\"maxValues\":{{\"id\":{max_value}}},\"nullCount\":{{\"id\":{null_count}}}}}""#
+        )
+    }
+
+    fn id_partial_stats_add_json(
+        num_records: i64,
+        min_value: Option<i32>,
+        max_value: Option<i32>,
+        null_count: i64,
+    ) -> String {
+        let mut stats_fields = vec![format!(r#"\"numRecords\":{num_records}"#)];
+        if let Some(min_value) = min_value {
+            stats_fields.push(format!(r#"\"minValues\":{{\"id\":{min_value}}}"#));
+        }
+        if let Some(max_value) = max_value {
+            stats_fields.push(format!(r#"\"maxValues\":{{\"id\":{max_value}}}"#));
+        }
+        stats_fields.push(format!(r#"\"nullCount\":{{\"id\":{null_count}}}"#));
+
+        format!(
+            r#""partitionValues":{{}},"stats":"{{{}}}""#,
+            stats_fields.join(",")
+        )
+    }
+
+    fn stats_add_json(stats_json: &str) -> String {
+        format!(r#""partitionValues":{{}},"stats":"{stats_json}""#)
+    }
+
+    fn id_stats_add_json_with_optional_counts(
+        num_records: Option<i64>,
+        min_value: i32,
+        max_value: i32,
+        null_count: Option<i64>,
+    ) -> String {
+        let mut stats_fields = Vec::new();
+        if let Some(num_records) = num_records {
+            stats_fields.push(format!(r#"\"numRecords\":{num_records}"#));
+        }
+        stats_fields.push(format!(r#"\"minValues\":{{\"id\":{min_value}}}"#));
+        stats_fields.push(format!(r#"\"maxValues\":{{\"id\":{max_value}}}"#));
+        if let Some(null_count) = null_count {
+            stats_fields.push(format!(r#"\"nullCount\":{{\"id\":{null_count}}}"#));
+        }
+
+        format!(
+            r#""partitionValues":{{}},"stats":"{{{}}}""#,
+            stats_fields.join(",")
+        )
     }
 
     #[test]
@@ -607,7 +698,8 @@ mod tests {
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
         let state = SessionContext::new().state();
-        let filter = datafusion::logical_expr::col("id").eq(datafusion::logical_expr::lit(7));
+        let filter = datafusion::logical_expr::col("id")
+            .in_list(vec![datafusion::logical_expr::lit(7_i32)], false);
 
         let result = provider.scan(&state, None, &[filter], None).await;
 
@@ -703,6 +795,436 @@ mod tests {
             scan_file_paths(scan)?,
             vec!["part-00000.parquet", "part-00001.parquet"]
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_accepts_inexact_integer_data_stats_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let possible_stats = id_stats_add_json(10, 101, 150, 0);
+        let impossible_stats = id_stats_add_json(10, 1, 50, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-integer-data-stats-filter",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                impossible_stats.as_str(),
+                possible_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(100_i32));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(
+            scan_file_paths(scan)?,
+            vec!["part-00001.parquet", "part-00002.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_combines_exact_partition_and_integer_data_stats_filters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let west_impossible_stats =
+            partitioned_id_stats_add_json(r#"{"region":"us-west"}"#, 10, 1, 50, 0);
+        let west_possible_stats =
+            partitioned_id_stats_add_json(r#"{"region":"us-west"}"#, 10, 101, 150, 0);
+        let east_possible_stats =
+            partitioned_id_stats_add_json(r#"{"region":"us-east"}"#, 10, 101, 150, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-partition-and-integer-data-stats",
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                west_impossible_stats.as_str(),
+                west_possible_stats.as_str(),
+                east_possible_stats.as_str(),
+                r#""partitionValues":{"region":"us-west"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let partition_filter =
+            datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("us-west"));
+        let stats_filter =
+            datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(100_i32));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&partition_filter, &stats_filter])?,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Inexact,
+            ]
+        );
+
+        let plan = provider
+            .scan(
+                &state,
+                Some(&vec![0, 1]),
+                &[partition_filter, stats_filter],
+                None,
+            )
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(
+            scan_file_paths(scan)?,
+            vec!["part-00001.parquet", "part-00003.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_projected_integer_data_stats_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stats = id_stats_add_json(10, 1, 50, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-projected-integer-data-stats-filter",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[stats.as_str()],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![1];
+        let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(7_i32));
+
+        let result = provider
+            .scan(&state, Some(&projection), &[filter], None)
+            .await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+                .to_string()
+                .contains("inexact pushed filter residual columns must be projected"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_integer_stats_pruning_for_supported_operators()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let low_stats = id_stats_add_json(10, 1, 5, 0);
+        let target_stats = id_stats_add_json(10, 7, 7, 0);
+        let high_stats = id_stats_add_json(10, 8, 10, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-integer-data-stats-operators",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                low_stats.as_str(),
+                target_stats.as_str(),
+                high_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "equals",
+                datafusion::logical_expr::col("id").eq(datafusion::logical_expr::lit(7_i32)),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not equals",
+                datafusion::logical_expr::col("id").not_eq(datafusion::logical_expr::lit(7_i32)),
+                vec![
+                    "part-00000.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "less than",
+                datafusion::logical_expr::col("id").lt(datafusion::logical_expr::lit(7_i32)),
+                vec!["part-00000.parquet", "part-00003.parquet"],
+            ),
+            (
+                "less than or equal",
+                datafusion::logical_expr::col("id").lt_eq(datafusion::logical_expr::lit(7_i32)),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "greater than",
+                datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(7_i32)),
+                vec!["part-00002.parquet", "part-00003.parquet"],
+            ),
+            (
+                "greater than or equal",
+                datafusion::logical_expr::col("id").gt_eq(datafusion::logical_expr::lit(7_i32)),
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            assert_eq!(
+                provider.supports_filters_pushdown(&[&filter])?,
+                vec![TableProviderFilterPushDown::Inexact],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.inexact_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_integer_stats_pruning_for_not_equals_null_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let all_literal_no_null_stats = id_stats_add_json(10, 7, 7, 0);
+        let mixed_value_stats = id_stats_add_json(10, 7, 8, 0);
+        let all_literal_with_null_stats = id_stats_add_json(10, 7, 7, 1);
+        let missing_null_count_stats = id_stats_add_json_with_optional_counts(Some(10), 7, 7, None);
+        let missing_num_records_stats = id_stats_add_json_with_optional_counts(None, 7, 7, Some(0));
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-integer-data-stats-not-equals-null-boundaries",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                all_literal_no_null_stats.as_str(),
+                mixed_value_stats.as_str(),
+                all_literal_with_null_stats.as_str(),
+                missing_null_count_stats.as_str(),
+                missing_num_records_stats.as_str(),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter =
+            datafusion::logical_expr::col("id").not_eq(datafusion::logical_expr::lit(7_i32));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert_eq!(scan_file_paths(scan)?, vec!["part-00001.parquet"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_keeps_partial_integer_stats_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let max_only_low_stats = id_partial_stats_add_json(10, None, Some(5), 0);
+        let min_only_high_stats = id_partial_stats_add_json(10, Some(8), None, 0);
+        let max_only_high_stats = id_partial_stats_add_json(10, None, Some(10), 0);
+        let min_only_low_stats = id_partial_stats_add_json(10, Some(1), None, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-integer-data-stats-partial",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                max_only_low_stats.as_str(),
+                min_only_high_stats.as_str(),
+                max_only_high_stats.as_str(),
+                min_only_low_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "greater than",
+                datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(7_i32)),
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+            (
+                "less than",
+                datafusion::logical_expr::col("id").lt(datafusion::logical_expr::lit(7_i32)),
+                vec![
+                    "part-00000.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                    "part-00004.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            assert_eq!(
+                provider.supports_filters_pushdown(&[&filter])?,
+                vec![TableProviderFilterPushDown::Inexact],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.inexact_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_keeps_invalid_integer_stats_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let impossible_stats = id_stats_add_json(10, 1, 5, 0);
+        let schema_mismatch_stats = stats_add_json(
+            r#"{\"numRecords\":10,\"minValues\":{\"id\":\"low\"},\"maxValues\":{\"id\":\"high\"},\"nullCount\":{\"id\":0}}"#,
+        );
+        let malformed_stats = stats_add_json(r#"not-json"#);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-integer-data-stats-invalid",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                impossible_stats.as_str(),
+                schema_mismatch_stats.as_str(),
+                malformed_stats.as_str(),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(7_i32));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider
+            .scan(&state, Some(&vec![0]), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        let paths = scan_file_paths(scan)?;
+        assert!(paths.contains(&"part-00001.parquet".to_owned()));
+        assert!(paths.contains(&"part-00002.parquet".to_owned()));
 
         Ok(())
     }
@@ -1755,6 +2277,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_stats_residual_column_remains_available_below_final_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let possible_stats = id_stats_add_json(10, 101, 150, 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "data-stats-residual-filter-projection",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[possible_stats.as_str()],
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri,
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql("select customer_name from orders where id > 100")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert!(
+            plan_display.contains("DeltaScanPlanningExec"),
+            "{plan_display}"
+        );
+        assert_eq!(physical_plan.schema().fields().len(), 1);
+        assert_eq!(physical_plan.schema().field(0).name(), "customer_name");
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0, 1]));
+        assert_eq!(scans[0].schema().fields().len(), 2);
+        assert_eq!(scans[0].schema().field(0).name(), "id");
+        assert_eq!(scans[0].schema().field(1).name(), "customer_name");
+        assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .residual_filter_count,
+            1
+        );
+        assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mixed_partition_pruning_keeps_residual_column_below_final_projection()
     -> Result<(), Box<dyn std::error::Error>> {
         const MIXED_FILTER_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
@@ -2243,6 +2826,7 @@ mod tests {
             name: &'static str,
             sql: &'static str,
             exact_count: usize,
+            residual_filter_count: usize,
         }
 
         let sql_cases = [
@@ -2250,22 +2834,26 @@ mod tests {
                 name: "partition in and data",
                 sql: "select id from orders where region in ('us-west', 'us-east') and id > 1",
                 exact_count: 1,
+                residual_filter_count: 1,
             },
             SqlMixedBooleanProbe {
                 name: "partition in or data",
                 sql: "select id from orders where region in ('us-west', 'us-east') or id = 1",
                 exact_count: 0,
+                residual_filter_count: 0,
             },
             SqlMixedBooleanProbe {
                 name: "partition equality or data",
                 sql: "select id from orders where region = 'us-west' or id = 1",
                 exact_count: 0,
+                residual_filter_count: 0,
             },
             SqlMixedBooleanProbe {
                 name: "partition in or nested exact partition and data",
                 sql: "select id from orders where (region in ('us-west', 'us-east') \
                       or region = 'eu-central') and id > 1",
                 exact_count: 1,
+                residual_filter_count: 1,
             },
         ];
 
@@ -2297,7 +2885,7 @@ mod tests {
                     .scan_plan()
                     .pushed_filter_plan
                     .residual_filter_count,
-                0,
+                case.residual_filter_count,
                 "{}: {}",
                 case.name,
                 plan_display

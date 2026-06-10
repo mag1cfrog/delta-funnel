@@ -11,7 +11,7 @@ use crate::table_formats::{DeltaKernelPredicate, datafusion_expr_to_kernel_predi
 use super::analysis::{DeltaFilterColumnScope, analyze_filter_for_pushdown};
 use super::{
     DeltaFilterPushdownDecision, DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan,
-    ExactPartitionKernelFilter,
+    ExactPartitionKernelFilter, KernelScanFilterKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +98,19 @@ fn partition_operator_decision(
         };
     }
 
+    if filter_analysis.scope == DeltaFilterColumnScope::DataOnly
+        && let Some(kernel_scan_filter) =
+            super::stats_pushdown::try_integer_data_stats_kernel_filter(filter, schema)
+    {
+        return DeltaFilterPushdownDecision {
+            outcome: DeltaFilterPushdownOutcome::Inexact,
+            residual: true,
+            rejection_reason: None,
+            filter_analysis,
+            kernel_scan_filter: Some(kernel_scan_filter),
+        };
+    }
+
     DeltaFilterPushdownDecision {
         outcome: DeltaFilterPushdownOutcome::Unsupported,
         residual: true,
@@ -121,6 +134,7 @@ fn try_exact_partition_kernel_filter(
     Some(ExactPartitionKernelFilter {
         datafusion_expr,
         kernel_predicate,
+        kind: KernelScanFilterKind::Partition,
     })
 }
 
@@ -177,6 +191,7 @@ fn try_mixed_and_partition_kernel_filter(
     Some(ExactPartitionKernelFilter {
         datafusion_expr,
         kernel_predicate,
+        kind: KernelScanFilterKind::Partition,
     })
 }
 
@@ -2568,16 +2583,17 @@ mod tests {
             plan.datafusion_pushdowns(),
             vec![
                 TableProviderFilterPushDown::Exact,
-                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Exact,
             ]
         );
         assert_eq!(plan.exact_count, 2);
-        assert_eq!(plan.unsupported_count, 1);
-        assert_eq!(plan.pushed_filter_count, 2);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 3);
         assert_eq!(plan.residual_filter_count, 1);
         assert_eq!(kernel_scan_expr(&plan.decisions[0]), Some(&exact));
-        assert!(plan.decisions[1].kernel_scan_filter.is_none());
+        assert!(plan.decisions[1].kernel_scan_filter.is_some());
         assert_eq!(kernel_scan_expr(&plan.decisions[2]), Some(&duplicate_exact));
     }
 

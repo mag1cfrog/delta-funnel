@@ -104,8 +104,7 @@ pub(crate) fn build_projected_predicated_scan(
     Ok((scan, schema))
 }
 
-/// Builds test scan state with parsed file statistics exposed in scan metadata.
-#[cfg(test)]
+/// Builds scan state with parsed file statistics exposed in scan metadata.
 pub(crate) fn build_projected_predicated_stats_scan(
     snapshot: &SnapshotRef,
     projected_column_names: Option<&[String]>,

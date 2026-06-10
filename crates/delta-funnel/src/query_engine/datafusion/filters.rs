@@ -2,6 +2,7 @@
 
 mod analysis;
 mod partition_pushdown;
+mod stats_pushdown;
 
 use std::collections::HashSet;
 
@@ -56,13 +57,24 @@ impl DeltaFilterPushdownRejectionReason {
     }
 }
 
+/// Kind of metadata pruning payload used by kernel scan planning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KernelScanFilterKind {
+    /// Exact partition metadata pruning.
+    Partition,
+    /// Inexact data-column file-statistics pruning.
+    DataStats,
+}
+
 #[derive(Clone, Debug, PartialEq)]
-/// Exact partition filter payload used by kernel scan planning.
+/// Metadata filter payload used by kernel scan planning.
 pub(crate) struct ExactPartitionKernelFilter {
     /// DataFusion expression after any kernel-safe rewrites.
     pub(crate) datafusion_expr: Expr,
     /// Converted Delta kernel predicate for the same expression.
     pub(crate) kernel_predicate: DeltaKernelPredicate,
+    /// Metadata pruning path that owns this kernel predicate.
+    pub(crate) kind: KernelScanFilterKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,6 +163,16 @@ impl DeltaFilterPushdownPlan {
             .map(|decision| decision.outcome.to_datafusion())
             .collect()
     }
+
+    #[must_use]
+    pub(crate) fn has_data_stats_filter(&self) -> bool {
+        self.decisions.iter().any(|decision| {
+            decision
+                .kernel_scan_filter
+                .as_ref()
+                .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +180,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use datafusion::common::ScalarValue;
     use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, col, lit};
 
@@ -167,6 +190,18 @@ mod tests {
         DeltaLogTable, PARTITIONED_SCHEMA_FIELDS_JSON,
     };
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+
+    fn int8_lit(value: i8) -> Expr {
+        Expr::Literal(ScalarValue::Int8(Some(value)), None)
+    }
+
+    fn int16_lit(value: i16) -> Expr {
+        Expr::Literal(ScalarValue::Int16(Some(value)), None)
+    }
+
+    fn int64_lit(value: i64) -> Expr {
+        Expr::Literal(ScalarValue::Int64(Some(value)), None)
+    }
 
     #[test]
     fn filter_pushdown_reports_exact_for_supported_partition_equality()
@@ -230,8 +265,9 @@ mod tests {
     }
 
     #[test]
-    fn filter_pushdown_keeps_data_filters_unsupported() -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("filter-pushdown-data-unsupported")?;
+    fn filter_pushdown_accepts_integer_data_stats_filters_as_inexact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-integer-data-stats")?;
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
@@ -239,17 +275,129 @@ mod tests {
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
-        let id_filter = col("id").gt(lit(1));
+        let id_filter = col("id").gt(lit(1_i32));
+        let cross_width_id_filter = col("id").gt(lit(1_i64));
         let name_filter = col("customer_name").eq(lit("a"));
 
-        let support = provider.supports_filters_pushdown(&[&id_filter, &name_filter])?;
+        let support = provider.supports_filters_pushdown(&[&id_filter])?;
+        let plan = provider.plan_supports_filters_pushdown(&[&id_filter]);
+
+        assert_eq!(support, vec![TableProviderFilterPushDown::Inexact]);
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert!(plan.decisions[0].kernel_scan_filter.is_some());
+
+        let support = provider.supports_filters_pushdown(&[&name_filter])?;
+
+        assert_eq!(support, vec![TableProviderFilterPushDown::Unsupported]);
+        let support = provider.supports_filters_pushdown(&[&cross_width_id_filter])?;
+
+        assert_eq!(support, vec![TableProviderFilterPushDown::Unsupported]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_accepts_same_width_integer_data_stats_widths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const INTEGER_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"byte_count\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_count\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_count\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_count\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-integer-data-stats-widths",
+            INTEGER_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let byte_filter = col("byte_count").gt(int8_lit(1));
+        let short_filter = col("short_count").gt(int16_lit(1));
+        let int_filter = col("int_count").gt(lit(1_i32));
+        let long_filter = col("long_count").gt(int64_lit(1));
+        let cross_width_filter = col("int_count").gt(int64_lit(1));
+
+        let support = provider.supports_filters_pushdown(&[
+            &byte_filter,
+            &short_filter,
+            &int_filter,
+            &long_filter,
+            &cross_width_filter,
+        ])?;
 
         assert_eq!(
             support,
             vec![
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Unsupported
             ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_accepts_simple_integer_data_stats_operators()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-integer-data-stats-operators")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let filters = [
+            col("id").eq(lit(7_i32)),
+            col("id").not_eq(lit(7_i32)),
+            col("id").lt(lit(7_i32)),
+            col("id").lt_eq(lit(7_i32)),
+            col("id").gt(lit(7_i32)),
+            col("id").gt_eq(lit(7_i32)),
+            lit(7_i32).lt(col("id")),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Inexact; filters.len()]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_rejects_unproven_integer_data_stats_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-integer-data-stats-unsupported")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let filters = [
+            col("id").in_list(vec![lit(1_i32), lit(2_i32)], false),
+            col("id").between(lit(1_i32), lit(2_i32)),
+            col("id").is_null(),
+            col("id").is_not_null(),
+            col("id").gt(lit(1_i32)).or(col("id").lt(lit(0_i32))),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
         );
 
         Ok(())
