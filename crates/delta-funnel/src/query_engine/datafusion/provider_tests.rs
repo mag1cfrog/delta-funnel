@@ -4691,6 +4691,68 @@ async fn boolean_data_stats_residual_column_remains_available_below_final_projec
 }
 
 #[tokio::test]
+async fn binary_data_stats_residual_column_remains_available_below_final_projection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let stats = binary_partial_stats_add_json(10, Some(0));
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "binary-data-stats-residual-filter-projection",
+        BINARY_DATA_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[stats.as_str()],
+    )?;
+    let table_uri = table.path().to_string_lossy().to_string();
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri,
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    register_delta_sources(
+        &ctx,
+        vec![DeltaTableProviderConfig {
+            source,
+            protocol: preflight,
+        }],
+    )?;
+
+    let dataframe = ctx
+        .sql("select id from orders where payload is not null")
+        .await?;
+    let physical_plan = dataframe.create_physical_plan().await?;
+    let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut scans = Vec::new();
+    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+    assert!(plan_display.contains("FilterExec"), "{plan_display}");
+    assert!(
+        plan_display.contains("DeltaScanPlanningExec"),
+        "{plan_display}"
+    );
+    assert_eq!(physical_plan.schema().fields().len(), 1);
+    assert_eq!(physical_plan.schema().field(0).name(), "id");
+    assert_eq!(scans.len(), 1);
+    assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0, 1]));
+    assert_eq!(scans[0].schema().fields().len(), 2);
+    assert_eq!(scans[0].schema().field(0).name(), "id");
+    assert_eq!(scans[0].schema().field(1).name(), "payload");
+    assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
+    assert_eq!(
+        scans[0]
+            .scan_plan()
+            .pushed_filter_plan
+            .residual_filter_count,
+        1
+    );
+    assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
+    assert_eq!(scan_file_paths(scans[0])?, vec!["part-00000.parquet"]);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn temporal_data_stats_residual_column_remains_available_below_final_projection()
 -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
