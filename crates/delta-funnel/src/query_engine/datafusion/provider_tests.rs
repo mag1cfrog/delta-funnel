@@ -232,6 +232,20 @@ fn floating_stats_add_json(
     )
 }
 
+fn partitioned_floating_stats_add_json(
+    partition_values_json: &str,
+    num_records: i64,
+    float_min_value: &str,
+    float_max_value: &str,
+    double_min_value: &str,
+    double_max_value: &str,
+    null_count: i64,
+) -> String {
+    format!(
+        r#""partitionValues":{partition_values_json},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"float_score\":{float_min_value},\"double_score\":{double_min_value}}},\"maxValues\":{{\"float_score\":{float_max_value},\"double_score\":{double_max_value}}},\"nullCount\":{{\"float_score\":{null_count},\"double_score\":{null_count}}}}}""#
+    )
+}
+
 fn floating_partial_stats_add_json(num_records: i64, null_count: Option<i64>) -> String {
     let mut stats_fields = vec![format!(r#"\"numRecords\":{num_records}"#)];
     if let Some(null_count) = null_count {
@@ -1751,6 +1765,86 @@ async fn table_provider_scan_accepts_projected_floating_data_stats_when_residual
     assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
     assert!(scan.scan_plan().kernel_partition_predicate.is_some());
     assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_uses_top_level_and_partition_and_floating_data_stats_filter()
+-> Result<(), Box<dyn std::error::Error>> {
+    const MIXED_FLOATING_STATS_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"float_score\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"double_score\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
+    let west_low_stats = partitioned_floating_stats_add_json(
+        r#"{"region":"us-west"}"#,
+        10,
+        "0.5",
+        "0.5",
+        "0.5",
+        "0.5",
+        0,
+    );
+    let west_target_stats = partitioned_floating_stats_add_json(
+        r#"{"region":"us-west"}"#,
+        10,
+        "1.5",
+        "1.5",
+        "2.25",
+        "2.25",
+        0,
+    );
+    let east_target_stats = partitioned_floating_stats_add_json(
+        r#"{"region":"us-east"}"#,
+        10,
+        "1.5",
+        "1.5",
+        "2.25",
+        "2.25",
+        0,
+    );
+    let west_missing_stats = r#""partitionValues":{"region":"us-west"}"#;
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-top-level-and-partition-floating-data-stats",
+        MIXED_FLOATING_STATS_SCHEMA_FIELDS_JSON,
+        r#"["region"]"#,
+        &[
+            west_low_stats.as_str(),
+            west_target_stats.as_str(),
+            east_target_stats.as_str(),
+            west_missing_stats,
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+    let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+    let filter = datafusion::logical_expr::col("region")
+        .eq(datafusion::logical_expr::lit("us-west"))
+        .and(datafusion::logical_expr::col("float_score").eq(float_value));
+    assert_eq!(
+        provider.supports_filters_pushdown(&[&filter])?,
+        vec![TableProviderFilterPushDown::Inexact]
+    );
+
+    let plan = provider.scan(&state, None, &[filter], None).await?;
+    let scan = plan
+        .as_any()
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+
+    assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
+    assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+    assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+    assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+    assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+    assert_eq!(
+        scan_file_paths(scan)?,
+        vec!["part-00001.parquet", "part-00003.parquet"]
+    );
 
     Ok(())
 }
