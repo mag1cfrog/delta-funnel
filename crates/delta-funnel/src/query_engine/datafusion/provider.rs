@@ -455,6 +455,9 @@ mod tests {
     const TIMESTAMP_NTZ_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
     const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
     const BOOLEAN_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]"#;
+    const DATE_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]"#;
+    const TIMESTAMP_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]"#;
+    const TIMESTAMP_NTZ_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]"#;
 
     fn scan_file_paths(
         scan: &DeltaScanPlanningExec,
@@ -589,6 +592,59 @@ mod tests {
         }
         if let Some(null_count) = null_count {
             stats_fields.push(format!(r#"\"nullCount\":{{\"is_current\":{null_count}}}"#));
+        }
+
+        format!(
+            r#""partitionValues":{{}},"stats":"{{{}}}""#,
+            stats_fields.join(",")
+        )
+    }
+
+    fn date_stats_add_json(
+        num_records: i64,
+        min_value: &str,
+        max_value: &str,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#""partitionValues":{{}},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"event_date\":\"{min_value}\"}},\"maxValues\":{{\"event_date\":\"{max_value}\"}},\"nullCount\":{{\"event_date\":{null_count}}}}}""#
+        )
+    }
+
+    fn partitioned_date_stats_add_json(
+        partition_values_json: &str,
+        num_records: i64,
+        min_value: &str,
+        max_value: &str,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#""partitionValues":{partition_values_json},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"event_date\":\"{min_value}\"}},\"maxValues\":{{\"event_date\":\"{max_value}\"}},\"nullCount\":{{\"event_date\":{null_count}}}}}""#
+        )
+    }
+
+    fn timestamp_stats_add_json(
+        column_name: &str,
+        num_records: i64,
+        min_value: &str,
+        max_value: &str,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#""partitionValues":{{}},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"{column_name}\":\"{min_value}\"}},\"maxValues\":{{\"{column_name}\":\"{max_value}\"}},\"nullCount\":{{\"{column_name}\":{null_count}}}}}""#
+        )
+    }
+
+    fn temporal_partial_stats_add_json(
+        column_name: &str,
+        num_records: i64,
+        null_count: Option<i64>,
+    ) -> String {
+        let mut stats_fields = vec![format!(r#"\"numRecords\":{num_records}"#)];
+        if let Some(null_count) = null_count {
+            stats_fields.push(format!(
+                r#"\"nullCount\":{{\"{column_name}\":{null_count}}}"#
+            ));
         }
 
         format!(
@@ -1558,6 +1614,576 @@ mod tests {
             scan_file_paths(scan)?,
             vec!["part-00000.parquet", "part-00003.parquet"]
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_date_stats_pruning_for_supported_operators()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pre_epoch_stats = date_stats_add_json(10, "1969-12-31", "1969-12-31", 0);
+        let leap_stats = date_stats_add_json(10, "2024-02-29", "2024-02-29", 0);
+        let target_stats = date_stats_add_json(10, "2026-01-01", "2026-01-01", 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-date-data-stats-operators",
+            DATE_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                pre_epoch_stats.as_str(),
+                leap_stats.as_str(),
+                target_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let target = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let leap = Expr::Literal(ScalarValue::Date32(Some(19_782)), None);
+        let cases = [
+            (
+                "equals",
+                datafusion::logical_expr::col("event_date").eq(target.clone()),
+                vec!["part-00002.parquet", "part-00003.parquet"],
+            ),
+            (
+                "not equals",
+                datafusion::logical_expr::col("event_date").not_eq(target.clone()),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "greater than",
+                datafusion::logical_expr::col("event_date").gt(leap.clone()),
+                vec!["part-00002.parquet", "part-00003.parquet"],
+            ),
+            (
+                "less than reversed",
+                target.gt(datafusion::logical_expr::col("event_date")),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            assert_eq!(
+                provider.supports_filters_pushdown(&[&filter])?,
+                vec![TableProviderFilterPushDown::Inexact],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0, 1]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.inexact_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                1,
+                "{name}"
+            );
+            assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_timestamp_stats_pruning_for_supported_operators()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let low_stats = timestamp_stats_add_json(
+            "event_ts",
+            10,
+            "2025-12-31T23:59:59.999999Z",
+            "2025-12-31T23:59:59.999999Z",
+            0,
+        );
+        let target_stats = timestamp_stats_add_json(
+            "event_ts",
+            10,
+            "2026-01-01T00:00:00.123456Z",
+            "2026-01-01T00:00:00.123456Z",
+            0,
+        );
+        let high_stats = timestamp_stats_add_json(
+            "event_ts",
+            10,
+            "2026-01-01T00:00:00.123457Z",
+            "2026-01-01T00:00:00.123457Z",
+            0,
+        );
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-timestamp-data-stats-operators",
+            TIMESTAMP_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                low_stats.as_str(),
+                target_stats.as_str(),
+                high_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let target = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
+            None,
+        );
+        let high = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_457), Some("UTC".into())),
+            None,
+        );
+        let cases = [
+            (
+                "equals",
+                datafusion::logical_expr::col("event_ts").eq(target.clone()),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "less than",
+                datafusion::logical_expr::col("event_ts").lt(target.clone()),
+                vec!["part-00000.parquet", "part-00003.parquet"],
+            ),
+            (
+                "greater than reversed",
+                high.gt(datafusion::logical_expr::col("event_ts")),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            assert_eq!(
+                provider.supports_filters_pushdown(&[&filter])?,
+                vec![TableProviderFilterPushDown::Inexact],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0, 1]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.inexact_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                1,
+                "{name}"
+            );
+            assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_timestamp_ntz_stats_pruning_for_supported_operators()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let low_stats = timestamp_stats_add_json(
+            "event_ts_ntz",
+            10,
+            "2025-12-31 23:59:59.999999",
+            "2025-12-31 23:59:59.999999",
+            0,
+        );
+        let target_stats = timestamp_stats_add_json(
+            "event_ts_ntz",
+            10,
+            "2026-01-01 00:00:00.123456",
+            "2026-01-01 00:00:00.123456",
+            0,
+        );
+        let high_stats = timestamp_stats_add_json(
+            "event_ts_ntz",
+            10,
+            "2026-01-01 00:00:00.123457",
+            "2026-01-01 00:00:00.123457",
+            0,
+        );
+        let table = DeltaLogTable::new_with_schema_protocol_and_adds(
+            "table-provider-timestamp-ntz-data-stats-operators",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TIMESTAMP_NTZ_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                low_stats.as_str(),
+                target_stats.as_str(),
+                high_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let target = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), None),
+            None,
+        );
+        let high = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_457), None),
+            None,
+        );
+        let cases = [
+            (
+                "equals",
+                datafusion::logical_expr::col("event_ts_ntz").eq(target.clone()),
+                vec!["part-00001.parquet", "part-00003.parquet"],
+            ),
+            (
+                "less than",
+                datafusion::logical_expr::col("event_ts_ntz").lt(target.clone()),
+                vec!["part-00000.parquet", "part-00003.parquet"],
+            ),
+            (
+                "greater than reversed",
+                high.gt(datafusion::logical_expr::col("event_ts_ntz")),
+                vec![
+                    "part-00000.parquet",
+                    "part-00001.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            assert_eq!(
+                provider.supports_filters_pushdown(&[&filter])?,
+                vec![TableProviderFilterPushDown::Inexact],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0, 1]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.inexact_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                1,
+                "{name}"
+            );
+            assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_temporal_null_count_stats_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let non_null_stats = date_stats_add_json(10, "2026-01-01", "2026-01-01", 0);
+        let all_null_stats = temporal_partial_stats_add_json("event_date", 10, Some(10));
+        let with_null_stats = date_stats_add_json(10, "2026-01-01", "2026-01-01", 2);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-temporal-null-count-data-stats",
+            DATE_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                non_null_stats.as_str(),
+                all_null_stats.as_str(),
+                with_null_stats.as_str(),
+                r#""partitionValues":{}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let cases = [
+            (
+                "is null",
+                datafusion::logical_expr::col("event_date").is_null(),
+                vec![
+                    "part-00001.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+            (
+                "is not null",
+                datafusion::logical_expr::col("event_date").is_not_null(),
+                vec![
+                    "part-00000.parquet",
+                    "part-00002.parquet",
+                    "part-00003.parquet",
+                ],
+            ),
+        ];
+
+        for (name, filter, expected_paths) in cases {
+            assert_eq!(
+                provider.supports_filters_pushdown(&[&filter])?,
+                vec![TableProviderFilterPushDown::Inexact],
+                "{name}"
+            );
+
+            let plan = provider
+                .scan(&state, Some(&vec![0, 1]), &[filter], None)
+                .await?;
+            let scan = plan
+                .as_any()
+                .downcast_ref::<DeltaScanPlanningExec>()
+                .ok_or("expected DeltaScanPlanningExec")?;
+
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.inexact_count,
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                scan.scan_plan().pushed_filter_plan.residual_filter_count,
+                1,
+                "{name}"
+            );
+            assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+            assert_eq!(scan_file_paths(scan)?, expected_paths, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_unproven_temporal_data_stats_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stats = timestamp_stats_add_json(
+            "event_ts",
+            10,
+            "2026-01-01T00:00:00.123456Z",
+            "2026-01-01T00:00:00.123456Z",
+            0,
+        );
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-temporal-data-stats-unsupported",
+            TIMESTAMP_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[stats.as_str()],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let timestamp = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
+            None,
+        );
+        let filter = datafusion::logical_expr::col("event_ts").not_eq(timestamp);
+
+        let result = provider
+            .scan(&state, Some(&vec![0, 1]), &[filter], None)
+            .await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+                .to_string()
+                .contains("pushed filters must be exact partition predicates"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_uses_top_level_and_partition_and_temporal_data_stats_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MIXED_TEMPORAL_STATS_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
+        let west_low_stats = partitioned_date_stats_add_json(
+            r#"{"region":"us-west"}"#,
+            10,
+            "2024-02-29",
+            "2024-02-29",
+            0,
+        );
+        let west_target_stats = partitioned_date_stats_add_json(
+            r#"{"region":"us-west"}"#,
+            10,
+            "2026-01-01",
+            "2026-01-01",
+            0,
+        );
+        let east_target_stats = partitioned_date_stats_add_json(
+            r#"{"region":"us-east"}"#,
+            10,
+            "2026-01-01",
+            "2026-01-01",
+            0,
+        );
+        let west_missing_stats = r#""partitionValues":{"region":"us-west"}"#;
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-top-level-and-partition-temporal-data-stats",
+            MIXED_TEMPORAL_STATS_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                west_low_stats.as_str(),
+                west_target_stats.as_str(),
+                east_target_stats.as_str(),
+                west_missing_stats,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let date = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let filter = datafusion::logical_expr::col("region")
+            .eq(datafusion::logical_expr::lit("us-west"))
+            .and(datafusion::logical_expr::col("event_date").eq(date));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let plan = provider.scan(&state, None, &[filter], None).await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().pushed_filter_plan.exact_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.unsupported_count, 0);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(
+            scan_file_paths(scan)?,
+            vec!["part-00001.parquet", "part-00003.parquet"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_rejects_projected_temporal_data_stats_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stats = date_stats_add_json(10, "2026-01-01", "2026-01-01", 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-projected-temporal-data-stats-filter",
+            DATE_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[stats.as_str()],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![0];
+        let date = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let filter = datafusion::logical_expr::col("event_date").eq(date);
+
+        let result = provider
+            .scan(&state, Some(&projection), &[filter], None)
+            .await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+                .to_string()
+                .contains("inexact pushed filter residual columns must be projected"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_provider_scan_accepts_projected_temporal_data_stats_when_residual_columns_are_projected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stats = date_stats_add_json(10, "2026-01-01", "2026-01-01", 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "table-provider-projected-temporal-data-stats-filter-with-residual",
+            DATE_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[stats.as_str()],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let state = SessionContext::new().state();
+        let projection = vec![0, 1];
+        let date = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+        let filter = datafusion::logical_expr::col("event_date").eq(date);
+
+        let plan = provider
+            .scan(&state, Some(&projection), &[filter], None)
+            .await?;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(scan.scan_plan().scan_projection, Some(vec![0, 1]));
+        assert_eq!(scan.scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(scan.scan_plan().pushed_filter_plan.residual_filter_count, 1);
+        assert!(scan.scan_plan().kernel_partition_predicate.is_some());
+        assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
 
         Ok(())
     }
@@ -2848,6 +3474,67 @@ mod tests {
         assert_eq!(scans[0].schema().fields().len(), 2);
         assert_eq!(scans[0].schema().field(0).name(), "id");
         assert_eq!(scans[0].schema().field(1).name(), "is_current");
+        assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
+        assert_eq!(
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .residual_filter_count,
+            1
+        );
+        assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn temporal_data_stats_residual_column_remains_available_below_final_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let stats = date_stats_add_json(10, "2026-01-01", "2026-01-01", 0);
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "temporal-data-stats-residual-filter-projection",
+            DATE_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[stats.as_str()],
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri,
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql("select id from orders where event_date = DATE '2026-01-01'")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert!(
+            plan_display.contains("DeltaScanPlanningExec"),
+            "{plan_display}"
+        );
+        assert_eq!(physical_plan.schema().fields().len(), 1);
+        assert_eq!(physical_plan.schema().field(0).name(), "id");
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0, 1]));
+        assert_eq!(scans[0].schema().fields().len(), 2);
+        assert_eq!(scans[0].schema().field(0).name(), "id");
+        assert_eq!(scans[0].schema().field(1).name(), "event_date");
         assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
         assert_eq!(
             scans[0]

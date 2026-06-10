@@ -203,6 +203,21 @@ mod tests {
         Expr::Literal(ScalarValue::Int64(Some(value)), None)
     }
 
+    fn date_lit(value: i32) -> Expr {
+        Expr::Literal(ScalarValue::Date32(Some(value)), None)
+    }
+
+    fn timestamp_lit(value: i64, timezone: &str) -> Expr {
+        Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(value), Some(timezone.into())),
+            None,
+        )
+    }
+
+    fn timestamp_ntz_lit(value: i64) -> Expr {
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(value), None), None)
+    }
+
     #[test]
     fn filter_pushdown_reports_exact_for_supported_partition_equality()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -442,6 +457,132 @@ mod tests {
             Expr::Not(Box::new(col("is_current"))),
             col("is_current").in_list(vec![lit(true)], false),
             col("is_current").lt(lit(true)),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Unsupported
+                && decision.residual
+                && decision.kernel_scan_filter.is_none()
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_accepts_temporal_data_stats_filters_as_inexact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEMPORAL_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]"#;
+        const TIMESTAMP_NTZ_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
+        let table = DeltaLogTable::new_with_schema_protocol_and_adds(
+            "filter-pushdown-temporal-data-stats",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TEMPORAL_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[r#""partitionValues":{}"#],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let date = date_lit(20_454);
+        let timestamp = timestamp_lit(1_767_225_600_123_456, "UTC");
+        let timestamp_ntz = timestamp_ntz_lit(1_767_225_600_123_456);
+        let filters = [
+            col("event_date").eq(date.clone()),
+            col("event_date").not_eq(date.clone()),
+            col("event_date").lt(date.clone()),
+            col("event_date").lt_eq(date.clone()),
+            col("event_date").gt(date.clone()),
+            col("event_date").gt_eq(date.clone()),
+            date.gt(col("event_date")),
+            col("event_date").is_null(),
+            col("event_date").is_not_null(),
+            col("event_ts").eq(timestamp.clone()),
+            col("event_ts").lt(timestamp.clone()),
+            col("event_ts").lt_eq(timestamp.clone()),
+            col("event_ts").gt(timestamp.clone()),
+            col("event_ts").gt_eq(timestamp.clone()),
+            timestamp.gt(col("event_ts")),
+            col("event_ts").is_null(),
+            col("event_ts").is_not_null(),
+            col("event_ts_ntz").eq(timestamp_ntz.clone()),
+            col("event_ts_ntz").lt(timestamp_ntz.clone()),
+            col("event_ts_ntz").lt_eq(timestamp_ntz.clone()),
+            col("event_ts_ntz").gt(timestamp_ntz.clone()),
+            col("event_ts_ntz").gt_eq(timestamp_ntz.clone()),
+            timestamp_ntz.gt(col("event_ts_ntz")),
+            col("event_ts_ntz").is_null(),
+            col("event_ts_ntz").is_not_null(),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Inexact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.residual
+                && decision
+                    .kernel_scan_filter
+                    .as_ref()
+                    .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_rejects_unproven_temporal_data_stats_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEMPORAL_DATA_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]"#;
+        const TIMESTAMP_NTZ_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
+        let table = DeltaLogTable::new_with_schema_protocol_and_adds(
+            "filter-pushdown-temporal-data-stats-unsupported",
+            TIMESTAMP_NTZ_PROTOCOL_JSON,
+            TEMPORAL_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[r#""partitionValues":{}"#],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let date = date_lit(20_454);
+        let timestamp = timestamp_lit(1_767_225_600_123_456, "UTC");
+        let timestamp_ntz = timestamp_ntz_lit(1_767_225_600_123_456);
+        let filters = [
+            col("event_date").in_list(vec![date.clone()], false),
+            col("event_date").between(date_lit(19_782), date.clone()),
+            col("event_date").eq(lit("2026-01-01")),
+            col("event_ts").not_eq(timestamp.clone()),
+            col("event_ts").eq(timestamp_ntz.clone()),
+            col("event_ts").eq(timestamp_lit(1_767_225_600_123_456, "America/Phoenix")),
+            col("event_ts_ntz").not_eq(timestamp_ntz.clone()),
+            col("event_ts_ntz").eq(timestamp),
+            col("event_ts_ntz").eq(date),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
         let plan = provider.plan_supports_filters_pushdown(&filter_refs);
