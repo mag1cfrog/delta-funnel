@@ -43,8 +43,8 @@ enum KernelPartitionOperatorFamily {
 ///
 /// A filter can be exact only when it is partition-only and accepted by the
 /// kernel predicate path. A mixed top-level `AND` can be inexact when at least
-/// one top-level term is accepted by the exact partition policy and every
-/// remaining term is data-only residual work for DataFusion.
+/// one top-level term is accepted by the exact partition or data-stats policy
+/// and every remaining term is safe residual work for DataFusion.
 pub(super) fn plan_partition_operator_pushdown(
     filters: &[&Expr],
     schema: &SchemaRef,
@@ -85,9 +85,11 @@ fn partition_operator_decision(
         };
     }
 
-    if filter_analysis.scope == DeltaFilterColumnScope::PartitionAndData
-        && let Some(kernel_scan_filter) =
-            try_mixed_and_partition_kernel_filter(filter, schema, partition_columns)
+    if matches!(
+        filter_analysis.scope,
+        DeltaFilterColumnScope::PartitionAndData | DeltaFilterColumnScope::DataOnly
+    ) && let Some(kernel_scan_filter) =
+        try_mixed_and_kernel_filter(filter, schema, partition_columns)
     {
         return DeltaFilterPushdownDecision {
             outcome: DeltaFilterPushdownOutcome::Inexact,
@@ -138,7 +140,7 @@ fn try_exact_partition_kernel_filter(
     })
 }
 
-fn try_mixed_and_partition_kernel_filter(
+fn try_mixed_and_kernel_filter(
     filter: &Expr,
     schema: &SchemaRef,
     partition_columns: &HashSet<String>,
@@ -162,11 +164,16 @@ fn try_mixed_and_partition_kernel_filter(
                 extracted_filters.push(try_exact_partition_kernel_filter(term, schema)?);
             }
             DeltaFilterColumnScope::DataOnly => {
-                if !is_safe_data_residual_term(term, schema) {
+                if let Some(kernel_filter) =
+                    super::stats_pushdown::try_integer_data_stats_kernel_filter(term, schema)
+                {
+                    extracted_filters.push(kernel_filter);
+                    residual_term_count = residual_term_count.saturating_add(1);
+                } else if is_safe_data_residual_term(term, schema) {
+                    residual_term_count = residual_term_count.saturating_add(1);
+                } else {
                     return None;
                 }
-
-                residual_term_count = residual_term_count.saturating_add(1);
             }
             DeltaFilterColumnScope::PartitionAndData | DeltaFilterColumnScope::Unsupported => {
                 return None;
@@ -182,6 +189,14 @@ fn try_mixed_and_partition_kernel_filter(
         .iter()
         .map(|filter| filter.datafusion_expr.clone())
         .reduce(Expr::and)?;
+    let kind = if extracted_filters
+        .iter()
+        .any(|filter| filter.kind == KernelScanFilterKind::DataStats)
+    {
+        KernelScanFilterKind::DataStats
+    } else {
+        KernelScanFilterKind::Partition
+    };
     let kernel_predicate = DeltaKernelPredicate::and_from(
         extracted_filters
             .into_iter()
@@ -191,7 +206,7 @@ fn try_mixed_and_partition_kernel_filter(
     Some(ExactPartitionKernelFilter {
         datafusion_expr,
         kernel_predicate,
-        kind: KernelScanFilterKind::Partition,
+        kind,
     })
 }
 
@@ -2627,9 +2642,86 @@ mod tests {
         assert!(plan.decisions[0].residual);
         assert_eq!(
             kernel_scan_expr(&plan.decisions[0]),
-            Some(&region_filter.and(day_filter))
+            Some(&region_filter.and(data_filter).and(day_filter))
         );
-        assert!(plan.decisions[0].kernel_scan_filter.is_some());
+        assert_eq!(
+            plan.decisions[0]
+                .kernel_scan_filter
+                .as_ref()
+                .map(|filter| filter.kind),
+            Some(KernelScanFilterKind::DataStats)
+        );
+    }
+
+    #[test]
+    fn partition_operator_planner_extracts_top_level_and_partition_and_stats_terms_as_inexact() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["region"]);
+        let partition_filter = col("region").eq(lit("us-west"));
+        let stats_filter = col("id").gt(lit(1_i64));
+        let mixed_filter = partition_filter.clone().and(stats_filter.clone());
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &[&mixed_filter],
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert!(plan.decisions[0].residual);
+        assert_eq!(
+            kernel_scan_expr(&plan.decisions[0]),
+            Some(&partition_filter.and(stats_filter))
+        );
+        assert_eq!(
+            plan.decisions[0]
+                .kernel_scan_filter
+                .as_ref()
+                .map(|filter| filter.kind),
+            Some(KernelScanFilterKind::DataStats)
+        );
+    }
+
+    #[test]
+    fn partition_operator_planner_extracts_top_level_and_stats_terms_with_data_residuals() {
+        let schema = schema();
+        let partition_columns = partition_columns(&["region"]);
+        let stats_filter = col("id").gt(lit(1_i64));
+        let residual_filter = col("large_region").eq(lit("us-west"));
+        let mixed_filter = stats_filter.clone().and(residual_filter);
+
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
+            &[&mixed_filter],
+            &schema,
+            &partition_columns,
+        );
+
+        assert_eq!(
+            plan.datafusion_pushdowns(),
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 1);
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, 1);
+        assert_eq!(plan.residual_filter_count, 1);
+        assert!(plan.decisions[0].residual);
+        assert_eq!(kernel_scan_expr(&plan.decisions[0]), Some(&stats_filter));
+        assert_eq!(
+            plan.decisions[0]
+                .kernel_scan_filter
+                .as_ref()
+                .map(|filter| filter.kind),
+            Some(KernelScanFilterKind::DataStats)
+        );
     }
 
     #[test]
@@ -2671,6 +2763,7 @@ mod tests {
         let schema = schema();
         let partition_columns = partition_columns(&["region"]);
         let partition_filter = col("region").eq(lit("us-west"));
+        let stats_filter = col("id").gt(lit(1_i64));
         let scalar_udf = create_udf(
             "is_interesting",
             vec![DataType::Int64],
@@ -2685,8 +2778,19 @@ mod tests {
             ));
         let filters = [
             partition_filter.clone().or(col("id").gt(lit(1_i64))),
+            stats_filter
+                .clone()
+                .or(col("large_region").eq(lit("us-west"))),
+            stats_filter
+                .clone()
+                .or(col("id").in_list(vec![lit(1_i64)], false)),
             Expr::Not(Box::new(
                 partition_filter.clone().and(col("id").gt(lit(1_i64))),
+            )),
+            Expr::Not(Box::new(
+                stats_filter
+                    .clone()
+                    .and(col("large_region").eq(lit("us-west"))),
             )),
             partition_filter.clone().and(col("ghost").gt(lit(1_i64))),
             partition_filter
