@@ -232,6 +232,21 @@ mod tests {
         Expr::Literal(ScalarValue::LargeUtf8(Some(value.to_owned())), None)
     }
 
+    fn binary_lit(value: &[u8]) -> Expr {
+        Expr::Literal(ScalarValue::Binary(Some(value.to_vec())), None)
+    }
+
+    fn large_binary_lit(value: &[u8]) -> Expr {
+        Expr::Literal(ScalarValue::LargeBinary(Some(value.to_vec())), None)
+    }
+
+    fn fixed_size_binary_lit(size: i32, value: &[u8]) -> Expr {
+        Expr::Literal(
+            ScalarValue::FixedSizeBinary(size, Some(value.to_vec())),
+            None,
+        )
+    }
+
     #[test]
     fn filter_pushdown_reports_exact_for_supported_partition_equality()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -467,6 +482,118 @@ mod tests {
             Expr::Not(Box::new(col("is_current"))),
             col("is_current").in_list(vec![lit(true)], false),
             col("is_current").lt(lit(true)),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Unsupported; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, 0);
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert_eq!(plan.pushed_filter_count, 0);
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Unsupported
+                && decision.residual
+                && decision.kernel_scan_filter.is_none()
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_accepts_binary_null_count_data_stats_filters_as_inexact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const BINARY_DATA_SCHEMA_FIELDS_JSON: &str =
+            r#"[{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-binary-data-stats-null-counts",
+            BINARY_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let mut provider = DeltaTableProvider::try_new(source, preflight)?;
+        provider.set_schema_for_tests(Arc::new(Schema::new(vec![
+            Field::new("payload", DataType::Binary, true),
+            Field::new("large_payload", DataType::LargeBinary, true),
+            Field::new("fixed_payload", DataType::FixedSizeBinary(3), true),
+        ])));
+        let filters = [
+            col("payload").is_null(),
+            col("payload").is_not_null(),
+            col("large_payload").is_null(),
+            col("large_payload").is_not_null(),
+            col("fixed_payload").is_null(),
+            col("fixed_payload").is_not_null(),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&filter_refs)?,
+            vec![TableProviderFilterPushDown::Inexact; filters.len()]
+        );
+        assert_eq!(plan.exact_count, 0);
+        assert_eq!(plan.inexact_count, filters.len());
+        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.pushed_filter_count, filters.len());
+        assert_eq!(plan.residual_filter_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.residual
+                && decision
+                    .kernel_scan_filter
+                    .as_ref()
+                    .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_pushdown_rejects_unproven_binary_data_stats_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const BINARY_DATA_SCHEMA_FIELDS_JSON: &str =
+            r#"[{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "filter-pushdown-binary-data-stats-unsupported",
+            BINARY_DATA_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            r#""partitionValues":{}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let mut provider = DeltaTableProvider::try_new(source, preflight)?;
+        provider.set_schema_for_tests(Arc::new(Schema::new(vec![
+            Field::new("payload", DataType::Binary, true),
+            Field::new("large_payload", DataType::LargeBinary, true),
+            Field::new("fixed_payload", DataType::FixedSizeBinary(3), true),
+        ])));
+        let payload = binary_lit(b"hello");
+        let filters = [
+            col("payload").eq(payload.clone()),
+            col("payload").not_eq(payload.clone()),
+            col("payload").lt(payload.clone()),
+            col("payload").gt_eq(payload.clone()),
+            payload.clone().gt(col("payload")),
+            col("payload").eq(binary_lit(b"")),
+            col("payload").in_list(vec![payload.clone()], false),
+            col("payload").between(binary_lit(b"a"), payload.clone()),
+            col("large_payload").eq(large_binary_lit(b"hello")),
+            col("fixed_payload").eq(fixed_size_binary_lit(3, b"hey")),
+            col("fixed_payload").eq(fixed_size_binary_lit(4, b"heyo")),
         ];
         let filter_refs = filters.iter().collect::<Vec<_>>();
         let plan = provider.plan_supports_filters_pushdown(&filter_refs);

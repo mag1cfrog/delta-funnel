@@ -26,6 +26,7 @@ pub(super) fn try_data_stats_kernel_filter(
 fn is_supported_data_stats_filter(filter: &Expr, schema: &SchemaRef) -> bool {
     is_supported_integer_data_stats_filter(filter, schema)
         || is_supported_boolean_null_count_stats_filter(filter, schema)
+        || is_supported_binary_null_count_stats_filter(filter, schema)
         || is_supported_decimal_data_stats_filter(filter, schema)
         || is_supported_string_data_stats_filter(filter, schema)
         || is_supported_temporal_data_stats_filter(filter, schema)
@@ -62,6 +63,20 @@ fn is_supported_boolean_null_count_stats_filter(filter: &Expr, schema: &SchemaRe
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
             is_data_column_with_type(inner.as_ref(), schema, |data_type| {
                 matches!(data_type, DataType::Boolean)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn is_supported_binary_null_count_stats_filter(filter: &Expr, schema: &SchemaRef) -> bool {
+    match filter {
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            is_data_column_with_type(inner.as_ref(), schema, |data_type| {
+                matches!(
+                    data_type,
+                    DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+                )
             })
         }
         _ => false,
