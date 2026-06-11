@@ -2507,6 +2507,136 @@ async fn table_provider_scan_rejects_binary_data_stats_comparators()
 }
 
 #[tokio::test]
+async fn table_provider_scan_rejects_unsupported_data_stats_matrix_entries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new("table-provider-unsupported-data-stats-matrix")?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let mut provider = DeltaTableProvider::try_new(source, preflight)?;
+    provider.set_schema_for_tests(Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("amount256", DataType::Decimal256(38, 18), true),
+        Field::new(
+            "event_ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
+        Field::new("customer_name", DataType::Utf8, true),
+        Field::new("payload", DataType::Binary, true),
+        Field::new(
+            "profile",
+            DataType::Struct(vec![Field::new("age", DataType::Int32, true)].into()),
+            true,
+        ),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        Field::new(
+            "properties",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        ),
+        Field::new(
+            "dict_name",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        ),
+        Field::new("unsigned_count", DataType::UInt32, true),
+    ])));
+    let state = SessionContext::new().state();
+    let decimal256 = Expr::Literal(ScalarValue::Decimal256(Some(12_345.into()), 38, 18), None);
+    let timestamp = Expr::Literal(
+        ScalarValue::TimestampMicrosecond(Some(1_767_225_600_123_456), Some("UTC".into())),
+        None,
+    );
+    let binary = Expr::Literal(ScalarValue::Binary(Some(b"hello".to_vec())), None);
+    let filters = [
+        (
+            "integer null count",
+            datafusion::logical_expr::col("id").is_null(),
+        ),
+        (
+            "decimal256 equality",
+            datafusion::logical_expr::col("amount256").eq(decimal256),
+        ),
+        (
+            "timestamp inequality",
+            datafusion::logical_expr::col("event_ts").not_eq(timestamp),
+        ),
+        (
+            "string membership",
+            datafusion::logical_expr::col("customer_name")
+                .in_list(vec![datafusion::logical_expr::lit("alice")], false),
+        ),
+        (
+            "binary equality",
+            datafusion::logical_expr::col("payload").eq(binary),
+        ),
+        (
+            "struct null count",
+            datafusion::logical_expr::col("profile").is_null(),
+        ),
+        (
+            "list null count",
+            datafusion::logical_expr::col("tags").is_null(),
+        ),
+        (
+            "map null count",
+            datafusion::logical_expr::col("properties").is_null(),
+        ),
+        (
+            "dictionary null count",
+            datafusion::logical_expr::col("dict_name").is_null(),
+        ),
+        (
+            "unsigned equality",
+            datafusion::logical_expr::col("unsigned_count")
+                .eq(datafusion::logical_expr::lit(7_u32)),
+        ),
+    ];
+
+    for (name, filter) in filters {
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter])?,
+            vec![TableProviderFilterPushDown::Unsupported],
+            "{name}"
+        );
+
+        let result = provider
+            .scan(&state, Some(&vec![0]), std::slice::from_ref(&filter), None)
+            .await;
+
+        assert!(
+            matches!(result, Err(DataFusionError::External(error)) if error
+                .to_string()
+                .contains("pushed filters must be exact partition predicates")),
+            "{name} should be rejected before kernel scan planning"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn table_provider_scan_rejects_projected_boolean_data_stats_filter()
 -> Result<(), Box<dyn std::error::Error>> {
     let stats = boolean_stats_add_json(10, false, false, 0);
