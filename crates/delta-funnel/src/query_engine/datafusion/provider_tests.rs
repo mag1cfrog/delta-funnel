@@ -47,6 +47,15 @@ fn scan_file_paths(
         .scan_file_paths(&scan_plan.table_uri)
 }
 
+fn assert_scan_does_not_support_limit_pushdown(scan: &DeltaScanPlanningExec) {
+    assert!(
+        !scan.supports_limit_pushdown(),
+        "DeltaScanPlanningExec must not advertise provider-level limit pushdown"
+    );
+    assert_eq!(scan.fetch(), None);
+    assert!(scan.with_fetch(Some(1)).is_none());
+}
+
 fn id_stats_add_json(num_records: i64, min_value: i32, max_value: i32, null_count: i64) -> String {
     format!(
         r#""partitionValues":{{}},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"id\":{min_value}}},\"maxValues\":{{\"id\":{max_value}}},\"nullCount\":{{\"id\":{null_count}}}}}""#
@@ -4425,7 +4434,12 @@ async fn table_provider_scan_limit_does_not_change_scan_planning_contract()
     let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(100));
 
     let with_limit = provider
-        .scan(&state, Some(&projection), std::slice::from_ref(&filter), Some(1))
+        .scan(
+            &state,
+            Some(&projection),
+            std::slice::from_ref(&filter),
+            Some(1),
+        )
         .await?;
     let without_limit = provider
         .scan(&state, Some(&projection), &[filter], None)
@@ -4446,11 +4460,17 @@ async fn table_provider_scan_limit_does_not_change_scan_planning_contract()
     );
     assert_eq!(
         with_limit_scan.scan_plan().pushed_filter_plan.exact_count,
-        without_limit_scan.scan_plan().pushed_filter_plan.exact_count
+        without_limit_scan
+            .scan_plan()
+            .pushed_filter_plan
+            .exact_count
     );
     assert_eq!(
         with_limit_scan.scan_plan().pushed_filter_plan.inexact_count,
-        without_limit_scan.scan_plan().pushed_filter_plan.inexact_count
+        without_limit_scan
+            .scan_plan()
+            .pushed_filter_plan
+            .inexact_count
     );
     assert_eq!(
         with_limit_scan
@@ -4463,7 +4483,10 @@ async fn table_provider_scan_limit_does_not_change_scan_planning_contract()
             .residual_filter_count
     );
     assert_eq!(
-        with_limit_scan.scan_plan().kernel_partition_predicate.is_some(),
+        with_limit_scan
+            .scan_plan()
+            .kernel_partition_predicate
+            .is_some(),
         without_limit_scan
             .scan_plan()
             .kernel_partition_predicate
@@ -4473,6 +4496,112 @@ async fn table_provider_scan_limit_does_not_change_scan_planning_contract()
         scan_file_paths(with_limit_scan)?,
         scan_file_paths(without_limit_scan)?
     );
+    assert_scan_does_not_support_limit_pushdown(with_limit_scan);
+    assert_scan_does_not_support_limit_pushdown(without_limit_scan);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_limit_stays_above_inexact_residual_filter_scan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let possible_stats = id_stats_add_json(10, 101, 150, 0);
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "limit-above-residual-filter-scan",
+        DEFAULT_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[possible_stats.as_str()],
+    )?;
+    let table_uri = table.path().to_string_lossy().to_string();
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri,
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    register_delta_sources(
+        &ctx,
+        vec![DeltaTableProviderConfig {
+            source,
+            protocol: preflight,
+        }],
+    )?;
+
+    let dataframe = ctx
+        .sql("select customer_name from orders where id > 100 limit 1")
+        .await?;
+    let physical_plan = dataframe.create_physical_plan().await?;
+    let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut scans = Vec::new();
+    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+    assert!(
+        plan_display.contains("CoalescePartitionsExec: fetch=1"),
+        "{plan_display}"
+    );
+    assert!(plan_display.contains("FilterExec"), "{plan_display}");
+    assert!(
+        plan_display.contains("FilterExec: id@0 > 100"),
+        "{plan_display}"
+    );
+    assert!(
+        plan_display.contains("DeltaScanPlanningExec"),
+        "{plan_display}"
+    );
+    assert_eq!(scans.len(), 1);
+    assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0, 1]));
+    assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
+    assert_eq!(
+        scans[0]
+            .scan_plan()
+            .pushed_filter_plan
+            .residual_filter_count,
+        1
+    );
+    assert_scan_does_not_support_limit_pushdown(scans[0]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_limit_stays_above_joined_delta_scans() -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let _orders = register_fixture_source(&ctx, "orders", "limit-join-orders")?;
+    let _customers = register_fixture_source(&ctx, "customers", "limit-join-customers")?;
+
+    let dataframe = ctx
+        .sql(
+            "select orders.id \
+             from orders join customers on orders.id = customers.id \
+             limit 1",
+        )
+        .await?;
+    let physical_plan = dataframe.create_physical_plan().await?;
+    let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut scans = Vec::new();
+    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+    assert!(
+        plan_display.contains("CoalescePartitionsExec: fetch=1"),
+        "{plan_display}"
+    );
+    assert!(plan_display.contains("HashJoinExec"), "{plan_display}");
+    assert!(plan_display.contains("HashJoinExec") && plan_display.contains("fetch=1"));
+    assert!(
+        plan_display.contains("DeltaScanPlanningExec"),
+        "{plan_display}"
+    );
+    assert_eq!(scans.len(), 2);
+    for scan in scans {
+        assert_eq!(scan.scan_plan().scan_projection, Some(vec![0]));
+        assert_eq!(scan.scan_plan().pushed_filter_plan.pushed_filter_count, 0);
+        assert_scan_does_not_support_limit_pushdown(scan);
+    }
 
     Ok(())
 }
