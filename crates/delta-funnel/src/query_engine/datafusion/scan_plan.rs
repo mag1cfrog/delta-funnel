@@ -294,6 +294,44 @@ mod tests {
     }
 
     #[test]
+    fn provider_scan_plan_expands_empty_metadata_when_kernel_prunes_all_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "provider-scan-metadata-empty-pruned",
+            crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":"eu-central"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: vec![
+                col("region").eq(lit("us-west")),
+                col("region").eq(lit("us-east")),
+            ],
+        })?;
+        let expansion = plan.expand_scan_metadata()?;
+
+        assert_eq!(expansion.source_name, "orders");
+        assert_eq!(expansion.snapshot_version, 1);
+        assert!(expansion.scan_metadata_exhausted);
+        assert!(expansion.files.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
     fn provider_scan_plan_metadata_expansion_maps_kernel_errors()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("provider-scan-metadata-expansion-error")?;
