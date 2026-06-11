@@ -181,7 +181,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::ScalarValue;
     use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, col, lit};
@@ -245,6 +245,356 @@ mod tests {
             ScalarValue::FixedSizeBinary(size, Some(value.to_vec())),
             None,
         )
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExpectedStatsPushdown {
+        InexactDataStats,
+        Unsupported,
+    }
+
+    #[test]
+    fn filter_pushdown_documents_data_stats_type_operator_matrix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-data-stats-type-operator-matrix")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let mut provider = DeltaTableProvider::try_new(source, preflight)?;
+        provider.set_schema_for_tests(Arc::new(Schema::new(vec![
+            Field::new("byte_count", DataType::Int8, true),
+            Field::new("short_count", DataType::Int16, true),
+            Field::new("int_count", DataType::Int32, true),
+            Field::new("long_count", DataType::Int64, true),
+            Field::new("is_current", DataType::Boolean, true),
+            Field::new("event_date", DataType::Date32, true),
+            Field::new(
+                "event_ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "event_ts_ntz",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new("amount256", DataType::Decimal256(38, 18), true),
+            Field::new("customer_name", DataType::Utf8, true),
+            Field::new("large_customer_name", DataType::LargeUtf8, true),
+            Field::new("float_score", DataType::Float32, true),
+            Field::new("double_score", DataType::Float64, true),
+            Field::new("payload", DataType::Binary, true),
+            Field::new("large_payload", DataType::LargeBinary, true),
+            Field::new("fixed_payload", DataType::FixedSizeBinary(3), true),
+            Field::new(
+                "profile",
+                DataType::Struct(vec![Field::new("age", DataType::Int32, true)].into()),
+                true,
+            ),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "properties",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("key", DataType::Utf8, false),
+                                Field::new("value", DataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+            Field::new(
+                "dict_name",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("unsigned_count", DataType::UInt32, true),
+            Field::new("date64_value", DataType::Date64, true),
+        ])));
+
+        let int32_value = lit(7_i32);
+        let decimal_value = decimal_lit(200);
+        let date_value = date_lit(20_454);
+        let timestamp_value = timestamp_lit(1_767_225_600_123_456, "UTC");
+        let timestamp_ntz_value = timestamp_ntz_lit(1_767_225_600_123_456);
+        let utf8_value = lit("alice");
+        let large_utf8_value = large_utf8_lit("alice");
+        let float_value = Expr::Literal(ScalarValue::Float32(Some(1.5)), None);
+        let double_value = Expr::Literal(ScalarValue::Float64(Some(2.25)), None);
+        let binary_value = binary_lit(b"hello");
+        let decimal256_value =
+            Expr::Literal(ScalarValue::Decimal256(Some(200.into()), 38, 18), None);
+
+        use ExpectedStatsPushdown::{InexactDataStats, Unsupported};
+        let cases = [
+            (
+                "int8 equality",
+                col("byte_count").eq(int8_lit(7)),
+                InexactDataStats,
+            ),
+            (
+                "int16 ordering",
+                col("short_count").lt(int16_lit(7)),
+                InexactDataStats,
+            ),
+            (
+                "int32 inequality",
+                col("int_count").not_eq(int32_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "int64 reversed ordering",
+                int64_lit(7).lt(col("long_count")),
+                InexactDataStats,
+            ),
+            (
+                "integer null count unsupported",
+                col("int_count").is_null(),
+                Unsupported,
+            ),
+            (
+                "integer membership unsupported",
+                col("int_count").in_list(vec![int32_value.clone()], false),
+                Unsupported,
+            ),
+            (
+                "integer between unsupported",
+                col("int_count").between(lit(1_i32), int32_value.clone()),
+                Unsupported,
+            ),
+            (
+                "boolean null count",
+                col("is_current").is_not_null(),
+                InexactDataStats,
+            ),
+            (
+                "boolean equality unsupported",
+                col("is_current").eq(lit(true)),
+                Unsupported,
+            ),
+            (
+                "boolean shorthand unsupported",
+                col("is_current"),
+                Unsupported,
+            ),
+            (
+                "date equality",
+                col("event_date").eq(date_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "date inequality",
+                col("event_date").not_eq(date_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "date between unsupported",
+                col("event_date").between(date_lit(20_000), date_value.clone()),
+                Unsupported,
+            ),
+            (
+                "timestamp equality",
+                col("event_ts").eq(timestamp_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "timestamp ordering",
+                col("event_ts").gt(timestamp_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "timestamp inequality unsupported",
+                col("event_ts").not_eq(timestamp_value.clone()),
+                Unsupported,
+            ),
+            (
+                "timestamp ntz equality",
+                col("event_ts_ntz").eq(timestamp_ntz_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "timestamp null count",
+                col("event_ts").is_null(),
+                InexactDataStats,
+            ),
+            (
+                "decimal equality",
+                col("amount").eq(decimal_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "decimal ordering",
+                col("amount").gt(decimal_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "decimal null count",
+                col("amount").is_null(),
+                InexactDataStats,
+            ),
+            (
+                "decimal256 unsupported",
+                col("amount256").eq(decimal256_value),
+                Unsupported,
+            ),
+            (
+                "string equality",
+                col("customer_name").eq(utf8_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "string ordering",
+                col("customer_name").lt(utf8_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "large string equality",
+                col("large_customer_name").eq(large_utf8_value),
+                InexactDataStats,
+            ),
+            (
+                "string membership unsupported",
+                col("customer_name").in_list(vec![utf8_value.clone()], false),
+                Unsupported,
+            ),
+            (
+                "float equality",
+                col("float_score").eq(float_value.clone()),
+                InexactDataStats,
+            ),
+            (
+                "float zero unsupported",
+                col("float_score").eq(lit(0.0_f32)),
+                Unsupported,
+            ),
+            (
+                "double ordering",
+                col("double_score").gt(double_value),
+                InexactDataStats,
+            ),
+            (
+                "floating null count",
+                col("float_score").is_not_null(),
+                InexactDataStats,
+            ),
+            (
+                "binary null count",
+                col("payload").is_null(),
+                InexactDataStats,
+            ),
+            (
+                "large binary null count",
+                col("large_payload").is_not_null(),
+                InexactDataStats,
+            ),
+            (
+                "fixed binary null count",
+                col("fixed_payload").is_null(),
+                InexactDataStats,
+            ),
+            (
+                "binary equality unsupported",
+                col("payload").eq(binary_value.clone()),
+                Unsupported,
+            ),
+            (
+                "binary ordering unsupported",
+                col("payload").gt(binary_value.clone()),
+                Unsupported,
+            ),
+            (
+                "binary membership unsupported",
+                col("payload").in_list(vec![binary_value], false),
+                Unsupported,
+            ),
+            ("struct unsupported", col("profile").is_null(), Unsupported),
+            ("list unsupported", col("tags").is_null(), Unsupported),
+            ("map unsupported", col("properties").is_null(), Unsupported),
+            (
+                "dictionary unsupported",
+                col("dict_name").is_null(),
+                Unsupported,
+            ),
+            (
+                "unsigned integer unsupported",
+                col("unsigned_count").eq(lit(7_u32)),
+                Unsupported,
+            ),
+            (
+                "date64 unsupported",
+                col("date64_value").is_null(),
+                Unsupported,
+            ),
+        ];
+
+        for (name, filter, expected) in cases {
+            let filter_refs = [&filter];
+            let support = provider.supports_filters_pushdown(&filter_refs)?;
+            let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+            match expected {
+                InexactDataStats => {
+                    assert_eq!(
+                        support,
+                        vec![TableProviderFilterPushDown::Inexact],
+                        "{name}"
+                    );
+                    assert_eq!(plan.exact_count, 0, "{name}");
+                    assert_eq!(plan.inexact_count, 1, "{name}");
+                    assert_eq!(plan.unsupported_count, 0, "{name}");
+                    assert_eq!(plan.pushed_filter_count, 1, "{name}");
+                    assert_eq!(plan.residual_filter_count, 1, "{name}");
+                    let decision = &plan.decisions[0];
+                    assert!(decision.residual, "{name}");
+                    assert_eq!(decision.rejection_reason, None, "{name}");
+                    assert!(
+                        decision
+                            .kernel_scan_filter
+                            .as_ref()
+                            .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats),
+                        "{name}"
+                    );
+                }
+                Unsupported => {
+                    assert_eq!(
+                        support,
+                        vec![TableProviderFilterPushDown::Unsupported],
+                        "{name}"
+                    );
+                    assert_eq!(plan.exact_count, 0, "{name}");
+                    assert_eq!(plan.inexact_count, 0, "{name}");
+                    assert_eq!(plan.unsupported_count, 1, "{name}");
+                    assert_eq!(plan.pushed_filter_count, 0, "{name}");
+                    assert_eq!(plan.residual_filter_count, 1, "{name}");
+                    let decision = &plan.decisions[0];
+                    assert_eq!(
+                        decision.outcome,
+                        DeltaFilterPushdownOutcome::Unsupported,
+                        "{name}"
+                    );
+                    assert!(decision.residual, "{name}");
+                    assert!(decision.rejection_reason.is_some(), "{name}");
+                    assert!(decision.kernel_scan_filter.is_none(), "{name}");
+                }
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
