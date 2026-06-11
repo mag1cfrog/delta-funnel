@@ -155,6 +155,24 @@ pub enum DeltaFunnelError {
         source: Box<delta_kernel::Error>,
     },
 
+    /// Delta scan metadata could not be expanded from kernel scan planning.
+    #[snafu(display(
+        "Delta scan metadata expansion error for source `{}` at snapshot version {snapshot_version} ({}): {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    DeltaScanMetadataExpansion {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Resolved Delta snapshot version.
+        snapshot_version: u64,
+        /// Kernel scan metadata expansion failure.
+        source: Box<delta_kernel::Error>,
+    },
+
     /// A required dependency contract is unavailable or incompatible.
     #[snafu(display("dependency compatibility error: {message}"))]
     DependencyCompatibility {
@@ -326,6 +344,30 @@ mod tests {
         assert!(display.contains(r"orders\nlatest"));
         assert!(display.contains("s3://example.com/table"));
         assert!(display.contains(r"table\nalready exists"));
+        assert!(!display.contains('\n'));
+        assert!(!display.contains("user"));
+        assert!(!display.contains("password"));
+        assert!(!display.contains("token"));
+        assert!(!display.contains("secret"));
+    }
+
+    #[test]
+    fn scan_metadata_expansion_error_has_sanitized_display() {
+        let error = DeltaFunnelError::DeltaScanMetadataExpansion {
+            source_name: "orders\nlatest".to_owned(),
+            table_uri: "s3://user:password@example.com/table?token=secret".to_owned(),
+            snapshot_version: 7,
+            source: Box::new(delta_kernel::Error::generic(
+                "scan\nmetadata expansion failed",
+            )),
+        };
+
+        let display = error.to_string();
+
+        assert!(display.contains(r"orders\nlatest"));
+        assert!(display.contains("snapshot version 7"));
+        assert!(display.contains("s3://example.com/table"));
+        assert!(display.contains(r"scan\nmetadata expansion failed"));
         assert!(!display.contains('\n'));
         assert!(!display.contains("user"));
         assert!(!display.contains("password"));

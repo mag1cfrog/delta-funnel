@@ -14,7 +14,7 @@ pub(crate) use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArr
 pub(crate) use delta_kernel::engine::default::DefaultEngineBuilder;
 pub(crate) use delta_kernel::engine::default::storage::store_from_url_opts;
 pub(crate) use delta_kernel::expressions::{
-    ColumnName, Expression, Predicate, PredicateRef, Scalar,
+    ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar,
 };
 pub(crate) use delta_kernel::scan::Scan;
 pub(crate) use delta_kernel::scan::ScanMetadata;

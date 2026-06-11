@@ -4,8 +4,11 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::Expr;
 
 use crate::{
-    DeltaProtocolReport,
-    table_formats::{DeltaKernelPredicate, ProjectedDeltaScan},
+    DeltaFunnelError, DeltaProtocolReport,
+    table_formats::{
+        DeltaKernelPredicate, KernelScanFileMetadata, KernelScanMetadataExpansion,
+        ProjectedDeltaScan,
+    },
 };
 
 use super::filters::DeltaFilterPushdownPlan;
@@ -41,6 +44,21 @@ pub(crate) struct ProviderScanPlan {
     kernel_scan: ProjectedDeltaScan,
 }
 
+/// Metadata-only expansion of one planned Delta provider scan.
+#[allow(dead_code)]
+pub(crate) struct ProviderScanMetadataExpansion {
+    /// DataFusion table name for this source.
+    pub(crate) source_name: String,
+    /// Normalized Delta table URI for this source.
+    pub(crate) table_uri: String,
+    /// Resolved Delta snapshot version.
+    pub(crate) snapshot_version: u64,
+    /// File metadata records selected by Delta Kernel for this provider scan.
+    pub(crate) files: Vec<KernelScanFileMetadata>,
+    /// Whether the kernel scan metadata iterator was consumed to completion.
+    pub(crate) scan_metadata_exhausted: bool,
+}
+
 pub(super) struct ProviderScanPlanParts {
     pub(super) source_name: String,
     pub(super) table_uri: String,
@@ -74,6 +92,37 @@ impl ProviderScanPlan {
     pub(crate) fn kernel_scan(&self) -> &ProjectedDeltaScan {
         &self.kernel_scan
     }
+
+    /// Expands this provider scan plan into metadata-only file records.
+    ///
+    /// This is the provider-facing boundary for scan metadata expansion. It
+    /// preserves provider context for later task planning and maps kernel
+    /// expansion failures into a phase-specific DeltaFunnel error.
+    #[allow(dead_code)]
+    pub(crate) fn expand_scan_metadata(
+        &self,
+    ) -> Result<ProviderScanMetadataExpansion, DeltaFunnelError> {
+        let KernelScanMetadataExpansion {
+            files,
+            scan_metadata_exhausted,
+        } = self
+            .kernel_scan
+            .expand_kernel_scan_metadata(&self.table_uri)
+            .map_err(|source| DeltaFunnelError::DeltaScanMetadataExpansion {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                source: Box::new(source),
+            })?;
+
+        Ok(ProviderScanMetadataExpansion {
+            source_name: self.source_name.clone(),
+            table_uri: self.table_uri.clone(),
+            snapshot_version: self.snapshot_version,
+            files,
+            scan_metadata_exhausted,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -83,7 +132,7 @@ mod tests {
 
     use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
 
-    use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+    use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     use super::super::provider::DeltaTableProvider;
     use super::*;
@@ -145,6 +194,179 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.pushed_filter_count, 0);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
         assert!(plan.kernel_partition_predicate.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_scan_plan_expands_metadata_with_source_context_and_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "provider-scan-metadata-expansion",
+            crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":"eu-central"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: vec![col("region").eq(lit("us-west"))],
+        })?;
+        let expansion = plan.expand_scan_metadata()?;
+
+        assert_eq!(expansion.source_name, "orders");
+        assert_eq!(expansion.table_uri, plan.table_uri);
+        assert_eq!(expansion.snapshot_version, 1);
+        assert!(expansion.scan_metadata_exhausted);
+        assert_eq!(expansion.files.len(), 1);
+        assert_eq!(expansion.files[0].path, "part-00000.parquet");
+        assert_eq!(
+            expansion.files[0]
+                .partition_values
+                .get("region")
+                .map(String::as_str),
+            Some("us-west")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_scan_plan_expands_multiple_active_files_in_kernel_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "provider-scan-metadata-multiple-files",
+            crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":"eu-central"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: Vec::new(),
+        })?;
+        let expansion = plan.expand_scan_metadata()?;
+        let paths = expansion
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        let sizes = expansion
+            .files
+            .iter()
+            .map(|file| file.size)
+            .collect::<Vec<_>>();
+
+        assert!(expansion.scan_metadata_exhausted);
+        assert_eq!(
+            paths,
+            vec![
+                "part-00000.parquet",
+                "part-00001.parquet",
+                "part-00002.parquet"
+            ]
+        );
+        assert_eq!(sizes, vec![0, 0, 0]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_scan_plan_expands_empty_metadata_when_kernel_prunes_all_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "provider-scan-metadata-empty-pruned",
+            crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":"eu-central"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: vec![
+                col("region").eq(lit("us-west")),
+                col("region").eq(lit("us-east")),
+            ],
+        })?;
+        let expansion = plan.expand_scan_metadata()?;
+
+        assert_eq!(expansion.source_name, "orders");
+        assert_eq!(expansion.snapshot_version, 1);
+        assert!(expansion.scan_metadata_exhausted);
+        assert!(expansion.files.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_scan_plan_metadata_expansion_maps_kernel_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("provider-scan-metadata-expansion-error")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let mut plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: None,
+            pushed_filters: Vec::new(),
+        })?;
+        plan.table_uri = "\nnot a valid table uri".to_owned();
+
+        let error = match plan.expand_scan_metadata() {
+            Ok(_) => return Err("scan metadata expansion should fail".into()),
+            Err(error) => error,
+        };
+
+        match error {
+            DeltaFunnelError::DeltaScanMetadataExpansion {
+                source_name,
+                table_uri,
+                snapshot_version,
+                source: _,
+            } => {
+                assert_eq!(source_name, "orders");
+                assert_eq!(table_uri, "\nnot a valid table uri");
+                assert_eq!(snapshot_version, 1);
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
 
         Ok(())
     }
