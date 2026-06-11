@@ -598,6 +598,57 @@ mod tests {
     }
 
     #[test]
+    fn filter_pushdown_matrix_unsupported_entries_keep_stable_policy_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("filter-pushdown-data-stats-matrix-reasons")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let mut provider = DeltaTableProvider::try_new(source, preflight)?;
+        provider.set_schema_for_tests(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("customer_name", DataType::Utf8, true),
+            Field::new("amount256", DataType::Decimal256(38, 18), true),
+            Field::new("float_score", DataType::Float32, true),
+            Field::new("payload", DataType::Binary, true),
+            Field::new(
+                "profile",
+                DataType::Struct(vec![Field::new("age", DataType::Int32, true)].into()),
+                true,
+            ),
+        ])));
+        let decimal256 = Expr::Literal(ScalarValue::Decimal256(Some(200.into()), 38, 18), None);
+        let filters = [
+            col("id").is_null(),
+            col("customer_name").in_list(vec![lit("alice")], false),
+            col("amount256").eq(decimal256),
+            col("float_score").eq(lit(0.0_f32)),
+            col("payload").eq(binary_lit(b"hello")),
+            col("profile").is_null(),
+        ];
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let plan = provider.plan_supports_filters_pushdown(&filter_refs);
+
+        assert_eq!(plan.unsupported_count, filters.len());
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Unsupported
+                && decision.residual
+                && decision.kernel_scan_filter.is_none()
+                && decision.rejection_reason
+                    == Some(DeltaFilterPushdownRejectionReason::UnsupportedByPolicy)
+                && decision
+                    .rejection_reason
+                    .map(DeltaFilterPushdownRejectionReason::code)
+                    == Some("unsupported_by_policy")
+        }));
+
+        Ok(())
+    }
+
+    #[test]
     fn filter_pushdown_reports_exact_for_supported_partition_equality()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
