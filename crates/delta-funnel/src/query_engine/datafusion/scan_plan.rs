@@ -243,6 +243,57 @@ mod tests {
     }
 
     #[test]
+    fn provider_scan_plan_expands_multiple_active_files_in_kernel_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "provider-scan-metadata-multiple-files",
+            crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+                r#""partitionValues":{"region":"eu-central"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: Vec::new(),
+        })?;
+        let expansion = plan.expand_scan_metadata()?;
+        let paths = expansion
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        let sizes = expansion
+            .files
+            .iter()
+            .map(|file| file.size)
+            .collect::<Vec<_>>();
+
+        assert!(expansion.scan_metadata_exhausted);
+        assert_eq!(
+            paths,
+            vec![
+                "part-00000.parquet",
+                "part-00001.parquet",
+                "part-00002.parquet"
+            ]
+        );
+        assert_eq!(sizes, vec![0, 0, 0]);
+
+        Ok(())
+    }
+
+    #[test]
     fn provider_scan_plan_metadata_expansion_maps_kernel_errors()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("provider-scan-metadata-expansion-error")?;
