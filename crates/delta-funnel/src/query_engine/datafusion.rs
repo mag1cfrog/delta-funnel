@@ -1,6 +1,7 @@
 //! DataFusion integration.
 
 mod execution;
+mod file_task;
 mod filters;
 mod projection;
 mod provider;

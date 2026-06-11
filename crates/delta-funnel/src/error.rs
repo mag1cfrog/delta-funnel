@@ -173,6 +173,27 @@ pub enum DeltaFunnelError {
         source: Box<delta_kernel::Error>,
     },
 
+    /// Delta scan metadata could not be converted into provider file tasks.
+    #[snafu(display(
+        "Delta scan file task planning error for source `{}` at snapshot version {snapshot_version} ({}), file `{}`: {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(path),
+        sanitize_reason_for_display(reason)
+    ))]
+    DeltaScanFileTaskPlanning {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Resolved Delta snapshot version.
+        snapshot_version: u64,
+        /// Delta add-action path associated with the task planning failure.
+        path: String,
+        /// Sanitized reason for the task planning failure.
+        reason: String,
+    },
+
     /// A required dependency contract is unavailable or incompatible.
     #[snafu(display("dependency compatibility error: {message}"))]
     DependencyCompatibility {
@@ -368,6 +389,30 @@ mod tests {
         assert!(display.contains("snapshot version 7"));
         assert!(display.contains("s3://example.com/table"));
         assert!(display.contains(r"scan\nmetadata expansion failed"));
+        assert!(!display.contains('\n'));
+        assert!(!display.contains("user"));
+        assert!(!display.contains("password"));
+        assert!(!display.contains("token"));
+        assert!(!display.contains("secret"));
+    }
+
+    #[test]
+    fn scan_file_task_planning_error_has_sanitized_display() {
+        let error = DeltaFunnelError::DeltaScanFileTaskPlanning {
+            source_name: "orders\nlatest".to_owned(),
+            table_uri: "s3://user:password@example.com/table?token=secret".to_owned(),
+            snapshot_version: 7,
+            path: "part\n00000.parquet".to_owned(),
+            reason: "kernel\nsize was negative".to_owned(),
+        };
+
+        let display = error.to_string();
+
+        assert!(display.contains(r"orders\nlatest"));
+        assert!(display.contains("snapshot version 7"));
+        assert!(display.contains("s3://example.com/table"));
+        assert!(display.contains(r"part\n00000.parquet"));
+        assert!(display.contains(r"kernel\nsize was negative"));
         assert!(!display.contains('\n'));
         assert!(!display.contains("user"));
         assert!(!display.contains("password"));

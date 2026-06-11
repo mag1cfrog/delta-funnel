@@ -11,6 +11,7 @@ use crate::{
     },
 };
 
+use super::file_task::DeltaScanFileTask;
 use super::filters::DeltaFilterPushdownPlan;
 
 /// Caller request used to build a provider scan plan.
@@ -122,6 +123,32 @@ impl ProviderScanPlan {
             files,
             scan_metadata_exhausted,
         })
+    }
+}
+
+impl ProviderScanMetadataExpansion {
+    /// Converts expanded scan metadata into provider-owned file tasks.
+    #[allow(dead_code)]
+    pub(crate) fn into_file_tasks(self) -> Result<Vec<DeltaScanFileTask>, DeltaFunnelError> {
+        let Self {
+            source_name,
+            table_uri,
+            snapshot_version,
+            files,
+            scan_metadata_exhausted: _,
+        } = self;
+
+        files
+            .into_iter()
+            .map(|file| {
+                DeltaScanFileTask::from_kernel_metadata(
+                    &source_name,
+                    &table_uri,
+                    snapshot_version,
+                    file,
+                )
+            })
+            .collect()
     }
 }
 
@@ -289,6 +316,47 @@ mod tests {
             ]
         );
         assert_eq!(sizes, vec![0, 0, 0]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_scan_metadata_expansion_converts_one_file_task_per_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "provider-scan-file-tasks",
+            crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: Vec::new(),
+        })?;
+        let table_uri = plan.table_uri.clone();
+        let tasks = plan.expand_scan_metadata()?.into_file_tasks()?;
+        let paths = tasks
+            .iter()
+            .map(|task| task.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(paths, vec!["part-00000.parquet", "part-00001.parquet"]);
+        assert_eq!(tasks[0].source_name, "orders");
+        assert_eq!(tasks[0].table_uri, table_uri);
+        assert_eq!(tasks[0].snapshot_version, 1);
+        assert_eq!(tasks[0].estimated_bytes, Some(0));
 
         Ok(())
     }
