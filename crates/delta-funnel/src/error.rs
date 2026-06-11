@@ -173,6 +173,27 @@ pub enum DeltaFunnelError {
         source: Box<delta_kernel::Error>,
     },
 
+    /// Delta scan metadata could not be converted into provider file tasks.
+    #[snafu(display(
+        "Delta scan file task planning error for source `{}` at snapshot version {snapshot_version} ({}), file `{}`: {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(path),
+        sanitize_reason_for_display(reason)
+    ))]
+    DeltaScanFileTaskPlanning {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Resolved Delta snapshot version.
+        snapshot_version: u64,
+        /// Delta add-action path associated with the task planning failure.
+        path: String,
+        /// Sanitized reason for the task planning failure.
+        reason: String,
+    },
+
     /// A required dependency contract is unavailable or incompatible.
     #[snafu(display("dependency compatibility error: {message}"))]
     DependencyCompatibility {
