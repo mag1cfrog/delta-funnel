@@ -103,9 +103,14 @@ fn valid_estimated_bytes(
 mod tests {
     use std::collections::HashMap;
 
-    use crate::table_formats::{
-        KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata, KernelScanFileMetadata,
-        KernelScanFileStats,
+    use crate::{
+        DeltaSourceConfig, load_delta_source,
+        query_engine::datafusion::test_support::{DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable},
+        table_formats::{
+            KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata,
+            KernelScanFileMetadata, KernelScanFileStats,
+            build_projected_predicated_stats_delta_scan,
+        },
     };
 
     use super::DeltaScanFileTask;
@@ -175,6 +180,57 @@ mod tests {
 
         assert!(task.stats.is_none());
         assert_eq!(task.estimated_rows, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_task_preserves_deletion_vector_presence_without_payload_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
+        let table = DeltaLogTable::new_with_schema_protocol_and_adds(
+            "file-task-dv-preservation",
+            DELETION_VECTOR_PROTOCOL_JSON,
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            "[]",
+            &[
+                r#""partitionValues":{},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
+        let expansion = scan.expand_kernel_scan_metadata(source.table_uri())?;
+        let Some(file) = expansion.files.into_iter().next() else {
+            return Err("expected one deletion-vector scan file".into());
+        };
+
+        let task = DeltaScanFileTask::from_kernel_metadata(
+            source.name(),
+            source.table_uri(),
+            source.version(),
+            file,
+        )?;
+
+        assert!(task.deletion_vector.is_present());
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_task_preserves_transform_presence_without_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = kernel_file("transform.parquet");
+        file.physical_to_logical_transform =
+            KernelPhysicalToLogicalTransform::test_required_column_transform("physical_id");
+
+        let task =
+            DeltaScanFileTask::from_kernel_metadata("orders", "file:///tmp/table", 42, file)?;
+
+        assert!(task.transform.is_required());
 
         Ok(())
     }

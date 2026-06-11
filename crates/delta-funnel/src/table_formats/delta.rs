@@ -256,8 +256,17 @@ impl KernelScanDeletionVectorMetadata {
 impl KernelPhysicalToLogicalTransform {
     #[cfg(test)]
     #[must_use]
-    fn is_required(&self) -> bool {
+    pub(crate) fn is_required(&self) -> bool {
         matches!(self, Self::Required(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_required_column_transform(column_name: &str) -> Self {
+        let transform = std::sync::Arc::new(kernel::Expression::Column(kernel::ColumnName::new([
+            column_name,
+        ])));
+
+        Self::Required(KernelPhysicalToLogicalTransformHandle { transform })
     }
 
     fn from_transform(transform: Option<kernel::ExpressionRef>) -> Self {
