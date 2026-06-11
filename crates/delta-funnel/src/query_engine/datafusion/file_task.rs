@@ -185,6 +185,45 @@ mod tests {
     }
 
     #[test]
+    fn file_task_model_cannot_be_reduced_to_plain_path_list_without_losing_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let task = DeltaScanFileTask::from_kernel_metadata(
+            "orders",
+            "file:///tmp/table",
+            42,
+            kernel_file("part-00000.parquet"),
+        )?;
+
+        let path_only = task.path.clone();
+
+        assert_eq!(path_only, "part-00000.parquet");
+        assert_eq!(task.source_name, "orders");
+        assert_eq!(task.table_uri, "file:///tmp/table");
+        assert_eq!(task.snapshot_version, 42);
+        assert_eq!(task.estimated_bytes, Some(123));
+        assert_eq!(task.estimated_rows, Some(7));
+        assert_eq!(task.modification_time_ms, Some(1587968586000));
+        assert_eq!(
+            task.partition_values.get("region").map(String::as_str),
+            Some("us-west")
+        );
+        assert_eq!(
+            task.stats.as_ref().and_then(|stats| stats.num_records),
+            Some(7)
+        );
+        assert!(matches!(
+            task.deletion_vector,
+            KernelScanDeletionVectorMetadata::NotPresent
+        ));
+        assert!(matches!(
+            task.transform,
+            KernelPhysicalToLogicalTransform::NotRequired
+        ));
+
+        Ok(())
+    }
+
+    #[test]
     fn file_task_preserves_deletion_vector_presence_without_payload_read()
     -> Result<(), Box<dyn std::error::Error>> {
         const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
