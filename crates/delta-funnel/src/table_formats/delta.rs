@@ -254,6 +254,12 @@ impl KernelScanDeletionVectorMetadata {
 }
 
 impl KernelPhysicalToLogicalTransform {
+    #[cfg(test)]
+    #[must_use]
+    fn is_required(&self) -> bool {
+        matches!(self, Self::Required(_))
+    }
+
     fn from_transform(transform: Option<kernel::ExpressionRef>) -> Self {
         match transform {
             Some(transform) => Self::Required(KernelPhysicalToLogicalTransformHandle { transform }),
@@ -415,8 +421,10 @@ fn load_delta_source_after_name_validation(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::common::ScalarValue;
@@ -904,6 +912,69 @@ mod tests {
             file.partition_values.get("region").map(String::as_str),
             Some("us-west")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_scan_metadata_expansion_reports_empty_scan_as_exhausted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_metadata_and_adds(
+            "kernel-scan-metadata-empty",
+            METADATA_JSON,
+            &[],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None)?;
+
+        let expansion = scan.expand_kernel_scan_metadata(source.table_uri())?;
+
+        assert!(expansion.scan_metadata_exhausted);
+        assert!(expansion.files.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_scan_file_metadata_preserves_transform_handle_without_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let transform = Arc::new(Expression::Column(ColumnName::new(["physical_id"])));
+        let partition_values = HashMap::from([("region".to_owned(), "us-west".to_owned())]);
+
+        let file = super::kernel::ScanFile {
+            path: "part-with-transform.parquet".to_owned(),
+            size: 456,
+            modification_time: 1587968587000,
+            stats: None,
+            dv_info: super::kernel::DvInfo::default(),
+            transform: Some(Arc::clone(&transform)),
+            partition_values,
+        };
+
+        let metadata = super::KernelScanFileMetadata::from_kernel_scan_file(file);
+
+        assert_eq!(metadata.path, "part-with-transform.parquet");
+        assert_eq!(metadata.size, 456);
+        assert_eq!(metadata.modification_time, 1587968587000);
+        assert!(metadata.stats.is_none());
+        assert!(!metadata.deletion_vector.is_present());
+        assert!(metadata.physical_to_logical_transform.is_required());
+        assert_eq!(
+            metadata.partition_values.get("region").map(String::as_str),
+            Some("us-west")
+        );
+        match metadata.physical_to_logical_transform {
+            super::KernelPhysicalToLogicalTransform::Required(handle) => {
+                assert!(Arc::ptr_eq(&handle.transform, &transform));
+            }
+            super::KernelPhysicalToLogicalTransform::NotRequired => {
+                return Err("transform handle should be preserved".into());
+            }
+        }
 
         Ok(())
     }
