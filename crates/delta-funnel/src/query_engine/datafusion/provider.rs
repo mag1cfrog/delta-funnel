@@ -402,6 +402,10 @@ impl TableProvider for DeltaTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        // SQL LIMIT is enforced by DataFusion above the provider scan. Treat the
+        // provider limit as advisory until a scan-local limit case is proven
+        // safe across residual filters, joins, deletion vectors, transforms, and
+        // ordering-sensitive plans.
         let scan_plan = self
             .plan_scan(ProviderScanPlanRequest {
                 requested_projection: projection.cloned(),
