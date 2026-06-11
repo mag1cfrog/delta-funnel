@@ -4403,9 +4403,16 @@ async fn table_provider_scan_accepts_projected_mixed_partition_filter_when_resid
 }
 
 #[tokio::test]
-async fn table_provider_scan_limit_does_not_change_projection_contract()
+async fn table_provider_scan_limit_does_not_change_scan_planning_contract()
 -> Result<(), Box<dyn std::error::Error>> {
-    let table = DeltaLogTable::new("table-provider-limit-unsupported")?;
+    let matching_stats = id_stats_add_json(10, 101, 150, 0);
+    let skipped_stats = id_stats_add_json(10, 1, 50, 0);
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-limit-unsupported",
+        DEFAULT_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[matching_stats.as_str(), skipped_stats.as_str()],
+    )?;
     let source = load_delta_source(DeltaSourceConfig {
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
@@ -4414,12 +4421,15 @@ async fn table_provider_scan_limit_does_not_change_projection_contract()
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
     let state = SessionContext::new().state();
-    let projection = vec![0];
+    let projection = vec![0, 1];
+    let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(100));
 
     let with_limit = provider
-        .scan(&state, Some(&projection), &[], Some(1))
+        .scan(&state, Some(&projection), std::slice::from_ref(&filter), Some(1))
         .await?;
-    let without_limit = provider.scan(&state, Some(&projection), &[], None).await?;
+    let without_limit = provider
+        .scan(&state, Some(&projection), &[filter], None)
+        .await?;
     let with_limit_scan = with_limit
         .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
@@ -4433,6 +4443,35 @@ async fn table_provider_scan_limit_does_not_change_projection_contract()
     assert_eq!(
         with_limit_scan.scan_plan().scan_projection,
         without_limit_scan.scan_plan().scan_projection
+    );
+    assert_eq!(
+        with_limit_scan.scan_plan().pushed_filter_plan.exact_count,
+        without_limit_scan.scan_plan().pushed_filter_plan.exact_count
+    );
+    assert_eq!(
+        with_limit_scan.scan_plan().pushed_filter_plan.inexact_count,
+        without_limit_scan.scan_plan().pushed_filter_plan.inexact_count
+    );
+    assert_eq!(
+        with_limit_scan
+            .scan_plan()
+            .pushed_filter_plan
+            .residual_filter_count,
+        without_limit_scan
+            .scan_plan()
+            .pushed_filter_plan
+            .residual_filter_count
+    );
+    assert_eq!(
+        with_limit_scan.scan_plan().kernel_partition_predicate.is_some(),
+        without_limit_scan
+            .scan_plan()
+            .kernel_partition_predicate
+            .is_some()
+    );
+    assert_eq!(
+        scan_file_paths(with_limit_scan)?,
+        scan_file_paths(without_limit_scan)?
     );
 
     Ok(())
