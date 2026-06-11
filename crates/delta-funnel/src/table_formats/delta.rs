@@ -1,5 +1,7 @@
 //! Delta table-format source loading.
 
+use std::collections::HashMap;
+
 use crate::DeltaFunnelError;
 
 mod kernel;
@@ -14,6 +16,119 @@ pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };
 use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
+
+/// Metadata-only expansion of one kernel scan.
+///
+/// This is the direct output of `delta_kernel` scan metadata expansion. It is
+/// not yet the provider execution task model; later provider planning converts
+/// these file metadata records into Delta-aware file tasks and grouped scan
+/// partitions.
+#[allow(dead_code)]
+pub(crate) struct KernelScanMetadataExpansion {
+    /// File-level metadata rows yielded by Delta Kernel scan metadata expansion.
+    pub(crate) files: Vec<KernelScanFileMetadata>,
+    /// Whether the kernel scan metadata iterator was consumed to completion.
+    ///
+    /// This records that the adapter did not stop after a partial metadata
+    /// batch. Later planning layers can rely on `files` representing the full
+    /// kernel-selected file set for this scan.
+    pub(crate) scan_metadata_exhausted: bool,
+}
+
+/// Metadata for one file selected by kernel scan planning.
+#[allow(dead_code)]
+pub(crate) struct KernelScanFileMetadata {
+    /// Delta add-action path for the selected data file.
+    ///
+    /// This is the table-relative path that Delta Kernel exposes in
+    /// `ScanFile`, not a resolved object-store URI.
+    pub(crate) path: String,
+    /// File size in bytes from the Delta add action.
+    pub(crate) size: i64,
+    /// Last modification timestamp from the Delta add action.
+    ///
+    /// Delta log metadata stores this value in milliseconds since the Unix
+    /// epoch.
+    pub(crate) modification_time: i64,
+    /// Parsed file statistics from Delta Kernel when stats are available.
+    pub(crate) stats: Option<KernelScanFileStats>,
+    /// Deletion-vector metadata selected with this file, if one exists.
+    ///
+    /// The handle intentionally preserves kernel-owned metadata only. It must
+    /// not read or materialize the deletion-vector payload during metadata
+    /// expansion.
+    pub(crate) deletion_vector: KernelScanDeletionVectorMetadata,
+    /// Optional physical-to-logical transform required for this file.
+    ///
+    /// Delta Kernel uses this for features where physical Parquet columns do
+    /// not directly match the logical scan schema. The expression is preserved
+    /// for the later execution path and is not evaluated here.
+    pub(crate) physical_to_logical_transform: KernelPhysicalToLogicalTransform,
+    /// Partition values from the Delta add action keyed by partition column.
+    ///
+    /// Values are the raw string metadata values exposed by Delta Kernel.
+    pub(crate) partition_values: HashMap<String, String>,
+}
+
+/// Parsed statistics for one kernel-selected scan file.
+#[allow(dead_code)]
+pub(crate) struct KernelScanFileStats {
+    /// Number of records parsed from the Delta add-action stats JSON.
+    pub(crate) num_records: u64,
+}
+
+/// Opaque metadata for a deletion vector selected by kernel scan planning.
+///
+/// This preserves the kernel-owned deletion-vector descriptor for later
+/// execution without loading the deletion-vector payload.
+#[allow(dead_code)]
+pub(crate) enum KernelScanDeletionVectorMetadata {
+    /// The selected file has no deletion vector.
+    NotPresent,
+    /// The selected file has deletion-vector metadata preserved for execution.
+    Present(KernelScanDeletionVectorHandle),
+}
+
+/// Opaque handle for kernel-owned deletion-vector metadata.
+///
+/// The wrapped `DvInfo` is kept private so metadata expansion cannot
+/// accidentally load the deletion-vector payload. Execution code can add a
+/// narrow accessor when deletion-vector reads are implemented.
+#[allow(dead_code)]
+pub(crate) struct KernelScanDeletionVectorHandle {
+    /// Kernel deletion-vector metadata for the selected file.
+    dv_info: kernel::DvInfo,
+}
+
+impl KernelScanDeletionVectorMetadata {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_present(&self) -> bool {
+        matches!(self, Self::Present(_))
+    }
+}
+
+/// Opaque physical-to-logical transform metadata selected for one scan file.
+///
+/// The transform is applied only after physical Parquet data has been read,
+/// which belongs to provider execution rather than metadata expansion.
+#[allow(dead_code)]
+pub(crate) enum KernelPhysicalToLogicalTransform {
+    /// The physical Parquet file already matches the logical scan shape.
+    NotRequired,
+    /// A kernel expression must be applied after physical data is read.
+    Required(KernelPhysicalToLogicalTransformHandle),
+}
+
+/// Opaque handle for a kernel physical-to-logical transform expression.
+///
+/// The expression is metadata for later execution. It is not evaluated while
+/// expanding scan metadata.
+#[allow(dead_code)]
+pub(crate) struct KernelPhysicalToLogicalTransformHandle {
+    /// Kernel expression that maps physical file data into logical scan data.
+    transform: kernel::ExpressionRef,
+}
 
 /// Caller-provided configuration for one named Delta source.
 pub struct DeltaSourceConfig {
@@ -54,14 +169,18 @@ impl ProjectedDeltaScan {
         &self.scan
     }
 
-    #[cfg(test)]
-    /// Returns scan file paths after kernel scan planning.
-    pub(crate) fn scan_file_paths(
+    /// Expands this kernel scan into metadata-only scan file records.
+    ///
+    /// This exhausts kernel scan metadata for one provider scan and does not
+    /// read Parquet data, load deletion-vector payloads, or apply physical data
+    /// transforms.
+    #[allow(dead_code)]
+    pub(crate) fn expand_kernel_scan_metadata(
         &self,
         table_uri: &str,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        fn collect_scan_file(files: &mut Vec<kernel::ScanFile>, file: kernel::ScanFile) {
-            files.push(file);
+    ) -> Result<KernelScanMetadataExpansion, delta_kernel::Error> {
+        fn collect_scan_file(files: &mut Vec<KernelScanFileMetadata>, file: kernel::ScanFile) {
+            files.push(KernelScanFileMetadata::from_kernel_scan_file(file));
         }
 
         let table_url = kernel::try_parse_uri(table_uri)?;
@@ -73,9 +192,73 @@ impl ProjectedDeltaScan {
             files = scan_metadata?.visit_scan_files(files, collect_scan_file)?;
         }
 
-        let mut paths = files.into_iter().map(|file| file.path).collect::<Vec<_>>();
+        Ok(KernelScanMetadataExpansion {
+            files,
+            scan_metadata_exhausted: true,
+        })
+    }
+
+    #[cfg(test)]
+    /// Returns scan file paths after kernel scan planning.
+    pub(crate) fn scan_file_paths(
+        &self,
+        table_uri: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut paths = self
+            .expand_kernel_scan_metadata(table_uri)?
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
         paths.sort();
         Ok(paths)
+    }
+}
+
+impl KernelScanFileMetadata {
+    fn from_kernel_scan_file(file: kernel::ScanFile) -> Self {
+        let kernel::ScanFile {
+            path,
+            size,
+            modification_time,
+            stats,
+            dv_info,
+            transform,
+            partition_values,
+        } = file;
+
+        Self {
+            path,
+            size,
+            modification_time,
+            stats: stats.map(|stats| KernelScanFileStats {
+                num_records: stats.num_records,
+            }),
+            deletion_vector: KernelScanDeletionVectorMetadata::from_dv_info(dv_info),
+            physical_to_logical_transform: KernelPhysicalToLogicalTransform::from_transform(
+                transform,
+            ),
+            partition_values,
+        }
+    }
+}
+
+impl KernelScanDeletionVectorMetadata {
+    fn from_dv_info(dv_info: kernel::DvInfo) -> Self {
+        if dv_info.has_vector() {
+            Self::Present(KernelScanDeletionVectorHandle { dv_info })
+        } else {
+            Self::NotPresent
+        }
+    }
+}
+
+impl KernelPhysicalToLogicalTransform {
+    fn from_transform(transform: Option<kernel::ExpressionRef>) -> Self {
+        match transform {
+            Some(transform) => Self::Required(KernelPhysicalToLogicalTransformHandle { transform }),
+            None => Self::NotRequired,
+        }
     }
 }
 
@@ -617,6 +800,20 @@ mod tests {
         )
     }
 
+    fn partitioned_dv_add_json_with_id_stats_and_size(
+        path: &str,
+        partition_values_json: &str,
+        size: i64,
+        num_records: i64,
+        min_value: i32,
+        max_value: i32,
+        null_count: i64,
+    ) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{partition_values_json},"size":{size},"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"id\":{min_value}}},\"maxValues\":{{\"id\":{max_value}}},\"nullCount\":{{\"id\":{null_count}}}}}","deletionVector":{{"storageType":"u","pathOrInlineDv":"vBn[lx{{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}}}}"#
+        )
+    }
+
     fn integer_partitioned_add_json(path: &str, value: &str) -> String {
         partitioned_add_json(
             path,
@@ -636,24 +833,12 @@ mod tests {
         scan: &ProjectedDeltaScan,
         table_uri: &str,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        fn collect_scan_file(
-            files: &mut Vec<super::kernel::ScanFile>,
-            file: super::kernel::ScanFile,
-        ) {
-            files.push(file);
-        }
-
-        let table_url = super::kernel::try_parse_uri(table_uri)?;
-        let store =
-            super::kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
-        let engine = super::kernel::DefaultEngineBuilder::new(store).build();
-        let mut files = Vec::new();
-
-        for scan_metadata in scan.kernel_scan().scan_metadata(&engine)? {
-            files = scan_metadata?.visit_scan_files(files, collect_scan_file)?;
-        }
-
-        let mut paths = files.into_iter().map(|file| file.path).collect::<Vec<_>>();
+        let mut paths = scan
+            .expand_kernel_scan_metadata(table_uri)?
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
         paths.sort();
         Ok(paths)
     }
@@ -668,28 +853,59 @@ mod tests {
         scan: &ProjectedDeltaScan,
         table_uri: &str,
     ) -> Result<Vec<KernelScanFileBoundary>, Box<dyn std::error::Error>> {
-        fn collect_scan_file(
-            files: &mut Vec<KernelScanFileBoundary>,
-            file: super::kernel::ScanFile,
-        ) {
-            files.push(KernelScanFileBoundary {
+        let mut boundaries = scan
+            .expand_kernel_scan_metadata(table_uri)?
+            .files
+            .into_iter()
+            .map(|file| KernelScanFileBoundary {
                 path: file.path,
-                has_deletion_vector: file.dv_info.has_vector(),
-            });
-        }
+                has_deletion_vector: file.deletion_vector.is_present(),
+            })
+            .collect::<Vec<_>>();
+        boundaries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(boundaries)
+    }
 
-        let table_url = super::kernel::try_parse_uri(table_uri)?;
-        let store =
-            super::kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
-        let engine = super::kernel::DefaultEngineBuilder::new(store).build();
-        let mut files = Vec::new();
+    #[test]
+    fn kernel_scan_metadata_expansion_preserves_file_metadata_without_data_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "kernel-scan-metadata-expansion",
+            DELETION_VECTOR_PROTOCOL_JSON,
+            PARTITIONED_METADATA_JSON,
+            &[partitioned_dv_add_json_with_id_stats_and_size(
+                "region-west-dv.parquet",
+                r#"{"region":"us-west"}"#,
+                123,
+                7,
+                10,
+                20,
+                0,
+            )],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path.to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None)?;
 
-        for scan_metadata in scan.kernel_scan().scan_metadata(&engine)? {
-            files = scan_metadata?.visit_scan_files(files, collect_scan_file)?;
-        }
+        let expansion = scan.expand_kernel_scan_metadata(source.table_uri())?;
 
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(files)
+        assert!(expansion.scan_metadata_exhausted);
+        assert_eq!(expansion.files.len(), 1);
+        let file = &expansion.files[0];
+        assert_eq!(file.path, "region-west-dv.parquet");
+        assert_eq!(file.size, 123);
+        assert_eq!(file.modification_time, 1587968586000);
+        assert_eq!(file.stats.as_ref().map(|stats| stats.num_records), Some(7));
+        assert!(file.deletion_vector.is_present());
+        assert_eq!(
+            file.partition_values.get("region").map(String::as_str),
+            Some("us-west")
+        );
+
+        Ok(())
     }
 
     fn kernel_partition_characterization_source()
