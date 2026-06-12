@@ -454,6 +454,22 @@ mod tests {
         estimated_bytes: Option<u64>,
         estimated_rows: Option<u64>,
     ) -> Result<DeltaScanFileTask, DeltaFunnelError> {
+        file_task_with_metadata(
+            path,
+            estimated_bytes,
+            estimated_rows,
+            KernelScanDeletionVectorMetadata::NotPresent,
+            KernelPhysicalToLogicalTransform::NotRequired,
+        )
+    }
+
+    fn file_task_with_metadata(
+        path: &str,
+        estimated_bytes: Option<u64>,
+        estimated_rows: Option<u64>,
+        deletion_vector: KernelScanDeletionVectorMetadata,
+        physical_to_logical_transform: KernelPhysicalToLogicalTransform,
+    ) -> Result<DeltaScanFileTask, DeltaFunnelError> {
         let mut task = DeltaScanFileTask::from_kernel_metadata(
             "orders",
             "file:///tmp/table",
@@ -472,8 +488,8 @@ mod tests {
                 stats: Some(KernelScanFileStats {
                     num_records: estimated_rows.unwrap_or(1),
                 }),
-                deletion_vector: KernelScanDeletionVectorMetadata::NotPresent,
-                physical_to_logical_transform: KernelPhysicalToLogicalTransform::NotRequired,
+                deletion_vector,
+                physical_to_logical_transform,
                 partition_values: HashMap::from([("region".to_owned(), "us-west".to_owned())]),
             },
         )?;
@@ -525,6 +541,30 @@ mod tests {
 
         assert!(error.to_string().contains("snapshot version"));
         assert!(error.to_string().contains("part-0.parquet"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_known_size_file_stays_whole() -> Result<(), Box<dyn std::error::Error>> {
+        let plan = DeltaScanFileTaskPartitionPlan::try_new(plan_request(
+            vec![
+                file_task("huge.parquet", Some(1_000), Some(100))?,
+                file_task("small-0.parquet", Some(10), Some(1))?,
+                file_task("small-1.parquet", Some(10), Some(1))?,
+            ],
+            2,
+        ))?;
+
+        assert_eq!(
+            plan_partition_paths(&plan),
+            vec![
+                vec!["huge.parquet"],
+                vec!["small-0.parquet", "small-1.parquet"]
+            ]
+        );
+        assert_eq!(plan.partitions[0].estimated_bytes, Some(1_000));
+        assert_eq!(plan.partitions[1].estimated_bytes, Some(20));
 
         Ok(())
     }
@@ -672,6 +712,40 @@ mod tests {
                 "part-3.parquet",
             ]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_plan_remains_delta_aware_file_task_plan() -> Result<(), Box<dyn std::error::Error>> {
+        let plan = DeltaScanFileTaskPartitionPlan::try_new(plan_request(
+            vec![file_task_with_metadata(
+                "part-with-delta-metadata.parquet",
+                Some(10),
+                Some(1),
+                KernelScanDeletionVectorMetadata::NotPresent,
+                KernelPhysicalToLogicalTransform::test_required_column_transform("physical_id"),
+            )?],
+            1,
+        ))?;
+        let file_task = &plan.partitions[0].file_tasks[0];
+        let path_only = file_task.path.clone();
+
+        assert_eq!(path_only, "part-with-delta-metadata.parquet");
+        assert_eq!(file_task.source_name, "orders");
+        assert_eq!(file_task.table_uri, "file:///tmp/table");
+        assert_eq!(file_task.snapshot_version, 42);
+        assert_eq!(file_task.estimated_bytes, Some(10));
+        assert_eq!(file_task.estimated_rows, Some(1));
+        assert_eq!(
+            file_task.partition_values.get("region").map(String::as_str),
+            Some("us-west")
+        );
+        assert!(matches!(
+            file_task.deletion_vector,
+            KernelScanDeletionVectorMetadata::NotPresent
+        ));
+        assert!(file_task.transform.is_required());
 
         Ok(())
     }
