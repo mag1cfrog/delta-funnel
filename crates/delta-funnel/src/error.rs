@@ -152,6 +152,7 @@ pub enum DeltaFunnelError {
         /// Sanitized or sanitizable Delta table URI context.
         table_uri: String,
         /// Kernel scan construction failure.
+        #[snafu(source(from(delta_kernel::Error, Box::new)))]
         source: Box<delta_kernel::Error>,
     },
 
@@ -170,6 +171,7 @@ pub enum DeltaFunnelError {
         /// Resolved Delta snapshot version.
         snapshot_version: u64,
         /// Kernel scan metadata expansion failure.
+        #[snafu(source(from(delta_kernel::Error, Box::new)))]
         source: Box<delta_kernel::Error>,
     },
 

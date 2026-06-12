@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
 
-use crate::DeltaFunnelError;
+use crate::{DeltaFunnelError, error::DeltaScanProjectionSnafu};
 
 #[allow(dead_code)]
 pub(super) struct ProjectionPlan {
@@ -29,40 +29,30 @@ pub(super) fn plan_projection(
         });
     };
 
-    reject_duplicate_projection_indexes(&projection).map_err(|reason| {
-        DeltaFunnelError::DeltaScanProjection {
-            source_name: source_name.to_owned(),
-            table_uri: table_uri.to_owned(),
-            reason,
-        }
-    })?;
+    if let Err(reason) = reject_duplicate_projection_indexes(&projection) {
+        return projection_error(source_name, table_uri, reason);
+    }
 
-    let projected_column_names = projection
-        .iter()
-        .map(|index| {
-            schema.fields().get(*index).map_or_else(
-                || {
-                    Err(DeltaFunnelError::DeltaScanProjection {
-                        source_name: source_name.to_owned(),
-                        table_uri: table_uri.to_owned(),
-                        reason: format!(
-                            "projection index {index} is out of bounds for schema with {} fields",
-                            schema.fields().len()
-                        ),
-                    })
-                },
-                |field| Ok(field.name().to_owned()),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut projected_column_names = Vec::with_capacity(projection.len());
+    for index in &projection {
+        let Some(field) = schema.fields().get(*index) else {
+            return projection_error(
+                source_name,
+                table_uri,
+                format!(
+                    "projection index {index} is out of bounds for schema with {} fields",
+                    schema.fields().len()
+                ),
+            );
+        };
 
-    let projected_schema = Arc::new(schema.as_ref().project(&projection).map_err(|error| {
-        DeltaFunnelError::DeltaScanProjection {
-            source_name: source_name.to_owned(),
-            table_uri: table_uri.to_owned(),
-            reason: error.to_string(),
-        }
-    })?);
+        projected_column_names.push(field.name().to_owned());
+    }
+
+    let projected_schema = match schema.as_ref().project(&projection) {
+        Ok(schema) => Arc::new(schema),
+        Err(error) => return projection_error(source_name, table_uri, error.to_string()),
+    };
 
     Ok(ProjectionPlan {
         projected_schema,
@@ -82,6 +72,19 @@ fn reject_duplicate_projection_indexes(projection: &[usize]) -> Result<(), Strin
     }
 
     Ok(())
+}
+
+fn projection_error<T>(
+    source_name: &str,
+    table_uri: &str,
+    reason: impl Into<String>,
+) -> Result<T, DeltaFunnelError> {
+    DeltaScanProjectionSnafu {
+        source_name: source_name.to_owned(),
+        table_uri: table_uri.to_owned(),
+        reason: reason.into(),
+    }
+    .fail()
 }
 
 #[cfg(test)]

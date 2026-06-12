@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     DeltaFunnelError,
+    error::DeltaScanFileTaskPlanningSnafu,
     table_formats::{
         KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata, KernelScanFileMetadata,
     },
@@ -84,17 +85,22 @@ fn valid_estimated_bytes(
     snapshot_version: u64,
     file: &KernelScanFileMetadata,
 ) -> Result<Option<u64>, DeltaFunnelError> {
-    let bytes =
-        u64::try_from(file.size).map_err(|_| DeltaFunnelError::DeltaScanFileTaskPlanning {
-            source_name: source_name.to_owned(),
-            table_uri: table_uri.to_owned(),
-            snapshot_version,
-            path: file.path.clone(),
-            reason: format!(
-                "kernel scan file size must be non-negative, got {}",
-                file.size
-            ),
-        })?;
+    let bytes = match u64::try_from(file.size) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return DeltaScanFileTaskPlanningSnafu {
+                source_name: source_name.to_owned(),
+                table_uri: table_uri.to_owned(),
+                snapshot_version,
+                path: file.path.clone(),
+                reason: format!(
+                    "kernel scan file size must be non-negative, got {}",
+                    file.size
+                ),
+            }
+            .fail();
+        }
+    };
 
     Ok(Some(bytes))
 }

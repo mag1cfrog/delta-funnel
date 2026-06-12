@@ -1,6 +1,6 @@
 //! Delta source table URI normalization.
 
-use crate::DeltaFunnelError;
+use crate::{DeltaFunnelError, error::InvalidSourceUriSnafu};
 
 use super::kernel::try_parse_uri;
 
@@ -24,14 +24,21 @@ pub(crate) fn normalize_delta_table_uri(
 ) -> Result<String, DeltaFunnelError> {
     let table_uri = table_uri.as_ref();
     if table_uri.trim().is_empty() {
-        return Err(DeltaFunnelError::InvalidSourceUri {
+        return InvalidSourceUriSnafu {
             reason: EMPTY_TABLE_URI,
-        });
+        }
+        .fail();
     }
 
-    let table_url = try_parse_uri(table_uri).map_err(|_| DeltaFunnelError::InvalidSourceUri {
-        reason: INVALID_TABLE_URI,
-    })?;
+    let table_url = match try_parse_uri(table_uri) {
+        Ok(table_url) => table_url,
+        Err(_) => {
+            return InvalidSourceUriSnafu {
+                reason: INVALID_TABLE_URI,
+            }
+            .fail();
+        }
+    };
 
     Ok(table_url.to_string())
 }

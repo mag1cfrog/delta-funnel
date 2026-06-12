@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::DeltaFunnelError;
+use crate::{DeltaFunnelError, error::DeltaSourceSchemaSnafu};
 
 mod kernel;
 mod protocol;
@@ -309,9 +309,16 @@ impl PlannedDeltaSource {
 
 pub(crate) fn delta_source_arrow_schema(
     source: &PlannedDeltaSource,
-) -> Result<ArrowSchemaRef, String> {
-    snapshot_arrow_schema(source.loaded_snapshot().kernel_snapshot())
-        .map_err(|error| error.to_string())
+) -> Result<ArrowSchemaRef, DeltaFunnelError> {
+    match snapshot_arrow_schema(source.loaded_snapshot().kernel_snapshot()) {
+        Ok(schema) => Ok(schema),
+        Err(error) => DeltaSourceSchemaSnafu {
+            source_name: source.name().to_owned(),
+            table_uri: source.table_uri().to_owned(),
+            reason: error.to_string(),
+        }
+        .fail(),
+    }
 }
 
 /// Builds kernel-backed scan state for a loaded Delta source projection.
