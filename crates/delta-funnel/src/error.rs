@@ -232,6 +232,8 @@ fn sanitize_reason_for_display(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::DeltaFunnelError;
 
     #[test]
@@ -414,6 +416,15 @@ mod tests {
         assert!(!display.contains("password"));
         assert!(!display.contains("token"));
         assert!(!display.contains("secret"));
+
+        let Some(source) = Error::source(&error) else {
+            panic!("metadata expansion error must preserve its kernel source");
+        };
+        assert!(
+            source
+                .to_string()
+                .contains("scan\nmetadata expansion failed")
+        );
     }
 
     #[test]

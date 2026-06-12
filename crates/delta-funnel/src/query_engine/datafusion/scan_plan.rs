@@ -835,11 +835,37 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let manifest =
             fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))?;
+        let dependencies = direct_manifest_dependency_names(&manifest);
 
-        assert!(manifest.contains("delta_kernel"));
-        assert!(!manifest.contains("deltalake"));
-        assert!(!manifest.contains("buoyant_kernel"));
+        assert!(dependencies.contains(&"delta_kernel"));
+        assert!(!dependencies.contains(&"deltalake"));
+        assert!(!dependencies.contains(&"buoyant_kernel"));
 
         Ok(())
+    }
+
+    fn direct_manifest_dependency_names(manifest: &str) -> Vec<&str> {
+        let mut dependency_names = Vec::new();
+        let mut in_dependency_section = false;
+
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                in_dependency_section = matches!(
+                    line,
+                    "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]"
+                );
+                continue;
+            }
+            if !in_dependency_section || line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((dependency_name, _value)) = line.split_once('=') else {
+                continue;
+            };
+            dependency_names.push(dependency_name.trim().trim_matches('"'));
+        }
+
+        dependency_names
     }
 }
