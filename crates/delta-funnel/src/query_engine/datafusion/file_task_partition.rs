@@ -1,4 +1,10 @@
 //! Metadata-only grouping for Delta scan file tasks.
+//!
+//! Partition planning consumes provider-owned file tasks and emits grouped scan
+//! partitions without touching file contents. The plan keeps all selected file
+//! tasks in memory because this MVP needs a complete metadata view to balance
+//! tasks by bytes or file count. Each task remains whole, preserving per-file
+//! Delta correctness metadata for later read execution.
 
 use crate::{DeltaFunnelError, error::DeltaScanFileTaskPartitionPlanningSnafu};
 
@@ -22,6 +28,11 @@ pub(crate) struct DeltaScanFileTaskPartitionPlanRequest {
 }
 
 /// Metadata-only partition plan for grouped Delta scan file tasks.
+///
+/// This is the read-execution contract produced by scan partition planning. It
+/// carries the source, table, snapshot, grouped partitions, per-file task
+/// metadata, and aggregate estimates needed to schedule provider reads without
+/// reloading the Delta snapshot or expanding kernel scan metadata again.
 #[allow(dead_code)]
 pub(crate) struct DeltaScanFileTaskPartitionPlan {
     /// DataFusion table name for this source.

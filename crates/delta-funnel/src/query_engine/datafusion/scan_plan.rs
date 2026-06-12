@@ -1,4 +1,13 @@
 //! Delta provider scan planning state.
+//!
+//! The MVP scan partition planner is intentionally metadata-only and
+//! in-memory. It expands the Delta Kernel scan into one metadata record per
+//! active selected file, converts those records into provider-owned file tasks,
+//! and groups the tasks before execution exists. This owns file metadata,
+//! partition values, parsed statistics, deletion-vector metadata handles, and
+//! transform handles, but it does not read Parquet data or deletion-vector
+//! payloads. Memory use is therefore bounded by the number of files selected by
+//! kernel partition and stats pruning for this provider scan.
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::Expr;
@@ -52,6 +61,11 @@ pub(crate) struct ProviderScanPlan {
 }
 
 /// Metadata-only expansion of one planned Delta provider scan.
+///
+/// This is an all-or-error boundary. A successful value owns every kernel file
+/// metadata record selected for this provider scan and records whether the
+/// upstream metadata iterator was exhausted. Partial expansions are not exposed
+/// to file-task grouping.
 #[allow(dead_code)]
 pub(crate) struct ProviderScanMetadataExpansion {
     /// DataFusion table name for this source.
@@ -134,6 +148,9 @@ impl ProviderScanPlan {
     ///
     /// Partition options are validated before Delta Kernel metadata expansion so
     /// invalid caller options fail before any scan metadata work is consumed.
+    /// The returned plan is the provider execution handoff: it carries scan
+    /// context plus grouped file tasks, so later read execution should consume it
+    /// directly instead of reloading the snapshot or re-expanding scan metadata.
     #[allow(dead_code)]
     pub(crate) fn plan_file_task_partitions(
         &self,
