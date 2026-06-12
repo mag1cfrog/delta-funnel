@@ -194,6 +194,24 @@ pub enum DeltaFunnelError {
         reason: String,
     },
 
+    /// Delta scan file tasks could not be grouped into provider scan partitions.
+    #[snafu(display(
+        "Delta scan file task partition planning error for source `{}` at snapshot version {snapshot_version} ({}): {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(reason)
+    ))]
+    DeltaScanFileTaskPartitionPlanning {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Resolved Delta snapshot version.
+        snapshot_version: u64,
+        /// Sanitized reason for the partition planning failure.
+        reason: String,
+    },
+
     /// A required dependency contract is unavailable or incompatible.
     #[snafu(display("dependency compatibility error: {message}"))]
     DependencyCompatibility {
@@ -413,6 +431,28 @@ mod tests {
         assert!(display.contains("s3://example.com/table"));
         assert!(display.contains(r"part\n00000.parquet"));
         assert!(display.contains(r"kernel\nsize was negative"));
+        assert!(!display.contains('\n'));
+        assert!(!display.contains("user"));
+        assert!(!display.contains("password"));
+        assert!(!display.contains("token"));
+        assert!(!display.contains("secret"));
+    }
+
+    #[test]
+    fn scan_file_task_partition_planning_error_has_sanitized_display() {
+        let error = DeltaFunnelError::DeltaScanFileTaskPartitionPlanning {
+            source_name: "orders\nlatest".to_owned(),
+            table_uri: "s3://user:password@example.com/table?token=secret".to_owned(),
+            snapshot_version: 7,
+            reason: "target\npartitions was zero".to_owned(),
+        };
+
+        let display = error.to_string();
+
+        assert!(display.contains(r"orders\nlatest"));
+        assert!(display.contains("snapshot version 7"));
+        assert!(display.contains("s3://example.com/table"));
+        assert!(display.contains(r"target\npartitions was zero"));
         assert!(!display.contains('\n'));
         assert!(!display.contains("user"));
         assert!(!display.contains("password"));
