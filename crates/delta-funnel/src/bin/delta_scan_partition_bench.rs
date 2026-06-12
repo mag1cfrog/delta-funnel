@@ -10,6 +10,11 @@ use delta_funnel::{
 };
 
 const MIB: u64 = 1024 * 1024;
+const BENCHMARK_FD_PER_PARTITION_CANDIDATES: [usize; 4] = [4, 8, 16, 32];
+const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
+    [64 * MIB, 128 * MIB, 256 * MIB, 512 * MIB];
+const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
+const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
 const BENCHMARK_CSV_HEADER: [&str; 36] = [
     "shape_name",
     "total_rows",
@@ -71,7 +76,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     file_set: &file_set,
                     simulation_profile_count: simulation_profiles.len(),
                     simulation,
-                    policy_case: *policy_case,
+                    policy_case,
                     policy_decision,
                     simulated_work: &simulated_work,
                     partitioned_work: &partitioned_work,
@@ -123,9 +128,9 @@ struct SyntheticFile {
     size_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BenchmarkPolicyCase {
-    name: &'static str,
+    name: String,
     input: DeltaScanPartitionTargetDiagnosticInput,
 }
 
@@ -135,7 +140,7 @@ struct BenchmarkCsvRowInput<'a> {
     file_set: &'a SyntheticFileSet,
     simulation_profile_count: usize,
     simulation: SyntheticWorkSimulationProfile,
-    policy_case: BenchmarkPolicyCase,
+    policy_case: &'a BenchmarkPolicyCase,
     policy_decision: DeltaScanPartitionTargetDiagnosticOutput,
     simulated_work: &'a SyntheticWorkSimulationResult,
     partitioned_work: &'a SyntheticPartitionedWorkPlan,
@@ -629,43 +634,59 @@ impl SyntheticFileSet {
 impl BenchmarkPolicyCase {
     fn standard_cases(available_parallelism: Option<usize>) -> Vec<Self> {
         let baseline = Self::baseline_input(available_parallelism);
+        let mut cases = vec![Self::new("default_policy", baseline)];
 
-        vec![
-            Self {
-                name: "default_policy",
-                input: baseline,
-            },
-            Self {
-                name: "low_unix_fd_limit",
-                input: DeltaScanPartitionTargetDiagnosticInput {
-                    unix_soft_file_descriptor_limit: Some(64),
+        for file_descriptors_per_partition in BENCHMARK_FD_PER_PARTITION_CANDIDATES {
+            cases.push(Self::new(
+                format!("fd_per_partition_{file_descriptors_per_partition}"),
+                DeltaScanPartitionTargetDiagnosticInput {
+                    unix_soft_file_descriptor_limit: Some(BENCHMARK_UNIX_SOFT_FD_LIMIT),
+                    file_descriptors_per_partition,
                     ..baseline
                 },
-            },
-            Self {
-                name: "low_available_memory",
-                input: DeltaScanPartitionTargetDiagnosticInput {
-                    available_memory_bytes: Some(1024 * MIB),
+            ));
+        }
+
+        for memory_bytes_per_partition in BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES {
+            cases.push(Self::new(
+                format!(
+                    "memory_per_partition_{}mib",
+                    memory_bytes_per_partition / MIB
+                ),
+                DeltaScanPartitionTargetDiagnosticInput {
+                    available_memory_bytes: Some(BENCHMARK_AVAILABLE_MEMORY_BYTES),
+                    available_memory_bytes_per_partition: memory_bytes_per_partition,
                     ..baseline
                 },
-            },
-            Self {
-                name: "fd_per_partition_8",
-                input: DeltaScanPartitionTargetDiagnosticInput {
-                    unix_soft_file_descriptor_limit: Some(128),
-                    file_descriptors_per_partition: 8,
-                    ..baseline
-                },
-            },
-            Self {
-                name: "memory_per_partition_128mib",
-                input: DeltaScanPartitionTargetDiagnosticInput {
-                    available_memory_bytes: Some(1024 * MIB),
-                    available_memory_bytes_per_partition: 128 * MIB,
-                    ..baseline
-                },
-            },
-        ]
+            ));
+        }
+
+        for file_descriptors_per_partition in BENCHMARK_FD_PER_PARTITION_CANDIDATES {
+            for memory_bytes_per_partition in BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES {
+                cases.push(Self::new(
+                    format!(
+                        "combined_fd_{file_descriptors_per_partition}_memory_{}mib",
+                        memory_bytes_per_partition / MIB
+                    ),
+                    DeltaScanPartitionTargetDiagnosticInput {
+                        available_memory_bytes: Some(BENCHMARK_AVAILABLE_MEMORY_BYTES),
+                        unix_soft_file_descriptor_limit: Some(BENCHMARK_UNIX_SOFT_FD_LIMIT),
+                        file_descriptors_per_partition,
+                        available_memory_bytes_per_partition: memory_bytes_per_partition,
+                        ..baseline
+                    },
+                ));
+            }
+        }
+
+        cases
+    }
+
+    fn new(name: impl Into<String>, input: DeltaScanPartitionTargetDiagnosticInput) -> Self {
+        Self {
+            name: name.into(),
+            input,
+        }
     }
 
     fn baseline_input(
@@ -679,14 +700,14 @@ impl BenchmarkPolicyCase {
     }
 
     fn derive_target(
-        self,
+        &self,
     ) -> Result<DeltaScanPartitionTargetDiagnosticOutput, delta_funnel::DeltaFunnelError> {
         derive_delta_scan_partition_target_diagnostic(self.input)
     }
 
     #[cfg(test)]
-    fn with_input(name: &'static str, input: DeltaScanPartitionTargetDiagnosticInput) -> Self {
-        Self { name, input }
+    fn with_input(name: impl Into<String>, input: DeltaScanPartitionTargetDiagnosticInput) -> Self {
+        Self::new(name, input)
     }
 }
 
@@ -1319,6 +1340,16 @@ fn boolean_column(name: &'static str) -> ColumnShape {
 mod tests {
     use super::*;
 
+    fn find_policy_case<'a>(
+        cases: &'a [BenchmarkPolicyCase],
+        name: &str,
+    ) -> Result<&'a BenchmarkPolicyCase, Box<dyn Error>> {
+        cases
+            .iter()
+            .find(|case| case.name == name)
+            .ok_or_else(|| format!("missing policy case {name}").into())
+    }
+
     #[test]
     fn synthetic_partitioned_event_log_preserves_target_scale() {
         let shape = SyntheticDeltaTableShape::partitioned_event_log();
@@ -1675,18 +1706,23 @@ mod tests {
     #[test]
     fn standard_policy_cases_cover_resource_cap_matrix() -> Result<(), Box<dyn Error>> {
         let cases = BenchmarkPolicyCase::standard_cases(Some(16));
-        let names = cases.iter().map(|case| case.name).collect::<Vec<_>>();
+        let names = cases
+            .iter()
+            .map(|case| case.name.as_str())
+            .collect::<Vec<_>>();
 
-        assert_eq!(
-            names,
-            [
-                "default_policy",
-                "low_unix_fd_limit",
-                "low_available_memory",
-                "fd_per_partition_8",
-                "memory_per_partition_128mib"
-            ]
-        );
+        assert_eq!(cases.len(), 25);
+        assert_eq!(names.first(), Some(&"default_policy"));
+        assert!(names.contains(&"fd_per_partition_4"));
+        assert!(names.contains(&"fd_per_partition_8"));
+        assert!(names.contains(&"fd_per_partition_16"));
+        assert!(names.contains(&"fd_per_partition_32"));
+        assert!(names.contains(&"memory_per_partition_64mib"));
+        assert!(names.contains(&"memory_per_partition_128mib"));
+        assert!(names.contains(&"memory_per_partition_256mib"));
+        assert!(names.contains(&"memory_per_partition_512mib"));
+        assert!(names.contains(&"combined_fd_16_memory_256mib"));
+        assert!(names.contains(&"combined_fd_32_memory_512mib"));
         assert!(
             cases
                 .iter()
@@ -1698,19 +1734,27 @@ mod tests {
                 .all(|case| case.input.datafusion_target_partitions == Some(16))
         );
 
-        let low_fd = cases[1].derive_target()?;
-        let low_memory = cases[2].derive_target()?;
-        let fd_per_partition_8 = cases[3].derive_target()?;
-        let memory_per_partition_128mib = cases[4].derive_target()?;
+        let fd_per_partition_16 =
+            find_policy_case(&cases, "fd_per_partition_16")?.derive_target()?;
+        let fd_per_partition_32 =
+            find_policy_case(&cases, "fd_per_partition_32")?.derive_target()?;
+        let memory_per_partition_256mib =
+            find_policy_case(&cases, "memory_per_partition_256mib")?.derive_target()?;
+        let memory_per_partition_512mib =
+            find_policy_case(&cases, "memory_per_partition_512mib")?.derive_target()?;
+        let combined = find_policy_case(&cases, "combined_fd_32_memory_512mib")?.derive_target()?;
 
-        assert_eq!(low_fd.target_partitions, 4);
-        assert_eq!(low_fd.unix_file_descriptor_cap, Some(4));
-        assert_eq!(low_memory.target_partitions, 4);
-        assert_eq!(low_memory.memory_cap, Some(4));
-        assert_eq!(fd_per_partition_8.target_partitions, 16);
-        assert_eq!(fd_per_partition_8.unix_file_descriptor_cap, Some(16));
-        assert_eq!(memory_per_partition_128mib.target_partitions, 8);
-        assert_eq!(memory_per_partition_128mib.memory_cap, Some(8));
+        assert_eq!(fd_per_partition_16.target_partitions, 8);
+        assert_eq!(fd_per_partition_16.unix_file_descriptor_cap, Some(8));
+        assert_eq!(fd_per_partition_32.target_partitions, 4);
+        assert_eq!(fd_per_partition_32.unix_file_descriptor_cap, Some(4));
+        assert_eq!(memory_per_partition_256mib.target_partitions, 4);
+        assert_eq!(memory_per_partition_256mib.memory_cap, Some(4));
+        assert_eq!(memory_per_partition_512mib.target_partitions, 2);
+        assert_eq!(memory_per_partition_512mib.memory_cap, Some(2));
+        assert_eq!(combined.target_partitions, 2);
+        assert_eq!(combined.unix_file_descriptor_cap, Some(4));
+        assert_eq!(combined.memory_cap, Some(2));
 
         Ok(())
     }
@@ -1787,7 +1831,8 @@ mod tests {
         let file_set = shape.generate_file_set()?;
         let simulation = SyntheticWorkSimulationProfile::s3_normal();
         let simulated_work = simulation.simulate_file_set(&file_set)?;
-        let case = BenchmarkPolicyCase::standard_cases(Some(16))[0];
+        let cases = BenchmarkPolicyCase::standard_cases(Some(16));
+        let case = &cases[0];
         let decision = case.derive_target()?;
         let partitioned_work =
             simulated_work.partition_by_estimated_bytes(&file_set, decision.target_partitions)?;
