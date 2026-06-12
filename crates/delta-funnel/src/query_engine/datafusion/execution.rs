@@ -128,7 +128,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        not_impl_err!("Delta scan read execution is owned by #17 and #4")
+        not_impl_err!("Delta scan partition planning is complete; read execution is owned by #4")
     }
 }
 
@@ -183,7 +183,7 @@ mod tests {
             result,
             Err(error) if error
                 .to_string()
-                .contains("Delta scan read execution is owned by #17 and #4")
+                .contains("Delta scan partition planning is complete; read execution is owned by #4")
         ));
 
         Ok(())
@@ -222,7 +222,7 @@ mod tests {
             result,
             Err(error) if error
                 .to_string()
-                .contains("Delta scan read execution is owned by #17 and #4")
+                .contains("Delta scan partition planning is complete; read execution is owned by #4")
         ));
 
         Ok(())
@@ -274,7 +274,7 @@ mod tests {
             result,
             Err(error) if error
                 .to_string()
-                .contains("Delta scan read execution is owned by #17 and #4")
+                .contains("Delta scan partition planning is complete; read execution is owned by #4")
         ));
 
         Ok(())
