@@ -8,6 +8,7 @@ mod execution;
 mod file_task;
 mod file_task_partition;
 mod filters;
+mod partition_target;
 mod projection;
 mod provider;
 mod registration;
