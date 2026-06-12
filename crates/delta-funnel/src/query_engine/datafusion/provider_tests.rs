@@ -505,7 +505,7 @@ async fn table_provider_scan_without_projection_returns_full_non_reading_plan()
 }
 
 #[tokio::test]
-async fn table_provider_scan_uses_session_target_partitions_for_file_task_grouping()
+async fn table_provider_scan_records_session_target_but_uses_auto_file_task_grouping()
 -> Result<(), Box<dyn std::error::Error>> {
     let table = DeltaLogTable::new_with_schema_and_sized_adds(
         "table-provider-target-partitions",
@@ -534,22 +534,36 @@ async fn table_provider_scan_uses_session_target_partitions_for_file_task_groupi
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
-    assert_eq!(plan.properties().output_partitioning().partition_count(), 2);
-    assert_eq!(delta_plan.partition_target_decision().target_partitions, 2);
+    let decision = delta_plan.partition_target_decision();
+    assert_eq!(decision.datafusion_target_partitions, Some(2));
+    assert!(matches!(
+        decision.source,
+        DeltaScanPartitionTargetSource::AvailableParallelismFallback
+            | DeltaScanPartitionTargetSource::StaticFallback
+    ));
     assert_eq!(
-        delta_plan.partition_target_decision().source,
-        DeltaScanPartitionTargetSource::DataFusionConfig
+        plan.properties().output_partitioning().partition_count(),
+        delta_plan.partition_plan().partitions.len()
     );
-    assert_eq!(delta_plan.partition_plan().partitions.len(), 2);
+    assert!(!delta_plan.partition_plan().partitions.is_empty());
+    assert!(
+        delta_plan
+            .partition_plan()
+            .partitions
+            .iter()
+            .all(|partition| !partition.file_tasks.is_empty())
+    );
+    let file_paths = scan_partition_file_paths(delta_plan)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     assert_eq!(
-        scan_partition_file_paths(delta_plan),
+        file_paths,
         vec![
-            vec!["part-00000.parquet".to_owned()],
-            vec![
-                "part-00001.parquet".to_owned(),
-                "part-00002.parquet".to_owned(),
-                "part-00003.parquet".to_owned()
-            ],
+            "part-00000.parquet".to_owned(),
+            "part-00001.parquet".to_owned(),
+            "part-00002.parquet".to_owned(),
+            "part-00003.parquet".to_owned(),
         ]
     );
     assert_eq!(delta_plan.partition_plan().estimated_bytes, Some(120));
@@ -673,11 +687,13 @@ async fn table_provider_scan_exec_carries_direct_partition_execution_handoff()
     assert_eq!(partition_plan.table_uri, scan_plan.table_uri);
     assert_eq!(partition_plan.snapshot_version, scan_plan.snapshot_version);
     assert!(partition_plan.scan_metadata_exhausted);
-    assert_eq!(delta_plan.partition_target_decision().target_partitions, 2);
-    assert_eq!(
-        delta_plan.partition_target_decision().source,
-        DeltaScanPartitionTargetSource::DataFusionConfig
-    );
+    let decision = delta_plan.partition_target_decision();
+    assert_eq!(decision.datafusion_target_partitions, Some(2));
+    assert!(matches!(
+        decision.source,
+        DeltaScanPartitionTargetSource::AvailableParallelismFallback
+            | DeltaScanPartitionTargetSource::StaticFallback
+    ));
     assert_eq!(partition_plan.partitions.len(), 2);
     assert_eq!(partition_plan.estimated_bytes, Some(96));
 

@@ -1,9 +1,9 @@
 //! Default target derivation for Delta scan file task partitions.
 //!
-//! The policy is intentionally conservative and CPU-oriented. Stable execution
-//! configuration wins first, and machine-derived parallelism is only a bounded
-//! fallback so large machines do not create explosive partition counts by
-//! default. Unit tests inject machine context instead of reading host state.
+//! The policy is intentionally conservative and CPU-oriented. Explicit
+//! DeltaFunnel configuration wins first, and machine-derived parallelism is
+//! reduced by cheap OS resource hints when those hints are available. Unit tests
+//! inject machine context instead of reading host state.
 
 use crate::{DeltaFunnelError, error::DeltaScanFileTaskPartitionPlanningSnafu};
 
@@ -12,8 +12,7 @@ use super::execution_environment::{
 };
 use super::file_task_partition::DeltaScanFileTaskPartitionOptions;
 
-const DEFAULT_MIN_PARTITIONS: usize = 4;
-const DEFAULT_MAX_PARTITIONS: usize = 64;
+const DEFAULT_MIN_PARTITIONS: usize = 1;
 const DEFAULT_PARALLELISM_MULTIPLIER: usize = 1;
 // Conservative pre-benchmark guards used to keep fallback partition counts from
 // over-consuming per-partition OS resources. Issue #128's benchmark matrix is
@@ -52,9 +51,7 @@ pub(crate) struct DeltaScanPartitionTargetConfig {
 pub(crate) struct DeltaScanPartitionTargetPolicy {
     /// Lower bound for machine-derived fallback targets.
     pub(crate) min_default_partitions: usize,
-    /// Upper bound for machine-derived fallback targets.
-    pub(crate) max_default_partitions: usize,
-    /// Multiplier applied to available parallelism before clamping.
+    /// Multiplier applied to available parallelism before resource caps.
     pub(crate) parallelism_multiplier: usize,
     /// File descriptors reserved per fallback scan partition on Unix platforms.
     ///
@@ -74,8 +71,6 @@ pub(crate) struct DeltaScanPartitionTargetPolicy {
 pub(crate) enum DeltaScanPartitionTargetSource {
     /// User-provided DeltaFunnel override selected the target.
     ExplicitOverride,
-    /// DataFusion execution configuration selected the target.
-    DataFusionConfig,
     /// Bounded host parallelism fallback selected the target.
     AvailableParallelismFallback,
     /// Static fallback selected the target because host parallelism was unavailable.
@@ -92,7 +87,7 @@ pub(crate) struct DeltaScanPartitionTargetDecision {
     pub(crate) source: DeltaScanPartitionTargetSource,
     /// Original user override input.
     pub(crate) explicit_target_partitions: Option<usize>,
-    /// Original DataFusion execution target input.
+    /// Original DataFusion execution target input, retained for diagnostics.
     pub(crate) datafusion_target_partitions: Option<usize>,
     /// Execution environment profile used by this decision.
     pub(crate) environment_profile: DeltaExecutionEnvironmentProfile,
@@ -106,6 +101,8 @@ pub(crate) struct DeltaScanPartitionTargetDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct DeltaScanPartitionTargetAppliedCaps {
+    /// Cap derived from DataFusion execution target partitions.
+    pub(crate) datafusion_target_partitions: Option<usize>,
     /// Cap derived from Unix file descriptor limits.
     pub(crate) unix_file_descriptor_limit: Option<usize>,
     /// Cap derived from available memory hints.
@@ -116,7 +113,6 @@ impl Default for DeltaScanPartitionTargetPolicy {
     fn default() -> Self {
         Self {
             min_default_partitions: DEFAULT_MIN_PARTITIONS,
-            max_default_partitions: DEFAULT_MAX_PARTITIONS,
             parallelism_multiplier: DEFAULT_PARALLELISM_MULTIPLIER,
             file_descriptors_per_partition: DEFAULT_FILE_DESCRIPTORS_PER_PARTITION,
             available_memory_bytes_per_partition: DEFAULT_AVAILABLE_MEMORY_BYTES_PER_PARTITION,
@@ -125,7 +121,11 @@ impl Default for DeltaScanPartitionTargetPolicy {
 }
 
 impl DeltaScanPartitionTargetConfig {
-    /// Builds config from DataFusion execution state and local host parallelism.
+    /// Builds config from DataFusion execution state and local host signals.
+    ///
+    /// DataFusion always exposes a non-null target partition value. The scan
+    /// target policy records that value for diagnostics, but does not treat the
+    /// DataFusion default as an explicit DeltaFunnel override.
     #[allow(dead_code)]
     pub(crate) fn from_datafusion_target(datafusion_target_partitions: usize) -> Self {
         Self {
@@ -157,11 +157,6 @@ impl DeltaScanPartitionTargetPolicy {
 
         if let Some(target_partitions) = config.datafusion_target_partitions {
             self.validate_target(context, "DataFusion target_partitions", target_partitions)?;
-            return Ok(self.decision(
-                DeltaScanPartitionTargetSource::DataFusionConfig,
-                target_partitions,
-                config,
-            ));
         }
 
         let (source, target_partitions, applied_caps) =
@@ -170,7 +165,7 @@ impl DeltaScanPartitionTargetPolicy {
                     self.validate_target(context, "available_parallelism", available_parallelism)?;
                     let multiplied = available_parallelism
                         .saturating_mul(self.parallelism_multiplier)
-                        .clamp(self.min_default_partitions, self.max_default_partitions);
+                        .max(self.min_default_partitions);
                     let (capped, applied_caps) = self.apply_fallback_caps(multiplied, config);
 
                     (
@@ -201,12 +196,6 @@ impl DeltaScanPartitionTargetPolicy {
             return target_planning_error(
                 context,
                 "min_default_partitions must be greater than zero",
-            );
-        }
-        if self.max_default_partitions < self.min_default_partitions {
-            return target_planning_error(
-                context,
-                "max_default_partitions must be greater than or equal to min_default_partitions",
             );
         }
         if self.parallelism_multiplier == 0 {
@@ -260,6 +249,7 @@ impl DeltaScanPartitionTargetPolicy {
             datafusion_target_partitions: config.datafusion_target_partitions,
             environment_profile: config.environment_profile,
             applied_caps: DeltaScanPartitionTargetAppliedCaps {
+                datafusion_target_partitions: None,
                 unix_file_descriptor_limit: None,
                 memory_hint: None,
             },
@@ -290,10 +280,14 @@ impl DeltaScanPartitionTargetPolicy {
         target_partitions: usize,
         config: DeltaScanPartitionTargetConfig,
     ) -> (usize, DeltaScanPartitionTargetAppliedCaps) {
+        let datafusion_target_partitions = config.datafusion_target_partitions;
         let unix_file_descriptor_limit = self.unix_file_descriptor_cap(config);
         let memory_hint = self.memory_cap(config.environment_profile.memory_hint);
         let mut capped_target = target_partitions;
 
+        if let Some(cap) = datafusion_target_partitions {
+            capped_target = capped_target.min(cap);
+        }
         if let Some(cap) = unix_file_descriptor_limit {
             capped_target = capped_target.min(cap);
         }
@@ -304,6 +298,7 @@ impl DeltaScanPartitionTargetPolicy {
         (
             capped_target.max(1),
             DeltaScanPartitionTargetAppliedCaps {
+                datafusion_target_partitions,
                 unix_file_descriptor_limit,
                 memory_hint,
             },
@@ -395,8 +390,7 @@ mod tests {
 
     fn test_policy() -> DeltaScanPartitionTargetPolicy {
         DeltaScanPartitionTargetPolicy {
-            min_default_partitions: 4,
-            max_default_partitions: 64,
+            min_default_partitions: 1,
             parallelism_multiplier: 1,
             file_descriptors_per_partition: 16,
             available_memory_bytes_per_partition: 256 * 1024 * 1024,
@@ -420,6 +414,7 @@ mod tests {
         assert_eq!(
             decision.applied_caps,
             DeltaScanPartitionTargetAppliedCaps {
+                datafusion_target_partitions: None,
                 unix_file_descriptor_limit: None,
                 memory_hint: None,
             }
@@ -447,15 +442,17 @@ mod tests {
     }
 
     #[test]
-    fn datafusion_target_wins_when_no_explicit_override() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let decision = test_policy().derive_target(context(), config(None, Some(8), Some(4)))?;
+    fn datafusion_target_caps_fallback_when_no_explicit_override()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let decision = test_policy().derive_target(context(), config(None, Some(8), Some(16)))?;
 
         assert_eq!(decision.target_partitions, 8);
         assert_eq!(
             decision.source,
-            DeltaScanPartitionTargetSource::DataFusionConfig
+            DeltaScanPartitionTargetSource::AvailableParallelismFallback
         );
+        assert_eq!(decision.datafusion_target_partitions, Some(8));
+        assert_eq!(decision.applied_caps.datafusion_target_partitions, Some(8));
 
         Ok(())
     }
@@ -478,17 +475,28 @@ mod tests {
     }
 
     #[test]
-    fn available_parallelism_fallback_is_clamped_by_policy_bounds()
+    fn datafusion_target_cap_does_not_raise_lower_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let decision = test_policy().derive_target(context(), config(None, Some(8), Some(4)))?;
+
+        assert_eq!(decision.target_partitions, 4);
+        assert_eq!(decision.applied_caps.datafusion_target_partitions, Some(8));
+
+        Ok(())
+    }
+
+    #[test]
+    fn available_parallelism_fallback_uses_parallelism_without_fixed_upper_bound()
     -> Result<(), Box<dyn std::error::Error>> {
         let low = test_policy().derive_target(context(), config(None, None, Some(1)))?;
         let high = test_policy().derive_target(context(), config(None, None, Some(512)))?;
 
-        assert_eq!(low.target_partitions, 4);
+        assert_eq!(low.target_partitions, 1);
         assert_eq!(
             low.source,
             DeltaScanPartitionTargetSource::AvailableParallelismFallback
         );
-        assert_eq!(high.target_partitions, 64);
+        assert_eq!(high.target_partitions, 512);
         assert_eq!(
             high.source,
             DeltaScanPartitionTargetSource::AvailableParallelismFallback
@@ -501,8 +509,7 @@ mod tests {
     fn available_parallelism_fallback_applies_policy_multiplier()
     -> Result<(), Box<dyn std::error::Error>> {
         let policy = DeltaScanPartitionTargetPolicy {
-            min_default_partitions: 4,
-            max_default_partitions: 64,
+            min_default_partitions: 1,
             parallelism_multiplier: 2,
             file_descriptors_per_partition: 16,
             available_memory_bytes_per_partition: 256 * 1024 * 1024,
@@ -537,6 +544,7 @@ mod tests {
         let decision = test_policy().derive_target(context(), config)?;
 
         assert_eq!(decision.target_partitions, 4);
+        assert_eq!(decision.applied_caps.datafusion_target_partitions, None);
         assert_eq!(decision.applied_caps.unix_file_descriptor_limit, Some(4));
         assert_eq!(decision.applied_caps.memory_hint, None);
 
@@ -561,6 +569,7 @@ mod tests {
         let decision = test_policy().derive_target(context(), config)?;
 
         assert_eq!(decision.target_partitions, 2);
+        assert_eq!(decision.applied_caps.datafusion_target_partitions, None);
         assert_eq!(decision.applied_caps.unix_file_descriptor_limit, None);
         assert_eq!(decision.applied_caps.memory_hint, Some(2));
 
@@ -593,6 +602,7 @@ mod tests {
             DeltaScanPartitionTargetSource::ExplicitOverride
         );
         assert_eq!(decision.applied_caps.unix_file_descriptor_limit, None);
+        assert_eq!(decision.applied_caps.datafusion_target_partitions, None);
         assert_eq!(decision.applied_caps.memory_hint, None);
 
         Ok(())
@@ -603,7 +613,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let decision = test_policy().derive_target(context(), config(None, None, None))?;
 
-        assert_eq!(decision.target_partitions, 4);
+        assert_eq!(decision.target_partitions, 1);
         assert_eq!(
             decision.source,
             DeltaScanPartitionTargetSource::StaticFallback
@@ -617,7 +627,6 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let policy = DeltaScanPartitionTargetPolicy {
             min_default_partitions: 0,
-            max_default_partitions: 64,
             parallelism_multiplier: 1,
             file_descriptors_per_partition: 16,
             available_memory_bytes_per_partition: 256 * 1024 * 1024,
