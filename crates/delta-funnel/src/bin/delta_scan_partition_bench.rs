@@ -10,7 +10,7 @@ use delta_funnel::{
 };
 
 const MIB: u64 = 1024 * 1024;
-const BENCHMARK_CSV_HEADER: [&str; 29] = [
+const BENCHMARK_CSV_HEADER: [&str; 36] = [
     "shape_name",
     "total_rows",
     "active_files",
@@ -34,8 +34,15 @@ const BENCHMARK_CSV_HEADER: [&str; 29] = [
     "policy_case",
     "policy_available_parallelism",
     "policy_datafusion_target",
+    "policy_available_memory_bytes",
+    "policy_unix_soft_fd_limit",
+    "policy_fd_per_partition",
+    "policy_memory_bytes_per_partition",
     "policy_target",
     "policy_source",
+    "policy_datafusion_cap",
+    "policy_unix_fd_cap",
+    "policy_memory_cap",
     "simulated_serial_micros",
     "simulated_max_file_micros",
     "simulated_output_partitions",
@@ -45,65 +52,34 @@ const BENCHMARK_CSV_HEADER: [&str; 29] = [
 fn main() -> Result<(), Box<dyn Error>> {
     let shape = SyntheticDeltaTableShape::partitioned_event_log();
     let file_set = shape.generate_file_set()?;
-    let simulation = SyntheticWorkSimulationProfile::s3_normal();
-    let simulation_profile_count = SyntheticWorkSimulationProfile::standard_profiles().len();
-    let simulated_work = simulation.simulate_file_set(&file_set)?;
-    let policy_case = BenchmarkPolicyCase::default_policy_from_local_parallelism();
-    let policy_decision = policy_case.derive_target()?;
-    let partitioned_work = simulated_work
-        .partition_by_estimated_bytes(&file_set, policy_decision.target_partitions)?;
+    let simulation_profiles = SyntheticWorkSimulationProfile::standard_profiles();
+    let policy_cases = BenchmarkPolicyCase::standard_cases(local_available_parallelism());
 
     println!("{}", BENCHMARK_CSV_HEADER.join(","));
-    println!(
-        "{}",
-        [
-            shape.name.to_owned(),
-            shape.total_rows.to_string(),
-            shape.active_file_count.to_string(),
-            shape.active_data_size_bytes.to_string(),
-            shape.active_data_size_mib().to_string(),
-            shape.average_file_size_bytes().to_string(),
-            shape.partitioning.partition_count.to_string(),
-            file_set.files.len().to_string(),
-            file_set.total_rows().to_string(),
-            file_set.total_bytes().to_string(),
-            file_set.max_files_per_partition().to_string(),
-            shape.source_split_rows().to_string(),
-            shape
-                .schema
-                .type_count(SyntheticDataType::String)
-                .to_string(),
-            shape.schema.type_count(SyntheticDataType::Int).to_string(),
-            shape
-                .schema
-                .type_count(SyntheticDataType::Double)
-                .to_string(),
-            shape
-                .schema
-                .type_count(SyntheticDataType::Bigint)
-                .to_string(),
-            shape
-                .schema
-                .type_count(SyntheticDataType::Timestamp)
-                .to_string(),
-            shape
-                .schema
-                .type_count(SyntheticDataType::Boolean)
-                .to_string(),
-            simulation_profile_count.to_string(),
-            simulation.name.to_owned(),
-            policy_case.name.to_owned(),
-            optional_usize(policy_case.input.available_parallelism),
-            optional_usize(policy_case.input.datafusion_target_partitions),
-            policy_decision.target_partitions.to_string(),
-            policy_source_name(policy_decision.source).to_owned(),
-            simulated_work.serial_micros.to_string(),
-            simulated_work.max_file_micros.to_string(),
-            partitioned_work.partitions.len().to_string(),
-            partitioned_work.wall_micros.to_string(),
-        ]
-        .join(",")
-    );
+    for simulation in simulation_profiles {
+        let simulated_work = simulation.simulate_file_set(&file_set)?;
+
+        for policy_case in &policy_cases {
+            let policy_decision = policy_case.derive_target()?;
+            let partitioned_work = simulated_work
+                .partition_by_estimated_bytes(&file_set, policy_decision.target_partitions)?;
+
+            println!(
+                "{}",
+                benchmark_csv_row(BenchmarkCsvRowInput {
+                    shape: &shape,
+                    file_set: &file_set,
+                    simulation_profile_count: simulation_profiles.len(),
+                    simulation,
+                    policy_case: *policy_case,
+                    policy_decision,
+                    simulated_work: &simulated_work,
+                    partitioned_work: &partitioned_work,
+                })
+                .join(",")
+            );
+        }
+    }
 
     Ok(())
 }
@@ -151,6 +127,18 @@ struct SyntheticFile {
 struct BenchmarkPolicyCase {
     name: &'static str,
     input: DeltaScanPartitionTargetDiagnosticInput,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BenchmarkCsvRowInput<'a> {
+    shape: &'a SyntheticDeltaTableShape,
+    file_set: &'a SyntheticFileSet,
+    simulation_profile_count: usize,
+    simulation: SyntheticWorkSimulationProfile,
+    policy_case: BenchmarkPolicyCase,
+    policy_decision: DeltaScanPartitionTargetDiagnosticOutput,
+    simulated_work: &'a SyntheticWorkSimulationResult,
+    partitioned_work: &'a SyntheticPartitionedWorkPlan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,16 +627,54 @@ impl SyntheticFileSet {
 }
 
 impl BenchmarkPolicyCase {
-    fn default_policy_from_local_parallelism() -> Self {
-        let available_parallelism = local_available_parallelism();
+    fn standard_cases(available_parallelism: Option<usize>) -> Vec<Self> {
+        let baseline = Self::baseline_input(available_parallelism);
 
-        Self {
-            name: "default_policy_local_parallelism",
-            input: DeltaScanPartitionTargetDiagnosticInput {
-                available_parallelism,
-                datafusion_target_partitions: available_parallelism,
-                ..DeltaScanPartitionTargetDiagnosticInput::default()
+        vec![
+            Self {
+                name: "default_policy",
+                input: baseline,
             },
+            Self {
+                name: "low_unix_fd_limit",
+                input: DeltaScanPartitionTargetDiagnosticInput {
+                    unix_soft_file_descriptor_limit: Some(64),
+                    ..baseline
+                },
+            },
+            Self {
+                name: "low_available_memory",
+                input: DeltaScanPartitionTargetDiagnosticInput {
+                    available_memory_bytes: Some(1024 * MIB),
+                    ..baseline
+                },
+            },
+            Self {
+                name: "fd_per_partition_8",
+                input: DeltaScanPartitionTargetDiagnosticInput {
+                    unix_soft_file_descriptor_limit: Some(128),
+                    file_descriptors_per_partition: 8,
+                    ..baseline
+                },
+            },
+            Self {
+                name: "memory_per_partition_128mib",
+                input: DeltaScanPartitionTargetDiagnosticInput {
+                    available_memory_bytes: Some(1024 * MIB),
+                    available_memory_bytes_per_partition: 128 * MIB,
+                    ..baseline
+                },
+            },
+        ]
+    }
+
+    fn baseline_input(
+        available_parallelism: Option<usize>,
+    ) -> DeltaScanPartitionTargetDiagnosticInput {
+        DeltaScanPartitionTargetDiagnosticInput {
+            available_parallelism,
+            datafusion_target_partitions: available_parallelism,
+            ..DeltaScanPartitionTargetDiagnosticInput::default()
         }
     }
 
@@ -1152,7 +1178,75 @@ fn local_available_parallelism() -> Option<usize> {
         .map(std::num::NonZeroUsize::get)
 }
 
+fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
+    let shape = input.shape;
+    let file_set = input.file_set;
+    let policy_case = input.policy_case;
+    let policy_decision = input.policy_decision;
+
+    vec![
+        shape.name.to_owned(),
+        shape.total_rows.to_string(),
+        shape.active_file_count.to_string(),
+        shape.active_data_size_bytes.to_string(),
+        shape.active_data_size_mib().to_string(),
+        shape.average_file_size_bytes().to_string(),
+        shape.partitioning.partition_count.to_string(),
+        file_set.files.len().to_string(),
+        file_set.total_rows().to_string(),
+        file_set.total_bytes().to_string(),
+        file_set.max_files_per_partition().to_string(),
+        shape.source_split_rows().to_string(),
+        shape
+            .schema
+            .type_count(SyntheticDataType::String)
+            .to_string(),
+        shape.schema.type_count(SyntheticDataType::Int).to_string(),
+        shape
+            .schema
+            .type_count(SyntheticDataType::Double)
+            .to_string(),
+        shape
+            .schema
+            .type_count(SyntheticDataType::Bigint)
+            .to_string(),
+        shape
+            .schema
+            .type_count(SyntheticDataType::Timestamp)
+            .to_string(),
+        shape
+            .schema
+            .type_count(SyntheticDataType::Boolean)
+            .to_string(),
+        input.simulation_profile_count.to_string(),
+        input.simulation.name.to_owned(),
+        policy_case.name.to_owned(),
+        optional_usize(policy_case.input.available_parallelism),
+        optional_usize(policy_case.input.datafusion_target_partitions),
+        optional_u64(policy_case.input.available_memory_bytes),
+        optional_u64(policy_case.input.unix_soft_file_descriptor_limit),
+        policy_case.input.file_descriptors_per_partition.to_string(),
+        policy_case
+            .input
+            .available_memory_bytes_per_partition
+            .to_string(),
+        policy_decision.target_partitions.to_string(),
+        policy_source_name(policy_decision.source).to_owned(),
+        optional_usize(policy_decision.datafusion_target_cap),
+        optional_usize(policy_decision.unix_file_descriptor_cap),
+        optional_usize(policy_decision.memory_cap),
+        input.simulated_work.serial_micros.to_string(),
+        input.simulated_work.max_file_micros.to_string(),
+        input.partitioned_work.partitions.len().to_string(),
+        input.partitioned_work.wall_micros.to_string(),
+    ]
+}
+
 fn optional_usize(value: Option<usize>) -> String {
+    value.map_or_else(String::new, |value| value.to_string())
+}
+
+fn optional_u64(value: Option<u64>) -> String {
     value.map_or_else(String::new, |value| value.to_string())
 }
 
@@ -1562,19 +1656,61 @@ mod tests {
     #[test]
     fn policy_case_derives_target_with_production_diagnostic_policy() -> Result<(), Box<dyn Error>>
     {
-        let case = BenchmarkPolicyCase::with_input(
-            "test_policy",
+        let case = BenchmarkPolicyCase::with_input("test_policy", {
             DeltaScanPartitionTargetDiagnosticInput {
                 available_parallelism: Some(64),
                 datafusion_target_partitions: Some(16),
                 ..DeltaScanPartitionTargetDiagnosticInput::default()
-            },
-        );
+            }
+        });
         let decision = case.derive_target()?;
 
         assert_eq!(decision.target_partitions, 16);
         assert_eq!(decision.available_parallelism, Some(64));
         assert_eq!(decision.datafusion_target_cap, Some(16));
+
+        Ok(())
+    }
+
+    #[test]
+    fn standard_policy_cases_cover_resource_cap_matrix() -> Result<(), Box<dyn Error>> {
+        let cases = BenchmarkPolicyCase::standard_cases(Some(16));
+        let names = cases.iter().map(|case| case.name).collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                "default_policy",
+                "low_unix_fd_limit",
+                "low_available_memory",
+                "fd_per_partition_8",
+                "memory_per_partition_128mib"
+            ]
+        );
+        assert!(
+            cases
+                .iter()
+                .all(|case| case.input.available_parallelism == Some(16))
+        );
+        assert!(
+            cases
+                .iter()
+                .all(|case| case.input.datafusion_target_partitions == Some(16))
+        );
+
+        let low_fd = cases[1].derive_target()?;
+        let low_memory = cases[2].derive_target()?;
+        let fd_per_partition_8 = cases[3].derive_target()?;
+        let memory_per_partition_128mib = cases[4].derive_target()?;
+
+        assert_eq!(low_fd.target_partitions, 4);
+        assert_eq!(low_fd.unix_file_descriptor_cap, Some(4));
+        assert_eq!(low_memory.target_partitions, 4);
+        assert_eq!(low_memory.memory_cap, Some(4));
+        assert_eq!(fd_per_partition_8.target_partitions, 16);
+        assert_eq!(fd_per_partition_8.unix_file_descriptor_cap, Some(16));
+        assert_eq!(memory_per_partition_128mib.target_partitions, 8);
+        assert_eq!(memory_per_partition_128mib.memory_cap, Some(8));
 
         Ok(())
     }
@@ -1610,6 +1746,12 @@ mod tests {
     }
 
     #[test]
+    fn optional_u64_renders_csv_fields() {
+        assert_eq!(optional_u64(None), "");
+        assert_eq!(optional_u64(Some(1024)), "1024");
+    }
+
+    #[test]
     fn policy_source_name_renders_csv_fields() {
         assert_eq!(
             policy_source_name(DeltaScanPartitionTargetDiagnosticSource::ExplicitOverride),
@@ -1629,11 +1771,42 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 29);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 36);
         assert_eq!(BENCHMARK_CSV_HEADER[20], "policy_case");
         assert_eq!(BENCHMARK_CSV_HEADER[21], "policy_available_parallelism");
         assert_eq!(BENCHMARK_CSV_HEADER[22], "policy_datafusion_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[23], "policy_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[24], "policy_source");
+        assert_eq!(BENCHMARK_CSV_HEADER[23], "policy_available_memory_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[24], "policy_unix_soft_fd_limit");
+        assert_eq!(BENCHMARK_CSV_HEADER[27], "policy_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[28], "policy_source");
+    }
+
+    #[test]
+    fn benchmark_csv_row_matches_header_width() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+        let simulation = SyntheticWorkSimulationProfile::s3_normal();
+        let simulated_work = simulation.simulate_file_set(&file_set)?;
+        let case = BenchmarkPolicyCase::standard_cases(Some(16))[0];
+        let decision = case.derive_target()?;
+        let partitioned_work =
+            simulated_work.partition_by_estimated_bytes(&file_set, decision.target_partitions)?;
+        let row = benchmark_csv_row(BenchmarkCsvRowInput {
+            shape: &shape,
+            file_set: &file_set,
+            simulation_profile_count: SyntheticWorkSimulationProfile::standard_profiles().len(),
+            simulation,
+            policy_case: case,
+            policy_decision: decision,
+            simulated_work: &simulated_work,
+            partitioned_work: &partitioned_work,
+        });
+
+        assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
+        assert_eq!(row[20], "default_policy");
+        assert_eq!(row[27], "16");
+        assert_eq!(row[28], "available_parallelism_fallback");
+
+        Ok(())
     }
 }
