@@ -1,15 +1,21 @@
 //! Portable synthetic Delta scan partition benchmark runner.
 
+use std::error::Error;
+use std::fmt;
+
+use chrono::{Datelike, Days, NaiveDate};
+
 const MIB: u64 = 1024 * 1024;
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     let shape = SyntheticDeltaTableShape::partitioned_event_log();
+    let file_set = shape.generate_file_set()?;
 
     println!(
-        "shape_name,total_rows,active_files,active_bytes,active_mib,avg_file_size_bytes,partition_count,source_rows,string_columns,int_columns,double_columns,bigint_columns,timestamp_columns,boolean_columns"
+        "shape_name,total_rows,active_files,active_bytes,active_mib,avg_file_size_bytes,partition_count,generated_files,generated_rows,generated_bytes,max_files_per_partition,source_rows,string_columns,int_columns,double_columns,bigint_columns,timestamp_columns,boolean_columns"
     );
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         shape.name,
         shape.total_rows,
         shape.active_file_count,
@@ -17,6 +23,10 @@ fn main() {
         shape.active_data_size_mib(),
         shape.average_file_size_bytes(),
         shape.partitioning.partition_count,
+        file_set.files.len(),
+        file_set.total_rows(),
+        file_set.total_bytes(),
+        file_set.max_files_per_partition(),
         shape.source_split_rows(),
         shape.schema.type_count(SyntheticDataType::String),
         shape.schema.type_count(SyntheticDataType::Int),
@@ -25,6 +35,8 @@ fn main() {
         shape.schema.type_count(SyntheticDataType::Timestamp),
         shape.schema.type_count(SyntheticDataType::Boolean)
     );
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +53,29 @@ struct SyntheticDeltaTableShape {
     row_distribution: RowDistributionShape,
     null_patterns: Vec<NullPattern>,
     cardinalities: Vec<CardinalityHint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntheticFileSet {
+    partitions: Vec<SyntheticPartition>,
+    files: Vec<SyntheticFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntheticPartition {
+    date: SyntheticDate,
+    rows: u64,
+    size_bytes: u64,
+    file_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntheticFile {
+    path: String,
+    partition_date: SyntheticDate,
+    file_index_in_partition: usize,
+    rows: u64,
+    size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,11 +96,16 @@ struct PartitioningShape {
     max_files_per_partition: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SyntheticDate {
     year: i32,
     month: u8,
     day: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntheticGenerationError {
+    message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +335,155 @@ impl SyntheticDeltaTableShape {
         }
     }
 
+    fn generate_file_set(&self) -> Result<SyntheticFileSet, SyntheticGenerationError> {
+        let partition_dates = self.generate_partition_dates()?;
+        let partition_rows = self.partition_rows(&partition_dates);
+        let partition_bytes = apportion_by_weights(self.active_data_size_bytes, &partition_rows)?;
+        let file_counts = self.file_counts_per_partition(partition_dates.len())?;
+
+        let mut partitions = Vec::with_capacity(partition_dates.len());
+        let mut files = Vec::with_capacity(self.active_file_count);
+
+        for (partition_index, date) in partition_dates.into_iter().enumerate() {
+            let rows = partition_rows[partition_index];
+            let size_bytes = partition_bytes[partition_index];
+            let file_count = file_counts[partition_index];
+            partitions.push(SyntheticPartition {
+                date,
+                rows,
+                size_bytes,
+                file_count,
+            });
+
+            let file_rows = split_evenly(rows, file_count);
+            let file_bytes = split_evenly(size_bytes, file_count);
+            for file_index in 0..file_count {
+                files.push(SyntheticFile {
+                    path: synthetic_file_path(date, file_index),
+                    partition_date: date,
+                    file_index_in_partition: file_index,
+                    rows: file_rows[file_index],
+                    size_bytes: file_bytes[file_index],
+                });
+            }
+        }
+
+        Ok(SyntheticFileSet { partitions, files })
+    }
+
+    fn generate_partition_dates(&self) -> Result<Vec<SyntheticDate>, SyntheticGenerationError> {
+        let year_counts = [
+            (2023, 235_usize),
+            (2024, 285_usize),
+            (2025, 285_usize),
+            (2026, 128_usize),
+        ];
+        let mut dates = Vec::with_capacity(self.partitioning.partition_count);
+
+        for (year, count) in year_counts {
+            let start = if year == self.partitioning.start_date.year {
+                self.partitioning.start_date
+            } else {
+                SyntheticDate {
+                    year,
+                    month: 1,
+                    day: 1,
+                }
+            };
+            let end = if year == self.partitioning.end_date.year {
+                self.partitioning.end_date
+            } else {
+                SyntheticDate {
+                    year,
+                    month: 12,
+                    day: 31,
+                }
+            };
+            let required_start =
+                (year == self.partitioning.start_date.year).then_some(self.partitioning.start_date);
+            let required_end =
+                (year == self.partitioning.end_date.year).then_some(self.partitioning.end_date);
+
+            dates.extend(select_active_dates_for_year(
+                start,
+                end,
+                count,
+                required_start,
+                required_end,
+            )?);
+        }
+
+        dates.sort();
+        if dates.len() != self.partitioning.partition_count {
+            return Err(generation_error(format!(
+                "generated {} partitions, expected {}",
+                dates.len(),
+                self.partitioning.partition_count
+            )));
+        }
+
+        Ok(dates)
+    }
+
+    fn partition_rows(&self, partition_dates: &[SyntheticDate]) -> Vec<u64> {
+        let year_rows = [
+            (2023, 2_660_000_u64),
+            (2024, 3_890_000_u64),
+            (2025, 3_890_000_u64),
+            (2026, self.total_rows - 2_660_000 - 3_890_000 - 3_890_000),
+        ];
+        let mut rows = Vec::with_capacity(partition_dates.len());
+
+        for (year, total_rows) in year_rows {
+            let count = partition_dates
+                .iter()
+                .filter(|date| date.year == year)
+                .count();
+            rows.extend(split_evenly(total_rows, count));
+        }
+
+        rows
+    }
+
+    fn file_counts_per_partition(
+        &self,
+        partition_count: usize,
+    ) -> Result<Vec<usize>, SyntheticGenerationError> {
+        if self.active_file_count < partition_count {
+            return Err(generation_error(
+                "active file count must be at least partition count for this shape",
+            ));
+        }
+        if self.active_file_count > partition_count * self.partitioning.max_files_per_partition {
+            return Err(generation_error(
+                "active file count exceeds max files per partition for this shape",
+            ));
+        }
+        let mut file_counts = vec![1; partition_count];
+        let mut remaining_extra_files = self.active_file_count - partition_count;
+
+        for (seed_index, extra_files) in [(37_usize, 4_usize), (181, 2), (421, 2), (677, 2)] {
+            let index = seed_index % partition_count;
+            let capacity = self.partitioning.max_files_per_partition - file_counts[index];
+            let assigned = capacity.min(extra_files).min(remaining_extra_files);
+            file_counts[index] += assigned;
+            remaining_extra_files -= assigned;
+        }
+
+        let mut cursor = 37_usize;
+
+        while remaining_extra_files > 0 {
+            let index = cursor % partition_count;
+            if file_counts[index] < self.partitioning.max_files_per_partition {
+                file_counts[index] += 1;
+                remaining_extra_files -= 1;
+            }
+            cursor = cursor.wrapping_add(41);
+        }
+
+        Ok(file_counts)
+    }
+
     fn average_file_size_bytes(&self) -> u64 {
         self.active_data_size_bytes / self.active_file_count as u64
     }
@@ -311,6 +500,57 @@ impl SyntheticDeltaTableShape {
             .sum()
     }
 }
+
+impl SyntheticFileSet {
+    fn total_rows(&self) -> u64 {
+        self.files.iter().map(|file| file.rows).sum()
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|file| file.size_bytes).sum()
+    }
+
+    fn max_files_per_partition(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(|partition| partition.file_count)
+            .max()
+            .unwrap_or_default()
+    }
+}
+
+impl SyntheticDate {
+    fn to_naive(self) -> Result<NaiveDate, SyntheticGenerationError> {
+        NaiveDate::from_ymd_opt(self.year, u32::from(self.month), u32::from(self.day))
+            .ok_or_else(|| generation_error("invalid synthetic date"))
+    }
+
+    fn from_naive(date: NaiveDate) -> Self {
+        Self {
+            year: date.year(),
+            month: date.month() as u8,
+            day: date.day() as u8,
+        }
+    }
+}
+
+impl fmt::Display for SyntheticDate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:04}-{:02}-{:02}",
+            self.year, self.month, self.day
+        )
+    }
+}
+
+impl fmt::Display for SyntheticGenerationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for SyntheticGenerationError {}
 
 impl SchemaShape {
     fn type_count(&self, data_type: SyntheticDataType) -> usize {
@@ -351,6 +591,138 @@ fn synthetic_columns() -> Vec<ColumnShape> {
         string_column("quality_tier"),
         string_column("group_code"),
     ]
+}
+
+fn select_active_dates_for_year(
+    start: SyntheticDate,
+    end: SyntheticDate,
+    count: usize,
+    required_start: Option<SyntheticDate>,
+    required_end: Option<SyntheticDate>,
+) -> Result<Vec<SyntheticDate>, SyntheticGenerationError> {
+    let mut selected = Vec::with_capacity(count);
+    if let Some(date) = required_start {
+        selected.push(date);
+    }
+    if let Some(date) = required_end
+        && !selected.contains(&date)
+    {
+        selected.push(date);
+    }
+
+    let mut candidates = dates_between(start, end)?;
+    candidates.retain(|date| !selected.contains(date));
+    candidates.sort_by_key(|date| active_date_rank(*date));
+
+    for candidate in candidates {
+        if selected.len() == count {
+            break;
+        }
+        selected.push(candidate);
+    }
+
+    if selected.len() != count {
+        return Err(generation_error(format!(
+            "selected {} active dates for {}, expected {}",
+            selected.len(),
+            start.year,
+            count
+        )));
+    }
+
+    selected.sort();
+    Ok(selected)
+}
+
+fn dates_between(
+    start: SyntheticDate,
+    end: SyntheticDate,
+) -> Result<Vec<SyntheticDate>, SyntheticGenerationError> {
+    let mut current = start.to_naive()?;
+    let end = end.to_naive()?;
+    let mut dates = Vec::new();
+
+    while current <= end {
+        dates.push(SyntheticDate::from_naive(current));
+        current = current
+            .checked_add_days(Days::new(1))
+            .ok_or_else(|| generation_error("synthetic date range overflow"))?;
+    }
+
+    Ok(dates)
+}
+
+fn active_date_rank(date: SyntheticDate) -> (u8, u8, u8) {
+    let preferred_month = if (4..=9).contains(&date.month) { 0 } else { 1 };
+
+    (preferred_month, date.month, date.day)
+}
+
+fn split_evenly(total: u64, count: usize) -> Vec<u64> {
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let base = total / count as u64;
+    let remainder = total % count as u64;
+    (0..count)
+        .map(|index| base + if (index as u64) < remainder { 1 } else { 0 })
+        .collect()
+}
+
+fn apportion_by_weights(total: u64, weights: &[u64]) -> Result<Vec<u64>, SyntheticGenerationError> {
+    if weights.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let weight_sum: u128 = weights.iter().map(|weight| u128::from(*weight)).sum();
+    if weight_sum == 0 {
+        return Ok(split_evenly(total, weights.len()));
+    }
+
+    let mut values = Vec::with_capacity(weights.len());
+    let mut remainders = Vec::with_capacity(weights.len());
+    let mut assigned = 0_u64;
+
+    for (index, weight) in weights.iter().enumerate() {
+        let scaled = u128::from(total) * u128::from(*weight);
+        let base = scaled / weight_sum;
+        let value = u64::try_from(base)
+            .map_err(|_| generation_error("apportioned value does not fit into u64"))?;
+        values.push(value);
+        remainders.push((scaled % weight_sum, index));
+        assigned = assigned
+            .checked_add(value)
+            .ok_or_else(|| generation_error("apportioned value sum overflow"))?;
+    }
+
+    let remaining = total
+        .checked_sub(assigned)
+        .ok_or_else(|| generation_error("apportioned value sum exceeded total"))?;
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+    let remaining = usize::try_from(remaining)
+        .map_err(|_| generation_error("remaining apportioned value count does not fit usize"))?;
+    for (_, index) in remainders.into_iter().take(remaining) {
+        values[index] = values[index]
+            .checked_add(1)
+            .ok_or_else(|| generation_error("apportioned value increment overflow"))?;
+    }
+
+    Ok(values)
+}
+
+fn synthetic_file_path(date: SyntheticDate, file_index: usize) -> String {
+    format!(
+        "event_year={}/event_month={:02}/event_day={:02}/part-{:05}.parquet",
+        date.year, date.month, date.day, file_index
+    )
+}
+
+fn generation_error(message: impl Into<String>) -> SyntheticGenerationError {
+    SyntheticGenerationError {
+        message: message.into(),
+    }
 }
 
 fn string_column(name: &'static str) -> ColumnShape {
@@ -522,5 +894,75 @@ mod tests {
                 .deletion_vectors_enabled_in_source_shape
         );
         assert_eq!(shape.delta_features.active_deletion_vectors_in_benchmark, 0);
+    }
+
+    #[test]
+    fn generated_file_set_preserves_target_partition_and_file_counts() -> Result<(), Box<dyn Error>>
+    {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+
+        assert_eq!(file_set.partitions.len(), 933);
+        assert_eq!(file_set.files.len(), 956);
+        assert_eq!(file_set.total_rows(), shape.total_rows);
+        assert_eq!(file_set.total_bytes(), shape.active_data_size_bytes);
+        assert_eq!(file_set.max_files_per_partition(), 5);
+        assert_eq!(
+            file_set.partitions.first().map(|partition| partition.date),
+            Some(SyntheticDate {
+                year: 2023,
+                month: 2,
+                day: 3
+            })
+        );
+        assert_eq!(
+            file_set.partitions.last().map(|partition| partition.date),
+            Some(SyntheticDate {
+                year: 2026,
+                month: 6,
+                day: 12
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn generated_file_set_preserves_partition_totals() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+
+        for partition in &file_set.partitions {
+            let files = file_set
+                .files
+                .iter()
+                .filter(|file| file.partition_date == partition.date)
+                .collect::<Vec<_>>();
+
+            assert_eq!(files.len(), partition.file_count);
+            assert_eq!(
+                files.iter().map(|file| file.rows).sum::<u64>(),
+                partition.rows
+            );
+            assert_eq!(
+                files.iter().map(|file| file.size_bytes).sum::<u64>(),
+                partition.size_bytes
+            );
+            assert!(files.iter().enumerate().all(|(index, file)| {
+                file.file_index_in_partition == index
+                    && file.path.contains(&partition.date.year.to_string())
+            }));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn generated_file_set_is_deterministic() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+
+        assert_eq!(shape.generate_file_set()?, shape.generate_file_set()?);
+
+        Ok(())
     }
 }
