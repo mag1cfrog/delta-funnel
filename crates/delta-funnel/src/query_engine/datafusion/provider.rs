@@ -14,9 +14,11 @@ use datafusion::common::{
 };
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use snafu::ResultExt;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
+    error::{DeltaScanConstructionSnafu, DeltaScanFilterSnafu},
     table_formats::{
         DeltaKernelPredicate, ProjectedDeltaScan, build_projected_predicated_delta_scan,
         build_projected_predicated_stats_delta_scan, delta_source_arrow_schema,
@@ -41,13 +43,7 @@ impl DeltaTableProvider {
         preflight: ProtocolPreflight,
     ) -> Result<Self, DeltaFunnelError> {
         reject_mismatched_preflight(&source, preflight.protocol())?;
-        let schema = delta_source_arrow_schema(&source).map_err(|reason| {
-            DeltaFunnelError::DeltaSourceSchema {
-                source_name: source.name().to_owned(),
-                table_uri: source.table_uri().to_owned(),
-                reason,
-            }
-        })?;
+        let schema = delta_source_arrow_schema(&source)?;
 
         Ok(Self {
             source,
@@ -187,11 +183,12 @@ impl DeltaTableProvider {
                 && decision.kernel_scan_filter.is_none()
         });
         if pushed_filter_plan.unsupported_count > 0 || missing_partition_expression {
-            return Err(DeltaFunnelError::DeltaScanFilter {
+            return DeltaScanFilterSnafu {
                 source_name: self.source_name().to_owned(),
                 table_uri: self.source.table_uri().to_owned(),
                 reason: "pushed filters must be exact partition predicates or safely inexact mixed AND predicates".to_owned(),
-            });
+            }
+            .fail();
         }
 
         Ok(())
@@ -219,11 +216,12 @@ impl DeltaTableProvider {
             .any(|column| !projected_columns.contains(column.as_str()));
 
         if missing_residual_column {
-            return Err(DeltaFunnelError::DeltaScanFilter {
+            return DeltaScanFilterSnafu {
                 source_name: self.source_name().to_owned(),
                 table_uri: self.source.table_uri().to_owned(),
                 reason: "inexact pushed filter residual columns must be projected".to_owned(),
-            });
+            }
+            .fail();
         }
 
         Ok(())
@@ -302,10 +300,9 @@ impl DeltaTableProvider {
             )
         };
 
-        result.map_err(|source| DeltaFunnelError::DeltaScanConstruction {
+        result.context(DeltaScanConstructionSnafu {
             source_name: self.source_name().to_owned(),
             table_uri: self.source.table_uri().to_owned(),
-            source: Box::new(source),
         })
     }
 

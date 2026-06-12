@@ -2,7 +2,10 @@
 
 use std::collections::HashSet;
 
-use crate::DeltaFunnelError;
+use crate::{
+    DeltaFunnelError,
+    error::{DuplicateSourceNameSnafu, InvalidSourceNameSnafu},
+};
 
 const EMPTY_NAME: &str = "source names must not be empty";
 const INVALID_FIRST_CHARACTER: &str = "source names must start with an ASCII letter or underscore";
@@ -117,9 +120,10 @@ where
         validate_source_name(name)?;
 
         if !seen.insert(name.to_ascii_lowercase()) {
-            return Err(DeltaFunnelError::DuplicateSourceName {
+            return DuplicateSourceNameSnafu {
                 name: name.to_owned(),
-            });
+            }
+            .fail();
         }
     }
 
@@ -129,29 +133,30 @@ where
 fn validate_source_name(name: &str) -> Result<(), DeltaFunnelError> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
-        return Err(invalid_source_name(name, EMPTY_NAME));
+        return invalid_source_name(name, EMPTY_NAME);
     };
 
     if !is_valid_first_character(first) {
-        return Err(invalid_source_name(name, INVALID_FIRST_CHARACTER));
+        return invalid_source_name(name, INVALID_FIRST_CHARACTER);
     }
 
     if !chars.all(is_valid_following_character) {
-        return Err(invalid_source_name(name, INVALID_CHARACTER));
+        return invalid_source_name(name, INVALID_CHARACTER);
     }
 
     if is_reserved_sql_keyword(name) {
-        return Err(invalid_source_name(name, SQL_KEYWORD));
+        return invalid_source_name(name, SQL_KEYWORD);
     }
 
     Ok(())
 }
 
-fn invalid_source_name(name: &str, reason: &'static str) -> DeltaFunnelError {
-    DeltaFunnelError::InvalidSourceName {
+fn invalid_source_name<T>(name: &str, reason: &'static str) -> Result<T, DeltaFunnelError> {
+    InvalidSourceNameSnafu {
         name: name.to_owned(),
         reason,
     }
+    .fail()
 }
 
 fn is_valid_first_character(value: char) -> bool {

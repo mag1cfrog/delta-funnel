@@ -1,6 +1,9 @@
 //! Delta source snapshot loading.
 
-use crate::DeltaFunnelError;
+use crate::{
+    DeltaFunnelError,
+    error::{DeltaSnapshotLoadSnafu, DeltaSourceEngineSnafu, InvalidSourceUriSnafu},
+};
 
 use super::kernel::{
     DefaultEngineBuilder, Snapshot, SnapshotRef, Version, store_from_url_opts, try_parse_uri,
@@ -44,16 +47,24 @@ struct DeltaKernelEngine {
 
 impl DeltaKernelEngine {
     fn build(table_uri: &str) -> Result<Self, DeltaFunnelError> {
-        let table_url =
-            try_parse_uri(table_uri).map_err(|_| DeltaFunnelError::InvalidSourceUri {
-                reason: "normalized table URI could not be parsed",
-            })?;
-        let store =
-            store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>()).map_err(|_| {
-                DeltaFunnelError::DeltaSourceEngine {
+        let table_url = match try_parse_uri(table_uri) {
+            Ok(table_url) => table_url,
+            Err(_) => {
+                return InvalidSourceUriSnafu {
+                    reason: "normalized table URI could not be parsed",
+                }
+                .fail();
+            }
+        };
+        let store = match store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>()) {
+            Ok(store) => store,
+            Err(_) => {
+                return DeltaSourceEngineSnafu {
                     reason: ENGINE_CONSTRUCTION_FAILED,
                 }
-            })?;
+                .fail();
+            }
+        };
 
         Ok(Self {
             inner: Box::new(DefaultEngineBuilder::new(store).build()),
@@ -89,11 +100,15 @@ pub(crate) fn load_delta_table_snapshot(
         builder = builder.at_version(version);
     }
 
-    let snapshot = builder.build(engine.as_kernel_engine()).map_err(|_| {
-        DeltaFunnelError::DeltaSnapshotLoad {
-            reason: SNAPSHOT_LOAD_FAILED,
+    let snapshot = match builder.build(engine.as_kernel_engine()) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return DeltaSnapshotLoadSnafu {
+                reason: SNAPSHOT_LOAD_FAILED,
+            }
+            .fail();
         }
-    })?;
+    };
 
     Ok(LoadedDeltaTableSnapshot {
         table_uri,

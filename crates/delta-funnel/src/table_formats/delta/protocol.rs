@@ -1,7 +1,7 @@
 //! Delta protocol preflight.
 
-use crate::DeltaFunnelError;
 use crate::redaction::sanitize_uri_for_display;
+use crate::{DeltaFunnelError, error::DeltaProtocolCompatibilitySnafu};
 
 use super::PlannedDeltaSource;
 use super::kernel::{
@@ -114,23 +114,23 @@ fn build_protocol_report(
 
 fn ensure_protocol_supported(protocol: &DeltaProtocolReport) -> Result<(), DeltaFunnelError> {
     if !is_supported_reader_version(protocol.min_reader_version) {
-        return Err(compatibility_error(
+        return compatibility_error(
             protocol,
             format!(
                 "unsupported Delta minReaderVersion {}",
                 protocol.min_reader_version
             ),
-        ));
+        );
     }
 
     if let Some(feature) = unsupported_reader_feature(&protocol.reader_features) {
-        return Err(compatibility_error(
+        return compatibility_error(
             protocol,
             format!(
                 "unsupported Delta reader feature `{}`",
                 sanitize_value_for_display(feature)
             ),
-        ));
+        );
     }
 
     Ok(())
@@ -152,13 +152,17 @@ fn is_supported_reader_version(version: i32) -> bool {
     matches!(version, 1) || version == TABLE_FEATURES_MIN_READER_VERSION
 }
 
-fn compatibility_error(protocol: &DeltaProtocolReport, reason: String) -> DeltaFunnelError {
-    DeltaFunnelError::DeltaProtocolCompatibility {
+fn compatibility_error<T>(
+    protocol: &DeltaProtocolReport,
+    reason: String,
+) -> Result<T, DeltaFunnelError> {
+    DeltaProtocolCompatibilitySnafu {
         source_name: protocol.source_name.clone(),
         table_uri: protocol.table_uri.clone(),
         snapshot_version: protocol.snapshot_version,
         reason,
     }
+    .fail()
 }
 
 fn sanitize_value_for_display(value: &str) -> String {

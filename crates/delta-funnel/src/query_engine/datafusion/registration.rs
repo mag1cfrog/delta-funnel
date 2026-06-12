@@ -8,7 +8,8 @@ use datafusion::prelude::SessionContext;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
-    redaction::sanitize_uri_for_display, table_formats::validate_table_source_names,
+    error::DataFusionRegistrationSnafu, redaction::sanitize_uri_for_display,
+    table_formats::validate_table_source_names,
 };
 
 use super::provider::DeltaTableProvider;
@@ -90,11 +91,12 @@ fn reject_existing_registration_names(
             .iter()
             .find(|existing_name| existing_name.eq_ignore_ascii_case(provider.source_name()))
         {
-            return Err(DeltaFunnelError::DataFusionRegistration {
+            return DataFusionRegistrationSnafu {
                 source_name: provider.source_name().to_owned(),
                 table_uri: provider.source_table_uri().to_owned(),
                 reason: format!("table already exists: {existing_name}"),
-            });
+            }
+            .fail();
         }
     }
 
@@ -113,12 +115,14 @@ fn register_delta_provider(
     };
     let table_uri = provider.source_table_uri().to_owned();
 
-    ctx.register_table(registered.name.as_str(), Arc::new(provider))
-        .map_err(|error| DeltaFunnelError::DataFusionRegistration {
+    if let Err(error) = ctx.register_table(registered.name.as_str(), Arc::new(provider)) {
+        return DataFusionRegistrationSnafu {
             source_name: registered.name.clone(),
             table_uri,
             reason: error.to_string(),
-        })?;
+        }
+        .fail();
+    }
 
     Ok(registered)
 }
@@ -162,14 +166,15 @@ pub(super) fn reject_mismatched_preflight(
         || protocol.snapshot_version != source.version()
         || protocol.table_uri != source_table_uri
     {
-        return Err(DeltaFunnelError::DataFusionRegistration {
+        return DataFusionRegistrationSnafu {
             source_name: source.name().to_owned(),
             table_uri: source.table_uri().to_owned(),
             reason: format!(
                 "protocol preflight belongs to source `{}` at snapshot version {} ({})",
                 protocol.source_name, protocol.snapshot_version, protocol.table_uri
             ),
-        });
+        }
+        .fail();
     }
 
     Ok(())

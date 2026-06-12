@@ -2,9 +2,11 @@
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::Expr;
+use snafu::ResultExt;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport,
+    error::DeltaScanMetadataExpansionSnafu,
     table_formats::{
         DeltaKernelPredicate, KernelScanFileMetadata, KernelScanMetadataExpansion,
         ProjectedDeltaScan,
@@ -113,11 +115,10 @@ impl ProviderScanPlan {
         } = self
             .kernel_scan
             .expand_kernel_scan_metadata(&self.table_uri)
-            .map_err(|source| DeltaFunnelError::DeltaScanMetadataExpansion {
+            .context(DeltaScanMetadataExpansionSnafu {
                 source_name: self.source_name.clone(),
                 table_uri: self.table_uri.clone(),
                 snapshot_version: self.snapshot_version,
-                source: Box::new(source),
             })?;
 
         Ok(ProviderScanMetadataExpansion {
