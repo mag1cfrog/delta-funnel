@@ -58,6 +58,22 @@ pub(crate) struct DeltaScanFileTaskPartitionOptions {
     pub(crate) target_partitions: usize,
 }
 
+impl DeltaScanFileTaskPartitionOptions {
+    /// Validates partition options for one provider scan context.
+    ///
+    /// This method lets scan-plan callers fail fast before metadata expansion
+    /// when caller-controlled options are invalid.
+    #[allow(dead_code)]
+    pub(crate) fn validate_for_scan_context(
+        &self,
+        source_name: &str,
+        table_uri: &str,
+        snapshot_version: u64,
+    ) -> Result<(), DeltaFunnelError> {
+        validate_partition_options(source_name, table_uri, snapshot_version, self)
+    }
+}
+
 impl DeltaScanFileTaskPartitionPlan {
     /// Groups Delta-aware file tasks into metadata-only provider scan partitions.
     ///
@@ -78,7 +94,7 @@ impl DeltaScanFileTaskPartitionPlan {
             options,
         } = request;
 
-        validate_partition_options(&source_name, &table_uri, snapshot_version, &options)?;
+        options.validate_for_scan_context(&source_name, &table_uri, snapshot_version)?;
         validate_file_task_context(&source_name, &table_uri, snapshot_version, &file_tasks)?;
 
         let estimated_bytes = sum_task_estimate(

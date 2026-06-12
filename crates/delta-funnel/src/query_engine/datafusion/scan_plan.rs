@@ -12,6 +12,10 @@ use crate::{
 };
 
 use super::file_task::DeltaScanFileTask;
+use super::file_task_partition::{
+    DeltaScanFileTaskPartitionOptions, DeltaScanFileTaskPartitionPlan,
+    DeltaScanFileTaskPartitionPlanRequest,
+};
 use super::filters::DeltaFilterPushdownPlan;
 
 /// Caller request used to build a provider scan plan.
@@ -124,6 +128,24 @@ impl ProviderScanPlan {
             scan_metadata_exhausted,
         })
     }
+
+    /// Expands scan metadata and groups the resulting file tasks into partitions.
+    ///
+    /// Partition options are validated before Delta Kernel metadata expansion so
+    /// invalid caller options fail before any scan metadata work is consumed.
+    #[allow(dead_code)]
+    pub(crate) fn plan_file_task_partitions(
+        &self,
+        options: DeltaScanFileTaskPartitionOptions,
+    ) -> Result<DeltaScanFileTaskPartitionPlan, DeltaFunnelError> {
+        options.validate_for_scan_context(
+            &self.source_name,
+            &self.table_uri,
+            self.snapshot_version,
+        )?;
+        self.expand_scan_metadata()?
+            .into_file_task_partition_plan(options)
+    }
 }
 
 impl ProviderScanMetadataExpansion {
@@ -138,18 +160,49 @@ impl ProviderScanMetadataExpansion {
             scan_metadata_exhausted: _,
         } = self;
 
-        files
-            .into_iter()
-            .map(|file| {
-                DeltaScanFileTask::from_kernel_metadata(
-                    &source_name,
-                    &table_uri,
-                    snapshot_version,
-                    file,
-                )
-            })
-            .collect()
+        file_tasks_from_metadata(&source_name, &table_uri, snapshot_version, files)
     }
+
+    /// Converts expanded scan metadata into a grouped file-task partition plan.
+    #[allow(dead_code)]
+    pub(crate) fn into_file_task_partition_plan(
+        self,
+        options: DeltaScanFileTaskPartitionOptions,
+    ) -> Result<DeltaScanFileTaskPartitionPlan, DeltaFunnelError> {
+        let Self {
+            source_name,
+            table_uri,
+            snapshot_version,
+            files,
+            scan_metadata_exhausted,
+        } = self;
+        let file_tasks =
+            file_tasks_from_metadata(&source_name, &table_uri, snapshot_version, files)?;
+
+        DeltaScanFileTaskPartitionPlan::try_new(DeltaScanFileTaskPartitionPlanRequest {
+            source_name,
+            table_uri,
+            snapshot_version,
+            scan_metadata_exhausted,
+            file_tasks,
+            options,
+        })
+    }
+}
+
+/// Converts kernel file metadata into provider file tasks with scan context.
+fn file_tasks_from_metadata(
+    source_name: &str,
+    table_uri: &str,
+    snapshot_version: u64,
+    files: Vec<KernelScanFileMetadata>,
+) -> Result<Vec<DeltaScanFileTask>, DeltaFunnelError> {
+    files
+        .into_iter()
+        .map(|file| {
+            DeltaScanFileTask::from_kernel_metadata(source_name, table_uri, snapshot_version, file)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -357,6 +410,99 @@ mod tests {
         assert_eq!(tasks[0].table_uri, table_uri);
         assert_eq!(tasks[0].snapshot_version, 1);
         assert_eq!(tasks[0].estimated_bytes, Some(0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_scan_metadata_expansion_converts_to_file_task_partition_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "provider-scan-file-task-partitions",
+            crate::query_engine::datafusion::test_support::PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            &[
+                r#""partitionValues":{"region":"us-west"}"#,
+                r#""partitionValues":{"region":"us-east"}"#,
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: Some(vec![0]),
+            pushed_filters: Vec::new(),
+        })?;
+        let table_uri = plan.table_uri.clone();
+        let partition_plan = plan.expand_scan_metadata()?.into_file_task_partition_plan(
+            DeltaScanFileTaskPartitionOptions {
+                target_partitions: 1,
+            },
+        )?;
+        let partition_paths = partition_plan.partitions[0]
+            .file_tasks
+            .iter()
+            .map(|task| task.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(partition_plan.source_name, "orders");
+        assert_eq!(partition_plan.table_uri, table_uri);
+        assert_eq!(partition_plan.snapshot_version, 1);
+        assert!(partition_plan.scan_metadata_exhausted);
+        assert_eq!(partition_plan.partitions.len(), 1);
+        assert_eq!(
+            partition_paths,
+            vec!["part-00000.parquet", "part-00001.parquet"]
+        );
+        assert_eq!(partition_plan.estimated_bytes, Some(0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_scan_plan_rejects_zero_partition_target_before_metadata_expansion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("provider-scan-partition-zero-target")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+
+        let mut plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: None,
+            pushed_filters: Vec::new(),
+        })?;
+        plan.table_uri = "\nnot a valid table uri".to_owned();
+
+        let error = match plan.plan_file_task_partitions(DeltaScanFileTaskPartitionOptions {
+            target_partitions: 0,
+        }) {
+            Ok(_) => return Err("zero target partition planning should fail".into()),
+            Err(error) => error,
+        };
+
+        match error {
+            DeltaFunnelError::DeltaScanFileTaskPartitionPlanning {
+                source_name,
+                table_uri,
+                snapshot_version,
+                reason,
+            } => {
+                assert_eq!(source_name, "orders");
+                assert_eq!(table_uri, "\nnot a valid table uri");
+                assert_eq!(snapshot_version, 1);
+                assert!(reason.contains("target_partitions"));
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
 
         Ok(())
     }
