@@ -4,8 +4,43 @@ use std::error::Error;
 use std::fmt;
 
 use chrono::{Datelike, Days, NaiveDate};
+use delta_funnel::{
+    DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
+    DeltaScanPartitionTargetDiagnosticSource, derive_delta_scan_partition_target_diagnostic,
+};
 
 const MIB: u64 = 1024 * 1024;
+const BENCHMARK_CSV_HEADER: [&str; 29] = [
+    "shape_name",
+    "total_rows",
+    "active_files",
+    "active_bytes",
+    "active_mib",
+    "avg_file_size_bytes",
+    "partition_count",
+    "generated_files",
+    "generated_rows",
+    "generated_bytes",
+    "max_files_per_partition",
+    "source_rows",
+    "string_columns",
+    "int_columns",
+    "double_columns",
+    "bigint_columns",
+    "timestamp_columns",
+    "boolean_columns",
+    "simulation_profile_count",
+    "simulation_profile",
+    "policy_case",
+    "policy_available_parallelism",
+    "policy_datafusion_target",
+    "policy_target",
+    "policy_source",
+    "simulated_serial_micros",
+    "simulated_max_file_micros",
+    "simulated_output_partitions",
+    "simulated_wall_micros",
+];
 
 fn main() -> Result<(), Box<dyn Error>> {
     let shape = SyntheticDeltaTableShape::partitioned_event_log();
@@ -13,38 +48,61 @@ fn main() -> Result<(), Box<dyn Error>> {
     let simulation = SyntheticWorkSimulationProfile::s3_normal();
     let simulation_profile_count = SyntheticWorkSimulationProfile::standard_profiles().len();
     let simulated_work = simulation.simulate_file_set(&file_set)?;
-    let partitioned_work = simulated_work.partition_by_estimated_bytes(&file_set, 16)?;
+    let policy_case = BenchmarkPolicyCase::default_policy_from_local_parallelism();
+    let policy_decision = policy_case.derive_target()?;
+    let partitioned_work = simulated_work
+        .partition_by_estimated_bytes(&file_set, policy_decision.target_partitions)?;
 
+    println!("{}", BENCHMARK_CSV_HEADER.join(","));
     println!(
-        "shape_name,total_rows,active_files,active_bytes,active_mib,avg_file_size_bytes,partition_count,generated_files,generated_rows,generated_bytes,max_files_per_partition,source_rows,string_columns,int_columns,double_columns,bigint_columns,timestamp_columns,boolean_columns,simulation_profile_count,simulation_profile,simulated_serial_micros,simulated_max_file_micros,simulated_target_partitions,simulated_output_partitions,simulated_wall_micros"
-    );
-    println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        shape.name,
-        shape.total_rows,
-        shape.active_file_count,
-        shape.active_data_size_bytes,
-        shape.active_data_size_mib(),
-        shape.average_file_size_bytes(),
-        shape.partitioning.partition_count,
-        file_set.files.len(),
-        file_set.total_rows(),
-        file_set.total_bytes(),
-        file_set.max_files_per_partition(),
-        shape.source_split_rows(),
-        shape.schema.type_count(SyntheticDataType::String),
-        shape.schema.type_count(SyntheticDataType::Int),
-        shape.schema.type_count(SyntheticDataType::Double),
-        shape.schema.type_count(SyntheticDataType::Bigint),
-        shape.schema.type_count(SyntheticDataType::Timestamp),
-        shape.schema.type_count(SyntheticDataType::Boolean),
-        simulation_profile_count,
-        simulation.name,
-        simulated_work.serial_micros,
-        simulated_work.max_file_micros,
-        partitioned_work.target_partitions,
-        partitioned_work.partitions.len(),
-        partitioned_work.wall_micros
+        "{}",
+        [
+            shape.name.to_owned(),
+            shape.total_rows.to_string(),
+            shape.active_file_count.to_string(),
+            shape.active_data_size_bytes.to_string(),
+            shape.active_data_size_mib().to_string(),
+            shape.average_file_size_bytes().to_string(),
+            shape.partitioning.partition_count.to_string(),
+            file_set.files.len().to_string(),
+            file_set.total_rows().to_string(),
+            file_set.total_bytes().to_string(),
+            file_set.max_files_per_partition().to_string(),
+            shape.source_split_rows().to_string(),
+            shape
+                .schema
+                .type_count(SyntheticDataType::String)
+                .to_string(),
+            shape.schema.type_count(SyntheticDataType::Int).to_string(),
+            shape
+                .schema
+                .type_count(SyntheticDataType::Double)
+                .to_string(),
+            shape
+                .schema
+                .type_count(SyntheticDataType::Bigint)
+                .to_string(),
+            shape
+                .schema
+                .type_count(SyntheticDataType::Timestamp)
+                .to_string(),
+            shape
+                .schema
+                .type_count(SyntheticDataType::Boolean)
+                .to_string(),
+            simulation_profile_count.to_string(),
+            simulation.name.to_owned(),
+            policy_case.name.to_owned(),
+            optional_usize(policy_case.input.available_parallelism),
+            optional_usize(policy_case.input.datafusion_target_partitions),
+            policy_decision.target_partitions.to_string(),
+            policy_source_name(policy_decision.source).to_owned(),
+            simulated_work.serial_micros.to_string(),
+            simulated_work.max_file_micros.to_string(),
+            partitioned_work.partitions.len().to_string(),
+            partitioned_work.wall_micros.to_string(),
+        ]
+        .join(",")
     );
 
     Ok(())
@@ -87,6 +145,12 @@ struct SyntheticFile {
     file_index_in_partition: usize,
     rows: u64,
     size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BenchmarkPolicyCase {
+    name: &'static str,
+    input: DeltaScanPartitionTargetDiagnosticInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,6 +638,32 @@ impl SyntheticFileSet {
     }
 }
 
+impl BenchmarkPolicyCase {
+    fn default_policy_from_local_parallelism() -> Self {
+        let available_parallelism = local_available_parallelism();
+
+        Self {
+            name: "default_policy_local_parallelism",
+            input: DeltaScanPartitionTargetDiagnosticInput {
+                available_parallelism,
+                datafusion_target_partitions: available_parallelism,
+                ..DeltaScanPartitionTargetDiagnosticInput::default()
+            },
+        }
+    }
+
+    fn derive_target(
+        self,
+    ) -> Result<DeltaScanPartitionTargetDiagnosticOutput, delta_funnel::DeltaFunnelError> {
+        derive_delta_scan_partition_target_diagnostic(self.input)
+    }
+
+    #[cfg(test)]
+    fn with_input(name: &'static str, input: DeltaScanPartitionTargetDiagnosticInput) -> Self {
+        Self { name, input }
+    }
+}
+
 impl SyntheticWorkSimulationProfile {
     fn local_fast() -> Self {
         Self {
@@ -1056,6 +1146,26 @@ fn deterministic_file_hash(file: &SyntheticFile) -> u64 {
     hash
 }
 
+fn local_available_parallelism() -> Option<usize> {
+    std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZeroUsize::get)
+}
+
+fn optional_usize(value: Option<usize>) -> String {
+    value.map_or_else(String::new, |value| value.to_string())
+}
+
+fn policy_source_name(source: DeltaScanPartitionTargetDiagnosticSource) -> &'static str {
+    match source {
+        DeltaScanPartitionTargetDiagnosticSource::ExplicitOverride => "explicit_override",
+        DeltaScanPartitionTargetDiagnosticSource::AvailableParallelismFallback => {
+            "available_parallelism_fallback"
+        }
+        DeltaScanPartitionTargetDiagnosticSource::StaticFallback => "static_fallback",
+    }
+}
+
 fn synthetic_file_path(date: SyntheticDate, file_index: usize) -> String {
     format!(
         "event_year={}/event_month={:02}/event_day={:02}/part-{:05}.parquet",
@@ -1447,5 +1557,83 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn policy_case_derives_target_with_production_diagnostic_policy() -> Result<(), Box<dyn Error>>
+    {
+        let case = BenchmarkPolicyCase::with_input(
+            "test_policy",
+            DeltaScanPartitionTargetDiagnosticInput {
+                available_parallelism: Some(64),
+                datafusion_target_partitions: Some(16),
+                ..DeltaScanPartitionTargetDiagnosticInput::default()
+            },
+        );
+        let decision = case.derive_target()?;
+
+        assert_eq!(decision.target_partitions, 16);
+        assert_eq!(decision.available_parallelism, Some(64));
+        assert_eq!(decision.datafusion_target_cap, Some(16));
+
+        Ok(())
+    }
+
+    #[test]
+    fn policy_target_drives_partitioned_work_plan() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+        let work = SyntheticWorkSimulationProfile::s3_normal().simulate_file_set(&file_set)?;
+        let case = BenchmarkPolicyCase::with_input(
+            "test_policy",
+            DeltaScanPartitionTargetDiagnosticInput {
+                available_parallelism: Some(64),
+                datafusion_target_partitions: Some(8),
+                ..DeltaScanPartitionTargetDiagnosticInput::default()
+            },
+        );
+        let decision = case.derive_target()?;
+        let plan = work.partition_by_estimated_bytes(&file_set, decision.target_partitions)?;
+
+        assert_eq!(decision.target_partitions, 8);
+        assert_eq!(plan.target_partitions, 8);
+        assert!(plan.partitions.len() <= 8);
+        assert!(plan.wall_micros < work.serial_micros);
+
+        Ok(())
+    }
+
+    #[test]
+    fn optional_usize_renders_csv_fields() {
+        assert_eq!(optional_usize(None), "");
+        assert_eq!(optional_usize(Some(8)), "8");
+    }
+
+    #[test]
+    fn policy_source_name_renders_csv_fields() {
+        assert_eq!(
+            policy_source_name(DeltaScanPartitionTargetDiagnosticSource::ExplicitOverride),
+            "explicit_override"
+        );
+        assert_eq!(
+            policy_source_name(
+                DeltaScanPartitionTargetDiagnosticSource::AvailableParallelismFallback
+            ),
+            "available_parallelism_fallback"
+        );
+        assert_eq!(
+            policy_source_name(DeltaScanPartitionTargetDiagnosticSource::StaticFallback),
+            "static_fallback"
+        );
+    }
+
+    #[test]
+    fn benchmark_csv_header_matches_policy_output_shape() {
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 29);
+        assert_eq!(BENCHMARK_CSV_HEADER[20], "policy_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[21], "policy_available_parallelism");
+        assert_eq!(BENCHMARK_CSV_HEADER[22], "policy_datafusion_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[23], "policy_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[24], "policy_source");
     }
 }
