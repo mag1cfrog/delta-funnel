@@ -7,11 +7,20 @@
 
 use crate::{DeltaFunnelError, error::DeltaScanFileTaskPartitionPlanningSnafu};
 
+use super::execution_environment::{
+    DeltaExecutionEnvironmentProfile, DeltaMemoryHint, DeltaUnixResourceLimit,
+};
 use super::file_task_partition::DeltaScanFileTaskPartitionOptions;
 
 const DEFAULT_MIN_PARTITIONS: usize = 4;
 const DEFAULT_MAX_PARTITIONS: usize = 64;
 const DEFAULT_PARALLELISM_MULTIPLIER: usize = 1;
+// Conservative pre-benchmark guards used to keep fallback partition counts from
+// over-consuming per-partition OS resources. Issue #128's benchmark matrix is
+// expected to validate or replace these policy variables before they become
+// performance-tuned defaults.
+const DEFAULT_FILE_DESCRIPTORS_PER_PARTITION: usize = 16;
+const DEFAULT_AVAILABLE_MEMORY_BYTES_PER_PARTITION: u64 = 256 * 1024 * 1024;
 
 /// Provider scan context used to report target-derivation failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,8 +42,8 @@ pub(crate) struct DeltaScanPartitionTargetConfig {
     pub(crate) explicit_target_partitions: Option<usize>,
     /// DataFusion execution target partition count, if available.
     pub(crate) datafusion_target_partitions: Option<usize>,
-    /// Host parallelism observed by the caller, injected for deterministic tests.
-    pub(crate) available_parallelism: Option<usize>,
+    /// Local execution environment profile used for fallback target derivation.
+    pub(crate) environment_profile: DeltaExecutionEnvironmentProfile,
 }
 
 /// Conservative fallback policy for deriving scan partition targets.
@@ -47,6 +56,16 @@ pub(crate) struct DeltaScanPartitionTargetPolicy {
     pub(crate) max_default_partitions: usize,
     /// Multiplier applied to available parallelism before clamping.
     pub(crate) parallelism_multiplier: usize,
+    /// File descriptors reserved per fallback scan partition on Unix platforms.
+    ///
+    /// This is a conservative policy variable for benchmark validation, not a
+    /// measured optimum.
+    pub(crate) file_descriptors_per_partition: usize,
+    /// Available memory reserved per fallback scan partition when memory is known.
+    ///
+    /// This is a conservative policy variable for benchmark validation, not a
+    /// measured optimum.
+    pub(crate) available_memory_bytes_per_partition: u64,
 }
 
 /// Source that selected the final scan partition target.
@@ -75,10 +94,22 @@ pub(crate) struct DeltaScanPartitionTargetDecision {
     pub(crate) explicit_target_partitions: Option<usize>,
     /// Original DataFusion execution target input.
     pub(crate) datafusion_target_partitions: Option<usize>,
-    /// Original host parallelism input.
-    pub(crate) available_parallelism: Option<usize>,
+    /// Execution environment profile used by this decision.
+    pub(crate) environment_profile: DeltaExecutionEnvironmentProfile,
+    /// Resource caps that affected fallback target derivation.
+    pub(crate) applied_caps: DeltaScanPartitionTargetAppliedCaps,
     /// Policy used for fallback target derivation.
     pub(crate) policy: DeltaScanPartitionTargetPolicy,
+}
+
+/// Resource caps applied to fallback target derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct DeltaScanPartitionTargetAppliedCaps {
+    /// Cap derived from Unix file descriptor limits.
+    pub(crate) unix_file_descriptor_limit: Option<usize>,
+    /// Cap derived from available memory hints.
+    pub(crate) memory_hint: Option<usize>,
 }
 
 impl Default for DeltaScanPartitionTargetPolicy {
@@ -87,6 +118,8 @@ impl Default for DeltaScanPartitionTargetPolicy {
             min_default_partitions: DEFAULT_MIN_PARTITIONS,
             max_default_partitions: DEFAULT_MAX_PARTITIONS,
             parallelism_multiplier: DEFAULT_PARALLELISM_MULTIPLIER,
+            file_descriptors_per_partition: DEFAULT_FILE_DESCRIPTORS_PER_PARTITION,
+            available_memory_bytes_per_partition: DEFAULT_AVAILABLE_MEMORY_BYTES_PER_PARTITION,
         }
     }
 }
@@ -98,7 +131,7 @@ impl DeltaScanPartitionTargetConfig {
         Self {
             explicit_target_partitions: None,
             datafusion_target_partitions: Some(datafusion_target_partitions),
-            available_parallelism: local_available_parallelism(),
+            environment_profile: DeltaExecutionEnvironmentProfile::from_local_environment(),
         }
     }
 }
@@ -131,25 +164,33 @@ impl DeltaScanPartitionTargetPolicy {
             ));
         }
 
-        let (source, target_partitions) = match config.available_parallelism {
-            Some(available_parallelism) => {
-                self.validate_target(context, "available_parallelism", available_parallelism)?;
-                let multiplied = available_parallelism
-                    .saturating_mul(self.parallelism_multiplier)
-                    .clamp(self.min_default_partitions, self.max_default_partitions);
+        let (source, target_partitions, applied_caps) =
+            match config.environment_profile.available_parallelism {
+                Some(available_parallelism) => {
+                    self.validate_target(context, "available_parallelism", available_parallelism)?;
+                    let multiplied = available_parallelism
+                        .saturating_mul(self.parallelism_multiplier)
+                        .clamp(self.min_default_partitions, self.max_default_partitions);
+                    let (capped, applied_caps) = self.apply_fallback_caps(multiplied, config);
 
-                (
-                    DeltaScanPartitionTargetSource::AvailableParallelismFallback,
-                    multiplied,
-                )
-            }
-            None => (
-                DeltaScanPartitionTargetSource::StaticFallback,
-                self.min_default_partitions,
-            ),
-        };
+                    (
+                        DeltaScanPartitionTargetSource::AvailableParallelismFallback,
+                        capped,
+                        applied_caps,
+                    )
+                }
+                None => {
+                    let (capped, applied_caps) =
+                        self.apply_fallback_caps(self.min_default_partitions, config);
+                    (
+                        DeltaScanPartitionTargetSource::StaticFallback,
+                        capped,
+                        applied_caps,
+                    )
+                }
+            };
 
-        Ok(self.decision(source, target_partitions, config))
+        Ok(self.fallback_decision(source, target_partitions, config, applied_caps))
     }
 
     fn validate(
@@ -172,6 +213,18 @@ impl DeltaScanPartitionTargetPolicy {
             return target_planning_error(
                 context,
                 "parallelism_multiplier must be greater than zero",
+            );
+        }
+        if self.file_descriptors_per_partition == 0 {
+            return target_planning_error(
+                context,
+                "file_descriptors_per_partition must be greater than zero",
+            );
+        }
+        if self.available_memory_bytes_per_partition == 0 {
+            return target_planning_error(
+                context,
+                "available_memory_bytes_per_partition must be greater than zero",
             );
         }
 
@@ -205,9 +258,73 @@ impl DeltaScanPartitionTargetPolicy {
             source,
             explicit_target_partitions: config.explicit_target_partitions,
             datafusion_target_partitions: config.datafusion_target_partitions,
-            available_parallelism: config.available_parallelism,
+            environment_profile: config.environment_profile,
+            applied_caps: DeltaScanPartitionTargetAppliedCaps {
+                unix_file_descriptor_limit: None,
+                memory_hint: None,
+            },
             policy: self,
         }
+    }
+
+    fn fallback_decision(
+        self,
+        source: DeltaScanPartitionTargetSource,
+        target_partitions: usize,
+        config: DeltaScanPartitionTargetConfig,
+        applied_caps: DeltaScanPartitionTargetAppliedCaps,
+    ) -> DeltaScanPartitionTargetDecision {
+        DeltaScanPartitionTargetDecision {
+            target_partitions,
+            source,
+            explicit_target_partitions: config.explicit_target_partitions,
+            datafusion_target_partitions: config.datafusion_target_partitions,
+            environment_profile: config.environment_profile,
+            applied_caps,
+            policy: self,
+        }
+    }
+
+    fn apply_fallback_caps(
+        self,
+        target_partitions: usize,
+        config: DeltaScanPartitionTargetConfig,
+    ) -> (usize, DeltaScanPartitionTargetAppliedCaps) {
+        let unix_file_descriptor_limit = self.unix_file_descriptor_cap(config);
+        let memory_hint = self.memory_cap(config.environment_profile.memory_hint);
+        let mut capped_target = target_partitions;
+
+        if let Some(cap) = unix_file_descriptor_limit {
+            capped_target = capped_target.min(cap);
+        }
+        if let Some(cap) = memory_hint {
+            capped_target = capped_target.min(cap);
+        }
+
+        (
+            capped_target.max(1),
+            DeltaScanPartitionTargetAppliedCaps {
+                unix_file_descriptor_limit,
+                memory_hint,
+            },
+        )
+    }
+
+    fn unix_file_descriptor_cap(self, config: DeltaScanPartitionTargetConfig) -> Option<usize> {
+        let limit = config.environment_profile.unix_file_descriptor_limit?;
+        let DeltaUnixResourceLimit::Finite(soft_limit) = limit.soft_limit else {
+            return None;
+        };
+        let soft_limit = usize::try_from(soft_limit).ok()?;
+
+        Some((soft_limit / self.file_descriptors_per_partition).max(1))
+    }
+
+    fn memory_cap(self, memory_hint: Option<DeltaMemoryHint>) -> Option<usize> {
+        let available_bytes = memory_hint?.available_bytes?;
+        let cap = available_bytes / self.available_memory_bytes_per_partition;
+
+        usize::try_from(cap).ok().map(|cap| cap.max(1))
     }
 }
 
@@ -219,12 +336,6 @@ impl DeltaScanPartitionTargetDecision {
             target_partitions: self.target_partitions,
         }
     }
-}
-
-fn local_available_parallelism() -> Option<usize> {
-    std::thread::available_parallelism()
-        .ok()
-        .map(std::num::NonZeroUsize::get)
 }
 
 fn target_planning_error<T>(
@@ -242,6 +353,9 @@ fn target_planning_error<T>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::execution_environment::{
+        DeltaExecutionOsFamily, DeltaMemoryHint, DeltaUnixFileDescriptorLimit,
+    };
     use super::*;
 
     fn context() -> DeltaScanPartitionTargetContext<'static> {
@@ -260,7 +374,22 @@ mod tests {
         DeltaScanPartitionTargetConfig {
             explicit_target_partitions,
             datafusion_target_partitions,
+            environment_profile: profile(available_parallelism, None, None),
+        }
+    }
+
+    fn profile(
+        available_parallelism: Option<usize>,
+        memory_hint: Option<DeltaMemoryHint>,
+        unix_file_descriptor_limit: Option<DeltaUnixFileDescriptorLimit>,
+    ) -> DeltaExecutionEnvironmentProfile {
+        DeltaExecutionEnvironmentProfile {
             available_parallelism,
+            os_family: DeltaExecutionOsFamily::Other,
+            memory_hint,
+            unix_file_descriptor_limit,
+            io_latency_hint: None,
+            runtime_probe: None,
         }
     }
 
@@ -269,6 +398,8 @@ mod tests {
             min_default_partitions: 4,
             max_default_partitions: 64,
             parallelism_multiplier: 1,
+            file_descriptors_per_partition: 16,
+            available_memory_bytes_per_partition: 256 * 1024 * 1024,
         }
     }
 
@@ -285,7 +416,14 @@ mod tests {
         );
         assert_eq!(decision.explicit_target_partitions, Some(12));
         assert_eq!(decision.datafusion_target_partitions, Some(8));
-        assert_eq!(decision.available_parallelism, Some(4));
+        assert_eq!(decision.environment_profile.available_parallelism, Some(4));
+        assert_eq!(
+            decision.applied_caps,
+            DeltaScanPartitionTargetAppliedCaps {
+                unix_file_descriptor_limit: None,
+                memory_hint: None,
+            }
+        );
         assert_eq!(decision.file_task_partition_options().target_partitions, 12);
 
         Ok(())
@@ -366,6 +504,8 @@ mod tests {
             min_default_partitions: 4,
             max_default_partitions: 64,
             parallelism_multiplier: 2,
+            file_descriptors_per_partition: 16,
+            available_memory_bytes_per_partition: 256 * 1024 * 1024,
         };
 
         let decision = policy.derive_target(context(), config(None, None, Some(8)))?;
@@ -375,6 +515,85 @@ mod tests {
             decision.source,
             DeltaScanPartitionTargetSource::AvailableParallelismFallback
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn unix_file_descriptor_limit_caps_fallback_target() -> Result<(), Box<dyn std::error::Error>> {
+        let config = DeltaScanPartitionTargetConfig {
+            explicit_target_partitions: None,
+            datafusion_target_partitions: None,
+            environment_profile: profile(
+                Some(64),
+                None,
+                Some(DeltaUnixFileDescriptorLimit {
+                    soft_limit: DeltaUnixResourceLimit::Finite(64),
+                    hard_limit: DeltaUnixResourceLimit::Finite(256),
+                }),
+            ),
+        };
+
+        let decision = test_policy().derive_target(context(), config)?;
+
+        assert_eq!(decision.target_partitions, 4);
+        assert_eq!(decision.applied_caps.unix_file_descriptor_limit, Some(4));
+        assert_eq!(decision.applied_caps.memory_hint, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn memory_hint_caps_fallback_target() -> Result<(), Box<dyn std::error::Error>> {
+        let config = DeltaScanPartitionTargetConfig {
+            explicit_target_partitions: None,
+            datafusion_target_partitions: None,
+            environment_profile: profile(
+                Some(64),
+                Some(DeltaMemoryHint {
+                    total_bytes: Some(4 * 1024 * 1024 * 1024),
+                    available_bytes: Some(512 * 1024 * 1024),
+                }),
+                None,
+            ),
+        };
+
+        let decision = test_policy().derive_target(context(), config)?;
+
+        assert_eq!(decision.target_partitions, 2);
+        assert_eq!(decision.applied_caps.unix_file_descriptor_limit, None);
+        assert_eq!(decision.applied_caps.memory_hint, Some(2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn resource_caps_do_not_override_explicit_target() -> Result<(), Box<dyn std::error::Error>> {
+        let config = DeltaScanPartitionTargetConfig {
+            explicit_target_partitions: Some(32),
+            datafusion_target_partitions: None,
+            environment_profile: profile(
+                Some(64),
+                Some(DeltaMemoryHint {
+                    total_bytes: Some(4 * 1024 * 1024 * 1024),
+                    available_bytes: Some(512 * 1024 * 1024),
+                }),
+                Some(DeltaUnixFileDescriptorLimit {
+                    soft_limit: DeltaUnixResourceLimit::Finite(64),
+                    hard_limit: DeltaUnixResourceLimit::Finite(256),
+                }),
+            ),
+        };
+
+        let decision = test_policy().derive_target(context(), config)?;
+
+        assert_eq!(decision.target_partitions, 32);
+        assert_eq!(
+            decision.source,
+            DeltaScanPartitionTargetSource::ExplicitOverride
+        );
+        assert_eq!(decision.applied_caps.unix_file_descriptor_limit, None);
+        assert_eq!(decision.applied_caps.memory_hint, None);
 
         Ok(())
     }
@@ -400,6 +619,8 @@ mod tests {
             min_default_partitions: 0,
             max_default_partitions: 64,
             parallelism_multiplier: 1,
+            file_descriptors_per_partition: 16,
+            available_memory_bytes_per_partition: 256 * 1024 * 1024,
         };
 
         let error = policy

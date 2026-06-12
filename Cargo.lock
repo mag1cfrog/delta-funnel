@@ -1264,8 +1264,10 @@ dependencies = [
  "chrono",
  "datafusion",
  "delta_kernel",
+ "libc",
  "snafu",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
