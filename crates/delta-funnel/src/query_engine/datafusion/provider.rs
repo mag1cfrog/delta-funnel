@@ -26,8 +26,10 @@ use crate::{
 };
 
 use super::execution::DeltaScanPlanningExec;
-use super::file_task_partition::DeltaScanFileTaskPartitionOptions;
 use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
+use super::partition_target::{
+    DeltaScanPartitionTargetConfig, DeltaScanPartitionTargetContext, DeltaScanPartitionTargetPolicy,
+};
 use super::projection::{ProjectionPlan, plan_projection};
 use super::registration::reject_mismatched_preflight;
 use super::scan_plan::{ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest};
@@ -408,14 +410,23 @@ impl TableProvider for DeltaTableProvider {
             requested_projection: projection.cloned(),
             pushed_filters: filters.to_vec(),
         })?;
-        let partition_plan =
-            scan_plan.plan_file_task_partitions(DeltaScanFileTaskPartitionOptions {
-                target_partitions: state.config().target_partitions(),
-            })?;
+        let partition_target_decision = DeltaScanPartitionTargetPolicy::default().derive_target(
+            DeltaScanPartitionTargetContext {
+                source_name: &scan_plan.source_name,
+                table_uri: &scan_plan.table_uri,
+                snapshot_version: scan_plan.snapshot_version,
+            },
+            DeltaScanPartitionTargetConfig::from_datafusion_target(
+                state.config().target_partitions(),
+            ),
+        )?;
+        let partition_plan = scan_plan
+            .plan_file_task_partitions(partition_target_decision.file_task_partition_options())?;
 
         Ok(Arc::new(DeltaScanPlanningExec::new(
             scan_plan,
             partition_plan,
+            partition_target_decision,
         )))
     }
 

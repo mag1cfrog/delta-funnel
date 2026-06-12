@@ -14,11 +14,13 @@ use datafusion::physical_plan::{
 };
 
 use super::file_task_partition::DeltaScanFileTaskPartitionPlan;
+use super::partition_target::DeltaScanPartitionTargetDecision;
 use super::scan_plan::ProviderScanPlan;
 
 pub(crate) struct DeltaScanPlanningExec {
     scan_plan: ProviderScanPlan,
     partition_plan: DeltaScanFileTaskPartitionPlan,
+    partition_target_decision: DeltaScanPartitionTargetDecision,
     properties: Arc<PlanProperties>,
 }
 
@@ -26,6 +28,7 @@ impl DeltaScanPlanningExec {
     pub(crate) fn new(
         scan_plan: ProviderScanPlan,
         partition_plan: DeltaScanFileTaskPartitionPlan,
+        partition_target_decision: DeltaScanPartitionTargetDecision,
     ) -> Self {
         // Empty Delta scans keep the grouped plan's zero partitions. DataFusion
         // accepts this at physical planning time, and it avoids inventing empty
@@ -42,6 +45,7 @@ impl DeltaScanPlanningExec {
         Self {
             scan_plan,
             partition_plan,
+            partition_target_decision,
             properties: Arc::new(properties),
         }
     }
@@ -55,6 +59,11 @@ impl DeltaScanPlanningExec {
     pub(crate) fn partition_plan(&self) -> &DeltaScanFileTaskPartitionPlan {
         &self.partition_plan
     }
+
+    #[cfg(test)]
+    pub(crate) fn partition_target_decision(&self) -> DeltaScanPartitionTargetDecision {
+        self.partition_target_decision
+    }
 }
 
 impl fmt::Debug for DeltaScanPlanningExec {
@@ -64,6 +73,14 @@ impl fmt::Debug for DeltaScanPlanningExec {
             .field("source_name", &self.scan_plan.source_name)
             .field("snapshot_version", &self.scan_plan.snapshot_version)
             .field("scan_projection", &self.scan_plan.scan_projection)
+            .field(
+                "partition_target",
+                &self.partition_target_decision.target_partitions,
+            )
+            .field(
+                "partition_target_source",
+                &self.partition_target_decision.source,
+            )
             .field("partition_count", &self.partition_plan.partitions.len())
             .field(
                 "pushed_filter_count",

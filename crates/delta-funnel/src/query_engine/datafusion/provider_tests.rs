@@ -9,6 +9,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use super::super::execution::DeltaScanPlanningExec;
+use super::super::partition_target::DeltaScanPartitionTargetSource;
 use super::*;
 use crate::query_engine::datafusion::registration::{
     DeltaTableProviderConfig, register_delta_sources,
@@ -534,6 +535,11 @@ async fn table_provider_scan_uses_session_target_partitions_for_file_task_groupi
         .ok_or("expected DeltaScanPlanningExec")?;
 
     assert_eq!(plan.properties().output_partitioning().partition_count(), 2);
+    assert_eq!(delta_plan.partition_target_decision().target_partitions, 2);
+    assert_eq!(
+        delta_plan.partition_target_decision().source,
+        DeltaScanPartitionTargetSource::DataFusionConfig
+    );
     assert_eq!(delta_plan.partition_plan().partitions.len(), 2);
     assert_eq!(
         scan_partition_file_paths(delta_plan),
@@ -667,6 +673,11 @@ async fn table_provider_scan_exec_carries_direct_partition_execution_handoff()
     assert_eq!(partition_plan.table_uri, scan_plan.table_uri);
     assert_eq!(partition_plan.snapshot_version, scan_plan.snapshot_version);
     assert!(partition_plan.scan_metadata_exhausted);
+    assert_eq!(delta_plan.partition_target_decision().target_partitions, 2);
+    assert_eq!(
+        delta_plan.partition_target_decision().source,
+        DeltaScanPartitionTargetSource::DataFusionConfig
+    );
     assert_eq!(partition_plan.partitions.len(), 2);
     assert_eq!(partition_plan.estimated_bytes, Some(96));
 
