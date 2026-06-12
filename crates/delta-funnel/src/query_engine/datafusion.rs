@@ -1,5 +1,9 @@
 //! DataFusion integration.
 
+use datafusion::common::DataFusionError;
+
+use crate::DeltaFunnelError;
+
 mod execution;
 mod file_task;
 mod file_task_partition;
@@ -12,6 +16,12 @@ mod scan_plan;
 pub use registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources, register_delta_sources,
 };
+
+impl From<DeltaFunnelError> for DataFusionError {
+    fn from(error: DeltaFunnelError) -> Self {
+        Self::External(Box::new(error))
+    }
+}
 
 #[cfg(test)]
 mod test_support {
@@ -93,6 +103,42 @@ mod test_support {
             partition_columns_json: &str,
             add_partition_values_jsons: &[&str],
         ) -> Result<Self, Box<dyn std::error::Error>> {
+            let add_partition_values_and_sizes = add_partition_values_jsons
+                .iter()
+                .map(|partition_values_json| (*partition_values_json, 0))
+                .collect::<Vec<_>>();
+
+            Self::new_with_schema_protocol_and_sized_adds(
+                name,
+                protocol_json,
+                schema_fields_json,
+                partition_columns_json,
+                &add_partition_values_and_sizes,
+            )
+        }
+
+        pub(crate) fn new_with_schema_and_sized_adds(
+            name: &str,
+            schema_fields_json: &str,
+            partition_columns_json: &str,
+            add_partition_values_and_sizes: &[(&str, u64)],
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_schema_protocol_and_sized_adds(
+                name,
+                PROTOCOL_JSON,
+                schema_fields_json,
+                partition_columns_json,
+                add_partition_values_and_sizes,
+            )
+        }
+
+        pub(crate) fn new_with_schema_protocol_and_sized_adds(
+            name: &str,
+            protocol_json: &str,
+            schema_fields_json: &str,
+            partition_columns_json: &str,
+            add_partition_values_and_sizes: &[(&str, u64)],
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let path = Path::new("target")
                 .join("delta-funnel-datafusion-provider-tests")
                 .join(unique_name(name)?);
@@ -106,11 +152,15 @@ mod test_support {
                     metadata_json(schema_fields_json, partition_columns_json)
                 ),
             )?;
-            let add_actions = add_partition_values_jsons
+            let add_actions = add_partition_values_and_sizes
                 .iter()
                 .enumerate()
-                .map(|(index, partition_values_json)| {
-                    add_json(&format!("part-{index:05}.parquet"), partition_values_json)
+                .map(|(index, (partition_values_json, size))| {
+                    add_json(
+                        &format!("part-{index:05}.parquet"),
+                        partition_values_json,
+                        *size,
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -140,9 +190,9 @@ mod test_support {
         )
     }
 
-    fn add_json(path: &str, partition_values_json: &str) -> String {
+    fn add_json(path: &str, partition_values_json: &str, size: u64) -> String {
         format!(
-            r#"{{"add":{{"path":"{path}",{partition_values_json},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+            r#"{{"add":{{"path":"{path}",{partition_values_json},"size":{size},"modificationTime":1587968586000,"dataChange":true}}}}"#
         )
     }
 

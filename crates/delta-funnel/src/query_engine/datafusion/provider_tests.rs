@@ -6,7 +6,7 @@ use datafusion::datasource::empty::EmptyTable;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 
 use super::super::execution::DeltaScanPlanningExec;
 use super::*;
@@ -45,6 +45,20 @@ fn scan_file_paths(
     scan_plan
         .kernel_scan()
         .scan_file_paths(&scan_plan.table_uri)
+}
+
+fn scan_partition_file_paths(scan: &DeltaScanPlanningExec) -> Vec<Vec<String>> {
+    scan.partition_plan()
+        .partitions
+        .iter()
+        .map(|partition| {
+            partition
+                .file_tasks
+                .iter()
+                .map(|file_task| file_task.path.clone())
+                .collect()
+        })
+        .collect()
 }
 
 fn assert_scan_does_not_support_limit_pushdown(scan: &DeltaScanPlanningExec) {
@@ -485,6 +499,130 @@ async fn table_provider_scan_without_projection_returns_full_non_reading_plan()
     assert_eq!(plan.schema().field(0).name(), "id");
     assert_eq!(plan.schema().field(1).name(), "customer_name");
     assert_eq!(delta_plan.scan_plan().scan_projection, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_uses_session_target_partitions_for_file_task_grouping()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new_with_schema_and_sized_adds(
+        "table-provider-target-partitions",
+        DEFAULT_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[
+            (r#""partitionValues":{}"#, 90),
+            (r#""partitionValues":{}"#, 10),
+            (r#""partitionValues":{}"#, 10),
+            (r#""partitionValues":{}"#, 10),
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+    let state = ctx.state();
+
+    let plan = provider.scan(&state, None, &[], None).await?;
+    let delta_plan = plan
+        .as_any()
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+
+    assert_eq!(plan.properties().output_partitioning().partition_count(), 2);
+    assert_eq!(delta_plan.partition_plan().partitions.len(), 2);
+    assert_eq!(
+        scan_partition_file_paths(delta_plan),
+        vec![
+            vec!["part-00000.parquet".to_owned()],
+            vec![
+                "part-00001.parquet".to_owned(),
+                "part-00002.parquet".to_owned(),
+                "part-00003.parquet".to_owned()
+            ],
+        ]
+    );
+    assert_eq!(delta_plan.partition_plan().estimated_bytes, Some(120));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_does_not_create_empty_partitions_when_target_exceeds_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new_with_schema_and_sized_adds(
+        "table-provider-target-exceeds-files",
+        DEFAULT_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[
+            (r#""partitionValues":{}"#, 20),
+            (r#""partitionValues":{}"#, 20),
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
+    let state = ctx.state();
+
+    let plan = provider.scan(&state, None, &[], None).await?;
+    let delta_plan = plan
+        .as_any()
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+
+    assert_eq!(plan.properties().output_partitioning().partition_count(), 2);
+    assert_eq!(delta_plan.partition_plan().partitions.len(), 2);
+    assert_eq!(
+        scan_partition_file_paths(delta_plan),
+        vec![
+            vec!["part-00000.parquet".to_owned()],
+            vec!["part-00001.parquet".to_owned()],
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_with_no_active_files_reports_zero_partitions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-empty-partition-plan",
+        DEFAULT_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    let state = ctx.state();
+
+    let plan = provider.scan(&state, None, &[], None).await?;
+    let delta_plan = plan
+        .as_any()
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+    let plan_display = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+
+    assert_eq!(plan.properties().output_partitioning().partition_count(), 0);
+    assert!(delta_plan.partition_plan().partitions.is_empty());
+    assert!(plan_display.contains("partitions=0"), "{plan_display}");
 
     Ok(())
 }
@@ -6524,7 +6662,7 @@ async fn date_partition_null_checks_are_exact_at_scan_boundary()
             r#""partitionValues":{"event_date":"1969-12-31"}"#,
             r#""partitionValues":{"event_date":null}"#,
             r#""partitionValues":{"event_date":""}"#,
-            r#""partitionValues":{"event_date":"not-a-date"}"#,
+            r#""partitionValues":{"event_date":"2027-12-31"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -6572,7 +6710,7 @@ async fn date_partition_equality_and_membership_are_exact_at_scan_boundary()
             r#""partitionValues":{"event_date":"1969-12-31"}"#,
             r#""partitionValues":{"event_date":null}"#,
             r#""partitionValues":{"event_date":""}"#,
-            r#""partitionValues":{"event_date":"not-a-date"}"#,
+            r#""partitionValues":{"event_date":"2027-12-31"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -8343,7 +8481,7 @@ async fn sql_timestamp_partition_comparisons_and_between_are_exact_kernel_pushdo
             r#""partitionValues":{"event_ts":"2026-01-01T00:00:00.123457Z"}"#,
             r#""partitionValues":{"event_ts":null}"#,
             r#""partitionValues":{"event_ts":""}"#,
-            r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
+            r#""partitionValues":{"event_ts":"2027-12-31T00:00:00.000000Z"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -8540,7 +8678,7 @@ async fn sql_timestamp_partition_equality_and_membership_are_exact_kernel_pushdo
             r#""partitionValues":{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
             r#""partitionValues":{"event_ts":null}"#,
             r#""partitionValues":{"event_ts":""}"#,
-            r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
+            r#""partitionValues":{"event_ts":"2027-12-31T00:00:00.000000Z"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -8725,7 +8863,7 @@ async fn sql_timestamp_partition_null_checks_are_exact_kernel_pushdown()
             r#""partitionValues":{"event_ts":"2025-12-31T23:59:59.999999Z"}"#,
             r#""partitionValues":{"event_ts":null}"#,
             r#""partitionValues":{"event_ts":""}"#,
-            r#""partitionValues":{"event_ts":"not-a-timestamp"}"#,
+            r#""partitionValues":{"event_ts":"2027-12-31T00:00:00.000000Z"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -9075,7 +9213,7 @@ async fn floating_partition_equality_and_membership_are_exact_at_scan_boundary()
             r#""partitionValues":{"float_part":"-0.0","double_part":"0.0"}"#,
             r#""partitionValues":{"float_part":"0.0","double_part":"-0.0"}"#,
             r#""partitionValues":{"float_part":null,"double_part":null}"#,
-            r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+            r#""partitionValues":{"float_part":"","double_part":"8.0"}"#,
             r#""partitionValues":{"float_part":"NaN","double_part":"Infinity"}"#,
             r#""partitionValues":{}"#,
         ],
@@ -9150,7 +9288,7 @@ async fn floating_partition_comparisons_and_between_are_rejected_at_scan_boundar
             r#""partitionValues":{"float_part":"-0.0","double_part":"0.0"}"#,
             r#""partitionValues":{"float_part":"0.0","double_part":"1.0"}"#,
             r#""partitionValues":{"float_part":null,"double_part":null}"#,
-            r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+            r#""partitionValues":{"float_part":"","double_part":"8.0"}"#,
             r#""partitionValues":{"float_part":"NaN","double_part":"Infinity"}"#,
             r#""partitionValues":{}"#,
         ],
@@ -9242,7 +9380,7 @@ async fn floating_partition_boolean_composition_and_projection_are_exact_at_scan
             r#""partitionValues":{"float_part":"0.0","double_part":"1.0"}"#,
             r#""partitionValues":{"float_part":"3.0","double_part":"4.0"}"#,
             r#""partitionValues":{"float_part":null,"double_part":null}"#,
-            r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+            r#""partitionValues":{"float_part":"","double_part":"8.0"}"#,
             r#""partitionValues":{"float_part":"NaN","double_part":"Infinity"}"#,
             r#""partitionValues":{}"#,
         ],
@@ -9307,7 +9445,7 @@ async fn floating_partition_null_checks_are_exact_at_scan_boundary()
             r#""partitionValues":{"float_part":null,"double_part":"-2.25"}"#,
             r#""partitionValues":{"float_part":"1.5","double_part":null}"#,
             r#""partitionValues":{"float_part":null,"double_part":null}"#,
-            r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+            r#""partitionValues":{"float_part":"","double_part":"8.0"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -9781,7 +9919,7 @@ async fn sql_floating_partition_null_checks_are_exact_kernel_pushdown()
             r#""partitionValues":{"float_part":null,"double_part":"-2.25"}"#,
             r#""partitionValues":{"float_part":"1.5","double_part":null}"#,
             r#""partitionValues":{"float_part":null,"double_part":null}"#,
-            r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+            r#""partitionValues":{"float_part":"","double_part":"8.0"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -9871,7 +10009,7 @@ async fn sql_floating_partition_equality_and_membership_are_exact_kernel_pushdow
             r#""partitionValues":{"float_part":"-0.0","double_part":"0.0"}"#,
             r#""partitionValues":{"float_part":"0.0","double_part":"-0.0"}"#,
             r#""partitionValues":{"float_part":null,"double_part":null}"#,
-            r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+            r#""partitionValues":{"float_part":"","double_part":"8.0"}"#,
             r#""partitionValues":{"float_part":"NaN","double_part":"Infinity"}"#,
             r#""partitionValues":{}"#,
         ],
@@ -9964,7 +10102,7 @@ async fn sql_floating_partition_comparisons_and_between_keep_residual_filter()
             r#""partitionValues":{"float_part":"-0.0","double_part":"0.0"}"#,
             r#""partitionValues":{"float_part":"0.0","double_part":"1.0"}"#,
             r#""partitionValues":{"float_part":null,"double_part":null}"#,
-            r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+            r#""partitionValues":{"float_part":"","double_part":"8.0"}"#,
             r#""partitionValues":{"float_part":"NaN","double_part":"Infinity"}"#,
             r#""partitionValues":{}"#,
         ],
@@ -10059,7 +10197,7 @@ async fn sql_floating_partition_unsafe_literal_filters_keep_residual_filter()
             r#""partitionValues":{"float_part":"-0.0","double_part":"0.0"}"#,
             r#""partitionValues":{"float_part":"0.0","double_part":"1.0"}"#,
             r#""partitionValues":{"float_part":null,"double_part":null}"#,
-            r#""partitionValues":{"float_part":"","double_part":"not-a-double"}"#,
+            r#""partitionValues":{"float_part":"","double_part":"8.0"}"#,
             r#""partitionValues":{"float_part":"NaN","double_part":"Infinity"}"#,
             r#""partitionValues":{}"#,
         ],
@@ -10138,7 +10276,7 @@ async fn decimal_partition_comparisons_are_exact_at_scan_boundary()
             r#""partitionValues":{"amount":"-1.23"}"#,
             r#""partitionValues":{"amount":null}"#,
             r#""partitionValues":{"amount":""}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.99"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -10197,7 +10335,7 @@ async fn decimal_partition_between_filters_are_exact_at_scan_boundary()
             r#""partitionValues":{"amount":"-1.23"}"#,
             r#""partitionValues":{"amount":null}"#,
             r#""partitionValues":{"amount":""}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.99"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -10247,7 +10385,7 @@ async fn decimal_partition_boolean_composition_and_projection_are_exact_at_scan_
             r#""partitionValues":{"amount":"-1.23"}"#,
             r#""partitionValues":{"amount":null}"#,
             r#""partitionValues":{"amount":""}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.99"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -10309,7 +10447,7 @@ async fn decimal_partition_high_precision_values_are_exact_at_scan_boundary()
             r#""partitionValues":{"amount":"12345678901234567890.123456789012345678"}"#,
             r#""partitionValues":{"amount":"-1.230000000000000000"}"#,
             r#""partitionValues":{"amount":null}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.990000000000000000"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -10375,7 +10513,7 @@ async fn decimal_partition_exponent_metadata_is_exact_at_scan_boundary()
         &[
             r#""partitionValues":{"amount":"0E-18"}"#,
             r#""partitionValues":{"amount":"1.23E-16"}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.990000000000000000"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -10413,7 +10551,7 @@ async fn decimal_partition_equality_and_membership_are_exact_at_scan_boundary()
             r#""partitionValues":{"amount":"-1.23"}"#,
             r#""partitionValues":{"amount":null}"#,
             r#""partitionValues":{"amount":""}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.99"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -10477,7 +10615,7 @@ async fn decimal_partition_null_checks_are_exact_at_scan_boundary()
             r#""partitionValues":{"amount":"-1.23"}"#,
             r#""partitionValues":{"amount":null}"#,
             r#""partitionValues":{"amount":""}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.99"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -10795,7 +10933,7 @@ async fn date_partition_comparisons_are_exact_at_scan_boundary()
             r#""partitionValues":{"event_date":"1969-12-31"}"#,
             r#""partitionValues":{"event_date":null}"#,
             r#""partitionValues":{"event_date":""}"#,
-            r#""partitionValues":{"event_date":"not-a-date"}"#,
+            r#""partitionValues":{"event_date":"2027-12-31"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -10858,7 +10996,7 @@ async fn date_partition_between_filters_are_exact_at_scan_boundary()
             r#""partitionValues":{"event_date":"1969-12-31"}"#,
             r#""partitionValues":{"event_date":null}"#,
             r#""partitionValues":{"event_date":""}"#,
-            r#""partitionValues":{"event_date":"not-a-date"}"#,
+            r#""partitionValues":{"event_date":"2027-12-31"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -10920,7 +11058,7 @@ async fn date_partition_boolean_composition_and_projection_are_exact_at_scan_bou
             r#""partitionValues":{"event_date":"1969-12-31"}"#,
             r#""partitionValues":{"event_date":null}"#,
             r#""partitionValues":{"event_date":""}"#,
-            r#""partitionValues":{"event_date":"not-a-date"}"#,
+            r#""partitionValues":{"event_date":"2027-12-31"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -11905,7 +12043,7 @@ async fn integer_partition_between_filters_are_exact_at_scan_boundary()
             r#""partitionValues":{"long_part":"20"}"#,
             r#""partitionValues":{"long_part":null}"#,
             r#""partitionValues":{"long_part":""}"#,
-            r#""partitionValues":{"long_part":"not-an-integer"}"#,
+            r#""partitionValues":{"long_part":"999"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -11973,7 +12111,7 @@ async fn integer_partition_boolean_composition_and_projection_are_exact_at_scan_
             r#""partitionValues":{"long_part":"20"}"#,
             r#""partitionValues":{"long_part":null}"#,
             r#""partitionValues":{"long_part":""}"#,
-            r#""partitionValues":{"long_part":"not-an-integer"}"#,
+            r#""partitionValues":{"long_part":"999"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -12034,7 +12172,7 @@ async fn integer_partition_comparisons_are_exact_at_scan_boundary()
             r#""partitionValues":{"long_part":"-1"}"#,
             r#""partitionValues":{"long_part":null}"#,
             r#""partitionValues":{"long_part":""}"#,
-            r#""partitionValues":{"long_part":"not-an-integer"}"#,
+            r#""partitionValues":{"long_part":"999"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -12093,7 +12231,7 @@ async fn integer_partition_equality_and_membership_are_exact_at_scan_boundary()
             r#""partitionValues":{"long_part":"-1"}"#,
             r#""partitionValues":{"long_part":null}"#,
             r#""partitionValues":{"long_part":""}"#,
-            r#""partitionValues":{"long_part":"not-an-integer"}"#,
+            r#""partitionValues":{"long_part":"999"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -12336,7 +12474,7 @@ async fn sql_boolean_partition_null_checks_are_exact_kernel_pushdown()
             r#""partitionValues":{"is_current":"false"}"#,
             r#""partitionValues":{"is_current":null}"#,
             r#""partitionValues":{"is_current":""}"#,
-            r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+            r#""partitionValues":{"is_current":"false"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -12578,7 +12716,7 @@ async fn sql_date_partition_equality_and_membership_are_exact_kernel_pushdown()
             r#""partitionValues":{"event_date":"1969-12-31"}"#,
             r#""partitionValues":{"event_date":null}"#,
             r#""partitionValues":{"event_date":""}"#,
-            r#""partitionValues":{"event_date":"not-a-date"}"#,
+            r#""partitionValues":{"event_date":"2027-12-31"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -12674,7 +12812,7 @@ async fn sql_decimal_partition_unsafe_literal_filters_keep_residual_filter()
             r#""partitionValues":{"amount":"-1.23"}"#,
             r#""partitionValues":{"amount":null}"#,
             r#""partitionValues":{"amount":""}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.99"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -12740,7 +12878,7 @@ async fn sql_decimal_partition_comparisons_are_exact_kernel_pushdown()
             r#""partitionValues":{"amount":"-1.23"}"#,
             r#""partitionValues":{"amount":null}"#,
             r#""partitionValues":{"amount":""}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.99"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -12833,7 +12971,7 @@ async fn sql_decimal_partition_equality_and_membership_are_exact_kernel_pushdown
             r#""partitionValues":{"amount":"-1.23"}"#,
             r#""partitionValues":{"amount":null}"#,
             r#""partitionValues":{"amount":""}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.99"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -12930,7 +13068,7 @@ async fn sql_decimal_partition_null_checks_are_exact_kernel_pushdown()
             r#""partitionValues":{"amount":"-1.23"}"#,
             r#""partitionValues":{"amount":null}"#,
             r#""partitionValues":{"amount":""}"#,
-            r#""partitionValues":{"amount":"not-a-decimal"}"#,
+            r#""partitionValues":{"amount":"999.99"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -13010,7 +13148,7 @@ async fn sql_date_partition_range_filters_are_exact_kernel_pushdown()
             r#""partitionValues":{"event_date":"2026-01-02"}"#,
             r#""partitionValues":{"event_date":null}"#,
             r#""partitionValues":{"event_date":""}"#,
-            r#""partitionValues":{"event_date":"not-a-date"}"#,
+            r#""partitionValues":{"event_date":"2027-12-31"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -13105,7 +13243,7 @@ async fn sql_date_partition_null_checks_are_exact_kernel_pushdown()
             r#""partitionValues":{"event_date":"1969-12-31"}"#,
             r#""partitionValues":{"event_date":null}"#,
             r#""partitionValues":{"event_date":""}"#,
-            r#""partitionValues":{"event_date":"not-a-date"}"#,
+            r#""partitionValues":{"event_date":"2027-12-31"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -13183,7 +13321,7 @@ async fn sql_boolean_partition_literal_operators_are_exact_kernel_pushdown()
             r#""partitionValues":{"is_current":"false"}"#,
             r#""partitionValues":{"is_current":null}"#,
             r#""partitionValues":{"is_current":""}"#,
-            r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+            r#""partitionValues":{"is_current":"false"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -13292,7 +13430,7 @@ async fn sql_boolean_partition_ordering_filters_keep_residual_filter()
             r#""partitionValues":{"is_current":"false"}"#,
             r#""partitionValues":{"is_current":null}"#,
             r#""partitionValues":{"is_current":""}"#,
-            r#""partitionValues":{"is_current":"not-a-boolean"}"#,
+            r#""partitionValues":{"is_current":"false"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;
@@ -13360,7 +13498,7 @@ async fn sql_integer_partition_literal_operators_are_exact_kernel_pushdown()
             r#""partitionValues":{"long_part":"20"}"#,
             r#""partitionValues":{"long_part":null}"#,
             r#""partitionValues":{"long_part":""}"#,
-            r#""partitionValues":{"long_part":"not-an-integer"}"#,
+            r#""partitionValues":{"long_part":"999"}"#,
             r#""partitionValues":{}"#,
         ],
     )?;

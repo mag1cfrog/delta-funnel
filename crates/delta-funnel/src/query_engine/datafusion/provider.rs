@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{
-    Column, DataFusionError, Result as DataFusionResult,
+    Column, Result as DataFusionResult,
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion::datasource::{TableProvider, TableType};
@@ -26,6 +26,7 @@ use crate::{
 };
 
 use super::execution::DeltaScanPlanningExec;
+use super::file_task_partition::DeltaScanFileTaskPartitionOptions;
 use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
 use super::projection::{ProjectionPlan, plan_projection};
 use super::registration::reject_mismatched_preflight;
@@ -394,7 +395,7 @@ impl TableProvider for DeltaTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         _limit: Option<usize>,
@@ -403,14 +404,19 @@ impl TableProvider for DeltaTableProvider {
         // provider limit as advisory until a scan-local limit case is proven
         // safe across residual filters, joins, deletion vectors, transforms, and
         // ordering-sensitive plans.
-        let scan_plan = self
-            .plan_scan(ProviderScanPlanRequest {
-                requested_projection: projection.cloned(),
-                pushed_filters: filters.to_vec(),
-            })
-            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let scan_plan = self.plan_scan(ProviderScanPlanRequest {
+            requested_projection: projection.cloned(),
+            pushed_filters: filters.to_vec(),
+        })?;
+        let partition_plan =
+            scan_plan.plan_file_task_partitions(DeltaScanFileTaskPartitionOptions {
+                target_partitions: state.config().target_partitions(),
+            })?;
 
-        Ok(Arc::new(DeltaScanPlanningExec::new(scan_plan)))
+        Ok(Arc::new(DeltaScanPlanningExec::new(
+            scan_plan,
+            partition_plan,
+        )))
     }
 
     fn supports_filters_pushdown(

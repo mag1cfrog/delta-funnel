@@ -13,18 +13,24 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 
+use super::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::scan_plan::ProviderScanPlan;
 
 pub(crate) struct DeltaScanPlanningExec {
     scan_plan: ProviderScanPlan,
+    partition_plan: DeltaScanFileTaskPartitionPlan,
     properties: Arc<PlanProperties>,
 }
 
 impl DeltaScanPlanningExec {
-    pub(crate) fn new(scan_plan: ProviderScanPlan) -> Self {
+    pub(crate) fn new(
+        scan_plan: ProviderScanPlan,
+        partition_plan: DeltaScanFileTaskPartitionPlan,
+    ) -> Self {
+        let partition_count = partition_plan.partitions.len();
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&scan_plan.projected_schema)),
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(partition_count),
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
@@ -32,6 +38,7 @@ impl DeltaScanPlanningExec {
 
         Self {
             scan_plan,
+            partition_plan,
             properties: Arc::new(properties),
         }
     }
@@ -39,6 +46,11 @@ impl DeltaScanPlanningExec {
     #[cfg(test)]
     pub(crate) fn scan_plan(&self) -> &ProviderScanPlan {
         &self.scan_plan
+    }
+
+    #[cfg(test)]
+    pub(crate) fn partition_plan(&self) -> &DeltaScanFileTaskPartitionPlan {
+        &self.partition_plan
     }
 }
 
@@ -49,6 +61,7 @@ impl fmt::Debug for DeltaScanPlanningExec {
             .field("source_name", &self.scan_plan.source_name)
             .field("snapshot_version", &self.scan_plan.snapshot_version)
             .field("scan_projection", &self.scan_plan.scan_projection)
+            .field("partition_count", &self.partition_plan.partitions.len())
             .field(
                 "pushed_filter_count",
                 &self.scan_plan.pushed_filter_plan.pushed_filter_count,
@@ -66,10 +79,11 @@ impl DisplayAs for DeltaScanPlanningExec {
         match display_type {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 formatter,
-                "DeltaScanPlanningExec: source={}, snapshot_version={}, projection={:?}",
+                "DeltaScanPlanningExec: source={}, snapshot_version={}, projection={:?}, partitions={}",
                 self.scan_plan.source_name,
                 self.scan_plan.snapshot_version,
-                self.scan_plan.scan_projection
+                self.scan_plan.scan_projection,
+                self.partition_plan.partitions.len()
             ),
             DisplayFormatType::TreeRender => write!(formatter, "DeltaScanPlanningExec"),
         }
