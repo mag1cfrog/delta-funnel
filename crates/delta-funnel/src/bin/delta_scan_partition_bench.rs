@@ -10,12 +10,15 @@ const MIB: u64 = 1024 * 1024;
 fn main() -> Result<(), Box<dyn Error>> {
     let shape = SyntheticDeltaTableShape::partitioned_event_log();
     let file_set = shape.generate_file_set()?;
+    let simulation = SyntheticWorkSimulationProfile::s3_normal();
+    let simulation_profile_count = SyntheticWorkSimulationProfile::standard_profiles().len();
+    let simulated_work = simulation.simulate_file_set(&file_set)?;
 
     println!(
-        "shape_name,total_rows,active_files,active_bytes,active_mib,avg_file_size_bytes,partition_count,generated_files,generated_rows,generated_bytes,max_files_per_partition,source_rows,string_columns,int_columns,double_columns,bigint_columns,timestamp_columns,boolean_columns"
+        "shape_name,total_rows,active_files,active_bytes,active_mib,avg_file_size_bytes,partition_count,generated_files,generated_rows,generated_bytes,max_files_per_partition,source_rows,string_columns,int_columns,double_columns,bigint_columns,timestamp_columns,boolean_columns,simulation_profile_count,simulation_profile,simulated_serial_micros,simulated_max_file_micros"
     );
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         shape.name,
         shape.total_rows,
         shape.active_file_count,
@@ -33,7 +36,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         shape.schema.type_count(SyntheticDataType::Double),
         shape.schema.type_count(SyntheticDataType::Bigint),
         shape.schema.type_count(SyntheticDataType::Timestamp),
-        shape.schema.type_count(SyntheticDataType::Boolean)
+        shape.schema.type_count(SyntheticDataType::Boolean),
+        simulation_profile_count,
+        simulation.name,
+        simulated_work.serial_micros,
+        simulated_work.max_file_micros
     );
 
     Ok(())
@@ -76,6 +83,34 @@ struct SyntheticFile {
     file_index_in_partition: usize,
     rows: u64,
     size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyntheticWorkSimulationProfile {
+    name: &'static str,
+    open_latency_micros: u64,
+    read_latency_micros: u64,
+    bandwidth_bytes_per_second: u64,
+    cpu_micros_per_1k_rows: u64,
+    jitter_basis_points: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntheticWorkSimulationResult {
+    profile_name: &'static str,
+    file_costs: Vec<SyntheticFileWorkCost>,
+    serial_micros: u64,
+    max_file_micros: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyntheticFileWorkCost {
+    file_index: usize,
+    size_bytes: u64,
+    rows: u64,
+    base_micros: u64,
+    jitter_micros: u64,
+    total_micros: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,6 +554,140 @@ impl SyntheticFileSet {
     }
 }
 
+impl SyntheticWorkSimulationProfile {
+    fn local_fast() -> Self {
+        Self {
+            name: "local_fast",
+            open_latency_micros: 100,
+            read_latency_micros: 50,
+            bandwidth_bytes_per_second: 1_500 * MIB,
+            cpu_micros_per_1k_rows: 8,
+            jitter_basis_points: 250,
+        }
+    }
+
+    fn s3_normal() -> Self {
+        Self {
+            name: "s3_normal",
+            open_latency_micros: 8_000,
+            read_latency_micros: 4_000,
+            bandwidth_bytes_per_second: 125 * MIB,
+            cpu_micros_per_1k_rows: 10,
+            jitter_basis_points: 1_500,
+        }
+    }
+
+    fn s3_high_latency() -> Self {
+        Self {
+            name: "s3_high_latency",
+            open_latency_micros: 35_000,
+            read_latency_micros: 20_000,
+            bandwidth_bytes_per_second: 100 * MIB,
+            cpu_micros_per_1k_rows: 10,
+            jitter_basis_points: 2_500,
+        }
+    }
+
+    fn s3_throttled() -> Self {
+        Self {
+            name: "s3_throttled",
+            open_latency_micros: 15_000,
+            read_latency_micros: 8_000,
+            bandwidth_bytes_per_second: 32 * MIB,
+            cpu_micros_per_1k_rows: 10,
+            jitter_basis_points: 2_000,
+        }
+    }
+
+    fn cpu_heavy() -> Self {
+        Self {
+            name: "cpu_heavy",
+            open_latency_micros: 1_000,
+            read_latency_micros: 500,
+            bandwidth_bytes_per_second: 500 * MIB,
+            cpu_micros_per_1k_rows: 80,
+            jitter_basis_points: 500,
+        }
+    }
+
+    fn standard_profiles() -> [Self; 5] {
+        [
+            Self::local_fast(),
+            Self::s3_normal(),
+            Self::s3_high_latency(),
+            Self::s3_throttled(),
+            Self::cpu_heavy(),
+        ]
+    }
+
+    fn simulate_file_set(
+        self,
+        file_set: &SyntheticFileSet,
+    ) -> Result<SyntheticWorkSimulationResult, SyntheticGenerationError> {
+        let mut serial_micros = 0_u64;
+        let mut max_file_micros = 0_u64;
+        let mut file_costs = Vec::with_capacity(file_set.files.len());
+
+        for (file_index, file) in file_set.files.iter().enumerate() {
+            let cost = self.simulate_file(file_index, file)?;
+            serial_micros = serial_micros
+                .checked_add(cost.total_micros)
+                .ok_or_else(|| generation_error("simulated serial time overflow"))?;
+            max_file_micros = max_file_micros.max(cost.total_micros);
+            file_costs.push(cost);
+        }
+
+        Ok(SyntheticWorkSimulationResult {
+            profile_name: self.name,
+            file_costs,
+            serial_micros,
+            max_file_micros,
+        })
+    }
+
+    fn simulate_file(
+        self,
+        file_index: usize,
+        file: &SyntheticFile,
+    ) -> Result<SyntheticFileWorkCost, SyntheticGenerationError> {
+        let transfer_micros = scaled_ceil_div(
+            file.size_bytes,
+            1_000_000,
+            self.bandwidth_bytes_per_second,
+            "transfer time",
+        )?;
+        let cpu_micros =
+            scaled_ceil_div(file.rows, self.cpu_micros_per_1k_rows, 1_000, "cpu time")?;
+        let base_micros = self
+            .open_latency_micros
+            .checked_add(self.read_latency_micros)
+            .and_then(|value| value.checked_add(transfer_micros))
+            .and_then(|value| value.checked_add(cpu_micros))
+            .ok_or_else(|| generation_error("simulated file base time overflow"))?;
+        let jitter_micros = scaled_ceil_div(
+            base_micros,
+            u64::from(deterministic_jitter_basis_points(
+                file,
+                self.jitter_basis_points,
+            )),
+            10_000,
+            "jitter time",
+        )?;
+        let total_micros = base_micros
+            .checked_add(jitter_micros)
+            .ok_or_else(|| generation_error("simulated file total time overflow"))?;
+
+        Ok(SyntheticFileWorkCost {
+            file_index,
+            size_bytes: file.size_bytes,
+            rows: file.rows,
+            base_micros,
+            jitter_micros,
+            total_micros,
+        })
+    }
+}
+
 impl SyntheticDate {
     fn to_naive(self) -> Result<NaiveDate, SyntheticGenerationError> {
         NaiveDate::from_ymd_opt(self.year, u32::from(self.month), u32::from(self.day))
@@ -710,6 +879,56 @@ fn apportion_by_weights(total: u64, weights: &[u64]) -> Result<Vec<u64>, Synthet
     }
 
     Ok(values)
+}
+
+fn scaled_ceil_div(
+    value: u64,
+    scale: u64,
+    denominator: u64,
+    label: &str,
+) -> Result<u64, SyntheticGenerationError> {
+    if value == 0 || scale == 0 {
+        return Ok(0);
+    }
+    if denominator == 0 {
+        return Err(generation_error(format!("{label} denominator is zero")));
+    }
+
+    let scaled = u128::from(value) * u128::from(scale);
+    let denominator = u128::from(denominator);
+    let rounded = scaled.div_ceil(denominator);
+
+    u64::try_from(rounded).map_err(|_| generation_error(format!("{label} does not fit into u64")))
+}
+
+fn deterministic_jitter_basis_points(file: &SyntheticFile, max_basis_points: u16) -> u16 {
+    if max_basis_points == 0 {
+        return 0;
+    }
+
+    let hash = deterministic_file_hash(file);
+    let range = u64::from(max_basis_points) + 1;
+
+    (hash % range) as u16
+}
+
+fn deterministic_file_hash(file: &SyntheticFile) -> u64 {
+    let mut hash = 14_695_981_039_346_656_037_u64;
+
+    for byte in file.path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    for byte in file.rows.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    for byte in file.size_bytes.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+
+    hash
 }
 
 fn synthetic_file_path(date: SyntheticDate, file_index: usize) -> String {
@@ -962,6 +1181,68 @@ mod tests {
         let shape = SyntheticDeltaTableShape::partitioned_event_log();
 
         assert_eq!(shape.generate_file_set()?, shape.generate_file_set()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn standard_simulation_profiles_are_stable() {
+        let profiles = SyntheticWorkSimulationProfile::standard_profiles();
+
+        assert_eq!(
+            profiles.map(|profile| profile.name),
+            [
+                "local_fast",
+                "s3_normal",
+                "s3_high_latency",
+                "s3_throttled",
+                "cpu_heavy"
+            ]
+        );
+        assert!(profiles.iter().all(|profile| {
+            profile.bandwidth_bytes_per_second > 0 && profile.jitter_basis_points <= 10_000
+        }));
+    }
+
+    #[test]
+    fn simulated_file_work_is_deterministic() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+        let profile = SyntheticWorkSimulationProfile::s3_normal();
+
+        assert_eq!(
+            profile.simulate_file_set(&file_set)?,
+            profile.simulate_file_set(&file_set)?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn simulated_storage_profiles_change_total_work() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+        let local = SyntheticWorkSimulationProfile::local_fast().simulate_file_set(&file_set)?;
+        let normal = SyntheticWorkSimulationProfile::s3_normal().simulate_file_set(&file_set)?;
+        let high_latency =
+            SyntheticWorkSimulationProfile::s3_high_latency().simulate_file_set(&file_set)?;
+        let cpu_heavy = SyntheticWorkSimulationProfile::cpu_heavy().simulate_file_set(&file_set)?;
+
+        assert_eq!(normal.profile_name, "s3_normal");
+        assert_eq!(normal.file_costs.len(), file_set.files.len());
+        assert!(normal.serial_micros > local.serial_micros);
+        assert!(high_latency.serial_micros > normal.serial_micros);
+        assert!(cpu_heavy.serial_micros > local.serial_micros);
+        assert!(normal.max_file_micros <= normal.serial_micros);
+
+        Ok(())
+    }
+
+    #[test]
+    fn scaled_ceil_div_handles_zero_and_rounding() -> Result<(), Box<dyn Error>> {
+        assert_eq!(scaled_ceil_div(0, 1_000, 7, "test")?, 0);
+        assert_eq!(scaled_ceil_div(10, 1_000, 10, "test")?, 1_000);
+        assert_eq!(scaled_ceil_div(10, 1_000, 6, "test")?, 1_667);
 
         Ok(())
     }
