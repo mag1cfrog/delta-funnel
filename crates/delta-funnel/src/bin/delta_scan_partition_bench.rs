@@ -19,7 +19,12 @@ const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
     [64 * MIB, 128 * MIB, 256 * MIB, 512 * MIB];
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
-const BENCHMARK_CSV_HEADER: [&str; 36] = [
+const BENCHMARK_SCHEMA_VERSION: u32 = 1;
+const BENCHMARK_CSV_HEADER: [&str; 40] = [
+    "benchmark_schema_version",
+    "host_os",
+    "host_arch",
+    "host_available_parallelism",
     "shape_name",
     "total_rows",
     "active_files",
@@ -79,10 +84,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn write_benchmark_csv(output: &mut impl Write) -> Result<(), Box<dyn Error>> {
+    let run_environment = BenchmarkRunEnvironment::local();
     let shape = SyntheticDeltaTableShape::partitioned_event_log();
     let file_set = shape.generate_file_set()?;
     let simulation_profiles = SyntheticWorkSimulationProfile::standard_profiles();
-    let policy_cases = BenchmarkPolicyCase::standard_cases(local_available_parallelism());
+    let policy_cases = BenchmarkPolicyCase::standard_cases(run_environment.available_parallelism);
 
     writeln!(output, "{}", BENCHMARK_CSV_HEADER.join(","))?;
     for simulation in simulation_profiles {
@@ -99,6 +105,7 @@ fn write_benchmark_csv(output: &mut impl Write) -> Result<(), Box<dyn Error>> {
                 benchmark_csv_row(BenchmarkCsvRowInput {
                     shape: &shape,
                     file_set: &file_set,
+                    run_environment,
                     simulation_profile_count: simulation_profiles.len(),
                     simulation,
                     policy_case,
@@ -137,6 +144,14 @@ struct BenchmarkRunnerConfig {
     show_help: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BenchmarkRunEnvironment {
+    schema_version: u32,
+    host_os: &'static str,
+    host_arch: &'static str,
+    available_parallelism: Option<usize>,
+}
+
 impl BenchmarkRunnerConfig {
     fn parse<I>(args: I) -> Result<Self, BenchmarkRunnerConfigError>
     where
@@ -168,6 +183,17 @@ impl BenchmarkRunnerConfig {
             output_path,
             show_help,
         })
+    }
+}
+
+impl BenchmarkRunEnvironment {
+    fn local() -> Self {
+        Self {
+            schema_version: BENCHMARK_SCHEMA_VERSION,
+            host_os: env::consts::OS,
+            host_arch: env::consts::ARCH,
+            available_parallelism: local_available_parallelism(),
+        }
     }
 }
 
@@ -239,6 +265,7 @@ struct BenchmarkPolicyCase {
 struct BenchmarkCsvRowInput<'a> {
     shape: &'a SyntheticDeltaTableShape,
     file_set: &'a SyntheticFileSet,
+    run_environment: BenchmarkRunEnvironment,
     simulation_profile_count: usize,
     simulation: SyntheticWorkSimulationProfile,
     policy_case: &'a BenchmarkPolicyCase,
@@ -1307,6 +1334,10 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
     let policy_decision = input.policy_decision;
 
     vec![
+        input.run_environment.schema_version.to_string(),
+        input.run_environment.host_os.to_owned(),
+        input.run_environment.host_arch.to_owned(),
+        optional_usize(input.run_environment.available_parallelism),
         shape.name.to_owned(),
         shape.total_rows.to_string(),
         shape.active_file_count.to_string(),
@@ -1541,11 +1572,20 @@ mod tests {
         let lines = csv.lines().collect::<Vec<_>>();
 
         assert_eq!(lines.len(), 126);
-        assert!(lines[0].starts_with("shape_name,total_rows"));
+        assert!(lines[0].starts_with("benchmark_schema_version,host_os,host_arch"));
         assert!(csv.contains(",local_fast,default_policy,"));
         assert!(csv.contains(",s3_normal,combined_fd_16_memory_256mib,"));
 
         Ok(())
+    }
+
+    #[test]
+    fn benchmark_run_environment_records_local_host_metadata() {
+        let environment = BenchmarkRunEnvironment::local();
+
+        assert_eq!(environment.schema_version, BENCHMARK_SCHEMA_VERSION);
+        assert_eq!(environment.host_os, env::consts::OS);
+        assert_eq!(environment.host_arch, env::consts::ARCH);
     }
 
     #[test]
@@ -2013,14 +2053,18 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 36);
-        assert_eq!(BENCHMARK_CSV_HEADER[20], "policy_case");
-        assert_eq!(BENCHMARK_CSV_HEADER[21], "policy_available_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[22], "policy_datafusion_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[23], "policy_available_memory_bytes");
-        assert_eq!(BENCHMARK_CSV_HEADER[24], "policy_unix_soft_fd_limit");
-        assert_eq!(BENCHMARK_CSV_HEADER[27], "policy_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[28], "policy_source");
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 40);
+        assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
+        assert_eq!(BENCHMARK_CSV_HEADER[1], "host_os");
+        assert_eq!(BENCHMARK_CSV_HEADER[2], "host_arch");
+        assert_eq!(BENCHMARK_CSV_HEADER[3], "host_available_parallelism");
+        assert_eq!(BENCHMARK_CSV_HEADER[24], "policy_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[25], "policy_available_parallelism");
+        assert_eq!(BENCHMARK_CSV_HEADER[26], "policy_datafusion_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[27], "policy_available_memory_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[28], "policy_unix_soft_fd_limit");
+        assert_eq!(BENCHMARK_CSV_HEADER[31], "policy_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[32], "policy_source");
     }
 
     #[test]
@@ -2037,6 +2081,12 @@ mod tests {
         let row = benchmark_csv_row(BenchmarkCsvRowInput {
             shape: &shape,
             file_set: &file_set,
+            run_environment: BenchmarkRunEnvironment {
+                schema_version: BENCHMARK_SCHEMA_VERSION,
+                host_os: "test-os",
+                host_arch: "test-arch",
+                available_parallelism: Some(16),
+            },
             simulation_profile_count: SyntheticWorkSimulationProfile::standard_profiles().len(),
             simulation,
             policy_case: case,
@@ -2046,9 +2096,13 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[20], "default_policy");
-        assert_eq!(row[27], "16");
-        assert_eq!(row[28], "available_parallelism_fallback");
+        assert_eq!(row[0], "1");
+        assert_eq!(row[1], "test-os");
+        assert_eq!(row[2], "test-arch");
+        assert_eq!(row[3], "16");
+        assert_eq!(row[24], "default_policy");
+        assert_eq!(row[31], "16");
+        assert_eq!(row[32], "available_parallelism_fallback");
 
         Ok(())
     }
