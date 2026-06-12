@@ -232,6 +232,8 @@ fn sanitize_reason_for_display(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::DeltaFunnelError;
 
     #[test]
@@ -393,7 +395,8 @@ mod tests {
     }
 
     #[test]
-    fn scan_metadata_expansion_error_has_sanitized_display() {
+    fn scan_metadata_expansion_error_has_sanitized_display()
+    -> Result<(), Box<dyn std::error::Error>> {
         let error = DeltaFunnelError::DeltaScanMetadataExpansion {
             source_name: "orders\nlatest".to_owned(),
             table_uri: "s3://user:password@example.com/table?token=secret".to_owned(),
@@ -414,6 +417,16 @@ mod tests {
         assert!(!display.contains("password"));
         assert!(!display.contains("token"));
         assert!(!display.contains("secret"));
+
+        let source = Error::source(&error)
+            .ok_or("metadata expansion error must preserve its kernel source")?;
+        assert!(
+            source
+                .to_string()
+                .contains("scan\nmetadata expansion failed")
+        );
+
+        Ok(())
     }
 
     #[test]

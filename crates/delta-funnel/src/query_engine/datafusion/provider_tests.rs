@@ -628,6 +628,66 @@ async fn table_provider_scan_with_no_active_files_reports_zero_partitions()
 }
 
 #[tokio::test]
+async fn table_provider_scan_exec_carries_direct_partition_execution_handoff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new_with_schema_and_sized_adds(
+        "table-provider-direct-partition-execution-handoff",
+        DEFAULT_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[
+            (r#""partitionValues":{}"#, 64),
+            (r#""partitionValues":{}"#, 32),
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+    let state = ctx.state();
+    let projection = vec![1];
+
+    let plan = provider.scan(&state, Some(&projection), &[], None).await?;
+    let delta_plan = plan
+        .as_any()
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+    let scan_plan = delta_plan.scan_plan();
+    let partition_plan = delta_plan.partition_plan();
+
+    assert_eq!(scan_plan.source_name, "orders");
+    assert_eq!(scan_plan.snapshot_version, 1);
+    assert_eq!(scan_plan.scan_projection, Some(vec![1]));
+    assert_eq!(scan_plan.projected_schema.fields().len(), 1);
+    assert_eq!(scan_plan.projected_schema.field(0).name(), "customer_name");
+    assert_eq!(partition_plan.source_name, scan_plan.source_name);
+    assert_eq!(partition_plan.table_uri, scan_plan.table_uri);
+    assert_eq!(partition_plan.snapshot_version, scan_plan.snapshot_version);
+    assert!(partition_plan.scan_metadata_exhausted);
+    assert_eq!(partition_plan.partitions.len(), 2);
+    assert_eq!(partition_plan.estimated_bytes, Some(96));
+
+    let file_tasks = partition_plan
+        .partitions
+        .iter()
+        .flat_map(|partition| partition.file_tasks.iter())
+        .collect::<Vec<_>>();
+    assert_eq!(file_tasks.len(), 2);
+    assert_eq!(file_tasks[0].source_name, "orders");
+    assert_eq!(file_tasks[0].table_uri, scan_plan.table_uri);
+    assert_eq!(file_tasks[0].snapshot_version, 1);
+    assert_eq!(file_tasks[0].path, "part-00000.parquet");
+    assert_eq!(file_tasks[0].estimated_bytes, Some(64));
+    assert_eq!(file_tasks[1].path, "part-00001.parquet");
+    assert_eq!(file_tasks[1].estimated_bytes, Some(32));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn table_provider_scan_rejects_invalid_projection_before_execution()
 -> Result<(), Box<dyn std::error::Error>> {
     let table = DeltaLogTable::new("table-provider-invalid-projection")?;

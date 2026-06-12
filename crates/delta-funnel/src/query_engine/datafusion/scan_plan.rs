@@ -1,4 +1,13 @@
 //! Delta provider scan planning state.
+//!
+//! The MVP scan partition planner is intentionally metadata-only and
+//! in-memory. It expands the Delta Kernel scan into one metadata record per
+//! active selected file, converts those records into provider-owned file tasks,
+//! and groups the tasks before execution exists. This owns file metadata,
+//! partition values, parsed statistics, deletion-vector metadata handles, and
+//! transform handles, but it does not read Parquet data or deletion-vector
+//! payloads. Memory use is therefore bounded by the number of files selected by
+//! kernel partition and stats pruning for this provider scan.
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::Expr;
@@ -52,6 +61,11 @@ pub(crate) struct ProviderScanPlan {
 }
 
 /// Metadata-only expansion of one planned Delta provider scan.
+///
+/// This is an all-or-error boundary. A successful value owns every kernel file
+/// metadata record selected for this provider scan and records whether the
+/// upstream metadata iterator was exhausted. Partial expansions are not exposed
+/// to file-task grouping.
 #[allow(dead_code)]
 pub(crate) struct ProviderScanMetadataExpansion {
     /// DataFusion table name for this source.
@@ -134,6 +148,9 @@ impl ProviderScanPlan {
     ///
     /// Partition options are validated before Delta Kernel metadata expansion so
     /// invalid caller options fail before any scan metadata work is consumed.
+    /// The returned plan is the provider execution handoff: it carries scan
+    /// context plus grouped file tasks, so later read execution should consume it
+    /// directly instead of reloading the snapshot or re-expanding scan metadata.
     #[allow(dead_code)]
     pub(crate) fn plan_file_task_partitions(
         &self,
@@ -818,11 +835,37 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let manifest =
             fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))?;
+        let dependencies = direct_manifest_dependency_names(&manifest);
 
-        assert!(manifest.contains("delta_kernel"));
-        assert!(!manifest.contains("deltalake"));
-        assert!(!manifest.contains("buoyant_kernel"));
+        assert!(dependencies.contains(&"delta_kernel"));
+        assert!(!dependencies.contains(&"deltalake"));
+        assert!(!dependencies.contains(&"buoyant_kernel"));
 
         Ok(())
+    }
+
+    fn direct_manifest_dependency_names(manifest: &str) -> Vec<&str> {
+        let mut dependency_names = Vec::new();
+        let mut in_dependency_section = false;
+
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                in_dependency_section = matches!(
+                    line,
+                    "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]"
+                );
+                continue;
+            }
+            if !in_dependency_section || line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((dependency_name, _value)) = line.split_once('=') else {
+                continue;
+            };
+            dependency_names.push(dependency_name.trim().trim_matches('"'));
+        }
+
+        dependency_names
     }
 }
