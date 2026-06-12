@@ -13,12 +13,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let simulation = SyntheticWorkSimulationProfile::s3_normal();
     let simulation_profile_count = SyntheticWorkSimulationProfile::standard_profiles().len();
     let simulated_work = simulation.simulate_file_set(&file_set)?;
+    let partitioned_work = simulated_work.partition_by_estimated_bytes(&file_set, 16)?;
 
     println!(
-        "shape_name,total_rows,active_files,active_bytes,active_mib,avg_file_size_bytes,partition_count,generated_files,generated_rows,generated_bytes,max_files_per_partition,source_rows,string_columns,int_columns,double_columns,bigint_columns,timestamp_columns,boolean_columns,simulation_profile_count,simulation_profile,simulated_serial_micros,simulated_max_file_micros"
+        "shape_name,total_rows,active_files,active_bytes,active_mib,avg_file_size_bytes,partition_count,generated_files,generated_rows,generated_bytes,max_files_per_partition,source_rows,string_columns,int_columns,double_columns,bigint_columns,timestamp_columns,boolean_columns,simulation_profile_count,simulation_profile,simulated_serial_micros,simulated_max_file_micros,simulated_target_partitions,simulated_output_partitions,simulated_wall_micros"
     );
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         shape.name,
         shape.total_rows,
         shape.active_file_count,
@@ -40,7 +41,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         simulation_profile_count,
         simulation.name,
         simulated_work.serial_micros,
-        simulated_work.max_file_micros
+        simulated_work.max_file_micros,
+        partitioned_work.target_partitions,
+        partitioned_work.partitions.len(),
+        partitioned_work.wall_micros
     );
 
     Ok(())
@@ -111,6 +115,22 @@ struct SyntheticFileWorkCost {
     base_micros: u64,
     jitter_micros: u64,
     total_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntheticPartitionedWorkPlan {
+    target_partitions: usize,
+    partitions: Vec<SyntheticWorkPartition>,
+    wall_micros: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyntheticWorkPartition {
+    partition_index: usize,
+    file_count: usize,
+    rows: u64,
+    size_bytes: u64,
+    work_micros: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -688,6 +708,111 @@ impl SyntheticWorkSimulationProfile {
     }
 }
 
+impl SyntheticWorkSimulationResult {
+    fn partition_by_estimated_bytes(
+        &self,
+        file_set: &SyntheticFileSet,
+        target_partitions: usize,
+    ) -> Result<SyntheticPartitionedWorkPlan, SyntheticGenerationError> {
+        if target_partitions == 0 {
+            return Err(generation_error(
+                "target partitions must be greater than zero",
+            ));
+        }
+        if self.file_costs.len() != file_set.files.len() {
+            return Err(generation_error(
+                "simulated file costs must match generated files",
+            ));
+        }
+        if file_set.files.is_empty() {
+            return Ok(SyntheticPartitionedWorkPlan {
+                target_partitions,
+                partitions: Vec::new(),
+                wall_micros: 0,
+            });
+        }
+
+        let output_limit = target_partitions.min(file_set.files.len());
+        let target_bytes = file_set.total_bytes().div_ceil(output_limit as u64);
+        let mut partitions = Vec::new();
+        let mut current = SyntheticWorkPartitionBuilder::default();
+
+        for (file, cost) in file_set.files.iter().zip(&self.file_costs) {
+            let can_start_next_partition = current.file_count > 0
+                && partitions.len() + 1 < output_limit
+                && current.size_bytes.saturating_add(file.size_bytes) > target_bytes;
+
+            if can_start_next_partition {
+                partitions.push(current.finish(partitions.len()));
+                current = SyntheticWorkPartitionBuilder::default();
+            }
+
+            current.add(file, cost)?;
+        }
+
+        if current.file_count > 0 {
+            partitions.push(current.finish(partitions.len()));
+        }
+
+        let wall_micros = partitions
+            .iter()
+            .map(|partition| partition.work_micros)
+            .max()
+            .unwrap_or_default();
+
+        Ok(SyntheticPartitionedWorkPlan {
+            target_partitions,
+            partitions,
+            wall_micros,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SyntheticWorkPartitionBuilder {
+    file_count: usize,
+    rows: u64,
+    size_bytes: u64,
+    work_micros: u64,
+}
+
+impl SyntheticWorkPartitionBuilder {
+    fn add(
+        &mut self,
+        file: &SyntheticFile,
+        cost: &SyntheticFileWorkCost,
+    ) -> Result<(), SyntheticGenerationError> {
+        self.file_count = self
+            .file_count
+            .checked_add(1)
+            .ok_or_else(|| generation_error("partition file count overflow"))?;
+        self.rows = self
+            .rows
+            .checked_add(file.rows)
+            .ok_or_else(|| generation_error("partition row count overflow"))?;
+        self.size_bytes = self
+            .size_bytes
+            .checked_add(file.size_bytes)
+            .ok_or_else(|| generation_error("partition byte count overflow"))?;
+        self.work_micros = self
+            .work_micros
+            .checked_add(cost.total_micros)
+            .ok_or_else(|| generation_error("partition work time overflow"))?;
+
+        Ok(())
+    }
+
+    fn finish(self, partition_index: usize) -> SyntheticWorkPartition {
+        SyntheticWorkPartition {
+            partition_index,
+            file_count: self.file_count,
+            rows: self.rows,
+            size_bytes: self.size_bytes,
+            work_micros: self.work_micros,
+        }
+    }
+}
+
 impl SyntheticDate {
     fn to_naive(self) -> Result<NaiveDate, SyntheticGenerationError> {
         NaiveDate::from_ymd_opt(self.year, u32::from(self.month), u32::from(self.day))
@@ -1243,6 +1368,83 @@ mod tests {
         assert_eq!(scaled_ceil_div(0, 1_000, 7, "test")?, 0);
         assert_eq!(scaled_ceil_div(10, 1_000, 10, "test")?, 1_000);
         assert_eq!(scaled_ceil_div(10, 1_000, 6, "test")?, 1_667);
+
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_work_rejects_zero_target() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+        let work = SyntheticWorkSimulationProfile::s3_normal().simulate_file_set(&file_set)?;
+        let error = work
+            .partition_by_estimated_bytes(&file_set, 0)
+            .err()
+            .ok_or("expected zero target to fail")?;
+
+        assert!(error.to_string().contains("greater than zero"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_work_target_one_matches_serial_work() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+        let work = SyntheticWorkSimulationProfile::s3_normal().simulate_file_set(&file_set)?;
+        let plan = work.partition_by_estimated_bytes(&file_set, 1)?;
+
+        assert_eq!(plan.partitions.len(), 1);
+        assert_eq!(plan.wall_micros, work.serial_micros);
+        assert_eq!(plan.partitions[0].file_count, file_set.files.len());
+        assert_eq!(plan.partitions[0].rows, shape.total_rows);
+        assert_eq!(plan.partitions[0].size_bytes, shape.active_data_size_bytes);
+
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_work_uses_known_size_grouping_shape() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+        let work = SyntheticWorkSimulationProfile::s3_normal().simulate_file_set(&file_set)?;
+        let plan = work.partition_by_estimated_bytes(&file_set, 16)?;
+
+        assert!(plan.partitions.len() <= 16);
+        assert!(
+            plan.partitions
+                .iter()
+                .all(|partition| partition.file_count > 0)
+        );
+        assert_eq!(
+            plan.partitions
+                .iter()
+                .map(|partition| partition.file_count)
+                .sum::<usize>(),
+            file_set.files.len()
+        );
+        assert_eq!(
+            plan.partitions
+                .iter()
+                .map(|partition| partition.rows)
+                .sum::<u64>(),
+            shape.total_rows
+        );
+        assert_eq!(
+            plan.partitions
+                .iter()
+                .map(|partition| partition.size_bytes)
+                .sum::<u64>(),
+            shape.active_data_size_bytes
+        );
+        assert!(plan.wall_micros < work.serial_micros);
+        assert!(plan.wall_micros >= work.max_file_micros);
+        assert!(
+            plan.partitions
+                .iter()
+                .enumerate()
+                .all(|(index, partition)| partition.partition_index == index)
+        );
 
         Ok(())
     }
