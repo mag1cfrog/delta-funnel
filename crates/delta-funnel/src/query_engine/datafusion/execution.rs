@@ -27,6 +27,9 @@ impl DeltaScanPlanningExec {
         scan_plan: ProviderScanPlan,
         partition_plan: DeltaScanFileTaskPartitionPlan,
     ) -> Self {
+        // Empty Delta scans keep the grouped plan's zero partitions. DataFusion
+        // accepts this at physical planning time, and it avoids inventing empty
+        // read work before provider execution exists.
         let partition_count = partition_plan.partitions.len();
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&scan_plan.projected_schema)),

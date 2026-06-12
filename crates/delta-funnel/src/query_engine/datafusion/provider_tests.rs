@@ -738,6 +738,10 @@ async fn table_provider_scan_accepts_exact_partition_equality_filter()
     assert_eq!(scan.scan_plan().pushed_filter_plan.pushed_filter_count, 1);
     assert!(scan.scan_plan().kernel_partition_predicate.is_some());
     assert_eq!(scan_file_paths(scan)?, vec!["part-00000.parquet"]);
+    assert_eq!(
+        scan_partition_file_paths(scan),
+        vec![vec!["part-00000.parquet".to_owned()]]
+    );
 
     Ok(())
 }
@@ -785,6 +789,13 @@ async fn table_provider_scan_accepts_exact_partition_in_filter()
     assert_eq!(
         scan_file_paths(scan)?,
         vec!["part-00000.parquet", "part-00001.parquet"]
+    );
+    assert_eq!(
+        scan_partition_file_paths(scan),
+        vec![vec![
+            "part-00000.parquet".to_owned(),
+            "part-00001.parquet".to_owned()
+        ]]
     );
 
     Ok(())
