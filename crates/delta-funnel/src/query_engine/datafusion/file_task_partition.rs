@@ -154,12 +154,12 @@ fn validate_partition_options(
     options: &DeltaScanFileTaskPartitionOptions,
 ) -> Result<(), DeltaFunnelError> {
     if options.target_partitions == 0 {
-        return Err(partition_planning_error(
+        return partition_planning_error(
             source_name,
             table_uri,
             snapshot_version,
             "target_partitions must be greater than zero",
-        ));
+        );
     }
 
     Ok(())
@@ -178,7 +178,7 @@ fn validate_file_task_context(
 ) -> Result<(), DeltaFunnelError> {
     for file_task in file_tasks {
         if file_task.source_name != source_name {
-            return Err(partition_planning_error(
+            return partition_planning_error(
                 source_name,
                 table_uri,
                 snapshot_version,
@@ -186,10 +186,10 @@ fn validate_file_task_context(
                     "file task `{}` belongs to source `{}`, not `{source_name}`",
                     file_task.path, file_task.source_name
                 ),
-            ));
+            );
         }
         if file_task.table_uri != table_uri {
-            return Err(partition_planning_error(
+            return partition_planning_error(
                 source_name,
                 table_uri,
                 snapshot_version,
@@ -197,10 +197,10 @@ fn validate_file_task_context(
                     "file task `{}` belongs to table URI `{}`, not `{table_uri}`",
                     file_task.path, file_task.table_uri
                 ),
-            ));
+            );
         }
         if file_task.snapshot_version != snapshot_version {
-            return Err(partition_planning_error(
+            return partition_planning_error(
                 source_name,
                 table_uri,
                 snapshot_version,
@@ -208,7 +208,7 @@ fn validate_file_task_context(
                     "file task `{}` belongs to snapshot version {}, not {snapshot_version}",
                     file_task.path, file_task.snapshot_version
                 ),
-            ));
+            );
         }
     }
 
@@ -228,35 +228,35 @@ fn group_by_estimated_bytes(
     target_partitions: usize,
 ) -> Result<Vec<DeltaScanFileTaskPartition>, DeltaFunnelError> {
     let output_limit = target_partitions.min(file_tasks.len());
-    let total_bytes = sum_task_estimate(
+    let Some(total_bytes) = sum_task_estimate(
         source_name,
         table_uri,
         snapshot_version,
         "estimated bytes",
         file_tasks.iter().map(|file_task| file_task.estimated_bytes),
     )?
-    .ok_or_else(|| {
-        partition_planning_error(
+    else {
+        return partition_planning_error(
             source_name,
             table_uri,
             snapshot_version,
             "known-size grouping requires every file task to have estimated bytes",
-        )
-    })?;
+        );
+    };
     let target_bytes = total_bytes.div_ceil(output_limit as u64);
     let mut partitions = Vec::new();
     let mut current_file_tasks = Vec::new();
     let mut current_bytes = 0_u64;
 
     for file_task in file_tasks {
-        let file_bytes = file_task.estimated_bytes.ok_or_else(|| {
-            partition_planning_error(
+        let Some(file_bytes) = file_task.estimated_bytes else {
+            return partition_planning_error(
                 source_name,
                 table_uri,
                 snapshot_version,
                 "known-size grouping requires every file task to have estimated bytes",
-            )
-        })?;
+            );
+        };
         // Keep scan order stable and only start a new partition before adding a
         // file that would exceed the byte budget. Large files stay whole, so a
         // single oversized file may exceed the target by itself.
@@ -275,14 +275,17 @@ fn group_by_estimated_bytes(
             current_bytes = 0;
         }
 
-        current_bytes = current_bytes.checked_add(file_bytes).ok_or_else(|| {
-            partition_planning_error(
-                source_name,
-                table_uri,
-                snapshot_version,
-                "partition estimated bytes overflowed u64",
-            )
-        })?;
+        current_bytes = match current_bytes.checked_add(file_bytes) {
+            Some(bytes) => bytes,
+            None => {
+                return partition_planning_error(
+                    source_name,
+                    table_uri,
+                    snapshot_version,
+                    "partition estimated bytes overflowed u64",
+                );
+            }
+        };
         current_file_tasks.push(file_task);
     }
 
@@ -324,12 +327,12 @@ fn group_by_file_count(
 
         for _ in 0..take_count {
             let Some(file_task) = file_tasks.next() else {
-                return Err(partition_planning_error(
+                return partition_planning_error(
                     source_name,
                     table_uri,
                     snapshot_version,
                     "file-count grouping exhausted file tasks unexpectedly",
-                ));
+                );
             };
             partition_file_tasks.push(file_task);
         }
@@ -395,33 +398,36 @@ fn sum_task_estimate(
         let Some(estimate) = estimate else {
             return Ok(None);
         };
-        total = total.checked_add(estimate).ok_or_else(|| {
-            partition_planning_error(
-                source_name,
-                table_uri,
-                snapshot_version,
-                format!("{estimate_name} overflowed u64"),
-            )
-        })?;
+        total = match total.checked_add(estimate) {
+            Some(total) => total,
+            None => {
+                return partition_planning_error(
+                    source_name,
+                    table_uri,
+                    snapshot_version,
+                    format!("{estimate_name} overflowed u64"),
+                );
+            }
+        };
     }
 
     Ok(Some(total))
 }
 
 /// Creates the SNAFU-backed partition-planning error for this module.
-fn partition_planning_error(
+fn partition_planning_error<T>(
     source_name: &str,
     table_uri: &str,
     snapshot_version: u64,
     reason: impl Into<String>,
-) -> DeltaFunnelError {
+) -> Result<T, DeltaFunnelError> {
     DeltaScanFileTaskPartitionPlanningSnafu {
         source_name: source_name.to_owned(),
         table_uri: table_uri.to_owned(),
         snapshot_version,
         reason: reason.into(),
     }
-    .build()
+    .fail()
 }
 
 #[cfg(test)]
@@ -470,20 +476,24 @@ mod tests {
         deletion_vector: KernelScanDeletionVectorMetadata,
         physical_to_logical_transform: KernelPhysicalToLogicalTransform,
     ) -> Result<DeltaScanFileTask, DeltaFunnelError> {
+        let size = match i64::try_from(estimated_bytes.unwrap_or(10)) {
+            Ok(size) => size,
+            Err(_) => {
+                return partition_planning_error(
+                    "orders",
+                    "file:///tmp/table",
+                    42,
+                    "test file size does not fit i64",
+                );
+            }
+        };
         let mut task = DeltaScanFileTask::from_kernel_metadata(
             "orders",
             "file:///tmp/table",
             42,
             KernelScanFileMetadata {
                 path: path.to_owned(),
-                size: i64::try_from(estimated_bytes.unwrap_or(10)).map_err(|_| {
-                    partition_planning_error(
-                        "orders",
-                        "file:///tmp/table",
-                        42,
-                        "test file size does not fit i64",
-                    )
-                })?,
+                size,
                 modification_time: 1587968586000,
                 stats: Some(KernelScanFileStats {
                     num_records: estimated_rows.unwrap_or(1),
