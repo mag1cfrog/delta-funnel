@@ -1,7 +1,11 @@
 //! Portable synthetic Delta scan partition benchmark runner.
 
+use std::env;
 use std::error::Error;
 use std::fmt;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 use chrono::{Datelike, Days, NaiveDate};
 use delta_funnel::{
@@ -55,12 +59,32 @@ const BENCHMARK_CSV_HEADER: [&str; 36] = [
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let config = BenchmarkRunnerConfig::parse(env::args_os().skip(1))?;
+
+    if config.show_help {
+        print_usage(io::stdout())?;
+        return Ok(());
+    }
+
+    if let Some(output_path) = config.output_path {
+        let mut output = File::create(output_path)?;
+        write_benchmark_csv(&mut output)?;
+    } else {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        write_benchmark_csv(&mut output)?;
+    }
+
+    Ok(())
+}
+
+fn write_benchmark_csv(output: &mut impl Write) -> Result<(), Box<dyn Error>> {
     let shape = SyntheticDeltaTableShape::partitioned_event_log();
     let file_set = shape.generate_file_set()?;
     let simulation_profiles = SyntheticWorkSimulationProfile::standard_profiles();
     let policy_cases = BenchmarkPolicyCase::standard_cases(local_available_parallelism());
 
-    println!("{}", BENCHMARK_CSV_HEADER.join(","));
+    writeln!(output, "{}", BENCHMARK_CSV_HEADER.join(","))?;
     for simulation in simulation_profiles {
         let simulated_work = simulation.simulate_file_set(&file_set)?;
 
@@ -69,7 +93,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let partitioned_work = simulated_work
                 .partition_by_estimated_bytes(&file_set, policy_decision.target_partitions)?;
 
-            println!(
+            writeln!(
+                output,
                 "{}",
                 benchmark_csv_row(BenchmarkCsvRowInput {
                     shape: &shape,
@@ -82,12 +107,88 @@ fn main() -> Result<(), Box<dyn Error>> {
                     partitioned_work: &partitioned_work,
                 })
                 .join(",")
-            );
+            )?;
         }
     }
 
     Ok(())
 }
+
+fn print_usage(mut output: impl Write) -> io::Result<()> {
+    writeln!(
+        output,
+        "Usage: delta_scan_partition_bench [--output <path>]"
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Writes a portable synthetic Delta scan partition benchmark matrix as CSV."
+    )?;
+    writeln!(
+        output,
+        "Without --output, CSV is written to stdout for shell pipelines."
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BenchmarkRunnerConfig {
+    output_path: Option<PathBuf>,
+    show_help: bool,
+}
+
+impl BenchmarkRunnerConfig {
+    fn parse<I>(args: I) -> Result<Self, BenchmarkRunnerConfigError>
+    where
+        I: IntoIterator,
+        I::Item: Into<std::ffi::OsString>,
+    {
+        let mut output_path = None;
+        let mut show_help = false;
+        let mut args = args.into_iter().map(Into::into);
+
+        while let Some(arg) = args.next() {
+            if arg == "--help" || arg == "-h" {
+                show_help = true;
+            } else if arg == "--output" || arg == "-o" {
+                let path = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingOutputPath)?;
+                if output_path.replace(PathBuf::from(path)).is_some() {
+                    return Err(BenchmarkRunnerConfigError::DuplicateOutputPath);
+                }
+            } else {
+                return Err(BenchmarkRunnerConfigError::UnknownArgument(
+                    arg.to_string_lossy().into(),
+                ));
+            }
+        }
+
+        Ok(Self {
+            output_path,
+            show_help,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BenchmarkRunnerConfigError {
+    MissingOutputPath,
+    DuplicateOutputPath,
+    UnknownArgument(String),
+}
+
+impl fmt::Display for BenchmarkRunnerConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingOutputPath => write!(formatter, "--output requires a path"),
+            Self::DuplicateOutputPath => write!(formatter, "--output may be provided only once"),
+            Self::UnknownArgument(argument) => write!(formatter, "unknown argument `{argument}`"),
+        }
+    }
+}
+
+impl Error for BenchmarkRunnerConfigError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SyntheticDeltaTableShape {
@@ -1348,6 +1449,103 @@ mod tests {
             .iter()
             .find(|case| case.name == name)
             .ok_or_else(|| format!("missing policy case {name}").into())
+    }
+
+    #[test]
+    fn runner_config_defaults_to_stdout() -> Result<(), Box<dyn Error>> {
+        let config = BenchmarkRunnerConfig::parse(Vec::<&str>::new())?;
+
+        assert_eq!(
+            config,
+            BenchmarkRunnerConfig {
+                output_path: None,
+                show_help: false
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn runner_config_accepts_output_path() -> Result<(), Box<dyn Error>> {
+        let config = BenchmarkRunnerConfig::parse(["--output", "target/scan-bench.csv"])?;
+
+        assert_eq!(
+            config.output_path,
+            Some(PathBuf::from("target/scan-bench.csv"))
+        );
+        assert!(!config.show_help);
+
+        Ok(())
+    }
+
+    #[test]
+    fn runner_config_accepts_short_output_path() -> Result<(), Box<dyn Error>> {
+        let config = BenchmarkRunnerConfig::parse(["-o", "target/scan-bench.csv"])?;
+
+        assert_eq!(
+            config.output_path,
+            Some(PathBuf::from("target/scan-bench.csv"))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn runner_config_accepts_help() -> Result<(), Box<dyn Error>> {
+        let config = BenchmarkRunnerConfig::parse(["--help"])?;
+
+        assert!(config.show_help);
+        assert_eq!(config.output_path, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn runner_config_rejects_invalid_arguments() {
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--output"]),
+            Err(BenchmarkRunnerConfigError::MissingOutputPath)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--output", "a.csv", "--output", "b.csv"]),
+            Err(BenchmarkRunnerConfigError::DuplicateOutputPath)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--unknown"]),
+            Err(BenchmarkRunnerConfigError::UnknownArgument(
+                "--unknown".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn print_usage_describes_output_path() -> Result<(), Box<dyn Error>> {
+        let mut output = Vec::new();
+
+        print_usage(&mut output)?;
+        let usage = String::from_utf8(output)?;
+
+        assert!(usage.contains("Usage: delta_scan_partition_bench [--output <path>]"));
+        assert!(usage.contains("CSV is written to stdout"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_benchmark_csv_outputs_portable_matrix() -> Result<(), Box<dyn Error>> {
+        let mut output = Vec::new();
+
+        write_benchmark_csv(&mut output)?;
+        let csv = String::from_utf8(output)?;
+        let lines = csv.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 126);
+        assert!(lines[0].starts_with("shape_name,total_rows"));
+        assert!(csv.contains(",local_fast,default_policy,"));
+        assert!(csv.contains(",s3_normal,combined_fd_16_memory_256mib,"));
+
+        Ok(())
     }
 
     #[test]
