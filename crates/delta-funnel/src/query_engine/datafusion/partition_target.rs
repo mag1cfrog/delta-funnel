@@ -8,7 +8,8 @@
 use crate::{DeltaFunnelError, error::DeltaScanFileTaskPartitionPlanningSnafu};
 
 use super::execution_environment::{
-    DeltaExecutionEnvironmentProfile, DeltaMemoryHint, DeltaUnixResourceLimit,
+    DeltaExecutionEnvironmentProfile, DeltaExecutionOsFamily, DeltaMemoryHint,
+    DeltaUnixFileDescriptorLimit, DeltaUnixResourceLimit,
 };
 use super::file_task_partition::DeltaScanFileTaskPartitionOptions;
 
@@ -333,6 +334,145 @@ impl DeltaScanPartitionTargetDecision {
     }
 }
 
+/// Diagnostic input for scan partition target benchmark tools.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaScanPartitionTargetDiagnosticInput {
+    /// Explicit DeltaFunnel target override.
+    pub explicit_target_partitions: Option<usize>,
+    /// DataFusion execution target, used as an upper cap during fallback.
+    pub datafusion_target_partitions: Option<usize>,
+    /// Available host parallelism used as the fallback baseline.
+    pub available_parallelism: Option<usize>,
+    /// Available memory in bytes, used as an upper cap when present.
+    pub available_memory_bytes: Option<u64>,
+    /// Unix soft file descriptor limit, used as an upper cap when present.
+    pub unix_soft_file_descriptor_limit: Option<u64>,
+    /// Minimum fallback partition count.
+    pub min_default_partitions: usize,
+    /// Multiplier applied to available parallelism before caps.
+    pub parallelism_multiplier: usize,
+    /// File descriptors reserved per fallback scan partition.
+    pub file_descriptors_per_partition: usize,
+    /// Available memory reserved per fallback scan partition.
+    pub available_memory_bytes_per_partition: u64,
+}
+
+/// Diagnostic output for scan partition target benchmark tools.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaScanPartitionTargetDiagnosticOutput {
+    /// Final target partition count.
+    pub target_partitions: usize,
+    /// Source that selected the uncapped target.
+    pub source: DeltaScanPartitionTargetDiagnosticSource,
+    /// Explicit DeltaFunnel target override from the input.
+    pub explicit_target_partitions: Option<usize>,
+    /// DataFusion execution target from the input.
+    pub datafusion_target_partitions: Option<usize>,
+    /// Available host parallelism from the input.
+    pub available_parallelism: Option<usize>,
+    /// DataFusion cap applied during fallback.
+    pub datafusion_target_cap: Option<usize>,
+    /// Unix file descriptor cap applied during fallback.
+    pub unix_file_descriptor_cap: Option<usize>,
+    /// Memory cap applied during fallback.
+    pub memory_cap: Option<usize>,
+}
+
+/// Diagnostic source that selected the uncapped scan target.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaScanPartitionTargetDiagnosticSource {
+    /// Explicit DeltaFunnel override selected the target.
+    ExplicitOverride,
+    /// Available host parallelism selected the fallback target.
+    AvailableParallelismFallback,
+    /// Static fallback selected the target.
+    StaticFallback,
+}
+
+impl Default for DeltaScanPartitionTargetDiagnosticInput {
+    fn default() -> Self {
+        Self {
+            explicit_target_partitions: None,
+            datafusion_target_partitions: None,
+            available_parallelism: None,
+            available_memory_bytes: None,
+            unix_soft_file_descriptor_limit: None,
+            min_default_partitions: DEFAULT_MIN_PARTITIONS,
+            parallelism_multiplier: DEFAULT_PARALLELISM_MULTIPLIER,
+            file_descriptors_per_partition: DEFAULT_FILE_DESCRIPTORS_PER_PARTITION,
+            available_memory_bytes_per_partition: DEFAULT_AVAILABLE_MEMORY_BYTES_PER_PARTITION,
+        }
+    }
+}
+
+/// Derives a scan partition target using the production policy for diagnostics.
+#[doc(hidden)]
+pub fn derive_delta_scan_partition_target_diagnostic(
+    input: DeltaScanPartitionTargetDiagnosticInput,
+) -> Result<DeltaScanPartitionTargetDiagnosticOutput, DeltaFunnelError> {
+    let policy = DeltaScanPartitionTargetPolicy {
+        min_default_partitions: input.min_default_partitions,
+        parallelism_multiplier: input.parallelism_multiplier,
+        file_descriptors_per_partition: input.file_descriptors_per_partition,
+        available_memory_bytes_per_partition: input.available_memory_bytes_per_partition,
+    };
+    let decision = policy.derive_target(
+        DeltaScanPartitionTargetContext {
+            source_name: "scan-target-diagnostic",
+            table_uri: "diagnostic://scan-target",
+            snapshot_version: 0,
+        },
+        DeltaScanPartitionTargetConfig {
+            explicit_target_partitions: input.explicit_target_partitions,
+            datafusion_target_partitions: input.datafusion_target_partitions,
+            environment_profile: DeltaExecutionEnvironmentProfile {
+                available_parallelism: input.available_parallelism,
+                os_family: DeltaExecutionOsFamily::Other,
+                memory_hint: input
+                    .available_memory_bytes
+                    .map(|available_bytes| DeltaMemoryHint {
+                        total_bytes: None,
+                        available_bytes: Some(available_bytes),
+                    }),
+                unix_file_descriptor_limit: input.unix_soft_file_descriptor_limit.map(
+                    |soft_limit| DeltaUnixFileDescriptorLimit {
+                        soft_limit: DeltaUnixResourceLimit::Finite(soft_limit),
+                        hard_limit: DeltaUnixResourceLimit::Finite(soft_limit),
+                    },
+                ),
+                io_latency_hint: None,
+                runtime_probe: None,
+            },
+        },
+    )?;
+
+    Ok(DeltaScanPartitionTargetDiagnosticOutput {
+        target_partitions: decision.target_partitions,
+        source: decision.source.into(),
+        explicit_target_partitions: decision.explicit_target_partitions,
+        datafusion_target_partitions: decision.datafusion_target_partitions,
+        available_parallelism: decision.environment_profile.available_parallelism,
+        datafusion_target_cap: decision.applied_caps.datafusion_target_partitions,
+        unix_file_descriptor_cap: decision.applied_caps.unix_file_descriptor_limit,
+        memory_cap: decision.applied_caps.memory_hint,
+    })
+}
+
+impl From<DeltaScanPartitionTargetSource> for DeltaScanPartitionTargetDiagnosticSource {
+    fn from(source: DeltaScanPartitionTargetSource) -> Self {
+        match source {
+            DeltaScanPartitionTargetSource::ExplicitOverride => Self::ExplicitOverride,
+            DeltaScanPartitionTargetSource::AvailableParallelismFallback => {
+                Self::AvailableParallelismFallback
+            }
+            DeltaScanPartitionTargetSource::StaticFallback => Self::StaticFallback,
+        }
+    }
+}
+
 fn target_planning_error<T>(
     context: DeltaScanPartitionTargetContext<'_>,
     reason: impl Into<String>,
@@ -481,6 +621,51 @@ mod tests {
 
         assert_eq!(decision.target_partitions, 4);
         assert_eq!(decision.applied_caps.datafusion_target_partitions, Some(8));
+
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_facade_uses_production_policy_caps() -> Result<(), Box<dyn std::error::Error>> {
+        let output = derive_delta_scan_partition_target_diagnostic(
+            DeltaScanPartitionTargetDiagnosticInput {
+                datafusion_target_partitions: Some(32),
+                available_parallelism: Some(64),
+                available_memory_bytes: Some(512 * 1024 * 1024),
+                unix_soft_file_descriptor_limit: Some(128),
+                ..DeltaScanPartitionTargetDiagnosticInput::default()
+            },
+        )?;
+
+        assert_eq!(output.target_partitions, 2);
+        assert_eq!(
+            output.source,
+            DeltaScanPartitionTargetDiagnosticSource::AvailableParallelismFallback
+        );
+        assert_eq!(output.datafusion_target_cap, Some(32));
+        assert_eq!(output.unix_file_descriptor_cap, Some(8));
+        assert_eq!(output.memory_cap, Some(2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_facade_reuses_policy_validation() -> Result<(), Box<dyn std::error::Error>> {
+        let error = derive_delta_scan_partition_target_diagnostic(
+            DeltaScanPartitionTargetDiagnosticInput {
+                datafusion_target_partitions: Some(0),
+                available_parallelism: Some(4),
+                ..DeltaScanPartitionTargetDiagnosticInput::default()
+            },
+        )
+        .err()
+        .ok_or("expected diagnostic input validation to fail")?;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::DeltaScanFileTaskPartitionPlanning { .. }
+        ));
+        assert!(error.to_string().contains("DataFusion target_partitions"));
 
         Ok(())
     }

@@ -17,7 +17,9 @@ mod table_formats;
 
 pub use error::DeltaFunnelError;
 pub use query_engine::{
-    DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources, register_delta_sources,
+    DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
+    DeltaScanPartitionTargetDiagnosticSource, DeltaTableProviderConfig, RegisteredDeltaSource,
+    RegisteredDeltaSources, derive_delta_scan_partition_target_diagnostic, register_delta_sources,
 };
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, PlannedDeltaSource, ProtocolPreflight,
