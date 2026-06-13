@@ -15,6 +15,7 @@ use datafusion::physical_plan::{
     PlanProperties, SendableRecordBatchStream,
 };
 
+use crate::DeltaFunnelError;
 use crate::table_formats::KernelScanReadSchema;
 
 use super::super::planning::file_task::DeltaScanFileTask;
@@ -164,12 +165,14 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             ))));
         }
 
-        let file_reader = DeltaFileReader::try_new(DeltaFileReaderConfig {
-            source_name: &self.scan_plan.source_name,
-            table_uri: &self.scan_plan.table_uri,
-            snapshot_version: self.scan_plan.snapshot_version,
-        })
-        .map_err(DataFusionError::from)?;
+        let file_reader: Arc<dyn DeltaScanPartitionFileReader> = Arc::new(
+            DeltaFileReader::try_new(DeltaFileReaderConfig {
+                source_name: &self.scan_plan.source_name,
+                table_uri: &self.scan_plan.table_uri,
+                snapshot_version: self.scan_plan.snapshot_version,
+            })
+            .map_err(DataFusionError::from)?,
+        );
         let read_schema = self.scan_plan.kernel_scan().read_schema();
         let file_tasks = scan_partition.file_tasks.clone();
 
@@ -182,9 +185,25 @@ impl ExecutionPlan for DeltaScanPlanningExec {
     }
 }
 
+trait DeltaScanPartitionFileReader: Send + Sync {
+    fn read_file(
+        &self,
+        request: DeltaFileReadRequest<'_>,
+    ) -> Result<super::file_reader::DeltaFileReadResult, DeltaFunnelError>;
+}
+
+impl DeltaScanPartitionFileReader for DeltaFileReader {
+    fn read_file(
+        &self,
+        request: DeltaFileReadRequest<'_>,
+    ) -> Result<super::file_reader::DeltaFileReadResult, DeltaFunnelError> {
+        Self::read_file(self, request)
+    }
+}
+
 fn sequential_scan_partition_stream(
     schema: SchemaRef,
-    file_reader: DeltaFileReader,
+    file_reader: Arc<dyn DeltaScanPartitionFileReader>,
     read_schema: KernelScanReadSchema,
     file_tasks: Vec<DeltaScanFileTask>,
 ) -> SendableRecordBatchStream {
@@ -215,17 +234,30 @@ fn sequential_scan_partition_stream(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use datafusion::arrow::array::{Array, Int32Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
+    use futures_util::StreamExt;
 
+    use super::super::file_reader::{DeltaFileReadRequest, DeltaFileReadResult};
+    use super::DeltaScanPartitionFileReader;
     use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
     };
+    use crate::query_engine::datafusion::planning::file_task::DeltaScanFileTask;
     use crate::query_engine::datafusion::test_support::{
         DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, find_delta_scan_plans, register_fixture_source,
     };
-    use crate::table_formats::RealParquetDeltaTable;
+    use crate::table_formats::{
+        KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata, RealParquetDeltaTable,
+    };
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     #[tokio::test]
@@ -516,6 +548,123 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn sequential_stream_emits_before_exhausting_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = RealParquetDeltaTable::new_default("incremental-stream-read-schema")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
+        let read_schema = scan.read_schema();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(FakePartitionFileReader {
+            read_count: Arc::clone(&read_count),
+            schema: Arc::clone(&schema),
+        });
+        let mut stream = super::sequential_scan_partition_stream(
+            schema,
+            reader,
+            read_schema,
+            vec![
+                fake_task("part-00000.parquet"),
+                fake_task("part-00001.parquet"),
+            ],
+        );
+
+        let first = stream.next().await.ok_or("expected first batch")??;
+
+        assert_eq!(batch_ids(&first)?, vec![1]);
+        assert_eq!(
+            read_count.load(Ordering::SeqCst),
+            1,
+            "stream should yield the first batch before reading the second file"
+        );
+
+        let remaining = datafusion::physical_plan::common::collect(stream).await?;
+        let remaining_ids = remaining
+            .iter()
+            .map(batch_ids)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert_eq!(remaining_ids, vec![2, 3]);
+        assert_eq!(read_count.load(Ordering::SeqCst), 2);
+
+        Ok(())
+    }
+
+    struct FakePartitionFileReader {
+        read_count: Arc<AtomicUsize>,
+        schema: datafusion::arrow::datatypes::SchemaRef,
+    }
+
+    impl DeltaScanPartitionFileReader for FakePartitionFileReader {
+        fn read_file(
+            &self,
+            request: DeltaFileReadRequest<'_>,
+        ) -> Result<DeltaFileReadResult, crate::DeltaFunnelError> {
+            self.read_count.fetch_add(1, Ordering::SeqCst);
+
+            let ids = match request.task.path.as_str() {
+                "part-00000.parquet" => vec![vec![1], vec![2]],
+                "part-00001.parquet" => vec![vec![3]],
+                path => {
+                    return Err(crate::DeltaFunnelError::Config {
+                        message: format!("unexpected fake file task `{path}`"),
+                    });
+                }
+            };
+            let batches = ids
+                .into_iter()
+                .map(|ids| id_batch(Arc::clone(&self.schema), ids))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| crate::DeltaFunnelError::Config {
+                    message: format!("fake batch construction failed: {error}"),
+                })?;
+
+            Ok(DeltaFileReadResult { batches })
+        }
+    }
+
+    fn fake_task(path: &str) -> DeltaScanFileTask {
+        DeltaScanFileTask {
+            source_name: "orders".to_owned(),
+            table_uri: "file:///tmp/table".to_owned(),
+            snapshot_version: 1,
+            path: path.to_owned(),
+            estimated_bytes: Some(1),
+            estimated_rows: Some(1),
+            modification_time_ms: Some(1),
+            partition_values: BTreeMap::new(),
+            stats: None,
+            deletion_vector: KernelScanDeletionVectorMetadata::NotPresent,
+            transform: KernelPhysicalToLogicalTransform::NotRequired,
+        }
+    }
+
+    fn id_batch(
+        schema: datafusion::arrow::datatypes::SchemaRef,
+        ids: Vec<i32>,
+    ) -> Result<RecordBatch, datafusion::arrow::error::ArrowError> {
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))])
+    }
+
+    fn batch_ids(batch: &RecordBatch) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected Int32Array")?;
+
+        Ok(ids.values().to_vec())
     }
 
     fn register_real_parquet_source(

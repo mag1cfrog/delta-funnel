@@ -1264,6 +1264,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "delta_kernel",
+ "futures-util",
  "libc",
  "snafu",
  "tokio",
