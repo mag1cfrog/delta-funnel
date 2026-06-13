@@ -1162,7 +1162,7 @@ impl BenchmarkPolicyCase {
         cases
     }
 
-    fn strategy_baseline_cases(baseline: DeltaScanPartitionTargetDiagnosticInput) -> [Self; 5] {
+    fn strategy_baseline_cases(baseline: DeltaScanPartitionTargetDiagnosticInput) -> [Self; 9] {
         [
             Self::new(
                 "fixed_target_1",
@@ -1175,6 +1175,34 @@ impl BenchmarkPolicyCase {
                 "fixed_target_4",
                 DeltaScanPartitionTargetDiagnosticInput {
                     explicit_target_partitions: Some(4),
+                    ..baseline
+                },
+            ),
+            Self::new(
+                "fixed_target_8",
+                DeltaScanPartitionTargetDiagnosticInput {
+                    explicit_target_partitions: Some(8),
+                    ..baseline
+                },
+            ),
+            Self::new(
+                "fixed_target_16",
+                DeltaScanPartitionTargetDiagnosticInput {
+                    explicit_target_partitions: Some(16),
+                    ..baseline
+                },
+            ),
+            Self::new(
+                "fixed_target_32",
+                DeltaScanPartitionTargetDiagnosticInput {
+                    explicit_target_partitions: Some(32),
+                    ..baseline
+                },
+            ),
+            Self::new(
+                "fixed_target_64",
+                DeltaScanPartitionTargetDiagnosticInput {
+                    explicit_target_partitions: Some(64),
                     ..baseline
                 },
             ),
@@ -2334,7 +2362,7 @@ mod tests {
         let csv = String::from_utf8(output)?;
         let lines = csv.lines().collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), 991);
+        assert_eq!(lines.len(), 1111);
         assert!(lines[0].starts_with("benchmark_schema_version,host_os,host_arch"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
@@ -2999,10 +3027,14 @@ mod tests {
             .map(|case| case.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(cases.len(), 33);
+        assert_eq!(cases.len(), 37);
         assert_eq!(names.first(), Some(&"default_policy"));
         assert!(names.contains(&"fixed_target_1"));
         assert!(names.contains(&"fixed_target_4"));
+        assert!(names.contains(&"fixed_target_8"));
+        assert!(names.contains(&"fixed_target_16"));
+        assert!(names.contains(&"fixed_target_32"));
+        assert!(names.contains(&"fixed_target_64"));
         assert!(names.contains(&"available_parallelism_uncapped"));
         assert!(names.contains(&"available_parallelism_x2_uncapped"));
         assert!(names.contains(&"datafusion_cap_4"));
@@ -3021,6 +3053,10 @@ mod tests {
         assert!(names.contains(&"combined_fd_32_memory_512mib"));
         let fixed_target_1 = find_policy_case(&cases, "fixed_target_1")?.derive_target()?;
         let fixed_target_4 = find_policy_case(&cases, "fixed_target_4")?.derive_target()?;
+        let fixed_target_8 = find_policy_case(&cases, "fixed_target_8")?.derive_target()?;
+        let fixed_target_16 = find_policy_case(&cases, "fixed_target_16")?.derive_target()?;
+        let fixed_target_32 = find_policy_case(&cases, "fixed_target_32")?.derive_target()?;
+        let fixed_target_64 = find_policy_case(&cases, "fixed_target_64")?.derive_target()?;
         let available_parallelism_uncapped =
             find_policy_case(&cases, "available_parallelism_uncapped")?.derive_target()?;
         let available_parallelism_x2_uncapped =
@@ -3048,6 +3084,10 @@ mod tests {
             fixed_target_4.source,
             DeltaScanPartitionTargetDiagnosticSource::ExplicitOverride
         );
+        assert_eq!(fixed_target_8.target_partitions, 8);
+        assert_eq!(fixed_target_16.target_partitions, 16);
+        assert_eq!(fixed_target_32.target_partitions, 32);
+        assert_eq!(fixed_target_64.target_partitions, 64);
         assert_eq!(available_parallelism_uncapped.target_partitions, 16);
         assert_eq!(available_parallelism_uncapped.datafusion_target_cap, None);
         assert_eq!(available_parallelism_x2_uncapped.target_partitions, 32);
