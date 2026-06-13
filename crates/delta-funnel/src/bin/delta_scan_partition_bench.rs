@@ -20,11 +20,12 @@ const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
 const BENCHMARK_SCHEMA_VERSION: u32 = 1;
-const BENCHMARK_CSV_HEADER: [&str; 41] = [
+const BENCHMARK_CSV_HEADER: [&str; 42] = [
     "benchmark_schema_version",
     "host_os",
     "host_arch",
     "host_available_parallelism",
+    "workload_case_count",
     "workload_case",
     "shape_name",
     "total_rows",
@@ -86,38 +87,41 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn write_benchmark_csv(output: &mut impl Write) -> Result<(), Box<dyn Error>> {
     let run_environment = BenchmarkRunEnvironment::local();
-    let workload_case = SyntheticWorkloadCase::partitioned_event_log_target_shape();
-    let shape = &workload_case.shape;
-    let file_set = shape.generate_file_set()?;
+    let workload_cases = SyntheticWorkloadCase::standard_cases()?;
     let simulation_profiles = SyntheticWorkSimulationProfile::standard_profiles();
     let policy_cases = BenchmarkPolicyCase::standard_cases(run_environment.available_parallelism);
 
     writeln!(output, "{}", BENCHMARK_CSV_HEADER.join(","))?;
-    for simulation in simulation_profiles {
-        let simulated_work = simulation.simulate_file_set(&file_set)?;
+    for workload_case in &workload_cases {
+        for simulation in simulation_profiles {
+            let simulated_work = simulation.simulate_file_set(&workload_case.file_set)?;
 
-        for policy_case in &policy_cases {
-            let policy_decision = policy_case.derive_target()?;
-            let partitioned_work = simulated_work
-                .partition_by_estimated_bytes(&file_set, policy_decision.target_partitions)?;
+            for policy_case in &policy_cases {
+                let policy_decision = policy_case.derive_target()?;
+                let partitioned_work = simulated_work.partition_by_estimated_bytes(
+                    &workload_case.file_set,
+                    policy_decision.target_partitions,
+                )?;
 
-            writeln!(
-                output,
-                "{}",
-                benchmark_csv_row(BenchmarkCsvRowInput {
-                    shape,
-                    file_set: &file_set,
-                    run_environment,
-                    workload_case: workload_case.name,
-                    simulation_profile_count: simulation_profiles.len(),
-                    simulation,
-                    policy_case,
-                    policy_decision,
-                    simulated_work: &simulated_work,
-                    partitioned_work: &partitioned_work,
-                })
-                .join(",")
-            )?;
+                writeln!(
+                    output,
+                    "{}",
+                    benchmark_csv_row(BenchmarkCsvRowInput {
+                        shape: &workload_case.shape,
+                        file_set: &workload_case.file_set,
+                        run_environment,
+                        workload_case: workload_case.name,
+                        workload_case_count: workload_cases.len(),
+                        simulation_profile_count: simulation_profiles.len(),
+                        simulation,
+                        policy_case,
+                        policy_decision,
+                        simulated_work: &simulated_work,
+                        partitioned_work: &partitioned_work,
+                    })
+                    .join(",")
+                )?;
+            }
         }
     }
 
@@ -201,11 +205,77 @@ impl BenchmarkRunEnvironment {
 }
 
 impl SyntheticWorkloadCase {
-    fn partitioned_event_log_target_shape() -> Self {
-        Self {
+    fn standard_cases() -> Result<Vec<Self>, SyntheticGenerationError> {
+        Ok(vec![
+            Self::partitioned_event_log_target_shape()?,
+            Self::many_tiny_files()?,
+        ])
+    }
+
+    #[cfg(test)]
+    fn edge_cases() -> Result<Vec<Self>, SyntheticGenerationError> {
+        Ok(vec![
+            Self::explicit_files("empty_scan", 0, 0, &[])?,
+            Self::explicit_files("one_file", 25_000, 16 * MIB, &[(25_000, 16 * MIB)])?,
+            Self::explicit_files(
+                "few_medium_files",
+                800_000,
+                512 * MIB,
+                &[(100_000, 64 * MIB); 8],
+            )?,
+        ])
+    }
+
+    fn partitioned_event_log_target_shape() -> Result<Self, SyntheticGenerationError> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+
+        Ok(Self {
             name: "partitioned_event_log_target_shape",
-            shape: SyntheticDeltaTableShape::partitioned_event_log(),
+            shape,
+            file_set,
+        })
+    }
+
+    fn many_tiny_files() -> Result<Self, SyntheticGenerationError> {
+        const FILE_COUNT: usize = 4_096;
+        const ROWS_PER_FILE: u64 = 1_000;
+        const BYTES_PER_FILE: u64 = 64 * 1024;
+
+        Self::explicit_files(
+            "many_tiny_files",
+            FILE_COUNT as u64 * ROWS_PER_FILE,
+            FILE_COUNT as u64 * BYTES_PER_FILE,
+            &[(ROWS_PER_FILE, BYTES_PER_FILE); FILE_COUNT],
+        )
+    }
+
+    fn explicit_files(
+        name: &'static str,
+        total_rows: u64,
+        total_bytes: u64,
+        files: &[(u64, u64)],
+    ) -> Result<Self, SyntheticGenerationError> {
+        let file_set = SyntheticFileSet::from_explicit_files(name, files)?;
+        if file_set.total_rows() != total_rows {
+            return Err(generation_error(format!(
+                "workload `{name}` file rows do not match total rows"
+            )));
         }
+        if file_set.total_bytes() != total_bytes {
+            return Err(generation_error(format!(
+                "workload `{name}` file bytes do not match total bytes"
+            )));
+        }
+
+        let shape =
+            SyntheticDeltaTableShape::synthetic_workload(name, total_rows, total_bytes, &file_set);
+
+        Ok(Self {
+            name,
+            shape,
+            file_set,
+        })
     }
 }
 
@@ -248,6 +318,7 @@ struct SyntheticDeltaTableShape {
 struct SyntheticWorkloadCase {
     name: &'static str,
     shape: SyntheticDeltaTableShape,
+    file_set: SyntheticFileSet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,6 +356,7 @@ struct BenchmarkCsvRowInput<'a> {
     file_set: &'a SyntheticFileSet,
     run_environment: BenchmarkRunEnvironment,
     workload_case: &'static str,
+    workload_case_count: usize,
     simulation_profile_count: usize,
     simulation: SyntheticWorkSimulationProfile,
     policy_case: &'a BenchmarkPolicyCase,
@@ -435,6 +507,86 @@ struct CardinalityHint {
 }
 
 impl SyntheticDeltaTableShape {
+    fn synthetic_workload(
+        name: &'static str,
+        total_rows: u64,
+        total_bytes: u64,
+        file_set: &SyntheticFileSet,
+    ) -> Self {
+        let partition_count = file_set.partitions.len();
+        let active_file_count = file_set.files.len();
+        let average_file_size = average_or_zero(total_bytes, active_file_count);
+        let average_rows_per_file = average_or_zero(total_rows, active_file_count);
+
+        Self {
+            name,
+            total_rows,
+            active_file_count,
+            active_data_size_bytes: total_bytes,
+            file_size_bytes: DistributionSummary {
+                average: average_file_size,
+                p50: average_file_size,
+                p90: average_file_size,
+                p99: average_file_size,
+            },
+            rows_per_file: DistributionSummary {
+                average: average_rows_per_file,
+                p50: average_rows_per_file,
+                p90: average_rows_per_file,
+                p99: average_rows_per_file,
+            },
+            partitioning: PartitioningShape {
+                columns: ["event_year", "event_month", "event_day"],
+                partition_count,
+                start_date: SyntheticDate {
+                    year: 2026,
+                    month: 1,
+                    day: 1,
+                },
+                end_date: SyntheticDate {
+                    year: 2026,
+                    month: 1,
+                    day: 1,
+                },
+                average_files_per_partition_hundredths: average_files_per_partition_hundredths(
+                    active_file_count,
+                    partition_count,
+                ),
+                max_files_per_partition: file_set.max_files_per_partition(),
+            },
+            delta_features: DeltaFeatureShape {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                compression: "zstd",
+                table_features: Vec::new(),
+                deletion_vectors_enabled_in_source_shape: false,
+                active_deletion_vectors_in_benchmark: 0,
+            },
+            schema: SchemaShape {
+                all_columns_nullable: true,
+                columns: synthetic_columns(),
+            },
+            row_distribution: RowDistributionShape {
+                source_split: vec![CategoryRowCount {
+                    category: "synthetic",
+                    rows: total_rows,
+                }],
+                uniform_category: UniformCategoryShape {
+                    column_name: "category_num",
+                    category_count: 1,
+                    min_rows_per_category: total_rows,
+                    max_rows_per_category: total_rows,
+                },
+                seasonality: vec![CategoryRowCount {
+                    category: "2026",
+                    rows: total_rows,
+                }],
+            },
+            null_patterns: Vec::new(),
+            cardinalities: Vec::new(),
+        }
+    }
+
     fn partitioned_event_log() -> Self {
         Self {
             name: "synthetic_partitioned_event_log",
@@ -744,7 +896,7 @@ impl SyntheticDeltaTableShape {
     }
 
     fn average_file_size_bytes(&self) -> u64 {
-        self.active_data_size_bytes / self.active_file_count as u64
+        average_or_zero(self.active_data_size_bytes, self.active_file_count)
     }
 
     fn active_data_size_mib(&self) -> u64 {
@@ -761,6 +913,40 @@ impl SyntheticDeltaTableShape {
 }
 
 impl SyntheticFileSet {
+    fn from_explicit_files(
+        workload_name: &str,
+        file_specs: &[(u64, u64)],
+    ) -> Result<Self, SyntheticGenerationError> {
+        let mut partitions = Vec::with_capacity(file_specs.len());
+        let mut files = Vec::with_capacity(file_specs.len());
+
+        for (index, (rows, size_bytes)) in file_specs.iter().copied().enumerate() {
+            let day = u8::try_from(index % 28 + 1)
+                .map_err(|_| generation_error("synthetic day does not fit into u8"))?;
+            let date = SyntheticDate {
+                year: 2026,
+                month: 1,
+                day,
+            };
+
+            partitions.push(SyntheticPartition {
+                date,
+                rows,
+                size_bytes,
+                file_count: 1,
+            });
+            files.push(SyntheticFile {
+                path: format!("{workload_name}/part-{index:05}.parquet"),
+                partition_date: date,
+                file_index_in_partition: 0,
+                rows,
+                size_bytes,
+            });
+        }
+
+        Ok(Self { partitions, files })
+    }
+
     fn total_rows(&self) -> u64 {
         self.files.iter().map(|file| file.rows).sum()
     }
@@ -1248,6 +1434,19 @@ fn split_evenly(total: u64, count: usize) -> Vec<u64> {
         .collect()
 }
 
+fn average_or_zero(total: u64, count: usize) -> u64 {
+    if count == 0 { 0 } else { total / count as u64 }
+}
+
+fn average_files_per_partition_hundredths(file_count: usize, partition_count: usize) -> u16 {
+    if partition_count == 0 {
+        return 0;
+    }
+
+    let hundredths = file_count.saturating_mul(100) / partition_count;
+    u16::try_from(hundredths).unwrap_or(u16::MAX)
+}
+
 fn apportion_by_weights(total: u64, weights: &[u64]) -> Result<Vec<u64>, SyntheticGenerationError> {
     if weights.is_empty() {
         return Ok(Vec::new());
@@ -1357,6 +1556,7 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
         input.run_environment.host_os.to_owned(),
         input.run_environment.host_arch.to_owned(),
         optional_usize(input.run_environment.available_parallelism),
+        input.workload_case_count.to_string(),
         input.workload_case.to_owned(),
         shape.name.to_owned(),
         shape.total_rows.to_string(),
@@ -1591,9 +1791,13 @@ mod tests {
         let csv = String::from_utf8(output)?;
         let lines = csv.lines().collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), 126);
+        assert_eq!(lines.len(), 251);
         assert!(lines[0].starts_with("benchmark_schema_version,host_os,host_arch"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
+        assert!(csv.contains(",many_tiny_files,"));
+        assert!(!csv.contains(",empty_scan,"));
+        assert!(!csv.contains(",one_file,"));
+        assert!(!csv.contains(",few_medium_files,"));
         assert!(csv.contains(",local_fast,default_policy,"));
         assert!(csv.contains(",s3_normal,combined_fd_16_memory_256mib,"));
 
@@ -1610,12 +1814,61 @@ mod tests {
     }
 
     #[test]
-    fn workload_case_wraps_current_target_shape() {
-        let workload_case = SyntheticWorkloadCase::partitioned_event_log_target_shape();
+    fn workload_case_wraps_current_target_shape() -> Result<(), Box<dyn Error>> {
+        let workload_case = SyntheticWorkloadCase::partitioned_event_log_target_shape()?;
 
         assert_eq!(workload_case.name, "partitioned_event_log_target_shape");
         assert_eq!(workload_case.shape.name, "synthetic_partitioned_event_log");
         assert_eq!(workload_case.shape.active_file_count, 956);
+
+        Ok(())
+    }
+
+    #[test]
+    fn standard_workload_cases_cover_basic_file_shapes() -> Result<(), Box<dyn Error>> {
+        let workload_cases = SyntheticWorkloadCase::standard_cases()?;
+        let names = workload_cases
+            .iter()
+            .map(|workload_case| workload_case.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            ["partitioned_event_log_target_shape", "many_tiny_files"]
+        );
+        assert_eq!(workload_cases[1].file_set.files.len(), 4_096);
+        assert!(workload_cases[1].file_set.files.len() > workload_cases[0].file_set.files.len());
+        assert!(
+            workload_cases
+                .iter()
+                .all(|workload_case| workload_case.file_set.total_rows()
+                    == workload_case.shape.total_rows)
+        );
+        assert!(
+            workload_cases
+                .iter()
+                .all(|workload_case| workload_case.file_set.total_bytes()
+                    == workload_case.shape.active_data_size_bytes)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn edge_workload_cases_cover_correctness_only_shapes() -> Result<(), Box<dyn Error>> {
+        let workload_cases = SyntheticWorkloadCase::edge_cases()?;
+        let names = workload_cases
+            .iter()
+            .map(|workload_case| workload_case.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["empty_scan", "one_file", "few_medium_files"]);
+        assert_eq!(workload_cases[0].file_set.files.len(), 0);
+        assert_eq!(workload_cases[0].shape.average_file_size_bytes(), 0);
+        assert_eq!(workload_cases[1].file_set.files.len(), 1);
+        assert_eq!(workload_cases[2].file_set.files.len(), 8);
+
+        Ok(())
     }
 
     #[test]
@@ -2083,19 +2336,20 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 41);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 42);
         assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(BENCHMARK_CSV_HEADER[1], "host_os");
         assert_eq!(BENCHMARK_CSV_HEADER[2], "host_arch");
         assert_eq!(BENCHMARK_CSV_HEADER[3], "host_available_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[4], "workload_case");
-        assert_eq!(BENCHMARK_CSV_HEADER[25], "policy_case");
-        assert_eq!(BENCHMARK_CSV_HEADER[26], "policy_available_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[27], "policy_datafusion_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[28], "policy_available_memory_bytes");
-        assert_eq!(BENCHMARK_CSV_HEADER[29], "policy_unix_soft_fd_limit");
-        assert_eq!(BENCHMARK_CSV_HEADER[32], "policy_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[33], "policy_source");
+        assert_eq!(BENCHMARK_CSV_HEADER[4], "workload_case_count");
+        assert_eq!(BENCHMARK_CSV_HEADER[5], "workload_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[26], "policy_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[27], "policy_available_parallelism");
+        assert_eq!(BENCHMARK_CSV_HEADER[28], "policy_datafusion_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[29], "policy_available_memory_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[30], "policy_unix_soft_fd_limit");
+        assert_eq!(BENCHMARK_CSV_HEADER[33], "policy_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[34], "policy_source");
     }
 
     #[test]
@@ -2119,6 +2373,7 @@ mod tests {
                 available_parallelism: Some(16),
             },
             workload_case: "test-workload",
+            workload_case_count: 2,
             simulation_profile_count: SyntheticWorkSimulationProfile::standard_profiles().len(),
             simulation,
             policy_case: case,
@@ -2132,10 +2387,11 @@ mod tests {
         assert_eq!(row[1], "test-os");
         assert_eq!(row[2], "test-arch");
         assert_eq!(row[3], "16");
-        assert_eq!(row[4], "test-workload");
-        assert_eq!(row[25], "default_policy");
-        assert_eq!(row[32], "16");
-        assert_eq!(row[33], "available_parallelism_fallback");
+        assert_eq!(row[4], "2");
+        assert_eq!(row[5], "test-workload");
+        assert_eq!(row[26], "default_policy");
+        assert_eq!(row[33], "16");
+        assert_eq!(row[34], "available_parallelism_fallback");
 
         Ok(())
     }
