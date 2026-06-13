@@ -11,10 +11,13 @@ pub(crate) use delta::build_projected_delta_scan;
 pub(crate) use delta::test_support::RealParquetDeltaTable;
 pub(crate) use delta::{
     DeltaKernelPredicate, KernelDataFileReadRequest, KernelDataFileReader,
-    KernelDataFileReaderConfig, KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata,
-    KernelScanFileMetadata, KernelScanMetadataExpansion, KernelScanReadSchema, ProjectedDeltaScan,
-    build_projected_predicated_delta_scan, build_projected_predicated_stats_delta_scan,
-    datafusion_expr_to_kernel_predicate, delta_source_arrow_schema,
+    KernelDataFileReaderConfig, KernelDeletionVectorReadRequest, KernelDeletionVectorReader,
+    KernelDeletionVectorReaderConfig, KernelPhysicalToLogicalTransform,
+    KernelScanDeletionVectorMetadata, KernelScanFileMetadata, KernelScanMetadataExpansion,
+    KernelScanReadSchema, ProjectedDeltaScan, ProviderDeletionVectorSelection,
+    ProviderDeletionVectorSelectionContext, build_projected_predicated_delta_scan,
+    build_projected_predicated_stats_delta_scan, datafusion_expr_to_kernel_predicate,
+    delta_source_arrow_schema,
 };
 pub use delta::{
     DeltaProtocolReport, DeltaSourceConfig, PlannedDeltaSource, ProtocolPreflight,

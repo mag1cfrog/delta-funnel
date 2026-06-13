@@ -16,7 +16,8 @@ mod uri;
 use super::validate_table_source_names;
 #[allow(unused_imports)]
 pub(crate) use deletion_vector::{
-    KernelDeletionVectorReadRequest, KernelDeletionVectorReader, ProviderDeletionVectorSelection,
+    KernelDeletionVectorReadRequest, KernelDeletionVectorReader, KernelDeletionVectorReaderConfig,
+    ProviderDeletionVectorSelection, ProviderDeletionVectorSelectionContext,
 };
 use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{DeltaKernelPredicate, datafusion_expr_to_kernel_predicate};
@@ -128,9 +129,11 @@ impl KernelScanDeletionVectorMetadata {
 
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn test_present() -> Self {
+    pub(crate) fn test_present_from_descriptor(
+        descriptor: kernel::DeletionVectorDescriptor,
+    ) -> Self {
         Self::Present(KernelScanDeletionVectorHandle {
-            dv_info: kernel::DvInfo::default(),
+            dv_info: descriptor.into(),
         })
     }
 }

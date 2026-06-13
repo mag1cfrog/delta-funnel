@@ -4,6 +4,8 @@
 //! planning and later DataFusion stream execution. This first slice wires the
 //! non-DV, non-transform path through the official kernel reader baseline.
 
+use datafusion::arrow::array::BooleanArray;
+use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::record_batch::RecordBatch;
 use snafu::ResultExt;
 
@@ -12,7 +14,9 @@ use crate::{
     error::{DeltaScanFileReadPhase, DeltaScanFileReadSnafu},
     table_formats::{
         KernelDataFileReadRequest, KernelDataFileReader, KernelDataFileReaderConfig,
-        KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata, KernelScanReadSchema,
+        KernelDeletionVectorReadRequest, KernelDeletionVectorReader,
+        KernelDeletionVectorReaderConfig, KernelPhysicalToLogicalTransform, KernelScanReadSchema,
+        ProviderDeletionVectorSelection, ProviderDeletionVectorSelectionContext,
     },
 };
 
@@ -25,6 +29,7 @@ pub(crate) struct DeltaFileReader {
     table_uri: String,
     snapshot_version: u64,
     data_file_reader: KernelDataFileReader,
+    deletion_vector_reader: KernelDeletionVectorReader,
 }
 
 /// Context required to construct the file-level reader.
@@ -63,12 +68,19 @@ impl DeltaFileReader {
             table_uri: config.table_uri,
             snapshot_version: config.snapshot_version,
         })?;
+        let deletion_vector_reader =
+            KernelDeletionVectorReader::try_new(KernelDeletionVectorReaderConfig {
+                source_name: config.source_name,
+                table_uri: config.table_uri,
+                snapshot_version: config.snapshot_version,
+            })?;
 
         Ok(Self {
             source_name: config.source_name.to_owned(),
             table_uri: config.table_uri.to_owned(),
             snapshot_version: config.snapshot_version,
             data_file_reader,
+            deletion_vector_reader,
         })
     }
 
@@ -80,7 +92,12 @@ impl DeltaFileReader {
     ) -> Result<DeltaFileReadResult, DeltaFunnelError> {
         self.validate_task_context(request.task)?;
         self.reject_unwired_transform(request.task)?;
-        self.reject_unwired_deletion_vector(request.task)?;
+        let mut deletion_vector =
+            self.deletion_vector_reader
+                .read_selection(KernelDeletionVectorReadRequest {
+                    path: &request.task.path,
+                    deletion_vector: &request.task.deletion_vector,
+                })?;
 
         let data = self
             .data_file_reader
@@ -90,10 +107,13 @@ impl DeltaFileReader {
                 modification_time_ms: request.task.modification_time_ms,
                 schema: request.read_schema,
             })?;
+        let batches =
+            self.apply_deletion_vector_mask(request.task, data.batches, deletion_vector.as_mut())?;
+        if let Some(deletion_vector) = deletion_vector.as_mut() {
+            deletion_vector.finish(self.deletion_vector_context(request.task))?;
+        }
 
-        Ok(DeltaFileReadResult {
-            batches: data.batches,
-        })
+        Ok(DeltaFileReadResult { batches })
     }
 
     fn validate_task_context(&self, task: &DeltaScanFileTask) -> Result<(), DeltaFunnelError> {
@@ -132,16 +152,42 @@ impl DeltaFileReader {
         }
     }
 
-    fn reject_unwired_deletion_vector(
+    fn apply_deletion_vector_mask(
         &self,
         task: &DeltaScanFileTask,
-    ) -> Result<(), DeltaFunnelError> {
-        match &task.deletion_vector {
-            KernelScanDeletionVectorMetadata::NotPresent => Ok(()),
-            KernelScanDeletionVectorMetadata::Present(_) => Err(delta_kernel::Error::generic(
-                "deletion-vector masking is owned by a later #138 slice",
-            ))
-            .context(DeltaScanFileReadSnafu {
+        batches: Vec<RecordBatch>,
+        mut deletion_vector: Option<&mut ProviderDeletionVectorSelection>,
+    ) -> Result<Vec<RecordBatch>, DeltaFunnelError> {
+        let Some(deletion_vector) = deletion_vector.as_mut() else {
+            return Ok(batches);
+        };
+
+        batches
+            .into_iter()
+            .map(|batch| self.apply_deletion_vector_mask_to_batch(task, batch, deletion_vector))
+            .collect()
+    }
+
+    fn apply_deletion_vector_mask_to_batch(
+        &self,
+        task: &DeltaScanFileTask,
+        batch: RecordBatch,
+        deletion_vector: &mut ProviderDeletionVectorSelection,
+    ) -> Result<RecordBatch, DeltaFunnelError> {
+        let keep_mask =
+            deletion_vector.consume_batch(batch.num_rows(), self.deletion_vector_context(task))?;
+        if keep_mask.iter().all(|selected| *selected) {
+            return Ok(batch);
+        }
+        if keep_mask.iter().all(|selected| !*selected) {
+            return Ok(RecordBatch::new_empty(batch.schema()));
+        }
+
+        let keep_mask = BooleanArray::from(keep_mask);
+
+        match filter_record_batch(&batch, &keep_mask) {
+            Ok(filtered) => Ok(filtered),
+            Err(error) => Err(delta_kernel::Error::from(error)).context(DeltaScanFileReadSnafu {
                 source_name: self.source_name.clone(),
                 table_uri: self.table_uri.clone(),
                 snapshot_version: self.snapshot_version,
@@ -150,10 +196,28 @@ impl DeltaFileReader {
             }),
         }
     }
+
+    fn deletion_vector_context<'a>(
+        &self,
+        task: &'a DeltaScanFileTask,
+    ) -> ProviderDeletionVectorSelectionContext<'a> {
+        ProviderDeletionVectorSelectionContext {
+            source_name: &task.source_name,
+            table_uri: &task.table_uri,
+            snapshot_version: task.snapshot_version,
+            path: &task.path,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::actions::deletion_vector::{
+        DeletionVectorDescriptor, DeletionVectorStorageType,
+    };
+    use delta_kernel::actions::deletion_vector_writer::{
+        KernelDeletionVector, StreamingDeletionVectorWriter,
+    };
     use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 
     use super::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
@@ -253,14 +317,76 @@ mod tests {
     }
 
     #[test]
-    fn file_reader_rejects_deletion_vector_until_slice_is_wired()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = RealParquetDeltaTable::new_default("file-reader-dv-reject")?;
+    fn file_reader_applies_deletion_vector_mask() -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("file-reader-dv-mask")?;
         let source = load_source("orders", &table)?;
         let scan = build_projected_delta_scan(&source, None)?;
         let read_schema = scan.read_schema();
         let mut task = first_file_task(&source, &scan)?;
-        task.deletion_vector = KernelScanDeletionVectorMetadata::test_present();
+        set_task_deletion_vector(&mut task, &table, &[1])?;
+        let reader = test_reader(&source)?;
+        let result = reader.read_file(DeltaFileReadRequest {
+            task: &task,
+            read_schema: &read_schema,
+        })?;
+
+        assert_eq!(collect_ids(&result.batches)?, vec![1, 3]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_reader_emits_empty_batch_when_all_rows_deleted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("file-reader-dv-all-deleted")?;
+        let source = load_source("orders", &table)?;
+        let scan = build_projected_delta_scan(&source, None)?;
+        let read_schema = scan.read_schema();
+        let mut task = first_file_task(&source, &scan)?;
+        set_task_deletion_vector(&mut task, &table, &[0, 1, 2])?;
+        let reader = test_reader(&source)?;
+        let result = reader.read_file(DeltaFileReadRequest {
+            task: &task,
+            read_schema: &read_schema,
+        })?;
+
+        assert_eq!(result.batches.len(), 1);
+        let batch = result.batches.first().ok_or("expected one record batch")?;
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(collect_ids(&result.batches)?, Vec::<i32>::new());
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_reader_keeps_all_rows_when_dv_deletes_no_rows() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table = RealParquetDeltaTable::new_default("file-reader-dv-none-deleted")?;
+        let source = load_source("orders", &table)?;
+        let scan = build_projected_delta_scan(&source, None)?;
+        let read_schema = scan.read_schema();
+        let mut task = first_file_task(&source, &scan)?;
+        set_task_deletion_vector(&mut task, &table, &[])?;
+        let reader = test_reader(&source)?;
+        let result = reader.read_file(DeltaFileReadRequest {
+            task: &task,
+            read_schema: &read_schema,
+        })?;
+
+        assert_eq!(collect_ids(&result.batches)?, vec![1, 2, 3]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_reader_rejects_overlong_deletion_vector() -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("file-reader-dv-overlong")?;
+        let source = load_source("orders", &table)?;
+        let scan = build_projected_delta_scan(&source, None)?;
+        let read_schema = scan.read_schema();
+        let mut task = first_file_task(&source, &scan)?;
+        set_task_deletion_vector(&mut task, &table, &[9])?;
         let reader = test_reader(&source)?;
         let error = reader
             .read_file(DeltaFileReadRequest {
@@ -268,11 +394,15 @@ mod tests {
                 read_schema: &read_schema,
             })
             .err()
-            .ok_or("expected DV rejection")?;
+            .ok_or("expected overlong DV error")?;
         let display = error.to_string();
 
         assert!(display.contains("source `orders`"), "{display}");
-        assert!(display.contains("deletion-vector masking"), "{display}");
+        assert!(
+            display.contains("selection-vector length mismatch"),
+            "{display}"
+        );
+        assert!(display.contains("unconsumed entries"), "{display}");
         assert!(display.contains(table.data_file_path()), "{display}");
 
         Ok(())
@@ -324,6 +454,61 @@ mod tests {
             source.version(),
             file,
         )?)
+    }
+
+    fn set_task_deletion_vector(
+        task: &mut DeltaScanFileTask,
+        table: &RealParquetDeltaTable,
+        deleted_rows: &[u64],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        task.deletion_vector = write_relative_deletion_vector(table, deleted_rows)?;
+
+        Ok(())
+    }
+
+    fn write_relative_deletion_vector(
+        table: &RealParquetDeltaTable,
+        deleted_rows: &[u64],
+    ) -> Result<KernelScanDeletionVectorMetadata, Box<dyn std::error::Error>> {
+        const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
+        const RELATIVE_DV_FILE: &str = "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
+
+        let mut buffer = Vec::new();
+        let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
+        let mut deletion_vector = KernelDeletionVector::new();
+        deletion_vector.add_deleted_row_indexes(deleted_rows);
+        let write_result = writer.write_deletion_vector(deletion_vector)?;
+        writer.finalize()?;
+        std::fs::write(table.path().join(RELATIVE_DV_FILE), buffer)?;
+
+        Ok(
+            KernelScanDeletionVectorMetadata::test_present_from_descriptor(
+                DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: RELATIVE_DV_ID.to_owned(),
+                    offset: Some(write_result.offset),
+                    size_in_bytes: write_result.size_in_bytes,
+                    cardinality: write_result.cardinality,
+                },
+            ),
+        )
+    }
+
+    fn collect_ids(
+        batches: &[datafusion::arrow::record_batch::RecordBatch],
+    ) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        let mut ids = Vec::new();
+
+        for batch in batches {
+            let id_column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or("expected id Int32Array")?;
+            ids.extend(id_column.values());
+        }
+
+        Ok(ids)
     }
 
     fn load_source(
