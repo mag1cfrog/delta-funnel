@@ -601,6 +601,36 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn provider_execution_boundary_avoids_runtime_creation_and_sync_bridge() {
+        let checked_sources = [
+            (
+                "catalog/provider.rs",
+                include_str!("../catalog/provider.rs"),
+            ),
+            (
+                "execution/planning_exec.rs",
+                include_str!("planning_exec.rs"),
+            ),
+        ];
+        let forbidden_patterns = [
+            concat!("block", "_", "on"),
+            concat!("tokio", "::", "runtime"),
+            concat!("Runtime", "::", "new"),
+            concat!("Builder", "::", "new_current_thread"),
+            concat!("Builder", "::", "new_multi_thread"),
+        ];
+
+        for (source_path, source) in checked_sources {
+            for forbidden_pattern in forbidden_patterns {
+                assert!(
+                    !source.contains(forbidden_pattern),
+                    "{source_path} must not contain `{forbidden_pattern}`"
+                );
+            }
+        }
+    }
+
     struct FakePartitionFileReader {
         read_count: Arc<AtomicUsize>,
         schema: datafusion::arrow::datatypes::SchemaRef,
