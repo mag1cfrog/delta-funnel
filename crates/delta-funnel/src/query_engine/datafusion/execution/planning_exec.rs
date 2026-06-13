@@ -964,6 +964,8 @@ mod tests {
         ];
         let forbidden_patterns = [
             concat!("block", "_", "on"),
+            concat!("tokio", "::", "spawn"),
+            concat!("tokio", "::", "task", "::", "spawn_blocking"),
             concat!("tokio", "::", "runtime"),
             concat!("Runtime", "::", "new"),
             concat!("Builder", "::", "new_current_thread"),
