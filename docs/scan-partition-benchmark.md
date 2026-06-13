@@ -37,9 +37,10 @@ cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
   --output target/delta-scan-partition-host-probe.csv
 ```
 
-Host-probe mode currently records cheap local host signals and feeds them
-through the same production diagnostic target policy. It does not run local IO
-throughput probes yet.
+Host-probe mode currently records cheap local host signals and runs a bounded
+in-process scheduler probe before feeding the host profile through the same
+production diagnostic target policy. It does not run local IO throughput probes
+yet.
 
 Use a deterministic jitter seed:
 
@@ -154,6 +155,12 @@ Important field groups:
   - `host_memory_available_bytes`
   - `host_unix_soft_fd_limit`
   - `host_unix_soft_fd_limit_status`
+  - `host_scheduler_probe_task_count`
+  - `host_scheduler_probe_completed_task_count`
+  - `host_scheduler_probe_concurrency`
+  - `host_scheduler_probe_total_micros`
+  - `host_scheduler_probe_nanos_per_task`
+  - `host_runtime_probe_stable_concurrency_hint`
 
 `partition_work_imbalance_basis_points` is:
 
@@ -199,8 +206,8 @@ scheduling overhead, bounded execution slots, and aggregate transfer floors so
 policy cases can be compared more realistically than with infinite parallelism.
 
 Host-probe mode records real cheap host signals, including available
-parallelism, memory hints, and Unix fd limit status when available. It does not
-run disk, network, or stress probes yet.
+parallelism, memory hints, Unix fd limit status when available, and a bounded
+local scheduler probe. It does not run disk, network, or stress probes yet.
 
 It is still not a production read benchmark. It does not measure real Parquet
 decoding, Arrow batch memory, object-store request behavior, or DataFusion

@@ -6,6 +6,9 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::Instant;
 
 use chrono::{Datelike, Days, NaiveDate};
 use delta_funnel::{
@@ -23,9 +26,11 @@ const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
 const BENCHMARK_AVAILABLE_PARALLELISM_CANDIDATES: [usize; 3] = [4, 16, 64];
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
-const BENCHMARK_SCHEMA_VERSION: u32 = 7;
+const HOST_PROBE_MAX_SCHEDULER_CONCURRENCY: usize = 64;
+const HOST_PROBE_SCHEDULER_TASKS_PER_WORKER: usize = 256;
+const BENCHMARK_SCHEMA_VERSION: u32 = 8;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
-const BENCHMARK_CSV_HEADER: [&str; 66] = [
+const BENCHMARK_CSV_HEADER: [&str; 72] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -92,6 +97,12 @@ const BENCHMARK_CSV_HEADER: [&str; 66] = [
     "host_memory_available_bytes",
     "host_unix_soft_fd_limit",
     "host_unix_soft_fd_limit_status",
+    "host_scheduler_probe_task_count",
+    "host_scheduler_probe_completed_task_count",
+    "host_scheduler_probe_concurrency",
+    "host_scheduler_probe_total_micros",
+    "host_scheduler_probe_nanos_per_task",
+    "host_runtime_probe_stable_concurrency_hint",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -175,6 +186,7 @@ fn write_host_probe_benchmark_csv(
 ) -> Result<(), Box<dyn Error>> {
     let run_environment = BenchmarkRunEnvironment::local();
     let local_environment = delta_scan_partition_target_local_environment_diagnostic();
+    let scheduler_probe = run_host_scheduler_probe(run_environment.available_parallelism);
     let policy_decision =
         derive_delta_scan_partition_target_diagnostic(local_environment.policy_input)?;
 
@@ -186,6 +198,7 @@ fn write_host_probe_benchmark_csv(
             run_environment,
             seed,
             local_environment,
+            scheduler_probe,
             policy_decision,
         })
         .join(",")
@@ -568,7 +581,18 @@ struct HostProbeCsvRowInput {
     run_environment: BenchmarkRunEnvironment,
     seed: u64,
     local_environment: DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+    scheduler_probe: HostSchedulerProbeResult,
     policy_decision: DeltaScanPartitionTargetDiagnosticOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostSchedulerProbeResult {
+    task_count: usize,
+    completed_task_count: usize,
+    concurrency: usize,
+    total_micros: u64,
+    nanos_per_task: u64,
+    stable_concurrency_hint: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2153,6 +2177,52 @@ fn local_available_parallelism() -> Option<usize> {
         .map(std::num::NonZeroUsize::get)
 }
 
+fn run_host_scheduler_probe(available_parallelism: Option<usize>) -> HostSchedulerProbeResult {
+    let concurrency = available_parallelism
+        .unwrap_or(1)
+        .clamp(1, HOST_PROBE_MAX_SCHEDULER_CONCURRENCY);
+    let task_count = concurrency.saturating_mul(HOST_PROBE_SCHEDULER_TASKS_PER_WORKER);
+    let next_task = AtomicUsize::new(0);
+    let completed_task_count = AtomicUsize::new(0);
+    let started = Instant::now();
+
+    thread::scope(|scope| {
+        for _ in 0..concurrency {
+            scope.spawn(|| {
+                loop {
+                    let task_index = next_task.fetch_add(1, Ordering::Relaxed);
+                    if task_index >= task_count {
+                        break;
+                    }
+                    std::hint::black_box(task_index);
+                    completed_task_count.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+
+    let elapsed = started.elapsed();
+    let completed_task_count = completed_task_count.load(Ordering::Relaxed);
+    let nanos_per_task = if completed_task_count == 0 {
+        0
+    } else {
+        u128_to_u64_saturating(elapsed.as_nanos().div_ceil(completed_task_count as u128))
+    };
+
+    HostSchedulerProbeResult {
+        task_count,
+        completed_task_count,
+        concurrency,
+        total_micros: u128_to_u64_saturating(elapsed.as_micros()),
+        nanos_per_task,
+        stable_concurrency_hint: concurrency,
+    }
+}
+
+fn u128_to_u64_saturating(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
     let shape = input.shape;
     let file_set = input.file_set;
@@ -2267,6 +2337,12 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
         String::new(),
         String::new(),
         String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
     ]
 }
 
@@ -2308,6 +2384,12 @@ fn host_probe_csv_row(input: HostProbeCsvRowInput) -> Vec<String> {
             .unix_soft_file_descriptor_limit_status,
     )
     .to_owned();
+    row[66] = input.scheduler_probe.task_count.to_string();
+    row[67] = input.scheduler_probe.completed_task_count.to_string();
+    row[68] = input.scheduler_probe.concurrency.to_string();
+    row[69] = input.scheduler_probe.total_micros.to_string();
+    row[70] = input.scheduler_probe.nanos_per_task.to_string();
+    row[71] = input.scheduler_probe.stable_concurrency_hint.to_string();
 
     row
 }
@@ -2561,7 +2643,7 @@ mod tests {
 
         assert_eq!(lines.len(), 1111);
         assert!(lines[0].starts_with("benchmark_schema_version,benchmark_mode,host_os,host_arch"));
-        assert!(csv.contains("\n7,synthetic,"));
+        assert!(csv.contains("\n8,synthetic,"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
@@ -2595,7 +2677,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "7");
+        assert_eq!(row[0], "8");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[5], "42");
         assert_eq!(row[6], "0");
@@ -2610,6 +2692,12 @@ mod tests {
             row[65],
             "finite" | "unlimited" | "unknown" | "unsupported"
         ));
+        assert!(!row[66].is_empty());
+        assert!(!row[67].is_empty());
+        assert!(!row[68].is_empty());
+        assert!(!row[69].is_empty());
+        assert!(!row[70].is_empty());
+        assert!(!row[71].is_empty());
 
         Ok(())
     }
@@ -2641,11 +2729,19 @@ mod tests {
             },
             seed: 7,
             local_environment,
+            scheduler_probe: HostSchedulerProbeResult {
+                task_count: 512,
+                completed_task_count: 512,
+                concurrency: 2,
+                total_micros: 123,
+                nanos_per_task: 240,
+                stable_concurrency_hint: 2,
+            },
             policy_decision,
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "7");
+        assert_eq!(row[0], "8");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
@@ -2664,8 +2760,30 @@ mod tests {
         assert_eq!(row[63], (1024 * MIB).to_string());
         assert_eq!(row[64], "128");
         assert_eq!(row[65], "finite");
+        assert_eq!(row[66], "512");
+        assert_eq!(row[67], "512");
+        assert_eq!(row[68], "2");
+        assert_eq!(row[69], "123");
+        assert_eq!(row[70], "240");
+        assert_eq!(row[71], "2");
 
         Ok(())
+    }
+
+    #[test]
+    fn host_scheduler_probe_uses_bounded_concurrency() {
+        let probe = run_host_scheduler_probe(Some(HOST_PROBE_MAX_SCHEDULER_CONCURRENCY * 2));
+
+        assert_eq!(probe.concurrency, HOST_PROBE_MAX_SCHEDULER_CONCURRENCY);
+        assert_eq!(
+            probe.task_count,
+            HOST_PROBE_MAX_SCHEDULER_CONCURRENCY * HOST_PROBE_SCHEDULER_TASKS_PER_WORKER
+        );
+        assert_eq!(probe.completed_task_count, probe.task_count);
+        assert_eq!(
+            probe.stable_concurrency_hint,
+            HOST_PROBE_MAX_SCHEDULER_CONCURRENCY
+        );
     }
 
     #[test]
@@ -3479,7 +3597,7 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 66);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 72);
         assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(BENCHMARK_CSV_HEADER[1], "benchmark_mode");
         assert_eq!(BENCHMARK_CSV_HEADER[2], "host_os");
@@ -3527,6 +3645,24 @@ mod tests {
         assert_eq!(BENCHMARK_CSV_HEADER[63], "host_memory_available_bytes");
         assert_eq!(BENCHMARK_CSV_HEADER[64], "host_unix_soft_fd_limit");
         assert_eq!(BENCHMARK_CSV_HEADER[65], "host_unix_soft_fd_limit_status");
+        assert_eq!(BENCHMARK_CSV_HEADER[66], "host_scheduler_probe_task_count");
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[67],
+            "host_scheduler_probe_completed_task_count"
+        );
+        assert_eq!(BENCHMARK_CSV_HEADER[68], "host_scheduler_probe_concurrency");
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[69],
+            "host_scheduler_probe_total_micros"
+        );
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[70],
+            "host_scheduler_probe_nanos_per_task"
+        );
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[71],
+            "host_runtime_probe_stable_concurrency_hint"
+        );
     }
 
     #[test]
@@ -3562,7 +3698,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "7");
+        assert_eq!(row[0], "8");
         assert_eq!(row[1], "synthetic");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
@@ -3587,6 +3723,12 @@ mod tests {
         assert_eq!(row[63], "");
         assert_eq!(row[64], "");
         assert_eq!(row[65], "");
+        assert_eq!(row[66], "");
+        assert_eq!(row[67], "");
+        assert_eq!(row[68], "");
+        assert_eq!(row[69], "");
+        assert_eq!(row[70], "");
+        assert_eq!(row[71], "");
 
         Ok(())
     }
