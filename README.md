@@ -16,3 +16,6 @@ design hardens.
 
 Foundation dependency and error-handling decisions are recorded in
 [`docs/dependency-alignment.md`](docs/dependency-alignment.md).
+
+The synthetic scan partition target benchmark runner is documented in
+[`docs/scan-partition-benchmark.md`](docs/scan-partition-benchmark.md).

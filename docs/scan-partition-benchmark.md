@@ -1,0 +1,149 @@
+# Scan Partition Benchmark
+
+`delta_scan_partition_bench` is a portable synthetic benchmark runner for the
+Delta DataFusion scan partition target policy.
+
+The runner does not read Parquet data, contact object storage, require S3
+credentials, or execute production scan reads. It builds deterministic
+Delta-like file tasks in memory, runs the production target policy through the
+diagnostic facade, simulates scan work, groups files by estimated bytes, and
+writes a CSV matrix.
+
+## Run
+
+Write CSV to stdout:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench
+```
+
+Write CSV to a file:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --output target/delta-scan-partition-bench.csv
+```
+
+Use a deterministic jitter seed:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --seed 42 \
+  --output target/delta-scan-partition-bench-seed-42.csv
+```
+
+The default seed is `0`. The seed affects deterministic simulated work jitter.
+It does not change workload file shapes or policy target derivation.
+
+## Matrix
+
+The default matrix currently covers:
+
+- Workloads:
+  - `partitioned_event_log_target_shape`: target synthetic table shape, 956
+    files, about 393 MiB, 933 daily partitions.
+  - `many_tiny_files`: 4096 files, 64 KiB per file, small-file latency pressure.
+  - `mixed_tiny_large_files`: 1024 tiny files plus 16 large files, mixed size
+    grouping pressure.
+  - `highly_skewed_files`: one 2 GiB file plus 255 small files, max-file
+    dominated grouping pressure.
+- Simulation profiles:
+  - `local_fast`
+  - `s3_normal`
+  - `s3_high_latency`
+  - `s3_throttled`
+  - `cpu_heavy`
+- Policy cases:
+  - `default_policy`
+  - `fd_per_partition_4`, `8`, `16`, `32`
+  - `memory_per_partition_64mib`, `128mib`, `256mib`, `512mib`
+  - all fd-per-partition x memory-per-partition combined cases
+
+Correctness-only edge shapes such as empty scans, one-file scans, and few-file
+scans stay in unit tests and are not part of the default performance matrix.
+
+## Output
+
+The runner writes one CSV header and one row per matrix case.
+
+Important field groups:
+
+- Run metadata:
+  - `benchmark_schema_version`
+  - `host_os`
+  - `host_arch`
+  - `host_available_parallelism`
+  - `seed`
+- Workload shape:
+  - `workload_case`
+  - `active_files`
+  - `active_bytes`
+  - `generated_files`
+  - `generated_bytes`
+- Policy inputs and result:
+  - `policy_case`
+  - `policy_available_parallelism`
+  - `policy_datafusion_target`
+  - `policy_fd_per_partition`
+  - `policy_memory_bytes_per_partition`
+  - `policy_target`
+  - `policy_source`
+  - `policy_datafusion_cap`
+  - `policy_unix_fd_cap`
+  - `policy_memory_cap`
+- Simulated execution:
+  - `simulated_serial_micros`
+  - `simulated_max_file_micros`
+  - `simulated_output_partitions`
+  - `simulated_wall_micros`
+  - `simulated_throughput_mib_per_second`
+  - `simulated_rows_per_second`
+- Grouping balance:
+  - `partition_files_p50`
+  - `partition_files_p95`
+  - `partition_files_max`
+  - `partition_bytes_p50`
+  - `partition_bytes_p95`
+  - `partition_bytes_max`
+  - `partition_work_micros_p50`
+  - `partition_work_micros_p95`
+  - `partition_work_imbalance_basis_points`
+
+`partition_work_imbalance_basis_points` is:
+
+```text
+max_partition_work / average_partition_work * 10000
+```
+
+`10000` means perfectly balanced simulated partition work. Higher values mean
+more imbalance.
+
+## Cross-machine comparison
+
+Run the same command on each machine and keep the CSV output:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --seed 0 \
+  --output bench-$(uname -s)-$(uname -m).csv
+```
+
+Compare rows with the same `workload_case`, `simulation_profile`, and
+`policy_case`. The host metadata columns show which machine produced each row.
+
+The policy variables under active calibration are:
+
+- `policy_fd_per_partition`
+- `policy_memory_bytes_per_partition`
+
+Use `policy_target`, applied cap columns, wall time, throughput, and grouping
+balance columns together. A policy case that improves wall time but creates
+high imbalance or depends on unsafe resource caps is not automatically a better
+default.
+
+## Scope
+
+This benchmark validates scan partition target policy and synthetic file-task
+grouping behavior. It is not a production read benchmark. It does not measure
+real Parquet decoding, Arrow batch memory, object-store request behavior, or
+DataFusion runtime scheduling. Those belong to later read execution work.
