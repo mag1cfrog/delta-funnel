@@ -1,13 +1,14 @@
 # Scan Partition Benchmark
 
-`delta_scan_partition_bench` is a portable synthetic benchmark runner for the
-Delta DataFusion scan partition target policy.
+`delta_scan_partition_bench` is a portable benchmark runner for the Delta
+DataFusion scan partition target policy. Its default mode is the deterministic
+synthetic matrix.
 
 The production policy is documented in
 [`scan-partition-target-policy.md`](scan-partition-target-policy.md).
 
-The runner does not read Parquet data, contact object storage, require S3
-credentials, or execute production scan reads. It builds deterministic
+The synthetic mode does not read Parquet data, contact object storage, require
+S3 credentials, or execute production scan reads. It builds deterministic
 Delta-like file tasks in memory, runs the production target policy through the
 diagnostic facade, simulates scan work, groups files by estimated bytes or the
 unknown-size file-count fallback, and writes a CSV matrix.
@@ -24,8 +25,14 @@ Write CSV to a file:
 
 ```bash
 cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode synthetic \
   --output target/delta-scan-partition-bench.csv
 ```
+
+The `--mode host-probe` flag is reserved for the opt-in host probe mode. It is
+parsed separately from synthetic mode so CSV output can distinguish
+`synthetic` from `host_probe`, but host-probe execution is added in the later
+implementation slices.
 
 Use a deterministic jitter seed:
 
@@ -89,6 +96,7 @@ Important field groups:
 
 - Run metadata:
   - `benchmark_schema_version`
+  - `benchmark_mode`
   - `host_os`
   - `host_arch`
   - `host_available_parallelism`
