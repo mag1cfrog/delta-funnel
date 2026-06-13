@@ -17,11 +17,12 @@ const MIB: u64 = 1024 * 1024;
 const BENCHMARK_FD_PER_PARTITION_CANDIDATES: [usize; 4] = [4, 8, 16, 32];
 const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
     [64 * MIB, 128 * MIB, 256 * MIB, 512 * MIB];
+const BENCHMARK_AVAILABLE_PARALLELISM_CANDIDATES: [usize; 3] = [4, 16, 64];
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
-const BENCHMARK_SCHEMA_VERSION: u32 = 1;
+const BENCHMARK_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
-const BENCHMARK_CSV_HEADER: [&str; 54] = [
+const BENCHMARK_CSV_HEADER: [&str; 55] = [
     "benchmark_schema_version",
     "host_os",
     "host_arch",
@@ -61,6 +62,7 @@ const BENCHMARK_CSV_HEADER: [&str; 54] = [
     "policy_datafusion_cap",
     "policy_unix_fd_cap",
     "policy_memory_cap",
+    "unknown_size_fallback_used",
     "simulated_serial_micros",
     "simulated_max_file_micros",
     "simulated_output_partitions",
@@ -234,6 +236,8 @@ impl SyntheticWorkloadCase {
             Self::many_tiny_files()?,
             Self::mixed_tiny_large_files()?,
             Self::highly_skewed_files()?,
+            Self::unknown_size_files()?,
+            Self::zero_byte_files()?,
         ])
     }
 
@@ -314,6 +318,29 @@ impl SyntheticWorkloadCase {
             HUGE_BYTES + SMALL_FILE_COUNT as u64 * SMALL_BYTES_PER_FILE,
             &files,
         )
+    }
+
+    fn unknown_size_files() -> Result<Self, SyntheticGenerationError> {
+        const FILE_COUNT: usize = 1_024;
+        const ROWS_PER_FILE: u64 = 4_000;
+        const BYTES_PER_FILE: u64 = 512 * 1024;
+
+        let mut workload = Self::explicit_files(
+            "unknown_size_files",
+            FILE_COUNT as u64 * ROWS_PER_FILE,
+            FILE_COUNT as u64 * BYTES_PER_FILE,
+            &[(ROWS_PER_FILE, BYTES_PER_FILE); FILE_COUNT],
+        )?;
+        for file in &mut workload.file_set.files {
+            file.estimated_size_bytes = None;
+        }
+        Ok(workload)
+    }
+
+    fn zero_byte_files() -> Result<Self, SyntheticGenerationError> {
+        const FILE_COUNT: usize = 512;
+
+        Self::explicit_files("zero_byte_files", 0, 0, &[(0, 0); FILE_COUNT])
     }
 
     fn explicit_files(
@@ -411,6 +438,7 @@ struct SyntheticFile {
     partition_date: SyntheticDate,
     file_index_in_partition: usize,
     rows: u64,
+    estimated_size_bytes: Option<u64>,
     size_bytes: u64,
 }
 
@@ -467,6 +495,7 @@ struct SyntheticFileWorkCost {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SyntheticPartitionedWorkPlan {
     target_partitions: usize,
+    unknown_size_fallback_used: bool,
     partitions: Vec<SyntheticWorkPartition>,
     wall_micros: u64,
 }
@@ -476,6 +505,7 @@ struct SyntheticWorkPartition {
     partition_index: usize,
     file_count: usize,
     rows: u64,
+    estimated_size_bytes: Option<u64>,
     size_bytes: u64,
     work_micros: u64,
 }
@@ -858,6 +888,7 @@ impl SyntheticDeltaTableShape {
                     partition_date: date,
                     file_index_in_partition: file_index,
                     rows: file_rows[file_index],
+                    estimated_size_bytes: Some(file_bytes[file_index]),
                     size_bytes: file_bytes[file_index],
                 });
             }
@@ -1024,6 +1055,7 @@ impl SyntheticFileSet {
                 partition_date: date,
                 file_index_in_partition: 0,
                 rows,
+                estimated_size_bytes: Some(size_bytes),
                 size_bytes,
             });
         }
@@ -1037,6 +1069,20 @@ impl SyntheticFileSet {
 
     fn total_bytes(&self) -> u64 {
         self.files.iter().map(|file| file.size_bytes).sum()
+    }
+
+    fn total_estimated_size_bytes(&self) -> Result<Option<u64>, SyntheticGenerationError> {
+        let mut total = 0_u64;
+        for file in &self.files {
+            let Some(estimated_size_bytes) = file.estimated_size_bytes else {
+                return Ok(None);
+            };
+            total = total
+                .checked_add(estimated_size_bytes)
+                .ok_or_else(|| generation_error("estimated file size overflow"))?;
+        }
+
+        Ok(Some(total))
     }
 
     fn max_files_per_partition(&self) -> usize {
@@ -1053,6 +1099,7 @@ impl BenchmarkPolicyCase {
         let baseline = Self::baseline_input(available_parallelism);
         let mut cases = vec![Self::new("default_policy", baseline)];
         cases.extend(Self::strategy_baseline_cases(baseline));
+        cases.extend(Self::available_parallelism_override_cases(baseline));
 
         for file_descriptors_per_partition in BENCHMARK_FD_PER_PARTITION_CANDIDATES {
             cases.push(Self::new(
@@ -1139,6 +1186,23 @@ impl BenchmarkPolicyCase {
                 },
             ),
         ]
+    }
+
+    fn available_parallelism_override_cases(
+        baseline: DeltaScanPartitionTargetDiagnosticInput,
+    ) -> impl Iterator<Item = Self> {
+        BENCHMARK_AVAILABLE_PARALLELISM_CANDIDATES
+            .into_iter()
+            .map(move |available_parallelism| {
+                Self::new(
+                    format!("available_parallelism_override_{available_parallelism}"),
+                    DeltaScanPartitionTargetDiagnosticInput {
+                        available_parallelism: Some(available_parallelism),
+                        datafusion_target_partitions: Some(available_parallelism),
+                        ..baseline
+                    },
+                )
+            })
     }
 
     fn new(name: impl Into<String>, input: DeltaScanPartitionTargetDiagnosticInput) -> Self {
@@ -1326,31 +1390,43 @@ impl SyntheticWorkSimulationResult {
         if file_set.files.is_empty() {
             return Ok(SyntheticPartitionedWorkPlan {
                 target_partitions,
+                unknown_size_fallback_used: false,
                 partitions: Vec::new(),
                 wall_micros: 0,
             });
         }
 
         let output_limit = target_partitions.min(file_set.files.len());
-        let target_bytes = file_set.total_bytes().div_ceil(output_limit as u64);
+        let Some(total_estimated_size_bytes) = file_set.total_estimated_size_bytes()? else {
+            return self.partition_by_file_count(file_set, target_partitions, output_limit);
+        };
+        let target_bytes = total_estimated_size_bytes.div_ceil(output_limit as u64);
         let mut partitions = Vec::new();
         let mut current = SyntheticWorkPartitionBuilder::default();
 
         for (file, cost) in file_set.files.iter().zip(&self.file_costs) {
+            let Some(estimated_size_bytes) = file.estimated_size_bytes else {
+                return Err(generation_error(
+                    "known-size grouping requires every file to have estimated bytes",
+                ));
+            };
             let can_start_next_partition = current.file_count > 0
                 && partitions.len() + 1 < output_limit
-                && current.size_bytes.saturating_add(file.size_bytes) > target_bytes;
+                && current
+                    .estimated_size_bytes
+                    .saturating_add(estimated_size_bytes)
+                    > target_bytes;
 
             if can_start_next_partition {
-                partitions.push(current.finish(partitions.len()));
+                partitions.push(current.finish(partitions.len(), true));
                 current = SyntheticWorkPartitionBuilder::default();
             }
 
-            current.add(file, cost)?;
+            current.add(file, cost, Some(estimated_size_bytes))?;
         }
 
         if current.file_count > 0 {
-            partitions.push(current.finish(partitions.len()));
+            partitions.push(current.finish(partitions.len(), true));
         }
 
         let wall_micros = partitions
@@ -1361,6 +1437,49 @@ impl SyntheticWorkSimulationResult {
 
         Ok(SyntheticPartitionedWorkPlan {
             target_partitions,
+            unknown_size_fallback_used: false,
+            partitions,
+            wall_micros,
+        })
+    }
+
+    fn partition_by_file_count(
+        &self,
+        file_set: &SyntheticFileSet,
+        target_partitions: usize,
+        output_limit: usize,
+    ) -> Result<SyntheticPartitionedWorkPlan, SyntheticGenerationError> {
+        let mut partitions = Vec::new();
+        let mut file_costs = file_set.files.iter().zip(&self.file_costs);
+        let mut remaining_files = file_set.files.len();
+
+        for partition_index in 0..output_limit {
+            let remaining_partitions = output_limit - partition_index;
+            let take_count = remaining_files.div_ceil(remaining_partitions);
+            let mut current = SyntheticWorkPartitionBuilder::default();
+
+            for _ in 0..take_count {
+                let Some((file, cost)) = file_costs.next() else {
+                    return Err(generation_error(
+                        "file-count grouping exhausted files unexpectedly",
+                    ));
+                };
+                current.add(file, cost, None)?;
+            }
+
+            remaining_files -= take_count;
+            partitions.push(current.finish(partitions.len(), false));
+        }
+
+        let wall_micros = partitions
+            .iter()
+            .map(|partition| partition.work_micros)
+            .max()
+            .unwrap_or_default();
+
+        Ok(SyntheticPartitionedWorkPlan {
+            target_partitions,
+            unknown_size_fallback_used: true,
             partitions,
             wall_micros,
         })
@@ -1411,6 +1530,7 @@ impl SyntheticPartitionedWorkPlan {
 struct SyntheticWorkPartitionBuilder {
     file_count: usize,
     rows: u64,
+    estimated_size_bytes: u64,
     size_bytes: u64,
     work_micros: u64,
 }
@@ -1420,6 +1540,7 @@ impl SyntheticWorkPartitionBuilder {
         &mut self,
         file: &SyntheticFile,
         cost: &SyntheticFileWorkCost,
+        estimated_size_bytes: Option<u64>,
     ) -> Result<(), SyntheticGenerationError> {
         self.file_count = self
             .file_count
@@ -1429,6 +1550,12 @@ impl SyntheticWorkPartitionBuilder {
             .rows
             .checked_add(file.rows)
             .ok_or_else(|| generation_error("partition row count overflow"))?;
+        if let Some(estimated_size_bytes) = estimated_size_bytes {
+            self.estimated_size_bytes = self
+                .estimated_size_bytes
+                .checked_add(estimated_size_bytes)
+                .ok_or_else(|| generation_error("partition estimated byte count overflow"))?;
+        }
         self.size_bytes = self
             .size_bytes
             .checked_add(file.size_bytes)
@@ -1441,11 +1568,12 @@ impl SyntheticWorkPartitionBuilder {
         Ok(())
     }
 
-    fn finish(self, partition_index: usize) -> SyntheticWorkPartition {
+    fn finish(self, partition_index: usize, estimated_size_known: bool) -> SyntheticWorkPartition {
         SyntheticWorkPartition {
             partition_index,
             file_count: self.file_count,
             rows: self.rows,
+            estimated_size_bytes: estimated_size_known.then_some(self.estimated_size_bytes),
             size_bytes: self.size_bytes,
             work_micros: self.work_micros,
         }
@@ -1808,6 +1936,10 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
         optional_usize(policy_decision.datafusion_target_cap),
         optional_usize(policy_decision.unix_file_descriptor_cap),
         optional_usize(policy_decision.memory_cap),
+        input
+            .partitioned_work
+            .unknown_size_fallback_used
+            .to_string(),
         input.simulated_work.serial_micros.to_string(),
         input.simulated_work.max_file_micros.to_string(),
         input.partitioned_work.partitions.len().to_string(),
@@ -2032,16 +2164,19 @@ mod tests {
         let csv = String::from_utf8(output)?;
         let lines = csv.lines().collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), 601);
+        assert_eq!(lines.len(), 991);
         assert!(lines[0].starts_with("benchmark_schema_version,host_os,host_arch"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
         assert!(csv.contains(",highly_skewed_files,"));
+        assert!(csv.contains(",unknown_size_files,"));
+        assert!(csv.contains(",zero_byte_files,"));
         assert!(!csv.contains(",empty_scan,"));
         assert!(!csv.contains(",one_file,"));
         assert!(!csv.contains(",few_medium_files,"));
         assert!(csv.contains(",local_fast,default_policy,"));
+        assert!(csv.contains(",s3_normal,available_parallelism_override_64,"));
         assert!(csv.contains(",s3_normal,combined_fd_16_memory_256mib,"));
 
         Ok(())
@@ -2081,7 +2216,9 @@ mod tests {
                 "partitioned_event_log_target_shape",
                 "many_tiny_files",
                 "mixed_tiny_large_files",
-                "highly_skewed_files"
+                "highly_skewed_files",
+                "unknown_size_files",
+                "zero_byte_files"
             ]
         );
         assert_eq!(workload_cases[1].file_set.files.len(), 4_096);
@@ -2097,6 +2234,22 @@ mod tests {
         assert!(
             workload_cases[3].file_set.files[0].size_bytes
                 > workload_cases[3].shape.average_file_size_bytes()
+        );
+        assert_eq!(workload_cases[4].file_set.files.len(), 1_024);
+        assert!(
+            workload_cases[4]
+                .file_set
+                .files
+                .iter()
+                .all(|file| file.estimated_size_bytes.is_none())
+        );
+        assert_eq!(workload_cases[5].file_set.files.len(), 512);
+        assert!(
+            workload_cases[5]
+                .file_set
+                .files
+                .iter()
+                .all(|file| file.size_bytes == 0 && file.estimated_size_bytes == Some(0))
         );
         assert!(
             workload_cases
@@ -2463,6 +2616,7 @@ mod tests {
             .simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
         let plan = work.partition_by_estimated_bytes(&file_set, 16)?;
 
+        assert!(!plan.unknown_size_fallback_used);
         assert!(plan.partitions.len() <= 16);
         assert!(
             plan.partitions
@@ -2512,6 +2666,37 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_work_uses_file_count_fallback_for_unknown_sizes() -> Result<(), Box<dyn Error>> {
+        let workload_case = SyntheticWorkloadCase::unknown_size_files()?;
+        let file_set = &workload_case.file_set;
+        let work = SyntheticWorkSimulationProfile::s3_normal()
+            .simulate_file_set(file_set, DEFAULT_BENCHMARK_SEED)?;
+        let plan = work.partition_by_estimated_bytes(file_set, 16)?;
+
+        assert!(plan.unknown_size_fallback_used);
+        assert_eq!(plan.partitions.len(), 16);
+        assert!(
+            plan.partitions
+                .iter()
+                .all(|partition| partition.file_count == 64)
+        );
+        assert!(
+            plan.partitions
+                .iter()
+                .all(|partition| partition.estimated_size_bytes.is_none())
+        );
+        assert_eq!(
+            plan.partitions
+                .iter()
+                .map(|partition| partition.size_bytes)
+                .sum::<u64>(),
+            file_set.total_bytes()
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn policy_case_derives_target_with_production_diagnostic_policy() -> Result<(), Box<dyn Error>>
     {
         let case = BenchmarkPolicyCase::with_input("test_policy", {
@@ -2538,13 +2723,16 @@ mod tests {
             .map(|case| case.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(cases.len(), 30);
+        assert_eq!(cases.len(), 33);
         assert_eq!(names.first(), Some(&"default_policy"));
         assert!(names.contains(&"fixed_target_1"));
         assert!(names.contains(&"fixed_target_4"));
         assert!(names.contains(&"available_parallelism_uncapped"));
         assert!(names.contains(&"available_parallelism_x2_uncapped"));
         assert!(names.contains(&"datafusion_cap_4"));
+        assert!(names.contains(&"available_parallelism_override_4"));
+        assert!(names.contains(&"available_parallelism_override_16"));
+        assert!(names.contains(&"available_parallelism_override_64"));
         assert!(names.contains(&"fd_per_partition_4"));
         assert!(names.contains(&"fd_per_partition_8"));
         assert!(names.contains(&"fd_per_partition_16"));
@@ -2555,12 +2743,6 @@ mod tests {
         assert!(names.contains(&"memory_per_partition_512mib"));
         assert!(names.contains(&"combined_fd_16_memory_256mib"));
         assert!(names.contains(&"combined_fd_32_memory_512mib"));
-        assert!(
-            cases
-                .iter()
-                .all(|case| case.input.available_parallelism == Some(16))
-        );
-
         let fixed_target_1 = find_policy_case(&cases, "fixed_target_1")?.derive_target()?;
         let fixed_target_4 = find_policy_case(&cases, "fixed_target_4")?.derive_target()?;
         let available_parallelism_uncapped =
@@ -2568,6 +2750,8 @@ mod tests {
         let available_parallelism_x2_uncapped =
             find_policy_case(&cases, "available_parallelism_x2_uncapped")?.derive_target()?;
         let datafusion_cap_4 = find_policy_case(&cases, "datafusion_cap_4")?.derive_target()?;
+        let available_parallelism_override_64 =
+            find_policy_case(&cases, "available_parallelism_override_64")?.derive_target()?;
         let fd_per_partition_16 =
             find_policy_case(&cases, "fd_per_partition_16")?.derive_target()?;
         let fd_per_partition_32 =
@@ -2597,6 +2781,11 @@ mod tests {
         );
         assert_eq!(datafusion_cap_4.target_partitions, 4);
         assert_eq!(datafusion_cap_4.datafusion_target_cap, Some(4));
+        assert_eq!(available_parallelism_override_64.target_partitions, 64);
+        assert_eq!(
+            available_parallelism_override_64.available_parallelism,
+            Some(64)
+        );
         assert_eq!(fd_per_partition_16.target_partitions, 8);
         assert_eq!(fd_per_partition_16.unix_file_descriptor_cap, Some(8));
         assert_eq!(fd_per_partition_32.target_partitions, 4);
@@ -2669,7 +2858,7 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 54);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 55);
         assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(BENCHMARK_CSV_HEADER[1], "host_os");
         assert_eq!(BENCHMARK_CSV_HEADER[2], "host_arch");
@@ -2684,13 +2873,14 @@ mod tests {
         assert_eq!(BENCHMARK_CSV_HEADER[31], "policy_unix_soft_fd_limit");
         assert_eq!(BENCHMARK_CSV_HEADER[34], "policy_target");
         assert_eq!(BENCHMARK_CSV_HEADER[35], "policy_source");
+        assert_eq!(BENCHMARK_CSV_HEADER[39], "unknown_size_fallback_used");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[43],
+            BENCHMARK_CSV_HEADER[44],
             "simulated_throughput_mib_per_second"
         );
-        assert_eq!(BENCHMARK_CSV_HEADER[45], "partition_files_p50");
+        assert_eq!(BENCHMARK_CSV_HEADER[46], "partition_files_p50");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[53],
+            BENCHMARK_CSV_HEADER[54],
             "partition_work_imbalance_basis_points"
         );
     }
@@ -2717,7 +2907,7 @@ mod tests {
             },
             seed: 7,
             workload_case: "test-workload",
-            workload_case_count: 4,
+            workload_case_count: SyntheticWorkloadCase::standard_cases()?.len(),
             simulation_profile_count: SyntheticWorkSimulationProfile::standard_profiles().len(),
             simulation,
             policy_case: case,
@@ -2727,19 +2917,20 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "1");
+        assert_eq!(row[0], "2");
         assert_eq!(row[1], "test-os");
         assert_eq!(row[2], "test-arch");
         assert_eq!(row[3], "16");
         assert_eq!(row[4], "7");
-        assert_eq!(row[5], "4");
+        assert_eq!(row[5], "6");
         assert_eq!(row[6], "test-workload");
         assert_eq!(row[27], "default_policy");
         assert_eq!(row[34], "16");
         assert_eq!(row[35], "available_parallelism_fallback");
-        assert!(!row[43].is_empty());
+        assert_eq!(row[39], "false");
         assert!(!row[44].is_empty());
-        assert!(!row[53].is_empty());
+        assert!(!row[45].is_empty());
+        assert!(!row[54].is_empty());
 
         Ok(())
     }

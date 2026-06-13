@@ -6,8 +6,8 @@ Delta DataFusion scan partition target policy.
 The runner does not read Parquet data, contact object storage, require S3
 credentials, or execute production scan reads. It builds deterministic
 Delta-like file tasks in memory, runs the production target policy through the
-diagnostic facade, simulates scan work, groups files by estimated bytes, and
-writes a CSV matrix.
+diagnostic facade, simulates scan work, groups files by estimated bytes or the
+unknown-size file-count fallback, and writes a CSV matrix.
 
 ## Run
 
@@ -39,6 +39,9 @@ It does not change workload file shapes or policy target derivation.
 
 The default matrix currently covers:
 
+- 990 rows:
+  - 6 workloads x 5 simulation profiles x 33 policy cases.
+
 - Workloads:
   - `partitioned_event_log_target_shape`: target synthetic table shape, 956
     files, about 393 MiB, 933 daily partitions.
@@ -47,6 +50,10 @@ The default matrix currently covers:
     grouping pressure.
   - `highly_skewed_files`: one 2 GiB file plus 255 small files, max-file
     dominated grouping pressure.
+  - `unknown_size_files`: 1024 files with real simulated bytes but missing size
+    estimates, forcing the file-count fallback grouping path.
+  - `zero_byte_files`: 512 selected zero-byte files, useful for scheduler and
+    per-file overhead sensitivity.
 - Simulation profiles:
   - `local_fast`
   - `s3_normal`
@@ -59,6 +66,7 @@ The default matrix currently covers:
   - `available_parallelism_uncapped`
   - `available_parallelism_x2_uncapped`
   - `datafusion_cap_4`
+  - `available_parallelism_override_4`, `16`, `64`
   - `fd_per_partition_4`, `8`, `16`, `32`
   - `memory_per_partition_64mib`, `128mib`, `256mib`, `512mib`
   - all fd-per-partition x memory-per-partition combined cases
@@ -95,6 +103,7 @@ Important field groups:
   - `policy_datafusion_cap`
   - `policy_unix_fd_cap`
   - `policy_memory_cap`
+  - `unknown_size_fallback_used`
 - Simulated execution:
   - `simulated_serial_micros`
   - `simulated_max_file_micros`
@@ -134,11 +143,15 @@ cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
 
 Compare rows with the same `workload_case`, `simulation_profile`, and
 `policy_case`. The host metadata columns show which machine produced each row.
+The `available_parallelism_override_*` policy cases keep fixed parallelism
+inputs in the CSV, which makes some rows directly comparable even when machines
+have different local core counts.
 
 The policy variables under active calibration are:
 
 - `policy_fd_per_partition`
 - `policy_memory_bytes_per_partition`
+- `policy_available_parallelism`
 
 Use `policy_target`, applied cap columns, wall time, throughput, and grouping
 balance columns together. A policy case that improves wall time but creates
