@@ -191,10 +191,9 @@ fn parse_linux_meminfo(contents: &str) -> Option<DeltaMemoryHint> {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        let bytes = linux_meminfo_kib_value_to_bytes(value)?;
         match name {
-            "MemTotal" => total_bytes = Some(bytes),
-            "MemAvailable" => available_bytes = Some(bytes),
+            "MemTotal" => total_bytes = Some(linux_meminfo_kib_value_to_bytes(value)?),
+            "MemAvailable" => available_bytes = Some(linux_meminfo_kib_value_to_bytes(value)?),
             _ => {}
         }
     }
@@ -298,6 +297,25 @@ mod tests {
             "\
 MemTotal:       16384000 kB
 MemFree:         1000000 kB
+MemAvailable:    8192000 kB
+",
+        )
+        .ok_or("expected linux memory hint")?;
+
+        assert_eq!(hint.total_bytes, Some(16_777_216_000));
+        assert_eq!(hint.available_bytes, Some(8_388_608_000));
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_meminfo_parser_ignores_unrelated_non_kib_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hint = parse_linux_meminfo(
+            "\
+MemTotal:       16384000 kB
+HugePages_Total:       0
 MemAvailable:    8192000 kB
 ",
         )

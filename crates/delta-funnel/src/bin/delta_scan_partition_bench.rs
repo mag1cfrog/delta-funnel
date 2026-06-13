@@ -3,14 +3,20 @@
 use std::env;
 use std::error::Error;
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::Instant;
 
 use chrono::{Datelike, Days, NaiveDate};
 use delta_funnel::{
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
-    DeltaScanPartitionTargetDiagnosticSource, derive_delta_scan_partition_target_diagnostic,
+    DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+    DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+    delta_scan_partition_target_local_environment_diagnostic,
+    derive_delta_scan_partition_target_diagnostic,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -20,10 +26,17 @@ const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
 const BENCHMARK_AVAILABLE_PARALLELISM_CANDIDATES: [usize; 3] = [4, 16, 64];
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
-const BENCHMARK_SCHEMA_VERSION: u32 = 5;
+const HOST_PROBE_MAX_SCHEDULER_CONCURRENCY: usize = 64;
+const HOST_PROBE_SCHEDULER_TASKS_PER_WORKER: usize = 256;
+const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
+const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
+const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
+const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
+const BENCHMARK_SCHEMA_VERSION: u32 = 9;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
-const BENCHMARK_CSV_HEADER: [&str; 61] = [
+const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "benchmark_schema_version",
+    "benchmark_mode",
     "host_os",
     "host_arch",
     "host_available_parallelism",
@@ -84,6 +97,24 @@ const BENCHMARK_CSV_HEADER: [&str; 61] = [
     "partition_work_micros_p50",
     "partition_work_micros_p95",
     "partition_work_imbalance_basis_points",
+    "host_memory_total_bytes",
+    "host_memory_available_bytes",
+    "host_unix_soft_fd_limit",
+    "host_unix_soft_fd_limit_status",
+    "host_scheduler_probe_task_count",
+    "host_scheduler_probe_completed_task_count",
+    "host_scheduler_probe_concurrency",
+    "host_scheduler_probe_total_micros",
+    "host_scheduler_probe_nanos_per_task",
+    "host_runtime_probe_stable_concurrency_hint",
+    "host_local_io_probe_enabled",
+    "host_local_io_probe_status",
+    "host_local_io_probe_repetitions",
+    "host_local_io_probe_bytes_per_repetition",
+    "host_local_io_probe_bytes_read",
+    "host_local_io_probe_total_micros",
+    "host_local_io_probe_latency_micros",
+    "host_local_io_probe_throughput_bytes_per_second",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -94,19 +125,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    if let Some(output_path) = config.output_path {
+    if let Some(output_path) = &config.output_path {
         let mut output = File::create(output_path)?;
-        write_benchmark_csv(&mut output, config.seed)?;
+        write_benchmark_csv(&mut output, &config)?;
     } else {
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        write_benchmark_csv(&mut output, config.seed)?;
+        write_benchmark_csv(&mut output, &config)?;
     }
 
     Ok(())
 }
 
-fn write_benchmark_csv(output: &mut impl Write, seed: u64) -> Result<(), Box<dyn Error>> {
+fn write_benchmark_csv(
+    output: &mut impl Write,
+    config: &BenchmarkRunnerConfig,
+) -> Result<(), Box<dyn Error>> {
+    match config.mode {
+        BenchmarkMode::Synthetic => write_synthetic_benchmark_csv(output, config.seed),
+        BenchmarkMode::HostProbe => {
+            write_host_probe_benchmark_csv(output, config.seed, &config.host_probe_local_io)
+        }
+    }
+}
+
+fn write_synthetic_benchmark_csv(output: &mut impl Write, seed: u64) -> Result<(), Box<dyn Error>> {
     let run_environment = BenchmarkRunEnvironment::local();
     let workload_cases = SyntheticWorkloadCase::standard_cases()?;
     let simulation_profiles = SyntheticWorkSimulationProfile::standard_profiles();
@@ -131,6 +174,7 @@ fn write_benchmark_csv(output: &mut impl Write, seed: u64) -> Result<(), Box<dyn
                         shape: &workload_case.shape,
                         file_set: &workload_case.file_set,
                         run_environment,
+                        mode: BenchmarkMode::Synthetic,
                         seed,
                         workload_case: workload_case.name,
                         workload_case_count: workload_cases.len(),
@@ -150,19 +194,54 @@ fn write_benchmark_csv(output: &mut impl Write, seed: u64) -> Result<(), Box<dyn
     Ok(())
 }
 
+fn write_host_probe_benchmark_csv(
+    output: &mut impl Write,
+    seed: u64,
+    local_io_config: &HostProbeLocalIoConfig,
+) -> Result<(), Box<dyn Error>> {
+    let run_environment = BenchmarkRunEnvironment::local();
+    let local_environment = delta_scan_partition_target_local_environment_diagnostic();
+    let scheduler_probe = run_host_scheduler_probe(run_environment.available_parallelism);
+    let local_io_probe = run_host_local_io_probe(local_io_config, seed);
+    let policy_decision =
+        derive_delta_scan_partition_target_diagnostic(local_environment.policy_input)?;
+
+    writeln!(output, "{}", BENCHMARK_CSV_HEADER.join(","))?;
+    writeln!(
+        output,
+        "{}",
+        host_probe_csv_row(HostProbeCsvRowInput {
+            run_environment,
+            seed,
+            local_environment,
+            scheduler_probe,
+            local_io_probe,
+            policy_decision,
+        })
+        .join(",")
+    )?;
+
+    Ok(())
+}
+
 fn print_usage(mut output: impl Write) -> io::Result<()> {
     writeln!(
         output,
-        "Usage: delta_scan_partition_bench [--output <path>] [--seed <u64>]"
+        "Usage: delta_scan_partition_bench [--mode <synthetic|host-probe>] [--output <path>] [--seed <u64>]"
     )?;
     writeln!(output)?;
     writeln!(
         output,
-        "Writes a portable synthetic Delta scan partition benchmark matrix as CSV."
+        "Writes a portable Delta scan partition benchmark matrix as CSV."
     )?;
     writeln!(
         output,
         "Without --output, CSV is written to stdout for shell pipelines."
+    )?;
+    writeln!(output, "The default mode is synthetic.")?;
+    writeln!(
+        output,
+        "Use --host-probe-local-io with host-probe mode to run the opt-in local IO read probe."
     )?;
     writeln!(output, "The default seed is {DEFAULT_BENCHMARK_SEED}.")?;
     Ok(())
@@ -171,8 +250,24 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BenchmarkRunnerConfig {
     output_path: Option<PathBuf>,
+    mode: BenchmarkMode,
+    host_probe_local_io: HostProbeLocalIoConfig,
     seed: u64,
     show_help: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostProbeLocalIoConfig {
+    enabled: bool,
+    temp_dir: Option<PathBuf>,
+    bytes_per_repetition: usize,
+    repetitions: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkMode {
+    Synthetic,
+    HostProbe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +285,9 @@ impl BenchmarkRunnerConfig {
         I::Item: Into<std::ffi::OsString>,
     {
         let mut output_path = None;
+        let mut mode = BenchmarkMode::Synthetic;
+        let mut host_probe_local_io = HostProbeLocalIoConfig::default();
+        let mut mode_seen = false;
         let mut seed = DEFAULT_BENCHMARK_SEED;
         let mut show_help = false;
         let mut args = args.into_iter().map(Into::into);
@@ -204,6 +302,52 @@ impl BenchmarkRunnerConfig {
                 if output_path.replace(PathBuf::from(path)).is_some() {
                     return Err(BenchmarkRunnerConfigError::DuplicateOutputPath);
                 }
+            } else if arg == "--mode" {
+                let value = args.next().ok_or(BenchmarkRunnerConfigError::MissingMode)?;
+                let parsed_mode =
+                    BenchmarkMode::parse(&value.to_string_lossy()).ok_or_else(|| {
+                        BenchmarkRunnerConfigError::InvalidMode(value.to_string_lossy().into())
+                    })?;
+                if mode_seen {
+                    return Err(BenchmarkRunnerConfigError::DuplicateMode);
+                }
+                mode_seen = true;
+                mode = parsed_mode;
+            } else if arg == "--host-probe-local-io" {
+                host_probe_local_io.enabled = true;
+            } else if arg == "--host-probe-temp-dir" {
+                let path = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingHostProbeTempDir)?;
+                if host_probe_local_io
+                    .temp_dir
+                    .replace(PathBuf::from(path))
+                    .is_some()
+                {
+                    return Err(BenchmarkRunnerConfigError::DuplicateHostProbeTempDir);
+                }
+            } else if arg == "--host-probe-io-bytes" {
+                let value = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingHostProbeIoBytes)?;
+                let bytes = value.to_string_lossy().parse::<usize>().map_err(|_| {
+                    BenchmarkRunnerConfigError::InvalidHostProbeIoBytes(
+                        value.to_string_lossy().into(),
+                    )
+                })?;
+                validate_host_probe_io_bytes(bytes)?;
+                host_probe_local_io.bytes_per_repetition = bytes;
+            } else if arg == "--host-probe-io-repetitions" {
+                let value = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingHostProbeIoRepetitions)?;
+                let repetitions = value.to_string_lossy().parse::<usize>().map_err(|_| {
+                    BenchmarkRunnerConfigError::InvalidHostProbeIoRepetitions(
+                        value.to_string_lossy().into(),
+                    )
+                })?;
+                validate_host_probe_io_repetitions(repetitions)?;
+                host_probe_local_io.repetitions = repetitions;
             } else if arg == "--seed" {
                 let value = args.next().ok_or(BenchmarkRunnerConfigError::MissingSeed)?;
                 seed = value.to_string_lossy().parse().map_err(|_| {
@@ -218,9 +362,59 @@ impl BenchmarkRunnerConfig {
 
         Ok(Self {
             output_path,
+            mode,
+            host_probe_local_io,
             seed,
             show_help,
         })
+    }
+}
+
+impl Default for HostProbeLocalIoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            temp_dir: None,
+            bytes_per_repetition: HOST_PROBE_DEFAULT_LOCAL_IO_BYTES,
+            repetitions: HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS,
+        }
+    }
+}
+
+fn validate_host_probe_io_bytes(bytes: usize) -> Result<(), BenchmarkRunnerConfigError> {
+    if bytes == 0 || bytes > HOST_PROBE_MAX_LOCAL_IO_BYTES {
+        return Err(BenchmarkRunnerConfigError::HostProbeIoBytesOutOfRange(
+            bytes,
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_host_probe_io_repetitions(
+    repetitions: usize,
+) -> Result<(), BenchmarkRunnerConfigError> {
+    if repetitions == 0 || repetitions > HOST_PROBE_MAX_LOCAL_IO_REPETITIONS {
+        return Err(BenchmarkRunnerConfigError::HostProbeIoRepetitionsOutOfRange(repetitions));
+    }
+
+    Ok(())
+}
+
+impl BenchmarkMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "synthetic" => Some(Self::Synthetic),
+            "host-probe" | "host_probe" => Some(Self::HostProbe),
+            _ => None,
+        }
+    }
+
+    fn as_csv_value(self) -> &'static str {
+        match self {
+            Self::Synthetic => "synthetic",
+            Self::HostProbe => "host_probe",
+        }
     }
 }
 
@@ -382,6 +576,17 @@ impl SyntheticWorkloadCase {
 enum BenchmarkRunnerConfigError {
     MissingOutputPath,
     DuplicateOutputPath,
+    MissingMode,
+    DuplicateMode,
+    InvalidMode(String),
+    MissingHostProbeTempDir,
+    DuplicateHostProbeTempDir,
+    MissingHostProbeIoBytes,
+    InvalidHostProbeIoBytes(String),
+    HostProbeIoBytesOutOfRange(usize),
+    MissingHostProbeIoRepetitions,
+    InvalidHostProbeIoRepetitions(String),
+    HostProbeIoRepetitionsOutOfRange(usize),
     MissingSeed,
     InvalidSeed(String),
     UnknownArgument(String),
@@ -392,6 +597,40 @@ impl fmt::Display for BenchmarkRunnerConfigError {
         match self {
             Self::MissingOutputPath => write!(formatter, "--output requires a path"),
             Self::DuplicateOutputPath => write!(formatter, "--output may be provided only once"),
+            Self::MissingMode => write!(formatter, "--mode requires a value"),
+            Self::DuplicateMode => write!(formatter, "--mode may be provided only once"),
+            Self::InvalidMode(value) => write!(
+                formatter,
+                "invalid --mode value `{value}`; expected `synthetic` or `host-probe`"
+            ),
+            Self::MissingHostProbeTempDir => {
+                write!(formatter, "--host-probe-temp-dir requires a path")
+            }
+            Self::DuplicateHostProbeTempDir => {
+                write!(formatter, "--host-probe-temp-dir may be provided only once")
+            }
+            Self::MissingHostProbeIoBytes => {
+                write!(formatter, "--host-probe-io-bytes requires a byte count")
+            }
+            Self::InvalidHostProbeIoBytes(value) => {
+                write!(formatter, "invalid --host-probe-io-bytes value `{value}`")
+            }
+            Self::HostProbeIoBytesOutOfRange(value) => write!(
+                formatter,
+                "--host-probe-io-bytes value `{value}` must be between 1 and {HOST_PROBE_MAX_LOCAL_IO_BYTES}"
+            ),
+            Self::MissingHostProbeIoRepetitions => write!(
+                formatter,
+                "--host-probe-io-repetitions requires a repetition count"
+            ),
+            Self::InvalidHostProbeIoRepetitions(value) => write!(
+                formatter,
+                "invalid --host-probe-io-repetitions value `{value}`"
+            ),
+            Self::HostProbeIoRepetitionsOutOfRange(value) => write!(
+                formatter,
+                "--host-probe-io-repetitions value `{value}` must be between 1 and {HOST_PROBE_MAX_LOCAL_IO_REPETITIONS}"
+            ),
             Self::MissingSeed => write!(formatter, "--seed requires a u64 value"),
             Self::InvalidSeed(value) => write!(formatter, "invalid --seed value `{value}`"),
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument `{argument}`"),
@@ -459,6 +698,7 @@ struct BenchmarkCsvRowInput<'a> {
     shape: &'a SyntheticDeltaTableShape,
     file_set: &'a SyntheticFileSet,
     run_environment: BenchmarkRunEnvironment,
+    mode: BenchmarkMode,
     seed: u64,
     workload_case: &'static str,
     workload_case_count: usize,
@@ -468,6 +708,45 @@ struct BenchmarkCsvRowInput<'a> {
     policy_decision: DeltaScanPartitionTargetDiagnosticOutput,
     simulated_work: &'a SyntheticWorkSimulationResult,
     partitioned_work: &'a SyntheticPartitionedWorkPlan,
+}
+
+#[derive(Debug, Clone)]
+struct HostProbeCsvRowInput {
+    run_environment: BenchmarkRunEnvironment,
+    seed: u64,
+    local_environment: DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+    scheduler_probe: HostSchedulerProbeResult,
+    local_io_probe: HostLocalIoProbeResult,
+    policy_decision: DeltaScanPartitionTargetDiagnosticOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostSchedulerProbeResult {
+    task_count: usize,
+    completed_task_count: usize,
+    concurrency: usize,
+    total_micros: u64,
+    nanos_per_task: u64,
+    stable_concurrency_hint: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostLocalIoProbeResult {
+    enabled: bool,
+    status: HostLocalIoProbeStatus,
+    repetitions: usize,
+    bytes_per_repetition: usize,
+    bytes_read: u64,
+    total_micros: Option<u64>,
+    latency_micros: Option<u64>,
+    throughput_bytes_per_second: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostLocalIoProbeStatus {
+    Disabled,
+    Ok,
+    Error,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2052,6 +2331,169 @@ fn local_available_parallelism() -> Option<usize> {
         .map(std::num::NonZeroUsize::get)
 }
 
+fn run_host_scheduler_probe(available_parallelism: Option<usize>) -> HostSchedulerProbeResult {
+    let concurrency = available_parallelism
+        .unwrap_or(1)
+        .clamp(1, HOST_PROBE_MAX_SCHEDULER_CONCURRENCY);
+    let task_count = concurrency.saturating_mul(HOST_PROBE_SCHEDULER_TASKS_PER_WORKER);
+    let next_task = AtomicUsize::new(0);
+    let completed_task_count = AtomicUsize::new(0);
+    let started = Instant::now();
+
+    thread::scope(|scope| {
+        for _ in 0..concurrency {
+            scope.spawn(|| {
+                loop {
+                    let task_index = next_task.fetch_add(1, Ordering::Relaxed);
+                    if task_index >= task_count {
+                        break;
+                    }
+                    std::hint::black_box(task_index);
+                    completed_task_count.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+
+    let elapsed = started.elapsed();
+    let completed_task_count = completed_task_count.load(Ordering::Relaxed);
+    let nanos_per_task = if completed_task_count == 0 {
+        0
+    } else {
+        u128_to_u64_saturating(elapsed.as_nanos().div_ceil(completed_task_count as u128))
+    };
+
+    HostSchedulerProbeResult {
+        task_count,
+        completed_task_count,
+        concurrency,
+        total_micros: u128_to_u64_saturating(elapsed.as_micros()),
+        nanos_per_task,
+        stable_concurrency_hint: concurrency,
+    }
+}
+
+fn run_host_local_io_probe(config: &HostProbeLocalIoConfig, seed: u64) -> HostLocalIoProbeResult {
+    if !config.enabled {
+        return HostLocalIoProbeResult {
+            enabled: false,
+            status: HostLocalIoProbeStatus::Disabled,
+            repetitions: config.repetitions,
+            bytes_per_repetition: config.bytes_per_repetition,
+            bytes_read: 0,
+            total_micros: None,
+            latency_micros: None,
+            throughput_bytes_per_second: None,
+        };
+    }
+
+    match run_host_local_io_probe_inner(config, seed) {
+        Ok(result) => result,
+        Err(_error) => HostLocalIoProbeResult {
+            enabled: true,
+            status: HostLocalIoProbeStatus::Error,
+            repetitions: config.repetitions,
+            bytes_per_repetition: config.bytes_per_repetition,
+            bytes_read: 0,
+            total_micros: None,
+            latency_micros: None,
+            throughput_bytes_per_second: None,
+        },
+    }
+}
+
+fn run_host_local_io_probe_inner(
+    config: &HostProbeLocalIoConfig,
+    seed: u64,
+) -> io::Result<HostLocalIoProbeResult> {
+    let temp_dir = config.temp_dir.clone().unwrap_or_else(env::temp_dir);
+    fs::create_dir_all(&temp_dir)?;
+    let probe_path = temp_dir.join(format!(
+        "delta-funnel-host-probe-{}-{seed}.bin",
+        std::process::id()
+    ));
+    let result = run_host_local_io_probe_at_path(config, &probe_path);
+    let _ = fs::remove_file(&probe_path);
+    result
+}
+
+fn run_host_local_io_probe_at_path(
+    config: &HostProbeLocalIoConfig,
+    probe_path: &std::path::Path,
+) -> io::Result<HostLocalIoProbeResult> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(probe_path)?;
+    write_probe_file(&mut file, config.bytes_per_repetition)?;
+    file.sync_all()?;
+
+    let mut total_latency_micros = 0_u64;
+    let mut bytes_read = 0_u64;
+    let mut buffer = vec![0_u8; 8192];
+    let started = Instant::now();
+
+    for _ in 0..config.repetitions {
+        file.seek(SeekFrom::Start(0))?;
+        let first_read_started = Instant::now();
+        let mut first_byte = [0_u8; 1];
+        file.read_exact(&mut first_byte)?;
+        total_latency_micros = total_latency_micros.saturating_add(u128_to_u64_saturating(
+            first_read_started.elapsed().as_micros(),
+        ));
+        bytes_read = bytes_read.saturating_add(1);
+
+        let mut remaining = config.bytes_per_repetition.saturating_sub(1);
+        while remaining > 0 {
+            let read_size = remaining.min(buffer.len());
+            file.read_exact(&mut buffer[..read_size])?;
+            bytes_read = bytes_read.saturating_add(read_size as u64);
+            remaining -= read_size;
+        }
+
+        std::hint::black_box(first_byte);
+        std::hint::black_box(&buffer);
+    }
+
+    let total_micros = u128_to_u64_saturating(started.elapsed().as_micros()).max(1);
+    let throughput_bytes_per_second =
+        u128_to_u64_saturating(u128::from(bytes_read) * 1_000_000 / u128::from(total_micros));
+    let latency_micros = total_latency_micros / config.repetitions as u64;
+
+    Ok(HostLocalIoProbeResult {
+        enabled: true,
+        status: HostLocalIoProbeStatus::Ok,
+        repetitions: config.repetitions,
+        bytes_per_repetition: config.bytes_per_repetition,
+        bytes_read,
+        total_micros: Some(total_micros),
+        latency_micros: Some(latency_micros),
+        throughput_bytes_per_second: Some(throughput_bytes_per_second),
+    })
+}
+
+fn write_probe_file(file: &mut File, bytes: usize) -> io::Result<()> {
+    let mut remaining = bytes;
+    let mut pattern = vec![0_u8; 8192];
+    for (index, byte) in pattern.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+
+    while remaining > 0 {
+        let write_size = remaining.min(pattern.len());
+        file.write_all(&pattern[..write_size])?;
+        remaining -= write_size;
+    }
+
+    Ok(())
+}
+
+fn u128_to_u64_saturating(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
     let shape = input.shape;
     let file_set = input.file_set;
@@ -2061,6 +2503,7 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
 
     vec![
         input.run_environment.schema_version.to_string(),
+        input.mode.as_csv_value().to_owned(),
         input.run_environment.host_os.to_owned(),
         input.run_environment.host_arch.to_owned(),
         optional_usize(input.run_environment.available_parallelism),
@@ -2161,7 +2604,81 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
         partitioned_work_summary
             .work_imbalance_basis_points
             .to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
     ]
+}
+
+fn host_probe_csv_row(input: HostProbeCsvRowInput) -> Vec<String> {
+    let policy_input = input.local_environment.policy_input;
+    let policy_decision = input.policy_decision;
+    let mut row = vec![String::new(); BENCHMARK_CSV_HEADER.len()];
+
+    row[0] = input.run_environment.schema_version.to_string();
+    row[1] = BenchmarkMode::HostProbe.as_csv_value().to_owned();
+    row[2] = input.run_environment.host_os.to_owned();
+    row[3] = input.run_environment.host_arch.to_owned();
+    row[4] = optional_usize(input.run_environment.available_parallelism);
+    row[5] = input.seed.to_string();
+    row[6] = "0".to_owned();
+    row[7] = "host_probe".to_owned();
+    row[26] = "0".to_owned();
+    row[31] = "host_probe_default_policy".to_owned();
+    row[32] = optional_usize(policy_input.available_parallelism);
+    row[33] = optional_usize(policy_input.datafusion_target_partitions);
+    row[34] = optional_u64(policy_input.available_memory_bytes);
+    row[35] = optional_u64(policy_input.unix_soft_file_descriptor_limit);
+    row[36] = policy_input.file_descriptors_per_partition.to_string();
+    row[37] = policy_input
+        .available_memory_bytes_per_partition
+        .to_string();
+    row[38] = policy_decision.target_partitions.to_string();
+    row[39] = policy_source_name(policy_decision.source).to_owned();
+    row[40] = optional_usize(policy_decision.datafusion_target_cap);
+    row[41] = optional_usize(policy_decision.unix_file_descriptor_cap);
+    row[42] = optional_usize(policy_decision.memory_cap);
+    row[43] = "false".to_owned();
+    row[62] = optional_u64(input.local_environment.memory_total_bytes);
+    row[63] = optional_u64(input.local_environment.memory_available_bytes);
+    row[64] = optional_u64(input.local_environment.unix_soft_file_descriptor_limit);
+    row[65] = unix_file_descriptor_status_name(
+        input
+            .local_environment
+            .unix_soft_file_descriptor_limit_status,
+    )
+    .to_owned();
+    row[66] = input.scheduler_probe.task_count.to_string();
+    row[67] = input.scheduler_probe.completed_task_count.to_string();
+    row[68] = input.scheduler_probe.concurrency.to_string();
+    row[69] = input.scheduler_probe.total_micros.to_string();
+    row[70] = input.scheduler_probe.nanos_per_task.to_string();
+    row[71] = input.scheduler_probe.stable_concurrency_hint.to_string();
+    row[72] = input.local_io_probe.enabled.to_string();
+    row[73] = local_io_probe_status_name(input.local_io_probe.status).to_owned();
+    row[74] = input.local_io_probe.repetitions.to_string();
+    row[75] = input.local_io_probe.bytes_per_repetition.to_string();
+    row[76] = input.local_io_probe.bytes_read.to_string();
+    row[77] = optional_u64(input.local_io_probe.total_micros);
+    row[78] = optional_u64(input.local_io_probe.latency_micros);
+    row[79] = optional_u64(input.local_io_probe.throughput_bytes_per_second);
+
+    row
 }
 
 fn optional_usize(value: Option<usize>) -> String {
@@ -2179,6 +2696,25 @@ fn policy_source_name(source: DeltaScanPartitionTargetDiagnosticSource) -> &'sta
             "available_parallelism_fallback"
         }
         DeltaScanPartitionTargetDiagnosticSource::StaticFallback => "static_fallback",
+    }
+}
+
+fn unix_file_descriptor_status_name(
+    status: DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+) -> &'static str {
+    match status {
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unsupported => "unsupported",
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unknown => "unknown",
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite => "finite",
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unlimited => "unlimited",
+    }
+}
+
+fn local_io_probe_status_name(status: HostLocalIoProbeStatus) -> &'static str {
+    match status {
+        HostLocalIoProbeStatus::Disabled => "disabled",
+        HostLocalIoProbeStatus::Ok => "ok",
+        HostLocalIoProbeStatus::Error => "error",
     }
 }
 
@@ -2259,6 +2795,8 @@ mod tests {
             config,
             BenchmarkRunnerConfig {
                 output_path: None,
+                mode: BenchmarkMode::Synthetic,
+                host_probe_local_io: HostProbeLocalIoConfig::default(),
                 seed: DEFAULT_BENCHMARK_SEED,
                 show_help: false
             }
@@ -2312,6 +2850,47 @@ mod tests {
     }
 
     #[test]
+    fn runner_config_accepts_benchmark_mode() -> Result<(), Box<dyn Error>> {
+        let synthetic = BenchmarkRunnerConfig::parse(["--mode", "synthetic"])?;
+        let host_probe = BenchmarkRunnerConfig::parse(["--mode", "host-probe"])?;
+        let host_probe_alias = BenchmarkRunnerConfig::parse(["--mode", "host_probe"])?;
+
+        assert_eq!(synthetic.mode, BenchmarkMode::Synthetic);
+        assert_eq!(host_probe.mode, BenchmarkMode::HostProbe);
+        assert_eq!(host_probe_alias.mode, BenchmarkMode::HostProbe);
+
+        Ok(())
+    }
+
+    #[test]
+    fn runner_config_accepts_host_probe_local_io_options() -> Result<(), Box<dyn Error>> {
+        let config = BenchmarkRunnerConfig::parse([
+            "--mode",
+            "host-probe",
+            "--host-probe-local-io",
+            "--host-probe-temp-dir",
+            "target",
+            "--host-probe-io-bytes",
+            "4096",
+            "--host-probe-io-repetitions",
+            "2",
+        ])?;
+
+        assert_eq!(config.mode, BenchmarkMode::HostProbe);
+        assert_eq!(
+            config.host_probe_local_io,
+            HostProbeLocalIoConfig {
+                enabled: true,
+                temp_dir: Some(PathBuf::from("target")),
+                bytes_per_repetition: 4096,
+                repetitions: 2,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn runner_config_rejects_invalid_arguments() {
         assert_eq!(
             BenchmarkRunnerConfig::parse(["--output"]),
@@ -2337,6 +2916,61 @@ mod tests {
                 "not-a-number".to_owned()
             ))
         );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--mode"]),
+            Err(BenchmarkRunnerConfigError::MissingMode)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--mode", "synthetic", "--mode", "host-probe"]),
+            Err(BenchmarkRunnerConfigError::DuplicateMode)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--mode", "real-delta-scan"]),
+            Err(BenchmarkRunnerConfigError::InvalidMode(
+                "real-delta-scan".to_owned()
+            ))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--host-probe-temp-dir"]),
+            Err(BenchmarkRunnerConfigError::MissingHostProbeTempDir)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--host-probe-temp-dir",
+                "a",
+                "--host-probe-temp-dir",
+                "b"
+            ]),
+            Err(BenchmarkRunnerConfigError::DuplicateHostProbeTempDir)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--host-probe-io-bytes"]),
+            Err(BenchmarkRunnerConfigError::MissingHostProbeIoBytes)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--host-probe-io-bytes", "nope"]),
+            Err(BenchmarkRunnerConfigError::InvalidHostProbeIoBytes(
+                "nope".to_owned()
+            ))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--host-probe-io-bytes", "0"]),
+            Err(BenchmarkRunnerConfigError::HostProbeIoBytesOutOfRange(0))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--host-probe-io-repetitions"]),
+            Err(BenchmarkRunnerConfigError::MissingHostProbeIoRepetitions)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--host-probe-io-repetitions", "nope"]),
+            Err(BenchmarkRunnerConfigError::InvalidHostProbeIoRepetitions(
+                "nope".to_owned()
+            ))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--host-probe-io-repetitions", "0"]),
+            Err(BenchmarkRunnerConfigError::HostProbeIoRepetitionsOutOfRange(0))
+        );
     }
 
     #[test]
@@ -2347,9 +2981,13 @@ mod tests {
         let usage = String::from_utf8(output)?;
 
         assert!(
-            usage.contains("Usage: delta_scan_partition_bench [--output <path>] [--seed <u64>]")
+            usage.contains(
+                "Usage: delta_scan_partition_bench [--mode <synthetic|host-probe>] [--output <path>] [--seed <u64>]"
+            )
         );
         assert!(usage.contains("CSV is written to stdout"));
+        assert!(usage.contains("The default mode is synthetic."));
+        assert!(usage.contains("Use --host-probe-local-io"));
         assert!(usage.contains("The default seed is 0."));
 
         Ok(())
@@ -2358,13 +2996,21 @@ mod tests {
     #[test]
     fn write_benchmark_csv_outputs_portable_matrix() -> Result<(), Box<dyn Error>> {
         let mut output = Vec::new();
+        let config = BenchmarkRunnerConfig {
+            output_path: None,
+            mode: BenchmarkMode::Synthetic,
+            host_probe_local_io: HostProbeLocalIoConfig::default(),
+            seed: 42,
+            show_help: false,
+        };
 
-        write_benchmark_csv(&mut output, 42)?;
+        write_benchmark_csv(&mut output, &config)?;
         let csv = String::from_utf8(output)?;
         let lines = csv.lines().collect::<Vec<_>>();
 
         assert_eq!(lines.len(), 1111);
-        assert!(lines[0].starts_with("benchmark_schema_version,host_os,host_arch"));
+        assert!(lines[0].starts_with("benchmark_schema_version,benchmark_mode,host_os,host_arch"));
+        assert!(csv.contains("\n9,synthetic,"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
@@ -2379,6 +3025,217 @@ mod tests {
         assert!(csv.contains(",s3_normal,1000,32,131072000,combined_fd_16_memory_256mib,"));
 
         Ok(())
+    }
+
+    #[test]
+    fn write_benchmark_csv_outputs_host_probe_profile() -> Result<(), Box<dyn Error>> {
+        let mut output = Vec::new();
+        let config = BenchmarkRunnerConfig {
+            output_path: None,
+            mode: BenchmarkMode::HostProbe,
+            host_probe_local_io: HostProbeLocalIoConfig::default(),
+            seed: 42,
+            show_help: false,
+        };
+
+        write_benchmark_csv(&mut output, &config)?;
+        let csv = String::from_utf8(output)?;
+        let lines = csv.lines().collect::<Vec<_>>();
+        let row = lines[1].split(',').collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
+        assert_eq!(row[0], "9");
+        assert_eq!(row[1], "host_probe");
+        assert_eq!(row[5], "42");
+        assert_eq!(row[6], "0");
+        assert_eq!(row[7], "host_probe");
+        assert_eq!(row[26], "0");
+        assert_eq!(row[31], "host_probe_default_policy");
+        assert!(!row[36].is_empty());
+        assert!(!row[37].is_empty());
+        assert!(!row[38].is_empty());
+        assert_eq!(row[43], "false");
+        assert!(matches!(
+            row[65],
+            "finite" | "unlimited" | "unknown" | "unsupported"
+        ));
+        assert!(!row[66].is_empty());
+        assert!(!row[67].is_empty());
+        assert!(!row[68].is_empty());
+        assert!(!row[69].is_empty());
+        assert!(!row[70].is_empty());
+        assert!(!row[71].is_empty());
+        assert_eq!(row[72], "false");
+        assert_eq!(row[73], "disabled");
+        assert_eq!(row[76], "0");
+        assert_eq!(row[77], "");
+        assert_eq!(row[78], "");
+        assert_eq!(row[79], "");
+
+        Ok(())
+    }
+
+    #[test]
+    fn host_probe_csv_row_records_measured_policy_inputs() -> Result<(), Box<dyn Error>> {
+        let local_environment = DeltaScanPartitionTargetLocalEnvironmentDiagnostic {
+            policy_input: DeltaScanPartitionTargetDiagnosticInput {
+                available_parallelism: Some(16),
+                datafusion_target_partitions: Some(16),
+                available_memory_bytes: Some(1024 * MIB),
+                unix_soft_file_descriptor_limit: Some(128),
+                ..DeltaScanPartitionTargetDiagnosticInput::default()
+            },
+            memory_total_bytes: Some(2048 * MIB),
+            memory_available_bytes: Some(1024 * MIB),
+            unix_soft_file_descriptor_limit: Some(128),
+            unix_soft_file_descriptor_limit_status:
+                DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite,
+        };
+        let policy_decision =
+            derive_delta_scan_partition_target_diagnostic(local_environment.policy_input)?;
+        let row = host_probe_csv_row(HostProbeCsvRowInput {
+            run_environment: BenchmarkRunEnvironment {
+                schema_version: BENCHMARK_SCHEMA_VERSION,
+                host_os: "test-os",
+                host_arch: "test-arch",
+                available_parallelism: Some(16),
+            },
+            seed: 7,
+            local_environment,
+            scheduler_probe: HostSchedulerProbeResult {
+                task_count: 512,
+                completed_task_count: 512,
+                concurrency: 2,
+                total_micros: 123,
+                nanos_per_task: 240,
+                stable_concurrency_hint: 2,
+            },
+            local_io_probe: HostLocalIoProbeResult {
+                enabled: true,
+                status: HostLocalIoProbeStatus::Ok,
+                repetitions: 2,
+                bytes_per_repetition: 4096,
+                bytes_read: 8192,
+                total_micros: Some(100),
+                latency_micros: Some(3),
+                throughput_bytes_per_second: Some(81_920_000),
+            },
+            policy_decision,
+        });
+
+        assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
+        assert_eq!(row[0], "9");
+        assert_eq!(row[1], "host_probe");
+        assert_eq!(row[2], "test-os");
+        assert_eq!(row[3], "test-arch");
+        assert_eq!(row[4], "16");
+        assert_eq!(row[5], "7");
+        assert_eq!(row[7], "host_probe");
+        assert_eq!(row[31], "host_probe_default_policy");
+        assert_eq!(row[32], "16");
+        assert_eq!(row[33], "16");
+        assert_eq!(row[34], (1024 * MIB).to_string());
+        assert_eq!(row[35], "128");
+        assert_eq!(row[38], "4");
+        assert_eq!(row[41], "8");
+        assert_eq!(row[42], "4");
+        assert_eq!(row[62], (2048 * MIB).to_string());
+        assert_eq!(row[63], (1024 * MIB).to_string());
+        assert_eq!(row[64], "128");
+        assert_eq!(row[65], "finite");
+        assert_eq!(row[66], "512");
+        assert_eq!(row[67], "512");
+        assert_eq!(row[68], "2");
+        assert_eq!(row[69], "123");
+        assert_eq!(row[70], "240");
+        assert_eq!(row[71], "2");
+        assert_eq!(row[72], "true");
+        assert_eq!(row[73], "ok");
+        assert_eq!(row[74], "2");
+        assert_eq!(row[75], "4096");
+        assert_eq!(row[76], "8192");
+        assert_eq!(row[77], "100");
+        assert_eq!(row[78], "3");
+        assert_eq!(row[79], "81920000");
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_io_probe_status_renders_csv_fields() {
+        assert_eq!(
+            local_io_probe_status_name(HostLocalIoProbeStatus::Disabled),
+            "disabled"
+        );
+        assert_eq!(local_io_probe_status_name(HostLocalIoProbeStatus::Ok), "ok");
+        assert_eq!(
+            local_io_probe_status_name(HostLocalIoProbeStatus::Error),
+            "error"
+        );
+    }
+
+    #[test]
+    fn host_local_io_probe_stays_disabled_by_default() {
+        let probe = run_host_local_io_probe(&HostProbeLocalIoConfig::default(), 0);
+
+        assert!(!probe.enabled);
+        assert_eq!(probe.status, HostLocalIoProbeStatus::Disabled);
+        assert_eq!(probe.bytes_read, 0);
+        assert_eq!(probe.total_micros, None);
+        assert_eq!(probe.latency_micros, None);
+        assert_eq!(probe.throughput_bytes_per_second, None);
+    }
+
+    #[test]
+    fn host_local_io_probe_reads_temp_file() -> Result<(), Box<dyn Error>> {
+        let temp_dir =
+            env::temp_dir().join(format!("delta-funnel-test-local-io-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir)?;
+        let config = HostProbeLocalIoConfig {
+            enabled: true,
+            temp_dir: Some(temp_dir.clone()),
+            bytes_per_repetition: 4096,
+            repetitions: 2,
+        };
+
+        let probe = run_host_local_io_probe(&config, 99);
+
+        assert!(probe.enabled);
+        assert_eq!(probe.status, HostLocalIoProbeStatus::Ok);
+        assert_eq!(probe.repetitions, 2);
+        assert_eq!(probe.bytes_per_repetition, 4096);
+        assert_eq!(probe.bytes_read, 8192);
+        assert!(probe.total_micros.unwrap_or_default() > 0);
+        assert!(probe.throughput_bytes_per_second.unwrap_or_default() > 0);
+        assert!(
+            !temp_dir
+                .join(format!(
+                    "delta-funnel-host-probe-{}-99.bin",
+                    std::process::id()
+                ))
+                .exists()
+        );
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        Ok(())
+    }
+
+    #[test]
+    fn host_scheduler_probe_uses_bounded_concurrency() {
+        let probe = run_host_scheduler_probe(Some(HOST_PROBE_MAX_SCHEDULER_CONCURRENCY * 2));
+
+        assert_eq!(probe.concurrency, HOST_PROBE_MAX_SCHEDULER_CONCURRENCY);
+        assert_eq!(
+            probe.task_count,
+            HOST_PROBE_MAX_SCHEDULER_CONCURRENCY * HOST_PROBE_SCHEDULER_TASKS_PER_WORKER
+        );
+        assert_eq!(probe.completed_task_count, probe.task_count);
+        assert_eq!(
+            probe.stable_concurrency_hint,
+            HOST_PROBE_MAX_SCHEDULER_CONCURRENCY
+        );
     }
 
     #[test]
@@ -3185,49 +4042,95 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_mode_renders_csv_fields() {
+        assert_eq!(BenchmarkMode::Synthetic.as_csv_value(), "synthetic");
+        assert_eq!(BenchmarkMode::HostProbe.as_csv_value(), "host_probe");
+    }
+
+    #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 61);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 80);
         assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
-        assert_eq!(BENCHMARK_CSV_HEADER[1], "host_os");
-        assert_eq!(BENCHMARK_CSV_HEADER[2], "host_arch");
-        assert_eq!(BENCHMARK_CSV_HEADER[3], "host_available_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[4], "seed");
-        assert_eq!(BENCHMARK_CSV_HEADER[5], "workload_case_count");
-        assert_eq!(BENCHMARK_CSV_HEADER[6], "workload_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[1], "benchmark_mode");
+        assert_eq!(BENCHMARK_CSV_HEADER[2], "host_os");
+        assert_eq!(BENCHMARK_CSV_HEADER[3], "host_arch");
+        assert_eq!(BENCHMARK_CSV_HEADER[4], "host_available_parallelism");
+        assert_eq!(BENCHMARK_CSV_HEADER[5], "seed");
+        assert_eq!(BENCHMARK_CSV_HEADER[6], "workload_case_count");
+        assert_eq!(BENCHMARK_CSV_HEADER[7], "workload_case");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[27],
+            BENCHMARK_CSV_HEADER[28],
             "simulation_partition_scheduling_overhead_micros"
         );
-        assert_eq!(BENCHMARK_CSV_HEADER[28], "simulation_effective_parallelism");
+        assert_eq!(BENCHMARK_CSV_HEADER[29], "simulation_effective_parallelism");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[29],
+            BENCHMARK_CSV_HEADER[30],
             "simulation_aggregate_bandwidth_bytes_per_second"
         );
-        assert_eq!(BENCHMARK_CSV_HEADER[30], "policy_case");
-        assert_eq!(BENCHMARK_CSV_HEADER[31], "policy_available_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[32], "policy_datafusion_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[33], "policy_available_memory_bytes");
-        assert_eq!(BENCHMARK_CSV_HEADER[34], "policy_unix_soft_fd_limit");
-        assert_eq!(BENCHMARK_CSV_HEADER[37], "policy_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[38], "policy_source");
-        assert_eq!(BENCHMARK_CSV_HEADER[42], "unknown_size_fallback_used");
+        assert_eq!(BENCHMARK_CSV_HEADER[31], "policy_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[32], "policy_available_parallelism");
+        assert_eq!(BENCHMARK_CSV_HEADER[33], "policy_datafusion_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[34], "policy_available_memory_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[35], "policy_unix_soft_fd_limit");
+        assert_eq!(BENCHMARK_CSV_HEADER[38], "policy_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[39], "policy_source");
+        assert_eq!(BENCHMARK_CSV_HEADER[43], "unknown_size_fallback_used");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[46],
+            BENCHMARK_CSV_HEADER[47],
             "simulated_scheduling_overhead_micros"
         );
         assert_eq!(
-            BENCHMARK_CSV_HEADER[47],
+            BENCHMARK_CSV_HEADER[48],
             "simulated_aggregate_transfer_floor_micros"
         );
-        assert_eq!(BENCHMARK_CSV_HEADER[48], "simulated_execution_slots");
+        assert_eq!(BENCHMARK_CSV_HEADER[49], "simulated_execution_slots");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[50],
+            BENCHMARK_CSV_HEADER[51],
             "simulated_throughput_mib_per_second"
         );
-        assert_eq!(BENCHMARK_CSV_HEADER[52], "partition_files_p50");
+        assert_eq!(BENCHMARK_CSV_HEADER[53], "partition_files_p50");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[60],
+            BENCHMARK_CSV_HEADER[61],
             "partition_work_imbalance_basis_points"
+        );
+        assert_eq!(BENCHMARK_CSV_HEADER[62], "host_memory_total_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[63], "host_memory_available_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[64], "host_unix_soft_fd_limit");
+        assert_eq!(BENCHMARK_CSV_HEADER[65], "host_unix_soft_fd_limit_status");
+        assert_eq!(BENCHMARK_CSV_HEADER[66], "host_scheduler_probe_task_count");
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[67],
+            "host_scheduler_probe_completed_task_count"
+        );
+        assert_eq!(BENCHMARK_CSV_HEADER[68], "host_scheduler_probe_concurrency");
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[69],
+            "host_scheduler_probe_total_micros"
+        );
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[70],
+            "host_scheduler_probe_nanos_per_task"
+        );
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[71],
+            "host_runtime_probe_stable_concurrency_hint"
+        );
+        assert_eq!(BENCHMARK_CSV_HEADER[72], "host_local_io_probe_enabled");
+        assert_eq!(BENCHMARK_CSV_HEADER[73], "host_local_io_probe_status");
+        assert_eq!(BENCHMARK_CSV_HEADER[74], "host_local_io_probe_repetitions");
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[75],
+            "host_local_io_probe_bytes_per_repetition"
+        );
+        assert_eq!(BENCHMARK_CSV_HEADER[76], "host_local_io_probe_bytes_read");
+        assert_eq!(BENCHMARK_CSV_HEADER[77], "host_local_io_probe_total_micros");
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[78],
+            "host_local_io_probe_latency_micros"
+        );
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[79],
+            "host_local_io_probe_throughput_bytes_per_second"
         );
     }
 
@@ -3251,6 +4154,7 @@ mod tests {
                 host_arch: "test-arch",
                 available_parallelism: Some(16),
             },
+            mode: BenchmarkMode::Synthetic,
             seed: 7,
             workload_case: "test-workload",
             workload_case_count: SyntheticWorkloadCase::standard_cases()?.len(),
@@ -3263,26 +4167,45 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "5");
-        assert_eq!(row[1], "test-os");
-        assert_eq!(row[2], "test-arch");
-        assert_eq!(row[3], "16");
-        assert_eq!(row[4], "7");
-        assert_eq!(row[5], "6");
-        assert_eq!(row[6], "test-workload");
-        assert_eq!(row[27], "1000");
-        assert_eq!(row[28], "32");
-        assert_eq!(row[29], "131072000");
-        assert_eq!(row[30], "default_policy");
-        assert_eq!(row[37], "16");
-        assert_eq!(row[38], "available_parallelism_fallback");
-        assert_eq!(row[42], "false");
-        assert_eq!(row[46], "16000");
-        assert!(!row[47].is_empty());
-        assert_eq!(row[48], "16");
-        assert!(!row[50].is_empty());
+        assert_eq!(row[0], "9");
+        assert_eq!(row[1], "synthetic");
+        assert_eq!(row[2], "test-os");
+        assert_eq!(row[3], "test-arch");
+        assert_eq!(row[4], "16");
+        assert_eq!(row[5], "7");
+        assert_eq!(row[6], "6");
+        assert_eq!(row[7], "test-workload");
+        assert_eq!(row[28], "1000");
+        assert_eq!(row[29], "32");
+        assert_eq!(row[30], "131072000");
+        assert_eq!(row[31], "default_policy");
+        assert_eq!(row[38], "16");
+        assert_eq!(row[39], "available_parallelism_fallback");
+        assert_eq!(row[43], "false");
+        assert_eq!(row[47], "16000");
+        assert!(!row[48].is_empty());
+        assert_eq!(row[49], "16");
         assert!(!row[51].is_empty());
-        assert!(!row[60].is_empty());
+        assert!(!row[52].is_empty());
+        assert!(!row[61].is_empty());
+        assert_eq!(row[62], "");
+        assert_eq!(row[63], "");
+        assert_eq!(row[64], "");
+        assert_eq!(row[65], "");
+        assert_eq!(row[66], "");
+        assert_eq!(row[67], "");
+        assert_eq!(row[68], "");
+        assert_eq!(row[69], "");
+        assert_eq!(row[70], "");
+        assert_eq!(row[71], "");
+        assert_eq!(row[72], "");
+        assert_eq!(row[73], "");
+        assert_eq!(row[74], "");
+        assert_eq!(row[75], "");
+        assert_eq!(row[76], "");
+        assert_eq!(row[77], "");
+        assert_eq!(row[78], "");
+        assert_eq!(row[79], "");
 
         Ok(())
     }

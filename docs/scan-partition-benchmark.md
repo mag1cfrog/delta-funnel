@@ -1,13 +1,14 @@
 # Scan Partition Benchmark
 
-`delta_scan_partition_bench` is a portable synthetic benchmark runner for the
-Delta DataFusion scan partition target policy.
+`delta_scan_partition_bench` is a portable benchmark runner for the Delta
+DataFusion scan partition target policy. Its default mode is the deterministic
+synthetic matrix.
 
 The production policy is documented in
 [`scan-partition-target-policy.md`](scan-partition-target-policy.md).
 
-The runner does not read Parquet data, contact object storage, require S3
-credentials, or execute production scan reads. It builds deterministic
+The synthetic mode does not read Parquet data, contact object storage, require
+S3 credentials, or execute production scan reads. It builds deterministic
 Delta-like file tasks in memory, runs the production target policy through the
 diagnostic facade, simulates scan work, groups files by estimated bytes or the
 unknown-size file-count fallback, and writes a CSV matrix.
@@ -24,8 +25,39 @@ Write CSV to a file:
 
 ```bash
 cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode synthetic \
   --output target/delta-scan-partition-bench.csv
 ```
+
+Run the cheap host profile probe:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode host-probe \
+  --output target/delta-scan-partition-host-probe.csv
+```
+
+Host-probe mode currently records cheap local host signals and runs a bounded
+in-process scheduler probe before feeding the host profile through the same
+production diagnostic target policy. It does not run local IO probes unless
+explicitly requested.
+
+Run the opt-in local IO read probe:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode host-probe \
+  --host-probe-local-io \
+  --host-probe-io-bytes 1048576 \
+  --host-probe-io-repetitions 3 \
+  --output target/delta-scan-partition-host-probe-io.csv
+```
+
+The local IO probe writes one temporary file, syncs it, reads it repeatedly,
+records first-read latency and aggregate read throughput, then removes the temp
+file on a best-effort basis. Use `--host-probe-temp-dir <path>` to select the
+temporary directory. The probe is bounded: bytes per repetition must be between
+1 and 64 MiB, and repetitions must be between 1 and 128.
 
 Use a deterministic jitter seed:
 
@@ -89,6 +121,7 @@ Important field groups:
 
 - Run metadata:
   - `benchmark_schema_version`
+  - `benchmark_mode`
   - `host_os`
   - `host_arch`
   - `host_available_parallelism`
@@ -134,6 +167,25 @@ Important field groups:
   - `partition_work_micros_p50`
   - `partition_work_micros_p95`
   - `partition_work_imbalance_basis_points`
+- Host-probe diagnostics:
+  - `host_memory_total_bytes`
+  - `host_memory_available_bytes`
+  - `host_unix_soft_fd_limit`
+  - `host_unix_soft_fd_limit_status`
+  - `host_scheduler_probe_task_count`
+  - `host_scheduler_probe_completed_task_count`
+  - `host_scheduler_probe_concurrency`
+  - `host_scheduler_probe_total_micros`
+  - `host_scheduler_probe_nanos_per_task`
+  - `host_runtime_probe_stable_concurrency_hint`
+  - `host_local_io_probe_enabled`
+  - `host_local_io_probe_status`
+  - `host_local_io_probe_repetitions`
+  - `host_local_io_probe_bytes_per_repetition`
+  - `host_local_io_probe_bytes_read`
+  - `host_local_io_probe_total_micros`
+  - `host_local_io_probe_latency_micros`
+  - `host_local_io_probe_throughput_bytes_per_second`
 
 `partition_work_imbalance_basis_points` is:
 
@@ -173,10 +225,15 @@ default.
 
 ## Scope
 
-This benchmark validates scan partition target policy and synthetic file-task
+Synthetic mode validates scan partition target policy and synthetic file-task
 grouping behavior. It includes synthetic request latency, per-partition
 scheduling overhead, bounded execution slots, and aggregate transfer floors so
 policy cases can be compared more realistically than with infinite parallelism.
+
+Host-probe mode records real cheap host signals, including available
+parallelism, memory hints, Unix fd limit status when available, and a bounded
+local scheduler probe. Local IO probing is opt-in and bounded. Host-probe mode
+does not run network or stress probes.
 
 It is still not a production read benchmark. It does not measure real Parquet
 decoding, Arrow batch memory, object-store request behavior, or DataFusion

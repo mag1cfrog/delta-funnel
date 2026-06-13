@@ -17,7 +17,10 @@ mod scan_plan;
 
 pub use partition_target::{
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
-    DeltaScanPartitionTargetDiagnosticSource, derive_delta_scan_partition_target_diagnostic,
+    DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+    DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+    delta_scan_partition_target_local_environment_diagnostic,
+    derive_delta_scan_partition_target_diagnostic,
 };
 pub use registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources, register_delta_sources,
