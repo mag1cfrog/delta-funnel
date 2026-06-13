@@ -63,6 +63,20 @@ impl KernelScanReadSchema {
         self.physical_predicate.is_some()
     }
 
+    /// Returns this read schema without a kernel Parquet read predicate.
+    ///
+    /// DV-backed reads need original physical row indexes before row-level
+    /// predicate pushdown can be used safely. Metadata pruning may still select
+    /// files with a kernel predicate, but the file read path can drop the
+    /// physical predicate and rely on DataFusion residual filters until the
+    /// row-index-aware reader path is available.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn without_physical_predicate(mut self) -> Self {
+        self.physical_predicate = None;
+        self
+    }
+
     fn transform_schema_context(&self) -> String {
         format!(
             "physical schema fields [{}], logical schema fields [{}]",

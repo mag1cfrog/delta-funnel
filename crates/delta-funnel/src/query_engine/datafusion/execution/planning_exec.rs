@@ -191,8 +191,9 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             })
             .map_err(DataFusionError::from)?,
         );
-        let read_schema = self.scan_plan.kernel_scan().read_schema();
         let file_tasks = scan_partition.file_tasks.clone();
+        let read_schema =
+            partition_read_schema(self.scan_plan.kernel_scan().read_schema(), &file_tasks);
         let partition_limiter = self
             .sync_read_limiter
             .partition_limiter(partition)
@@ -221,6 +222,20 @@ impl DeltaScanPartitionFileReader for DeltaFileReader {
         request: DeltaFileReadRequest<'_>,
     ) -> Result<super::file_reader::DeltaFileReadResult, DeltaFunnelError> {
         Self::read_file(self, request)
+    }
+}
+
+fn partition_read_schema(
+    read_schema: KernelScanReadSchema,
+    file_tasks: &[DeltaScanFileTask],
+) -> KernelScanReadSchema {
+    if file_tasks
+        .iter()
+        .any(|task| task.deletion_vector.is_present())
+    {
+        read_schema.without_physical_predicate()
+    } else {
+        read_schema
     }
 }
 
@@ -753,6 +768,47 @@ mod tests {
             schema.fields().len() == 1 && schema.field(0).name() == "id"
         }));
         assert_eq!(ids, expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_vector_execution_keeps_data_filter_correct_when_read_predicate_is_gated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_rows_and_deletion_vector(
+            "dv-data-filter-read-predicate-gated",
+            1003,
+            &[0, 999, 1002],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql("select id from orders where id > 1000 order by id")
+            .await?;
+        let result = dataframe.collect().await?;
+        let ids = result
+            .iter()
+            .map(batch_ids)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![1001, 1002]);
 
         Ok(())
     }
