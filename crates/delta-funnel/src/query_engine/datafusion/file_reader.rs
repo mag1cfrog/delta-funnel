@@ -331,6 +331,36 @@ mod tests {
     }
 
     #[test]
+    fn file_reader_transform_error_preserves_context() -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("file-reader-transform-error-context")?;
+        let source = load_source("orders", &table)?;
+        let scan = build_projected_delta_scan(&source, None)?;
+        let read_schema = scan.read_schema();
+        let mut task = first_file_task(&source, &scan)?;
+        task.transform =
+            KernelPhysicalToLogicalTransform::test_required_column_transform("missing_physical_id");
+        let reader = test_reader(&source)?;
+        let error = reader
+            .read_file(DeltaFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+            })
+            .err()
+            .ok_or("expected transform error")?;
+        let display = error.to_string();
+
+        assert!(display.contains("source `orders`"), "{display}");
+        assert!(display.contains("snapshot version 1"), "{display}");
+        assert!(display.contains(table.data_file_path()), "{display}");
+        assert!(
+            display.contains("physical-to-logical transform application"),
+            "{display}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn file_reader_applies_deletion_vector_mask() -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("file-reader-dv-mask")?;
         let source = load_source("orders", &table)?;
