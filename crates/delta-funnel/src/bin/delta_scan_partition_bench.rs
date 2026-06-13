@@ -107,7 +107,7 @@ fn write_benchmark_csv(output: &mut impl Write, seed: u64) -> Result<(), Box<dyn
     writeln!(output, "{}", BENCHMARK_CSV_HEADER.join(","))?;
     for workload_case in &workload_cases {
         for simulation in simulation_profiles {
-            let simulated_work = simulation.simulate_file_set(&workload_case.file_set)?;
+            let simulated_work = simulation.simulate_file_set(&workload_case.file_set, seed)?;
 
             for policy_case in &policy_cases {
                 let policy_decision = policy_case.derive_target()?;
@@ -1197,13 +1197,14 @@ impl SyntheticWorkSimulationProfile {
     fn simulate_file_set(
         self,
         file_set: &SyntheticFileSet,
+        seed: u64,
     ) -> Result<SyntheticWorkSimulationResult, SyntheticGenerationError> {
         let mut serial_micros = 0_u64;
         let mut max_file_micros = 0_u64;
         let mut file_costs = Vec::with_capacity(file_set.files.len());
 
         for (file_index, file) in file_set.files.iter().enumerate() {
-            let cost = self.simulate_file(file_index, file)?;
+            let cost = self.simulate_file(file_index, file, seed)?;
             serial_micros = serial_micros
                 .checked_add(cost.total_micros)
                 .ok_or_else(|| generation_error("simulated serial time overflow"))?;
@@ -1223,6 +1224,7 @@ impl SyntheticWorkSimulationProfile {
         self,
         file_index: usize,
         file: &SyntheticFile,
+        seed: u64,
     ) -> Result<SyntheticFileWorkCost, SyntheticGenerationError> {
         let transfer_micros = scaled_ceil_div(
             file.size_bytes,
@@ -1242,6 +1244,7 @@ impl SyntheticWorkSimulationProfile {
             base_micros,
             u64::from(deterministic_jitter_basis_points(
                 file,
+                seed,
                 self.jitter_basis_points,
             )),
             10_000,
@@ -1652,20 +1655,30 @@ fn scaled_ceil_div(
     u64::try_from(rounded).map_err(|_| generation_error(format!("{label} does not fit into u64")))
 }
 
-fn deterministic_jitter_basis_points(file: &SyntheticFile, max_basis_points: u16) -> u16 {
+fn deterministic_jitter_basis_points(
+    file: &SyntheticFile,
+    seed: u64,
+    max_basis_points: u16,
+) -> u16 {
     if max_basis_points == 0 {
         return 0;
     }
 
-    let hash = deterministic_file_hash(file);
+    let hash = deterministic_file_hash(file, seed);
     let range = u64::from(max_basis_points) + 1;
 
     (hash % range) as u16
 }
 
-fn deterministic_file_hash(file: &SyntheticFile) -> u64 {
+fn deterministic_file_hash(file: &SyntheticFile, seed: u64) -> u64 {
     let mut hash = 14_695_981_039_346_656_037_u64;
 
+    if seed != DEFAULT_BENCHMARK_SEED {
+        for byte in seed.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(1_099_511_628_211);
+        }
+    }
     for byte in file.path.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(1_099_511_628_211);
@@ -2297,9 +2310,24 @@ mod tests {
         let profile = SyntheticWorkSimulationProfile::s3_normal();
 
         assert_eq!(
-            profile.simulate_file_set(&file_set)?,
-            profile.simulate_file_set(&file_set)?
+            profile.simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?,
+            profile.simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn simulation_seed_changes_deterministic_jitter() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+        let profile = SyntheticWorkSimulationProfile::s3_normal();
+        let seed_one = profile.simulate_file_set(&file_set, 1)?;
+        let seed_one_again = profile.simulate_file_set(&file_set, 1)?;
+        let seed_two = profile.simulate_file_set(&file_set, 2)?;
+
+        assert_eq!(seed_one, seed_one_again);
+        assert_ne!(seed_one.serial_micros, seed_two.serial_micros);
 
         Ok(())
     }
@@ -2308,11 +2336,14 @@ mod tests {
     fn simulated_storage_profiles_change_total_work() -> Result<(), Box<dyn Error>> {
         let shape = SyntheticDeltaTableShape::partitioned_event_log();
         let file_set = shape.generate_file_set()?;
-        let local = SyntheticWorkSimulationProfile::local_fast().simulate_file_set(&file_set)?;
-        let normal = SyntheticWorkSimulationProfile::s3_normal().simulate_file_set(&file_set)?;
-        let high_latency =
-            SyntheticWorkSimulationProfile::s3_high_latency().simulate_file_set(&file_set)?;
-        let cpu_heavy = SyntheticWorkSimulationProfile::cpu_heavy().simulate_file_set(&file_set)?;
+        let local = SyntheticWorkSimulationProfile::local_fast()
+            .simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
+        let normal = SyntheticWorkSimulationProfile::s3_normal()
+            .simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
+        let high_latency = SyntheticWorkSimulationProfile::s3_high_latency()
+            .simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
+        let cpu_heavy = SyntheticWorkSimulationProfile::cpu_heavy()
+            .simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
 
         assert_eq!(normal.profile_name, "s3_normal");
         assert_eq!(normal.file_costs.len(), file_set.files.len());
@@ -2353,7 +2384,8 @@ mod tests {
     fn partitioned_work_rejects_zero_target() -> Result<(), Box<dyn Error>> {
         let shape = SyntheticDeltaTableShape::partitioned_event_log();
         let file_set = shape.generate_file_set()?;
-        let work = SyntheticWorkSimulationProfile::s3_normal().simulate_file_set(&file_set)?;
+        let work = SyntheticWorkSimulationProfile::s3_normal()
+            .simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
         let error = work
             .partition_by_estimated_bytes(&file_set, 0)
             .err()
@@ -2368,7 +2400,8 @@ mod tests {
     fn partitioned_work_target_one_matches_serial_work() -> Result<(), Box<dyn Error>> {
         let shape = SyntheticDeltaTableShape::partitioned_event_log();
         let file_set = shape.generate_file_set()?;
-        let work = SyntheticWorkSimulationProfile::s3_normal().simulate_file_set(&file_set)?;
+        let work = SyntheticWorkSimulationProfile::s3_normal()
+            .simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
         let plan = work.partition_by_estimated_bytes(&file_set, 1)?;
 
         assert_eq!(plan.partitions.len(), 1);
@@ -2384,7 +2417,8 @@ mod tests {
     fn partitioned_work_uses_known_size_grouping_shape() -> Result<(), Box<dyn Error>> {
         let shape = SyntheticDeltaTableShape::partitioned_event_log();
         let file_set = shape.generate_file_set()?;
-        let work = SyntheticWorkSimulationProfile::s3_normal().simulate_file_set(&file_set)?;
+        let work = SyntheticWorkSimulationProfile::s3_normal()
+            .simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
         let plan = work.partition_by_estimated_bytes(&file_set, 16)?;
 
         assert!(plan.partitions.len() <= 16);
@@ -2514,7 +2548,8 @@ mod tests {
     fn policy_target_drives_partitioned_work_plan() -> Result<(), Box<dyn Error>> {
         let shape = SyntheticDeltaTableShape::partitioned_event_log();
         let file_set = shape.generate_file_set()?;
-        let work = SyntheticWorkSimulationProfile::s3_normal().simulate_file_set(&file_set)?;
+        let work = SyntheticWorkSimulationProfile::s3_normal()
+            .simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
         let case = BenchmarkPolicyCase::with_input(
             "test_policy",
             DeltaScanPartitionTargetDiagnosticInput {
@@ -2597,7 +2632,7 @@ mod tests {
         let shape = SyntheticDeltaTableShape::partitioned_event_log();
         let file_set = shape.generate_file_set()?;
         let simulation = SyntheticWorkSimulationProfile::s3_normal();
-        let simulated_work = simulation.simulate_file_set(&file_set)?;
+        let simulated_work = simulation.simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
         let cases = BenchmarkPolicyCase::standard_cases(Some(16));
         let case = &cases[0];
         let decision = case.derive_target()?;
