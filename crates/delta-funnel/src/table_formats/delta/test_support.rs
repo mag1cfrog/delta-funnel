@@ -137,6 +137,33 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local partitioned Delta table with one data file and a real
+    /// deletion vector.
+    pub(crate) fn new_with_partition_value_and_deletion_vector(
+        name: &str,
+        region: &str,
+        deleted_rows: &[u64],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            DELETION_VECTOR_PROTOCOL_JSON,
+            PARTITIONED_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batch: default_batch()?,
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: format!(r#"{{"region":"{region}"}}"#),
+                deletion_vector: Some(deletion_vector_fixture(deleted_rows)?),
+            }],
+        )
+    }
+
     fn new_with_batch(
         name: &str,
         batch: kernel::RecordBatch,

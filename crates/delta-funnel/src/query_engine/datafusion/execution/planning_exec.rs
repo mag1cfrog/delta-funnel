@@ -608,6 +608,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deletion_vector_execution_preserves_transformed_logical_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_partition_value_and_deletion_vector(
+            "dv-partition-transform-real-read",
+            "us-west",
+            &[1],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let dataframe = ctx.sql("select region, id from orders order by id").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        assert!(result.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 2
+                && schema.field(0).name() == "region"
+                && schema.field(1).name() == "id"
+        }));
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+---------+----+",
+                "| region  | id |",
+                "+---------+----+",
+                "| us-west | 1  |",
+                "| us-west | 3  |",
+                "+---------+----+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sequential_stream_emits_before_exhausting_source()
     -> Result<(), Box<dyn std::error::Error>> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
