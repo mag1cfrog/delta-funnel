@@ -4,13 +4,13 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::common::{DataFusionError, Result as DataFusionResult, not_impl_err};
+use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, Partitioning,
+    PlanProperties, SendableRecordBatchStream,
 };
 
 use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
@@ -142,23 +142,39 @@ impl ExecutionPlan for DeltaScanPlanningExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        not_impl_err!("Delta scan partition planning is complete; read execution is owned by #4")
+        let Some(scan_partition) = self.partition_plan.partitions.get(partition) else {
+            return Err(DataFusionError::Execution(format!(
+                "Delta scan execution partition {partition} is out of range for {} planned partitions",
+                self.partition_plan.partitions.len()
+            )));
+        };
+
+        if scan_partition.file_tasks.is_empty() {
+            return Ok(Box::pin(EmptyRecordBatchStream::new(Arc::clone(
+                &self.scan_plan.projected_schema,
+            ))));
+        }
+
+        Err(DataFusionError::Execution(
+            "Delta scan sequential file execution is not implemented yet for #139".to_owned(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
 
     use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
     };
     use crate::query_engine::datafusion::test_support::{
-        DeltaLogTable, PARTITIONED_SCHEMA_FIELDS_JSON, find_delta_scan_plans,
-        register_fixture_source,
+        DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, PARTITIONED_SCHEMA_FIELDS_JSON,
+        find_delta_scan_plans, register_fixture_source,
     };
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
@@ -188,10 +204,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execution_fails_at_deliberate_delta_scan_stub()
+    async fn execution_returns_no_rows_for_empty_delta_scan()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
-        let _table = register_fixture_source(&ctx, "orders", "execution-stub")?;
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "empty-execution",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let dataframe = ctx.sql("select * from orders").await?;
+        let result = dataframe.collect().await?;
+
+        assert!(result.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_rejects_out_of_range_partition() -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "out-of-range-partition")?;
+
+        let dataframe = ctx.sql("select * from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        let scan = scans[0];
+        let out_of_range_partition = scan.partition_plan().partitions.len();
+
+        let result = scan.execute(out_of_range_partition, ctx.task_ctx());
+
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains(
+                "Delta scan execution partition 1 is out of range for 1 planned partitions"
+            )
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_empty_execution_stops_at_sequential_file_stream_todo()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "sequential-file-stream-todo")?;
 
         let dataframe = ctx.sql("select * from orders").await?;
         let result = dataframe.collect().await;
@@ -200,18 +273,18 @@ mod tests {
             result,
             Err(error) if error
                 .to_string()
-                .contains("Delta scan partition planning is complete; read execution is owned by #4")
+                .contains("Delta scan sequential file execution is not implemented yet for #139")
         ));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn exact_partition_filter_execution_still_stops_at_scan_stub()
+    async fn exact_partition_filter_execution_still_stops_at_sequential_file_stream_todo()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema(
-            "execution-stub-exact-partition-filter",
+            "sequential-file-stream-todo-exact-partition-filter",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
@@ -240,18 +313,18 @@ mod tests {
             result,
             Err(error) if error
                 .to_string()
-                .contains("Delta scan partition planning is complete; read execution is owned by #4")
+                .contains("Delta scan sequential file execution is not implemented yet for #139")
         ));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn mixed_partition_filter_execution_still_stops_at_scan_stub()
+    async fn mixed_partition_filter_execution_still_stops_at_sequential_file_stream_todo()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = DeltaLogTable::new_with_schema(
-            "execution-stub-mixed-partition-filter",
+            "sequential-file-stream-todo-mixed-partition-filter",
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
@@ -293,7 +366,7 @@ mod tests {
             result,
             Err(error) if error
                 .to_string()
-                .contains("Delta scan partition planning is complete; read execution is owned by #4")
+                .contains("Delta scan sequential file execution is not implemented yet for #139")
         ));
 
         Ok(())
