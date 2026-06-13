@@ -39,8 +39,25 @@ cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
 
 Host-probe mode currently records cheap local host signals and runs a bounded
 in-process scheduler probe before feeding the host profile through the same
-production diagnostic target policy. It does not run local IO throughput probes
-yet.
+production diagnostic target policy. It does not run local IO probes unless
+explicitly requested.
+
+Run the opt-in local IO read probe:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode host-probe \
+  --host-probe-local-io \
+  --host-probe-io-bytes 1048576 \
+  --host-probe-io-repetitions 3 \
+  --output target/delta-scan-partition-host-probe-io.csv
+```
+
+The local IO probe writes one temporary file, syncs it, reads it repeatedly,
+records first-read latency and aggregate read throughput, then removes the temp
+file on a best-effort basis. Use `--host-probe-temp-dir <path>` to select the
+temporary directory. The probe is bounded: bytes per repetition must be between
+1 and 64 MiB, and repetitions must be between 1 and 128.
 
 Use a deterministic jitter seed:
 
@@ -161,6 +178,14 @@ Important field groups:
   - `host_scheduler_probe_total_micros`
   - `host_scheduler_probe_nanos_per_task`
   - `host_runtime_probe_stable_concurrency_hint`
+  - `host_local_io_probe_enabled`
+  - `host_local_io_probe_status`
+  - `host_local_io_probe_repetitions`
+  - `host_local_io_probe_bytes_per_repetition`
+  - `host_local_io_probe_bytes_read`
+  - `host_local_io_probe_total_micros`
+  - `host_local_io_probe_latency_micros`
+  - `host_local_io_probe_throughput_bytes_per_second`
 
 `partition_work_imbalance_basis_points` is:
 
@@ -207,7 +232,8 @@ policy cases can be compared more realistically than with infinite parallelism.
 
 Host-probe mode records real cheap host signals, including available
 parallelism, memory hints, Unix fd limit status when available, and a bounded
-local scheduler probe. It does not run disk, network, or stress probes yet.
+local scheduler probe. Local IO probing is opt-in and bounded. Host-probe mode
+does not run network or stress probes.
 
 It is still not a production read benchmark. It does not measure real Parquet
 decoding, Arrow batch memory, object-store request behavior, or DataFusion
