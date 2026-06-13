@@ -415,6 +415,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partition_value_transform_materializes_logical_partition_column()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_partition_value(
+            "partition-transform-real-read",
+            "us-west",
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let dataframe = ctx.sql("select region, id from orders order by id").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0, 2]));
+        assert!(
+            scans[0].partition_plan().partitions[0].file_tasks[0]
+                .transform
+                .is_required()
+        );
+
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        assert!(result.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 2
+                && schema.field(0).name() == "region"
+                && schema.field(1).name() == "id"
+        }));
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+---------+----+",
+                "| region  | id |",
+                "+---------+----+",
+                "| us-west | 1  |",
+                "| us-west | 2  |",
+                "| us-west | 3  |",
+                "+---------+----+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn column_mapping_transform_emits_logical_column_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table =
+            RealParquetDeltaTable::new_with_column_mapping("column-mapping-transform-real-read")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql("select customer_name, id from orders order by id")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert!(
+            scans[0].partition_plan().partitions[0].file_tasks[0]
+                .transform
+                .is_required()
+        );
+
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        assert!(result.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 2
+                && schema.field(0).name() == "customer_name"
+                && schema.field(1).name() == "id"
+                && schema.field_with_name("phys_customer_name").is_err()
+                && schema.field_with_name("phys_id").is_err()
+        }));
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+---------------+----+",
+                "| customer_name | id |",
+                "+---------------+----+",
+                "| alice         | 1  |",
+                "| bob           | 2  |",
+                "|               | 3  |",
+                "+---------------+----+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn residual_filter_runs_above_provider_output() -> Result<(), Box<dyn std::error::Error>>
     {
         let ctx = SessionContext::new();
@@ -543,6 +668,67 @@ mod tests {
                 "| 1  | alice         |",
                 "| 3  |               |",
                 "+----+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_vector_execution_preserves_transformed_logical_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_partition_value_and_deletion_vector(
+            "dv-partition-transform-real-read",
+            "us-west",
+            &[1],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let dataframe = ctx.sql("select region, id from orders order by id").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert!(
+            scans[0].partition_plan().partitions[0].file_tasks[0]
+                .transform
+                .is_required()
+        );
+
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        assert!(result.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 2
+                && schema.field(0).name() == "region"
+                && schema.field(1).name() == "id"
+        }));
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+---------+----+",
+                "| region  | id |",
+                "+---------+----+",
+                "| us-west | 1  |",
+                "| us-west | 3  |",
+                "+---------+----+",
             ]
             .join("\n")
         );
