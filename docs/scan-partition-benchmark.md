@@ -55,6 +55,10 @@ The default matrix currently covers:
   - `cpu_heavy`
 - Policy cases:
   - `default_policy`
+  - `fixed_target_1`, `fixed_target_4`
+  - `available_parallelism_uncapped`
+  - `available_parallelism_x2_uncapped`
+  - `datafusion_cap_4`
   - `fd_per_partition_4`, `8`, `16`, `32`
   - `memory_per_partition_64mib`, `128mib`, `256mib`, `512mib`
   - all fd-per-partition x memory-per-partition combined cases

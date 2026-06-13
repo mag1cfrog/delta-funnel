@@ -1052,6 +1052,7 @@ impl BenchmarkPolicyCase {
     fn standard_cases(available_parallelism: Option<usize>) -> Vec<Self> {
         let baseline = Self::baseline_input(available_parallelism);
         let mut cases = vec![Self::new("default_policy", baseline)];
+        cases.extend(Self::strategy_baseline_cases(baseline));
 
         for file_descriptors_per_partition in BENCHMARK_FD_PER_PARTITION_CANDIDATES {
             cases.push(Self::new(
@@ -1097,6 +1098,47 @@ impl BenchmarkPolicyCase {
         }
 
         cases
+    }
+
+    fn strategy_baseline_cases(baseline: DeltaScanPartitionTargetDiagnosticInput) -> [Self; 5] {
+        [
+            Self::new(
+                "fixed_target_1",
+                DeltaScanPartitionTargetDiagnosticInput {
+                    explicit_target_partitions: Some(1),
+                    ..baseline
+                },
+            ),
+            Self::new(
+                "fixed_target_4",
+                DeltaScanPartitionTargetDiagnosticInput {
+                    explicit_target_partitions: Some(4),
+                    ..baseline
+                },
+            ),
+            Self::new(
+                "available_parallelism_uncapped",
+                DeltaScanPartitionTargetDiagnosticInput {
+                    datafusion_target_partitions: None,
+                    ..baseline
+                },
+            ),
+            Self::new(
+                "available_parallelism_x2_uncapped",
+                DeltaScanPartitionTargetDiagnosticInput {
+                    datafusion_target_partitions: None,
+                    parallelism_multiplier: 2,
+                    ..baseline
+                },
+            ),
+            Self::new(
+                "datafusion_cap_4",
+                DeltaScanPartitionTargetDiagnosticInput {
+                    datafusion_target_partitions: Some(4),
+                    ..baseline
+                },
+            ),
+        ]
     }
 
     fn new(name: impl Into<String>, input: DeltaScanPartitionTargetDiagnosticInput) -> Self {
@@ -1990,7 +2032,7 @@ mod tests {
         let csv = String::from_utf8(output)?;
         let lines = csv.lines().collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), 501);
+        assert_eq!(lines.len(), 601);
         assert!(lines[0].starts_with("benchmark_schema_version,host_os,host_arch"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
@@ -2496,8 +2538,13 @@ mod tests {
             .map(|case| case.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(cases.len(), 25);
+        assert_eq!(cases.len(), 30);
         assert_eq!(names.first(), Some(&"default_policy"));
+        assert!(names.contains(&"fixed_target_1"));
+        assert!(names.contains(&"fixed_target_4"));
+        assert!(names.contains(&"available_parallelism_uncapped"));
+        assert!(names.contains(&"available_parallelism_x2_uncapped"));
+        assert!(names.contains(&"datafusion_cap_4"));
         assert!(names.contains(&"fd_per_partition_4"));
         assert!(names.contains(&"fd_per_partition_8"));
         assert!(names.contains(&"fd_per_partition_16"));
@@ -2513,12 +2560,14 @@ mod tests {
                 .iter()
                 .all(|case| case.input.available_parallelism == Some(16))
         );
-        assert!(
-            cases
-                .iter()
-                .all(|case| case.input.datafusion_target_partitions == Some(16))
-        );
 
+        let fixed_target_1 = find_policy_case(&cases, "fixed_target_1")?.derive_target()?;
+        let fixed_target_4 = find_policy_case(&cases, "fixed_target_4")?.derive_target()?;
+        let available_parallelism_uncapped =
+            find_policy_case(&cases, "available_parallelism_uncapped")?.derive_target()?;
+        let available_parallelism_x2_uncapped =
+            find_policy_case(&cases, "available_parallelism_x2_uncapped")?.derive_target()?;
+        let datafusion_cap_4 = find_policy_case(&cases, "datafusion_cap_4")?.derive_target()?;
         let fd_per_partition_16 =
             find_policy_case(&cases, "fd_per_partition_16")?.derive_target()?;
         let fd_per_partition_32 =
@@ -2529,6 +2578,25 @@ mod tests {
             find_policy_case(&cases, "memory_per_partition_512mib")?.derive_target()?;
         let combined = find_policy_case(&cases, "combined_fd_32_memory_512mib")?.derive_target()?;
 
+        assert_eq!(fixed_target_1.target_partitions, 1);
+        assert_eq!(
+            fixed_target_1.source,
+            DeltaScanPartitionTargetDiagnosticSource::ExplicitOverride
+        );
+        assert_eq!(fixed_target_4.target_partitions, 4);
+        assert_eq!(
+            fixed_target_4.source,
+            DeltaScanPartitionTargetDiagnosticSource::ExplicitOverride
+        );
+        assert_eq!(available_parallelism_uncapped.target_partitions, 16);
+        assert_eq!(available_parallelism_uncapped.datafusion_target_cap, None);
+        assert_eq!(available_parallelism_x2_uncapped.target_partitions, 32);
+        assert_eq!(
+            available_parallelism_x2_uncapped.datafusion_target_cap,
+            None
+        );
+        assert_eq!(datafusion_cap_4.target_partitions, 4);
+        assert_eq!(datafusion_cap_4.datafusion_target_cap, Some(4));
         assert_eq!(fd_per_partition_16.target_partitions, 8);
         assert_eq!(fd_per_partition_16.unix_file_descriptor_cap, Some(8));
         assert_eq!(fd_per_partition_32.target_partitions, 4);
