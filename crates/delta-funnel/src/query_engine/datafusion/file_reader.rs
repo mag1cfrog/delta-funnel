@@ -57,7 +57,20 @@ pub(crate) struct DeltaFileReadRequest<'a> {
 #[allow(dead_code)]
 pub(crate) struct DeltaFileReadResult {
     /// Arrow batches ready for later DataFusion stream handoff.
+    ///
+    /// The result implements `IntoIterator` so provider execution can consume
+    /// batches through an iterator-shaped boundary without seeing unmasked
+    /// physical data.
     pub(crate) batches: Vec<RecordBatch>,
+}
+
+impl IntoIterator for DeltaFileReadResult {
+    type Item = RecordBatch;
+    type IntoIter = std::vec::IntoIter<RecordBatch>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.batches.into_iter()
+    }
 }
 
 impl DeltaFileReader {
@@ -289,7 +302,10 @@ mod tests {
             task: &task,
             read_schema: &read_schema,
         })?;
-        let batch = result.batches.first().ok_or("expected one record batch")?;
+        let batch = result
+            .into_iter()
+            .next()
+            .ok_or("expected one record batch")?;
 
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.schema().field(0).name(), "customer_name");
