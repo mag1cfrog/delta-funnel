@@ -232,10 +232,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::query_engine::datafusion::filters::{
+    use crate::query_engine::datafusion::catalog::provider::DeltaTableProvider;
+    use crate::query_engine::datafusion::planning::filters::{
         DeltaFilterPushdownOutcome, DeltaFilterPushdownRejectionReason,
     };
-    use crate::query_engine::datafusion::provider::DeltaTableProvider;
     use crate::query_engine::datafusion::test_support::{
         DEEP_NESTED_WITH_CITY_SCHEMA_FIELDS_JSON, DeltaLogTable, NESTED_SCHEMA_FIELDS_JSON,
         PARTITIONED_SCHEMA_FIELDS_JSON,

@@ -8,14 +8,14 @@ use datafusion::arrow::datatypes::SchemaRef;
 use crate::{DeltaFunnelError, error::DeltaScanProjectionSnafu};
 
 #[allow(dead_code)]
-pub(super) struct ProjectionPlan {
-    pub(super) projected_schema: SchemaRef,
-    pub(super) scan_projection: Option<Vec<usize>>,
-    pub(super) projected_column_names: Option<Vec<String>>,
+pub(crate) struct ProjectionPlan {
+    pub(crate) projected_schema: SchemaRef,
+    pub(crate) scan_projection: Option<Vec<usize>>,
+    pub(crate) projected_column_names: Option<Vec<String>>,
 }
 
 #[allow(dead_code)]
-pub(super) fn plan_projection(
+pub(crate) fn plan_projection(
     source_name: &str,
     table_uri: &str,
     schema: &SchemaRef,
@@ -91,7 +91,7 @@ fn projection_error<T>(
 mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
-    use super::super::provider::DeltaTableProvider;
+    use super::super::super::catalog::provider::DeltaTableProvider;
     use super::super::scan_plan::ProviderScanPlanRequest;
     use super::*;
     use crate::query_engine::datafusion::test_support::DeltaLogTable;

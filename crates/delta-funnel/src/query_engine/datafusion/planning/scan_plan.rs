@@ -80,20 +80,20 @@ pub(crate) struct ProviderScanMetadataExpansion {
     pub(crate) scan_metadata_exhausted: bool,
 }
 
-pub(super) struct ProviderScanPlanParts {
-    pub(super) source_name: String,
-    pub(super) table_uri: String,
-    pub(super) snapshot_version: u64,
-    pub(super) projected_schema: SchemaRef,
-    pub(super) protocol: DeltaProtocolReport,
-    pub(super) scan_projection: Option<Vec<usize>>,
-    pub(super) pushed_filter_plan: DeltaFilterPushdownPlan,
-    pub(super) kernel_partition_predicate: Option<DeltaKernelPredicate>,
-    pub(super) kernel_scan: ProjectedDeltaScan,
+pub(crate) struct ProviderScanPlanParts {
+    pub(crate) source_name: String,
+    pub(crate) table_uri: String,
+    pub(crate) snapshot_version: u64,
+    pub(crate) projected_schema: SchemaRef,
+    pub(crate) protocol: DeltaProtocolReport,
+    pub(crate) scan_projection: Option<Vec<usize>>,
+    pub(crate) pushed_filter_plan: DeltaFilterPushdownPlan,
+    pub(crate) kernel_partition_predicate: Option<DeltaKernelPredicate>,
+    pub(crate) kernel_scan: ProjectedDeltaScan,
 }
 
 impl ProviderScanPlan {
-    pub(super) fn from_parts(parts: ProviderScanPlanParts) -> Self {
+    pub(crate) fn from_parts(parts: ProviderScanPlanParts) -> Self {
         Self {
             source_name: parts.source_name,
             table_uri: parts.table_uri,
@@ -232,7 +232,7 @@ mod tests {
 
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
-    use super::super::provider::DeltaTableProvider;
+    use super::super::super::catalog::provider::DeltaTableProvider;
     use super::*;
     use crate::query_engine::datafusion::test_support::DeltaLogTable;
 

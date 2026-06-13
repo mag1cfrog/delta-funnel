@@ -25,14 +25,16 @@ use crate::{
     },
 };
 
-use super::execution::DeltaScanPlanningExec;
-use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
-use super::partition_target::{
+use super::super::execution::DeltaScanPlanningExec;
+use super::super::planning::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
+use super::super::planning::partition_target::{
     DeltaScanPartitionTargetConfig, DeltaScanPartitionTargetContext, DeltaScanPartitionTargetPolicy,
 };
-use super::projection::{ProjectionPlan, plan_projection};
+use super::super::planning::projection::{ProjectionPlan, plan_projection};
+use super::super::planning::scan_plan::{
+    ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest,
+};
 use super::registration::reject_mismatched_preflight;
-use super::scan_plan::{ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest};
 
 pub(crate) struct DeltaTableProvider {
     source: PlannedDeltaSource,
