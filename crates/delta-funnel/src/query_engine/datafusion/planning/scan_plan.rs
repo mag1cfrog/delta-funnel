@@ -232,7 +232,7 @@ mod tests {
 
     use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
-    use super::super::super::provider::DeltaTableProvider;
+    use super::super::super::catalog::provider::DeltaTableProvider;
     use super::*;
     use crate::query_engine::datafusion::test_support::DeltaLogTable;
 

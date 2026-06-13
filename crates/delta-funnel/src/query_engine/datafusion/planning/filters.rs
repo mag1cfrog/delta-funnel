@@ -186,7 +186,7 @@ mod tests {
     use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, col, lit};
 
-    use super::super::super::provider::DeltaTableProvider;
+    use super::super::super::catalog::provider::DeltaTableProvider;
     use super::*;
     use crate::query_engine::datafusion::test_support::{
         DeltaLogTable, PARTITIONED_SCHEMA_FIELDS_JSON,

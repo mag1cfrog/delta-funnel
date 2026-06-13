@@ -91,7 +91,7 @@ fn projection_error<T>(
 mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
-    use super::super::super::provider::DeltaTableProvider;
+    use super::super::super::catalog::provider::DeltaTableProvider;
     use super::super::scan_plan::ProviderScanPlanRequest;
     use super::*;
     use crate::query_engine::datafusion::test_support::DeltaLogTable;

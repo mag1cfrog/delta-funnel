@@ -153,7 +153,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
 mod tests {
     use datafusion::prelude::SessionContext;
 
-    use crate::query_engine::datafusion::registration::{
+    use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
     };
     use crate::query_engine::datafusion::test_support::{

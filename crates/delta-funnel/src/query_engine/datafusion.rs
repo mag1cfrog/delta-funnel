@@ -4,20 +4,19 @@ use datafusion::common::DataFusionError;
 
 use crate::DeltaFunnelError;
 
+mod catalog;
 mod execution;
 mod planning;
-mod provider;
-mod registration;
 
+pub use catalog::registration::{
+    DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources, register_delta_sources,
+};
 pub use planning::partition_target::{
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
     delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic,
-};
-pub use registration::{
-    DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources, register_delta_sources,
 };
 
 impl From<DeltaFunnelError> for DataFusionError {
@@ -44,10 +43,10 @@ mod test_support {
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
 
-    use crate::query_engine::datafusion::execution::DeltaScanPlanningExec;
-    use crate::query_engine::datafusion::registration::{
+    use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
     };
+    use crate::query_engine::datafusion::execution::DeltaScanPlanningExec;
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     pub(crate) struct DeltaLogTable {

@@ -8,15 +8,16 @@ use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
-use super::super::execution::DeltaScanPlanningExec;
-use super::super::planning::partition_target::DeltaScanPartitionTargetSource;
+use super::super::super::execution::DeltaScanPlanningExec;
+use super::super::super::planning::partition_target::DeltaScanPartitionTargetSource;
 use super::*;
-use crate::query_engine::datafusion::registration::{
+use crate::query_engine::datafusion::catalog::registration::{
     DeltaTableProviderConfig, register_delta_sources,
 };
 use crate::query_engine::datafusion::test_support::{
-    DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, NESTED_SCHEMA_FIELDS_JSON,
-    PARTITIONED_SCHEMA_FIELDS_JSON, find_delta_scan_plans, register_fixture_source,
+    DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
+    NESTED_SCHEMA_FIELDS_JSON, PARTITIONED_SCHEMA_FIELDS_JSON, find_delta_scan_plans,
+    register_fixture_source,
 };
 use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
@@ -4872,7 +4873,7 @@ async fn sql_limit_stays_above_inexact_residual_filter_scan()
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(
         plan_display.contains("CoalescePartitionsExec: fetch=1"),
@@ -4920,7 +4921,7 @@ async fn sql_limit_stays_above_joined_delta_scans() -> Result<(), Box<dyn std::e
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(
         plan_display.contains("CoalescePartitionsExec: fetch=1"),
@@ -4989,7 +4990,7 @@ async fn residual_filter_column_remains_available_below_final_projection()
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(plan_display.contains("FilterExec"), "{plan_display}");
     assert!(
@@ -5046,7 +5047,7 @@ async fn data_stats_residual_column_remains_available_below_final_projection()
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(plan_display.contains("FilterExec"), "{plan_display}");
     assert!(
@@ -5108,7 +5109,7 @@ async fn string_data_stats_residual_column_remains_available_below_final_project
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(plan_display.contains("FilterExec"), "{plan_display}");
     assert!(
@@ -5170,7 +5171,7 @@ async fn floating_data_stats_residual_column_remains_available_below_final_proje
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(plan_display.contains("FilterExec"), "{plan_display}");
     assert!(
@@ -5258,7 +5259,7 @@ async fn sql_floating_data_stats_supported_filters_remain_residual()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             plan_display.contains("FilterExec"),
@@ -5341,7 +5342,7 @@ async fn boolean_data_stats_residual_column_remains_available_below_final_projec
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(plan_display.contains("FilterExec"), "{plan_display}");
     assert!(
@@ -5403,7 +5404,7 @@ async fn binary_data_stats_residual_column_remains_available_below_final_project
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(plan_display.contains("FilterExec"), "{plan_display}");
     assert!(
@@ -5466,7 +5467,7 @@ async fn temporal_data_stats_residual_column_remains_available_below_final_proje
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(plan_display.contains("FilterExec"), "{plan_display}");
     assert!(
@@ -5528,7 +5529,7 @@ async fn decimal_data_stats_residual_column_remains_available_below_final_projec
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(plan_display.contains("FilterExec"), "{plan_display}");
     assert!(
@@ -5592,7 +5593,7 @@ async fn composed_stats_residual_column_remains_available_below_final_projection
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(plan_display.contains("FilterExec"), "{plan_display}");
     assert!(
@@ -5691,7 +5692,7 @@ async fn mixed_partition_pruning_keeps_residual_column_below_final_projection()
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(plan_display.contains("FilterExec"), "{plan_display}");
     assert!(plan_display.contains("customer_name"), "{plan_display}");
@@ -5759,7 +5760,7 @@ async fn sql_exact_partition_filter_is_pushed_without_residual_filter()
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(!plan_display.contains("FilterExec"), "{plan_display}");
     assert_eq!(physical_plan.schema().fields().len(), 1);
@@ -5828,7 +5829,7 @@ async fn sql_partition_in_filter_is_exact_kernel_pushdown() -> Result<(), Box<dy
         .indent(true)
         .to_string();
     let mut scans = Vec::new();
-    super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
     assert!(!plan_display.contains("FilterExec"), "{plan_display}");
     assert_eq!(physical_plan.schema().fields().len(), 1);
@@ -5926,7 +5927,7 @@ async fn sql_duplicate_and_contradictory_partition_filters_are_exact_kernel_push
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         match expectation {
             ExpectedSqlPartitionEdge::ExactScan { exact_count, paths } => {
@@ -6046,7 +6047,7 @@ async fn sql_partition_in_edge_variants_document_rewrite_boundary()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         match expectation {
             ExpectedInProbe::EmptyBeforeScan => {
@@ -6154,7 +6155,7 @@ async fn sql_mixed_boolean_partition_filters_keep_required_residual_filters()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             plan_display.contains("FilterExec"),
@@ -6239,7 +6240,7 @@ async fn sql_null_partition_filters_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -6346,7 +6347,7 @@ async fn sql_negated_partition_filters_follow_supported_kernel_boundary()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         match expectation {
             ExpectedNegatedSql::ExactKernel { exact_count, paths } => {
@@ -6460,7 +6461,7 @@ async fn sql_partition_comparison_filters_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -6556,7 +6557,7 @@ async fn sql_empty_string_partition_filters_follow_kernel_boundary()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         match expectation {
             ExpectedEmptyStringSql::ExactKernel { paths } => {
@@ -8751,7 +8752,7 @@ async fn sql_timestamp_partition_comparisons_and_between_are_exact_kernel_pushdo
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -8851,7 +8852,7 @@ async fn sql_timestamp_ntz_partition_comparisons_and_between_are_exact_kernel_pu
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -8949,7 +8950,7 @@ async fn sql_timestamp_partition_equality_and_membership_are_exact_kernel_pushdo
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -9039,7 +9040,7 @@ async fn sql_timestamp_ntz_partition_equality_and_membership_are_exact_kernel_pu
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -9120,7 +9121,7 @@ async fn sql_timestamp_partition_null_checks_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -9203,7 +9204,7 @@ async fn sql_timestamp_ntz_partition_null_checks_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -10186,7 +10187,7 @@ async fn sql_floating_partition_null_checks_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -10282,7 +10283,7 @@ async fn sql_floating_partition_equality_and_membership_are_exact_kernel_pushdow
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -10376,7 +10377,7 @@ async fn sql_floating_partition_comparisons_and_between_keep_residual_filter()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             plan_display.contains("FilterExec"),
@@ -10468,7 +10469,7 @@ async fn sql_floating_partition_unsafe_literal_filters_keep_residual_filter()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             plan_display.contains("FilterExec"),
@@ -12661,7 +12662,7 @@ async fn sql_integer_partition_null_checks_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -12736,7 +12737,7 @@ async fn sql_boolean_partition_null_checks_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -12810,7 +12811,7 @@ async fn sql_binary_partition_null_checks_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -12900,7 +12901,7 @@ async fn sql_binary_partition_equality_and_membership_are_exact_kernel_pushdown(
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -12999,7 +13000,7 @@ async fn sql_date_partition_equality_and_membership_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -13075,7 +13076,7 @@ async fn sql_decimal_partition_unsafe_literal_filters_keep_residual_filter()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             plan_display.contains("FilterExec"),
@@ -13160,7 +13161,7 @@ async fn sql_decimal_partition_comparisons_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -13258,7 +13259,7 @@ async fn sql_decimal_partition_equality_and_membership_are_exact_kernel_pushdown
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -13336,7 +13337,7 @@ async fn sql_decimal_partition_null_checks_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -13436,7 +13437,7 @@ async fn sql_date_partition_range_filters_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -13513,7 +13514,7 @@ async fn sql_date_partition_null_checks_are_exact_kernel_pushdown()
             datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true);
         let plan_display = plan_display.to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -13625,7 +13626,7 @@ async fn sql_boolean_partition_literal_operators_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -13707,7 +13708,7 @@ async fn sql_boolean_partition_ordering_filters_keep_residual_filter()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             plan_display.contains("FilterExec"),
@@ -13816,7 +13817,7 @@ async fn sql_integer_partition_literal_operators_are_exact_kernel_pushdown()
             .indent(true)
             .to_string();
         let mut scans = Vec::new();
-        super::super::test_support::find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
         assert!(
             !plan_display.contains("FilterExec"),
@@ -13887,7 +13888,7 @@ fn schema_conversion_failure_reports_source_and_field_context()
 -> Result<(), Box<dyn std::error::Error>> {
     let table = DeltaLogTable::new_with_schema(
         "schema-failure",
-        super::super::test_support::INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
+        INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
         "[]",
         r#""partitionValues":{}"#,
     )?;

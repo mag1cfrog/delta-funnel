@@ -25,13 +25,13 @@ use crate::{
     },
 };
 
-use super::execution::DeltaScanPlanningExec;
-use super::planning::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
-use super::planning::partition_target::{
+use super::super::execution::DeltaScanPlanningExec;
+use super::super::planning::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
+use super::super::planning::partition_target::{
     DeltaScanPartitionTargetConfig, DeltaScanPartitionTargetContext, DeltaScanPartitionTargetPolicy,
 };
-use super::planning::projection::{ProjectionPlan, plan_projection};
-use super::planning::scan_plan::{
+use super::super::planning::projection::{ProjectionPlan, plan_projection};
+use super::super::planning::scan_plan::{
     ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest,
 };
 use super::registration::reject_mismatched_preflight;
