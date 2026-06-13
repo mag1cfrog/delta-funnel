@@ -10,7 +10,7 @@ use super::kernel::{
 
 // Reader features are Delta correctness requirements. Add features only after
 // the provider path proves the relevant semantics before rows reach DataFusion.
-const SUPPORTED_READER_FEATURES: &[&str] = &["timestampNtz", "deletionVectors"];
+const SUPPORTED_READER_FEATURES: &[&str] = &["timestampNtz", "deletionVectors", "columnMapping"];
 
 /// Protocol details for one named Delta source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,9 +145,8 @@ fn is_supported_reader_version(version: i32) -> bool {
     // Version 1 is the basic legacy read protocol. Version 3 is Delta's
     // table-feature protocol; the concrete reader requirements are then
     // expressed by `readerFeatures` and checked separately above.
-    // Legacy reader version 2 implies column mapping support, so keep it
-    // rejected until physical-to-logical column handling is implemented.
-    matches!(version, 1) || version == TABLE_FEATURES_MIN_READER_VERSION
+    // Legacy reader version 2 implies column mapping support.
+    matches!(version, 1 | 2) || version == TABLE_FEATURES_MIN_READER_VERSION
 }
 
 fn compatibility_error<T>(
@@ -349,35 +348,26 @@ mod tests {
     }
 
     #[test]
-    fn preflight_rejects_legacy_column_mapping_version() -> Result<(), Box<dyn std::error::Error>> {
+    fn preflight_allows_legacy_column_mapping_version() -> Result<(), Box<dyn std::error::Error>> {
         let source = load_source("orders", LEGACY_COLUMN_MAPPING_PROTOCOL_JSON)?;
 
-        let result = preflight_delta_protocol(&source);
+        let preflight = preflight_delta_protocol(&source)?;
 
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::DeltaProtocolCompatibility {
-                reason,
-                ..
-            }) if reason.contains("minReaderVersion 2")
-        ));
+        assert_eq!(preflight.protocol.min_reader_version, 2);
+        assert!(preflight.protocol.reader_features.is_empty());
 
         Ok(())
     }
 
     #[test]
-    fn preflight_rejects_column_mapping_reader_feature() -> Result<(), Box<dyn std::error::Error>> {
+    fn preflight_allows_column_mapping_reader_feature() -> Result<(), Box<dyn std::error::Error>> {
         let source = load_source("orders", COLUMN_MAPPING_FEATURE_PROTOCOL_JSON)?;
 
-        let result = preflight_delta_protocol(&source);
+        let preflight = preflight_delta_protocol(&source)?;
 
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::DeltaProtocolCompatibility {
-                reason,
-                ..
-            }) if reason.contains("columnMapping")
-        ));
+        assert_eq!(preflight.protocol.min_reader_version, 3);
+        assert_eq!(preflight.protocol.reader_features, vec!["columnMapping"]);
+        assert_eq!(preflight.protocol.writer_features, vec!["columnMapping"]);
 
         Ok(())
     }
@@ -474,8 +464,16 @@ mod tests {
             snapshot_version: 42,
             min_reader_version: super::TABLE_FEATURES_MIN_READER_VERSION,
             min_writer_version: 7,
-            reader_features: vec!["deletionVectors".to_owned(), "madeUpFeature".to_owned()],
-            writer_features: vec!["deletionVectors".to_owned(), "madeUpFeature".to_owned()],
+            reader_features: vec![
+                "deletionVectors".to_owned(),
+                "columnMapping".to_owned(),
+                "madeUpFeature".to_owned(),
+            ],
+            writer_features: vec![
+                "deletionVectors".to_owned(),
+                "columnMapping".to_owned(),
+                "madeUpFeature".to_owned(),
+            ],
         };
 
         let result = super::ensure_protocol_supported(&report);
@@ -485,7 +483,9 @@ mod tests {
             Err(DeltaFunnelError::DeltaProtocolCompatibility {
                 reason,
                 ..
-            }) if reason.contains("madeUpFeature") && !reason.contains("deletionVectors")
+            }) if reason.contains("madeUpFeature")
+                && !reason.contains("deletionVectors")
+                && !reason.contains("columnMapping")
         ));
     }
 

@@ -18,8 +18,10 @@ use super::uri::normalize_delta_table_uri;
 
 const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
 const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
+const COLUMN_MAPPING_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#;
 const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
+const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"},"createdTime":1587968585495}}"#;
 const DATA_FILE: &str = "part-00000.parquet";
 const MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
@@ -160,6 +162,29 @@ impl RealParquetDeltaTable {
                 },
                 partition_values_json: format!(r#"{{"region":"{region}"}}"#),
                 deletion_vector: Some(deletion_vector_fixture(deleted_rows)?),
+            }],
+        )
+    }
+
+    /// Creates a local Delta table whose logical columns use different
+    /// physical Parquet column names.
+    pub(crate) fn new_with_column_mapping(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            COLUMN_MAPPING_PROTOCOL_JSON,
+            COLUMN_MAPPING_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batch: physical_column_mapping_batch()?,
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
             }],
         )
     }
@@ -309,6 +334,13 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
+fn physical_column_mapping_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("phys_id", DataType::Int32, false),
+        Field::new("phys_customer_name", DataType::Utf8, true),
+    ]))
+}
+
 fn default_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
     let columns = vec![
         Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
@@ -316,6 +348,18 @@ fn default_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
     ];
 
     Ok(kernel::RecordBatch::try_new(schema(), columns)?)
+}
+
+fn physical_column_mapping_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let columns = vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
+    ];
+
+    Ok(kernel::RecordBatch::try_new(
+        physical_column_mapping_schema(),
+        columns,
+    )?)
 }
 
 fn sequential_batch(rows: usize) -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
