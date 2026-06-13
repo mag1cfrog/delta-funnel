@@ -16,14 +16,18 @@ mod uri;
 use super::validate_table_source_names;
 #[allow(unused_imports)]
 pub(crate) use deletion_vector::{
-    KernelDeletionVectorReadRequest, KernelDeletionVectorReader, ProviderDeletionVectorSelection,
+    KernelDeletionVectorReadRequest, KernelDeletionVectorReader, KernelDeletionVectorReaderConfig,
+    ProviderDeletionVectorSelection, ProviderDeletionVectorSelectionContext,
 };
 use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{DeltaKernelPredicate, datafusion_expr_to_kernel_predicate};
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };
-use read::KernelScanReadSchema;
+pub(crate) use read::{
+    KernelDataFileReadRequest, KernelDataFileReader, KernelDataFileReaderConfig,
+    KernelDataFileTransformRequest, KernelScanReadSchema,
+};
 use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
 
 /// Metadata-only expansion of one kernel scan.
@@ -121,6 +125,16 @@ impl KernelScanDeletionVectorMetadata {
     #[must_use]
     pub(crate) fn is_present(&self) -> bool {
         matches!(self, Self::Present(_))
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn test_present_from_descriptor(
+        descriptor: kernel::DeletionVectorDescriptor,
+    ) -> Self {
+        Self::Present(KernelScanDeletionVectorHandle {
+            dv_info: descriptor.into(),
+        })
     }
 }
 
@@ -292,6 +306,18 @@ impl KernelPhysicalToLogicalTransform {
         let transform = std::sync::Arc::new(kernel::Expression::Column(kernel::ColumnName::new([
             column_name,
         ])));
+
+        Self::Required(KernelPhysicalToLogicalTransformHandle { transform })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_required_orders_customer_name_replacement_transform(
+        replacement: &str,
+    ) -> Self {
+        let transform = std::sync::Arc::new(kernel::Expression::struct_from([
+            kernel::Expression::Column(kernel::ColumnName::new(["id"])),
+            kernel::Expression::Literal(kernel::Scalar::String(replacement.to_owned())),
+        ]));
 
         Self::Required(KernelPhysicalToLogicalTransformHandle { transform })
     }

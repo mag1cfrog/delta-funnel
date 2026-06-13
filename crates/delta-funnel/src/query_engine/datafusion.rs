@@ -6,6 +6,7 @@ use crate::DeltaFunnelError;
 
 mod execution;
 mod execution_environment;
+mod file_reader;
 mod file_task;
 mod file_task_partition;
 mod filters;
