@@ -90,8 +90,9 @@ impl DeltaScanFileTaskPartitionPlan {
     ///
     /// The policy is deterministic and never splits a physical file. When every
     /// file task has a byte estimate, partitions are formed in scan order around
-    /// a target byte budget. If any byte estimate is unknown, planning falls back
-    /// to deterministic file-count balancing.
+    /// a target byte budget. If any byte estimate is unknown, or if all selected
+    /// files have zero estimated bytes, planning falls back to deterministic
+    /// file-count balancing.
     #[allow(dead_code)]
     pub(crate) fn try_new(
         request: DeltaScanFileTaskPartitionPlanRequest,
@@ -124,8 +125,8 @@ impl DeltaScanFileTaskPartitionPlan {
         )?;
         let partitions = if file_tasks.is_empty() {
             Vec::new()
-        } else if estimated_bytes.is_some() {
-            group_by_estimated_bytes(
+        } else if matches!(estimated_bytes, Some(0) | None) {
+            group_by_file_count(
                 &source_name,
                 &table_uri,
                 snapshot_version,
@@ -133,7 +134,7 @@ impl DeltaScanFileTaskPartitionPlan {
                 options.target_partitions,
             )?
         } else {
-            group_by_file_count(
+            group_by_estimated_bytes(
                 &source_name,
                 &table_uri,
                 snapshot_version,
@@ -312,11 +313,12 @@ fn group_by_estimated_bytes(
     Ok(partitions)
 }
 
-/// Groups unknown-size file tasks by deterministic file-count balancing.
+/// Groups file tasks by deterministic file-count balancing.
 ///
-/// This fallback is used when any input task lacks a byte estimate. It preserves
-/// scan order, emits at most `target_partitions` non-empty partitions, and does
-/// not use row estimates to invent byte estimates.
+/// This fallback is used when any input task lacks a byte estimate or when the
+/// whole selected file set has zero estimated bytes. It preserves scan order,
+/// emits at most `target_partitions` non-empty partitions, and does not use row
+/// estimates to invent byte estimates.
 fn group_by_file_count(
     source_name: &str,
     table_uri: &str,
@@ -698,7 +700,14 @@ mod tests {
 
         assert_eq!(
             plan_partition_paths(&plan),
-            vec![vec!["zero-0.parquet", "zero-1.parquet"]]
+            vec![vec!["zero-0.parquet"], vec!["zero-1.parquet"]]
+        );
+        assert_eq!(
+            plan.partitions
+                .iter()
+                .map(|partition| partition.estimated_bytes)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(0)]
         );
         assert_eq!(plan.estimated_bytes, Some(0));
         assert_eq!(plan.estimated_rows, Some(0));

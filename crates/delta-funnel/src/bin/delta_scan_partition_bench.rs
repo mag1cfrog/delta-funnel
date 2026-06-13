@@ -1398,8 +1398,23 @@ impl SyntheticWorkSimulationResult {
 
         let output_limit = target_partitions.min(file_set.files.len());
         let Some(total_estimated_size_bytes) = file_set.total_estimated_size_bytes()? else {
-            return self.partition_by_file_count(file_set, target_partitions, output_limit);
+            return self.partition_by_file_count(
+                file_set,
+                target_partitions,
+                output_limit,
+                false,
+                true,
+            );
         };
+        if total_estimated_size_bytes == 0 {
+            return self.partition_by_file_count(
+                file_set,
+                target_partitions,
+                output_limit,
+                true,
+                false,
+            );
+        }
         let target_bytes = total_estimated_size_bytes.div_ceil(output_limit as u64);
         let mut partitions = Vec::new();
         let mut current = SyntheticWorkPartitionBuilder::default();
@@ -1448,6 +1463,8 @@ impl SyntheticWorkSimulationResult {
         file_set: &SyntheticFileSet,
         target_partitions: usize,
         output_limit: usize,
+        known_estimated_sizes: bool,
+        unknown_size_fallback_used: bool,
     ) -> Result<SyntheticPartitionedWorkPlan, SyntheticGenerationError> {
         let mut partitions = Vec::new();
         let mut file_costs = file_set.files.iter().zip(&self.file_costs);
@@ -1464,11 +1481,17 @@ impl SyntheticWorkSimulationResult {
                         "file-count grouping exhausted files unexpectedly",
                     ));
                 };
-                current.add(file, cost, None)?;
+                current.add(
+                    file,
+                    cost,
+                    known_estimated_sizes
+                        .then_some(file.estimated_size_bytes)
+                        .flatten(),
+                )?;
             }
 
             remaining_files -= take_count;
-            partitions.push(current.finish(partitions.len(), false));
+            partitions.push(current.finish(partitions.len(), known_estimated_sizes));
         }
 
         let wall_micros = partitions
@@ -1479,7 +1502,7 @@ impl SyntheticWorkSimulationResult {
 
         Ok(SyntheticPartitionedWorkPlan {
             target_partitions,
-            unknown_size_fallback_used: true,
+            unknown_size_fallback_used,
             partitions,
             wall_micros,
         })
@@ -2691,6 +2714,37 @@ mod tests {
                 .map(|partition| partition.size_bytes)
                 .sum::<u64>(),
             file_set.total_bytes()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_work_balances_zero_byte_files_by_file_count() -> Result<(), Box<dyn Error>> {
+        let workload_case = SyntheticWorkloadCase::zero_byte_files()?;
+        let file_set = &workload_case.file_set;
+        let work = SyntheticWorkSimulationProfile::s3_normal()
+            .simulate_file_set(file_set, DEFAULT_BENCHMARK_SEED)?;
+        let plan = work.partition_by_estimated_bytes(file_set, 16)?;
+
+        assert!(!plan.unknown_size_fallback_used);
+        assert_eq!(plan.partitions.len(), 16);
+        assert!(
+            plan.partitions
+                .iter()
+                .all(|partition| partition.file_count == 32)
+        );
+        assert!(
+            plan.partitions
+                .iter()
+                .all(|partition| partition.estimated_size_bytes == Some(0))
+        );
+        assert_eq!(
+            plan.partitions
+                .iter()
+                .map(|partition| partition.size_bytes)
+                .sum::<u64>(),
+            0
         );
 
         Ok(())
