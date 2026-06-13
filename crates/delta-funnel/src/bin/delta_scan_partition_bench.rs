@@ -210,6 +210,7 @@ impl SyntheticWorkloadCase {
             Self::partitioned_event_log_target_shape()?,
             Self::many_tiny_files()?,
             Self::mixed_tiny_large_files()?,
+            Self::highly_skewed_files()?,
         ])
     }
 
@@ -269,6 +270,25 @@ impl SyntheticWorkloadCase {
                 + LARGE_FILE_COUNT as u64 * LARGE_ROWS_PER_FILE,
             TINY_FILE_COUNT as u64 * TINY_BYTES_PER_FILE
                 + LARGE_FILE_COUNT as u64 * LARGE_BYTES_PER_FILE,
+            &files,
+        )
+    }
+
+    fn highly_skewed_files() -> Result<Self, SyntheticGenerationError> {
+        const SMALL_FILE_COUNT: usize = 255;
+        const SMALL_ROWS_PER_FILE: u64 = 10_000;
+        const SMALL_BYTES_PER_FILE: u64 = MIB;
+        const HUGE_ROWS: u64 = 16_000_000;
+        const HUGE_BYTES: u64 = 2 * 1024 * MIB;
+
+        let mut files = Vec::with_capacity(SMALL_FILE_COUNT + 1);
+        files.push((HUGE_ROWS, HUGE_BYTES));
+        files.extend([(SMALL_ROWS_PER_FILE, SMALL_BYTES_PER_FILE); SMALL_FILE_COUNT]);
+
+        Self::explicit_files(
+            "highly_skewed_files",
+            HUGE_ROWS + SMALL_FILE_COUNT as u64 * SMALL_ROWS_PER_FILE,
+            HUGE_BYTES + SMALL_FILE_COUNT as u64 * SMALL_BYTES_PER_FILE,
             &files,
         )
     }
@@ -1814,11 +1834,12 @@ mod tests {
         let csv = String::from_utf8(output)?;
         let lines = csv.lines().collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), 376);
+        assert_eq!(lines.len(), 501);
         assert!(lines[0].starts_with("benchmark_schema_version,host_os,host_arch"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
+        assert!(csv.contains(",highly_skewed_files,"));
         assert!(!csv.contains(",empty_scan,"));
         assert!(!csv.contains(",one_file,"));
         assert!(!csv.contains(",few_medium_files,"));
@@ -1861,7 +1882,8 @@ mod tests {
             [
                 "partitioned_event_log_target_shape",
                 "many_tiny_files",
-                "mixed_tiny_large_files"
+                "mixed_tiny_large_files",
+                "highly_skewed_files"
             ]
         );
         assert_eq!(workload_cases[1].file_set.files.len(), 4_096);
@@ -1869,6 +1891,15 @@ mod tests {
         assert_eq!(workload_cases[2].file_set.files.len(), 1_040);
         assert!(workload_cases[2].shape.active_data_size_bytes > 2 * 1024 * MIB);
         assert!(workload_cases[2].shape.average_file_size_bytes() > MIB);
+        assert_eq!(workload_cases[3].file_set.files.len(), 256);
+        assert_eq!(
+            workload_cases[3].file_set.files[0].size_bytes,
+            2 * 1024 * MIB
+        );
+        assert!(
+            workload_cases[3].file_set.files[0].size_bytes
+                > workload_cases[3].shape.average_file_size_bytes()
+        );
         assert!(
             workload_cases
                 .iter()
@@ -2404,7 +2435,7 @@ mod tests {
                 available_parallelism: Some(16),
             },
             workload_case: "test-workload",
-            workload_case_count: 3,
+            workload_case_count: 4,
             simulation_profile_count: SyntheticWorkSimulationProfile::standard_profiles().len(),
             simulation,
             policy_case: case,
@@ -2418,7 +2449,7 @@ mod tests {
         assert_eq!(row[1], "test-os");
         assert_eq!(row[2], "test-arch");
         assert_eq!(row[3], "16");
-        assert_eq!(row[4], "3");
+        assert_eq!(row[4], "4");
         assert_eq!(row[5], "test-workload");
         assert_eq!(row[26], "default_policy");
         assert_eq!(row[33], "16");
