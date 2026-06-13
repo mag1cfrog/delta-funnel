@@ -862,6 +862,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequential_stream_drop_stops_future_file_scheduling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = RealParquetDeltaTable::new_default("stream-drop-read-schema")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let sync_read_limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let reader = Arc::new(FakePartitionFileReader {
+            read_count: Arc::clone(&read_count),
+            schema: Arc::clone(&schema),
+            fail_path: None,
+        });
+        let mut stream = super::sequential_scan_partition_stream(
+            schema,
+            reader,
+            scan.read_schema(),
+            vec![
+                fake_task("part-many-batches.parquet"),
+                fake_task("part-00001.parquet"),
+            ],
+            sync_read_limiter.partition_limiter(0)?,
+        );
+
+        let first = stream.next().await.ok_or("expected first batch")??;
+
+        assert_eq!(batch_ids(&first)?, vec![1]);
+        assert_eq!(read_count.load(Ordering::SeqCst), 1);
+
+        drop(stream);
+
+        for _ in 0..100 {
+            if sync_read_limiter.active_file_reads() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(read_count.load(Ordering::SeqCst), 1);
+        assert_eq!(sync_read_limiter.active_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sequential_stream_releases_file_permit_after_failure()
     -> Result<(), Box<dyn std::error::Error>> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
@@ -950,6 +1000,7 @@ mod tests {
 
             let ids = match request.task.path.as_str() {
                 "part-00000.parquet" => vec![vec![1], vec![2]],
+                "part-many-batches.parquet" => vec![vec![1], vec![2], vec![4]],
                 "part-00001.parquet" => vec![vec![3]],
                 path => {
                     return Err(crate::DeltaFunnelError::Config {
