@@ -4,15 +4,27 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::DeltaFunnelError;
 
-/// Provider-local limits for Delta scan read scheduling.
+/// Bounded scheduling options for one Delta DataFusion provider scan.
+///
+/// These limits apply to provider-scheduled physical Delta file reads. The
+/// current official-kernel sync fallback limits a conservative file-level
+/// handoff: reading one file and sending its batches into the bounded
+/// DataFusion output channel. A native async reader should preserve these
+/// active-read semantics while enforcing them with an async semaphore-style
+/// limiter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DeltaProviderExecutionOptions {
-    /// Maximum provider file reads admitted across one physical scan.
-    pub(crate) read_parallelism: usize,
-    /// Maximum provider file reads admitted by one execution partition.
-    pub(crate) max_partition_read_parallelism: usize,
-    /// Maximum provider files that may be active or queued for one scan.
-    pub(crate) max_in_flight_files: usize,
+pub struct DeltaProviderScanExecutionOptions {
+    /// Maximum file-read handoffs that may run at once across the whole scan.
+    ///
+    /// This is the scan-wide concurrency cap shared by all DataFusion execution
+    /// partitions for one provider scan.
+    pub max_concurrent_file_reads_per_scan: usize,
+
+    /// Maximum file-read handoffs that one execution partition may own at once.
+    ///
+    /// This prevents a single DataFusion execution partition from consuming all
+    /// scan-wide read capacity when multiple scan partitions are active.
+    pub max_concurrent_file_reads_per_partition: usize,
 }
 
 /// Sync fallback limiter for provider-scheduled file work in one Delta scan.
@@ -22,7 +34,7 @@ pub(crate) struct DeltaProviderExecutionOptions {
 /// scheduling boundary with an async permit implementation such as a
 /// `tokio::sync::Semaphore`-backed limiter.
 pub(crate) struct DeltaProviderSyncReadLimiter {
-    options: DeltaProviderExecutionOptions,
+    options: DeltaProviderScanExecutionOptions,
     state: Mutex<DeltaProviderSyncReadLimiterState>,
     ready: Condvar,
 }
@@ -52,7 +64,10 @@ pub(crate) struct DeltaProviderSyncFileReadPermit {
 }
 
 impl DeltaProviderSyncReadLimiter {
-    pub(crate) fn new(options: DeltaProviderExecutionOptions, partition_count: usize) -> Arc<Self> {
+    pub(crate) fn new(
+        options: DeltaProviderScanExecutionOptions,
+        partition_count: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             options,
             state: Mutex::new(DeltaProviderSyncReadLimiterState {
@@ -138,13 +153,9 @@ impl DeltaProviderSyncReadLimiter {
     }
 
     fn can_acquire(&self, state: &DeltaProviderSyncReadLimiterState, partition: usize) -> bool {
-        let global_limit = self
-            .options
-            .read_parallelism
-            .min(self.options.max_in_flight_files);
-        state.active_file_reads < global_limit
+        state.active_file_reads < self.options.max_concurrent_file_reads_per_scan
             && state.partition_active_file_reads[partition]
-                < self.options.max_partition_read_parallelism
+                < self.options.max_concurrent_file_reads_per_partition
     }
 
     fn lock_state(&self) -> MutexGuard<'_, DeltaProviderSyncReadLimiterState> {
@@ -185,39 +196,39 @@ impl Drop for DeltaProviderSyncFileReadPermit {
     }
 }
 
-impl Default for DeltaProviderExecutionOptions {
+impl Default for DeltaProviderScanExecutionOptions {
     fn default() -> Self {
         Self {
-            read_parallelism: 1,
-            max_partition_read_parallelism: 1,
-            max_in_flight_files: 1,
+            max_concurrent_file_reads_per_scan: 1,
+            max_concurrent_file_reads_per_partition: 1,
         }
     }
 }
 
-impl DeltaProviderExecutionOptions {
-    #[allow(dead_code)]
-    pub(crate) fn try_new(
-        read_parallelism: usize,
-        max_partition_read_parallelism: usize,
-        max_in_flight_files: usize,
+impl DeltaProviderScanExecutionOptions {
+    /// Builds validated Delta provider scan execution options.
+    pub fn try_new(
+        max_concurrent_file_reads_per_scan: usize,
+        max_concurrent_file_reads_per_partition: usize,
     ) -> Result<Self, DeltaFunnelError> {
         let options = Self {
-            read_parallelism,
-            max_partition_read_parallelism,
-            max_in_flight_files,
+            max_concurrent_file_reads_per_scan,
+            max_concurrent_file_reads_per_partition,
         };
         options.validate()?;
         Ok(options)
     }
 
-    pub(crate) fn validate(&self) -> Result<(), DeltaFunnelError> {
-        validate_positive("read_parallelism", self.read_parallelism)?;
+    /// Validates provider scan execution bounds before registration or scan execution.
+    pub fn validate(&self) -> Result<(), DeltaFunnelError> {
         validate_positive(
-            "max_partition_read_parallelism",
-            self.max_partition_read_parallelism,
+            "max_concurrent_file_reads_per_scan",
+            self.max_concurrent_file_reads_per_scan,
         )?;
-        validate_positive("max_in_flight_files", self.max_in_flight_files)?;
+        validate_positive(
+            "max_concurrent_file_reads_per_partition",
+            self.max_concurrent_file_reads_per_partition,
+        )?;
         Ok(())
     }
 }
@@ -234,52 +245,41 @@ fn validate_positive(name: &'static str, value: usize) -> Result<(), DeltaFunnel
 
 #[cfg(test)]
 mod tests {
-    use super::{DeltaProviderExecutionOptions, DeltaProviderSyncReadLimiter};
+    use super::{DeltaProviderScanExecutionOptions, DeltaProviderSyncReadLimiter};
 
     #[test]
     fn default_execution_options_are_valid() -> Result<(), Box<dyn std::error::Error>> {
-        DeltaProviderExecutionOptions::default().validate()?;
+        DeltaProviderScanExecutionOptions::default().validate()?;
 
         Ok(())
     }
 
     #[test]
-    fn execution_options_reject_zero_read_parallelism() {
-        let error = DeltaProviderExecutionOptions::try_new(0, 1, 1)
-            .expect_err("zero read_parallelism must fail");
+    fn execution_options_reject_zero_max_concurrent_file_reads_per_scan() {
+        let error = DeltaProviderScanExecutionOptions::try_new(0, 1)
+            .expect_err("zero max_concurrent_file_reads_per_scan must fail");
 
         assert_eq!(
             error.to_string(),
-            "configuration error: read_parallelism must be greater than zero"
+            "configuration error: max_concurrent_file_reads_per_scan must be greater than zero"
         );
     }
 
     #[test]
-    fn execution_options_reject_zero_partition_read_parallelism() {
-        let error = DeltaProviderExecutionOptions::try_new(1, 0, 1)
-            .expect_err("zero max_partition_read_parallelism must fail");
+    fn execution_options_reject_zero_max_concurrent_file_reads_per_partition() {
+        let error = DeltaProviderScanExecutionOptions::try_new(1, 0)
+            .expect_err("zero max_concurrent_file_reads_per_partition must fail");
 
         assert_eq!(
             error.to_string(),
-            "configuration error: max_partition_read_parallelism must be greater than zero"
-        );
-    }
-
-    #[test]
-    fn execution_options_reject_zero_in_flight_files() {
-        let error = DeltaProviderExecutionOptions::try_new(1, 1, 0)
-            .expect_err("zero max_in_flight_files must fail");
-
-        assert_eq!(
-            error.to_string(),
-            "configuration error: max_in_flight_files must be greater than zero"
+            "configuration error: max_concurrent_file_reads_per_partition must be greater than zero"
         );
     }
 
     #[test]
     fn sync_file_permit_releases_on_drop() -> Result<(), Box<dyn std::error::Error>> {
         let limiter =
-            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::default(), 1);
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
         let partition = limiter.partition_limiter(0)?;
 
         let permit = partition.acquire_file_permit();
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn sync_file_permit_rejects_out_of_range_partition() -> Result<(), Box<dyn std::error::Error>> {
         let limiter =
-            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::default(), 1);
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
         let error = match limiter.partition_limiter(1) {
             Ok(_) => return Err("out of range partition must fail".into()),
             Err(error) => error,
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn sync_file_permit_respects_global_cap() -> Result<(), Box<dyn std::error::Error>> {
         let limiter =
-            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::try_new(1, 1, 1)?, 2);
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::try_new(1, 1)?, 2);
         let first_partition = limiter.partition_limiter(0)?;
         let second_partition = limiter.partition_limiter(1)?;
 
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn sync_file_permit_respects_partition_cap() -> Result<(), Box<dyn std::error::Error>> {
         let limiter =
-            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::try_new(2, 1, 2)?, 2);
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::try_new(2, 1)?, 2);
         let first_partition = limiter.partition_limiter(0)?;
         let second_partition = limiter.partition_limiter(1)?;
 
@@ -355,24 +355,6 @@ mod tests {
 
         drop(first_permit);
         drop(second_permit);
-
-        assert_eq!(limiter.active_file_reads(), 0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn sync_file_permit_respects_in_flight_file_cap() -> Result<(), Box<dyn std::error::Error>> {
-        let limiter =
-            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::try_new(2, 2, 1)?, 2);
-        let first_partition = limiter.partition_limiter(0)?;
-        let second_partition = limiter.partition_limiter(1)?;
-
-        let first_permit = first_partition.acquire_file_permit();
-
-        assert!(second_partition.try_acquire_file_permit().is_none());
-
-        drop(first_permit);
 
         assert_eq!(limiter.active_file_reads(), 0);
 

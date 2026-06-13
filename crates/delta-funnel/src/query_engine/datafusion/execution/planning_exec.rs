@@ -24,7 +24,7 @@ use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
 use super::file_reader::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
 use super::scheduling::{
-    DeltaProviderExecutionOptions, DeltaProviderSyncPartitionReadLimiter,
+    DeltaProviderScanExecutionOptions, DeltaProviderSyncPartitionReadLimiter,
     DeltaProviderSyncReadLimiter,
 };
 
@@ -32,7 +32,7 @@ pub(crate) struct DeltaScanPlanningExec {
     scan_plan: ProviderScanPlan,
     partition_plan: DeltaScanFileTaskPartitionPlan,
     partition_target_decision: DeltaScanPartitionTargetDecision,
-    execution_options: DeltaProviderExecutionOptions,
+    execution_options: DeltaProviderScanExecutionOptions,
     sync_read_limiter: Arc<DeltaProviderSyncReadLimiter>,
     properties: Arc<PlanProperties>,
 }
@@ -42,7 +42,7 @@ impl DeltaScanPlanningExec {
         scan_plan: ProviderScanPlan,
         partition_plan: DeltaScanFileTaskPartitionPlan,
         partition_target_decision: DeltaScanPartitionTargetDecision,
-        execution_options: DeltaProviderExecutionOptions,
+        execution_options: DeltaProviderScanExecutionOptions,
     ) -> Self {
         // Empty Delta scans keep the grouped plan's zero partitions. DataFusion
         // accepts this at physical planning time, and it avoids inventing empty
@@ -85,7 +85,7 @@ impl DeltaScanPlanningExec {
     }
 
     #[cfg(test)]
-    pub(crate) fn execution_options(&self) -> DeltaProviderExecutionOptions {
+    pub(crate) fn execution_options(&self) -> DeltaProviderScanExecutionOptions {
         self.execution_options
     }
 }
@@ -277,7 +277,8 @@ mod tests {
 
     use super::super::file_reader::{DeltaFileReadRequest, DeltaFileReadResult};
     use super::{
-        DeltaProviderExecutionOptions, DeltaProviderSyncReadLimiter, DeltaScanPartitionFileReader,
+        DeltaProviderScanExecutionOptions, DeltaProviderSyncReadLimiter,
+        DeltaScanPartitionFileReader,
     };
     use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
@@ -314,7 +315,7 @@ mod tests {
         assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0]));
         assert_eq!(
             scans[0].execution_options(),
-            super::DeltaProviderExecutionOptions::default()
+            super::DeltaProviderScanExecutionOptions::default()
         );
 
         Ok(())
@@ -790,7 +791,7 @@ mod tests {
             fail_path: None,
         });
         let sync_read_limiter =
-            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::default(), 1);
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
         let mut stream = super::sequential_scan_partition_stream(
             schema,
             reader,
@@ -838,7 +839,7 @@ mod tests {
         })?;
         let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
         let sync_read_limiter =
-            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::default(), 1);
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
         let reader = Arc::new(FakePartitionFileReader {
             read_count: Arc::new(AtomicUsize::new(0)),
             schema: Arc::clone(&schema),
@@ -872,7 +873,7 @@ mod tests {
         })?;
         let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
         let sync_read_limiter =
-            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::default(), 1);
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
         let reader = Arc::new(FakePartitionFileReader {
             read_count: Arc::new(AtomicUsize::new(0)),
             schema: Arc::clone(&schema),

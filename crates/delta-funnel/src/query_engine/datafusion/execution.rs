@@ -6,4 +6,4 @@ mod planning_exec;
 pub(crate) mod scheduling;
 
 pub(crate) use planning_exec::DeltaScanPlanningExec;
-pub(crate) use scheduling::DeltaProviderExecutionOptions;
+pub use scheduling::DeltaProviderScanExecutionOptions;

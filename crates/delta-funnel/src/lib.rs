@@ -17,12 +17,14 @@ mod table_formats;
 
 pub use error::DeltaFunnelError;
 pub use query_engine::{
-    DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
-    DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+    DeltaProviderScanExecutionOptions, DeltaScanPartitionTargetDiagnosticInput,
+    DeltaScanPartitionTargetDiagnosticOutput, DeltaScanPartitionTargetDiagnosticSource,
+    DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaTableProviderConfig,
     RegisteredDeltaSource, RegisteredDeltaSources,
     delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic, register_delta_sources,
+    register_delta_sources_with_scan_execution_options,
 };
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, PlannedDeltaSource, ProtocolPreflight,
