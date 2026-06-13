@@ -20,7 +20,7 @@ const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
 const BENCHMARK_SCHEMA_VERSION: u32 = 1;
-const BENCHMARK_CSV_HEADER: [&str; 42] = [
+const BENCHMARK_CSV_HEADER: [&str; 51] = [
     "benchmark_schema_version",
     "host_os",
     "host_arch",
@@ -63,6 +63,15 @@ const BENCHMARK_CSV_HEADER: [&str; 42] = [
     "simulated_max_file_micros",
     "simulated_output_partitions",
     "simulated_wall_micros",
+    "partition_files_p50",
+    "partition_files_p95",
+    "partition_files_max",
+    "partition_bytes_p50",
+    "partition_bytes_p95",
+    "partition_bytes_max",
+    "partition_work_micros_p50",
+    "partition_work_micros_p95",
+    "partition_work_imbalance_basis_points",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -450,6 +459,19 @@ struct SyntheticWorkPartition {
     rows: u64,
     size_bytes: u64,
     work_micros: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyntheticPartitionedWorkSummary {
+    files_p50: usize,
+    files_p95: usize,
+    files_max: usize,
+    bytes_p50: u64,
+    bytes_p95: u64,
+    bytes_max: u64,
+    work_micros_p50: u64,
+    work_micros_p95: u64,
+    work_imbalance_basis_points: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1281,6 +1303,46 @@ impl SyntheticWorkSimulationResult {
     }
 }
 
+impl SyntheticPartitionedWorkPlan {
+    fn summary(&self) -> SyntheticPartitionedWorkSummary {
+        let files = self
+            .partitions
+            .iter()
+            .map(|partition| partition.file_count as u64)
+            .collect::<Vec<_>>();
+        let bytes = self
+            .partitions
+            .iter()
+            .map(|partition| partition.size_bytes)
+            .collect::<Vec<_>>();
+        let work = self
+            .partitions
+            .iter()
+            .map(|partition| partition.work_micros)
+            .collect::<Vec<_>>();
+        let average_work = average_or_zero(work.iter().sum(), work.len());
+
+        SyntheticPartitionedWorkSummary {
+            files_p50: usize::try_from(percentile_nearest_rank(files.clone(), 50))
+                .unwrap_or(usize::MAX),
+            files_p95: usize::try_from(percentile_nearest_rank(files.clone(), 95))
+                .unwrap_or(usize::MAX),
+            files_max: usize::try_from(files.iter().copied().max().unwrap_or_default())
+                .unwrap_or(usize::MAX),
+            bytes_p50: percentile_nearest_rank(bytes.clone(), 50),
+            bytes_p95: percentile_nearest_rank(bytes.clone(), 95),
+            bytes_max: bytes.iter().copied().max().unwrap_or_default(),
+            work_micros_p50: percentile_nearest_rank(work.clone(), 50),
+            work_micros_p95: percentile_nearest_rank(work.clone(), 95),
+            work_imbalance_basis_points: if average_work == 0 {
+                0
+            } else {
+                self.wall_micros.saturating_mul(10_000) / average_work
+            },
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SyntheticWorkPartitionBuilder {
     file_count: usize,
@@ -1490,6 +1552,17 @@ fn average_files_per_partition_hundredths(file_count: usize, partition_count: us
     u16::try_from(hundredths).unwrap_or(u16::MAX)
 }
 
+fn percentile_nearest_rank(mut values: Vec<u64>, percentile: usize) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+
+    values.sort_unstable();
+    let bounded_percentile = percentile.clamp(1, 100);
+    let rank = (bounded_percentile * values.len()).div_ceil(100);
+    values[rank.saturating_sub(1)]
+}
+
 fn apportion_by_weights(total: u64, weights: &[u64]) -> Result<Vec<u64>, SyntheticGenerationError> {
     if weights.is_empty() {
         return Ok(Vec::new());
@@ -1593,6 +1666,7 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
     let file_set = input.file_set;
     let policy_case = input.policy_case;
     let policy_decision = input.policy_decision;
+    let partitioned_work_summary = input.partitioned_work.summary();
 
     vec![
         input.run_environment.schema_version.to_string(),
@@ -1655,6 +1729,17 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
         input.simulated_work.max_file_micros.to_string(),
         input.partitioned_work.partitions.len().to_string(),
         input.partitioned_work.wall_micros.to_string(),
+        partitioned_work_summary.files_p50.to_string(),
+        partitioned_work_summary.files_p95.to_string(),
+        partitioned_work_summary.files_max.to_string(),
+        partitioned_work_summary.bytes_p50.to_string(),
+        partitioned_work_summary.bytes_p95.to_string(),
+        partitioned_work_summary.bytes_max.to_string(),
+        partitioned_work_summary.work_micros_p50.to_string(),
+        partitioned_work_summary.work_micros_p95.to_string(),
+        partitioned_work_summary
+            .work_imbalance_basis_points
+            .to_string(),
     ]
 }
 
@@ -2191,6 +2276,14 @@ mod tests {
     }
 
     #[test]
+    fn percentile_nearest_rank_handles_empty_and_rounding() {
+        assert_eq!(percentile_nearest_rank(Vec::new(), 50), 0);
+        assert_eq!(percentile_nearest_rank(vec![10, 20, 30, 40], 50), 20);
+        assert_eq!(percentile_nearest_rank(vec![10, 20, 30, 40], 95), 40);
+        assert_eq!(percentile_nearest_rank(vec![10, 20, 30, 40], 100), 40);
+    }
+
+    #[test]
     fn partitioned_work_rejects_zero_target() -> Result<(), Box<dyn Error>> {
         let shape = SyntheticDeltaTableShape::partitioned_event_log();
         let file_set = shape.generate_file_set()?;
@@ -2263,6 +2356,15 @@ mod tests {
                 .enumerate()
                 .all(|(index, partition)| partition.partition_index == index)
         );
+
+        let summary = plan.summary();
+        assert!(summary.files_p50 > 0);
+        assert!(summary.files_p95 >= summary.files_p50);
+        assert!(summary.files_max >= summary.files_p95);
+        assert!(summary.bytes_p95 >= summary.bytes_p50);
+        assert!(summary.bytes_max >= summary.bytes_p95);
+        assert!(summary.work_micros_p95 >= summary.work_micros_p50);
+        assert!(summary.work_imbalance_basis_points >= 10_000);
 
         Ok(())
     }
@@ -2398,7 +2500,7 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 42);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 51);
         assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(BENCHMARK_CSV_HEADER[1], "host_os");
         assert_eq!(BENCHMARK_CSV_HEADER[2], "host_arch");
@@ -2412,6 +2514,11 @@ mod tests {
         assert_eq!(BENCHMARK_CSV_HEADER[30], "policy_unix_soft_fd_limit");
         assert_eq!(BENCHMARK_CSV_HEADER[33], "policy_target");
         assert_eq!(BENCHMARK_CSV_HEADER[34], "policy_source");
+        assert_eq!(BENCHMARK_CSV_HEADER[42], "partition_files_p50");
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[50],
+            "partition_work_imbalance_basis_points"
+        );
     }
 
     #[test]
@@ -2454,6 +2561,8 @@ mod tests {
         assert_eq!(row[26], "default_policy");
         assert_eq!(row[33], "16");
         assert_eq!(row[34], "available_parallelism_fallback");
+        assert!(!row[42].is_empty());
+        assert!(!row[50].is_empty());
 
         Ok(())
     }
