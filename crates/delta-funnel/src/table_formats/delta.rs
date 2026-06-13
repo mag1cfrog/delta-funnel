@@ -95,6 +95,7 @@ pub(crate) struct KernelScanFileStats {
 /// This preserves the kernel-owned deletion-vector descriptor for later
 /// execution without loading the deletion-vector payload.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) enum KernelScanDeletionVectorMetadata {
     /// The selected file has no deletion vector.
     NotPresent,
@@ -108,6 +109,7 @@ pub(crate) enum KernelScanDeletionVectorMetadata {
 /// accidentally load the deletion-vector payload. Execution code can add a
 /// narrow accessor when deletion-vector reads are implemented.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct KernelScanDeletionVectorHandle {
     /// Kernel deletion-vector metadata for the selected file.
     dv_info: kernel::DvInfo,
@@ -143,6 +145,7 @@ impl KernelScanDeletionVectorMetadata {
 /// The transform is applied only after physical Parquet data has been read,
 /// which belongs to provider execution rather than metadata expansion.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) enum KernelPhysicalToLogicalTransform {
     /// The physical Parquet file already matches the logical scan shape.
     NotRequired,
@@ -155,6 +158,7 @@ pub(crate) enum KernelPhysicalToLogicalTransform {
 /// The expression is metadata for later execution. It is not evaluated while
 /// expanding scan metadata.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct KernelPhysicalToLogicalTransformHandle {
     /// Kernel expression that maps physical file data into logical scan data.
     transform: kernel::ExpressionRef,

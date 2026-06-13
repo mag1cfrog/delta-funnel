@@ -15,6 +15,7 @@ use super::{KernelPhysicalToLogicalTransform, kernel};
 
 /// Kernel scan schema state required to read physical Parquet data.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct KernelScanReadSchema {
     physical_schema: kernel::KernelSchemaRef,
     logical_schema: kernel::KernelSchemaRef,

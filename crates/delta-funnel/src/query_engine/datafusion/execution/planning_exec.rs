@@ -4,18 +4,24 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
+use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, Partitioning,
     PlanProperties, SendableRecordBatchStream,
 };
 
+use crate::table_formats::KernelScanReadSchema;
+
+use super::super::planning::file_task::DeltaScanFileTask;
 use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
+use super::file_reader::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
 
 pub(crate) struct DeltaScanPlanningExec {
     scan_plan: ProviderScanPlan,
@@ -158,14 +164,58 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             ))));
         }
 
-        Err(DataFusionError::Execution(
-            "Delta scan sequential file execution is not implemented yet for #139".to_owned(),
+        let file_reader = DeltaFileReader::try_new(DeltaFileReaderConfig {
+            source_name: &self.scan_plan.source_name,
+            table_uri: &self.scan_plan.table_uri,
+            snapshot_version: self.scan_plan.snapshot_version,
+        })
+        .map_err(DataFusionError::from)?;
+        let read_schema = self.scan_plan.kernel_scan().read_schema();
+        let file_tasks = scan_partition.file_tasks.clone();
+
+        Ok(sequential_scan_partition_stream(
+            Arc::clone(&self.scan_plan.projected_schema),
+            file_reader,
+            read_schema,
+            file_tasks,
         ))
     }
 }
 
+fn sequential_scan_partition_stream(
+    schema: SchemaRef,
+    file_reader: DeltaFileReader,
+    read_schema: KernelScanReadSchema,
+    file_tasks: Vec<DeltaScanFileTask>,
+) -> SendableRecordBatchStream {
+    let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
+    let output = builder.tx();
+
+    builder.spawn_blocking(move || {
+        for task in file_tasks {
+            let file_result = file_reader
+                .read_file(DeltaFileReadRequest {
+                    task: &task,
+                    read_schema: &read_schema,
+                })
+                .map_err(DataFusionError::from)?;
+
+            for batch in file_result {
+                if output.blocking_send(Ok(batch)).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    builder.build()
+}
+
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
 
@@ -173,9 +223,9 @@ mod tests {
         DeltaTableProviderConfig, register_delta_sources,
     };
     use crate::query_engine::datafusion::test_support::{
-        DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, PARTITIONED_SCHEMA_FIELDS_JSON,
-        find_delta_scan_plans, register_fixture_source,
+        DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, find_delta_scan_plans, register_fixture_source,
     };
+    use crate::table_formats::RealParquetDeltaTable;
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
     #[tokio::test]
@@ -261,82 +311,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_empty_execution_stops_at_sequential_file_stream_todo()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn sequential_execution_reads_real_delta_file() -> Result<(), Box<dyn std::error::Error>>
+    {
         let ctx = SessionContext::new();
-        let _table = register_fixture_source(&ctx, "orders", "sequential-file-stream-todo")?;
-
-        let dataframe = ctx.sql("select * from orders").await?;
-        let result = dataframe.collect().await;
-
-        assert!(matches!(
-            result,
-            Err(error) if error
-                .to_string()
-                .contains("Delta scan sequential file execution is not implemented yet for #139")
-        ));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn exact_partition_filter_execution_still_stops_at_sequential_file_stream_todo()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let ctx = SessionContext::new();
-        let table = DeltaLogTable::new_with_schema(
-            "sequential-file-stream-todo-exact-partition-filter",
-            PARTITIONED_SCHEMA_FIELDS_JSON,
-            r#"["region"]"#,
-            r#""partitionValues":{"region":"us-west"}"#,
-        )?;
-        let source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: table.path().to_string_lossy().to_string(),
-            version: None,
-        })?;
-        let preflight = preflight_delta_protocol(&source)?;
-        register_delta_sources(
-            &ctx,
-            vec![DeltaTableProviderConfig {
-                source,
-                protocol: preflight,
-                scan_target_partitions: None,
-            }],
-        )?;
+        let _table =
+            register_real_parquet_source(&ctx, "orders", "sequential-execution-real-read")?;
 
         let dataframe = ctx
-            .sql("select id from orders where region = 'us-west'")
+            .sql("select id, customer_name from orders order by id")
             .await?;
-        let result = dataframe.collect().await;
+        let result = dataframe.collect().await?;
+        let formatted = pretty_format_batches(&result)?.to_string();
 
-        assert!(matches!(
-            result,
-            Err(error) if error
-                .to_string()
-                .contains("Delta scan sequential file execution is not implemented yet for #139")
-        ));
+        assert_eq!(
+            formatted,
+            [
+                "+----+---------------+",
+                "| id | customer_name |",
+                "+----+---------------+",
+                "| 1  | alice         |",
+                "| 2  | bob           |",
+                "| 3  |               |",
+                "+----+---------------+",
+            ]
+            .join("\n")
+        );
 
         Ok(())
     }
 
-    #[tokio::test]
-    async fn mixed_partition_filter_execution_still_stops_at_sequential_file_stream_todo()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let ctx = SessionContext::new();
-        let table = DeltaLogTable::new_with_schema(
-            "sequential-file-stream-todo-mixed-partition-filter",
-            PARTITIONED_SCHEMA_FIELDS_JSON,
-            r#"["region"]"#,
-            r#""partitionValues":{"region":"us-west"}"#,
-        )?;
+    fn register_real_parquet_source(
+        ctx: &SessionContext,
+        source_name: &str,
+        fixture_name: &str,
+    ) -> Result<RealParquetDeltaTable, Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default(fixture_name)?;
         let source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
+            name: source_name.to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(
-            &ctx,
+            ctx,
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
@@ -344,31 +361,6 @@ mod tests {
             }],
         )?;
 
-        let sql = "select id from orders where region = 'us-west' and id > 1";
-        let plan_dataframe = ctx.sql(sql).await?;
-        let physical_plan = plan_dataframe.create_physical_plan().await?;
-        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
-            .indent(true)
-            .to_string();
-        let mut scans = Vec::new();
-        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
-
-        assert!(plan_display.contains("FilterExec"), "{plan_display}");
-        assert_eq!(scans.len(), 1);
-        assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
-        assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
-        assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
-
-        let collect_dataframe = ctx.sql(sql).await?;
-        let result = collect_dataframe.collect().await;
-
-        assert!(matches!(
-            result,
-            Err(error) if error
-                .to_string()
-                .contains("Delta scan sequential file execution is not implemented yet for #139")
-        ));
-
-        Ok(())
+        Ok(table)
     }
 }

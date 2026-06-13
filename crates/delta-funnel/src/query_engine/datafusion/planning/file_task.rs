@@ -16,6 +16,7 @@ use crate::{
 /// remain individually inspectable because Delta correctness metadata belongs
 /// to each physical file.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct DeltaScanFileTask {
     /// DataFusion table name for this source.
     pub(crate) source_name: String,
@@ -43,6 +44,7 @@ pub(crate) struct DeltaScanFileTask {
 
 /// Parsed statistics carried by one Delta scan file task.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct DeltaScanFileStats {
     /// Number of records from Delta Kernel parsed stats.
     pub(crate) num_records: Option<u64>,
