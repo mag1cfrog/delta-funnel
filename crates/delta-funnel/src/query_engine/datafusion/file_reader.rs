@@ -350,6 +350,31 @@ mod tests {
     }
 
     #[test]
+    fn file_reader_splits_deletion_vector_mask_across_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_rows("file-reader-dv-multi-batch", 1003)?;
+        let source = load_source("orders", &table)?;
+        let scan = build_projected_delta_scan(&source, None)?;
+        let read_schema = scan.read_schema();
+        let mut task = first_file_task(&source, &scan)?;
+        set_task_deletion_vector(&mut task, &table, &[0, 999, 1002])?;
+        let reader = test_reader(&source)?;
+        let result = reader.read_file(DeltaFileReadRequest {
+            task: &task,
+            read_schema: &read_schema,
+        })?;
+        let ids = collect_ids(&result.batches)?;
+        let expected = (1..=1003)
+            .filter(|id| ![1, 1000, 1003].contains(id))
+            .collect::<Vec<_>>();
+
+        assert!(result.batches.len() > 1);
+        assert_eq!(ids, expected);
+
+        Ok(())
+    }
+
+    #[test]
     fn file_reader_emits_empty_batch_when_all_rows_deleted()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("file-reader-dv-all-deleted")?;
