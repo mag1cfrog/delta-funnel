@@ -26,8 +26,10 @@ use crate::{
 };
 
 use super::execution::DeltaScanPlanningExec;
-use super::file_task_partition::DeltaScanFileTaskPartitionOptions;
 use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
+use super::partition_target::{
+    DeltaScanPartitionTargetConfig, DeltaScanPartitionTargetContext, DeltaScanPartitionTargetPolicy,
+};
 use super::projection::{ProjectionPlan, plan_projection};
 use super::registration::reject_mismatched_preflight;
 use super::scan_plan::{ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest};
@@ -36,12 +38,21 @@ pub(crate) struct DeltaTableProvider {
     source: PlannedDeltaSource,
     protocol: DeltaProtocolReport,
     schema: SchemaRef,
+    scan_target_partitions: Option<usize>,
 }
 
 impl DeltaTableProvider {
     pub(crate) fn try_new(
         source: PlannedDeltaSource,
         preflight: ProtocolPreflight,
+    ) -> Result<Self, DeltaFunnelError> {
+        Self::try_new_with_scan_target_partitions(source, preflight, None)
+    }
+
+    pub(crate) fn try_new_with_scan_target_partitions(
+        source: PlannedDeltaSource,
+        preflight: ProtocolPreflight,
+        scan_target_partitions: Option<usize>,
     ) -> Result<Self, DeltaFunnelError> {
         reject_mismatched_preflight(&source, preflight.protocol())?;
         let schema = delta_source_arrow_schema(&source)?;
@@ -50,6 +61,7 @@ impl DeltaTableProvider {
             source,
             protocol: preflight.into_protocol(),
             schema,
+            scan_target_partitions,
         })
     }
 
@@ -408,14 +420,24 @@ impl TableProvider for DeltaTableProvider {
             requested_projection: projection.cloned(),
             pushed_filters: filters.to_vec(),
         })?;
-        let partition_plan =
-            scan_plan.plan_file_task_partitions(DeltaScanFileTaskPartitionOptions {
-                target_partitions: state.config().target_partitions(),
-            })?;
+        let partition_target_decision = DeltaScanPartitionTargetPolicy::default().derive_target(
+            DeltaScanPartitionTargetContext {
+                source_name: &scan_plan.source_name,
+                table_uri: &scan_plan.table_uri,
+                snapshot_version: scan_plan.snapshot_version,
+            },
+            DeltaScanPartitionTargetConfig::from_scan_targets(
+                state.config().target_partitions(),
+                self.scan_target_partitions,
+            ),
+        )?;
+        let partition_plan = scan_plan
+            .plan_file_task_partitions(partition_target_decision.file_task_partition_options())?;
 
         Ok(Arc::new(DeltaScanPlanningExec::new(
             scan_plan,
             partition_plan,
+            partition_target_decision,
         )))
     }
 

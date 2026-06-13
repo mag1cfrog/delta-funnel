@@ -5,14 +5,20 @@ use datafusion::common::DataFusionError;
 use crate::DeltaFunnelError;
 
 mod execution;
+mod execution_environment;
 mod file_task;
 mod file_task_partition;
 mod filters;
+mod partition_target;
 mod projection;
 mod provider;
 mod registration;
 mod scan_plan;
 
+pub use partition_target::{
+    DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
+    DeltaScanPartitionTargetDiagnosticSource, derive_delta_scan_partition_target_diagnostic,
+};
 pub use registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources, register_delta_sources,
 };
@@ -220,6 +226,7 @@ mod test_support {
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
+                scan_target_partitions: None,
             }],
         )?;
 

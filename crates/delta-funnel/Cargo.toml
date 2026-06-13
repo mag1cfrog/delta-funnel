@@ -25,7 +25,11 @@ delta_kernel = { version = "0.23.0", default-features = false, features = [
     "default-engine-native-tls",
     "internal-api",
 ] }
+libc = "0.2"
 snafu = "0.9"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }

@@ -3,5 +3,7 @@
 pub(crate) mod datafusion;
 
 pub use datafusion::{
-    DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources, register_delta_sources,
+    DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
+    DeltaScanPartitionTargetDiagnosticSource, DeltaTableProviderConfig, RegisteredDeltaSource,
+    RegisteredDeltaSources, derive_delta_scan_partition_target_diagnostic, register_delta_sources,
 };
