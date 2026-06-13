@@ -15,6 +15,7 @@ use super::{KernelPhysicalToLogicalTransform, kernel};
 
 /// Kernel scan schema state required to read physical Parquet data.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct KernelScanReadSchema {
     physical_schema: kernel::KernelSchemaRef,
     logical_schema: kernel::KernelSchemaRef,
@@ -53,6 +54,13 @@ impl KernelScanReadSchema {
     #[must_use]
     pub(crate) fn physical_predicate(&self) -> Option<&kernel::PredicateRef> {
         self.physical_predicate.as_ref()
+    }
+
+    /// Whether this scan schema carries a kernel physical predicate.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn has_physical_predicate(&self) -> bool {
+        self.physical_predicate.is_some()
     }
 }
 

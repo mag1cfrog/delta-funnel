@@ -4,18 +4,25 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::common::{DataFusionError, Result as DataFusionResult, not_impl_err};
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
+use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, Partitioning,
+    PlanProperties, SendableRecordBatchStream,
 };
 
+use crate::DeltaFunnelError;
+use crate::table_formats::KernelScanReadSchema;
+
+use super::super::planning::file_task::DeltaScanFileTask;
 use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
+use super::file_reader::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
 
 pub(crate) struct DeltaScanPlanningExec {
     scan_plan: ProviderScanPlan,
@@ -142,23 +149,114 @@ impl ExecutionPlan for DeltaScanPlanningExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        not_impl_err!("Delta scan partition planning is complete; read execution is owned by #4")
+        let Some(scan_partition) = self.partition_plan.partitions.get(partition) else {
+            return Err(DataFusionError::Execution(format!(
+                "Delta scan execution partition {partition} is out of range for {} planned partitions",
+                self.partition_plan.partitions.len()
+            )));
+        };
+
+        if scan_partition.file_tasks.is_empty() {
+            return Ok(Box::pin(EmptyRecordBatchStream::new(Arc::clone(
+                &self.scan_plan.projected_schema,
+            ))));
+        }
+
+        let file_reader: Arc<dyn DeltaScanPartitionFileReader> = Arc::new(
+            DeltaFileReader::try_new(DeltaFileReaderConfig {
+                source_name: &self.scan_plan.source_name,
+                table_uri: &self.scan_plan.table_uri,
+                snapshot_version: self.scan_plan.snapshot_version,
+            })
+            .map_err(DataFusionError::from)?,
+        );
+        let read_schema = self.scan_plan.kernel_scan().read_schema();
+        let file_tasks = scan_partition.file_tasks.clone();
+
+        Ok(sequential_scan_partition_stream(
+            Arc::clone(&self.scan_plan.projected_schema),
+            file_reader,
+            read_schema,
+            file_tasks,
+        ))
     }
+}
+
+trait DeltaScanPartitionFileReader: Send + Sync {
+    fn read_file(
+        &self,
+        request: DeltaFileReadRequest<'_>,
+    ) -> Result<super::file_reader::DeltaFileReadResult, DeltaFunnelError>;
+}
+
+impl DeltaScanPartitionFileReader for DeltaFileReader {
+    fn read_file(
+        &self,
+        request: DeltaFileReadRequest<'_>,
+    ) -> Result<super::file_reader::DeltaFileReadResult, DeltaFunnelError> {
+        Self::read_file(self, request)
+    }
+}
+
+fn sequential_scan_partition_stream(
+    schema: SchemaRef,
+    file_reader: Arc<dyn DeltaScanPartitionFileReader>,
+    read_schema: KernelScanReadSchema,
+    file_tasks: Vec<DeltaScanFileTask>,
+) -> SendableRecordBatchStream {
+    let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
+    let output = builder.tx();
+
+    builder.spawn_blocking(move || {
+        for task in file_tasks {
+            let file_result = file_reader
+                .read_file(DeltaFileReadRequest {
+                    task: &task,
+                    read_schema: &read_schema,
+                })
+                .map_err(DataFusionError::from)?;
+
+            for batch in file_result {
+                if output.blocking_send(Ok(batch)).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    builder.build()
 }
 
 #[cfg(test)]
 mod tests {
-    use datafusion::prelude::SessionContext;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use datafusion::arrow::array::{Array, Int32Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::SessionContext;
+    use futures_util::StreamExt;
+
+    use super::super::file_reader::{DeltaFileReadRequest, DeltaFileReadResult};
+    use super::DeltaScanPartitionFileReader;
     use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
     };
+    use crate::query_engine::datafusion::planning::file_task::DeltaScanFileTask;
     use crate::query_engine::datafusion::test_support::{
-        DeltaLogTable, PARTITIONED_SCHEMA_FIELDS_JSON, find_delta_scan_plans,
-        register_fixture_source,
+        DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, find_delta_scan_plans, register_fixture_source,
+    };
+    use crate::table_formats::{
+        KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata, RealParquetDeltaTable,
     };
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
@@ -188,34 +286,233 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execution_fails_at_deliberate_delta_scan_stub()
+    async fn execution_returns_no_rows_for_empty_delta_scan()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
-        let _table = register_fixture_source(&ctx, "orders", "execution-stub")?;
+        let table = DeltaLogTable::new_with_schema_and_adds(
+            "empty-execution",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
 
         let dataframe = ctx.sql("select * from orders").await?;
-        let result = dataframe.collect().await;
+        let result = dataframe.collect().await?;
+
+        assert!(result.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_rejects_out_of_range_partition() -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let _table = register_fixture_source(&ctx, "orders", "out-of-range-partition")?;
+
+        let dataframe = ctx.sql("select * from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        let scan = scans[0];
+        let out_of_range_partition = scan.partition_plan().partitions.len();
+
+        let result = scan.execute(out_of_range_partition, ctx.task_ctx());
 
         assert!(matches!(
             result,
-            Err(error) if error
-                .to_string()
-                .contains("Delta scan partition planning is complete; read execution is owned by #4")
+            Err(error) if error.to_string().contains(
+                "Delta scan execution partition 1 is out of range for 1 planned partitions"
+            )
         ));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn exact_partition_filter_execution_still_stops_at_scan_stub()
+    async fn sequential_execution_reads_real_delta_file() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let ctx = SessionContext::new();
+        let _table =
+            register_real_parquet_source(&ctx, "orders", "sequential-execution-real-read")?;
+
+        let dataframe = ctx
+            .sql("select id, customer_name from orders order by id")
+            .await?;
+        let result = dataframe.collect().await?;
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+----+---------------+",
+                "| id | customer_name |",
+                "+----+---------------+",
+                "| 1  | alice         |",
+                "| 2  | bob           |",
+                "| 3  |               |",
+                "+----+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projection_execution_emits_requested_columns() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let ctx = SessionContext::new();
+        let _table =
+            register_real_parquet_source(&ctx, "orders", "projection-execution-real-read")?;
+
+        let dataframe = ctx
+            .sql("select customer_name from orders order by customer_name nulls last")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![1]));
+
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        assert!(
+            result
+                .iter()
+                .all(|batch| batch.schema().fields().len() == 1)
+        );
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+---------------+",
+                "| customer_name |",
+                "+---------------+",
+                "| alice         |",
+                "| bob           |",
+                "|               |",
+                "+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn residual_filter_runs_above_provider_output() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let ctx = SessionContext::new();
+        let _table = register_real_parquet_source(&ctx, "orders", "residual-filter-real-read")?;
+
+        let dataframe = ctx
+            .sql("select id, customer_name from orders where customer_name like 'a%'")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+            0
+        );
+
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+----+---------------+",
+                "| id | customer_name |",
+                "+----+---------------+",
+                "| 1  | alice         |",
+                "+----+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grouped_partition_execution_reads_multiple_file_tasks()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
-        let table = DeltaLogTable::new_with_schema(
-            "execution-stub-exact-partition-filter",
-            PARTITIONED_SCHEMA_FIELDS_JSON,
-            r#"["region"]"#,
-            r#""partitionValues":{"region":"us-west"}"#,
+        let table = RealParquetDeltaTable::new_with_two_files("grouped-partition-real-read")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
         )?;
+
+        let dataframe = ctx
+            .sql("select id, customer_name from orders order by id")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].partition_plan().partitions.len(), 1);
+        assert_eq!(scans[0].partition_plan().partitions[0].file_tasks.len(), 2);
+
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+----+---------------+",
+                "| id | customer_name |",
+                "+----+---------------+",
+                "| 1  | file-a-1      |",
+                "| 2  | file-a-2      |",
+                "| 3  | file-b-3      |",
+                "| 4  | file-b-4      |",
+                "+----+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_vector_execution_filters_deleted_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table =
+            RealParquetDeltaTable::new_with_deletion_vector("dv-execution-real-read", &[1])?;
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
@@ -232,38 +529,188 @@ mod tests {
         )?;
 
         let dataframe = ctx
-            .sql("select id from orders where region = 'us-west'")
+            .sql("select id, customer_name from orders order by id")
             .await?;
-        let result = dataframe.collect().await;
+        let result = dataframe.collect().await?;
+        let formatted = pretty_format_batches(&result)?.to_string();
 
-        assert!(matches!(
-            result,
-            Err(error) if error
-                .to_string()
-                .contains("Delta scan partition planning is complete; read execution is owned by #4")
-        ));
+        assert_eq!(
+            formatted,
+            [
+                "+----+---------------+",
+                "| id | customer_name |",
+                "+----+---------------+",
+                "| 1  | alice         |",
+                "| 3  |               |",
+                "+----+---------------+",
+            ]
+            .join("\n")
+        );
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn mixed_partition_filter_execution_still_stops_at_scan_stub()
+    async fn sequential_stream_emits_before_exhausting_source()
     -> Result<(), Box<dyn std::error::Error>> {
-        let ctx = SessionContext::new();
-        let table = DeltaLogTable::new_with_schema(
-            "execution-stub-mixed-partition-filter",
-            PARTITIONED_SCHEMA_FIELDS_JSON,
-            r#"["region"]"#,
-            r#""partitionValues":{"region":"us-west"}"#,
-        )?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = RealParquetDeltaTable::new_default("incremental-stream-read-schema")?;
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
         })?;
+        let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
+        let read_schema = scan.read_schema();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(FakePartitionFileReader {
+            read_count: Arc::clone(&read_count),
+            schema: Arc::clone(&schema),
+        });
+        let mut stream = super::sequential_scan_partition_stream(
+            schema,
+            reader,
+            read_schema,
+            vec![
+                fake_task("part-00000.parquet"),
+                fake_task("part-00001.parquet"),
+            ],
+        );
+
+        let first = stream.next().await.ok_or("expected first batch")??;
+
+        assert_eq!(batch_ids(&first)?, vec![1]);
+        assert_eq!(
+            read_count.load(Ordering::SeqCst),
+            1,
+            "stream should yield the first batch before reading the second file"
+        );
+
+        let remaining = datafusion::physical_plan::common::collect(stream).await?;
+        let remaining_ids = remaining
+            .iter()
+            .map(batch_ids)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert_eq!(remaining_ids, vec![2, 3]);
+        assert_eq!(read_count.load(Ordering::SeqCst), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_execution_boundary_avoids_runtime_creation_and_sync_bridge() {
+        let checked_sources = [
+            (
+                "catalog/provider.rs",
+                include_str!("../catalog/provider.rs"),
+            ),
+            (
+                "execution/planning_exec.rs",
+                include_str!("planning_exec.rs"),
+            ),
+        ];
+        let forbidden_patterns = [
+            concat!("block", "_", "on"),
+            concat!("tokio", "::", "runtime"),
+            concat!("Runtime", "::", "new"),
+            concat!("Builder", "::", "new_current_thread"),
+            concat!("Builder", "::", "new_multi_thread"),
+        ];
+
+        for (source_path, source) in checked_sources {
+            for forbidden_pattern in forbidden_patterns {
+                assert!(
+                    !source.contains(forbidden_pattern),
+                    "{source_path} must not contain `{forbidden_pattern}`"
+                );
+            }
+        }
+    }
+
+    struct FakePartitionFileReader {
+        read_count: Arc<AtomicUsize>,
+        schema: datafusion::arrow::datatypes::SchemaRef,
+    }
+
+    impl DeltaScanPartitionFileReader for FakePartitionFileReader {
+        fn read_file(
+            &self,
+            request: DeltaFileReadRequest<'_>,
+        ) -> Result<DeltaFileReadResult, crate::DeltaFunnelError> {
+            self.read_count.fetch_add(1, Ordering::SeqCst);
+
+            let ids = match request.task.path.as_str() {
+                "part-00000.parquet" => vec![vec![1], vec![2]],
+                "part-00001.parquet" => vec![vec![3]],
+                path => {
+                    return Err(crate::DeltaFunnelError::Config {
+                        message: format!("unexpected fake file task `{path}`"),
+                    });
+                }
+            };
+            let batches = ids
+                .into_iter()
+                .map(|ids| id_batch(Arc::clone(&self.schema), ids))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| crate::DeltaFunnelError::Config {
+                    message: format!("fake batch construction failed: {error}"),
+                })?;
+
+            Ok(DeltaFileReadResult { batches })
+        }
+    }
+
+    fn fake_task(path: &str) -> DeltaScanFileTask {
+        DeltaScanFileTask {
+            source_name: "orders".to_owned(),
+            table_uri: "file:///tmp/table".to_owned(),
+            snapshot_version: 1,
+            path: path.to_owned(),
+            estimated_bytes: Some(1),
+            estimated_rows: Some(1),
+            modification_time_ms: Some(1),
+            partition_values: BTreeMap::new(),
+            stats: None,
+            deletion_vector: KernelScanDeletionVectorMetadata::NotPresent,
+            transform: KernelPhysicalToLogicalTransform::NotRequired,
+        }
+    }
+
+    fn id_batch(
+        schema: datafusion::arrow::datatypes::SchemaRef,
+        ids: Vec<i32>,
+    ) -> Result<RecordBatch, datafusion::arrow::error::ArrowError> {
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))])
+    }
+
+    fn batch_ids(batch: &RecordBatch) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected Int32Array")?;
+
+        Ok(ids.values().to_vec())
+    }
+
+    fn register_real_parquet_source(
+        ctx: &SessionContext,
+        source_name: &str,
+        fixture_name: &str,
+    ) -> Result<RealParquetDeltaTable, Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default(fixture_name)?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: source_name.to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(
-            &ctx,
+            ctx,
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
@@ -271,31 +718,6 @@ mod tests {
             }],
         )?;
 
-        let sql = "select id from orders where region = 'us-west' and id > 1";
-        let plan_dataframe = ctx.sql(sql).await?;
-        let physical_plan = plan_dataframe.create_physical_plan().await?;
-        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
-            .indent(true)
-            .to_string();
-        let mut scans = Vec::new();
-        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
-
-        assert!(plan_display.contains("FilterExec"), "{plan_display}");
-        assert_eq!(scans.len(), 1);
-        assert!(scans[0].scan_plan().kernel_partition_predicate.is_some());
-        assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
-        assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
-
-        let collect_dataframe = ctx.sql(sql).await?;
-        let result = collect_dataframe.collect().await;
-
-        assert!(matches!(
-            result,
-            Err(error) if error
-                .to_string()
-                .contains("Delta scan partition planning is complete; read execution is owned by #4")
-        ));
-
-        Ok(())
+        Ok(table)
     }
 }

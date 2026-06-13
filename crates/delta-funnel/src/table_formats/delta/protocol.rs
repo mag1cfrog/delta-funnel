@@ -9,10 +9,8 @@ use super::kernel::{
 };
 
 // Reader features are Delta correctness requirements. Add features only after
-// the provider path proves the relevant semantics. For example,
-// `deletionVectors` must remain rejected until rows are masked before reaching
-// DataFusion.
-const SUPPORTED_READER_FEATURES: &[&str] = &["timestampNtz"];
+// the provider path proves the relevant semantics before rows reach DataFusion.
+const SUPPORTED_READER_FEATURES: &[&str] = &["timestampNtz", "deletionVectors"];
 
 /// Protocol details for one named Delta source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,20 +318,15 @@ mod tests {
     }
 
     #[test]
-    fn preflight_rejects_deletion_vectors_before_execution_support()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn preflight_allows_deletion_vectors_reader_feature() -> Result<(), Box<dyn std::error::Error>>
+    {
         let source = load_source("orders", DELETION_VECTOR_PROTOCOL_JSON)?;
 
-        let result = preflight_delta_protocol(&source);
+        let preflight = preflight_delta_protocol(&source)?;
 
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::DeltaProtocolCompatibility {
-                source_name,
-                reason,
-                ..
-            }) if source_name == "orders" && reason.contains("deletionVectors")
-        ));
+        assert_eq!(preflight.protocol.min_reader_version, 3);
+        assert_eq!(preflight.protocol.reader_features, vec!["deletionVectors"]);
+        assert_eq!(preflight.protocol.writer_features, vec!["deletionVectors"]);
 
         Ok(())
     }
@@ -413,7 +406,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_source_preflight_reports_failing_source() -> Result<(), Box<dyn std::error::Error>> {
+    fn multi_source_preflight_allows_deletion_vectors_source()
+    -> Result<(), Box<dyn std::error::Error>> {
         let orders = DeltaLogTable::new("orders", LEGACY_PROTOCOL_JSON)?;
         let customers = DeltaLogTable::new("customers", DELETION_VECTOR_PROTOCOL_JSON)?;
         let sources = load_delta_sources([
@@ -421,16 +415,15 @@ mod tests {
             source_config("customers", &customers),
         ])?;
 
-        let result = preflight_delta_sources(&sources);
+        let preflights = preflight_delta_sources(&sources)?;
 
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::DeltaProtocolCompatibility {
-                source_name,
-                reason,
-                ..
-            }) if source_name == "customers" && reason.contains("deletionVectors")
-        ));
+        assert_eq!(preflights.len(), 2);
+        assert_eq!(preflights[0].protocol.source_name, "orders");
+        assert_eq!(preflights[1].protocol.source_name, "customers");
+        assert_eq!(
+            preflights[1].protocol.reader_features,
+            vec!["deletionVectors"]
+        );
 
         Ok(())
     }
@@ -492,7 +485,7 @@ mod tests {
             Err(DeltaFunnelError::DeltaProtocolCompatibility {
                 reason,
                 ..
-            }) if reason.contains("deletionVectors") && !reason.contains("madeUpFeature")
+            }) if reason.contains("madeUpFeature") && !reason.contains("deletionVectors")
         ));
     }
 
