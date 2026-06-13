@@ -20,11 +20,13 @@ const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
 const BENCHMARK_SCHEMA_VERSION: u32 = 1;
-const BENCHMARK_CSV_HEADER: [&str; 53] = [
+const DEFAULT_BENCHMARK_SEED: u64 = 0;
+const BENCHMARK_CSV_HEADER: [&str; 54] = [
     "benchmark_schema_version",
     "host_os",
     "host_arch",
     "host_available_parallelism",
+    "seed",
     "workload_case_count",
     "workload_case",
     "shape_name",
@@ -86,17 +88,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if let Some(output_path) = config.output_path {
         let mut output = File::create(output_path)?;
-        write_benchmark_csv(&mut output)?;
+        write_benchmark_csv(&mut output, config.seed)?;
     } else {
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        write_benchmark_csv(&mut output)?;
+        write_benchmark_csv(&mut output, config.seed)?;
     }
 
     Ok(())
 }
 
-fn write_benchmark_csv(output: &mut impl Write) -> Result<(), Box<dyn Error>> {
+fn write_benchmark_csv(output: &mut impl Write, seed: u64) -> Result<(), Box<dyn Error>> {
     let run_environment = BenchmarkRunEnvironment::local();
     let workload_cases = SyntheticWorkloadCase::standard_cases()?;
     let simulation_profiles = SyntheticWorkSimulationProfile::standard_profiles();
@@ -121,6 +123,7 @@ fn write_benchmark_csv(output: &mut impl Write) -> Result<(), Box<dyn Error>> {
                         shape: &workload_case.shape,
                         file_set: &workload_case.file_set,
                         run_environment,
+                        seed,
                         workload_case: workload_case.name,
                         workload_case_count: workload_cases.len(),
                         simulation_profile_count: simulation_profiles.len(),
@@ -142,7 +145,7 @@ fn write_benchmark_csv(output: &mut impl Write) -> Result<(), Box<dyn Error>> {
 fn print_usage(mut output: impl Write) -> io::Result<()> {
     writeln!(
         output,
-        "Usage: delta_scan_partition_bench [--output <path>]"
+        "Usage: delta_scan_partition_bench [--output <path>] [--seed <u64>]"
     )?;
     writeln!(output)?;
     writeln!(
@@ -153,12 +156,14 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
         output,
         "Without --output, CSV is written to stdout for shell pipelines."
     )?;
+    writeln!(output, "The default seed is {DEFAULT_BENCHMARK_SEED}.")?;
     Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BenchmarkRunnerConfig {
     output_path: Option<PathBuf>,
+    seed: u64,
     show_help: bool,
 }
 
@@ -177,6 +182,7 @@ impl BenchmarkRunnerConfig {
         I::Item: Into<std::ffi::OsString>,
     {
         let mut output_path = None;
+        let mut seed = DEFAULT_BENCHMARK_SEED;
         let mut show_help = false;
         let mut args = args.into_iter().map(Into::into);
 
@@ -190,6 +196,11 @@ impl BenchmarkRunnerConfig {
                 if output_path.replace(PathBuf::from(path)).is_some() {
                     return Err(BenchmarkRunnerConfigError::DuplicateOutputPath);
                 }
+            } else if arg == "--seed" {
+                let value = args.next().ok_or(BenchmarkRunnerConfigError::MissingSeed)?;
+                seed = value.to_string_lossy().parse().map_err(|_| {
+                    BenchmarkRunnerConfigError::InvalidSeed(value.to_string_lossy().into())
+                })?;
             } else {
                 return Err(BenchmarkRunnerConfigError::UnknownArgument(
                     arg.to_string_lossy().into(),
@@ -199,6 +210,7 @@ impl BenchmarkRunnerConfig {
 
         Ok(Self {
             output_path,
+            seed,
             show_help,
         })
     }
@@ -337,6 +349,8 @@ impl SyntheticWorkloadCase {
 enum BenchmarkRunnerConfigError {
     MissingOutputPath,
     DuplicateOutputPath,
+    MissingSeed,
+    InvalidSeed(String),
     UnknownArgument(String),
 }
 
@@ -345,6 +359,8 @@ impl fmt::Display for BenchmarkRunnerConfigError {
         match self {
             Self::MissingOutputPath => write!(formatter, "--output requires a path"),
             Self::DuplicateOutputPath => write!(formatter, "--output may be provided only once"),
+            Self::MissingSeed => write!(formatter, "--seed requires a u64 value"),
+            Self::InvalidSeed(value) => write!(formatter, "invalid --seed value `{value}`"),
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument `{argument}`"),
         }
     }
@@ -409,6 +425,7 @@ struct BenchmarkCsvRowInput<'a> {
     shape: &'a SyntheticDeltaTableShape,
     file_set: &'a SyntheticFileSet,
     run_environment: BenchmarkRunEnvironment,
+    seed: u64,
     workload_case: &'static str,
     workload_case_count: usize,
     simulation_profile_count: usize,
@@ -1683,6 +1700,7 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
         input.run_environment.host_os.to_owned(),
         input.run_environment.host_arch.to_owned(),
         optional_usize(input.run_environment.available_parallelism),
+        input.seed.to_string(),
         input.workload_case_count.to_string(),
         input.workload_case.to_owned(),
         shape.name.to_owned(),
@@ -1855,6 +1873,7 @@ mod tests {
             config,
             BenchmarkRunnerConfig {
                 output_path: None,
+                seed: DEFAULT_BENCHMARK_SEED,
                 show_help: false
             }
         );
@@ -1898,6 +1917,15 @@ mod tests {
     }
 
     #[test]
+    fn runner_config_accepts_seed() -> Result<(), Box<dyn Error>> {
+        let config = BenchmarkRunnerConfig::parse(["--seed", "42"])?;
+
+        assert_eq!(config.seed, 42);
+
+        Ok(())
+    }
+
+    #[test]
     fn runner_config_rejects_invalid_arguments() {
         assert_eq!(
             BenchmarkRunnerConfig::parse(["--output"]),
@@ -1913,6 +1941,16 @@ mod tests {
                 "--unknown".to_owned()
             ))
         );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--seed"]),
+            Err(BenchmarkRunnerConfigError::MissingSeed)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--seed", "not-a-number"]),
+            Err(BenchmarkRunnerConfigError::InvalidSeed(
+                "not-a-number".to_owned()
+            ))
+        );
     }
 
     #[test]
@@ -1922,8 +1960,11 @@ mod tests {
         print_usage(&mut output)?;
         let usage = String::from_utf8(output)?;
 
-        assert!(usage.contains("Usage: delta_scan_partition_bench [--output <path>]"));
+        assert!(
+            usage.contains("Usage: delta_scan_partition_bench [--output <path>] [--seed <u64>]")
+        );
         assert!(usage.contains("CSV is written to stdout"));
+        assert!(usage.contains("The default seed is 0."));
 
         Ok(())
     }
@@ -1932,7 +1973,7 @@ mod tests {
     fn write_benchmark_csv_outputs_portable_matrix() -> Result<(), Box<dyn Error>> {
         let mut output = Vec::new();
 
-        write_benchmark_csv(&mut output)?;
+        write_benchmark_csv(&mut output, 42)?;
         let csv = String::from_utf8(output)?;
         let lines = csv.lines().collect::<Vec<_>>();
 
@@ -2525,27 +2566,28 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 53);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 54);
         assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(BENCHMARK_CSV_HEADER[1], "host_os");
         assert_eq!(BENCHMARK_CSV_HEADER[2], "host_arch");
         assert_eq!(BENCHMARK_CSV_HEADER[3], "host_available_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[4], "workload_case_count");
-        assert_eq!(BENCHMARK_CSV_HEADER[5], "workload_case");
-        assert_eq!(BENCHMARK_CSV_HEADER[26], "policy_case");
-        assert_eq!(BENCHMARK_CSV_HEADER[27], "policy_available_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[28], "policy_datafusion_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[29], "policy_available_memory_bytes");
-        assert_eq!(BENCHMARK_CSV_HEADER[30], "policy_unix_soft_fd_limit");
-        assert_eq!(BENCHMARK_CSV_HEADER[33], "policy_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[34], "policy_source");
+        assert_eq!(BENCHMARK_CSV_HEADER[4], "seed");
+        assert_eq!(BENCHMARK_CSV_HEADER[5], "workload_case_count");
+        assert_eq!(BENCHMARK_CSV_HEADER[6], "workload_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[27], "policy_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[28], "policy_available_parallelism");
+        assert_eq!(BENCHMARK_CSV_HEADER[29], "policy_datafusion_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[30], "policy_available_memory_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[31], "policy_unix_soft_fd_limit");
+        assert_eq!(BENCHMARK_CSV_HEADER[34], "policy_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[35], "policy_source");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[42],
+            BENCHMARK_CSV_HEADER[43],
             "simulated_throughput_mib_per_second"
         );
-        assert_eq!(BENCHMARK_CSV_HEADER[44], "partition_files_p50");
+        assert_eq!(BENCHMARK_CSV_HEADER[45], "partition_files_p50");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[52],
+            BENCHMARK_CSV_HEADER[53],
             "partition_work_imbalance_basis_points"
         );
     }
@@ -2570,6 +2612,7 @@ mod tests {
                 host_arch: "test-arch",
                 available_parallelism: Some(16),
             },
+            seed: 7,
             workload_case: "test-workload",
             workload_case_count: 4,
             simulation_profile_count: SyntheticWorkSimulationProfile::standard_profiles().len(),
@@ -2585,14 +2628,15 @@ mod tests {
         assert_eq!(row[1], "test-os");
         assert_eq!(row[2], "test-arch");
         assert_eq!(row[3], "16");
-        assert_eq!(row[4], "4");
-        assert_eq!(row[5], "test-workload");
-        assert_eq!(row[26], "default_policy");
-        assert_eq!(row[33], "16");
-        assert_eq!(row[34], "available_parallelism_fallback");
-        assert!(!row[42].is_empty());
+        assert_eq!(row[4], "7");
+        assert_eq!(row[5], "4");
+        assert_eq!(row[6], "test-workload");
+        assert_eq!(row[27], "default_policy");
+        assert_eq!(row[34], "16");
+        assert_eq!(row[35], "available_parallelism_fallback");
         assert!(!row[43].is_empty());
-        assert!(!row[52].is_empty());
+        assert!(!row[44].is_empty());
+        assert!(!row[53].is_empty());
 
         Ok(())
     }
