@@ -396,6 +396,14 @@ mod tests {
             display.contains("physical-to-logical transform application"),
             "{display}"
         );
+        assert!(
+            display.contains("physical schema fields [id, customer_name]"),
+            "{display}"
+        );
+        assert!(
+            display.contains("logical schema fields [id, customer_name]"),
+            "{display}"
+        );
 
         Ok(())
     }

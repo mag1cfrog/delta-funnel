@@ -62,6 +62,14 @@ impl KernelScanReadSchema {
     pub(crate) fn has_physical_predicate(&self) -> bool {
         self.physical_predicate.is_some()
     }
+
+    fn transform_schema_context(&self) -> String {
+        format!(
+            "physical schema fields [{}], logical schema fields [{}]",
+            schema_field_names(&self.physical_schema),
+            schema_field_names(&self.logical_schema)
+        )
+    }
 }
 
 /// Context required to construct the official-kernel reader baseline.
@@ -256,20 +264,28 @@ impl KernelDataFileReader {
         let physical_rows = request.batch.num_rows();
         let physical_data: Box<dyn delta_kernel::EngineData> =
             Box::new(kernel::ArrowEngineData::new(request.batch));
-        let logical_data = kernel::transform_to_logical(
+        let logical_data = match kernel::transform_to_logical(
             self.engine.as_ref(),
             physical_data,
             request.schema.physical_schema(),
             request.schema.logical_schema(),
             Some(transform.transform.clone()),
-        )
-        .context(DeltaScanFileReadSnafu {
-            source_name: self.source_name.clone(),
-            table_uri: self.table_uri.clone(),
-            snapshot_version: self.snapshot_version,
-            path: request.path.to_owned(),
-            phase: DeltaScanFileReadPhase::TransformApplication,
-        })?;
+        ) {
+            Ok(logical_data) => logical_data,
+            Err(error) => {
+                return Err(kernel::DeltaKernelError::generic(format!(
+                    "{error}; {}",
+                    request.schema.transform_schema_context()
+                )))
+                .context(DeltaScanFileReadSnafu {
+                    source_name: self.source_name.clone(),
+                    table_uri: self.table_uri.clone(),
+                    snapshot_version: self.snapshot_version,
+                    path: request.path.to_owned(),
+                    phase: DeltaScanFileReadPhase::TransformApplication,
+                });
+            }
+        };
         let logical_batch = kernel::EngineDataArrowExt::try_into_record_batch(logical_data)
             .context(DeltaScanFileReadSnafu {
                 source_name: self.source_name.clone(),
@@ -284,8 +300,9 @@ impl KernelDataFileReader {
         }
 
         Err(kernel::DeltaKernelError::generic(format!(
-            "physical-to-logical transform changed row count from {physical_rows} to {}",
-            logical_batch.num_rows()
+            "physical-to-logical transform changed row count from {physical_rows} to {}; {}",
+            logical_batch.num_rows(),
+            request.schema.transform_schema_context()
         )))
         .context(DeltaScanFileReadSnafu {
             source_name: self.source_name.clone(),
@@ -295,6 +312,14 @@ impl KernelDataFileReader {
             phase: DeltaScanFileReadPhase::TransformApplication,
         })
     }
+}
+
+fn schema_field_names(schema: &kernel::KernelSchemaRef) -> String {
+    schema
+        .fields()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
