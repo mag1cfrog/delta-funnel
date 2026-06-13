@@ -20,9 +20,9 @@ const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
 const BENCHMARK_AVAILABLE_PARALLELISM_CANDIDATES: [usize; 3] = [4, 16, 64];
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
-const BENCHMARK_SCHEMA_VERSION: u32 = 4;
+const BENCHMARK_SCHEMA_VERSION: u32 = 5;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
-const BENCHMARK_CSV_HEADER: [&str; 59] = [
+const BENCHMARK_CSV_HEADER: [&str; 61] = [
     "benchmark_schema_version",
     "host_os",
     "host_arch",
@@ -52,6 +52,7 @@ const BENCHMARK_CSV_HEADER: [&str; 59] = [
     "simulation_profile",
     "simulation_partition_scheduling_overhead_micros",
     "simulation_effective_parallelism",
+    "simulation_aggregate_bandwidth_bytes_per_second",
     "policy_case",
     "policy_available_parallelism",
     "policy_datafusion_target",
@@ -69,6 +70,7 @@ const BENCHMARK_CSV_HEADER: [&str; 59] = [
     "simulated_max_file_micros",
     "simulated_output_partitions",
     "simulated_scheduling_overhead_micros",
+    "simulated_aggregate_transfer_floor_micros",
     "simulated_execution_slots",
     "simulated_wall_micros",
     "simulated_throughput_mib_per_second",
@@ -476,6 +478,7 @@ struct SyntheticWorkSimulationProfile {
     partition_scheduling_overhead_micros: u64,
     effective_parallelism: usize,
     bandwidth_bytes_per_second: u64,
+    aggregate_bandwidth_bytes_per_second: u64,
     cpu_micros_per_1k_rows: u64,
     jitter_basis_points: u16,
 }
@@ -485,6 +488,7 @@ struct SyntheticWorkSimulationResult {
     profile_name: &'static str,
     partition_scheduling_overhead_micros: u64,
     effective_parallelism: usize,
+    aggregate_bandwidth_bytes_per_second: u64,
     file_costs: Vec<SyntheticFileWorkCost>,
     serial_micros: u64,
     max_file_micros: u64,
@@ -506,6 +510,7 @@ struct SyntheticPartitionedWorkPlan {
     unknown_size_fallback_used: bool,
     partitions: Vec<SyntheticWorkPartition>,
     scheduling_overhead_micros: u64,
+    aggregate_transfer_floor_micros: u64,
     execution_slots: usize,
     wall_micros: u64,
 }
@@ -1253,6 +1258,7 @@ impl SyntheticWorkSimulationProfile {
             partition_scheduling_overhead_micros: 150,
             effective_parallelism: 16,
             bandwidth_bytes_per_second: 1_500 * MIB,
+            aggregate_bandwidth_bytes_per_second: 1_500 * MIB,
             cpu_micros_per_1k_rows: 8,
             jitter_basis_points: 250,
         }
@@ -1266,6 +1272,7 @@ impl SyntheticWorkSimulationProfile {
             partition_scheduling_overhead_micros: 1_000,
             effective_parallelism: 32,
             bandwidth_bytes_per_second: 125 * MIB,
+            aggregate_bandwidth_bytes_per_second: 125 * MIB,
             cpu_micros_per_1k_rows: 10,
             jitter_basis_points: 1_500,
         }
@@ -1279,6 +1286,7 @@ impl SyntheticWorkSimulationProfile {
             partition_scheduling_overhead_micros: 1_500,
             effective_parallelism: 64,
             bandwidth_bytes_per_second: 100 * MIB,
+            aggregate_bandwidth_bytes_per_second: 100 * MIB,
             cpu_micros_per_1k_rows: 10,
             jitter_basis_points: 2_500,
         }
@@ -1292,6 +1300,7 @@ impl SyntheticWorkSimulationProfile {
             partition_scheduling_overhead_micros: 2_000,
             effective_parallelism: 16,
             bandwidth_bytes_per_second: 32 * MIB,
+            aggregate_bandwidth_bytes_per_second: 12_500_000,
             cpu_micros_per_1k_rows: 10,
             jitter_basis_points: 2_000,
         }
@@ -1305,6 +1314,7 @@ impl SyntheticWorkSimulationProfile {
             partition_scheduling_overhead_micros: 500,
             effective_parallelism: 16,
             bandwidth_bytes_per_second: 500 * MIB,
+            aggregate_bandwidth_bytes_per_second: 500 * MIB,
             cpu_micros_per_1k_rows: 80,
             jitter_basis_points: 500,
         }
@@ -1342,6 +1352,7 @@ impl SyntheticWorkSimulationProfile {
             profile_name: self.name,
             partition_scheduling_overhead_micros: self.partition_scheduling_overhead_micros,
             effective_parallelism: self.effective_parallelism,
+            aggregate_bandwidth_bytes_per_second: self.aggregate_bandwidth_bytes_per_second,
             file_costs,
             serial_micros,
             max_file_micros,
@@ -1415,6 +1426,7 @@ impl SyntheticWorkSimulationResult {
                 unknown_size_fallback_used: false,
                 partitions: Vec::new(),
                 scheduling_overhead_micros: 0,
+                aggregate_transfer_floor_micros: 0,
                 execution_slots: 0,
                 wall_micros: 0,
             });
@@ -1469,15 +1481,21 @@ impl SyntheticWorkSimulationResult {
         }
 
         let scheduling_overhead_micros = self.scheduling_overhead_micros(partitions.len())?;
+        let aggregate_transfer_floor_micros = self.aggregate_transfer_floor_micros(&partitions)?;
         let execution_slots = self.execution_slots(partitions.len())?;
-        let wall_micros =
-            partition_wall_micros(&partitions, scheduling_overhead_micros, execution_slots)?;
+        let wall_micros = partition_wall_micros(
+            &partitions,
+            scheduling_overhead_micros,
+            aggregate_transfer_floor_micros,
+            execution_slots,
+        )?;
 
         Ok(SyntheticPartitionedWorkPlan {
             target_partitions,
             unknown_size_fallback_used: false,
             partitions,
             scheduling_overhead_micros,
+            aggregate_transfer_floor_micros,
             execution_slots,
             wall_micros,
         })
@@ -1520,15 +1538,21 @@ impl SyntheticWorkSimulationResult {
         }
 
         let scheduling_overhead_micros = self.scheduling_overhead_micros(partitions.len())?;
+        let aggregate_transfer_floor_micros = self.aggregate_transfer_floor_micros(&partitions)?;
         let execution_slots = self.execution_slots(partitions.len())?;
-        let wall_micros =
-            partition_wall_micros(&partitions, scheduling_overhead_micros, execution_slots)?;
+        let wall_micros = partition_wall_micros(
+            &partitions,
+            scheduling_overhead_micros,
+            aggregate_transfer_floor_micros,
+            execution_slots,
+        )?;
 
         Ok(SyntheticPartitionedWorkPlan {
             target_partitions,
             unknown_size_fallback_used,
             partitions,
             scheduling_overhead_micros,
+            aggregate_transfer_floor_micros,
             execution_slots,
             wall_micros,
         })
@@ -1552,11 +1576,36 @@ impl SyntheticWorkSimulationResult {
 
         Ok(output_partitions.min(self.effective_parallelism))
     }
+
+    fn aggregate_transfer_floor_micros(
+        &self,
+        partitions: &[SyntheticWorkPartition],
+    ) -> Result<u64, SyntheticGenerationError> {
+        if self.aggregate_bandwidth_bytes_per_second == 0 {
+            return Err(generation_error(
+                "simulation aggregate bandwidth must be greater than zero",
+            ));
+        }
+
+        let total_bytes = partitions.iter().try_fold(0_u64, |total, partition| {
+            total
+                .checked_add(partition.size_bytes)
+                .ok_or_else(|| generation_error("aggregate transfer byte count overflow"))
+        })?;
+
+        scaled_ceil_div(
+            total_bytes,
+            1_000_000,
+            self.aggregate_bandwidth_bytes_per_second,
+            "aggregate transfer floor",
+        )
+    }
 }
 
 fn partition_wall_micros(
     partitions: &[SyntheticWorkPartition],
     scheduling_overhead_micros: u64,
+    aggregate_transfer_floor_micros: u64,
     execution_slots: usize,
 ) -> Result<u64, SyntheticGenerationError> {
     if partitions.is_empty() {
@@ -1584,6 +1633,7 @@ fn partition_wall_micros(
     let scheduled_work_micros = slot_load_micros.into_iter().max().unwrap_or_default();
 
     scheduled_work_micros
+        .max(aggregate_transfer_floor_micros)
         .checked_add(scheduling_overhead_micros)
         .ok_or_else(|| generation_error("partition wall time overflow"))
 }
@@ -2028,6 +2078,10 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
             .partition_scheduling_overhead_micros
             .to_string(),
         input.simulation.effective_parallelism.to_string(),
+        input
+            .simulation
+            .aggregate_bandwidth_bytes_per_second
+            .to_string(),
         policy_case.name.to_owned(),
         optional_usize(policy_case.input.available_parallelism),
         optional_usize(policy_case.input.datafusion_target_partitions),
@@ -2053,6 +2107,10 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
         input
             .partitioned_work
             .scheduling_overhead_micros
+            .to_string(),
+        input
+            .partitioned_work
+            .aggregate_transfer_floor_micros
             .to_string(),
         input.partitioned_work.execution_slots.to_string(),
         input.partitioned_work.wall_micros.to_string(),
@@ -2287,9 +2345,9 @@ mod tests {
         assert!(!csv.contains(",empty_scan,"));
         assert!(!csv.contains(",one_file,"));
         assert!(!csv.contains(",few_medium_files,"));
-        assert!(csv.contains(",local_fast,150,16,default_policy,"));
-        assert!(csv.contains(",s3_normal,1000,32,available_parallelism_override_64,"));
-        assert!(csv.contains(",s3_normal,1000,32,combined_fd_16_memory_256mib,"));
+        assert!(csv.contains(",local_fast,150,16,1572864000,default_policy,"));
+        assert!(csv.contains(",s3_normal,1000,32,131072000,available_parallelism_override_64,"));
+        assert!(csv.contains(",s3_normal,1000,32,131072000,combined_fd_16_memory_256mib,"));
 
         Ok(())
     }
@@ -2607,10 +2665,15 @@ mod tests {
         );
         assert!(profiles.iter().all(|profile| {
             profile.bandwidth_bytes_per_second > 0
+                && profile.aggregate_bandwidth_bytes_per_second > 0
                 && profile.jitter_basis_points <= 10_000
                 && profile.partition_scheduling_overhead_micros > 0
                 && profile.effective_parallelism > 0
         }));
+        assert_eq!(
+            SyntheticWorkSimulationProfile::s3_throttled().aggregate_bandwidth_bytes_per_second,
+            12_500_000
+        );
     }
 
     #[test]
@@ -2720,9 +2783,11 @@ mod tests {
             work.partition_scheduling_overhead_micros
         );
         assert_eq!(plan.execution_slots, 1);
+        assert!(plan.aggregate_transfer_floor_micros > 0);
         assert_eq!(
             plan.wall_micros,
-            work.serial_micros + work.partition_scheduling_overhead_micros
+            work.serial_micros.max(plan.aggregate_transfer_floor_micros)
+                + work.partition_scheduling_overhead_micros
         );
         assert_eq!(plan.partitions[0].file_count, file_set.files.len());
         assert_eq!(plan.partitions[0].rows, shape.total_rows);
@@ -2872,6 +2937,37 @@ mod tests {
         assert_eq!(plan.partitions.len(), 64);
         assert_eq!(plan.execution_slots, 16);
         assert!(plan.wall_micros > max_partition_work + plan.scheduling_overhead_micros);
+
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_work_applies_aggregate_bandwidth_floor() -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::partitioned_event_log();
+        let file_set = shape.generate_file_set()?;
+        let work = SyntheticWorkSimulationProfile::s3_throttled()
+            .simulate_file_set(&file_set, DEFAULT_BENCHMARK_SEED)?;
+        let plan = work.partition_by_estimated_bytes(&file_set, 64)?;
+        let expected_floor_micros = scaled_ceil_div(
+            file_set.total_bytes(),
+            1_000_000,
+            work.aggregate_bandwidth_bytes_per_second,
+            "test aggregate floor",
+        )?;
+        let max_partition_work = plan
+            .partitions
+            .iter()
+            .map(|partition| partition.work_micros)
+            .max()
+            .unwrap_or_default();
+
+        assert_eq!(work.aggregate_bandwidth_bytes_per_second, 12_500_000);
+        assert_eq!(plan.aggregate_transfer_floor_micros, expected_floor_micros);
+        assert!(plan.aggregate_transfer_floor_micros > max_partition_work);
+        assert_eq!(
+            plan.wall_micros,
+            plan.aggregate_transfer_floor_micros + plan.scheduling_overhead_micros
+        );
 
         Ok(())
     }
@@ -3038,7 +3134,7 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 59);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 61);
         assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(BENCHMARK_CSV_HEADER[1], "host_os");
         assert_eq!(BENCHMARK_CSV_HEADER[2], "host_arch");
@@ -3051,26 +3147,34 @@ mod tests {
             "simulation_partition_scheduling_overhead_micros"
         );
         assert_eq!(BENCHMARK_CSV_HEADER[28], "simulation_effective_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[29], "policy_case");
-        assert_eq!(BENCHMARK_CSV_HEADER[30], "policy_available_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[31], "policy_datafusion_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[32], "policy_available_memory_bytes");
-        assert_eq!(BENCHMARK_CSV_HEADER[33], "policy_unix_soft_fd_limit");
-        assert_eq!(BENCHMARK_CSV_HEADER[36], "policy_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[37], "policy_source");
-        assert_eq!(BENCHMARK_CSV_HEADER[41], "unknown_size_fallback_used");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[45],
+            BENCHMARK_CSV_HEADER[29],
+            "simulation_aggregate_bandwidth_bytes_per_second"
+        );
+        assert_eq!(BENCHMARK_CSV_HEADER[30], "policy_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[31], "policy_available_parallelism");
+        assert_eq!(BENCHMARK_CSV_HEADER[32], "policy_datafusion_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[33], "policy_available_memory_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[34], "policy_unix_soft_fd_limit");
+        assert_eq!(BENCHMARK_CSV_HEADER[37], "policy_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[38], "policy_source");
+        assert_eq!(BENCHMARK_CSV_HEADER[42], "unknown_size_fallback_used");
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[46],
             "simulated_scheduling_overhead_micros"
         );
-        assert_eq!(BENCHMARK_CSV_HEADER[46], "simulated_execution_slots");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[48],
+            BENCHMARK_CSV_HEADER[47],
+            "simulated_aggregate_transfer_floor_micros"
+        );
+        assert_eq!(BENCHMARK_CSV_HEADER[48], "simulated_execution_slots");
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[50],
             "simulated_throughput_mib_per_second"
         );
-        assert_eq!(BENCHMARK_CSV_HEADER[50], "partition_files_p50");
+        assert_eq!(BENCHMARK_CSV_HEADER[52], "partition_files_p50");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[58],
+            BENCHMARK_CSV_HEADER[60],
             "partition_work_imbalance_basis_points"
         );
     }
@@ -3107,7 +3211,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "4");
+        assert_eq!(row[0], "5");
         assert_eq!(row[1], "test-os");
         assert_eq!(row[2], "test-arch");
         assert_eq!(row[3], "16");
@@ -3116,15 +3220,17 @@ mod tests {
         assert_eq!(row[6], "test-workload");
         assert_eq!(row[27], "1000");
         assert_eq!(row[28], "32");
-        assert_eq!(row[29], "default_policy");
-        assert_eq!(row[36], "16");
-        assert_eq!(row[37], "available_parallelism_fallback");
-        assert_eq!(row[41], "false");
-        assert_eq!(row[45], "16000");
-        assert_eq!(row[46], "16");
-        assert!(!row[48].is_empty());
-        assert!(!row[49].is_empty());
-        assert!(!row[58].is_empty());
+        assert_eq!(row[29], "131072000");
+        assert_eq!(row[30], "default_policy");
+        assert_eq!(row[37], "16");
+        assert_eq!(row[38], "available_parallelism_fallback");
+        assert_eq!(row[42], "false");
+        assert_eq!(row[46], "16000");
+        assert!(!row[47].is_empty());
+        assert_eq!(row[48], "16");
+        assert!(!row[50].is_empty());
+        assert!(!row[51].is_empty());
+        assert!(!row[60].is_empty());
 
         Ok(())
     }
