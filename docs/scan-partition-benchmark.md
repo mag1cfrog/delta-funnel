@@ -29,10 +29,17 @@ cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
   --output target/delta-scan-partition-bench.csv
 ```
 
-The `--mode host-probe` flag is reserved for the opt-in host probe mode. It is
-parsed separately from synthetic mode so CSV output can distinguish
-`synthetic` from `host_probe`, but host-probe execution is added in the later
-implementation slices.
+Run the cheap host profile probe:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode host-probe \
+  --output target/delta-scan-partition-host-probe.csv
+```
+
+Host-probe mode currently records cheap local host signals and feeds them
+through the same production diagnostic target policy. It does not run local IO
+throughput probes yet.
 
 Use a deterministic jitter seed:
 
@@ -142,6 +149,11 @@ Important field groups:
   - `partition_work_micros_p50`
   - `partition_work_micros_p95`
   - `partition_work_imbalance_basis_points`
+- Host-probe diagnostics:
+  - `host_memory_total_bytes`
+  - `host_memory_available_bytes`
+  - `host_unix_soft_fd_limit`
+  - `host_unix_soft_fd_limit_status`
 
 `partition_work_imbalance_basis_points` is:
 
@@ -181,10 +193,14 @@ default.
 
 ## Scope
 
-This benchmark validates scan partition target policy and synthetic file-task
+Synthetic mode validates scan partition target policy and synthetic file-task
 grouping behavior. It includes synthetic request latency, per-partition
 scheduling overhead, bounded execution slots, and aggregate transfer floors so
 policy cases can be compared more realistically than with infinite parallelism.
+
+Host-probe mode records real cheap host signals, including available
+parallelism, memory hints, and Unix fd limit status when available. It does not
+run disk, network, or stress probes yet.
 
 It is still not a production read benchmark. It does not measure real Parquet
 decoding, Arrow batch memory, object-store request behavior, or DataFusion

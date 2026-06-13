@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use chrono::{Datelike, Days, NaiveDate};
 use delta_funnel::{
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
-    DeltaScanPartitionTargetDiagnosticSource, derive_delta_scan_partition_target_diagnostic,
+    DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+    DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+    delta_scan_partition_target_local_environment_diagnostic,
+    derive_delta_scan_partition_target_diagnostic,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -20,9 +23,9 @@ const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
 const BENCHMARK_AVAILABLE_PARALLELISM_CANDIDATES: [usize; 3] = [4, 16, 64];
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
-const BENCHMARK_SCHEMA_VERSION: u32 = 6;
+const BENCHMARK_SCHEMA_VERSION: u32 = 7;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
-const BENCHMARK_CSV_HEADER: [&str; 62] = [
+const BENCHMARK_CSV_HEADER: [&str; 66] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -85,6 +88,10 @@ const BENCHMARK_CSV_HEADER: [&str; 62] = [
     "partition_work_micros_p50",
     "partition_work_micros_p95",
     "partition_work_imbalance_basis_points",
+    "host_memory_total_bytes",
+    "host_memory_available_bytes",
+    "host_unix_soft_fd_limit",
+    "host_unix_soft_fd_limit_status",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -94,19 +101,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         print_usage(io::stdout())?;
         return Ok(());
     }
-    if config.mode == BenchmarkMode::HostProbe {
-        return Err(Box::new(
-            BenchmarkModeExecutionError::HostProbeNotImplemented,
-        ));
-    }
 
-    if let Some(output_path) = config.output_path {
+    if let Some(output_path) = &config.output_path {
         let mut output = File::create(output_path)?;
-        write_benchmark_csv(&mut output, config.seed, config.mode)?;
+        write_benchmark_csv(&mut output, &config)?;
     } else {
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        write_benchmark_csv(&mut output, config.seed, config.mode)?;
+        write_benchmark_csv(&mut output, &config)?;
     }
 
     Ok(())
@@ -114,9 +116,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn write_benchmark_csv(
     output: &mut impl Write,
-    seed: u64,
-    mode: BenchmarkMode,
+    config: &BenchmarkRunnerConfig,
 ) -> Result<(), Box<dyn Error>> {
+    match config.mode {
+        BenchmarkMode::Synthetic => write_synthetic_benchmark_csv(output, config.seed),
+        BenchmarkMode::HostProbe => write_host_probe_benchmark_csv(output, config.seed),
+    }
+}
+
+fn write_synthetic_benchmark_csv(output: &mut impl Write, seed: u64) -> Result<(), Box<dyn Error>> {
     let run_environment = BenchmarkRunEnvironment::local();
     let workload_cases = SyntheticWorkloadCase::standard_cases()?;
     let simulation_profiles = SyntheticWorkSimulationProfile::standard_profiles();
@@ -141,7 +149,7 @@ fn write_benchmark_csv(
                         shape: &workload_case.shape,
                         file_set: &workload_case.file_set,
                         run_environment,
-                        mode,
+                        mode: BenchmarkMode::Synthetic,
                         seed,
                         workload_case: workload_case.name,
                         workload_case_count: workload_cases.len(),
@@ -157,6 +165,31 @@ fn write_benchmark_csv(
             }
         }
     }
+
+    Ok(())
+}
+
+fn write_host_probe_benchmark_csv(
+    output: &mut impl Write,
+    seed: u64,
+) -> Result<(), Box<dyn Error>> {
+    let run_environment = BenchmarkRunEnvironment::local();
+    let local_environment = delta_scan_partition_target_local_environment_diagnostic();
+    let policy_decision =
+        derive_delta_scan_partition_target_diagnostic(local_environment.policy_input)?;
+
+    writeln!(output, "{}", BENCHMARK_CSV_HEADER.join(","))?;
+    writeln!(
+        output,
+        "{}",
+        host_probe_csv_row(HostProbeCsvRowInput {
+            run_environment,
+            seed,
+            local_environment,
+            policy_decision,
+        })
+        .join(",")
+    )?;
 
     Ok(())
 }
@@ -460,30 +493,6 @@ impl fmt::Display for BenchmarkRunnerConfigError {
 
 impl Error for BenchmarkRunnerConfigError {}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BenchmarkModeExecutionError {
-    HostProbeNotImplemented,
-}
-
-impl fmt::Debug for BenchmarkModeExecutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, formatter)
-    }
-}
-
-impl fmt::Display for BenchmarkModeExecutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::HostProbeNotImplemented => write!(
-                formatter,
-                "host-probe benchmark mode is parsed but not implemented yet"
-            ),
-        }
-    }
-}
-
-impl Error for BenchmarkModeExecutionError {}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SyntheticDeltaTableShape {
     name: &'static str,
@@ -552,6 +561,14 @@ struct BenchmarkCsvRowInput<'a> {
     policy_decision: DeltaScanPartitionTargetDiagnosticOutput,
     simulated_work: &'a SyntheticWorkSimulationResult,
     partitioned_work: &'a SyntheticPartitionedWorkPlan,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HostProbeCsvRowInput {
+    run_environment: BenchmarkRunEnvironment,
+    seed: u64,
+    local_environment: DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+    policy_decision: DeltaScanPartitionTargetDiagnosticOutput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2246,7 +2263,53 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
         partitioned_work_summary
             .work_imbalance_basis_points
             .to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
     ]
+}
+
+fn host_probe_csv_row(input: HostProbeCsvRowInput) -> Vec<String> {
+    let policy_input = input.local_environment.policy_input;
+    let policy_decision = input.policy_decision;
+    let mut row = vec![String::new(); BENCHMARK_CSV_HEADER.len()];
+
+    row[0] = input.run_environment.schema_version.to_string();
+    row[1] = BenchmarkMode::HostProbe.as_csv_value().to_owned();
+    row[2] = input.run_environment.host_os.to_owned();
+    row[3] = input.run_environment.host_arch.to_owned();
+    row[4] = optional_usize(input.run_environment.available_parallelism);
+    row[5] = input.seed.to_string();
+    row[6] = "0".to_owned();
+    row[7] = "host_probe".to_owned();
+    row[26] = "0".to_owned();
+    row[31] = "host_probe_default_policy".to_owned();
+    row[32] = optional_usize(policy_input.available_parallelism);
+    row[33] = optional_usize(policy_input.datafusion_target_partitions);
+    row[34] = optional_u64(policy_input.available_memory_bytes);
+    row[35] = optional_u64(policy_input.unix_soft_file_descriptor_limit);
+    row[36] = policy_input.file_descriptors_per_partition.to_string();
+    row[37] = policy_input
+        .available_memory_bytes_per_partition
+        .to_string();
+    row[38] = policy_decision.target_partitions.to_string();
+    row[39] = policy_source_name(policy_decision.source).to_owned();
+    row[40] = optional_usize(policy_decision.datafusion_target_cap);
+    row[41] = optional_usize(policy_decision.unix_file_descriptor_cap);
+    row[42] = optional_usize(policy_decision.memory_cap);
+    row[43] = "false".to_owned();
+    row[62] = optional_u64(input.local_environment.memory_total_bytes);
+    row[63] = optional_u64(input.local_environment.memory_available_bytes);
+    row[64] = optional_u64(input.local_environment.unix_soft_file_descriptor_limit);
+    row[65] = unix_file_descriptor_status_name(
+        input
+            .local_environment
+            .unix_soft_file_descriptor_limit_status,
+    )
+    .to_owned();
+
+    row
 }
 
 fn optional_usize(value: Option<usize>) -> String {
@@ -2264,6 +2327,17 @@ fn policy_source_name(source: DeltaScanPartitionTargetDiagnosticSource) -> &'sta
             "available_parallelism_fallback"
         }
         DeltaScanPartitionTargetDiagnosticSource::StaticFallback => "static_fallback",
+    }
+}
+
+fn unix_file_descriptor_status_name(
+    status: DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+) -> &'static str {
+    match status {
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unsupported => "unsupported",
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unknown => "unknown",
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite => "finite",
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unlimited => "unlimited",
     }
 }
 
@@ -2474,14 +2548,20 @@ mod tests {
     #[test]
     fn write_benchmark_csv_outputs_portable_matrix() -> Result<(), Box<dyn Error>> {
         let mut output = Vec::new();
+        let config = BenchmarkRunnerConfig {
+            output_path: None,
+            mode: BenchmarkMode::Synthetic,
+            seed: 42,
+            show_help: false,
+        };
 
-        write_benchmark_csv(&mut output, 42, BenchmarkMode::Synthetic)?;
+        write_benchmark_csv(&mut output, &config)?;
         let csv = String::from_utf8(output)?;
         let lines = csv.lines().collect::<Vec<_>>();
 
         assert_eq!(lines.len(), 1111);
         assert!(lines[0].starts_with("benchmark_schema_version,benchmark_mode,host_os,host_arch"));
-        assert!(csv.contains("\n6,synthetic,"));
+        assert!(csv.contains("\n7,synthetic,"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
@@ -2494,6 +2574,96 @@ mod tests {
         assert!(csv.contains(",local_fast,150,16,1572864000,default_policy,"));
         assert!(csv.contains(",s3_normal,1000,32,131072000,available_parallelism_override_64,"));
         assert!(csv.contains(",s3_normal,1000,32,131072000,combined_fd_16_memory_256mib,"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_benchmark_csv_outputs_host_probe_profile() -> Result<(), Box<dyn Error>> {
+        let mut output = Vec::new();
+        let config = BenchmarkRunnerConfig {
+            output_path: None,
+            mode: BenchmarkMode::HostProbe,
+            seed: 42,
+            show_help: false,
+        };
+
+        write_benchmark_csv(&mut output, &config)?;
+        let csv = String::from_utf8(output)?;
+        let lines = csv.lines().collect::<Vec<_>>();
+        let row = lines[1].split(',').collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
+        assert_eq!(row[0], "7");
+        assert_eq!(row[1], "host_probe");
+        assert_eq!(row[5], "42");
+        assert_eq!(row[6], "0");
+        assert_eq!(row[7], "host_probe");
+        assert_eq!(row[26], "0");
+        assert_eq!(row[31], "host_probe_default_policy");
+        assert!(!row[36].is_empty());
+        assert!(!row[37].is_empty());
+        assert!(!row[38].is_empty());
+        assert_eq!(row[43], "false");
+        assert!(matches!(
+            row[65],
+            "finite" | "unlimited" | "unknown" | "unsupported"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn host_probe_csv_row_records_measured_policy_inputs() -> Result<(), Box<dyn Error>> {
+        let local_environment = DeltaScanPartitionTargetLocalEnvironmentDiagnostic {
+            policy_input: DeltaScanPartitionTargetDiagnosticInput {
+                available_parallelism: Some(16),
+                datafusion_target_partitions: Some(16),
+                available_memory_bytes: Some(1024 * MIB),
+                unix_soft_file_descriptor_limit: Some(128),
+                ..DeltaScanPartitionTargetDiagnosticInput::default()
+            },
+            memory_total_bytes: Some(2048 * MIB),
+            memory_available_bytes: Some(1024 * MIB),
+            unix_soft_file_descriptor_limit: Some(128),
+            unix_soft_file_descriptor_limit_status:
+                DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite,
+        };
+        let policy_decision =
+            derive_delta_scan_partition_target_diagnostic(local_environment.policy_input)?;
+        let row = host_probe_csv_row(HostProbeCsvRowInput {
+            run_environment: BenchmarkRunEnvironment {
+                schema_version: BENCHMARK_SCHEMA_VERSION,
+                host_os: "test-os",
+                host_arch: "test-arch",
+                available_parallelism: Some(16),
+            },
+            seed: 7,
+            local_environment,
+            policy_decision,
+        });
+
+        assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
+        assert_eq!(row[0], "7");
+        assert_eq!(row[1], "host_probe");
+        assert_eq!(row[2], "test-os");
+        assert_eq!(row[3], "test-arch");
+        assert_eq!(row[4], "16");
+        assert_eq!(row[5], "7");
+        assert_eq!(row[7], "host_probe");
+        assert_eq!(row[31], "host_probe_default_policy");
+        assert_eq!(row[32], "16");
+        assert_eq!(row[33], "16");
+        assert_eq!(row[34], (1024 * MIB).to_string());
+        assert_eq!(row[35], "128");
+        assert_eq!(row[38], "4");
+        assert_eq!(row[41], "8");
+        assert_eq!(row[42], "4");
+        assert_eq!(row[62], (2048 * MIB).to_string());
+        assert_eq!(row[63], (1024 * MIB).to_string());
+        assert_eq!(row[64], "128");
+        assert_eq!(row[65], "finite");
 
         Ok(())
     }
@@ -3309,7 +3479,7 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 62);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 66);
         assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(BENCHMARK_CSV_HEADER[1], "benchmark_mode");
         assert_eq!(BENCHMARK_CSV_HEADER[2], "host_os");
@@ -3353,6 +3523,10 @@ mod tests {
             BENCHMARK_CSV_HEADER[61],
             "partition_work_imbalance_basis_points"
         );
+        assert_eq!(BENCHMARK_CSV_HEADER[62], "host_memory_total_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[63], "host_memory_available_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[64], "host_unix_soft_fd_limit");
+        assert_eq!(BENCHMARK_CSV_HEADER[65], "host_unix_soft_fd_limit_status");
     }
 
     #[test]
@@ -3388,7 +3562,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "6");
+        assert_eq!(row[0], "7");
         assert_eq!(row[1], "synthetic");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
@@ -3409,6 +3583,10 @@ mod tests {
         assert!(!row[51].is_empty());
         assert!(!row[52].is_empty());
         assert!(!row[61].is_empty());
+        assert_eq!(row[62], "");
+        assert_eq!(row[63], "");
+        assert_eq!(row[64], "");
+        assert_eq!(row[65], "");
 
         Ok(())
     }

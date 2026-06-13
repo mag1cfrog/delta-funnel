@@ -392,6 +392,37 @@ pub struct DeltaScanPartitionTargetDiagnosticOutput {
     pub memory_cap: Option<usize>,
 }
 
+/// Local environment diagnostic used by scan partition benchmark tools.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaScanPartitionTargetLocalEnvironmentDiagnostic {
+    /// Production diagnostic policy input derived from cheap local host signals.
+    pub policy_input: DeltaScanPartitionTargetDiagnosticInput,
+    /// Total physical memory in bytes, when available.
+    pub memory_total_bytes: Option<u64>,
+    /// Available memory in bytes, when available.
+    pub memory_available_bytes: Option<u64>,
+    /// Unix soft file descriptor limit, when finite and available.
+    pub unix_soft_file_descriptor_limit: Option<u64>,
+    /// Status of the Unix soft file descriptor limit probe.
+    pub unix_soft_file_descriptor_limit_status:
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+}
+
+/// Diagnostic status for the local Unix fd soft limit probe.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus {
+    /// The current platform does not expose a Unix fd limit.
+    Unsupported,
+    /// The probe failed or returned no usable value.
+    Unknown,
+    /// The Unix soft fd limit is finite and stored in the companion value.
+    Finite,
+    /// The Unix soft fd limit is unlimited.
+    Unlimited,
+}
+
 /// Diagnostic source that selected the uncapped scan target.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,6 +504,36 @@ pub fn derive_delta_scan_partition_target_diagnostic(
     })
 }
 
+/// Collects cheap local host signals for scan partition target diagnostics.
+#[doc(hidden)]
+pub fn delta_scan_partition_target_local_environment_diagnostic()
+-> DeltaScanPartitionTargetLocalEnvironmentDiagnostic {
+    let profile = DeltaExecutionEnvironmentProfile::from_local_environment();
+    let available_parallelism = profile.available_parallelism;
+    let memory_total_bytes = profile
+        .memory_hint
+        .and_then(|memory_hint| memory_hint.total_bytes);
+    let memory_available_bytes = profile
+        .memory_hint
+        .and_then(|memory_hint| memory_hint.available_bytes);
+    let (unix_soft_file_descriptor_limit, unix_soft_file_descriptor_limit_status) =
+        unix_soft_file_descriptor_diagnostic(profile.unix_file_descriptor_limit);
+
+    DeltaScanPartitionTargetLocalEnvironmentDiagnostic {
+        policy_input: DeltaScanPartitionTargetDiagnosticInput {
+            available_parallelism,
+            datafusion_target_partitions: available_parallelism,
+            available_memory_bytes: memory_available_bytes,
+            unix_soft_file_descriptor_limit,
+            ..DeltaScanPartitionTargetDiagnosticInput::default()
+        },
+        memory_total_bytes,
+        memory_available_bytes,
+        unix_soft_file_descriptor_limit,
+        unix_soft_file_descriptor_limit_status,
+    }
+}
+
 impl From<DeltaScanPartitionTargetSource> for DeltaScanPartitionTargetDiagnosticSource {
     fn from(source: DeltaScanPartitionTargetSource) -> Self {
         match source {
@@ -482,6 +543,33 @@ impl From<DeltaScanPartitionTargetSource> for DeltaScanPartitionTargetDiagnostic
             }
             DeltaScanPartitionTargetSource::StaticFallback => Self::StaticFallback,
         }
+    }
+}
+
+fn unix_soft_file_descriptor_diagnostic(
+    limit: Option<DeltaUnixFileDescriptorLimit>,
+) -> (
+    Option<u64>,
+    DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+) {
+    let Some(limit) = limit else {
+        let status = if cfg!(unix) {
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unknown
+        } else {
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unsupported
+        };
+        return (None, status);
+    };
+
+    match limit.soft_limit {
+        DeltaUnixResourceLimit::Finite(soft_limit) => (
+            Some(soft_limit),
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite,
+        ),
+        DeltaUnixResourceLimit::Unlimited => (
+            None,
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unlimited,
+        ),
     }
 }
 
@@ -659,6 +747,67 @@ mod tests {
         assert_eq!(output.memory_cap, Some(2));
 
         Ok(())
+    }
+
+    #[test]
+    fn local_environment_diagnostic_feeds_policy_input() -> Result<(), Box<dyn std::error::Error>> {
+        let diagnostic = delta_scan_partition_target_local_environment_diagnostic();
+        let decision = derive_delta_scan_partition_target_diagnostic(diagnostic.policy_input)?;
+
+        assert_eq!(
+            diagnostic.policy_input.datafusion_target_partitions,
+            diagnostic.policy_input.available_parallelism
+        );
+        assert_eq!(
+            diagnostic.policy_input.available_memory_bytes,
+            diagnostic.memory_available_bytes
+        );
+        assert_eq!(
+            diagnostic.policy_input.unix_soft_file_descriptor_limit,
+            diagnostic.unix_soft_file_descriptor_limit
+        );
+        assert!(decision.target_partitions > 0);
+        if diagnostic.unix_soft_file_descriptor_limit.is_some() {
+            assert_eq!(
+                diagnostic.unix_soft_file_descriptor_limit_status,
+                DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn unix_fd_diagnostic_distinguishes_unknown_finite_and_unlimited() {
+        let (value, status) = unix_soft_file_descriptor_diagnostic(None);
+        assert_eq!(value, None);
+        assert!(matches!(
+            status,
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unknown
+                | DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unsupported
+        ));
+
+        let (value, status) =
+            unix_soft_file_descriptor_diagnostic(Some(DeltaUnixFileDescriptorLimit {
+                soft_limit: DeltaUnixResourceLimit::Finite(128),
+                hard_limit: DeltaUnixResourceLimit::Finite(256),
+            }));
+        assert_eq!(value, Some(128));
+        assert_eq!(
+            status,
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite
+        );
+
+        let (value, status) =
+            unix_soft_file_descriptor_diagnostic(Some(DeltaUnixFileDescriptorLimit {
+                soft_limit: DeltaUnixResourceLimit::Unlimited,
+                hard_limit: DeltaUnixResourceLimit::Unlimited,
+            }));
+        assert_eq!(value, None);
+        assert_eq!(
+            status,
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unlimited
+        );
     }
 
     #[test]
