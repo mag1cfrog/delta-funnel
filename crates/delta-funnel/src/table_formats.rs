@@ -5,6 +5,8 @@ mod name;
 
 #[cfg(test)]
 pub(crate) use delta::KernelScanFileStats;
+#[cfg(test)]
+pub(crate) use delta::test_support::RealParquetDeltaTable;
 pub(crate) use delta::{
     DeltaKernelPredicate, KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata,
     KernelScanFileMetadata, KernelScanMetadataExpansion, ProjectedDeltaScan,

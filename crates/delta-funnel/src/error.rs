@@ -4,6 +4,39 @@ use crate::redaction::sanitize_uri_for_display;
 
 use snafu::Snafu;
 
+/// Phase associated with a Delta scan file read failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaScanFileReadPhase {
+    /// Parsing the table URI failed.
+    TableUriParsing,
+    /// Converting provider file metadata into kernel file metadata failed.
+    FileMetadataConversion,
+    /// Resolving the Delta add-action path against the table root failed.
+    FilePathResolution,
+    /// Constructing the kernel object-store engine failed.
+    ObjectStoreEngineConstruction,
+    /// Starting a Parquet read failed.
+    ParquetReadSetup,
+    /// Reading a Parquet batch failed.
+    ParquetBatchRead,
+    /// Converting kernel engine data into Arrow failed.
+    ArrowConversion,
+}
+
+impl std::fmt::Display for DeltaScanFileReadPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TableUriParsing => "table URI parsing",
+            Self::FileMetadataConversion => "file metadata conversion",
+            Self::FilePathResolution => "file path resolution",
+            Self::ObjectStoreEngineConstruction => "object store engine construction",
+            Self::ParquetReadSetup => "Parquet read setup",
+            Self::ParquetBatchRead => "Parquet batch read",
+            Self::ArrowConversion => "Arrow conversion",
+        })
+    }
+}
+
 /// Error type used by DeltaFunnel APIs.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -212,6 +245,30 @@ pub enum DeltaFunnelError {
         snapshot_version: u64,
         /// Sanitized reason for the partition planning failure.
         reason: String,
+    },
+
+    /// A Delta scan data file could not be read through the kernel adapter.
+    #[snafu(display(
+        "Delta scan file read error for source `{}` at snapshot version {snapshot_version} ({}), file `{}` during {phase}: {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(path),
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    DeltaScanFileRead {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Resolved Delta snapshot version.
+        snapshot_version: u64,
+        /// Delta add-action path associated with the read failure.
+        path: String,
+        /// Read phase associated with the failure.
+        phase: DeltaScanFileReadPhase,
+        /// Underlying kernel read failure.
+        #[snafu(source(from(delta_kernel::Error, Box::new)))]
+        source: Box<delta_kernel::Error>,
     },
 
     /// A required dependency contract is unavailable or incompatible.

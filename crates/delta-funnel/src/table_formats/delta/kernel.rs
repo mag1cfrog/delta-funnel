@@ -9,6 +9,7 @@ use datafusion::logical_expr::{Expr as DataFusionExpr, Operator as DataFusionOpe
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 pub(crate) use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::arrow::error::ArrowError;
+pub(crate) use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 pub(crate) use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 pub(crate) use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -22,7 +23,10 @@ pub(crate) use delta_kernel::scan::state::{DvInfo, ScanFile, transform_to_logica
 pub(crate) use delta_kernel::schema::SchemaRef as KernelSchemaRef;
 pub(crate) use delta_kernel::table_features::TABLE_FEATURES_MIN_READER_VERSION;
 use delta_kernel::table_features::TableFeature;
-pub(crate) use delta_kernel::{Snapshot, SnapshotRef, Version, try_parse_uri};
+pub(crate) use delta_kernel::{
+    Error as DeltaKernelError, FileMeta, ParquetHandler, Snapshot, SnapshotRef, Version,
+    try_parse_uri,
+};
 use snafu::Snafu;
 
 /// Protocol details extracted through the private kernel adapter boundary.
