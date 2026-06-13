@@ -5,8 +5,6 @@ use datafusion::common::DataFusionError;
 use crate::DeltaFunnelError;
 
 mod execution;
-mod execution_environment;
-mod file_reader;
 mod planning;
 mod provider;
 mod registration;

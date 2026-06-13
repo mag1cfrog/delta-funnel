@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-use super::planning::file_task::DeltaScanFileTask;
+use super::super::planning::file_task::DeltaScanFileTask;
 
 /// Reusable file-level Delta reader for one provider scan context.
 #[allow(dead_code)]

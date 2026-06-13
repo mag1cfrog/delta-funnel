@@ -5,7 +5,7 @@
 //! reduced by cheap OS resource hints when those hints are available. Unit tests
 //! inject machine context instead of reading host state.
 
-use super::super::execution_environment::{
+use super::super::execution::environment::{
     DeltaExecutionEnvironmentProfile, DeltaExecutionOsFamily, DeltaMemoryHint,
     DeltaUnixFileDescriptorLimit, DeltaUnixResourceLimit,
 };
@@ -587,7 +587,7 @@ fn target_planning_error<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::execution_environment::{
+    use super::super::super::execution::environment::{
         DeltaExecutionOsFamily, DeltaMemoryHint, DeltaUnixFileDescriptorLimit,
     };
     use super::*;
