@@ -37,6 +37,36 @@ impl std::fmt::Display for DeltaScanFileReadPhase {
     }
 }
 
+/// Phase associated with a Delta scan deletion-vector failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaScanDeletionVectorPhase {
+    /// Parsing the table URI failed.
+    TableUriParsing,
+    /// Constructing the kernel object-store engine failed.
+    ObjectStoreEngineConstruction,
+    /// Accessing the preserved deletion-vector descriptor failed.
+    DescriptorAccess,
+    /// Reading or decoding the deletion-vector payload failed.
+    PayloadRead,
+    /// The selection vector did not match the physical file row count.
+    SelectionVectorLengthMismatch,
+    /// The selection vector was consumed after it was closed.
+    SelectionVectorExhaustion,
+}
+
+impl std::fmt::Display for DeltaScanDeletionVectorPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TableUriParsing => "table URI parsing",
+            Self::ObjectStoreEngineConstruction => "object store engine construction",
+            Self::DescriptorAccess => "deletion-vector descriptor access",
+            Self::PayloadRead => "deletion-vector payload read",
+            Self::SelectionVectorLengthMismatch => "selection-vector length mismatch",
+            Self::SelectionVectorExhaustion => "selection-vector exhaustion",
+        })
+    }
+}
+
 /// Error type used by DeltaFunnel APIs.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -267,6 +297,30 @@ pub enum DeltaFunnelError {
         /// Read phase associated with the failure.
         phase: DeltaScanFileReadPhase,
         /// Underlying kernel read failure.
+        #[snafu(source(from(delta_kernel::Error, Box::new)))]
+        source: Box<delta_kernel::Error>,
+    },
+
+    /// A Delta scan deletion vector could not be loaded or consumed safely.
+    #[snafu(display(
+        "Delta scan deletion-vector error for source `{}` at snapshot version {snapshot_version} ({}), file `{}` during {phase}: {}",
+        sanitize_source_name_for_display(source_name),
+        sanitize_uri_for_display(table_uri),
+        sanitize_reason_for_display(path),
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    DeltaScanDeletionVector {
+        /// Caller-provided source name.
+        source_name: String,
+        /// Sanitized or sanitizable Delta table URI context.
+        table_uri: String,
+        /// Resolved Delta snapshot version.
+        snapshot_version: u64,
+        /// Delta add-action path associated with the deletion-vector failure.
+        path: String,
+        /// Deletion-vector phase associated with the failure.
+        phase: DeltaScanDeletionVectorPhase,
+        /// Underlying kernel deletion-vector failure.
         #[snafu(source(from(delta_kernel::Error, Box::new)))]
         source: Box<delta_kernel::Error>,
     },
