@@ -209,6 +209,7 @@ impl SyntheticWorkloadCase {
         Ok(vec![
             Self::partitioned_event_log_target_shape()?,
             Self::many_tiny_files()?,
+            Self::mixed_tiny_large_files()?,
         ])
     }
 
@@ -247,6 +248,28 @@ impl SyntheticWorkloadCase {
             FILE_COUNT as u64 * ROWS_PER_FILE,
             FILE_COUNT as u64 * BYTES_PER_FILE,
             &[(ROWS_PER_FILE, BYTES_PER_FILE); FILE_COUNT],
+        )
+    }
+
+    fn mixed_tiny_large_files() -> Result<Self, SyntheticGenerationError> {
+        const TINY_FILE_COUNT: usize = 1_024;
+        const TINY_ROWS_PER_FILE: u64 = 1_000;
+        const TINY_BYTES_PER_FILE: u64 = 64 * 1024;
+        const LARGE_FILE_COUNT: usize = 16;
+        const LARGE_ROWS_PER_FILE: u64 = 1_000_000;
+        const LARGE_BYTES_PER_FILE: u64 = 128 * MIB;
+
+        let mut files = Vec::with_capacity(TINY_FILE_COUNT + LARGE_FILE_COUNT);
+        files.extend([(TINY_ROWS_PER_FILE, TINY_BYTES_PER_FILE); TINY_FILE_COUNT]);
+        files.extend([(LARGE_ROWS_PER_FILE, LARGE_BYTES_PER_FILE); LARGE_FILE_COUNT]);
+
+        Self::explicit_files(
+            "mixed_tiny_large_files",
+            TINY_FILE_COUNT as u64 * TINY_ROWS_PER_FILE
+                + LARGE_FILE_COUNT as u64 * LARGE_ROWS_PER_FILE,
+            TINY_FILE_COUNT as u64 * TINY_BYTES_PER_FILE
+                + LARGE_FILE_COUNT as u64 * LARGE_BYTES_PER_FILE,
+            &files,
         )
     }
 
@@ -1791,10 +1814,11 @@ mod tests {
         let csv = String::from_utf8(output)?;
         let lines = csv.lines().collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), 251);
+        assert_eq!(lines.len(), 376);
         assert!(lines[0].starts_with("benchmark_schema_version,host_os,host_arch"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
+        assert!(csv.contains(",mixed_tiny_large_files,"));
         assert!(!csv.contains(",empty_scan,"));
         assert!(!csv.contains(",one_file,"));
         assert!(!csv.contains(",few_medium_files,"));
@@ -1834,10 +1858,17 @@ mod tests {
 
         assert_eq!(
             names,
-            ["partitioned_event_log_target_shape", "many_tiny_files"]
+            [
+                "partitioned_event_log_target_shape",
+                "many_tiny_files",
+                "mixed_tiny_large_files"
+            ]
         );
         assert_eq!(workload_cases[1].file_set.files.len(), 4_096);
         assert!(workload_cases[1].file_set.files.len() > workload_cases[0].file_set.files.len());
+        assert_eq!(workload_cases[2].file_set.files.len(), 1_040);
+        assert!(workload_cases[2].shape.active_data_size_bytes > 2 * 1024 * MIB);
+        assert!(workload_cases[2].shape.average_file_size_bytes() > MIB);
         assert!(
             workload_cases
                 .iter()
@@ -2373,7 +2404,7 @@ mod tests {
                 available_parallelism: Some(16),
             },
             workload_case: "test-workload",
-            workload_case_count: 2,
+            workload_case_count: 3,
             simulation_profile_count: SyntheticWorkSimulationProfile::standard_profiles().len(),
             simulation,
             policy_case: case,
@@ -2387,7 +2418,7 @@ mod tests {
         assert_eq!(row[1], "test-os");
         assert_eq!(row[2], "test-arch");
         assert_eq!(row[3], "16");
-        assert_eq!(row[4], "2");
+        assert_eq!(row[4], "3");
         assert_eq!(row[5], "test-workload");
         assert_eq!(row[26], "default_policy");
         assert_eq!(row[33], "16");
