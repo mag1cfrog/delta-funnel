@@ -23,13 +23,17 @@ use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
 use super::file_reader::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
-use super::scheduling::DeltaProviderExecutionOptions;
+use super::scheduling::{
+    DeltaProviderExecutionOptions, DeltaProviderSyncPartitionReadLimiter,
+    DeltaProviderSyncReadLimiter,
+};
 
 pub(crate) struct DeltaScanPlanningExec {
     scan_plan: ProviderScanPlan,
     partition_plan: DeltaScanFileTaskPartitionPlan,
     partition_target_decision: DeltaScanPartitionTargetDecision,
     execution_options: DeltaProviderExecutionOptions,
+    sync_read_limiter: Arc<DeltaProviderSyncReadLimiter>,
     properties: Arc<PlanProperties>,
 }
 
@@ -52,11 +56,15 @@ impl DeltaScanPlanningExec {
         )
         .with_scheduling_type(SchedulingType::Cooperative);
 
+        let sync_read_limiter =
+            DeltaProviderSyncReadLimiter::new(execution_options, partition_plan.partitions.len());
+
         Self {
             scan_plan,
             partition_plan,
             partition_target_decision,
             execution_options,
+            sync_read_limiter,
             properties: Arc::new(properties),
         }
     }
@@ -185,12 +193,17 @@ impl ExecutionPlan for DeltaScanPlanningExec {
         );
         let read_schema = self.scan_plan.kernel_scan().read_schema();
         let file_tasks = scan_partition.file_tasks.clone();
+        let partition_limiter = self
+            .sync_read_limiter
+            .partition_limiter(partition)
+            .map_err(DataFusionError::from)?;
 
         Ok(sequential_scan_partition_stream(
             Arc::clone(&self.scan_plan.projected_schema),
             file_reader,
             read_schema,
             file_tasks,
+            partition_limiter,
         ))
     }
 }
@@ -216,12 +229,18 @@ fn sequential_scan_partition_stream(
     file_reader: Arc<dyn DeltaScanPartitionFileReader>,
     read_schema: KernelScanReadSchema,
     file_tasks: Vec<DeltaScanFileTask>,
+    partition_limiter: DeltaProviderSyncPartitionReadLimiter,
 ) -> SendableRecordBatchStream {
     let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
     let output = builder.tx();
 
     builder.spawn_blocking(move || {
         for task in file_tasks {
+            if output.is_closed() {
+                return Ok(());
+            }
+
+            let _permit = partition_limiter.acquire_file_permit();
             let file_result = file_reader
                 .read_file(DeltaFileReadRequest {
                     task: &task,
@@ -257,7 +276,9 @@ mod tests {
     use futures_util::StreamExt;
 
     use super::super::file_reader::{DeltaFileReadRequest, DeltaFileReadResult};
-    use super::DeltaScanPartitionFileReader;
+    use super::{
+        DeltaProviderExecutionOptions, DeltaProviderSyncReadLimiter, DeltaScanPartitionFileReader,
+    };
     use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
     };
@@ -766,7 +787,10 @@ mod tests {
         let reader = Arc::new(FakePartitionFileReader {
             read_count: Arc::clone(&read_count),
             schema: Arc::clone(&schema),
+            fail_path: None,
         });
+        let sync_read_limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::default(), 1);
         let mut stream = super::sequential_scan_partition_stream(
             schema,
             reader,
@@ -775,6 +799,7 @@ mod tests {
                 fake_task("part-00000.parquet"),
                 fake_task("part-00001.parquet"),
             ],
+            sync_read_limiter.partition_limiter(0)?,
         );
 
         let first = stream.next().await.ok_or("expected first batch")??;
@@ -797,6 +822,79 @@ mod tests {
 
         assert_eq!(remaining_ids, vec![2, 3]);
         assert_eq!(read_count.load(Ordering::SeqCst), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sequential_stream_releases_file_permit_after_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = RealParquetDeltaTable::new_default("permit-success-read-schema")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
+        let sync_read_limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::default(), 1);
+        let reader = Arc::new(FakePartitionFileReader {
+            read_count: Arc::new(AtomicUsize::new(0)),
+            schema: Arc::clone(&schema),
+            fail_path: None,
+        });
+        let stream = super::sequential_scan_partition_stream(
+            schema,
+            reader,
+            scan.read_schema(),
+            vec![fake_task("part-00001.parquet")],
+            sync_read_limiter.partition_limiter(0)?,
+        );
+
+        let batches = datafusion::physical_plan::common::collect(stream).await?;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(sync_read_limiter.active_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sequential_stream_releases_file_permit_after_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = RealParquetDeltaTable::new_default("permit-failure-read-schema")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
+        let sync_read_limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::default(), 1);
+        let reader = Arc::new(FakePartitionFileReader {
+            read_count: Arc::new(AtomicUsize::new(0)),
+            schema: Arc::clone(&schema),
+            fail_path: Some("part-00001.parquet"),
+        });
+        let stream = super::sequential_scan_partition_stream(
+            schema,
+            reader,
+            scan.read_schema(),
+            vec![fake_task("part-00001.parquet")],
+            sync_read_limiter.partition_limiter(0)?,
+        );
+
+        let error = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect_err("fake read failure must reach DataFusion");
+
+        assert!(
+            error.to_string().contains("fake file read failure"),
+            "{error}"
+        );
+        assert_eq!(sync_read_limiter.active_file_reads(), 0);
 
         Ok(())
     }
@@ -834,6 +932,7 @@ mod tests {
     struct FakePartitionFileReader {
         read_count: Arc<AtomicUsize>,
         schema: datafusion::arrow::datatypes::SchemaRef,
+        fail_path: Option<&'static str>,
     }
 
     impl DeltaScanPartitionFileReader for FakePartitionFileReader {
@@ -842,6 +941,11 @@ mod tests {
             request: DeltaFileReadRequest<'_>,
         ) -> Result<DeltaFileReadResult, crate::DeltaFunnelError> {
             self.read_count.fetch_add(1, Ordering::SeqCst);
+            if self.fail_path == Some(request.task.path.as_str()) {
+                return Err(crate::DeltaFunnelError::Config {
+                    message: "fake file read failure".to_owned(),
+                });
+            }
 
             let ids = match request.task.path.as_str() {
                 "part-00000.parquet" => vec![vec![1], vec![2]],
