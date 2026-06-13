@@ -19,6 +19,7 @@ use super::uri::normalize_delta_table_uri;
 const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
 const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
 const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
 const DATA_FILE: &str = "part-00000.parquet";
 const MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
@@ -104,7 +105,34 @@ impl RealParquetDeltaTable {
                     max_customer: "bob".to_owned(),
                     customer_null_count: 1,
                 },
+                partition_values_json: "{}".to_owned(),
                 deletion_vector: Some(deletion_vector_fixture(deleted_rows)?),
+            }],
+        )
+    }
+
+    /// Creates a local Delta table whose partition column must be materialized
+    /// by the kernel physical-to-logical transform.
+    pub(crate) fn new_with_partition_value(
+        name: &str,
+        region: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            PARTITIONED_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batch: default_batch()?,
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: format!(r#"{{"region":"{region}"}}"#),
+                deletion_vector: None,
             }],
         )
     }
@@ -120,6 +148,7 @@ impl RealParquetDeltaTable {
                 path: DATA_FILE.to_owned(),
                 batch,
                 stats,
+                partition_values_json: "{}".to_owned(),
                 deletion_vector: None,
             }],
         )
@@ -135,6 +164,15 @@ impl RealParquetDeltaTable {
     fn new_with_protocol_file_batches(
         name: &str,
         protocol_json: &str,
+        files: Vec<RealParquetDataFile>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(name, protocol_json, METADATA_JSON, files)
+    }
+
+    fn new_with_protocol_metadata_file_batches(
+        name: &str,
+        protocol_json: &str,
+        metadata_json: &str,
         files: Vec<RealParquetDataFile>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let path = Path::new("target")
@@ -170,16 +208,22 @@ impl RealParquetDeltaTable {
                     &file.path,
                     data_file_size,
                     &file.stats,
+                    &file.partition_values_json,
                     &deletion_vector.descriptor,
                 ));
             } else {
-                add_actions.push(add_json(&file.path, data_file_size, &file.stats));
+                add_actions.push(add_json(
+                    &file.path,
+                    data_file_size,
+                    &file.stats,
+                    &file.partition_values_json,
+                ));
             }
         }
 
         fs::write(
             log_path.join("00000000000000000000.json"),
-            format!("{protocol_json}\n{METADATA_JSON}\n"),
+            format!("{protocol_json}\n{metadata_json}\n"),
         )?;
         fs::write(
             log_path.join("00000000000000000001.json"),
@@ -214,6 +258,7 @@ struct RealParquetDataFile {
     path: String,
     batch: kernel::RecordBatch,
     stats: AddStats,
+    partition_values_json: String,
     deletion_vector: Option<RealParquetDeletionVector>,
 }
 
@@ -300,18 +345,19 @@ fn file_batch(
             max_customer,
             customer_null_count,
         },
+        partition_values_json: "{}".to_owned(),
         deletion_vector: None,
     })
 }
 
-fn add_json(path: &str, size: u64, stats: &AddStats) -> String {
+fn add_json(path: &str, size: u64, stats: &AddStats, partition_values_json: &str) -> String {
     let rows = stats.rows;
     let max_id = stats.max_id;
     let min_customer = &stats.min_customer;
     let max_customer = &stats.max_customer;
     let null_count = stats.customer_null_count;
     format!(
-        r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":{MODIFICATION_TIME_MS},"dataChange":true,"stats":"{{\"numRecords\":{rows},\"minValues\":{{\"id\":1,\"customer_name\":\"{min_customer}\"}},\"maxValues\":{{\"id\":{max_id},\"customer_name\":\"{max_customer}\"}},\"nullCount\":{{\"id\":0,\"customer_name\":{null_count}}}}}"}}}}"#
+        r#"{{"add":{{"path":"{path}","partitionValues":{partition_values_json},"size":{size},"modificationTime":{MODIFICATION_TIME_MS},"dataChange":true,"stats":"{{\"numRecords\":{rows},\"minValues\":{{\"id\":1,\"customer_name\":\"{min_customer}\"}},\"maxValues\":{{\"id\":{max_id},\"customer_name\":\"{max_customer}\"}},\"nullCount\":{{\"id\":0,\"customer_name\":{null_count}}}}}"}}}}"#
     )
 }
 
@@ -319,6 +365,7 @@ fn dv_add_json(
     path: &str,
     size: u64,
     stats: &AddStats,
+    partition_values_json: &str,
     descriptor: &DeletionVectorDescriptor,
 ) -> String {
     let rows = stats.rows;
@@ -332,7 +379,7 @@ fn dv_add_json(
     let size_in_bytes = descriptor.size_in_bytes;
     let cardinality = descriptor.cardinality;
     format!(
-        r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":{MODIFICATION_TIME_MS},"dataChange":true,"stats":"{{\"numRecords\":{rows},\"minValues\":{{\"id\":1,\"customer_name\":\"{min_customer}\"}},\"maxValues\":{{\"id\":{max_id},\"customer_name\":\"{max_customer}\"}},\"nullCount\":{{\"id\":0,\"customer_name\":{null_count}}}}}","deletionVector":{{"storageType":"{storage_type}","pathOrInlineDv":"{path_or_inline_dv}","offset":{offset},"sizeInBytes":{size_in_bytes},"cardinality":{cardinality}}}}}}}"#
+        r#"{{"add":{{"path":"{path}","partitionValues":{partition_values_json},"size":{size},"modificationTime":{MODIFICATION_TIME_MS},"dataChange":true,"stats":"{{\"numRecords\":{rows},\"minValues\":{{\"id\":1,\"customer_name\":\"{min_customer}\"}},\"maxValues\":{{\"id\":{max_id},\"customer_name\":\"{max_customer}\"}},\"nullCount\":{{\"id\":0,\"customer_name\":{null_count}}}}}","deletionVector":{{"storageType":"{storage_type}","pathOrInlineDv":"{path_or_inline_dv}","offset":{offset},"sizeInBytes":{size_in_bytes},"cardinality":{cardinality}}}}}}}"#
     )
 }
 
