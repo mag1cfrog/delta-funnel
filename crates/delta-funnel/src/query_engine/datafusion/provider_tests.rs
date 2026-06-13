@@ -9,7 +9,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use super::super::execution::DeltaScanPlanningExec;
-use super::super::partition_target::DeltaScanPartitionTargetSource;
+use super::super::planning::partition_target::DeltaScanPartitionTargetSource;
 use super::*;
 use crate::query_engine::datafusion::registration::{
     DeltaTableProviderConfig, register_delta_sources,

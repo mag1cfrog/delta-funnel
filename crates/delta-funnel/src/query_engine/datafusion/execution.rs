@@ -13,9 +13,9 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 
-use super::file_task_partition::DeltaScanFileTaskPartitionPlan;
-use super::partition_target::DeltaScanPartitionTargetDecision;
-use super::scan_plan::ProviderScanPlan;
+use super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
+use super::planning::partition_target::DeltaScanPartitionTargetDecision;
+use super::planning::scan_plan::ProviderScanPlan;
 
 pub(crate) struct DeltaScanPlanningExec {
     scan_plan: ProviderScanPlan,

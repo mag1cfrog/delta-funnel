@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-use super::file_task::DeltaScanFileTask;
+use super::planning::file_task::DeltaScanFileTask;
 
 /// Reusable file-level Delta reader for one provider scan context.
 #[allow(dead_code)]
@@ -244,7 +244,7 @@ mod tests {
     use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 
     use super::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
-    use crate::query_engine::datafusion::file_task::DeltaScanFileTask;
+    use crate::query_engine::datafusion::planning::file_task::DeltaScanFileTask;
     use crate::table_formats::RealParquetDeltaTable;
     use crate::table_formats::{
         DeltaSourceConfig, KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata,

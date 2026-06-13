@@ -7,16 +7,12 @@ use crate::DeltaFunnelError;
 mod execution;
 mod execution_environment;
 mod file_reader;
-mod file_task;
-mod file_task_partition;
 mod filters;
-mod partition_target;
-mod projection;
+mod planning;
 mod provider;
 mod registration;
-mod scan_plan;
 
-pub use partition_target::{
+pub use planning::partition_target::{
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,

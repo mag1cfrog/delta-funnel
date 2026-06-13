@@ -5,13 +5,12 @@
 //! reduced by cheap OS resource hints when those hints are available. Unit tests
 //! inject machine context instead of reading host state.
 
-use crate::{DeltaFunnelError, error::DeltaScanFileTaskPartitionPlanningSnafu};
-
-use super::execution_environment::{
+use super::super::execution_environment::{
     DeltaExecutionEnvironmentProfile, DeltaExecutionOsFamily, DeltaMemoryHint,
     DeltaUnixFileDescriptorLimit, DeltaUnixResourceLimit,
 };
 use super::file_task_partition::DeltaScanFileTaskPartitionOptions;
+use crate::{DeltaFunnelError, error::DeltaScanFileTaskPartitionPlanningSnafu};
 
 const DEFAULT_MIN_PARTITIONS: usize = 1;
 const DEFAULT_PARALLELISM_MULTIPLIER: usize = 1;
@@ -588,7 +587,7 @@ fn target_planning_error<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::execution_environment::{
+    use super::super::super::execution_environment::{
         DeltaExecutionOsFamily, DeltaMemoryHint, DeltaUnixFileDescriptorLimit,
     };
     use super::*;
