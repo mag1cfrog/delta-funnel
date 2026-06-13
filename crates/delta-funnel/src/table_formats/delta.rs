@@ -6,7 +6,10 @@ use crate::{DeltaFunnelError, error::DeltaSourceSchemaSnafu};
 
 mod kernel;
 mod protocol;
+mod read;
 mod snapshot;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod uri;
 
 use super::validate_table_source_names;
@@ -15,6 +18,7 @@ pub(crate) use kernel::{DeltaKernelPredicate, datafusion_expr_to_kernel_predicat
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };
+use read::KernelScanReadSchema;
 use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
 
 /// Metadata-only expansion of one kernel scan.
@@ -167,6 +171,17 @@ impl ProjectedDeltaScan {
     #[must_use]
     pub(crate) fn kernel_scan(&self) -> &kernel::Scan {
         &self.scan
+    }
+
+    /// Returns the kernel scan schema state needed by later data-file reads.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn read_schema(&self) -> KernelScanReadSchema {
+        KernelScanReadSchema::new(
+            self.scan.physical_schema().clone(),
+            self.scan.logical_schema().clone(),
+            self.scan.physical_predicate().clone(),
+        )
     }
 
     /// Expands this kernel scan into metadata-only scan file records.
