@@ -423,6 +423,58 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn grouped_partition_execution_reads_multiple_file_tasks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_two_files("grouped-partition-real-read")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql("select id, customer_name from orders order by id")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].partition_plan().partitions.len(), 1);
+        assert_eq!(scans[0].partition_plan().partitions[0].file_tasks.len(), 2);
+
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+----+---------------+",
+                "| id | customer_name |",
+                "+----+---------------+",
+                "| 1  | file-a-1      |",
+                "| 2  | file-a-2      |",
+                "| 3  | file-b-3      |",
+                "| 4  | file-b-4      |",
+                "+----+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
     fn register_real_parquet_source(
         ctx: &SessionContext,
         source_name: &str,

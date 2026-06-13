@@ -68,10 +68,35 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local Delta table with two real Parquet files.
+    pub(crate) fn new_with_two_files(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_file_batches(
+            name,
+            vec![
+                file_batch(1, vec![(1, Some("file-a-1")), (2, Some("file-a-2"))])?,
+                file_batch(2, vec![(3, Some("file-b-3")), (4, Some("file-b-4"))])?,
+            ],
+        )
+    }
+
     fn new_with_batch(
         name: &str,
         batch: kernel::RecordBatch,
         stats: AddStats,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_file_batches(
+            name,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batch,
+                stats,
+            }],
+        )
+    }
+
+    fn new_with_file_batches(
+        name: &str,
+        files: Vec<RealParquetDataFile>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let path = Path::new("target")
             .join("delta-funnel-real-parquet-fixtures")
@@ -79,20 +104,29 @@ impl RealParquetDeltaTable {
         let log_path = path.join("_delta_log");
         fs::create_dir_all(&log_path)?;
 
-        let rows = batch.num_rows();
         let table_uri = normalize_delta_table_uri(path.to_string_lossy())?;
         let table_url = kernel::try_parse_uri(&table_uri)?;
         let store = kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
         let engine = kernel::DefaultEngineBuilder::new(store).build();
-        let data_url = table_url.join(DATA_FILE)?;
-        let engine_data: Box<dyn delta_kernel::EngineData> =
-            Box::new(kernel::ArrowEngineData::new(batch));
+        let mut add_actions = Vec::with_capacity(files.len());
+        let mut rows = 0_usize;
+        let mut total_data_file_size = 0_u64;
 
-        engine
-            .parquet_handler()
-            .write_parquet_file(data_url, Box::new(std::iter::once(Ok(engine_data))))?;
+        for file in files {
+            rows = rows.saturating_add(file.batch.num_rows());
 
-        let data_file_size = fs::metadata(path.join(DATA_FILE))?.len();
+            let data_url = table_url.join(&file.path)?;
+            let engine_data: Box<dyn delta_kernel::EngineData> =
+                Box::new(kernel::ArrowEngineData::new(file.batch));
+
+            engine
+                .parquet_handler()
+                .write_parquet_file(data_url, Box::new(std::iter::once(Ok(engine_data))))?;
+
+            let data_file_size = fs::metadata(path.join(&file.path))?.len();
+            total_data_file_size = total_data_file_size.saturating_add(data_file_size);
+            add_actions.push(add_json(&file.path, data_file_size, &file.stats));
+        }
 
         fs::write(
             log_path.join("00000000000000000000.json"),
@@ -100,13 +134,13 @@ impl RealParquetDeltaTable {
         )?;
         fs::write(
             log_path.join("00000000000000000001.json"),
-            format!("{}\n", add_json(DATA_FILE, data_file_size, &stats)),
+            format!("{}\n", add_actions.join("\n")),
         )?;
 
         Ok(Self {
             path,
             rows,
-            data_file_size,
+            data_file_size: total_data_file_size,
         })
     }
 
@@ -125,6 +159,12 @@ impl RealParquetDeltaTable {
     pub(crate) fn rows(&self) -> usize {
         self.rows
     }
+}
+
+struct RealParquetDataFile {
+    path: String,
+    batch: kernel::RecordBatch,
+    stats: AddStats,
 }
 
 struct AddStats {
@@ -163,6 +203,49 @@ fn sequential_batch(rows: usize) -> Result<kernel::RecordBatch, Box<dyn std::err
     ];
 
     Ok(kernel::RecordBatch::try_new(schema(), columns)?)
+}
+
+fn file_batch(
+    index: usize,
+    rows: Vec<(i32, Option<&str>)>,
+) -> Result<RealParquetDataFile, Box<dyn std::error::Error>> {
+    let row_count = rows.len();
+    let path = format!("part-{index:05}.parquet");
+    let ids = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let names = rows
+        .into_iter()
+        .map(|(_, name)| name.map(str::to_owned))
+        .collect::<Vec<_>>();
+    let max_id = ids.iter().copied().max().ok_or("file must have rows")?;
+    let min_customer = names
+        .iter()
+        .flatten()
+        .min()
+        .ok_or("file must have a non-null customer")?
+        .to_string();
+    let max_customer = names
+        .iter()
+        .flatten()
+        .max()
+        .ok_or("file must have a non-null customer")?
+        .to_string();
+    let customer_null_count = names.iter().filter(|name| name.is_none()).count();
+    let columns = vec![
+        Arc::new(Int32Array::from(ids)) as Arc<dyn Array>,
+        Arc::new(StringArray::from(names)) as Arc<dyn Array>,
+    ];
+
+    Ok(RealParquetDataFile {
+        path,
+        batch: kernel::RecordBatch::try_new(schema(), columns)?,
+        stats: AddStats {
+            rows: row_count,
+            max_id,
+            min_customer,
+            max_customer,
+            customer_null_count,
+        },
+    })
 }
 
 fn add_json(path: &str, size: u64, stats: &AddStats) -> String {
