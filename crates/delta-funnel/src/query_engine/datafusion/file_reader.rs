@@ -1,8 +1,9 @@
 //! File-level Delta reader for one provider scan task.
 //!
 //! This module owns the internal correctness boundary between file-task
-//! planning and later DataFusion stream execution. This first slice wires the
-//! non-DV, non-transform path through the official kernel reader baseline.
+//! planning and later DataFusion stream execution. It wires the official kernel
+//! reader baseline through transform application and deletion-vector masking
+//! before any batch is handed to provider execution.
 
 use datafusion::arrow::array::BooleanArray;
 use datafusion::arrow::compute::filter_record_batch;
@@ -14,8 +15,8 @@ use crate::{
     error::{DeltaScanFileReadPhase, DeltaScanFileReadSnafu},
     table_formats::{
         KernelDataFileReadRequest, KernelDataFileReader, KernelDataFileReaderConfig,
-        KernelDeletionVectorReadRequest, KernelDeletionVectorReader,
-        KernelDeletionVectorReaderConfig, KernelPhysicalToLogicalTransform, KernelScanReadSchema,
+        KernelDataFileTransformRequest, KernelDeletionVectorReadRequest,
+        KernelDeletionVectorReader, KernelDeletionVectorReaderConfig, KernelScanReadSchema,
         ProviderDeletionVectorSelection, ProviderDeletionVectorSelectionContext,
     },
 };
@@ -91,7 +92,6 @@ impl DeltaFileReader {
         request: DeltaFileReadRequest<'_>,
     ) -> Result<DeltaFileReadResult, DeltaFunnelError> {
         self.validate_task_context(request.task)?;
-        self.reject_unwired_transform(request.task)?;
         let mut deletion_vector =
             self.deletion_vector_reader
                 .read_selection(KernelDeletionVectorReadRequest {
@@ -107,8 +107,13 @@ impl DeltaFileReader {
                 modification_time_ms: request.task.modification_time_ms,
                 schema: request.read_schema,
             })?;
+        let batches = self.apply_physical_to_logical_transform(
+            request.task,
+            data.batches,
+            request.read_schema,
+        )?;
         let batches =
-            self.apply_deletion_vector_mask(request.task, data.batches, deletion_vector.as_mut())?;
+            self.apply_deletion_vector_mask(request.task, batches, deletion_vector.as_mut())?;
         if let Some(deletion_vector) = deletion_vector.as_mut() {
             deletion_vector.finish(self.deletion_vector_context(request.task))?;
         }
@@ -136,20 +141,25 @@ impl DeltaFileReader {
         })
     }
 
-    fn reject_unwired_transform(&self, task: &DeltaScanFileTask) -> Result<(), DeltaFunnelError> {
-        match &task.transform {
-            KernelPhysicalToLogicalTransform::NotRequired => Ok(()),
-            KernelPhysicalToLogicalTransform::Required(_) => Err(delta_kernel::Error::generic(
-                "physical-to-logical transform application is owned by a later #138 slice",
-            ))
-            .context(DeltaScanFileReadSnafu {
-                source_name: self.source_name.clone(),
-                table_uri: self.table_uri.clone(),
-                snapshot_version: self.snapshot_version,
-                path: task.path.clone(),
-                phase: DeltaScanFileReadPhase::TransformApplication,
-            }),
-        }
+    fn apply_physical_to_logical_transform(
+        &self,
+        task: &DeltaScanFileTask,
+        batches: Vec<RecordBatch>,
+        read_schema: &KernelScanReadSchema,
+    ) -> Result<Vec<RecordBatch>, DeltaFunnelError> {
+        batches
+            .into_iter()
+            .map(|batch| {
+                self.data_file_reader.apply_physical_to_logical_transform(
+                    KernelDataFileTransformRequest {
+                        path: &task.path,
+                        batch,
+                        schema: read_schema,
+                        transform: &task.transform,
+                    },
+                )
+            })
+            .collect()
     }
 
     fn apply_deletion_vector_mask(
@@ -288,30 +298,34 @@ mod tests {
     }
 
     #[test]
-    fn file_reader_rejects_transform_until_slice_is_wired() -> Result<(), Box<dyn std::error::Error>>
+    fn file_reader_applies_physical_to_logical_transform() -> Result<(), Box<dyn std::error::Error>>
     {
-        let table = RealParquetDeltaTable::new_default("file-reader-transform-reject")?;
+        let table = RealParquetDeltaTable::new_default("file-reader-transform-apply")?;
         let source = load_source("orders", &table)?;
         let scan = build_projected_delta_scan(&source, None)?;
         let read_schema = scan.read_schema();
         let mut task = first_file_task(&source, &scan)?;
-        task.transform = KernelPhysicalToLogicalTransform::test_required_column_transform("id");
+        task.transform =
+            KernelPhysicalToLogicalTransform::test_required_orders_customer_name_replacement_transform(
+                "transformed",
+            );
         let reader = test_reader(&source)?;
-        let error = reader
-            .read_file(DeltaFileReadRequest {
-                task: &task,
-                read_schema: &read_schema,
-            })
-            .err()
-            .ok_or("expected transform rejection")?;
-        let display = error.to_string();
+        let result = reader.read_file(DeltaFileReadRequest {
+            task: &task,
+            read_schema: &read_schema,
+        })?;
+        let batch = result.batches.first().ok_or("expected one record batch")?;
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected transformed customer_name StringArray")?;
 
-        assert!(display.contains("source `orders`"), "{display}");
-        assert!(
-            display.contains("physical-to-logical transform application"),
-            "{display}"
-        );
-        assert!(display.contains(table.data_file_path()), "{display}");
+        assert_eq!(batch.num_rows(), table.rows());
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(names.value(0), "transformed");
+        assert_eq!(names.value(1), "transformed");
+        assert_eq!(names.value(2), "transformed");
 
         Ok(())
     }

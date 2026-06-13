@@ -11,7 +11,7 @@ use crate::{
 };
 use snafu::ResultExt;
 
-use super::kernel;
+use super::{KernelPhysicalToLogicalTransform, kernel};
 
 /// Kernel scan schema state required to read physical Parquet data.
 #[allow(dead_code)]
@@ -73,7 +73,7 @@ pub(crate) struct KernelDataFileReader {
     source_name: String,
     table_uri: String,
     snapshot_version: u64,
-    parquet_handler: std::sync::Arc<dyn kernel::ParquetHandler>,
+    engine: std::sync::Arc<dyn kernel::Engine>,
 }
 
 /// Request to read one Delta data file through the official kernel engine path.
@@ -98,14 +98,25 @@ pub(crate) struct KernelDataFileReadResult {
     pub(crate) batches: Vec<kernel::RecordBatch>,
 }
 
+/// Request to apply one scan-file physical-to-logical transform.
+#[allow(dead_code)]
+pub(crate) struct KernelDataFileTransformRequest<'a> {
+    /// Delta add-action table-relative file path.
+    pub(crate) path: &'a str,
+    /// Physical batch returned by the Parquet handler.
+    pub(crate) batch: kernel::RecordBatch,
+    /// Kernel scan schema state for this provider scan.
+    pub(crate) schema: &'a KernelScanReadSchema,
+    /// Kernel transform selected for the scan file.
+    pub(crate) transform: &'a KernelPhysicalToLogicalTransform,
+}
+
 impl KernelDataFileReader {
     /// Builds a reusable official-kernel reader for one provider scan context.
     #[allow(dead_code)]
     pub(crate) fn try_new(
         config: KernelDataFileReaderConfig<'_>,
     ) -> Result<Self, DeltaFunnelError> {
-        use delta_kernel::Engine as _;
-
         const TABLE_ROOT_CONTEXT: &str = "<table-root>";
 
         let table_url =
@@ -124,13 +135,13 @@ impl KernelDataFileReader {
                 path: TABLE_ROOT_CONTEXT.to_owned(),
                 phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
             })?;
-        let engine = kernel::DefaultEngineBuilder::new(store).build();
+        let engine = std::sync::Arc::new(kernel::DefaultEngineBuilder::new(store).build());
 
         Ok(Self {
             source_name: config.source_name.to_owned(),
             table_uri: config.table_uri.to_owned(),
             snapshot_version: config.snapshot_version,
-            parquet_handler: engine.parquet_handler(),
+            engine,
         })
     }
 
@@ -185,7 +196,8 @@ impl KernelDataFileReader {
             })?;
         let file_meta = kernel::FileMeta::new(location, modification_time_ms, size);
         let read_results = self
-            .parquet_handler
+            .engine
+            .parquet_handler()
             .read_parquet_files(
                 std::slice::from_ref(&file_meta),
                 request.schema.physical_schema.clone(),
@@ -221,6 +233,59 @@ impl KernelDataFileReader {
         }
 
         Ok(KernelDataFileReadResult { file_meta, batches })
+    }
+
+    /// Applies the official-kernel physical-to-logical transform for one batch.
+    #[allow(dead_code)]
+    pub(crate) fn apply_physical_to_logical_transform(
+        &self,
+        request: KernelDataFileTransformRequest<'_>,
+    ) -> Result<kernel::RecordBatch, DeltaFunnelError> {
+        let KernelPhysicalToLogicalTransform::Required(transform) = request.transform else {
+            return Ok(request.batch);
+        };
+
+        let physical_rows = request.batch.num_rows();
+        let physical_data: Box<dyn delta_kernel::EngineData> =
+            Box::new(kernel::ArrowEngineData::new(request.batch));
+        let logical_data = kernel::transform_to_logical(
+            self.engine.as_ref(),
+            physical_data,
+            request.schema.physical_schema(),
+            request.schema.logical_schema(),
+            Some(transform.transform.clone()),
+        )
+        .context(DeltaScanFileReadSnafu {
+            source_name: self.source_name.clone(),
+            table_uri: self.table_uri.clone(),
+            snapshot_version: self.snapshot_version,
+            path: request.path.to_owned(),
+            phase: DeltaScanFileReadPhase::TransformApplication,
+        })?;
+        let logical_batch = kernel::EngineDataArrowExt::try_into_record_batch(logical_data)
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: request.path.to_owned(),
+                phase: DeltaScanFileReadPhase::ArrowConversion,
+            })?;
+
+        if logical_batch.num_rows() == physical_rows {
+            return Ok(logical_batch);
+        }
+
+        Err(kernel::DeltaKernelError::generic(format!(
+            "physical-to-logical transform changed row count from {physical_rows} to {}",
+            logical_batch.num_rows()
+        )))
+        .context(DeltaScanFileReadSnafu {
+            source_name: self.source_name.clone(),
+            table_uri: self.table_uri.clone(),
+            snapshot_version: self.snapshot_version,
+            path: request.path.to_owned(),
+            phase: DeltaScanFileReadPhase::TransformApplication,
+        })
     }
 }
 

@@ -26,7 +26,7 @@ pub use protocol::{
 };
 pub(crate) use read::{
     KernelDataFileReadRequest, KernelDataFileReader, KernelDataFileReaderConfig,
-    KernelScanReadSchema,
+    KernelDataFileTransformRequest, KernelScanReadSchema,
 };
 use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
 
@@ -306,6 +306,18 @@ impl KernelPhysicalToLogicalTransform {
         let transform = std::sync::Arc::new(kernel::Expression::Column(kernel::ColumnName::new([
             column_name,
         ])));
+
+        Self::Required(KernelPhysicalToLogicalTransformHandle { transform })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_required_orders_customer_name_replacement_transform(
+        replacement: &str,
+    ) -> Self {
+        let transform = std::sync::Arc::new(kernel::Expression::struct_from([
+            kernel::Expression::Column(kernel::ColumnName::new(["id"])),
+            kernel::Expression::Literal(kernel::Scalar::String(replacement.to_owned())),
+        ]));
 
         Self::Required(KernelPhysicalToLogicalTransformHandle { transform })
     }
