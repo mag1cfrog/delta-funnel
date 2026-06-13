@@ -978,10 +978,10 @@ async fn table_provider_scan_accepts_exact_partition_in_filter()
     );
     assert_eq!(
         scan_partition_file_paths(scan),
-        vec![vec![
-            "part-00000.parquet".to_owned(),
-            "part-00001.parquet".to_owned()
-        ]]
+        vec![
+            vec!["part-00000.parquet".to_owned()],
+            vec!["part-00001.parquet".to_owned()]
+        ]
     );
 
     Ok(())
