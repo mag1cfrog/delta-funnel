@@ -23,7 +23,10 @@ pub(crate) use kernel::{DeltaKernelPredicate, datafusion_expr_to_kernel_predicat
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };
-use read::KernelScanReadSchema;
+pub(crate) use read::{
+    KernelDataFileReadRequest, KernelDataFileReader, KernelDataFileReaderConfig,
+    KernelScanReadSchema,
+};
 use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
 
 /// Metadata-only expansion of one kernel scan.
@@ -121,6 +124,14 @@ impl KernelScanDeletionVectorMetadata {
     #[must_use]
     pub(crate) fn is_present(&self) -> bool {
         matches!(self, Self::Present(_))
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn test_present() -> Self {
+        Self::Present(KernelScanDeletionVectorHandle {
+            dv_info: kernel::DvInfo::default(),
+        })
     }
 }
 

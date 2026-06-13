@@ -21,6 +21,10 @@ pub enum DeltaScanFileReadPhase {
     ParquetBatchRead,
     /// Converting kernel engine data into Arrow failed.
     ArrowConversion,
+    /// Applying a physical-to-logical transform failed.
+    TransformApplication,
+    /// Applying a deletion-vector mask failed.
+    DeletionVectorMasking,
 }
 
 impl std::fmt::Display for DeltaScanFileReadPhase {
@@ -33,6 +37,8 @@ impl std::fmt::Display for DeltaScanFileReadPhase {
             Self::ParquetReadSetup => "Parquet read setup",
             Self::ParquetBatchRead => "Parquet batch read",
             Self::ArrowConversion => "Arrow conversion",
+            Self::TransformApplication => "physical-to-logical transform application",
+            Self::DeletionVectorMasking => "deletion-vector masking",
         })
     }
 }
