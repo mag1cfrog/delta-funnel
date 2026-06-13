@@ -20,7 +20,7 @@ const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
 const BENCHMARK_SCHEMA_VERSION: u32 = 1;
-const BENCHMARK_CSV_HEADER: [&str; 51] = [
+const BENCHMARK_CSV_HEADER: [&str; 53] = [
     "benchmark_schema_version",
     "host_os",
     "host_arch",
@@ -63,6 +63,8 @@ const BENCHMARK_CSV_HEADER: [&str; 51] = [
     "simulated_max_file_micros",
     "simulated_output_partitions",
     "simulated_wall_micros",
+    "simulated_throughput_mib_per_second",
+    "simulated_rows_per_second",
     "partition_files_p50",
     "partition_files_p95",
     "partition_files_max",
@@ -1563,6 +1565,14 @@ fn percentile_nearest_rank(mut values: Vec<u64>, percentile: usize) -> u64 {
     values[rank.saturating_sub(1)]
 }
 
+fn throughput_per_second(units: u64, elapsed_micros: u64) -> u64 {
+    if units == 0 || elapsed_micros == 0 {
+        return 0;
+    }
+
+    units.saturating_mul(1_000_000) / elapsed_micros
+}
+
 fn apportion_by_weights(total: u64, weights: &[u64]) -> Result<Vec<u64>, SyntheticGenerationError> {
     if weights.is_empty() {
         return Ok(Vec::new());
@@ -1729,6 +1739,13 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
         input.simulated_work.max_file_micros.to_string(),
         input.partitioned_work.partitions.len().to_string(),
         input.partitioned_work.wall_micros.to_string(),
+        throughput_per_second(
+            file_set.total_bytes() / MIB,
+            input.partitioned_work.wall_micros,
+        )
+        .to_string(),
+        throughput_per_second(file_set.total_rows(), input.partitioned_work.wall_micros)
+            .to_string(),
         partitioned_work_summary.files_p50.to_string(),
         partitioned_work_summary.files_p95.to_string(),
         partitioned_work_summary.files_max.to_string(),
@@ -2284,6 +2301,14 @@ mod tests {
     }
 
     #[test]
+    fn throughput_per_second_handles_zero_and_integer_rate() {
+        assert_eq!(throughput_per_second(0, 100), 0);
+        assert_eq!(throughput_per_second(100, 0), 0);
+        assert_eq!(throughput_per_second(100, 1_000_000), 100);
+        assert_eq!(throughput_per_second(100, 500_000), 200);
+    }
+
+    #[test]
     fn partitioned_work_rejects_zero_target() -> Result<(), Box<dyn Error>> {
         let shape = SyntheticDeltaTableShape::partitioned_event_log();
         let file_set = shape.generate_file_set()?;
@@ -2500,7 +2525,7 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 51);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 53);
         assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(BENCHMARK_CSV_HEADER[1], "host_os");
         assert_eq!(BENCHMARK_CSV_HEADER[2], "host_arch");
@@ -2514,9 +2539,13 @@ mod tests {
         assert_eq!(BENCHMARK_CSV_HEADER[30], "policy_unix_soft_fd_limit");
         assert_eq!(BENCHMARK_CSV_HEADER[33], "policy_target");
         assert_eq!(BENCHMARK_CSV_HEADER[34], "policy_source");
-        assert_eq!(BENCHMARK_CSV_HEADER[42], "partition_files_p50");
         assert_eq!(
-            BENCHMARK_CSV_HEADER[50],
+            BENCHMARK_CSV_HEADER[42],
+            "simulated_throughput_mib_per_second"
+        );
+        assert_eq!(BENCHMARK_CSV_HEADER[44], "partition_files_p50");
+        assert_eq!(
+            BENCHMARK_CSV_HEADER[52],
             "partition_work_imbalance_basis_points"
         );
     }
@@ -2562,7 +2591,8 @@ mod tests {
         assert_eq!(row[33], "16");
         assert_eq!(row[34], "available_parallelism_fallback");
         assert!(!row[42].is_empty());
-        assert!(!row[50].is_empty());
+        assert!(!row[43].is_empty());
+        assert!(!row[52].is_empty());
 
         Ok(())
     }
