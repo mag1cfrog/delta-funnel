@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::{DeltaFunnelError, error::DeltaSourceSchemaSnafu};
 
+mod deletion_vector;
 mod kernel;
 mod protocol;
 mod read;
@@ -13,6 +14,10 @@ pub(crate) mod test_support;
 mod uri;
 
 use super::validate_table_source_names;
+#[allow(unused_imports)]
+pub(crate) use deletion_vector::{
+    KernelDeletionVectorReadRequest, KernelDeletionVectorReader, ProviderDeletionVectorSelection,
+};
 use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{DeltaKernelPredicate, datafusion_expr_to_kernel_predicate};
 pub use protocol::{
@@ -102,6 +107,13 @@ pub(crate) enum KernelScanDeletionVectorMetadata {
 pub(crate) struct KernelScanDeletionVectorHandle {
     /// Kernel deletion-vector metadata for the selected file.
     dv_info: kernel::DvInfo,
+}
+
+impl KernelScanDeletionVectorHandle {
+    #[cfg(test)]
+    pub(crate) fn from_test_dv_info(dv_info: kernel::DvInfo) -> Self {
+        Self { dv_info }
+    }
 }
 
 impl KernelScanDeletionVectorMetadata {
