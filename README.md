@@ -17,5 +17,8 @@ design hardens.
 Foundation dependency and error-handling decisions are recorded in
 [`docs/dependency-alignment.md`](docs/dependency-alignment.md).
 
+The Delta DataFusion scan partition target policy is documented in
+[`docs/scan-partition-target-policy.md`](docs/scan-partition-target-policy.md).
+
 The synthetic scan partition target benchmark runner is documented in
 [`docs/scan-partition-benchmark.md`](docs/scan-partition-benchmark.md).

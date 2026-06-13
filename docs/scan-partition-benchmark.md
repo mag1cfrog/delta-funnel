@@ -3,6 +3,9 @@
 `delta_scan_partition_bench` is a portable synthetic benchmark runner for the
 Delta DataFusion scan partition target policy.
 
+The production policy is documented in
+[`scan-partition-target-policy.md`](scan-partition-target-policy.md).
+
 The runner does not read Parquet data, contact object storage, require S3
 credentials, or execute production scan reads. It builds deterministic
 Delta-like file tasks in memory, runs the production target policy through the
