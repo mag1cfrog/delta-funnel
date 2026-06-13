@@ -25,7 +25,7 @@ use crate::{
     },
 };
 
-use super::super::execution::DeltaScanPlanningExec;
+use super::super::execution::{DeltaProviderExecutionOptions, DeltaScanPlanningExec};
 use super::super::planning::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
 use super::super::planning::partition_target::{
     DeltaScanPartitionTargetConfig, DeltaScanPartitionTargetContext, DeltaScanPartitionTargetPolicy,
@@ -41,6 +41,7 @@ pub(crate) struct DeltaTableProvider {
     protocol: DeltaProtocolReport,
     schema: SchemaRef,
     scan_target_partitions: Option<usize>,
+    execution_options: DeltaProviderExecutionOptions,
 }
 
 impl DeltaTableProvider {
@@ -56,7 +57,22 @@ impl DeltaTableProvider {
         preflight: ProtocolPreflight,
         scan_target_partitions: Option<usize>,
     ) -> Result<Self, DeltaFunnelError> {
+        Self::try_new_with_execution_options(
+            source,
+            preflight,
+            scan_target_partitions,
+            DeltaProviderExecutionOptions::default(),
+        )
+    }
+
+    pub(crate) fn try_new_with_execution_options(
+        source: PlannedDeltaSource,
+        preflight: ProtocolPreflight,
+        scan_target_partitions: Option<usize>,
+        execution_options: DeltaProviderExecutionOptions,
+    ) -> Result<Self, DeltaFunnelError> {
         reject_mismatched_preflight(&source, preflight.protocol())?;
+        execution_options.validate()?;
         let schema = delta_source_arrow_schema(&source)?;
 
         Ok(Self {
@@ -64,6 +80,7 @@ impl DeltaTableProvider {
             protocol: preflight.into_protocol(),
             schema,
             scan_target_partitions,
+            execution_options,
         })
     }
 
@@ -440,6 +457,7 @@ impl TableProvider for DeltaTableProvider {
             scan_plan,
             partition_plan,
             partition_target_decision,
+            self.execution_options,
         )))
     }
 

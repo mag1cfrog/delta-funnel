@@ -23,11 +23,13 @@ use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
 use super::file_reader::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
+use super::scheduling::DeltaProviderExecutionOptions;
 
 pub(crate) struct DeltaScanPlanningExec {
     scan_plan: ProviderScanPlan,
     partition_plan: DeltaScanFileTaskPartitionPlan,
     partition_target_decision: DeltaScanPartitionTargetDecision,
+    execution_options: DeltaProviderExecutionOptions,
     properties: Arc<PlanProperties>,
 }
 
@@ -36,6 +38,7 @@ impl DeltaScanPlanningExec {
         scan_plan: ProviderScanPlan,
         partition_plan: DeltaScanFileTaskPartitionPlan,
         partition_target_decision: DeltaScanPartitionTargetDecision,
+        execution_options: DeltaProviderExecutionOptions,
     ) -> Self {
         // Empty Delta scans keep the grouped plan's zero partitions. DataFusion
         // accepts this at physical planning time, and it avoids inventing empty
@@ -53,6 +56,7 @@ impl DeltaScanPlanningExec {
             scan_plan,
             partition_plan,
             partition_target_decision,
+            execution_options,
             properties: Arc::new(properties),
         }
     }
@@ -70,6 +74,11 @@ impl DeltaScanPlanningExec {
     #[cfg(test)]
     pub(crate) fn partition_target_decision(&self) -> DeltaScanPartitionTargetDecision {
         self.partition_target_decision
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execution_options(&self) -> DeltaProviderExecutionOptions {
+        self.execution_options
     }
 }
 
@@ -89,6 +98,7 @@ impl fmt::Debug for DeltaScanPlanningExec {
                 &self.partition_target_decision.source,
             )
             .field("partition_count", &self.partition_plan.partitions.len())
+            .field("execution_options", &self.execution_options)
             .field(
                 "pushed_filter_count",
                 &self.scan_plan.pushed_filter_plan.pushed_filter_count,
@@ -281,6 +291,10 @@ mod tests {
         );
         assert_eq!(scans.len(), 1);
         assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0]));
+        assert_eq!(
+            scans[0].execution_options(),
+            super::DeltaProviderExecutionOptions::default()
+        );
 
         Ok(())
     }
