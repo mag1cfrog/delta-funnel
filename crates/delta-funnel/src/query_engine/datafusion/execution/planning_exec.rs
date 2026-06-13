@@ -712,6 +712,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deletion_vector_execution_matches_large_file_oracle_without_helper_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_rows_and_deletion_vector(
+            "dv-large-file-oracle-real-read",
+            1003,
+            &[0, 999, 1002],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let dataframe = ctx.sql("select id from orders order by id").await?;
+        let result = dataframe.collect().await?;
+        let ids = result
+            .iter()
+            .map(batch_ids)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let expected = (1..=1003)
+            .filter(|id| ![1, 1000, 1003].contains(id))
+            .collect::<Vec<_>>();
+
+        assert!(result.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 1 && schema.field(0).name() == "id"
+        }));
+        assert_eq!(ids, expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn deletion_vector_execution_preserves_transformed_logical_columns()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();

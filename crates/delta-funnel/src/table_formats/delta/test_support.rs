@@ -78,6 +78,36 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local Delta table whose single sequential data file has a real
+    /// deletion vector.
+    pub(crate) fn new_with_rows_and_deletion_vector(
+        name: &str,
+        rows: usize,
+        deleted_rows: &[u64],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if rows == 0 {
+            return Err("row count must be positive".into());
+        }
+
+        Self::new_with_protocol_file_batches(
+            name,
+            DELETION_VECTOR_PROTOCOL_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batch: sequential_batch(rows)?,
+                stats: AddStats {
+                    rows,
+                    max_id: i32::try_from(rows)?,
+                    min_customer: "customer-1".to_owned(),
+                    max_customer: format!("customer-{rows}"),
+                    customer_null_count: 0,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: Some(deletion_vector_fixture(deleted_rows)?),
+            }],
+        )
+    }
+
     /// Creates a local Delta table with two real Parquet files.
     pub(crate) fn new_with_two_files(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
         Self::new_with_file_batches(
