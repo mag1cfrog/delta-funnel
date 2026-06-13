@@ -16,7 +16,7 @@ use crate::query_engine::datafusion::registration::{
 };
 use crate::query_engine::datafusion::test_support::{
     DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, NESTED_SCHEMA_FIELDS_JSON,
-    PARTITIONED_SCHEMA_FIELDS_JSON, register_fixture_source,
+    PARTITIONED_SCHEMA_FIELDS_JSON, find_delta_scan_plans, register_fixture_source,
 };
 use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
@@ -567,6 +567,105 @@ async fn table_provider_scan_records_session_target_but_uses_auto_file_task_grou
         ]
     );
     assert_eq!(delta_plan.partition_plan().estimated_bytes, Some(120));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_scan_uses_explicit_delta_target_override()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new_with_schema_and_sized_adds(
+        "table-provider-explicit-target-override",
+        DEFAULT_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[
+            (r#""partitionValues":{}"#, 10),
+            (r#""partitionValues":{}"#, 10),
+            (r#""partitionValues":{}"#, 10),
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider =
+        DeltaTableProvider::try_new_with_scan_target_partitions(source, preflight, Some(3))?;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
+    let state = ctx.state();
+
+    let plan = provider.scan(&state, None, &[], None).await?;
+    let delta_plan = plan
+        .as_any()
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+
+    let decision = delta_plan.partition_target_decision();
+    assert_eq!(decision.target_partitions, 3);
+    assert_eq!(decision.explicit_target_partitions, Some(3));
+    assert_eq!(decision.datafusion_target_partitions, Some(8));
+    assert_eq!(
+        decision.source,
+        DeltaScanPartitionTargetSource::ExplicitOverride
+    );
+    assert_eq!(decision.applied_caps.datafusion_target_partitions, None);
+    assert_eq!(delta_plan.partition_plan().partitions.len(), 3);
+    assert_eq!(
+        scan_partition_file_paths(delta_plan),
+        vec![
+            vec!["part-00000.parquet".to_owned()],
+            vec!["part-00001.parquet".to_owned()],
+            vec!["part-00002.parquet".to_owned()],
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn registered_table_provider_scan_uses_configured_delta_target_override()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
+    let table = DeltaLogTable::new_with_schema_and_sized_adds(
+        "registered-provider-explicit-target-override",
+        DEFAULT_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[
+            (r#""partitionValues":{}"#, 10),
+            (r#""partitionValues":{}"#, 10),
+            (r#""partitionValues":{}"#, 10),
+        ],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    register_delta_sources(
+        &ctx,
+        vec![DeltaTableProviderConfig {
+            source,
+            protocol: preflight,
+            scan_target_partitions: Some(3),
+        }],
+    )?;
+
+    let dataframe = ctx.sql("select id from orders").await?;
+    let physical_plan = dataframe.create_physical_plan().await?;
+    let mut scans = Vec::new();
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+    assert_eq!(scans.len(), 1);
+    let decision = scans[0].partition_target_decision();
+    assert_eq!(decision.target_partitions, 3);
+    assert_eq!(decision.explicit_target_partitions, Some(3));
+    assert_eq!(decision.datafusion_target_partitions, Some(8));
+    assert_eq!(
+        decision.source,
+        DeltaScanPartitionTargetSource::ExplicitOverride
+    );
 
     Ok(())
 }
@@ -4761,6 +4860,7 @@ async fn sql_limit_stays_above_inexact_residual_filter_scan()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -4934,6 +5034,7 @@ async fn data_stats_residual_column_remains_available_below_final_projection()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -4995,6 +5096,7 @@ async fn string_data_stats_residual_column_remains_available_below_final_project
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5056,6 +5158,7 @@ async fn floating_data_stats_residual_column_remains_available_below_final_proje
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5123,6 +5226,7 @@ async fn sql_floating_data_stats_supported_filters_remain_residual()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5225,6 +5329,7 @@ async fn boolean_data_stats_residual_column_remains_available_below_final_projec
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5286,6 +5391,7 @@ async fn binary_data_stats_residual_column_remains_available_below_final_project
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5348,6 +5454,7 @@ async fn temporal_data_stats_residual_column_remains_available_below_final_proje
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5409,6 +5516,7 @@ async fn decimal_data_stats_residual_column_remains_available_below_final_projec
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5472,6 +5580,7 @@ async fn composed_stats_residual_column_remains_available_below_final_projection
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5553,6 +5662,7 @@ async fn mixed_partition_pruning_keeps_residual_column_below_final_projection()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5637,6 +5747,7 @@ async fn sql_exact_partition_filter_is_pushed_without_residual_filter()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5705,6 +5816,7 @@ async fn sql_partition_in_filter_is_exact_kernel_pushdown() -> Result<(), Box<dy
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5779,6 +5891,7 @@ async fn sql_duplicate_and_contradictory_partition_filters_are_exact_kernel_push
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5873,6 +5986,7 @@ async fn sql_partition_in_edge_variants_document_rewrite_boundary()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -5994,6 +6108,7 @@ async fn sql_mixed_boolean_partition_filters_keep_required_residual_filters()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -6096,6 +6211,7 @@ async fn sql_null_partition_filters_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -6185,6 +6301,7 @@ async fn sql_negated_partition_filters_follow_supported_kernel_boundary()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -6289,6 +6406,7 @@ async fn sql_partition_comparison_filters_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -6396,6 +6514,7 @@ async fn sql_empty_string_partition_filters_follow_kernel_boundary()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -8594,6 +8713,7 @@ async fn sql_timestamp_partition_comparisons_and_between_are_exact_kernel_pushdo
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -8693,6 +8813,7 @@ async fn sql_timestamp_ntz_partition_comparisons_and_between_are_exact_kernel_pu
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -8791,6 +8912,7 @@ async fn sql_timestamp_partition_equality_and_membership_are_exact_kernel_pushdo
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let cases = [
@@ -8888,6 +9010,7 @@ async fn sql_timestamp_ntz_partition_equality_and_membership_are_exact_kernel_pu
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let cases = [
@@ -8976,6 +9099,7 @@ async fn sql_timestamp_partition_null_checks_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let cases = [
@@ -9058,6 +9182,7 @@ async fn sql_timestamp_ntz_partition_null_checks_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let cases = [
@@ -10032,6 +10157,7 @@ async fn sql_floating_partition_null_checks_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let sql_cases = [
@@ -10123,6 +10249,7 @@ async fn sql_floating_partition_equality_and_membership_are_exact_kernel_pushdow
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let sql_cases = [
@@ -10216,6 +10343,7 @@ async fn sql_floating_partition_comparisons_and_between_keep_residual_filter()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let sql_cases = [
@@ -10311,6 +10439,7 @@ async fn sql_floating_partition_unsafe_literal_filters_keep_residual_filter()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let cases = [
@@ -12513,6 +12642,7 @@ async fn sql_integer_partition_null_checks_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -12587,6 +12717,7 @@ async fn sql_boolean_partition_null_checks_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -12660,6 +12791,7 @@ async fn sql_binary_partition_null_checks_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -12734,6 +12866,7 @@ async fn sql_binary_partition_equality_and_membership_are_exact_kernel_pushdown(
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -12829,6 +12962,7 @@ async fn sql_date_partition_equality_and_membership_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let cases = [
@@ -12925,6 +13059,7 @@ async fn sql_decimal_partition_unsafe_literal_filters_keep_residual_filter()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -12991,6 +13126,7 @@ async fn sql_decimal_partition_comparisons_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -13084,6 +13220,7 @@ async fn sql_decimal_partition_equality_and_membership_are_exact_kernel_pushdown
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -13181,6 +13318,7 @@ async fn sql_decimal_partition_null_checks_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let cases = [
@@ -13261,6 +13399,7 @@ async fn sql_date_partition_range_filters_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let cases = [
@@ -13356,6 +13495,7 @@ async fn sql_date_partition_null_checks_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let cases = [
@@ -13434,6 +13574,7 @@ async fn sql_boolean_partition_literal_operators_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -13543,6 +13684,7 @@ async fn sql_boolean_partition_ordering_filters_keep_residual_filter()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -13611,6 +13753,7 @@ async fn sql_integer_partition_literal_operators_are_exact_kernel_pushdown()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
 
@@ -13726,6 +13869,7 @@ async fn sql_analysis_accepts_nested_source_columns_without_target_planning()
         vec![DeltaTableProviderConfig {
             source,
             protocol: preflight,
+            scan_target_partitions: None,
         }],
     )?;
     let dataframe = ctx.sql("select id from orders").await?;

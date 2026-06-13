@@ -227,6 +227,7 @@ mod tests {
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
+                scan_target_partitions: None,
             }],
         )?;
 
@@ -266,6 +267,7 @@ mod tests {
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
+                scan_target_partitions: None,
             }],
         )?;
 

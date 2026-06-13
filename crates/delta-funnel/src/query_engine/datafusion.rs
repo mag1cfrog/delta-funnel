@@ -226,6 +226,7 @@ mod test_support {
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
+                scan_target_partitions: None,
             }],
         )?;
 

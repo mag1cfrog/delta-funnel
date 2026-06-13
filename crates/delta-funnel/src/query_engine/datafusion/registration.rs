@@ -20,6 +20,11 @@ pub struct DeltaTableProviderConfig {
     pub source: PlannedDeltaSource,
     /// Successful Delta protocol preflight for the source.
     pub protocol: ProtocolPreflight,
+    /// Optional DeltaFunnel scan file task partition target override.
+    ///
+    /// When set, this value wins over DataFusion's session target and automatic
+    /// machine fallback policy for this Delta source only.
+    pub scan_target_partitions: Option<usize>,
 }
 
 /// Registered Delta sources visible to a DataFusion session.
@@ -56,7 +61,16 @@ pub fn register_delta_sources(
     reject_duplicate_registration_names(&configs)?;
     let providers = configs
         .into_iter()
-        .map(|config| DeltaTableProvider::try_new(config.source, config.protocol))
+        .map(|config| match config.scan_target_partitions {
+            Some(scan_target_partitions) => {
+                DeltaTableProvider::try_new_with_scan_target_partitions(
+                    config.source,
+                    config.protocol,
+                    Some(scan_target_partitions),
+                )
+            }
+            None => DeltaTableProvider::try_new(config.source, config.protocol),
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     reject_existing_registration_names(ctx, &providers)?;
@@ -212,6 +226,7 @@ mod tests {
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
+                scan_target_partitions: None,
             }],
         )?;
 
@@ -273,6 +288,7 @@ mod tests {
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
+                scan_target_partitions: None,
             }],
         );
 
@@ -311,6 +327,7 @@ mod tests {
             vec![DeltaTableProviderConfig {
                 source: orders_source,
                 protocol: customers_preflight,
+                scan_target_partitions: None,
             }],
         );
 
@@ -359,10 +376,12 @@ mod tests {
                 DeltaTableProviderConfig {
                     source: orders_source,
                     protocol: orders_preflight,
+                    scan_target_partitions: None,
                 },
                 DeltaTableProviderConfig {
                     source: customers_source,
                     protocol: customers_preflight,
+                    scan_target_partitions: None,
                 },
             ],
         );
@@ -414,10 +433,12 @@ mod tests {
                 DeltaTableProviderConfig {
                     source: orders_source,
                     protocol: orders_preflight,
+                    scan_target_partitions: None,
                 },
                 DeltaTableProviderConfig {
                     source: customers_source,
                     protocol: customers_preflight,
+                    scan_target_partitions: None,
                 },
             ],
         );
@@ -470,10 +491,12 @@ mod tests {
                 DeltaTableProviderConfig {
                     source: orders_source,
                     protocol: orders_preflight,
+                    scan_target_partitions: None,
                 },
                 DeltaTableProviderConfig {
                     source: customers_source,
                     protocol: customers_preflight,
+                    scan_target_partitions: None,
                 },
             ],
         );
@@ -522,10 +545,12 @@ mod tests {
                 DeltaTableProviderConfig {
                     source: orders_source,
                     protocol: orders_preflight,
+                    scan_target_partitions: None,
                 },
                 DeltaTableProviderConfig {
                     source: customers_source,
                     protocol: customers_preflight,
+                    scan_target_partitions: None,
                 },
             ],
         );
@@ -571,10 +596,12 @@ mod tests {
                 DeltaTableProviderConfig {
                     source: orders_source,
                     protocol: orders_preflight,
+                    scan_target_partitions: None,
                 },
                 DeltaTableProviderConfig {
                     source: customers_source,
                     protocol: customers_preflight,
+                    scan_target_partitions: None,
                 },
             ],
         );

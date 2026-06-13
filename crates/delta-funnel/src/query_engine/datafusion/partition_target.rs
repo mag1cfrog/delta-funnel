@@ -129,8 +129,20 @@ impl DeltaScanPartitionTargetConfig {
     /// DataFusion default as an explicit DeltaFunnel override.
     #[allow(dead_code)]
     pub(crate) fn from_datafusion_target(datafusion_target_partitions: usize) -> Self {
+        Self::from_scan_targets(datafusion_target_partitions, None)
+    }
+
+    /// Builds config from DataFusion execution state plus an optional DeltaFunnel override.
+    ///
+    /// The explicit DeltaFunnel target is source-local and wins over DataFusion's
+    /// broader session target when present.
+    #[allow(dead_code)]
+    pub(crate) fn from_scan_targets(
+        datafusion_target_partitions: usize,
+        explicit_target_partitions: Option<usize>,
+    ) -> Self {
         Self {
-            explicit_target_partitions: None,
+            explicit_target_partitions,
             datafusion_target_partitions: Some(datafusion_target_partitions),
             environment_profile: DeltaExecutionEnvironmentProfile::from_local_environment(),
         }

@@ -38,12 +38,21 @@ pub(crate) struct DeltaTableProvider {
     source: PlannedDeltaSource,
     protocol: DeltaProtocolReport,
     schema: SchemaRef,
+    scan_target_partitions: Option<usize>,
 }
 
 impl DeltaTableProvider {
     pub(crate) fn try_new(
         source: PlannedDeltaSource,
         preflight: ProtocolPreflight,
+    ) -> Result<Self, DeltaFunnelError> {
+        Self::try_new_with_scan_target_partitions(source, preflight, None)
+    }
+
+    pub(crate) fn try_new_with_scan_target_partitions(
+        source: PlannedDeltaSource,
+        preflight: ProtocolPreflight,
+        scan_target_partitions: Option<usize>,
     ) -> Result<Self, DeltaFunnelError> {
         reject_mismatched_preflight(&source, preflight.protocol())?;
         let schema = delta_source_arrow_schema(&source)?;
@@ -52,6 +61,7 @@ impl DeltaTableProvider {
             source,
             protocol: preflight.into_protocol(),
             schema,
+            scan_target_partitions,
         })
     }
 
@@ -416,8 +426,9 @@ impl TableProvider for DeltaTableProvider {
                 table_uri: &scan_plan.table_uri,
                 snapshot_version: scan_plan.snapshot_version,
             },
-            DeltaScanPartitionTargetConfig::from_datafusion_target(
+            DeltaScanPartitionTargetConfig::from_scan_targets(
                 state.config().target_partitions(),
+                self.scan_target_partitions,
             ),
         )?;
         let partition_plan = scan_plan
