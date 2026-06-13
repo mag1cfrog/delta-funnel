@@ -356,12 +356,12 @@ mod tests {
     #[test]
     fn config_error_has_sanitized_display() {
         let error = DeltaFunnelError::Config {
-            message: "read_parallelism must be greater than zero".to_owned(),
+            message: "max_concurrent_file_reads_per_scan must be greater than zero".to_owned(),
         };
 
         assert_eq!(
             error.to_string(),
-            "configuration error: read_parallelism must be greater than zero"
+            "configuration error: max_concurrent_file_reads_per_scan must be greater than zero"
         );
     }
 

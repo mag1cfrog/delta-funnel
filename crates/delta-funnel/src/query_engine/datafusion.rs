@@ -9,8 +9,10 @@ mod execution;
 mod planning;
 
 pub use catalog::registration::{
-    DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources, register_delta_sources,
+    DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources,
+    register_delta_sources, register_delta_sources_with_scan_execution_options,
 };
+pub use execution::DeltaProviderScanExecutionOptions;
 pub use planning::partition_target::{
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,

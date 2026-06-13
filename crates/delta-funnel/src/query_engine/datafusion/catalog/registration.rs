@@ -12,6 +12,7 @@ use crate::{
     table_formats::validate_table_source_names,
 };
 
+use super::super::execution::DeltaProviderScanExecutionOptions;
 use super::provider::DeltaTableProvider;
 
 /// Delta source and preflight state used to build a DataFusion table provider.
@@ -58,18 +59,41 @@ pub fn register_delta_sources(
     ctx: &SessionContext,
     configs: Vec<DeltaTableProviderConfig>,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
+    register_delta_sources_with_options(ctx, configs, DeltaProviderScanExecutionOptions::default())
+}
+
+/// Registers preflighted Delta sources with explicit provider execution bounds.
+///
+/// # Errors
+///
+/// Returns [`DeltaFunnelError::Config`] when execution bounds are invalid,
+/// [`DeltaFunnelError::DeltaSourceSchema`] when a source schema cannot be
+/// converted to Arrow, or [`DeltaFunnelError::DataFusionRegistration`] when
+/// DataFusion rejects a table registration.
+pub fn register_delta_sources_with_scan_execution_options(
+    ctx: &SessionContext,
+    configs: Vec<DeltaTableProviderConfig>,
+    execution_options: DeltaProviderScanExecutionOptions,
+) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
+    execution_options.validate()?;
+    register_delta_sources_with_options(ctx, configs, execution_options)
+}
+
+fn register_delta_sources_with_options(
+    ctx: &SessionContext,
+    configs: Vec<DeltaTableProviderConfig>,
+    execution_options: DeltaProviderScanExecutionOptions,
+) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
     reject_duplicate_registration_names(&configs)?;
     let providers = configs
         .into_iter()
-        .map(|config| match config.scan_target_partitions {
-            Some(scan_target_partitions) => {
-                DeltaTableProvider::try_new_with_scan_target_partitions(
-                    config.source,
-                    config.protocol,
-                    Some(scan_target_partitions),
-                )
-            }
-            None => DeltaTableProvider::try_new(config.source, config.protocol),
+        .map(|config| {
+            DeltaTableProvider::try_new_with_execution_options(
+                config.source,
+                config.protocol,
+                config.scan_target_partitions,
+                execution_options,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -235,6 +259,41 @@ mod tests {
         assert_eq!(registered.sources[0].snapshot_version, 1);
         assert_eq!(registered.sources[0].schema.field(0).name(), "id");
         assert_eq!(registered.sources[0].protocol.source_name, "orders");
+
+        Ok(())
+    }
+
+    #[test]
+    fn registration_rejects_zero_execution_bounds_before_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("registration-zero-execution-bounds")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let ctx = SessionContext::new();
+
+        let result = register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+            DeltaProviderScanExecutionOptions {
+                max_concurrent_file_reads_per_scan: 0,
+                max_concurrent_file_reads_per_partition: 1,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::Config { message })
+                if message == "max_concurrent_file_reads_per_scan must be greater than zero"
+        ));
+        assert!(!ctx.table_exist("orders")?);
 
         Ok(())
     }
