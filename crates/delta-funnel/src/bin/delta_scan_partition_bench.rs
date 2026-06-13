@@ -20,11 +20,12 @@ const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
 const BENCHMARK_UNIX_SOFT_FD_LIMIT: u64 = 128;
 const BENCHMARK_AVAILABLE_MEMORY_BYTES: u64 = 1024 * MIB;
 const BENCHMARK_SCHEMA_VERSION: u32 = 1;
-const BENCHMARK_CSV_HEADER: [&str; 40] = [
+const BENCHMARK_CSV_HEADER: [&str; 41] = [
     "benchmark_schema_version",
     "host_os",
     "host_arch",
     "host_available_parallelism",
+    "workload_case",
     "shape_name",
     "total_rows",
     "active_files",
@@ -85,7 +86,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn write_benchmark_csv(output: &mut impl Write) -> Result<(), Box<dyn Error>> {
     let run_environment = BenchmarkRunEnvironment::local();
-    let shape = SyntheticDeltaTableShape::partitioned_event_log();
+    let workload_case = SyntheticWorkloadCase::partitioned_event_log_target_shape();
+    let shape = &workload_case.shape;
     let file_set = shape.generate_file_set()?;
     let simulation_profiles = SyntheticWorkSimulationProfile::standard_profiles();
     let policy_cases = BenchmarkPolicyCase::standard_cases(run_environment.available_parallelism);
@@ -103,9 +105,10 @@ fn write_benchmark_csv(output: &mut impl Write) -> Result<(), Box<dyn Error>> {
                 output,
                 "{}",
                 benchmark_csv_row(BenchmarkCsvRowInput {
-                    shape: &shape,
+                    shape,
                     file_set: &file_set,
                     run_environment,
+                    workload_case: workload_case.name,
                     simulation_profile_count: simulation_profiles.len(),
                     simulation,
                     policy_case,
@@ -197,6 +200,15 @@ impl BenchmarkRunEnvironment {
     }
 }
 
+impl SyntheticWorkloadCase {
+    fn partitioned_event_log_target_shape() -> Self {
+        Self {
+            name: "partitioned_event_log_target_shape",
+            shape: SyntheticDeltaTableShape::partitioned_event_log(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BenchmarkRunnerConfigError {
     MissingOutputPath,
@@ -233,6 +245,12 @@ struct SyntheticDeltaTableShape {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntheticWorkloadCase {
+    name: &'static str,
+    shape: SyntheticDeltaTableShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SyntheticFileSet {
     partitions: Vec<SyntheticPartition>,
     files: Vec<SyntheticFile>,
@@ -266,6 +284,7 @@ struct BenchmarkCsvRowInput<'a> {
     shape: &'a SyntheticDeltaTableShape,
     file_set: &'a SyntheticFileSet,
     run_environment: BenchmarkRunEnvironment,
+    workload_case: &'static str,
     simulation_profile_count: usize,
     simulation: SyntheticWorkSimulationProfile,
     policy_case: &'a BenchmarkPolicyCase,
@@ -1338,6 +1357,7 @@ fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
         input.run_environment.host_os.to_owned(),
         input.run_environment.host_arch.to_owned(),
         optional_usize(input.run_environment.available_parallelism),
+        input.workload_case.to_owned(),
         shape.name.to_owned(),
         shape.total_rows.to_string(),
         shape.active_file_count.to_string(),
@@ -1573,6 +1593,7 @@ mod tests {
 
         assert_eq!(lines.len(), 126);
         assert!(lines[0].starts_with("benchmark_schema_version,host_os,host_arch"));
+        assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",local_fast,default_policy,"));
         assert!(csv.contains(",s3_normal,combined_fd_16_memory_256mib,"));
 
@@ -1586,6 +1607,15 @@ mod tests {
         assert_eq!(environment.schema_version, BENCHMARK_SCHEMA_VERSION);
         assert_eq!(environment.host_os, env::consts::OS);
         assert_eq!(environment.host_arch, env::consts::ARCH);
+    }
+
+    #[test]
+    fn workload_case_wraps_current_target_shape() {
+        let workload_case = SyntheticWorkloadCase::partitioned_event_log_target_shape();
+
+        assert_eq!(workload_case.name, "partitioned_event_log_target_shape");
+        assert_eq!(workload_case.shape.name, "synthetic_partitioned_event_log");
+        assert_eq!(workload_case.shape.active_file_count, 956);
     }
 
     #[test]
@@ -2053,18 +2083,19 @@ mod tests {
 
     #[test]
     fn benchmark_csv_header_matches_policy_output_shape() {
-        assert_eq!(BENCHMARK_CSV_HEADER.len(), 40);
+        assert_eq!(BENCHMARK_CSV_HEADER.len(), 41);
         assert_eq!(BENCHMARK_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(BENCHMARK_CSV_HEADER[1], "host_os");
         assert_eq!(BENCHMARK_CSV_HEADER[2], "host_arch");
         assert_eq!(BENCHMARK_CSV_HEADER[3], "host_available_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[24], "policy_case");
-        assert_eq!(BENCHMARK_CSV_HEADER[25], "policy_available_parallelism");
-        assert_eq!(BENCHMARK_CSV_HEADER[26], "policy_datafusion_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[27], "policy_available_memory_bytes");
-        assert_eq!(BENCHMARK_CSV_HEADER[28], "policy_unix_soft_fd_limit");
-        assert_eq!(BENCHMARK_CSV_HEADER[31], "policy_target");
-        assert_eq!(BENCHMARK_CSV_HEADER[32], "policy_source");
+        assert_eq!(BENCHMARK_CSV_HEADER[4], "workload_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[25], "policy_case");
+        assert_eq!(BENCHMARK_CSV_HEADER[26], "policy_available_parallelism");
+        assert_eq!(BENCHMARK_CSV_HEADER[27], "policy_datafusion_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[28], "policy_available_memory_bytes");
+        assert_eq!(BENCHMARK_CSV_HEADER[29], "policy_unix_soft_fd_limit");
+        assert_eq!(BENCHMARK_CSV_HEADER[32], "policy_target");
+        assert_eq!(BENCHMARK_CSV_HEADER[33], "policy_source");
     }
 
     #[test]
@@ -2087,6 +2118,7 @@ mod tests {
                 host_arch: "test-arch",
                 available_parallelism: Some(16),
             },
+            workload_case: "test-workload",
             simulation_profile_count: SyntheticWorkSimulationProfile::standard_profiles().len(),
             simulation,
             policy_case: case,
@@ -2100,9 +2132,10 @@ mod tests {
         assert_eq!(row[1], "test-os");
         assert_eq!(row[2], "test-arch");
         assert_eq!(row[3], "16");
-        assert_eq!(row[24], "default_policy");
-        assert_eq!(row[31], "16");
-        assert_eq!(row[32], "available_parallelism_fallback");
+        assert_eq!(row[4], "test-workload");
+        assert_eq!(row[25], "default_policy");
+        assert_eq!(row[32], "16");
+        assert_eq!(row[33], "available_parallelism_fallback");
 
         Ok(())
     }
