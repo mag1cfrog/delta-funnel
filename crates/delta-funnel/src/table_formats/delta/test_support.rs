@@ -6,6 +6,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::Engine as _;
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+use delta_kernel::actions::deletion_vector_writer::{
+    KernelDeletionVector, StreamingDeletionVectorWriter,
+};
 use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
 
@@ -13,9 +17,12 @@ use super::kernel;
 use super::uri::normalize_delta_table_uri;
 
 const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
 const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const DATA_FILE: &str = "part-00000.parquet";
 const MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
+const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
+const RELATIVE_DV_FILE: &str = "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
 
 /// Local Delta fixture with one real Parquet data file.
 pub(crate) struct RealParquetDeltaTable {
@@ -79,6 +86,29 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local Delta table with one data file and a real deletion vector.
+    pub(crate) fn new_with_deletion_vector(
+        name: &str,
+        deleted_rows: &[u64],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_file_batches(
+            name,
+            DELETION_VECTOR_PROTOCOL_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batch: default_batch()?,
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                deletion_vector: Some(deletion_vector_fixture(deleted_rows)?),
+            }],
+        )
+    }
+
     fn new_with_batch(
         name: &str,
         batch: kernel::RecordBatch,
@@ -90,12 +120,21 @@ impl RealParquetDeltaTable {
                 path: DATA_FILE.to_owned(),
                 batch,
                 stats,
+                deletion_vector: None,
             }],
         )
     }
 
     fn new_with_file_batches(
         name: &str,
+        files: Vec<RealParquetDataFile>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_file_batches(name, PROTOCOL_JSON, files)
+    }
+
+    fn new_with_protocol_file_batches(
+        name: &str,
+        protocol_json: &str,
         files: Vec<RealParquetDataFile>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let path = Path::new("target")
@@ -125,12 +164,22 @@ impl RealParquetDeltaTable {
 
             let data_file_size = fs::metadata(path.join(&file.path))?.len();
             total_data_file_size = total_data_file_size.saturating_add(data_file_size);
-            add_actions.push(add_json(&file.path, data_file_size, &file.stats));
+            if let Some(deletion_vector) = &file.deletion_vector {
+                fs::write(path.join(RELATIVE_DV_FILE), &deletion_vector.bytes)?;
+                add_actions.push(dv_add_json(
+                    &file.path,
+                    data_file_size,
+                    &file.stats,
+                    &deletion_vector.descriptor,
+                ));
+            } else {
+                add_actions.push(add_json(&file.path, data_file_size, &file.stats));
+            }
         }
 
         fs::write(
             log_path.join("00000000000000000000.json"),
-            format!("{PROTOCOL_JSON}\n{METADATA_JSON}\n"),
+            format!("{protocol_json}\n{METADATA_JSON}\n"),
         )?;
         fs::write(
             log_path.join("00000000000000000001.json"),
@@ -165,6 +214,12 @@ struct RealParquetDataFile {
     path: String,
     batch: kernel::RecordBatch,
     stats: AddStats,
+    deletion_vector: Option<RealParquetDeletionVector>,
+}
+
+struct RealParquetDeletionVector {
+    descriptor: DeletionVectorDescriptor,
+    bytes: Vec<u8>,
 }
 
 struct AddStats {
@@ -245,6 +300,7 @@ fn file_batch(
             max_customer,
             customer_null_count,
         },
+        deletion_vector: None,
     })
 }
 
@@ -257,6 +313,49 @@ fn add_json(path: &str, size: u64, stats: &AddStats) -> String {
     format!(
         r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":{MODIFICATION_TIME_MS},"dataChange":true,"stats":"{{\"numRecords\":{rows},\"minValues\":{{\"id\":1,\"customer_name\":\"{min_customer}\"}},\"maxValues\":{{\"id\":{max_id},\"customer_name\":\"{max_customer}\"}},\"nullCount\":{{\"id\":0,\"customer_name\":{null_count}}}}}"}}}}"#
     )
+}
+
+fn dv_add_json(
+    path: &str,
+    size: u64,
+    stats: &AddStats,
+    descriptor: &DeletionVectorDescriptor,
+) -> String {
+    let rows = stats.rows;
+    let max_id = stats.max_id;
+    let min_customer = &stats.min_customer;
+    let max_customer = &stats.max_customer;
+    let null_count = stats.customer_null_count;
+    let storage_type = descriptor.storage_type;
+    let path_or_inline_dv = &descriptor.path_or_inline_dv;
+    let offset = descriptor.offset.unwrap_or(0);
+    let size_in_bytes = descriptor.size_in_bytes;
+    let cardinality = descriptor.cardinality;
+    format!(
+        r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":{MODIFICATION_TIME_MS},"dataChange":true,"stats":"{{\"numRecords\":{rows},\"minValues\":{{\"id\":1,\"customer_name\":\"{min_customer}\"}},\"maxValues\":{{\"id\":{max_id},\"customer_name\":\"{max_customer}\"}},\"nullCount\":{{\"id\":0,\"customer_name\":{null_count}}}}}","deletionVector":{{"storageType":"{storage_type}","pathOrInlineDv":"{path_or_inline_dv}","offset":{offset},"sizeInBytes":{size_in_bytes},"cardinality":{cardinality}}}}}}}"#
+    )
+}
+
+fn deletion_vector_fixture(
+    deleted_rows: &[u64],
+) -> Result<RealParquetDeletionVector, Box<dyn std::error::Error>> {
+    let mut buffer = Vec::new();
+    let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
+    let mut deletion_vector = KernelDeletionVector::new();
+    deletion_vector.add_deleted_row_indexes(deleted_rows.iter().copied());
+    let write_result = writer.write_deletion_vector(deletion_vector)?;
+    writer.finalize()?;
+
+    Ok(RealParquetDeletionVector {
+        descriptor: DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: RELATIVE_DV_ID.to_owned(),
+            offset: Some(write_result.offset),
+            size_in_bytes: write_result.size_in_bytes,
+            cardinality: write_result.cardinality,
+        },
+        bytes: buffer,
+    })
 }
 
 fn unique_name(name: &str) -> Result<String, Box<dyn std::error::Error>> {

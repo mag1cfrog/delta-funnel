@@ -123,7 +123,6 @@ impl KernelScanDeletionVectorHandle {
 }
 
 impl KernelScanDeletionVectorMetadata {
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_present(&self) -> bool {
         matches!(self, Self::Present(_))

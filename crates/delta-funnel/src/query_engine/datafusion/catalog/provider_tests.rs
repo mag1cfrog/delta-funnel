@@ -1038,7 +1038,7 @@ async fn table_provider_scan_accepts_inexact_integer_data_stats_filter()
 }
 
 #[test]
-fn datafusion_provider_preflight_rejects_deletion_vectors_before_stats_pushdown()
+fn datafusion_provider_preflight_allows_deletion_vectors_before_stats_pushdown()
 -> Result<(), Box<dyn std::error::Error>> {
     let stats = id_stats_add_json(10, 101, 150, 0);
     let table = DeltaLogTable::new_with_schema_protocol_and_adds(
@@ -1054,14 +1054,11 @@ fn datafusion_provider_preflight_rejects_deletion_vectors_before_stats_pushdown(
         version: None,
     })?;
 
-    let result = preflight_delta_protocol(&source);
+    let preflight = preflight_delta_protocol(&source)?;
 
-    assert!(
-        matches!(result, Err(DeltaFunnelError::DeltaProtocolCompatibility {
-            source_name,
-            reason,
-            ..
-        }) if source_name == "orders" && reason.contains("deletionVectors"))
+    assert_eq!(
+        preflight.protocol().reader_features,
+        vec!["deletionVectors"]
     );
 
     Ok(())

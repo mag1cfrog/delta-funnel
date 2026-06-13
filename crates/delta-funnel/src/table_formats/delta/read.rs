@@ -55,6 +55,13 @@ impl KernelScanReadSchema {
     pub(crate) fn physical_predicate(&self) -> Option<&kernel::PredicateRef> {
         self.physical_predicate.as_ref()
     }
+
+    /// Whether this scan schema carries a kernel physical predicate.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn has_physical_predicate(&self) -> bool {
+        self.physical_predicate.is_some()
+    }
 }
 
 /// Context required to construct the official-kernel reader baseline.

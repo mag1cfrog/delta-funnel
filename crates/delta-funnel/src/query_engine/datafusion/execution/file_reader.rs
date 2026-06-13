@@ -105,6 +105,7 @@ impl DeltaFileReader {
         request: DeltaFileReadRequest<'_>,
     ) -> Result<DeltaFileReadResult, DeltaFunnelError> {
         self.validate_task_context(request.task)?;
+        self.validate_deletion_vector_read_mode(request.task, request.read_schema)?;
         let mut deletion_vector =
             self.deletion_vector_reader
                 .read_selection(KernelDeletionVectorReadRequest {
@@ -132,6 +133,27 @@ impl DeltaFileReader {
         }
 
         Ok(DeltaFileReadResult { batches })
+    }
+
+    fn validate_deletion_vector_read_mode(
+        &self,
+        task: &DeltaScanFileTask,
+        read_schema: &KernelScanReadSchema,
+    ) -> Result<(), DeltaFunnelError> {
+        if !task.deletion_vector.is_present() || !read_schema.has_physical_predicate() {
+            return Ok(());
+        }
+
+        Err(delta_kernel::Error::generic(
+            "deletion-vector reads with kernel physical predicates require original row-index accounting",
+        ))
+        .context(DeltaScanFileReadSnafu {
+            source_name: self.source_name.clone(),
+            table_uri: self.table_uri.clone(),
+            snapshot_version: self.snapshot_version,
+            path: task.path.clone(),
+            phase: DeltaScanFileReadPhase::DeletionVectorMasking,
+        })
     }
 
     fn validate_task_context(&self, task: &DeltaScanFileTask) -> Result<(), DeltaFunnelError> {
@@ -235,6 +257,7 @@ impl DeltaFileReader {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::logical_expr::{col, lit};
     use delta_kernel::actions::deletion_vector::{
         DeletionVectorDescriptor, DeletionVectorStorageType,
     };
@@ -249,7 +272,8 @@ mod tests {
     use crate::table_formats::{
         DeltaSourceConfig, KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata,
         PlannedDeltaSource, build_projected_delta_scan,
-        build_projected_predicated_stats_delta_scan, load_delta_source,
+        build_projected_predicated_stats_delta_scan, datafusion_expr_to_kernel_predicate,
+        load_delta_source,
     };
 
     #[test]
@@ -489,6 +513,35 @@ mod tests {
         );
         assert!(display.contains("unconsumed entries"), "{display}");
         assert!(display.contains(table.data_file_path()), "{display}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_reader_rejects_deletion_vector_with_physical_predicate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("file-reader-dv-physical-predicate")?;
+        let source = load_source("orders", &table)?;
+        let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
+        let read_schema = scan.read_schema();
+        let mut task = first_file_task(&source, &scan)?;
+        set_task_deletion_vector(&mut task, &table, &[1])?;
+        let reader = test_reader(&source)?;
+        let error = reader
+            .read_file(DeltaFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+            })
+            .err()
+            .ok_or("expected DV physical predicate rejection")?;
+        let display = error.to_string();
+
+        assert!(display.contains("deletion-vector masking"), "{display}");
+        assert!(
+            display.contains("original row-index accounting"),
+            "{display}"
+        );
 
         Ok(())
     }

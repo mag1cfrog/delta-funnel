@@ -475,6 +475,49 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn deletion_vector_execution_filters_deleted_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table =
+            RealParquetDeltaTable::new_with_deletion_vector("dv-execution-real-read", &[1])?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql("select id, customer_name from orders order by id")
+            .await?;
+        let result = dataframe.collect().await?;
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+----+---------------+",
+                "| id | customer_name |",
+                "+----+---------------+",
+                "| 1  | alice         |",
+                "| 3  |               |",
+                "+----+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
     fn register_real_parquet_source(
         ctx: &SessionContext,
         source_name: &str,
