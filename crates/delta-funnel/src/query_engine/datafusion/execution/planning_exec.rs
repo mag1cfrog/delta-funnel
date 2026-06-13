@@ -444,6 +444,11 @@ mod tests {
 
         assert_eq!(scans.len(), 1);
         assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0, 2]));
+        assert!(
+            scans[0].partition_plan().partitions[0].file_tasks[0]
+                .transform
+                .is_required()
+        );
 
         let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
         assert!(result.iter().all(|batch| {
@@ -633,6 +638,16 @@ mod tests {
 
         let dataframe = ctx.sql("select region, id from orders order by id").await?;
         let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert!(
+            scans[0].partition_plan().partitions[0].file_tasks[0]
+                .transform
+                .is_required()
+        );
+
         let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
         assert!(result.iter().all(|batch| {
             let schema = batch.schema();

@@ -121,6 +121,9 @@ impl DeltaFileReader {
                 modification_time_ms: request.task.modification_time_ms,
                 schema: request.read_schema,
             })?;
+        // Transform before DV masking so DataFusion only sees logical columns.
+        // The kernel adapter verifies transforms preserve row count, keeping DV
+        // row-position alignment intact.
         let batches = self.apply_physical_to_logical_transform(
             request.task,
             data.batches,
