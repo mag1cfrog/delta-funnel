@@ -42,8 +42,8 @@ It does not change workload file shapes or policy target derivation.
 
 The default matrix currently covers:
 
-- 990 rows:
-  - 6 workloads x 5 simulation profiles x 33 policy cases.
+- 1110 data rows:
+  - 6 workloads x 5 simulation profiles x 37 policy cases.
 
 - Workloads:
   - `partitioned_event_log_target_shape`: target synthetic table shape, 956
@@ -58,14 +58,18 @@ The default matrix currently covers:
   - `zero_byte_files`: 512 selected zero-byte files, useful for scheduler and
     per-file overhead sensitivity.
 - Simulation profiles:
-  - `local_fast`
-  - `s3_normal`
-  - `s3_high_latency`
-  - `s3_throttled`
-  - `cpu_heavy`
+  - `local_fast`: low latency, local-like bandwidth, 16 effective execution
+    slots.
+  - `s3_normal`: moderate request latency, about 1 Gbps aggregate bandwidth,
+    32 effective execution slots.
+  - `s3_high_latency`: high request latency, 64 effective execution slots.
+  - `s3_throttled`: remote-like request latency, 100 Mbps aggregate bandwidth,
+    16 effective execution slots.
+  - `cpu_heavy`: lower latency but higher per-row CPU cost, 16 effective
+    execution slots.
 - Policy cases:
   - `default_policy`
-  - `fixed_target_1`, `fixed_target_4`
+  - `fixed_target_1`, `4`, `8`, `16`, `32`, `64`
   - `available_parallelism_uncapped`
   - `available_parallelism_x2_uncapped`
   - `datafusion_cap_4`
@@ -108,9 +112,15 @@ Important field groups:
   - `policy_memory_cap`
   - `unknown_size_fallback_used`
 - Simulated execution:
+  - `simulation_partition_scheduling_overhead_micros`
+  - `simulation_effective_parallelism`
+  - `simulation_aggregate_bandwidth_bytes_per_second`
   - `simulated_serial_micros`
   - `simulated_max_file_micros`
   - `simulated_output_partitions`
+  - `simulated_scheduling_overhead_micros`
+  - `simulated_aggregate_transfer_floor_micros`
+  - `simulated_execution_slots`
   - `simulated_wall_micros`
   - `simulated_throughput_mib_per_second`
   - `simulated_rows_per_second`
@@ -164,6 +174,10 @@ default.
 ## Scope
 
 This benchmark validates scan partition target policy and synthetic file-task
-grouping behavior. It is not a production read benchmark. It does not measure
-real Parquet decoding, Arrow batch memory, object-store request behavior, or
-DataFusion runtime scheduling. Those belong to later read execution work.
+grouping behavior. It includes synthetic request latency, per-partition
+scheduling overhead, bounded execution slots, and aggregate transfer floors so
+policy cases can be compared more realistically than with infinite parallelism.
+
+It is still not a production read benchmark. It does not measure real Parquet
+decoding, Arrow batch memory, object-store request behavior, or DataFusion
+runtime scheduling. Those belong to later read execution work.

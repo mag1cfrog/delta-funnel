@@ -1684,6 +1684,7 @@ impl SyntheticPartitionedWorkPlan {
             .map(|partition| partition.work_micros)
             .collect::<Vec<_>>();
         let average_work = average_or_zero(work.iter().sum(), work.len());
+        let max_work = work.iter().copied().max().unwrap_or_default();
 
         SyntheticPartitionedWorkSummary {
             files_p50: usize::try_from(percentile_nearest_rank(files.clone(), 50))
@@ -1700,7 +1701,7 @@ impl SyntheticPartitionedWorkPlan {
             work_imbalance_basis_points: if average_work == 0 {
                 0
             } else {
-                self.wall_micros.saturating_mul(10_000) / average_work
+                max_work.saturating_mul(10_000) / average_work
             },
         }
     }
@@ -2995,6 +2996,17 @@ mod tests {
         assert_eq!(
             plan.wall_micros,
             plan.aggregate_transfer_floor_micros + plan.scheduling_overhead_micros
+        );
+        assert_eq!(
+            plan.summary().work_imbalance_basis_points,
+            max_partition_work.saturating_mul(10_000)
+                / average_or_zero(
+                    plan.partitions
+                        .iter()
+                        .map(|partition| partition.work_micros)
+                        .sum(),
+                    plan.partitions.len()
+                )
         );
 
         Ok(())
