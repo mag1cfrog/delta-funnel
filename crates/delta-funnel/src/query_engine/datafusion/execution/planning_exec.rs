@@ -340,6 +340,89 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn projection_execution_emits_requested_columns() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let ctx = SessionContext::new();
+        let _table =
+            register_real_parquet_source(&ctx, "orders", "projection-execution-real-read")?;
+
+        let dataframe = ctx
+            .sql("select customer_name from orders order by customer_name nulls last")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![1]));
+
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        assert!(
+            result
+                .iter()
+                .all(|batch| batch.schema().fields().len() == 1)
+        );
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+---------------+",
+                "| customer_name |",
+                "+---------------+",
+                "| alice         |",
+                "| bob           |",
+                "|               |",
+                "+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn residual_filter_runs_above_provider_output() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let ctx = SessionContext::new();
+        let _table = register_real_parquet_source(&ctx, "orders", "residual-filter-real-read")?;
+
+        let dataframe = ctx
+            .sql("select id, customer_name from orders where customer_name like 'a%'")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+            0
+        );
+
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+----+---------------+",
+                "| id | customer_name |",
+                "+----+---------------+",
+                "| 1  | alice         |",
+                "+----+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
     fn register_real_parquet_source(
         ctx: &SessionContext,
         source_name: &str,
