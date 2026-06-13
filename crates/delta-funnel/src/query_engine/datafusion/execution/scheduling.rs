@@ -87,6 +87,26 @@ impl DeltaProviderSyncReadLimiter {
         self.lock_state().active_file_reads
     }
 
+    #[cfg(test)]
+    fn try_acquire_file_permit(
+        self: &Arc<Self>,
+        partition: usize,
+    ) -> Option<DeltaProviderSyncFileReadPermit> {
+        let mut state = self.lock_state();
+        if !self.can_acquire(&state, partition) {
+            return None;
+        }
+
+        state.active_file_reads += 1;
+        state.partition_active_file_reads[partition] += 1;
+
+        Some(DeltaProviderSyncFileReadPermit {
+            partition,
+            limiter: Arc::clone(self),
+            released: false,
+        })
+    }
+
     fn acquire_file_permit(self: &Arc<Self>, partition: usize) -> DeltaProviderSyncFileReadPermit {
         let mut state = self.lock_state();
         while !self.can_acquire(&state, partition) {
@@ -148,6 +168,11 @@ impl DeltaProviderSyncReadLimiter {
 impl DeltaProviderSyncPartitionReadLimiter {
     pub(crate) fn acquire_file_permit(&self) -> DeltaProviderSyncFileReadPermit {
         self.limiter.acquire_file_permit(self.partition)
+    }
+
+    #[cfg(test)]
+    fn try_acquire_file_permit(&self) -> Option<DeltaProviderSyncFileReadPermit> {
+        self.limiter.try_acquire_file_permit(self.partition)
     }
 }
 
@@ -280,6 +305,76 @@ mod tests {
             error.to_string(),
             "configuration error: sync read limiter partition 1 is out of range for 1 partitions"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_file_permit_respects_global_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::try_new(1, 1, 1)?, 2);
+        let first_partition = limiter.partition_limiter(0)?;
+        let second_partition = limiter.partition_limiter(1)?;
+
+        let first_permit = first_partition.acquire_file_permit();
+
+        assert!(second_partition.try_acquire_file_permit().is_none());
+        assert_eq!(limiter.active_file_reads(), 1);
+
+        drop(first_permit);
+
+        let second_permit = second_partition
+            .try_acquire_file_permit()
+            .ok_or("expected global permit after release")?;
+
+        assert_eq!(limiter.active_file_reads(), 1);
+
+        drop(second_permit);
+
+        assert_eq!(limiter.active_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_file_permit_respects_partition_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::try_new(2, 1, 2)?, 2);
+        let first_partition = limiter.partition_limiter(0)?;
+        let second_partition = limiter.partition_limiter(1)?;
+
+        let first_permit = first_partition.acquire_file_permit();
+
+        assert!(first_partition.try_acquire_file_permit().is_none());
+
+        let second_permit = second_partition
+            .try_acquire_file_permit()
+            .ok_or("expected another partition to use remaining global capacity")?;
+
+        assert_eq!(limiter.active_file_reads(), 2);
+
+        drop(first_permit);
+        drop(second_permit);
+
+        assert_eq!(limiter.active_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_file_permit_respects_in_flight_file_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderExecutionOptions::try_new(2, 2, 1)?, 2);
+        let first_partition = limiter.partition_limiter(0)?;
+        let second_partition = limiter.partition_limiter(1)?;
+
+        let first_permit = first_partition.acquire_file_permit();
+
+        assert!(second_partition.try_acquire_file_permit().is_none());
+
+        drop(first_permit);
+
+        assert_eq!(limiter.active_file_reads(), 0);
 
         Ok(())
     }
