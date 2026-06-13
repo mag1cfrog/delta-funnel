@@ -232,7 +232,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::query_engine::datafusion::filters::{
+    use crate::query_engine::datafusion::planning::filters::{
         DeltaFilterPushdownOutcome, DeltaFilterPushdownRejectionReason,
     };
     use crate::query_engine::datafusion::provider::DeltaTableProvider;

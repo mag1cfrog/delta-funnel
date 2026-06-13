@@ -186,7 +186,7 @@ mod tests {
     use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, col, lit};
 
-    use super::super::provider::DeltaTableProvider;
+    use super::super::super::provider::DeltaTableProvider;
     use super::*;
     use crate::query_engine::datafusion::test_support::{
         DeltaLogTable, PARTITIONED_SCHEMA_FIELDS_JSON,
@@ -1586,7 +1586,8 @@ mod tests {
         let filter_module_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("query_engine")
-            .join("datafusion");
+            .join("datafusion")
+            .join("planning");
         let filter_source_files = [
             filter_module_root.join("filters.rs"),
             filter_module_root.join("filters").join("analysis.rs"),

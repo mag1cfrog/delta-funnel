@@ -7,7 +7,6 @@ use crate::DeltaFunnelError;
 mod execution;
 mod execution_environment;
 mod file_reader;
-mod filters;
 mod planning;
 mod provider;
 mod registration;

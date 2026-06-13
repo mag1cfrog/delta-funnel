@@ -26,7 +26,7 @@ use crate::{
 };
 
 use super::execution::DeltaScanPlanningExec;
-use super::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
+use super::planning::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
 use super::planning::partition_target::{
     DeltaScanPartitionTargetConfig, DeltaScanPartitionTargetContext, DeltaScanPartitionTargetPolicy,
 };

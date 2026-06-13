@@ -22,12 +22,12 @@ use crate::{
     },
 };
 
-use super::super::filters::DeltaFilterPushdownPlan;
 use super::file_task::DeltaScanFileTask;
 use super::file_task_partition::{
     DeltaScanFileTaskPartitionOptions, DeltaScanFileTaskPartitionPlan,
     DeltaScanFileTaskPartitionPlanRequest,
 };
+use super::filters::DeltaFilterPushdownPlan;
 
 /// Caller request used to build a provider scan plan.
 #[allow(dead_code)]
