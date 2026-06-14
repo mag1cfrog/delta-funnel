@@ -1267,6 +1267,7 @@ dependencies = [
  "futures-util",
  "libc",
  "object_store",
+ "parquet",
  "snafu",
  "tokio",
  "windows-sys 0.61.2",

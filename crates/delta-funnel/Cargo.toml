@@ -25,13 +25,14 @@ delta_kernel = { version = "0.23.0", default-features = false, features = [
     "default-engine-native-tls",
     "internal-api",
 ] }
+futures-util = "0.3"
 libc = "0.2"
 object_store = "0.13.2"
+parquet = { version = "58.3.0", features = ["async", "object_store"] }
 snafu = "0.9"
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
-futures-util = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]

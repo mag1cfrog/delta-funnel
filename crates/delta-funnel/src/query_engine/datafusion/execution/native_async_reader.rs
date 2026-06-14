@@ -9,15 +9,19 @@
 use std::sync::Arc;
 
 use delta_kernel::engine::default::storage::store_from_url_opts;
+use futures_util::StreamExt;
 use object_store::{ObjectStore, path::Path};
+use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use snafu::ResultExt;
 
 use crate::{
     DeltaFunnelError,
     error::{DeltaScanFileReadPhase, DeltaScanFileReadSnafu},
+    table_formats::{KernelPhysicalToLogicalTransform, KernelScanReadSchema},
 };
 
 use super::super::planning::file_task::DeltaScanFileTask;
+use super::file_reader::{DeltaFileReadDeletionVectorStats, DeltaFileReadResult};
 
 const TABLE_ROOT_CONTEXT: &str = "<table-root>";
 
@@ -51,6 +55,15 @@ pub(crate) struct DeltaNativeAsyncParquetObject {
     pub(crate) path: Path,
     /// File size from Delta scan metadata.
     pub(crate) file_size: u64,
+}
+
+/// Request to read exactly one provider file task through the native async path.
+#[allow(dead_code)]
+pub(crate) struct DeltaNativeAsyncFileReadRequest<'a> {
+    /// Provider-owned task for one physical Delta data file.
+    pub(crate) task: &'a DeltaScanFileTask,
+    /// Kernel scan schema state selected for this provider scan.
+    pub(crate) read_schema: &'a KernelScanReadSchema,
 }
 
 /// Validates that the native async backend can construct its object-store path.
@@ -146,6 +159,62 @@ impl DeltaNativeAsyncFileReader {
         })
     }
 
+    /// Reads one non-DV file task with parquet-rs async object-store reads.
+    ///
+    /// This first native implementation intentionally supports only file tasks
+    /// whose physical Parquet batches are already provider-visible batches:
+    /// no deletion vectors, no physical-to-logical transform, and no kernel
+    /// physical predicate. Later slices reopen those equivalence boundaries.
+    #[allow(dead_code)]
+    pub(crate) async fn read_file(
+        &self,
+        request: DeltaNativeAsyncFileReadRequest<'_>,
+    ) -> Result<DeltaFileReadResult, DeltaFunnelError> {
+        self.validate_supported_read_mode(request.task, request.read_schema)?;
+        let object = self.parquet_object_for_task(request.task)?;
+        let reader =
+            ParquetObjectReader::new(object.store, object.path).with_file_size(object.file_size);
+        let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, Default::default())
+            .await
+            .map_err(delta_kernel::Error::from)
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: request.task.path.clone(),
+                phase: DeltaScanFileReadPhase::ParquetReadSetup,
+            })?;
+        let mut stream =
+            builder
+                .build()
+                .map_err(delta_kernel::Error::from)
+                .context(DeltaScanFileReadSnafu {
+                    source_name: self.source_name.clone(),
+                    table_uri: self.table_uri.clone(),
+                    snapshot_version: self.snapshot_version,
+                    path: request.task.path.clone(),
+                    phase: DeltaScanFileReadPhase::ParquetReadSetup,
+                })?;
+        let mut batches = Vec::new();
+
+        while let Some(batch) = stream.next().await {
+            batches.push(batch.map_err(delta_kernel::Error::from).context(
+                DeltaScanFileReadSnafu {
+                    source_name: self.source_name.clone(),
+                    table_uri: self.table_uri.clone(),
+                    snapshot_version: self.snapshot_version,
+                    path: request.task.path.clone(),
+                    phase: DeltaScanFileReadPhase::ParquetBatchRead,
+                },
+            )?);
+        }
+
+        Ok(DeltaFileReadResult {
+            batches,
+            deletion_vector_stats: DeltaFileReadDeletionVectorStats::default(),
+        })
+    }
+
     fn validate_task_context(&self, task: &DeltaScanFileTask) -> Result<(), DeltaFunnelError> {
         if task.source_name == self.source_name
             && task.table_uri == self.table_uri
@@ -165,6 +234,38 @@ impl DeltaNativeAsyncFileReader {
             phase: DeltaScanFileReadPhase::FileMetadataConversion,
         })
     }
+
+    fn validate_supported_read_mode(
+        &self,
+        task: &DeltaScanFileTask,
+        read_schema: &KernelScanReadSchema,
+    ) -> Result<(), DeltaFunnelError> {
+        let reason = if task.deletion_vector.is_present() {
+            Some("native async reader does not support deletion-vector file tasks yet")
+        } else if !matches!(
+            task.transform,
+            KernelPhysicalToLogicalTransform::NotRequired
+        ) {
+            Some("native async reader does not support physical-to-logical transforms yet")
+        } else if read_schema.has_physical_predicate() {
+            Some("native async reader does not support kernel physical predicates yet")
+        } else {
+            None
+        };
+
+        match reason {
+            Some(reason) => {
+                Err(delta_kernel::Error::generic(reason)).context(DeltaScanFileReadSnafu {
+                    source_name: self.source_name.clone(),
+                    table_uri: self.table_uri.clone(),
+                    snapshot_version: self.snapshot_version,
+                    path: task.path.clone(),
+                    phase: DeltaScanFileReadPhase::UnsupportedReadMode,
+                })
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -174,15 +275,24 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use datafusion::arrow::array::{Array, Int32Array, StringArray};
+
     use super::{
-        DeltaNativeAsyncFileReader, DeltaNativeAsyncFileReaderConfig,
-        validate_native_async_reader_config,
+        DeltaNativeAsyncFileReadRequest, DeltaNativeAsyncFileReader,
+        DeltaNativeAsyncFileReaderConfig, validate_native_async_reader_config,
     };
     use crate::{
-        DeltaFunnelError,
+        DeltaFunnelError, DeltaSourceConfig,
         error::DeltaScanFileReadPhase,
-        query_engine::datafusion::planning::file_task::DeltaScanFileTask,
-        table_formats::{KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata},
+        load_delta_source,
+        query_engine::datafusion::{
+            execution::file_reader::DeltaFileReadDeletionVectorStats,
+            planning::file_task::DeltaScanFileTask,
+        },
+        table_formats::{
+            KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata,
+            RealParquetDeltaTable, build_projected_predicated_stats_delta_scan,
+        },
     };
 
     struct TestDir {
@@ -297,6 +407,70 @@ mod tests {
                 ..
             }
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_reader_reads_real_non_dv_parquet_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("native-async-file-read")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
+        let read_schema = scan.read_schema();
+        let file = scan
+            .expand_kernel_scan_metadata(source.table_uri())?
+            .files
+            .into_iter()
+            .next()
+            .ok_or("expected one scan file")?;
+        let task = DeltaScanFileTask::from_kernel_metadata(
+            source.name(),
+            source.table_uri(),
+            source.version(),
+            file,
+        )?;
+        let reader = DeltaNativeAsyncFileReader::try_new(DeltaNativeAsyncFileReaderConfig {
+            source_name: source.name(),
+            table_uri: source.table_uri(),
+            snapshot_version: source.version(),
+        })?;
+
+        let result = reader
+            .read_file(DeltaNativeAsyncFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+            })
+            .await?;
+
+        assert_eq!(result.batches.len(), 1);
+        assert_eq!(
+            result.deletion_vector_stats,
+            DeltaFileReadDeletionVectorStats::default()
+        );
+
+        let batch = result.batches.first().ok_or("expected one record batch")?;
+        assert_eq!(batch.num_rows(), table.rows());
+        assert_eq!(batch.num_columns(), 2);
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected id Int32Array")?;
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected customer_name StringArray")?;
+
+        assert_eq!(ids.values(), &[1, 2, 3]);
+        assert_eq!(names.value(0), "alice");
+        assert_eq!(names.value(1), "bob");
+        assert!(names.is_null(2));
 
         Ok(())
     }
