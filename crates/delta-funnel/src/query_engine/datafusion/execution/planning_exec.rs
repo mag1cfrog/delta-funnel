@@ -106,7 +106,13 @@ impl DeltaScanPlanningExec {
         self.execution_options
     }
 
-    #[cfg(test)]
+    /// Returns a cheap point-in-time snapshot of provider-owned read progress.
+    ///
+    /// This is the internal handoff for later orchestration and progress
+    /// reporting. It intentionally stays separate from DataFusion metrics so
+    /// callers can inspect partial progress after success, failure, or stream
+    /// cancellation.
+    #[allow(dead_code)]
     pub(crate) fn read_stats_snapshot(&self) -> super::read_stats::DeltaProviderReadStatsSnapshot {
         self.read_stats.snapshot()
     }
