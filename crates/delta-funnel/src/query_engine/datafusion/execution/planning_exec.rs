@@ -476,9 +476,30 @@ mod tests {
         )?;
 
         let dataframe = ctx.sql("select * from orders").await?;
-        let result = dataframe.collect().await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
 
+        assert_eq!(scans.len(), 1);
         assert!(result.is_empty());
+        let read_stats = scans[0].read_stats_snapshot();
+        assert_eq!(read_stats.scan_partitions_planned, 0);
+        assert_eq!(read_stats.files_planned, 0);
+        assert_eq!(read_stats.estimated_rows, Some(0));
+        assert_eq!(read_stats.estimated_bytes, Some(0));
+        assert_eq!(read_stats.scan_partitions_started, 0);
+        assert_eq!(read_stats.scan_partitions_completed, 0);
+        assert_eq!(read_stats.files_started, 0);
+        assert_eq!(read_stats.files_completed, 0);
+        assert_eq!(read_stats.batches_produced, 0);
+        assert_eq!(read_stats.rows_produced, 0);
+        assert_eq!(read_stats.deletion_vector_payloads_loaded, 0);
+        assert_eq!(read_stats.deletion_vectors_applied, 0);
+        assert_eq!(read_stats.deletion_vector_rows_deleted, 0);
+        assert_eq!(read_stats.deletion_vector_failures, 0);
+        assert_eq!(read_stats.deletion_vector_rejections, 0);
 
         Ok(())
     }
