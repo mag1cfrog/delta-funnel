@@ -52,6 +52,27 @@ pub(crate) struct DeltaProviderReadStatsSnapshot {
     pub(crate) deletion_vector_rejections: u64,
 }
 
+/// Static context and planning estimates for one provider read stats instance.
+#[allow(dead_code)]
+pub(crate) struct DeltaProviderReadStatsConfig {
+    /// DataFusion table name for this source.
+    pub(crate) source_name: String,
+    /// Delta snapshot version selected for this scan.
+    pub(crate) snapshot_version: u64,
+    /// Provider file-reader backend selected for this scan.
+    pub(crate) reader_backend: DeltaProviderReaderBackend,
+    /// Whether metadata expansion exhausted the upstream kernel scan iterator.
+    pub(crate) scan_metadata_exhausted: Option<bool>,
+    /// Planned DataFusion execution partitions for this scan.
+    pub(crate) scan_partitions_planned: usize,
+    /// Selected provider file tasks planned for this scan.
+    pub(crate) files_planned: usize,
+    /// Estimated output rows from planning when every selected file had stats.
+    pub(crate) estimated_rows: Option<u64>,
+    /// Estimated bytes from planning when every selected file had a byte size.
+    pub(crate) estimated_bytes: Option<u64>,
+}
+
 /// Thread-safe provider read progress for one physical scan.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -82,25 +103,16 @@ impl DeltaProviderReadStats {
     /// Creates zeroed read progress for one physical scan.
     #[allow(dead_code)]
     #[must_use]
-    pub(crate) fn new(
-        source_name: impl Into<String>,
-        snapshot_version: u64,
-        reader_backend: DeltaProviderReaderBackend,
-        scan_metadata_exhausted: Option<bool>,
-        scan_partitions_planned: usize,
-        files_planned: usize,
-        estimated_rows: Option<u64>,
-        estimated_bytes: Option<u64>,
-    ) -> Self {
+    pub(crate) fn new(config: DeltaProviderReadStatsConfig) -> Self {
         Self {
-            source_name: source_name.into(),
-            snapshot_version,
-            reader_backend,
-            scan_metadata_exhausted,
-            scan_partitions_planned: usize_to_u64_saturating(scan_partitions_planned),
-            files_planned: usize_to_u64_saturating(files_planned),
-            estimated_rows,
-            estimated_bytes,
+            source_name: config.source_name,
+            snapshot_version: config.snapshot_version,
+            reader_backend: config.reader_backend,
+            scan_metadata_exhausted: config.scan_metadata_exhausted,
+            scan_partitions_planned: usize_to_u64_saturating(config.scan_partitions_planned),
+            files_planned: usize_to_u64_saturating(config.files_planned),
+            estimated_rows: config.estimated_rows,
+            estimated_bytes: config.estimated_bytes,
             scan_partitions_started: AtomicU64::new(0),
             scan_partitions_completed: AtomicU64::new(0),
             files_started: AtomicU64::new(0),
@@ -208,21 +220,21 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use super::DeltaProviderReadStats;
+    use super::{DeltaProviderReadStats, DeltaProviderReadStatsConfig};
     use crate::query_engine::datafusion::execution::DeltaProviderReaderBackend;
 
     #[test]
     fn read_stats_snapshot_starts_with_context_and_zero_counters() {
-        let stats = DeltaProviderReadStats::new(
-            "orders",
-            7,
-            DeltaProviderReaderBackend::OfficialKernel,
-            Some(true),
-            3,
-            5,
-            Some(99),
-            Some(42),
-        );
+        let stats = DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
+            source_name: "orders".to_owned(),
+            snapshot_version: 7,
+            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 3,
+            files_planned: 5,
+            estimated_rows: Some(99),
+            estimated_bytes: Some(42),
+        });
         let snapshot = stats.snapshot();
 
         assert_eq!(snapshot.source_name, "orders");
@@ -251,16 +263,16 @@ mod tests {
 
     #[test]
     fn read_stats_records_partial_progress_without_completing_failed_work() {
-        let stats = DeltaProviderReadStats::new(
-            "orders",
-            7,
-            DeltaProviderReaderBackend::OfficialKernel,
-            Some(false),
-            1,
-            1,
-            None,
-            None,
-        );
+        let stats = DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
+            source_name: "orders".to_owned(),
+            snapshot_version: 7,
+            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
+            scan_metadata_exhausted: Some(false),
+            scan_partitions_planned: 1,
+            files_planned: 1,
+            estimated_rows: None,
+            estimated_bytes: None,
+        });
 
         stats.record_scan_partition_started();
         stats.record_file_started();
@@ -289,16 +301,16 @@ mod tests {
         const THREADS: usize = 4;
         const ITERATIONS: usize = 100;
 
-        let stats = Arc::new(DeltaProviderReadStats::new(
-            "orders",
-            7,
-            DeltaProviderReaderBackend::OfficialKernel,
-            None,
-            THREADS,
-            THREADS,
-            None,
-            None,
-        ));
+        let stats = Arc::new(DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
+            source_name: "orders".to_owned(),
+            snapshot_version: 7,
+            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
+            scan_metadata_exhausted: None,
+            scan_partitions_planned: THREADS,
+            files_planned: THREADS,
+            estimated_rows: None,
+            estimated_bytes: None,
+        }));
         let mut handles = Vec::new();
 
         for _ in 0..THREADS {
