@@ -11,6 +11,8 @@ use crate::DeltaFunnelError;
 pub enum DeltaProviderReaderBackend {
     /// Current official delta_kernel reader baseline.
     OfficialKernel,
+    /// Native async Parquet reader for non-DV file tasks.
+    NativeAsync,
 }
 
 /// Bounded scheduling options for one Delta DataFusion provider scan.
@@ -413,7 +415,9 @@ fn validate_reader_backend(
     reader_backend: DeltaProviderReaderBackend,
 ) -> Result<(), DeltaFunnelError> {
     match reader_backend {
-        DeltaProviderReaderBackend::OfficialKernel => Ok(()),
+        DeltaProviderReaderBackend::OfficialKernel | DeltaProviderReaderBackend::NativeAsync => {
+            Ok(())
+        }
     }
 }
 
@@ -467,6 +471,25 @@ mod tests {
         assert_eq!(
             options.reader_backend,
             DeltaProviderReaderBackend::OfficialKernel
+        );
+        assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
+        assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn execution_options_can_select_native_async_backend() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            2,
+            1,
+        )?;
+
+        assert_eq!(
+            options.reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
         );
         assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);

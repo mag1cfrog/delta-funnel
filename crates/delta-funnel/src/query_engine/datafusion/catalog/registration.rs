@@ -300,6 +300,39 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn registration_accepts_native_async_backend_for_local_file_uri()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("registration-native-async-local-file")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let ctx = SessionContext::new();
+
+        let registered = register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+            DeltaProviderScanExecutionOptions {
+                reader_backend: DeltaProviderReaderBackend::NativeAsync,
+                max_concurrent_file_reads_per_scan: 1,
+                max_concurrent_file_reads_per_partition: 1,
+            },
+        )?;
+
+        assert_eq!(registered.sources.len(), 1);
+        assert_eq!(registered.sources[0].name, "orders");
+        assert!(ctx.table_exist("orders")?);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn catalog_inspection_exposes_registered_provider_schema()
     -> Result<(), Box<dyn std::error::Error>> {
