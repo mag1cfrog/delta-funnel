@@ -365,6 +365,7 @@ mod tests {
     use crate::error::{DeltaScanDeletionVectorPhase, DeltaScanFileReadPhase};
     use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
+        register_delta_sources_with_scan_execution_options,
     };
     use crate::query_engine::datafusion::execution::DeltaProviderReaderBackend;
     use crate::query_engine::datafusion::execution::read_stats::DeltaProviderReadStats;
@@ -530,7 +531,22 @@ mod tests {
         let dataframe = ctx
             .sql("select id, customer_name from orders order by id")
             .await?;
-        let result = dataframe.collect().await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].execution_options().reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
+        );
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
+        );
+
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
         let formatted = pretty_format_batches(&result)?.to_string();
 
         assert_eq!(
@@ -545,6 +561,47 @@ mod tests {
                 "+----+---------------+",
             ]
             .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_reader_backend_flows_through_provider_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_default("explicit-reader-backend")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::OfficialKernel,
+            2,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].execution_options(), execution_options);
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
         );
 
         Ok(())
