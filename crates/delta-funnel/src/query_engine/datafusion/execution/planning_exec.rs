@@ -1123,6 +1123,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_partition_streams_share_read_stats()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = RealParquetDeltaTable::new_default("multi-partition-read-stats")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let reader: Arc<dyn DeltaScanPartitionFileReader> = Arc::new(FakePartitionFileReader {
+            read_count: Arc::clone(&read_count),
+            schema: Arc::clone(&schema),
+            fail_path: None,
+        });
+        let sync_read_limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 2);
+        let read_stats = Arc::new(DeltaProviderReadStats::new(
+            "orders",
+            1,
+            Some(true),
+            2,
+            2,
+            Some(3),
+            Some(2),
+        ));
+        let stream_a = super::sequential_scan_partition_stream(
+            Arc::clone(&schema),
+            Arc::clone(&reader),
+            scan.read_schema(),
+            vec![fake_task("part-00000.parquet")],
+            sync_read_limiter.partition_limiter(0)?,
+            Arc::clone(&read_stats),
+        );
+        let stream_b = super::sequential_scan_partition_stream(
+            schema,
+            reader,
+            scan.read_schema(),
+            vec![fake_task("part-00001.parquet")],
+            sync_read_limiter.partition_limiter(1)?,
+            Arc::clone(&read_stats),
+        );
+
+        let (batches_a, batches_b) = tokio::try_join!(
+            datafusion::physical_plan::common::collect(stream_a),
+            datafusion::physical_plan::common::collect(stream_b)
+        )?;
+
+        let mut ids = batches_a
+            .iter()
+            .chain(batches_b.iter())
+            .map(batch_ids)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(read_count.load(Ordering::SeqCst), 2);
+        assert_eq!(sync_read_limiter.active_file_reads(), 0);
+        let stats = read_stats.snapshot();
+        assert_eq!(stats.scan_partitions_planned, 2);
+        assert_eq!(stats.files_planned, 2);
+        assert_eq!(stats.scan_partitions_started, 2);
+        assert_eq!(stats.scan_partitions_completed, 2);
+        assert_eq!(stats.files_started, 2);
+        assert_eq!(stats.files_completed, 2);
+        assert_eq!(stats.batches_produced, 3);
+        assert_eq!(stats.rows_produced, 3);
+        assert_eq!(stats.deletion_vector_failures, 0);
+        assert_eq!(stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sequential_stream_drop_stops_future_file_scheduling()
     -> Result<(), Box<dyn std::error::Error>> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
