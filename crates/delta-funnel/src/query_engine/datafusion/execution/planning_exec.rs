@@ -286,8 +286,12 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::logical_expr::{col, lit};
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
+    use delta_kernel::actions::deletion_vector::{
+        DeletionVectorDescriptor, DeletionVectorStorageType,
+    };
     use futures_util::StreamExt;
 
     use super::super::file_reader::{DeltaFileReadRequest, DeltaFileReadResult};
@@ -304,6 +308,7 @@ mod tests {
     };
     use crate::table_formats::{
         KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata, RealParquetDeltaTable,
+        build_projected_predicated_stats_delta_scan, datafusion_expr_to_kernel_predicate,
     };
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
@@ -1053,6 +1058,31 @@ mod tests {
     }
 
     #[test]
+    fn partition_read_schema_strips_physical_predicate_only_for_dv_tasks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("dv-partition-read-schema-gate")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
+        let read_schema = scan.read_schema();
+        let mut dv_task = fake_task("part-00000.parquet");
+        dv_task.deletion_vector = fake_deletion_vector_metadata();
+
+        assert!(read_schema.has_physical_predicate());
+        assert!(
+            super::partition_read_schema(read_schema.clone(), &[fake_task("part-00000.parquet")])
+                .has_physical_predicate()
+        );
+        assert!(!super::partition_read_schema(read_schema, &[dv_task]).has_physical_predicate());
+
+        Ok(())
+    }
+
+    #[test]
     fn provider_execution_boundary_avoids_runtime_creation_and_sync_bridge() {
         let checked_sources = [
             (
@@ -1138,6 +1168,16 @@ mod tests {
             deletion_vector: KernelScanDeletionVectorMetadata::NotPresent,
             transform: KernelPhysicalToLogicalTransform::NotRequired,
         }
+    }
+
+    fn fake_deletion_vector_metadata() -> KernelScanDeletionVectorMetadata {
+        KernelScanDeletionVectorMetadata::test_present_from_descriptor(DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: "fake-dv".to_owned(),
+            offset: Some(0),
+            size_in_bytes: 1,
+            cardinality: 1,
+        })
     }
 
     fn id_batch(
