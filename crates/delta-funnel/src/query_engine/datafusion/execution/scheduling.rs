@@ -4,6 +4,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::DeltaFunnelError;
 
+/// Provider file-reader backend selected for Delta scan execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaProviderReaderBackend {
+    /// Current official delta_kernel reader baseline.
+    OfficialKernel,
+}
+
 /// Bounded scheduling options for one Delta DataFusion provider scan.
 ///
 /// These limits apply to provider-scheduled physical Delta file reads. The
@@ -14,6 +21,9 @@ use crate::DeltaFunnelError;
 /// limiter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaProviderScanExecutionOptions {
+    /// File-reader backend used by normal provider scan execution.
+    pub reader_backend: DeltaProviderReaderBackend,
+
     /// Maximum file-read handoffs that may run at once across the whole scan.
     ///
     /// This is the scan-wide concurrency cap shared by all DataFusion execution
@@ -199,6 +209,7 @@ impl Drop for DeltaProviderSyncFileReadPermit {
 impl Default for DeltaProviderScanExecutionOptions {
     fn default() -> Self {
         Self {
+            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
             max_concurrent_file_reads_per_scan: 1,
             max_concurrent_file_reads_per_partition: 1,
         }
@@ -212,6 +223,22 @@ impl DeltaProviderScanExecutionOptions {
         max_concurrent_file_reads_per_partition: usize,
     ) -> Result<Self, DeltaFunnelError> {
         let options = Self {
+            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
+            max_concurrent_file_reads_per_scan,
+            max_concurrent_file_reads_per_partition,
+        };
+        options.validate()?;
+        Ok(options)
+    }
+
+    /// Builds validated Delta provider scan execution options with a reader backend.
+    pub fn try_new_with_reader_backend(
+        reader_backend: DeltaProviderReaderBackend,
+        max_concurrent_file_reads_per_scan: usize,
+        max_concurrent_file_reads_per_partition: usize,
+    ) -> Result<Self, DeltaFunnelError> {
+        let options = Self {
+            reader_backend,
             max_concurrent_file_reads_per_scan,
             max_concurrent_file_reads_per_partition,
         };
@@ -221,6 +248,7 @@ impl DeltaProviderScanExecutionOptions {
 
     /// Validates provider scan execution bounds before registration or scan execution.
     pub fn validate(&self) -> Result<(), DeltaFunnelError> {
+        validate_reader_backend(self.reader_backend)?;
         validate_positive(
             "max_concurrent_file_reads_per_scan",
             self.max_concurrent_file_reads_per_scan,
@@ -230,6 +258,14 @@ impl DeltaProviderScanExecutionOptions {
             self.max_concurrent_file_reads_per_partition,
         )?;
         Ok(())
+    }
+}
+
+fn validate_reader_backend(
+    reader_backend: DeltaProviderReaderBackend,
+) -> Result<(), DeltaFunnelError> {
+    match reader_backend {
+        DeltaProviderReaderBackend::OfficialKernel => Ok(()),
     }
 }
 
@@ -245,11 +281,46 @@ fn validate_positive(name: &'static str, value: usize) -> Result<(), DeltaFunnel
 
 #[cfg(test)]
 mod tests {
-    use super::{DeltaProviderScanExecutionOptions, DeltaProviderSyncReadLimiter};
+    use super::{
+        DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions, DeltaProviderSyncReadLimiter,
+    };
 
     #[test]
     fn default_execution_options_are_valid() -> Result<(), Box<dyn std::error::Error>> {
         DeltaProviderScanExecutionOptions::default().validate()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn default_execution_options_select_official_kernel_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = DeltaProviderScanExecutionOptions::default();
+
+        assert_eq!(
+            options.reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
+        );
+        options.validate()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn execution_options_can_select_official_kernel_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::OfficialKernel,
+            2,
+            1,
+        )?;
+
+        assert_eq!(
+            options.reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
+        );
+        assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
+        assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
 
         Ok(())
     }

@@ -23,8 +23,11 @@ use super::super::planning::file_task::DeltaScanFileTask;
 use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
-use super::file_reader::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
-use super::read_stats::DeltaProviderReadStats;
+use super::file_reader::DeltaFileReadRequest;
+use super::read_stats::{DeltaProviderReadStats, DeltaProviderReadStatsConfig};
+use super::reader_backend::{
+    DeltaProviderReaderBackendConfig, DeltaScanPartitionFileReader, build_partition_file_reader,
+};
 use super::scheduling::{
     DeltaProviderScanExecutionOptions, DeltaProviderSyncPartitionReadLimiter,
     DeltaProviderSyncReadLimiter,
@@ -61,19 +64,20 @@ impl DeltaScanPlanningExec {
 
         let sync_read_limiter =
             DeltaProviderSyncReadLimiter::new(execution_options, partition_plan.partitions.len());
-        let read_stats = Arc::new(DeltaProviderReadStats::new(
-            scan_plan.source_name.clone(),
-            scan_plan.snapshot_version,
-            Some(partition_plan.scan_metadata_exhausted),
-            partition_plan.partitions.len(),
-            partition_plan
+        let read_stats = Arc::new(DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
+            source_name: scan_plan.source_name.clone(),
+            snapshot_version: scan_plan.snapshot_version,
+            reader_backend: execution_options.reader_backend,
+            scan_metadata_exhausted: Some(partition_plan.scan_metadata_exhausted),
+            scan_partitions_planned: partition_plan.partitions.len(),
+            files_planned: partition_plan
                 .partitions
                 .iter()
                 .map(|partition| partition.file_tasks.len())
                 .sum(),
-            partition_plan.estimated_rows,
-            partition_plan.estimated_bytes,
-        ));
+            estimated_rows: partition_plan.estimated_rows,
+            estimated_bytes: partition_plan.estimated_bytes,
+        }));
 
         Self {
             scan_plan,
@@ -211,14 +215,13 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             ))));
         }
 
-        let file_reader: Arc<dyn DeltaScanPartitionFileReader> = Arc::new(
-            DeltaFileReader::try_new(DeltaFileReaderConfig {
-                source_name: &self.scan_plan.source_name,
-                table_uri: &self.scan_plan.table_uri,
-                snapshot_version: self.scan_plan.snapshot_version,
-            })
-            .map_err(DataFusionError::from)?,
-        );
+        let file_reader = build_partition_file_reader(DeltaProviderReaderBackendConfig {
+            reader_backend: self.execution_options.reader_backend,
+            source_name: &self.scan_plan.source_name,
+            table_uri: &self.scan_plan.table_uri,
+            snapshot_version: self.scan_plan.snapshot_version,
+        })
+        .map_err(DataFusionError::from)?;
         let file_tasks = scan_partition.file_tasks.clone();
         let read_schema =
             partition_read_schema(self.scan_plan.kernel_scan().read_schema(), &file_tasks);
@@ -235,22 +238,6 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             partition_limiter,
             Arc::clone(&self.read_stats),
         ))
-    }
-}
-
-trait DeltaScanPartitionFileReader: Send + Sync {
-    fn read_file(
-        &self,
-        request: DeltaFileReadRequest<'_>,
-    ) -> Result<super::file_reader::DeltaFileReadResult, DeltaFunnelError>;
-}
-
-impl DeltaScanPartitionFileReader for DeltaFileReader {
-    fn read_file(
-        &self,
-        request: DeltaFileReadRequest<'_>,
-    ) -> Result<super::file_reader::DeltaFileReadResult, DeltaFunnelError> {
-        Self::read_file(self, request)
     }
 }
 
@@ -378,8 +365,12 @@ mod tests {
     use crate::error::{DeltaScanDeletionVectorPhase, DeltaScanFileReadPhase};
     use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
+        register_delta_sources_with_scan_execution_options,
     };
-    use crate::query_engine::datafusion::execution::read_stats::DeltaProviderReadStats;
+    use crate::query_engine::datafusion::execution::DeltaProviderReaderBackend;
+    use crate::query_engine::datafusion::execution::read_stats::{
+        DeltaProviderReadStats, DeltaProviderReadStatsConfig,
+    };
     use crate::query_engine::datafusion::planning::file_task::DeltaScanFileTask;
     use crate::query_engine::datafusion::test_support::{
         DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, find_delta_scan_plans, register_fixture_source,
@@ -418,6 +409,10 @@ mod tests {
         let read_stats = scans[0].read_stats_snapshot();
         assert_eq!(read_stats.source_name, "orders");
         assert_eq!(read_stats.snapshot_version, 1);
+        assert_eq!(
+            read_stats.reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
+        );
         assert_eq!(read_stats.scan_metadata_exhausted, Some(true));
         assert_eq!(
             read_stats.scan_partitions_planned,
@@ -538,7 +533,22 @@ mod tests {
         let dataframe = ctx
             .sql("select id, customer_name from orders order by id")
             .await?;
-        let result = dataframe.collect().await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].execution_options().reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
+        );
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
+        );
+
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
         let formatted = pretty_format_batches(&result)?.to_string();
 
         assert_eq!(
@@ -553,6 +563,47 @@ mod tests {
                 "+----+---------------+",
             ]
             .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_reader_backend_flows_through_provider_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_default("explicit-reader-backend")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::OfficialKernel,
+            2,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].execution_options(), execution_options);
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
         );
 
         Ok(())
@@ -1168,15 +1219,16 @@ mod tests {
         });
         let sync_read_limiter =
             DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 2);
-        let read_stats = Arc::new(DeltaProviderReadStats::new(
-            "orders",
-            1,
-            Some(true),
-            2,
-            2,
-            Some(3),
-            Some(2),
-        ));
+        let read_stats = Arc::new(DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
+            source_name: "orders".to_owned(),
+            snapshot_version: 1,
+            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 2,
+            files_planned: 2,
+            estimated_rows: Some(3),
+            estimated_bytes: Some(2),
+        }));
         let stream_a = super::sequential_scan_partition_stream(
             Arc::clone(&schema),
             Arc::clone(&reader),
@@ -1560,15 +1612,16 @@ mod tests {
     }
 
     fn test_read_stats() -> Arc<DeltaProviderReadStats> {
-        Arc::new(DeltaProviderReadStats::new(
-            "orders",
-            1,
-            Some(true),
-            1,
-            2,
-            Some(3),
-            Some(2),
-        ))
+        Arc::new(DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
+            source_name: "orders".to_owned(),
+            snapshot_version: 1,
+            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 1,
+            files_planned: 2,
+            estimated_rows: Some(3),
+            estimated_bytes: Some(2),
+        }))
     }
 
     fn fake_deletion_vector_metadata() -> KernelScanDeletionVectorMetadata {

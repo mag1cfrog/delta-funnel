@@ -228,6 +228,7 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     use super::*;
+    use crate::query_engine::datafusion::execution::DeltaProviderReaderBackend;
     use crate::query_engine::datafusion::test_support::{
         DeltaLogTable, FailsOnCustomersSchemaProvider, INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
         SingleSchemaCatalogProvider, register_fixture_source,
@@ -283,6 +284,7 @@ mod tests {
                 scan_target_partitions: None,
             }],
             DeltaProviderScanExecutionOptions {
+                reader_backend: DeltaProviderReaderBackend::OfficialKernel,
                 max_concurrent_file_reads_per_scan: 0,
                 max_concurrent_file_reads_per_partition: 1,
             },
