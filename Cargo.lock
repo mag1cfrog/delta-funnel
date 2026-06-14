@@ -1266,6 +1266,7 @@ dependencies = [
  "delta_kernel",
  "futures-util",
  "libc",
+ "object_store",
  "snafu",
  "tokio",
  "windows-sys 0.61.2",

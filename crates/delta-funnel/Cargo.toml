@@ -26,6 +26,7 @@ delta_kernel = { version = "0.23.0", default-features = false, features = [
     "internal-api",
 ] }
 libc = "0.2"
+object_store = "0.13.2"
 snafu = "0.9"
 tokio = { version = "1", features = ["sync"] }
 

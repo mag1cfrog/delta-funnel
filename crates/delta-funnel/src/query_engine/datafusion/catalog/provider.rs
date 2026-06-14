@@ -19,7 +19,6 @@ use snafu::ResultExt;
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
     error::{DeltaScanConstructionSnafu, DeltaScanFilterSnafu},
-    redaction::sanitize_uri_for_display,
     table_formats::{
         DeltaKernelPredicate, ProjectedDeltaScan, build_projected_predicated_delta_scan,
         build_projected_predicated_stats_delta_scan, delta_source_arrow_schema,
@@ -27,7 +26,8 @@ use crate::{
 };
 
 use super::super::execution::{
-    DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions, DeltaScanPlanningExec,
+    DeltaNativeAsyncFileReaderConfig, DeltaProviderReaderBackend,
+    DeltaProviderScanExecutionOptions, DeltaScanPlanningExec, validate_native_async_reader_config,
 };
 use super::super::planning::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
 use super::super::planning::partition_target::{
@@ -401,32 +401,14 @@ fn reject_unsupported_reader_backend_source(
     execution_options: &DeltaProviderScanExecutionOptions,
     source: &PlannedDeltaSource,
 ) -> Result<(), DeltaFunnelError> {
-    reject_unsupported_reader_backend_table_uri(
-        execution_options,
-        source.name(),
-        source.table_uri(),
-    )
-}
-
-fn reject_unsupported_reader_backend_table_uri(
-    execution_options: &DeltaProviderScanExecutionOptions,
-    source_name: &str,
-    table_uri: &str,
-) -> Result<(), DeltaFunnelError> {
     match execution_options.reader_backend {
         DeltaProviderReaderBackend::OfficialKernel => Ok(()),
         DeltaProviderReaderBackend::NativeAsync => {
-            if table_uri.starts_with("file://") {
-                Ok(())
-            } else {
-                Err(DeltaFunnelError::Config {
-                    message: format!(
-                        "native async reader backend currently supports only file:// Delta table URIs; source {} uses {}",
-                        source_name,
-                        sanitize_uri_for_display(table_uri)
-                    ),
-                })
-            }
+            validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
+                source_name: source.name(),
+                table_uri: source.table_uri(),
+                snapshot_version: source.version(),
+            })
         }
     }
 }

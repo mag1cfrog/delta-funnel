@@ -477,27 +477,6 @@ fn delta_provider_accepts_native_async_backend_for_local_file_uri()
     Ok(())
 }
 
-#[test]
-fn native_async_backend_rejects_unsupported_table_uri_scheme_before_scan() {
-    let options = DeltaProviderScanExecutionOptions {
-        reader_backend: DeltaProviderReaderBackend::NativeAsync,
-        max_concurrent_file_reads_per_scan: 1,
-        max_concurrent_file_reads_per_partition: 1,
-    };
-
-    let result = reject_unsupported_reader_backend_table_uri(
-        &options,
-        "orders",
-        "s3://user:password@example.com/table?token=secret",
-    );
-
-    assert!(matches!(
-        result,
-        Err(DeltaFunnelError::Config { message })
-            if message == "native async reader backend currently supports only file:// Delta table URIs; source orders uses s3://example.com/table"
-    ));
-}
-
 #[tokio::test]
 async fn table_provider_scan_returns_projected_non_reading_plan()
 -> Result<(), Box<dyn std::error::Error>> {
