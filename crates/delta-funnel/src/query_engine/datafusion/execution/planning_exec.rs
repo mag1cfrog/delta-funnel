@@ -16,6 +16,7 @@ use datafusion::physical_plan::{
 };
 
 use crate::DeltaFunnelError;
+use crate::error::DeltaScanFileReadPhase;
 use crate::table_formats::KernelScanReadSchema;
 
 use super::super::planning::file_task::DeltaScanFileTask;
@@ -23,6 +24,7 @@ use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
 use super::file_reader::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
+use super::read_stats::DeltaProviderReadStats;
 use super::scheduling::{
     DeltaProviderScanExecutionOptions, DeltaProviderSyncPartitionReadLimiter,
     DeltaProviderSyncReadLimiter,
@@ -34,6 +36,7 @@ pub(crate) struct DeltaScanPlanningExec {
     partition_target_decision: DeltaScanPartitionTargetDecision,
     execution_options: DeltaProviderScanExecutionOptions,
     sync_read_limiter: Arc<DeltaProviderSyncReadLimiter>,
+    read_stats: Arc<DeltaProviderReadStats>,
     properties: Arc<PlanProperties>,
 }
 
@@ -58,6 +61,19 @@ impl DeltaScanPlanningExec {
 
         let sync_read_limiter =
             DeltaProviderSyncReadLimiter::new(execution_options, partition_plan.partitions.len());
+        let read_stats = Arc::new(DeltaProviderReadStats::new(
+            scan_plan.source_name.clone(),
+            scan_plan.snapshot_version,
+            Some(partition_plan.scan_metadata_exhausted),
+            partition_plan.partitions.len(),
+            partition_plan
+                .partitions
+                .iter()
+                .map(|partition| partition.file_tasks.len())
+                .sum(),
+            partition_plan.estimated_rows,
+            partition_plan.estimated_bytes,
+        ));
 
         Self {
             scan_plan,
@@ -65,6 +81,7 @@ impl DeltaScanPlanningExec {
             partition_target_decision,
             execution_options,
             sync_read_limiter,
+            read_stats,
             properties: Arc::new(properties),
         }
     }
@@ -87,6 +104,17 @@ impl DeltaScanPlanningExec {
     #[cfg(test)]
     pub(crate) fn execution_options(&self) -> DeltaProviderScanExecutionOptions {
         self.execution_options
+    }
+
+    /// Returns a cheap point-in-time snapshot of provider-owned read progress.
+    ///
+    /// This is the internal handoff for later orchestration and progress
+    /// reporting. It intentionally stays separate from DataFusion metrics so
+    /// callers can inspect partial progress after success, failure, or stream
+    /// cancellation.
+    #[allow(dead_code)]
+    pub(crate) fn read_stats_snapshot(&self) -> super::read_stats::DeltaProviderReadStatsSnapshot {
+        self.read_stats.snapshot()
     }
 }
 
@@ -205,6 +233,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             read_schema,
             file_tasks,
             partition_limiter,
+            Arc::clone(&self.read_stats),
         ))
     }
 }
@@ -250,35 +279,77 @@ fn sequential_scan_partition_stream(
     read_schema: KernelScanReadSchema,
     file_tasks: Vec<DeltaScanFileTask>,
     partition_limiter: DeltaProviderSyncPartitionReadLimiter,
+    read_stats: Arc<DeltaProviderReadStats>,
 ) -> SendableRecordBatchStream {
     let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
     let output = builder.tx();
 
     builder.spawn_blocking(move || {
+        read_stats.record_scan_partition_started();
         for task in file_tasks {
             if output.is_closed() {
                 return Ok(());
             }
 
+            read_stats.record_file_started();
             let _permit = partition_limiter.acquire_file_permit();
-            let file_result = file_reader
-                .read_file(DeltaFileReadRequest {
-                    task: &task,
-                    read_schema: &read_schema,
-                })
-                .map_err(DataFusionError::from)?;
+            let file_result = match file_reader.read_file(DeltaFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+            }) {
+                Ok(file_result) => file_result,
+                Err(error) => {
+                    record_deletion_vector_read_error(read_stats.as_ref(), &error);
+                    return Err(DataFusionError::from(error));
+                }
+            };
+            let deletion_vector_stats = file_result.deletion_vector_stats;
+            if deletion_vector_stats.payload_loaded {
+                read_stats.record_deletion_vector_payload_loaded();
+            }
+            if deletion_vector_stats.applied {
+                read_stats.record_deletion_vector_applied(deletion_vector_stats.deleted_rows);
+            }
 
             for batch in file_result {
+                let rows = batch.num_rows();
                 if output.blocking_send(Ok(batch)).is_err() {
                     return Ok(());
                 }
+                read_stats.record_batch_produced(rows);
             }
+            read_stats.record_file_completed();
         }
 
+        read_stats.record_scan_partition_completed();
         Ok(())
     });
 
     builder.build()
+}
+
+fn record_deletion_vector_read_error(
+    read_stats: &DeltaProviderReadStats,
+    error: &DeltaFunnelError,
+) {
+    match error {
+        DeltaFunnelError::DeltaScanDeletionVector { .. } => {
+            read_stats.record_deletion_vector_failure();
+        }
+        DeltaFunnelError::DeltaScanFileRead {
+            phase: DeltaScanFileReadPhase::DeletionVectorMasking,
+            ..
+        } => {
+            read_stats.record_deletion_vector_failure();
+        }
+        DeltaFunnelError::DeltaScanFileRead {
+            phase: DeltaScanFileReadPhase::DeletionVectorPredicateRejection,
+            ..
+        } => {
+            read_stats.record_deletion_vector_rejection();
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -304,9 +375,11 @@ mod tests {
         DeltaProviderScanExecutionOptions, DeltaProviderSyncReadLimiter,
         DeltaScanPartitionFileReader,
     };
+    use crate::error::{DeltaScanDeletionVectorPhase, DeltaScanFileReadPhase};
     use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
     };
+    use crate::query_engine::datafusion::execution::read_stats::DeltaProviderReadStats;
     use crate::query_engine::datafusion::planning::file_task::DeltaScanFileTask;
     use crate::query_engine::datafusion::test_support::{
         DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, find_delta_scan_plans, register_fixture_source,
@@ -342,6 +415,37 @@ mod tests {
             scans[0].execution_options(),
             super::DeltaProviderScanExecutionOptions::default()
         );
+        let read_stats = scans[0].read_stats_snapshot();
+        assert_eq!(read_stats.source_name, "orders");
+        assert_eq!(read_stats.snapshot_version, 1);
+        assert_eq!(read_stats.scan_metadata_exhausted, Some(true));
+        assert_eq!(
+            read_stats.scan_partitions_planned,
+            u64::try_from(scans[0].partition_plan().partitions.len())?
+        );
+        assert_eq!(
+            read_stats.files_planned,
+            u64::try_from(
+                scans[0]
+                    .partition_plan()
+                    .partitions
+                    .iter()
+                    .map(|partition| partition.file_tasks.len())
+                    .sum::<usize>()
+            )?
+        );
+        assert_eq!(
+            read_stats.estimated_rows,
+            scans[0].partition_plan().estimated_rows
+        );
+        assert_eq!(
+            read_stats.estimated_bytes,
+            scans[0].partition_plan().estimated_bytes
+        );
+        assert_eq!(read_stats.scan_partitions_started, 0);
+        assert_eq!(read_stats.files_started, 0);
+        assert_eq!(read_stats.batches_produced, 0);
+        assert_eq!(read_stats.rows_produced, 0);
 
         Ok(())
     }
@@ -372,9 +476,30 @@ mod tests {
         )?;
 
         let dataframe = ctx.sql("select * from orders").await?;
-        let result = dataframe.collect().await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
 
+        assert_eq!(scans.len(), 1);
         assert!(result.is_empty());
+        let read_stats = scans[0].read_stats_snapshot();
+        assert_eq!(read_stats.scan_partitions_planned, 0);
+        assert_eq!(read_stats.files_planned, 0);
+        assert_eq!(read_stats.estimated_rows, Some(0));
+        assert_eq!(read_stats.estimated_bytes, Some(0));
+        assert_eq!(read_stats.scan_partitions_started, 0);
+        assert_eq!(read_stats.scan_partitions_completed, 0);
+        assert_eq!(read_stats.files_started, 0);
+        assert_eq!(read_stats.files_completed, 0);
+        assert_eq!(read_stats.batches_produced, 0);
+        assert_eq!(read_stats.rows_produced, 0);
+        assert_eq!(read_stats.deletion_vector_payloads_loaded, 0);
+        assert_eq!(read_stats.deletion_vectors_applied, 0);
+        assert_eq!(read_stats.deletion_vector_rows_deleted, 0);
+        assert_eq!(read_stats.deletion_vector_failures, 0);
+        assert_eq!(read_stats.deletion_vector_rejections, 0);
 
         Ok(())
     }
@@ -717,7 +842,11 @@ mod tests {
         let dataframe = ctx
             .sql("select id, customer_name from orders order by id")
             .await?;
-        let result = dataframe.collect().await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
         let formatted = pretty_format_batches(&result)?.to_string();
 
         assert_eq!(
@@ -732,6 +861,12 @@ mod tests {
             ]
             .join("\n")
         );
+        let read_stats = scans[0].read_stats_snapshot();
+        assert_eq!(read_stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(read_stats.deletion_vectors_applied, 1);
+        assert_eq!(read_stats.deletion_vector_rows_deleted, 1);
+        assert_eq!(read_stats.deletion_vector_failures, 0);
+        assert_eq!(read_stats.deletion_vector_rejections, 0);
 
         Ok(())
     }
@@ -927,6 +1062,7 @@ mod tests {
         });
         let sync_read_limiter =
             DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let read_stats = test_read_stats();
         let mut stream = super::sequential_scan_partition_stream(
             schema,
             reader,
@@ -936,6 +1072,7 @@ mod tests {
                 fake_task("part-00001.parquet"),
             ],
             sync_read_limiter.partition_limiter(0)?,
+            Arc::clone(&read_stats),
         );
 
         let first = stream.next().await.ok_or("expected first batch")??;
@@ -958,6 +1095,13 @@ mod tests {
 
         assert_eq!(remaining_ids, vec![2, 3]);
         assert_eq!(read_count.load(Ordering::SeqCst), 2);
+        let stats = read_stats.snapshot();
+        assert_eq!(stats.scan_partitions_started, 1);
+        assert_eq!(stats.scan_partitions_completed, 1);
+        assert_eq!(stats.files_started, 2);
+        assert_eq!(stats.files_completed, 2);
+        assert_eq!(stats.batches_produced, 3);
+        assert_eq!(stats.rows_produced, 3);
 
         Ok(())
     }
@@ -980,18 +1124,105 @@ mod tests {
             schema: Arc::clone(&schema),
             fail_path: None,
         });
+        let read_stats = test_read_stats();
         let stream = super::sequential_scan_partition_stream(
             schema,
             reader,
             scan.read_schema(),
             vec![fake_task("part-00001.parquet")],
             sync_read_limiter.partition_limiter(0)?,
+            Arc::clone(&read_stats),
         );
 
         let batches = datafusion::physical_plan::common::collect(stream).await?;
 
         assert_eq!(batches.len(), 1);
         assert_eq!(sync_read_limiter.active_file_reads(), 0);
+        let stats = read_stats.snapshot();
+        assert_eq!(stats.scan_partitions_started, 1);
+        assert_eq!(stats.scan_partitions_completed, 1);
+        assert_eq!(stats.files_started, 1);
+        assert_eq!(stats.files_completed, 1);
+        assert_eq!(stats.batches_produced, 1);
+        assert_eq!(stats.rows_produced, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_partition_streams_share_read_stats()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = RealParquetDeltaTable::new_default("multi-partition-read-stats")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let reader: Arc<dyn DeltaScanPartitionFileReader> = Arc::new(FakePartitionFileReader {
+            read_count: Arc::clone(&read_count),
+            schema: Arc::clone(&schema),
+            fail_path: None,
+        });
+        let sync_read_limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 2);
+        let read_stats = Arc::new(DeltaProviderReadStats::new(
+            "orders",
+            1,
+            Some(true),
+            2,
+            2,
+            Some(3),
+            Some(2),
+        ));
+        let stream_a = super::sequential_scan_partition_stream(
+            Arc::clone(&schema),
+            Arc::clone(&reader),
+            scan.read_schema(),
+            vec![fake_task("part-00000.parquet")],
+            sync_read_limiter.partition_limiter(0)?,
+            Arc::clone(&read_stats),
+        );
+        let stream_b = super::sequential_scan_partition_stream(
+            schema,
+            reader,
+            scan.read_schema(),
+            vec![fake_task("part-00001.parquet")],
+            sync_read_limiter.partition_limiter(1)?,
+            Arc::clone(&read_stats),
+        );
+
+        let (batches_a, batches_b) = tokio::try_join!(
+            datafusion::physical_plan::common::collect(stream_a),
+            datafusion::physical_plan::common::collect(stream_b)
+        )?;
+
+        let mut ids = batches_a
+            .iter()
+            .chain(batches_b.iter())
+            .map(batch_ids)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(read_count.load(Ordering::SeqCst), 2);
+        assert_eq!(sync_read_limiter.active_file_reads(), 0);
+        let stats = read_stats.snapshot();
+        assert_eq!(stats.scan_partitions_planned, 2);
+        assert_eq!(stats.files_planned, 2);
+        assert_eq!(stats.scan_partitions_started, 2);
+        assert_eq!(stats.scan_partitions_completed, 2);
+        assert_eq!(stats.files_started, 2);
+        assert_eq!(stats.files_completed, 2);
+        assert_eq!(stats.batches_produced, 3);
+        assert_eq!(stats.rows_produced, 3);
+        assert_eq!(stats.deletion_vector_failures, 0);
+        assert_eq!(stats.deletion_vector_rejections, 0);
 
         Ok(())
     }
@@ -1015,6 +1246,7 @@ mod tests {
             schema: Arc::clone(&schema),
             fail_path: None,
         });
+        let read_stats = test_read_stats();
         let mut stream = super::sequential_scan_partition_stream(
             schema,
             reader,
@@ -1024,6 +1256,7 @@ mod tests {
                 fake_task("part-00001.parquet"),
             ],
             sync_read_limiter.partition_limiter(0)?,
+            Arc::clone(&read_stats),
         );
 
         let first = stream.next().await.ok_or("expected first batch")??;
@@ -1033,15 +1266,22 @@ mod tests {
 
         drop(stream);
 
-        for _ in 0..100 {
+        for _ in 0..1000 {
             if sync_read_limiter.active_file_reads() == 0 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
 
         assert_eq!(read_count.load(Ordering::SeqCst), 1);
         assert_eq!(sync_read_limiter.active_file_reads(), 0);
+        let stats = read_stats.snapshot();
+        assert_eq!(stats.scan_partitions_started, 1);
+        assert_eq!(stats.scan_partitions_completed, 0);
+        assert_eq!(stats.files_started, 1);
+        assert_eq!(stats.files_completed, 0);
+        assert!((1..=2).contains(&stats.batches_produced));
+        assert!((1..=2).contains(&stats.rows_produced));
 
         Ok(())
     }
@@ -1064,12 +1304,14 @@ mod tests {
             schema: Arc::clone(&schema),
             fail_path: Some("part-00001.parquet"),
         });
+        let read_stats = test_read_stats();
         let stream = super::sequential_scan_partition_stream(
             schema,
             reader,
             scan.read_schema(),
             vec![fake_task("part-00001.parquet")],
             sync_read_limiter.partition_limiter(0)?,
+            Arc::clone(&read_stats),
         );
 
         let error = datafusion::physical_plan::common::collect(stream)
@@ -1081,6 +1323,124 @@ mod tests {
             "{error}"
         );
         assert_eq!(sync_read_limiter.active_file_reads(), 0);
+        let stats = read_stats.snapshot();
+        assert_eq!(stats.scan_partitions_started, 1);
+        assert_eq!(stats.scan_partitions_completed, 0);
+        assert_eq!(stats.files_started, 1);
+        assert_eq!(stats.files_completed, 0);
+        assert_eq!(stats.batches_produced, 0);
+        assert_eq!(stats.rows_produced, 0);
+        assert_eq!(stats.deletion_vector_failures, 0);
+        assert_eq!(stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sequential_stream_records_deletion_vector_failure_metric()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = RealParquetDeltaTable::new_default("dv-failure-metric-read-schema")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
+        let sync_read_limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let reader = Arc::new(FakePartitionFileReader {
+            read_count: Arc::new(AtomicUsize::new(0)),
+            schema: Arc::clone(&schema),
+            fail_path: Some("part-dv-failure.parquet"),
+        });
+        let mut task = fake_task("part-dv-failure.parquet");
+        task.deletion_vector = fake_deletion_vector_metadata();
+        let read_stats = test_read_stats();
+        let stream = super::sequential_scan_partition_stream(
+            schema,
+            reader,
+            scan.read_schema(),
+            vec![task],
+            sync_read_limiter.partition_limiter(0)?,
+            Arc::clone(&read_stats),
+        );
+
+        let error = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect_err("fake DV failure must reach DataFusion");
+
+        assert!(
+            error
+                .to_string()
+                .contains("fake deletion-vector payload failure"),
+            "{error}"
+        );
+        assert_eq!(sync_read_limiter.active_file_reads(), 0);
+        let stats = read_stats.snapshot();
+        assert_eq!(stats.scan_partitions_started, 1);
+        assert_eq!(stats.scan_partitions_completed, 0);
+        assert_eq!(stats.files_started, 1);
+        assert_eq!(stats.files_completed, 0);
+        assert_eq!(stats.batches_produced, 0);
+        assert_eq!(stats.rows_produced, 0);
+        assert_eq!(stats.deletion_vector_failures, 1);
+        assert_eq!(stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sequential_stream_records_deletion_vector_rejection_metric()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = RealParquetDeltaTable::new_default("dv-rejection-metric-read-schema")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
+        let sync_read_limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let reader = Arc::new(FakePartitionFileReader {
+            read_count: Arc::new(AtomicUsize::new(0)),
+            schema: Arc::clone(&schema),
+            fail_path: Some("part-dv-rejection.parquet"),
+        });
+        let mut task = fake_task("part-dv-rejection.parquet");
+        task.deletion_vector = fake_deletion_vector_metadata();
+        let read_stats = test_read_stats();
+        let stream = super::sequential_scan_partition_stream(
+            schema,
+            reader,
+            scan.read_schema(),
+            vec![task],
+            sync_read_limiter.partition_limiter(0)?,
+            Arc::clone(&read_stats),
+        );
+
+        let error = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect_err("fake DV rejection must reach DataFusion");
+
+        assert!(
+            error
+                .to_string()
+                .contains("fake deletion-vector predicate rejection"),
+            "{error}"
+        );
+        assert_eq!(sync_read_limiter.active_file_reads(), 0);
+        let stats = read_stats.snapshot();
+        assert_eq!(stats.scan_partitions_started, 1);
+        assert_eq!(stats.scan_partitions_completed, 0);
+        assert_eq!(stats.files_started, 1);
+        assert_eq!(stats.files_completed, 0);
+        assert_eq!(stats.batches_produced, 0);
+        assert_eq!(stats.rows_produced, 0);
+        assert_eq!(stats.deletion_vector_failures, 0);
+        assert_eq!(stats.deletion_vector_rejections, 1);
 
         Ok(())
     }
@@ -1155,9 +1515,7 @@ mod tests {
         ) -> Result<DeltaFileReadResult, crate::DeltaFunnelError> {
             self.read_count.fetch_add(1, Ordering::SeqCst);
             if self.fail_path == Some(request.task.path.as_str()) {
-                return Err(crate::DeltaFunnelError::Config {
-                    message: "fake file read failure".to_owned(),
-                });
+                return Err(fake_file_read_error(request.task.path.as_str()));
             }
 
             let ids = match request.task.path.as_str() {
@@ -1178,7 +1536,10 @@ mod tests {
                     message: format!("fake batch construction failed: {error}"),
                 })?;
 
-            Ok(DeltaFileReadResult { batches })
+            Ok(DeltaFileReadResult {
+                batches,
+                deletion_vector_stats: Default::default(),
+            })
         }
     }
 
@@ -1198,6 +1559,18 @@ mod tests {
         }
     }
 
+    fn test_read_stats() -> Arc<DeltaProviderReadStats> {
+        Arc::new(DeltaProviderReadStats::new(
+            "orders",
+            1,
+            Some(true),
+            1,
+            2,
+            Some(3),
+            Some(2),
+        ))
+    }
+
     fn fake_deletion_vector_metadata() -> KernelScanDeletionVectorMetadata {
         KernelScanDeletionVectorMetadata::test_present_from_descriptor(DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedRelative,
@@ -1206,6 +1579,34 @@ mod tests {
             size_in_bytes: 1,
             cardinality: 1,
         })
+    }
+
+    fn fake_file_read_error(path: &str) -> crate::DeltaFunnelError {
+        match path {
+            "part-dv-failure.parquet" => crate::DeltaFunnelError::DeltaScanDeletionVector {
+                source_name: "orders".to_owned(),
+                table_uri: "file:///tmp/table".to_owned(),
+                snapshot_version: 1,
+                path: path.to_owned(),
+                phase: DeltaScanDeletionVectorPhase::PayloadRead,
+                source: Box::new(delta_kernel::Error::generic(
+                    "fake deletion-vector payload failure",
+                )),
+            },
+            "part-dv-rejection.parquet" => crate::DeltaFunnelError::DeltaScanFileRead {
+                source_name: "orders".to_owned(),
+                table_uri: "file:///tmp/table".to_owned(),
+                snapshot_version: 1,
+                path: path.to_owned(),
+                phase: DeltaScanFileReadPhase::DeletionVectorPredicateRejection,
+                source: Box::new(delta_kernel::Error::generic(
+                    "fake deletion-vector predicate rejection",
+                )),
+            },
+            _ => crate::DeltaFunnelError::Config {
+                message: "fake file read failure".to_owned(),
+            },
+        }
     }
 
     fn id_batch(
