@@ -31,6 +31,9 @@ use super::async_scheduler::{DeltaProviderAsyncFileReadFuture, DeltaProviderAsyn
 use super::file_reader::DeltaFileReadDeletionVectorStats;
 use super::read_stats::DeltaProviderReadStats;
 use super::scheduling::DeltaProviderAsyncFileReadPermit;
+use crate::table_formats::{
+    KernelDataFileReader, KernelDataFileReaderConfig, KernelDataFileTransformRequest,
+};
 
 const TABLE_ROOT_CONTEXT: &str = "<table-root>";
 
@@ -52,6 +55,7 @@ pub(crate) struct DeltaNativeAsyncFileReader {
     table_uri: String,
     snapshot_version: u64,
     store: Arc<dyn ObjectStore>,
+    data_file_reader: Arc<KernelDataFileReader>,
 }
 
 /// Object-store input for a single native async Parquet file read.
@@ -92,6 +96,9 @@ pub(crate) struct DeltaNativeAsyncFileReadStream {
     table_uri: String,
     snapshot_version: u64,
     path: String,
+    read_schema: KernelScanReadSchema,
+    transform: KernelPhysicalToLogicalTransform,
+    data_file_reader: Arc<KernelDataFileReader>,
     deletion_vector_stats: DeltaFileReadDeletionVectorStats,
     _permit: Option<DeltaProviderAsyncFileReadPermit>,
 }
@@ -126,12 +133,19 @@ impl DeltaNativeAsyncFileReader {
                 phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
             },
         )?;
+        let data_file_reader =
+            Arc::new(KernelDataFileReader::try_new(KernelDataFileReaderConfig {
+                source_name: config.source_name,
+                table_uri: config.table_uri,
+                snapshot_version: config.snapshot_version,
+            })?);
 
         Ok(Self {
             source_name: config.source_name.to_owned(),
             table_uri: config.table_uri.to_owned(),
             snapshot_version: config.snapshot_version,
             store,
+            data_file_reader,
         })
     }
 
@@ -192,9 +206,9 @@ impl DeltaNativeAsyncFileReader {
     /// Opens one non-DV file task with parquet-rs async object-store reads.
     ///
     /// This first native implementation intentionally supports only file tasks
-    /// whose physical Parquet batches are already provider-visible batches:
-    /// no deletion vectors, no physical-to-logical transform, and no kernel
-    /// physical predicate. Later slices reopen those equivalence boundaries.
+    /// with async object-store Parquet reads and optional physical-to-logical
+    /// transforms. Deletion vectors and kernel physical predicates remain gated
+    /// until later native reader slices reopen those paths.
     #[cfg(test)]
     pub(crate) async fn open_file_stream(
         &self,
@@ -274,6 +288,9 @@ impl DeltaNativeAsyncFileReader {
             table_uri: self.table_uri.clone(),
             snapshot_version: self.snapshot_version,
             path: request.task.path.clone(),
+            read_schema: request.read_schema.clone(),
+            transform: request.task.transform.clone(),
+            data_file_reader: Arc::clone(&self.data_file_reader),
             deletion_vector_stats: DeltaFileReadDeletionVectorStats::default(),
             _permit: permit,
         })
@@ -304,7 +321,10 @@ impl DeltaNativeAsyncFileReadStream {
                 phase: DeltaScanFileReadPhase::ParquetBatchRead,
             })?;
 
-        self.project_batch_to_schema(batch).map(Some)
+        let physical_batch = self.project_batch_to_schema(batch)?;
+
+        self.apply_physical_to_logical_transform(physical_batch)
+            .map(Some)
     }
 
     /// Reorders the Parquet batch into the provider scan schema when needed.
@@ -327,6 +347,19 @@ impl DeltaNativeAsyncFileReadStream {
                 snapshot_version: self.snapshot_version,
                 path: self.path.clone(),
                 phase: DeltaScanFileReadPhase::ArrowConversion,
+            })
+    }
+
+    fn apply_physical_to_logical_transform(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch, DeltaFunnelError> {
+        self.data_file_reader
+            .apply_physical_to_logical_transform(KernelDataFileTransformRequest {
+                path: &self.path,
+                batch,
+                schema: &self.read_schema,
+                transform: &self.transform,
             })
     }
 }
@@ -377,11 +410,6 @@ impl DeltaNativeAsyncFileReader {
     ) -> Result<(), DeltaFunnelError> {
         let reason = if task.deletion_vector.is_present() {
             Some("native async reader does not support deletion-vector file tasks yet")
-        } else if !matches!(
-            task.transform,
-            KernelPhysicalToLogicalTransform::NotRequired
-        ) {
-            Some("native async reader does not support physical-to-logical transforms yet")
         } else if read_schema.has_physical_predicate() {
             Some("native async reader does not support kernel physical predicates yet")
         } else {

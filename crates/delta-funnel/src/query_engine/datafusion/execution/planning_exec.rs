@@ -859,6 +859,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_column_mapping_transform_emits_logical_column_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_column_mapping(
+            "native-async-column-mapping-transform",
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx
+            .sql("select customer_name, id from orders order by id")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+        assert!(
+            scans[0].partition_plan().partitions[0].file_tasks[0]
+                .transform
+                .is_required()
+        );
+
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        assert!(result.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 2
+                && schema.field(0).name() == "customer_name"
+                && schema.field(1).name() == "id"
+                && schema.field_with_name("phys_customer_name").is_err()
+                && schema.field_with_name("phys_id").is_err()
+        }));
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+---------------+----+",
+                "| customer_name | id |",
+                "+---------------+----+",
+                "| alice         | 1  |",
+                "| bob           | 2  |",
+                "|               | 3  |",
+                "+---------------+----+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_backend_preserves_file_order_in_one_partition()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
