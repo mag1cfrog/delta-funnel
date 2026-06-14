@@ -292,6 +292,13 @@ fn sequential_scan_partition_stream(
                     read_schema: &read_schema,
                 })
                 .map_err(DataFusionError::from)?;
+            let deletion_vector_stats = file_result.deletion_vector_stats;
+            if deletion_vector_stats.payload_loaded {
+                read_stats.record_deletion_vector_payload_loaded();
+            }
+            if deletion_vector_stats.applied {
+                read_stats.record_deletion_vector_applied(deletion_vector_stats.deleted_rows);
+            }
 
             for batch in file_result {
                 let rows = batch.num_rows();
@@ -778,7 +785,11 @@ mod tests {
         let dataframe = ctx
             .sql("select id, customer_name from orders order by id")
             .await?;
-        let result = dataframe.collect().await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
         let formatted = pretty_format_batches(&result)?.to_string();
 
         assert_eq!(
@@ -793,6 +804,12 @@ mod tests {
             ]
             .join("\n")
         );
+        let read_stats = scans[0].read_stats_snapshot();
+        assert_eq!(read_stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(read_stats.deletion_vectors_applied, 1);
+        assert_eq!(read_stats.deletion_vector_rows_deleted, 1);
+        assert_eq!(read_stats.deletion_vector_failures, 0);
+        assert_eq!(read_stats.deletion_vector_rejections, 0);
 
         Ok(())
     }
@@ -1275,7 +1292,10 @@ mod tests {
                     message: format!("fake batch construction failed: {error}"),
                 })?;
 
-            Ok(DeltaFileReadResult { batches })
+            Ok(DeltaFileReadResult {
+                batches,
+                deletion_vector_stats: Default::default(),
+            })
         }
     }
 

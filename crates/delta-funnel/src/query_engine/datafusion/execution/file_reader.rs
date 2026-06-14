@@ -62,6 +62,8 @@ pub(crate) struct DeltaFileReadResult {
     /// batches through an iterator-shaped boundary without seeing unmasked
     /// physical data.
     pub(crate) batches: Vec<RecordBatch>,
+    /// File-local deletion-vector metrics observed during this read.
+    pub(crate) deletion_vector_stats: DeltaFileReadDeletionVectorStats,
 }
 
 impl IntoIterator for DeltaFileReadResult {
@@ -71,6 +73,17 @@ impl IntoIterator for DeltaFileReadResult {
     fn into_iter(self) -> Self::IntoIter {
         self.batches.into_iter()
     }
+}
+
+/// File-local deletion-vector metrics observed during one file read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeltaFileReadDeletionVectorStats {
+    /// Whether a deletion-vector payload was loaded for this file.
+    pub(crate) payload_loaded: bool,
+    /// Whether a deletion-vector mask was applied to this file.
+    pub(crate) applied: bool,
+    /// Rows removed by the deletion-vector mask.
+    pub(crate) deleted_rows: usize,
 }
 
 impl DeltaFileReader {
@@ -112,6 +125,10 @@ impl DeltaFileReader {
                     path: &request.task.path,
                     deletion_vector: &request.task.deletion_vector,
                 })?;
+        let mut deletion_vector_stats = DeltaFileReadDeletionVectorStats {
+            payload_loaded: deletion_vector.is_some(),
+            ..DeltaFileReadDeletionVectorStats::default()
+        };
 
         let data = self
             .data_file_reader
@@ -129,13 +146,20 @@ impl DeltaFileReader {
             data.batches,
             request.read_schema,
         )?;
-        let batches =
-            self.apply_deletion_vector_mask(request.task, batches, deletion_vector.as_mut())?;
+        let batches = self.apply_deletion_vector_mask(
+            request.task,
+            batches,
+            deletion_vector.as_mut(),
+            &mut deletion_vector_stats,
+        )?;
         if let Some(deletion_vector) = deletion_vector.as_mut() {
             deletion_vector.finish(self.deletion_vector_context(request.task))?;
         }
 
-        Ok(DeltaFileReadResult { batches })
+        Ok(DeltaFileReadResult {
+            batches,
+            deletion_vector_stats,
+        })
     }
 
     fn validate_deletion_vector_read_mode(
@@ -205,14 +229,23 @@ impl DeltaFileReader {
         task: &DeltaScanFileTask,
         batches: Vec<RecordBatch>,
         mut deletion_vector: Option<&mut ProviderDeletionVectorSelection>,
+        deletion_vector_stats: &mut DeltaFileReadDeletionVectorStats,
     ) -> Result<Vec<RecordBatch>, DeltaFunnelError> {
         let Some(deletion_vector) = deletion_vector.as_mut() else {
             return Ok(batches);
         };
 
+        deletion_vector_stats.applied = true;
         batches
             .into_iter()
-            .map(|batch| self.apply_deletion_vector_mask_to_batch(task, batch, deletion_vector))
+            .map(|batch| {
+                self.apply_deletion_vector_mask_to_batch(
+                    task,
+                    batch,
+                    deletion_vector,
+                    deletion_vector_stats,
+                )
+            })
             .collect()
     }
 
@@ -221,9 +254,14 @@ impl DeltaFileReader {
         task: &DeltaScanFileTask,
         batch: RecordBatch,
         deletion_vector: &mut ProviderDeletionVectorSelection,
+        deletion_vector_stats: &mut DeltaFileReadDeletionVectorStats,
     ) -> Result<RecordBatch, DeltaFunnelError> {
         let keep_mask =
             deletion_vector.consume_batch(batch.num_rows(), self.deletion_vector_context(task))?;
+        let deleted_rows = keep_mask.iter().filter(|selected| !**selected).count();
+        deletion_vector_stats.deleted_rows = deletion_vector_stats
+            .deleted_rows
+            .saturating_add(deleted_rows);
         if keep_mask.iter().all(|selected| *selected) {
             return Ok(batch);
         }
@@ -426,6 +464,9 @@ mod tests {
         })?;
 
         assert_eq!(collect_ids(&result.batches)?, vec![1, 3]);
+        assert!(result.deletion_vector_stats.payload_loaded);
+        assert!(result.deletion_vector_stats.applied);
+        assert_eq!(result.deletion_vector_stats.deleted_rows, 1);
 
         Ok(())
     }
@@ -451,6 +492,9 @@ mod tests {
 
         assert!(result.batches.len() > 1);
         assert_eq!(ids, expected);
+        assert!(result.deletion_vector_stats.payload_loaded);
+        assert!(result.deletion_vector_stats.applied);
+        assert_eq!(result.deletion_vector_stats.deleted_rows, 3);
 
         Ok(())
     }
@@ -475,6 +519,9 @@ mod tests {
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(collect_ids(&result.batches)?, Vec::<i32>::new());
+        assert!(result.deletion_vector_stats.payload_loaded);
+        assert!(result.deletion_vector_stats.applied);
+        assert_eq!(result.deletion_vector_stats.deleted_rows, 3);
 
         Ok(())
     }
@@ -495,6 +542,9 @@ mod tests {
         })?;
 
         assert_eq!(collect_ids(&result.batches)?, vec![1, 2, 3]);
+        assert!(result.deletion_vector_stats.payload_loaded);
+        assert!(result.deletion_vector_stats.applied);
+        assert_eq!(result.deletion_vector_stats.deleted_rows, 0);
 
         Ok(())
     }
