@@ -23,6 +23,8 @@ pub enum DeltaScanFileReadPhase {
     ArrowConversion,
     /// Applying a physical-to-logical transform failed.
     TransformApplication,
+    /// A deletion-vector read was rejected because the requested read mode is not safe yet.
+    DeletionVectorPredicateRejection,
     /// Applying a deletion-vector mask failed.
     DeletionVectorMasking,
 }
@@ -38,6 +40,7 @@ impl std::fmt::Display for DeltaScanFileReadPhase {
             Self::ParquetBatchRead => "Parquet batch read",
             Self::ArrowConversion => "Arrow conversion",
             Self::TransformApplication => "physical-to-logical transform application",
+            Self::DeletionVectorPredicateRejection => "deletion-vector predicate read rejection",
             Self::DeletionVectorMasking => "deletion-vector masking",
         })
     }

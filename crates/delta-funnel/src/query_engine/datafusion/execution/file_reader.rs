@@ -179,7 +179,7 @@ impl DeltaFileReader {
             table_uri: self.table_uri.clone(),
             snapshot_version: self.snapshot_version,
             path: task.path.clone(),
-            phase: DeltaScanFileReadPhase::DeletionVectorMasking,
+            phase: DeltaScanFileReadPhase::DeletionVectorPredicateRejection,
         })
     }
 
@@ -598,7 +598,10 @@ mod tests {
             .ok_or("expected DV physical predicate rejection")?;
         let display = error.to_string();
 
-        assert!(display.contains("deletion-vector masking"), "{display}");
+        assert!(
+            display.contains("deletion-vector predicate read rejection"),
+            "{display}"
+        );
         assert!(
             display.contains("original row-index accounting"),
             "{display}"
