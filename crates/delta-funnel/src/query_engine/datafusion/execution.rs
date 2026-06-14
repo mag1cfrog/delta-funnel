@@ -1,5 +1,6 @@
 //! Delta DataFusion scan execution.
 
+pub(crate) mod async_scheduler;
 pub(crate) mod environment;
 pub(crate) mod file_reader;
 mod planning_exec;

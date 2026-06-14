@@ -27,6 +27,7 @@ delta_kernel = { version = "0.23.0", default-features = false, features = [
 ] }
 libc = "0.2"
 snafu = "0.9"
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 futures-util = "0.3"
