@@ -733,4 +733,48 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn async_limiter_source_avoids_blocking_runtime_patterns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = include_str!("scheduling.rs");
+        let async_limiter_source = source_section(
+            source,
+            "impl DeltaProviderAsyncReadLimiter",
+            "impl DeltaProviderSyncPartitionReadLimiter",
+        )?;
+        let forbidden_patterns = [
+            concat!("Cond", "var"),
+            concat!("Mut", "ex"),
+            concat!("block", "_", "on"),
+            concat!("Handle", "::", "block", "_", "on"),
+            concat!("Runtime", "::", "new"),
+            concat!("spawn", "_", "blocking"),
+        ];
+
+        for pattern in forbidden_patterns {
+            assert!(
+                !async_limiter_source.contains(pattern),
+                "async limiter source must not contain {pattern}"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn source_section<'a>(
+        source: &'a str,
+        start_pattern: &str,
+        end_pattern: &str,
+    ) -> Result<&'a str, Box<dyn std::error::Error>> {
+        let start = source
+            .find(start_pattern)
+            .ok_or("expected source section start")?;
+        let end = source[start..]
+            .find(end_pattern)
+            .map(|offset| start + offset)
+            .ok_or("expected source section end")?;
+
+        Ok(&source[start..end])
+    }
 }

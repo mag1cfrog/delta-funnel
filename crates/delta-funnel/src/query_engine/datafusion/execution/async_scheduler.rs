@@ -326,6 +326,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_downstream_demand_bounds_admitted_work() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let limiter =
+            DeltaProviderAsyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let partition = limiter.partition_limiter(0)?;
+        let reader = Arc::new(CountingAsyncFileReader::new());
+        let mut scheduler = DeltaProviderAsyncPartitionReadScheduler::new(
+            DeltaProviderAsyncPartitionReadSchedulerConfig::new(
+                vec![
+                    FakeFileTask { id: 1 },
+                    FakeFileTask { id: 2 },
+                    FakeFileTask { id: 3 },
+                ],
+                Arc::clone(&reader),
+                partition,
+            ),
+        );
+
+        let first = scheduler
+            .next_file()
+            .await
+            .ok_or("expected first file output")??;
+
+        assert_eq!(first, 1);
+        assert_eq!(scheduler.admitted_file_tasks(), 1);
+        assert_eq!(scheduler.remaining_file_tasks(), 2);
+        assert_eq!(reader.futures_created(), 1);
+        assert_eq!(reader.reads_started(), 1);
+        assert_eq!(limiter.active_file_reads(), 0);
+
+        tokio::task::yield_now().await;
+
+        assert_eq!(scheduler.admitted_file_tasks(), 1);
+        assert_eq!(scheduler.remaining_file_tasks(), 2);
+        assert_eq!(reader.futures_created(), 1);
+        assert_eq!(reader.reads_started(), 1);
+        assert_eq!(limiter.active_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn scheduler_does_not_admit_file_work_before_permits()
     -> Result<(), Box<dyn std::error::Error>> {
         let limiter =
@@ -393,7 +435,101 @@ mod tests {
         drop(next);
 
         assert_eq!(limiter.active_file_reads(), 0);
+        assert_eq!(scheduler.admitted_file_tasks(), 1);
+        assert_eq!(scheduler.remaining_file_tasks(), 0);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_future_file_scheduling_without_draining_prefetch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter =
+            DeltaProviderAsyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let partition = limiter.partition_limiter(0)?;
+        let reader = Arc::new(PendingAsyncFileReader::new());
+        let mut scheduler = DeltaProviderAsyncPartitionReadScheduler::new(
+            DeltaProviderAsyncPartitionReadSchedulerConfig::new(
+                vec![FakeFileTask { id: 1 }, FakeFileTask { id: 2 }],
+                Arc::clone(&reader),
+                partition,
+            ),
+        );
+        let mut next = Box::pin(scheduler.next_file());
+
+        tokio::select! {
+            output = &mut next => {
+                return Err(format!("pending file read should not complete: {output:?}").into());
+            }
+            () = tokio::task::yield_now() => {}
+        }
+
+        assert_eq!(reader.futures_created(), 1);
+        assert_eq!(reader.reads_started(), 1);
+        assert_eq!(limiter.active_file_reads(), 1);
+
+        drop(next);
+        tokio::task::yield_now().await;
+
+        assert_eq!(reader.futures_created(), 1);
+        assert_eq!(reader.reads_started(), 1);
+        assert_eq!(scheduler.admitted_file_tasks(), 1);
+        assert_eq!(scheduler.remaining_file_tasks(), 1);
+        assert_eq!(limiter.active_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn async_scheduler_source_avoids_blocking_runtime_patterns() {
+        let source = include_str!("async_scheduler.rs");
+        let forbidden_patterns = [
+            concat!("Cond", "var"),
+            concat!("Mut", "ex"),
+            concat!("block", "_", "on"),
+            concat!("Handle", "::", "block", "_", "on"),
+            concat!("Runtime", "::", "new"),
+            concat!("spawn", "_", "blocking"),
+        ];
+
+        for pattern in forbidden_patterns {
+            assert!(
+                !source.contains(pattern),
+                "async scheduler source must not contain {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn async_limiter_dependency_is_direct_production_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = include_str!("../../../../Cargo.toml");
+        let dependency_line = direct_dependency_line(manifest, "tokio")
+            .ok_or("expected tokio direct dependency in production dependencies")?;
+
+        assert!(dependency_line.contains("features"));
+        assert!(dependency_line.contains("\"sync\""));
+
+        Ok(())
+    }
+
+    fn direct_dependency_line<'a>(manifest: &'a str, dependency: &str) -> Option<&'a str> {
+        let mut in_dependency_section = false;
+
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_dependency_section = trimmed == "[dependencies]";
+                continue;
+            }
+            if !in_dependency_section {
+                continue;
+            }
+            if trimmed.starts_with(&format!("{dependency} =")) {
+                return Some(trimmed);
+            }
+        }
+
+        None
     }
 }
