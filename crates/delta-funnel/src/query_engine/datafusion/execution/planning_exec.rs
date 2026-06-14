@@ -23,8 +23,11 @@ use super::super::planning::file_task::DeltaScanFileTask;
 use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
-use super::file_reader::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
+use super::file_reader::DeltaFileReadRequest;
 use super::read_stats::DeltaProviderReadStats;
+use super::reader_backend::{
+    DeltaProviderReaderBackendConfig, DeltaScanPartitionFileReader, build_partition_file_reader,
+};
 use super::scheduling::{
     DeltaProviderScanExecutionOptions, DeltaProviderSyncPartitionReadLimiter,
     DeltaProviderSyncReadLimiter,
@@ -211,14 +214,13 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             ))));
         }
 
-        let file_reader: Arc<dyn DeltaScanPartitionFileReader> = Arc::new(
-            DeltaFileReader::try_new(DeltaFileReaderConfig {
-                source_name: &self.scan_plan.source_name,
-                table_uri: &self.scan_plan.table_uri,
-                snapshot_version: self.scan_plan.snapshot_version,
-            })
-            .map_err(DataFusionError::from)?,
-        );
+        let file_reader = build_partition_file_reader(DeltaProviderReaderBackendConfig {
+            reader_backend: self.execution_options.reader_backend,
+            source_name: &self.scan_plan.source_name,
+            table_uri: &self.scan_plan.table_uri,
+            snapshot_version: self.scan_plan.snapshot_version,
+        })
+        .map_err(DataFusionError::from)?;
         let file_tasks = scan_partition.file_tasks.clone();
         let read_schema =
             partition_read_schema(self.scan_plan.kernel_scan().read_schema(), &file_tasks);
@@ -235,22 +237,6 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             partition_limiter,
             Arc::clone(&self.read_stats),
         ))
-    }
-}
-
-trait DeltaScanPartitionFileReader: Send + Sync {
-    fn read_file(
-        &self,
-        request: DeltaFileReadRequest<'_>,
-    ) -> Result<super::file_reader::DeltaFileReadResult, DeltaFunnelError>;
-}
-
-impl DeltaScanPartitionFileReader for DeltaFileReader {
-    fn read_file(
-        &self,
-        request: DeltaFileReadRequest<'_>,
-    ) -> Result<super::file_reader::DeltaFileReadResult, DeltaFunnelError> {
-        Self::read_file(self, request)
     }
 }
 
