@@ -806,11 +806,11 @@ mod tests {
             }],
         )?;
 
-        let dataframe = ctx
+        let id_dataframe = ctx
             .sql("select id from orders where id > 1000 order by id")
             .await?;
-        let result = dataframe.collect().await?;
-        let ids = result
+        let id_result = id_dataframe.collect().await?;
+        let ids = id_result
             .iter()
             .map(batch_ids)
             .collect::<Result<Vec<_>, _>>()?
@@ -819,6 +819,29 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, vec![1001, 1002]);
+
+        let name_dataframe = ctx
+            .sql("select customer_name from orders where id > 1000 order by customer_name")
+            .await?;
+        let name_result = name_dataframe.collect().await?;
+        let formatted = pretty_format_batches(&name_result)?.to_string();
+
+        assert!(name_result.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 1 && schema.field(0).name() == "customer_name"
+        }));
+        assert_eq!(
+            formatted,
+            [
+                "+---------------+",
+                "| customer_name |",
+                "+---------------+",
+                "| customer-1001 |",
+                "| customer-1002 |",
+                "+---------------+",
+            ]
+            .join("\n")
+        );
 
         Ok(())
     }
