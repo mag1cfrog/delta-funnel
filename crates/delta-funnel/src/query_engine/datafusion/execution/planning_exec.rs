@@ -1081,6 +1081,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_stream_backpressure_bounds_future_file_scheduling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_two_large_files(
+            "native-async-backpressure-scheduling",
+            20_000,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].partition_plan().partitions.len(), 1);
+        assert_eq!(scans[0].partition_plan().partitions[0].file_tasks.len(), 2);
+
+        let mut stream = scans[0].execute(0, ctx.task_ctx())?;
+        let first = stream.next().await.ok_or("expected first batch")??;
+        let first_ids = batch_ids(&first)?;
+        let stats_after_first_batch = scans[0].read_stats_snapshot();
+
+        assert_eq!(first_ids.first().copied(), Some(1));
+        assert_eq!(stats_after_first_batch.files_started, 1);
+        assert_eq!(stats_after_first_batch.files_completed, 0);
+        assert_eq!(stats_after_first_batch.scan_partitions_completed, 0);
+
+        let remaining = datafusion::physical_plan::common::collect(stream).await?;
+        let mut ids = first_ids;
+        ids.extend(collect_batch_ids(&remaining)?);
+        let expected_ids = (1..=40_000).collect::<Vec<_>>();
+
+        assert_eq!(ids, expected_ids);
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.scan_partitions_completed, 1);
+        assert_eq!(stats.files_started, 2);
+        assert_eq!(stats.files_completed, 2);
+        assert_eq!(stats.rows_produced, 40_000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn projection_execution_emits_requested_columns() -> Result<(), Box<dyn std::error::Error>>
     {
         let ctx = SessionContext::new();
