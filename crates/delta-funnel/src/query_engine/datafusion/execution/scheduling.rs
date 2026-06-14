@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
 use crate::DeltaFunnelError;
 
 /// Provider file-reader backend selected for Delta scan execution.
@@ -71,6 +73,34 @@ pub(crate) struct DeltaProviderSyncFileReadPermit {
     partition: usize,
     limiter: Arc<DeltaProviderSyncReadLimiter>,
     released: bool,
+}
+
+/// Async limiter for native provider file work in one Delta scan.
+///
+/// This limiter is intentionally separate from the official-kernel sync
+/// fallback limiter. Native async readers must acquire both scan-wide and
+/// partition-local capacity before starting file, object-store, or range-read
+/// work.
+#[allow(dead_code)]
+pub(crate) struct DeltaProviderAsyncReadLimiter {
+    options: DeltaProviderScanExecutionOptions,
+    scan_permits: Arc<Semaphore>,
+    partition_permits: Vec<Arc<Semaphore>>,
+}
+
+/// Per-execution-partition view of the native async read limiter.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct DeltaProviderAsyncPartitionReadLimiter {
+    partition: usize,
+    limiter: Arc<DeltaProviderAsyncReadLimiter>,
+}
+
+/// Owned async permit for one native provider file handoff.
+#[allow(dead_code)]
+pub(crate) struct DeltaProviderAsyncFileReadPermit {
+    _scan_permit: OwnedSemaphorePermit,
+    _partition_permit: OwnedSemaphorePermit,
 }
 
 impl DeltaProviderSyncReadLimiter {
@@ -186,6 +216,124 @@ impl DeltaProviderSyncReadLimiter {
     }
 }
 
+#[allow(dead_code)]
+impl DeltaProviderAsyncReadLimiter {
+    pub(crate) fn new(
+        options: DeltaProviderScanExecutionOptions,
+        partition_count: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            options,
+            scan_permits: Arc::new(Semaphore::new(options.max_concurrent_file_reads_per_scan)),
+            partition_permits: (0..partition_count)
+                .map(|_| {
+                    Arc::new(Semaphore::new(
+                        options.max_concurrent_file_reads_per_partition,
+                    ))
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn partition_limiter(
+        self: &Arc<Self>,
+        partition: usize,
+    ) -> Result<DeltaProviderAsyncPartitionReadLimiter, DeltaFunnelError> {
+        let partition_count = self.partition_permits.len();
+        if partition >= partition_count {
+            return Err(DeltaFunnelError::Config {
+                message: format!(
+                    "async read limiter partition {partition} is out of range for {partition_count} partitions"
+                ),
+            });
+        }
+
+        Ok(DeltaProviderAsyncPartitionReadLimiter {
+            partition,
+            limiter: Arc::clone(self),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_file_reads(&self) -> usize {
+        self.options
+            .max_concurrent_file_reads_per_scan
+            .saturating_sub(self.scan_permits.available_permits())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn partition_active_file_reads(&self, partition: usize) -> Option<usize> {
+        self.partition_permits.get(partition).map(|permits| {
+            self.options
+                .max_concurrent_file_reads_per_partition
+                .saturating_sub(permits.available_permits())
+        })
+    }
+
+    async fn acquire_file_permit(
+        self: &Arc<Self>,
+        partition: usize,
+    ) -> Result<DeltaProviderAsyncFileReadPermit, DeltaFunnelError> {
+        let scan_permit = Arc::clone(&self.scan_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| DeltaFunnelError::Config {
+                message: "async read limiter scan permits are closed".to_owned(),
+            })?;
+        let partition_permits = self.partition_permits.get(partition).ok_or_else(|| {
+            DeltaFunnelError::Config {
+                message: format!(
+                    "async read limiter partition {partition} is out of range for {} partitions",
+                    self.partition_permits.len()
+                ),
+            }
+        })?;
+        let partition_permit = Arc::clone(partition_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| DeltaFunnelError::Config {
+                message: format!("async read limiter partition {partition} permits are closed"),
+            })?;
+
+        Ok(DeltaProviderAsyncFileReadPermit {
+            _scan_permit: scan_permit,
+            _partition_permit: partition_permit,
+        })
+    }
+
+    #[cfg(test)]
+    fn try_acquire_file_permit(
+        self: &Arc<Self>,
+        partition: usize,
+    ) -> Option<DeltaProviderAsyncFileReadPermit> {
+        let scan_permit = Arc::clone(&self.scan_permits).try_acquire_owned().ok()?;
+        let partition_permits = self.partition_permits.get(partition)?;
+        let partition_permit = match Arc::clone(partition_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return None,
+        };
+
+        Some(DeltaProviderAsyncFileReadPermit {
+            _scan_permit: scan_permit,
+            _partition_permit: partition_permit,
+        })
+    }
+}
+
+#[allow(dead_code)]
+impl DeltaProviderAsyncPartitionReadLimiter {
+    pub(crate) async fn acquire_file_permit(
+        &self,
+    ) -> Result<DeltaProviderAsyncFileReadPermit, DeltaFunnelError> {
+        self.limiter.acquire_file_permit(self.partition).await
+    }
+
+    #[cfg(test)]
+    fn try_acquire_file_permit(&self) -> Option<DeltaProviderAsyncFileReadPermit> {
+        self.limiter.try_acquire_file_permit(self.partition)
+    }
+}
+
 impl DeltaProviderSyncPartitionReadLimiter {
     pub(crate) fn acquire_file_permit(&self) -> DeltaProviderSyncFileReadPermit {
         self.limiter.acquire_file_permit(self.partition)
@@ -282,7 +430,8 @@ fn validate_positive(name: &'static str, value: usize) -> Result<(), DeltaFunnel
 #[cfg(test)]
 mod tests {
     use super::{
-        DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions, DeltaProviderSyncReadLimiter,
+        DeltaProviderAsyncReadLimiter, DeltaProviderReaderBackend,
+        DeltaProviderScanExecutionOptions, DeltaProviderSyncReadLimiter,
     };
 
     #[test]
@@ -428,6 +577,159 @@ mod tests {
         drop(second_permit);
 
         assert_eq!(limiter.active_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_file_permit_rejects_out_of_range_partition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter =
+            DeltaProviderAsyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let error = match limiter.partition_limiter(1) {
+            Ok(_) => return Err("out of range partition must fail".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "configuration error: async read limiter partition 1 is out of range for 1 partitions"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_file_permit_respects_global_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = DeltaProviderAsyncReadLimiter::new(
+            DeltaProviderScanExecutionOptions::try_new(1, 1)?,
+            2,
+        );
+        let first_partition = limiter.partition_limiter(0)?;
+        let second_partition = limiter.partition_limiter(1)?;
+
+        let first_permit = first_partition.acquire_file_permit().await?;
+
+        assert!(second_partition.try_acquire_file_permit().is_none());
+        assert_eq!(limiter.active_file_reads(), 1);
+        assert_eq!(limiter.partition_active_file_reads(0), Some(1));
+        assert_eq!(limiter.partition_active_file_reads(1), Some(0));
+
+        drop(first_permit);
+
+        let second_permit = second_partition
+            .try_acquire_file_permit()
+            .ok_or("expected global permit after release")?;
+
+        assert_eq!(limiter.active_file_reads(), 1);
+        assert_eq!(limiter.partition_active_file_reads(0), Some(0));
+        assert_eq!(limiter.partition_active_file_reads(1), Some(1));
+
+        drop(second_permit);
+
+        assert_eq!(limiter.active_file_reads(), 0);
+        assert_eq!(limiter.partition_active_file_reads(1), Some(0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_file_permit_respects_partition_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = DeltaProviderAsyncReadLimiter::new(
+            DeltaProviderScanExecutionOptions::try_new(2, 1)?,
+            2,
+        );
+        let first_partition = limiter.partition_limiter(0)?;
+        let second_partition = limiter.partition_limiter(1)?;
+
+        let first_permit = first_partition.acquire_file_permit().await?;
+
+        assert!(first_partition.try_acquire_file_permit().is_none());
+
+        let second_permit = second_partition
+            .try_acquire_file_permit()
+            .ok_or("expected another partition to use remaining global capacity")?;
+
+        assert_eq!(limiter.active_file_reads(), 2);
+        assert_eq!(limiter.partition_active_file_reads(0), Some(1));
+        assert_eq!(limiter.partition_active_file_reads(1), Some(1));
+
+        drop(first_permit);
+        drop(second_permit);
+
+        assert_eq!(limiter.active_file_reads(), 0);
+        assert_eq!(limiter.partition_active_file_reads(0), Some(0));
+        assert_eq!(limiter.partition_active_file_reads(1), Some(0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_file_permit_releases_on_success() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter =
+            DeltaProviderAsyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let partition = limiter.partition_limiter(0)?;
+
+        async fn successful_read(
+            partition: &super::DeltaProviderAsyncPartitionReadLimiter,
+        ) -> Result<(), crate::DeltaFunnelError> {
+            let _permit = partition.acquire_file_permit().await?;
+            Ok(())
+        }
+
+        successful_read(&partition).await?;
+
+        assert_eq!(limiter.active_file_reads(), 0);
+        assert_eq!(limiter.partition_active_file_reads(0), Some(0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_file_permit_releases_on_failure() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter =
+            DeltaProviderAsyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let partition = limiter.partition_limiter(0)?;
+
+        async fn failing_read(
+            partition: &super::DeltaProviderAsyncPartitionReadLimiter,
+        ) -> Result<(), crate::DeltaFunnelError> {
+            let _permit = partition.acquire_file_permit().await?;
+            Err(crate::DeltaFunnelError::Config {
+                message: "fake async read failure".to_owned(),
+            })
+        }
+
+        let error = match failing_read(&partition).await {
+            Ok(_) => return Err("fake read failure must fail".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "configuration error: fake async read failure"
+        );
+        assert_eq!(limiter.active_file_reads(), 0);
+        assert_eq!(limiter.partition_active_file_reads(0), Some(0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_file_permit_releases_on_drop() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter =
+            DeltaProviderAsyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let partition = limiter.partition_limiter(0)?;
+
+        let permit = partition.acquire_file_permit().await?;
+
+        assert_eq!(limiter.active_file_reads(), 1);
+        assert_eq!(limiter.partition_active_file_reads(0), Some(1));
+
+        drop(permit);
+
+        assert_eq!(limiter.active_file_reads(), 0);
+        assert_eq!(limiter.partition_active_file_reads(0), Some(0));
 
         Ok(())
     }
