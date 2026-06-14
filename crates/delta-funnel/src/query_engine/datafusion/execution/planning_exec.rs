@@ -23,6 +23,7 @@ use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
 use super::file_reader::{DeltaFileReadRequest, DeltaFileReader, DeltaFileReaderConfig};
+use super::read_stats::DeltaProviderReadStats;
 use super::scheduling::{
     DeltaProviderScanExecutionOptions, DeltaProviderSyncPartitionReadLimiter,
     DeltaProviderSyncReadLimiter,
@@ -34,6 +35,8 @@ pub(crate) struct DeltaScanPlanningExec {
     partition_target_decision: DeltaScanPartitionTargetDecision,
     execution_options: DeltaProviderScanExecutionOptions,
     sync_read_limiter: Arc<DeltaProviderSyncReadLimiter>,
+    #[allow(dead_code)]
+    read_stats: Arc<DeltaProviderReadStats>,
     properties: Arc<PlanProperties>,
 }
 
@@ -58,6 +61,11 @@ impl DeltaScanPlanningExec {
 
         let sync_read_limiter =
             DeltaProviderSyncReadLimiter::new(execution_options, partition_plan.partitions.len());
+        let read_stats = Arc::new(DeltaProviderReadStats::new(
+            scan_plan.source_name.clone(),
+            scan_plan.snapshot_version,
+            Some(partition_plan.scan_metadata_exhausted),
+        ));
 
         Self {
             scan_plan,
@@ -65,6 +73,7 @@ impl DeltaScanPlanningExec {
             partition_target_decision,
             execution_options,
             sync_read_limiter,
+            read_stats,
             properties: Arc::new(properties),
         }
     }
@@ -87,6 +96,11 @@ impl DeltaScanPlanningExec {
     #[cfg(test)]
     pub(crate) fn execution_options(&self) -> DeltaProviderScanExecutionOptions {
         self.execution_options
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_stats_snapshot(&self) -> super::read_stats::DeltaProviderReadStatsSnapshot {
+        self.read_stats.snapshot()
     }
 }
 
@@ -342,6 +356,14 @@ mod tests {
             scans[0].execution_options(),
             super::DeltaProviderScanExecutionOptions::default()
         );
+        let read_stats = scans[0].read_stats_snapshot();
+        assert_eq!(read_stats.source_name, "orders");
+        assert_eq!(read_stats.snapshot_version, 1);
+        assert_eq!(read_stats.scan_metadata_exhausted, Some(true));
+        assert_eq!(read_stats.scan_partitions_started, 0);
+        assert_eq!(read_stats.files_started, 0);
+        assert_eq!(read_stats.batches_produced, 0);
+        assert_eq!(read_stats.rows_produced, 0);
 
         Ok(())
     }
