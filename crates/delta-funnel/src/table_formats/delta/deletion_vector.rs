@@ -48,6 +48,28 @@ pub(crate) struct ProviderDeletionVectorSelection {
     keep_mask: Vec<bool>,
     consumed: usize,
     closed: bool,
+    /// Tracks which row-coordinate contract this selection is using.
+    ///
+    /// Ordered consumption assumes each batch is read from the physical file in
+    /// original row order. Original-row-index lookup allows sparse/pruned rows
+    /// as long as every emitted row carries its original physical row index.
+    access_mode: ProviderDeletionVectorSelectionAccessMode,
+}
+
+/// Mutually exclusive ways to apply one DV selection.
+///
+/// Mixing these modes can silently shift the DV coordinate system. Once a
+/// reader starts consuming a file sequentially, `consumed` is the original row
+/// cursor. Once a reader starts querying by original row index, there is no
+/// sequential cursor to validate because pruning or pushdown may skip rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderDeletionVectorSelectionAccessMode {
+    /// No masking API has been chosen yet.
+    Unused,
+    /// Current baseline path: full-file ordered batches consume the DV cursor.
+    Ordered,
+    /// Optimized path: sparse emitted rows are looked up by original row index.
+    OriginalRowIndex,
 }
 
 impl KernelDeletionVectorReader {
@@ -129,6 +151,7 @@ impl ProviderDeletionVectorSelection {
             keep_mask,
             consumed: 0,
             closed: false,
+            access_mode: ProviderDeletionVectorSelectionAccessMode::Unused,
         }
     }
 
@@ -170,6 +193,24 @@ impl ProviderDeletionVectorSelection {
                 phase: DeltaScanDeletionVectorPhase::SelectionVectorExhaustion,
             });
         }
+        match self.access_mode {
+            ProviderDeletionVectorSelectionAccessMode::Unused => {
+                self.access_mode = ProviderDeletionVectorSelectionAccessMode::Ordered;
+            }
+            ProviderDeletionVectorSelectionAccessMode::Ordered => {}
+            ProviderDeletionVectorSelectionAccessMode::OriginalRowIndex => {
+                return Err(kernel::DeltaKernelError::generic(
+                    "cannot consume deletion-vector selection sequentially after original row-index lookup",
+                ))
+                .context(DeltaScanDeletionVectorSnafu {
+                    source_name: context.source_name.to_owned(),
+                    table_uri: context.table_uri.to_owned(),
+                    snapshot_version: context.snapshot_version,
+                    path: context.path.to_owned(),
+                    phase: DeltaScanDeletionVectorPhase::SelectionVectorExhaustion,
+                });
+            }
+        }
 
         let requested_end = self
             .consumed
@@ -193,6 +234,74 @@ impl ProviderDeletionVectorSelection {
         Ok(batch_mask)
     }
 
+    /// Selects rows by their original physical row indexes.
+    ///
+    /// This is the correctness boundary for DV-aware pruning and predicate
+    /// pushdown. Optimized readers may emit only a subset of a file, but every
+    /// emitted row must still carry its original physical row index so the DV
+    /// can be applied over the same coordinate system as the Delta protocol.
+    #[allow(dead_code)]
+    pub(crate) fn select_original_row_indexes<I>(
+        &mut self,
+        row_indexes: I,
+        context: ProviderDeletionVectorSelectionContext<'_>,
+    ) -> Result<Vec<bool>, DeltaFunnelError>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        if self.closed {
+            return Err(kernel::DeltaKernelError::generic(
+                "deletion-vector selection was queried after file completion",
+            ))
+            .context(DeltaScanDeletionVectorSnafu {
+                source_name: context.source_name.to_owned(),
+                table_uri: context.table_uri.to_owned(),
+                snapshot_version: context.snapshot_version,
+                path: context.path.to_owned(),
+                phase: DeltaScanDeletionVectorPhase::SelectionVectorExhaustion,
+            });
+        }
+        match self.access_mode {
+            ProviderDeletionVectorSelectionAccessMode::Unused => {
+                self.access_mode = ProviderDeletionVectorSelectionAccessMode::OriginalRowIndex;
+            }
+            ProviderDeletionVectorSelectionAccessMode::OriginalRowIndex => {}
+            ProviderDeletionVectorSelectionAccessMode::Ordered => {
+                return Err(kernel::DeltaKernelError::generic(
+                    "cannot query deletion-vector selection by original row index after sequential consumption",
+                ))
+                .context(DeltaScanDeletionVectorSnafu {
+                    source_name: context.source_name.to_owned(),
+                    table_uri: context.table_uri.to_owned(),
+                    snapshot_version: context.snapshot_version,
+                    path: context.path.to_owned(),
+                    phase: DeltaScanDeletionVectorPhase::SelectionVectorExhaustion,
+                });
+            }
+        }
+
+        row_indexes
+            .into_iter()
+            .map(|row_index| {
+                let row_index = usize::try_from(row_index)
+                    .map_err(|_| {
+                        kernel::DeltaKernelError::generic(
+                            "original row index does not fit host usize",
+                        )
+                    })
+                    .context(DeltaScanDeletionVectorSnafu {
+                        source_name: context.source_name.to_owned(),
+                        table_uri: context.table_uri.to_owned(),
+                        snapshot_version: context.snapshot_version,
+                        path: context.path.to_owned(),
+                        phase: DeltaScanDeletionVectorPhase::SelectionVectorLengthMismatch,
+                    })?;
+
+                Ok(self.keep_mask.get(row_index).copied().unwrap_or(true))
+            })
+            .collect()
+    }
+
     /// Closes consumption after the physical file reader reaches EOF.
     #[allow(dead_code)]
     pub(crate) fn finish(
@@ -200,6 +309,12 @@ impl ProviderDeletionVectorSelection {
         context: ProviderDeletionVectorSelectionContext<'_>,
     ) -> Result<(), DeltaFunnelError> {
         self.closed = true;
+
+        if self.access_mode == ProviderDeletionVectorSelectionAccessMode::OriginalRowIndex {
+            // Row-index mode may intentionally skip physical rows, so there is
+            // no full-file consumption invariant to check here.
+            return Ok(());
+        }
 
         if self.consumed < self.keep_mask.len() {
             return Err(kernel::DeltaKernelError::generic(format!(
@@ -325,6 +440,81 @@ mod tests {
         assert_eq!(selection.consume_batch(2, context)?, vec![false, true]);
         assert_eq!(selection.consume_batch(3, context)?, vec![true, true, true]);
         selection.finish(context)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_original_row_indexes_matches_ordered_full_file_oracle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = test_context();
+        let mut ordered =
+            ProviderDeletionVectorSelection::from_keep_mask(vec![true, false, true, false]);
+        let mut row_index =
+            ProviderDeletionVectorSelection::from_keep_mask(vec![true, false, true, false]);
+        let mut ordered_mask = Vec::new();
+
+        ordered_mask.extend(ordered.consume_batch(2, context)?);
+        ordered_mask.extend(ordered.consume_batch(3, context)?);
+        ordered_mask.extend(ordered.consume_batch(2, context)?);
+        ordered.finish(context)?;
+
+        let row_index_mask = row_index.select_original_row_indexes(0_u64..7, context)?;
+        row_index.finish(context)?;
+
+        assert_eq!(
+            row_index_mask, ordered_mask,
+            "row-index DV selection must match ordered full-file baseline"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_original_row_indexes_supports_sparse_pruned_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = test_context();
+        let mut selection =
+            ProviderDeletionVectorSelection::from_keep_mask(vec![true, false, true, false, false]);
+
+        assert_eq!(
+            selection.select_original_row_indexes([0, 2, 4, 5, 9], context)?,
+            vec![true, true, false, true, true]
+        );
+        selection.finish(context)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn selection_vector_access_modes_cannot_be_mixed() -> Result<(), Box<dyn std::error::Error>> {
+        let context = test_context();
+        let mut ordered = ProviderDeletionVectorSelection::from_keep_mask(vec![true, false]);
+        let mut row_index = ProviderDeletionVectorSelection::from_keep_mask(vec![true, false]);
+
+        ordered.consume_batch(1, context)?;
+        let ordered_error = ordered
+            .select_original_row_indexes([1], context)
+            .err()
+            .ok_or("expected ordered to row-index mode error")?;
+        assert!(
+            ordered_error
+                .to_string()
+                .contains("after sequential consumption"),
+            "{ordered_error}"
+        );
+
+        row_index.select_original_row_indexes([1], context)?;
+        let row_index_error = row_index
+            .consume_batch(1, context)
+            .err()
+            .ok_or("expected row-index to ordered mode error")?;
+        assert!(
+            row_index_error
+                .to_string()
+                .contains("after original row-index lookup"),
+            "{row_index_error}"
+        );
 
         Ok(())
     }

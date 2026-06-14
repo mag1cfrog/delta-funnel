@@ -191,8 +191,9 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             })
             .map_err(DataFusionError::from)?,
         );
-        let read_schema = self.scan_plan.kernel_scan().read_schema();
         let file_tasks = scan_partition.file_tasks.clone();
+        let read_schema =
+            partition_read_schema(self.scan_plan.kernel_scan().read_schema(), &file_tasks);
         let partition_limiter = self
             .sync_read_limiter
             .partition_limiter(partition)
@@ -221,6 +222,25 @@ impl DeltaScanPartitionFileReader for DeltaFileReader {
         request: DeltaFileReadRequest<'_>,
     ) -> Result<super::file_reader::DeltaFileReadResult, DeltaFunnelError> {
         Self::read_file(self, request)
+    }
+}
+
+fn partition_read_schema(
+    read_schema: KernelScanReadSchema,
+    file_tasks: &[DeltaScanFileTask],
+) -> KernelScanReadSchema {
+    if file_tasks
+        .iter()
+        .any(|task| task.deletion_vector.is_present())
+    {
+        // Temporary #142 gate: the official-kernel reader does not expose
+        // original row indexes for predicate-filtered batches, so DV-backed
+        // partitions must not push physical predicates into Parquet reads.
+        // The #145 native async reader owns reopening this path through hidden
+        // row-index metadata and the DV row-index oracle.
+        read_schema.without_physical_predicate()
+    } else {
+        read_schema
     }
 }
 
@@ -271,8 +291,12 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::logical_expr::{col, lit};
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
+    use delta_kernel::actions::deletion_vector::{
+        DeletionVectorDescriptor, DeletionVectorStorageType,
+    };
     use futures_util::StreamExt;
 
     use super::super::file_reader::{DeltaFileReadRequest, DeltaFileReadResult};
@@ -289,6 +313,7 @@ mod tests {
     };
     use crate::table_formats::{
         KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata, RealParquetDeltaTable,
+        build_projected_predicated_stats_delta_scan, datafusion_expr_to_kernel_predicate,
     };
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
@@ -712,6 +737,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deletion_vector_execution_matches_large_file_oracle_without_helper_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_rows_and_deletion_vector(
+            "dv-large-file-oracle-real-read",
+            1003,
+            &[0, 999, 1002],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let dataframe = ctx.sql("select id from orders order by id").await?;
+        let result = dataframe.collect().await?;
+        let ids = result
+            .iter()
+            .map(batch_ids)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let expected = (1..=1003)
+            .filter(|id| ![1, 1000, 1003].contains(id))
+            .collect::<Vec<_>>();
+
+        assert!(result.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 1 && schema.field(0).name() == "id"
+        }));
+        assert_eq!(ids, expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_vector_execution_keeps_data_filter_correct_when_read_predicate_is_gated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_rows_and_deletion_vector(
+            "dv-data-filter-read-predicate-gated",
+            1003,
+            &[0, 999, 1002],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let id_dataframe = ctx
+            .sql("select id from orders where id > 1000 order by id")
+            .await?;
+        let id_result = id_dataframe.collect().await?;
+        let ids = id_result
+            .iter()
+            .map(batch_ids)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![1001, 1002]);
+
+        let name_dataframe = ctx
+            .sql("select customer_name from orders where id > 1000 order by customer_name")
+            .await?;
+        let name_result = name_dataframe.collect().await?;
+        let formatted = pretty_format_batches(&name_result)?.to_string();
+
+        assert!(name_result.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 1 && schema.field(0).name() == "customer_name"
+        }));
+        assert_eq!(
+            formatted,
+            [
+                "+---------------+",
+                "| customer_name |",
+                "+---------------+",
+                "| customer-1001 |",
+                "| customer-1002 |",
+                "+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn deletion_vector_execution_preserves_transformed_logical_columns()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
@@ -951,6 +1086,31 @@ mod tests {
     }
 
     #[test]
+    fn partition_read_schema_strips_physical_predicate_only_for_dv_tasks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("dv-partition-read-schema-gate")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
+        let read_schema = scan.read_schema();
+        let mut dv_task = fake_task("part-00000.parquet");
+        dv_task.deletion_vector = fake_deletion_vector_metadata();
+
+        assert!(read_schema.has_physical_predicate());
+        assert!(
+            super::partition_read_schema(read_schema.clone(), &[fake_task("part-00000.parquet")])
+                .has_physical_predicate()
+        );
+        assert!(!super::partition_read_schema(read_schema, &[dv_task]).has_physical_predicate());
+
+        Ok(())
+    }
+
+    #[test]
     fn provider_execution_boundary_avoids_runtime_creation_and_sync_bridge() {
         let checked_sources = [
             (
@@ -1036,6 +1196,16 @@ mod tests {
             deletion_vector: KernelScanDeletionVectorMetadata::NotPresent,
             transform: KernelPhysicalToLogicalTransform::NotRequired,
         }
+    }
+
+    fn fake_deletion_vector_metadata() -> KernelScanDeletionVectorMetadata {
+        KernelScanDeletionVectorMetadata::test_present_from_descriptor(DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: "fake-dv".to_owned(),
+            offset: Some(0),
+            size_in_bytes: 1,
+            cardinality: 1,
+        })
     }
 
     fn id_batch(
