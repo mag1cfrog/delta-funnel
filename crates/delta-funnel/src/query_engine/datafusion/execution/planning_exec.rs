@@ -848,6 +848,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_backend_preserves_file_order_in_one_partition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_two_files("native-async-file-order")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].partition_plan().partitions.len(), 1);
+        assert_eq!(scans[0].partition_plan().partitions[0].file_tasks.len(), 2);
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let ids = collect_batch_ids(&result)?;
+
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        let read_stats = scans[0].read_stats_snapshot();
+        assert_eq!(read_stats.files_started, 2);
+        assert_eq!(read_stats.files_completed, 2);
+        assert_eq!(read_stats.rows_produced, 4);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_backend_preserves_multi_batch_row_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_rows("native-async-multi-batch-order", 9000)?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let ids = collect_batch_ids(&result)?;
+        let expected_ids = (1..=9000).collect::<Vec<_>>();
+
+        assert!(result.len() > 1);
+        assert_eq!(ids, expected_ids);
+        let read_stats = scans[0].read_stats_snapshot();
+        assert_eq!(read_stats.files_started, 1);
+        assert_eq!(read_stats.files_completed, 1);
+        assert_eq!(read_stats.batches_produced, u64::try_from(result.len())?);
+        assert_eq!(read_stats.rows_produced, 9000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn projection_execution_emits_requested_columns() -> Result<(), Box<dyn std::error::Error>>
     {
         let ctx = SessionContext::new();
@@ -1925,6 +2023,15 @@ mod tests {
             .ok_or("expected Int32Array")?;
 
         Ok(ids.values().to_vec())
+    }
+
+    fn collect_batch_ids(batches: &[RecordBatch]) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        let mut ids = Vec::new();
+        for batch in batches {
+            ids.extend(batch_ids(batch)?);
+        }
+
+        Ok(ids)
     }
 
     fn register_real_parquet_source(
