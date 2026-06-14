@@ -16,6 +16,14 @@ pub(crate) struct DeltaProviderReadStatsSnapshot {
     pub(crate) snapshot_version: u64,
     /// Whether metadata expansion exhausted the upstream kernel scan iterator.
     pub(crate) scan_metadata_exhausted: Option<bool>,
+    /// Planned DataFusion execution partitions for this scan.
+    pub(crate) scan_partitions_planned: u64,
+    /// Selected provider file tasks planned for this scan.
+    pub(crate) files_planned: u64,
+    /// Estimated output rows from planning when every selected file had stats.
+    pub(crate) estimated_rows: Option<u64>,
+    /// Estimated bytes from planning when every selected file had a byte size.
+    pub(crate) estimated_bytes: Option<u64>,
     /// Execution partitions whose stream was started by DataFusion.
     pub(crate) scan_partitions_started: u64,
     /// Execution partitions whose stream reached normal completion.
@@ -47,6 +55,10 @@ pub(crate) struct DeltaProviderReadStats {
     source_name: String,
     snapshot_version: u64,
     scan_metadata_exhausted: Option<bool>,
+    scan_partitions_planned: u64,
+    files_planned: u64,
+    estimated_rows: Option<u64>,
+    estimated_bytes: Option<u64>,
     scan_partitions_started: AtomicU64,
     scan_partitions_completed: AtomicU64,
     files_started: AtomicU64,
@@ -69,11 +81,19 @@ impl DeltaProviderReadStats {
         source_name: impl Into<String>,
         snapshot_version: u64,
         scan_metadata_exhausted: Option<bool>,
+        scan_partitions_planned: usize,
+        files_planned: usize,
+        estimated_rows: Option<u64>,
+        estimated_bytes: Option<u64>,
     ) -> Self {
         Self {
             source_name: source_name.into(),
             snapshot_version,
             scan_metadata_exhausted,
+            scan_partitions_planned: usize_to_u64_saturating(scan_partitions_planned),
+            files_planned: usize_to_u64_saturating(files_planned),
+            estimated_rows,
+            estimated_bytes,
             scan_partitions_started: AtomicU64::new(0),
             scan_partitions_completed: AtomicU64::new(0),
             files_started: AtomicU64::new(0),
@@ -96,6 +116,10 @@ impl DeltaProviderReadStats {
             source_name: self.source_name.clone(),
             snapshot_version: self.snapshot_version,
             scan_metadata_exhausted: self.scan_metadata_exhausted,
+            scan_partitions_planned: self.scan_partitions_planned,
+            files_planned: self.files_planned,
+            estimated_rows: self.estimated_rows,
+            estimated_bytes: self.estimated_bytes,
             scan_partitions_started: self.scan_partitions_started.load(Ordering::Relaxed),
             scan_partitions_completed: self.scan_partitions_completed.load(Ordering::Relaxed),
             files_started: self.files_started.load(Ordering::Relaxed),
@@ -180,12 +204,16 @@ mod tests {
 
     #[test]
     fn read_stats_snapshot_starts_with_context_and_zero_counters() {
-        let stats = DeltaProviderReadStats::new("orders", 7, Some(true));
+        let stats = DeltaProviderReadStats::new("orders", 7, Some(true), 3, 5, Some(99), Some(42));
         let snapshot = stats.snapshot();
 
         assert_eq!(snapshot.source_name, "orders");
         assert_eq!(snapshot.snapshot_version, 7);
         assert_eq!(snapshot.scan_metadata_exhausted, Some(true));
+        assert_eq!(snapshot.scan_partitions_planned, 3);
+        assert_eq!(snapshot.files_planned, 5);
+        assert_eq!(snapshot.estimated_rows, Some(99));
+        assert_eq!(snapshot.estimated_bytes, Some(42));
         assert_eq!(snapshot.scan_partitions_started, 0);
         assert_eq!(snapshot.scan_partitions_completed, 0);
         assert_eq!(snapshot.files_started, 0);
@@ -201,7 +229,7 @@ mod tests {
 
     #[test]
     fn read_stats_records_partial_progress_without_completing_failed_work() {
-        let stats = DeltaProviderReadStats::new("orders", 7, Some(false));
+        let stats = DeltaProviderReadStats::new("orders", 7, Some(false), 1, 1, None, None);
 
         stats.record_scan_partition_started();
         stats.record_file_started();
@@ -230,7 +258,9 @@ mod tests {
         const THREADS: usize = 4;
         const ITERATIONS: usize = 100;
 
-        let stats = Arc::new(DeltaProviderReadStats::new("orders", 7, None));
+        let stats = Arc::new(DeltaProviderReadStats::new(
+            "orders", 7, None, THREADS, THREADS, None, None,
+        ));
         let mut handles = Vec::new();
 
         for _ in 0..THREADS {
