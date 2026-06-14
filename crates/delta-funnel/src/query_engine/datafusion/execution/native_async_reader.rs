@@ -455,6 +455,9 @@ mod tests {
 
     use datafusion::arrow::array::{Array, Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use object_store::ObjectStoreExt;
+    use parquet::arrow::ArrowWriter;
 
     use super::{
         DeltaNativeAsyncFileReadRequest, DeltaNativeAsyncFileReader,
@@ -471,7 +474,7 @@ mod tests {
         },
         table_formats::{
             KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata,
-            RealParquetDeltaTable, build_projected_delta_scan,
+            KernelScanReadSchema, RealParquetDeltaTable, build_projected_delta_scan,
             build_projected_predicated_stats_delta_scan,
         },
     };
@@ -532,6 +535,37 @@ mod tests {
         Ok(batches)
     }
 
+    fn default_read_schema(name: &str) -> Result<KernelScanReadSchema, Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default(name)?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
+
+        Ok(scan.read_schema())
+    }
+
+    fn default_parquet_bytes() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("customer_name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])),
+            ],
+        )?;
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;
+
+        writer.write(&batch)?;
+
+        Ok(writer.into_inner()?)
+    }
+
     #[test]
     fn native_async_reader_resolves_local_file_task_to_object_store_path()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -558,6 +592,48 @@ mod tests {
         let object = reader.parquet_object_for_task(&task(table_uri, "part-00000.parquet"))?;
 
         assert_eq!(object.path.as_ref(), "table/root/part-00000.parquet");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_reader_reads_remote_like_memory_object_store_parquet_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table_uri = "memory:///table/root/";
+        let reader = reader(table_uri)?;
+        let read_schema = default_read_schema("native-async-memory-object-store-read")?;
+        let parquet_bytes = default_parquet_bytes()?;
+        let mut task = task(table_uri, "part-00000.parquet");
+
+        task.estimated_bytes = Some(u64::try_from(parquet_bytes.len())?);
+        let object = reader.parquet_object_for_task(&task)?;
+        reader.store.put(&object.path, parquet_bytes.into()).await?;
+
+        let stream = reader
+            .open_file_stream(DeltaNativeAsyncFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+            })
+            .await?;
+        let batches = collect_file_stream(stream).await?;
+        let batch = batches.first().ok_or("expected one remote-like batch")?;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected id Int32Array")?;
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected customer_name StringArray")?;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(ids.values(), &[1, 2, 3]);
+        assert_eq!(names.value(0), "alice");
+        assert_eq!(names.value(1), "bob");
+        assert!(names.is_null(2));
 
         Ok(())
     }
