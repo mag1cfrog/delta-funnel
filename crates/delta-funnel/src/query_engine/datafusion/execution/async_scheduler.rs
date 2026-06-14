@@ -30,7 +30,11 @@ pub(crate) type DeltaProviderAsyncFileReadFuture<Output> =
 #[allow(dead_code)]
 pub(crate) trait DeltaProviderAsyncFileReader<Task, Output>: Send + Sync {
     /// Starts one file read after the scheduler has acquired read permits.
-    fn read_file(
+    ///
+    /// Implementations may return a completed file result or a stream-like file
+    /// handle. The returned future should only advance the file read far enough
+    /// to produce the `Output` boundary.
+    fn start_file_read(
         &self,
         task: Task,
         permit: DeltaProviderAsyncFileReadPermit,
@@ -120,7 +124,7 @@ where
         let task = self.file_tasks.pop_front()?;
         self.admitted_file_tasks = self.admitted_file_tasks.saturating_add(1);
 
-        Some(self.reader.read_file(task, permit).await)
+        Some(self.reader.start_file_read(task, permit).await)
     }
 
     /// Planned file tasks not yet admitted to a read future.
@@ -183,7 +187,7 @@ mod tests {
     }
 
     impl DeltaProviderAsyncFileReader<FakeFileTask, usize> for CountingAsyncFileReader {
-        fn read_file(
+        fn start_file_read(
             &self,
             task: FakeFileTask,
             permit: DeltaProviderAsyncFileReadPermit,
@@ -221,7 +225,7 @@ mod tests {
     }
 
     impl DeltaProviderAsyncFileReader<FakeFileTask, usize> for PendingAsyncFileReader {
-        fn read_file(
+        fn start_file_read(
             &self,
             _task: FakeFileTask,
             permit: DeltaProviderAsyncFileReadPermit,

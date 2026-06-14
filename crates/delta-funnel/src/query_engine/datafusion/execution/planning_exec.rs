@@ -379,18 +379,18 @@ fn native_async_scan_partition_stream(
         );
 
         while !output.is_closed() {
-            let Some(file_result) = scheduler.next_file().await else {
+            let Some(file_stream) = scheduler.next_file().await else {
                 read_stats.record_scan_partition_completed();
                 return Ok(());
             };
-            let file_result = match file_result {
-                Ok(file_result) => file_result,
+            let mut file_stream = match file_stream {
+                Ok(file_stream) => file_stream,
                 Err(error) => {
                     record_deletion_vector_read_error(read_stats.as_ref(), &error);
                     return Err(DataFusionError::from(error));
                 }
             };
-            let deletion_vector_stats = file_result.deletion_vector_stats;
+            let deletion_vector_stats = file_stream.deletion_vector_stats();
             if deletion_vector_stats.payload_loaded {
                 read_stats.record_deletion_vector_payload_loaded();
             }
@@ -398,12 +398,23 @@ fn native_async_scan_partition_stream(
                 read_stats.record_deletion_vector_applied(deletion_vector_stats.deleted_rows);
             }
 
-            for batch in file_result {
+            while !output.is_closed() {
+                let batch = match file_stream.next_batch().await {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => break,
+                    Err(error) => {
+                        record_deletion_vector_read_error(read_stats.as_ref(), &error);
+                        return Err(DataFusionError::from(error));
+                    }
+                };
                 let rows = batch.num_rows();
                 if output.send(Ok(batch)).await.is_err() {
                     return Ok(());
                 }
                 read_stats.record_batch_produced(rows);
+            }
+            if output.is_closed() {
+                return Ok(());
             }
             read_stats.record_file_completed();
         }

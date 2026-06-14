@@ -15,7 +15,9 @@ use delta_kernel::engine::default::storage::store_from_url_opts;
 use futures_util::StreamExt;
 use object_store::{ObjectStore, path::Path};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::async_reader::{
+    ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
+};
 use snafu::ResultExt;
 
 use crate::{
@@ -26,7 +28,7 @@ use crate::{
 
 use super::super::planning::file_task::DeltaScanFileTask;
 use super::async_scheduler::{DeltaProviderAsyncFileReadFuture, DeltaProviderAsyncFileReader};
-use super::file_reader::{DeltaFileReadDeletionVectorStats, DeltaFileReadResult};
+use super::file_reader::DeltaFileReadDeletionVectorStats;
 use super::read_stats::DeltaProviderReadStats;
 use super::scheduling::DeltaProviderAsyncFileReadPermit;
 
@@ -79,6 +81,19 @@ pub(crate) struct DeltaNativeAsyncPartitionFileReader {
     reader: Arc<DeltaNativeAsyncFileReader>,
     read_schema: KernelScanReadSchema,
     read_stats: Arc<DeltaProviderReadStats>,
+}
+
+/// Native async batches for one provider file task.
+#[allow(dead_code)]
+pub(crate) struct DeltaNativeAsyncFileReadStream {
+    stream: ParquetRecordBatchStream<ParquetObjectReader>,
+    batch_projection: Option<Vec<usize>>,
+    source_name: String,
+    table_uri: String,
+    snapshot_version: u64,
+    path: String,
+    deletion_vector_stats: DeltaFileReadDeletionVectorStats,
+    _permit: Option<DeltaProviderAsyncFileReadPermit>,
 }
 
 /// Validates that the native async backend can construct its object-store path.
@@ -174,17 +189,30 @@ impl DeltaNativeAsyncFileReader {
         })
     }
 
-    /// Reads one non-DV file task with parquet-rs async object-store reads.
+    /// Opens one non-DV file task with parquet-rs async object-store reads.
     ///
     /// This first native implementation intentionally supports only file tasks
     /// whose physical Parquet batches are already provider-visible batches:
     /// no deletion vectors, no physical-to-logical transform, and no kernel
     /// physical predicate. Later slices reopen those equivalence boundaries.
-    #[allow(dead_code)]
-    pub(crate) async fn read_file(
+    #[cfg(test)]
+    pub(crate) async fn open_file_stream(
         &self,
         request: DeltaNativeAsyncFileReadRequest<'_>,
-    ) -> Result<DeltaFileReadResult, DeltaFunnelError> {
+    ) -> Result<DeltaNativeAsyncFileReadStream, DeltaFunnelError> {
+        self.open_file_stream_with_permit(request, None).await
+    }
+
+    /// Opens one non-DV file stream and holds the scheduler permit for its lifetime.
+    ///
+    /// The returned stream advances Parquet IO one batch at a time. Keeping the
+    /// file permit inside the stream ensures the async read limiter accounts for
+    /// the file until all batches are produced or the stream is dropped.
+    async fn open_file_stream_with_permit(
+        &self,
+        request: DeltaNativeAsyncFileReadRequest<'_>,
+        permit: Option<DeltaProviderAsyncFileReadPermit>,
+    ) -> Result<DeltaNativeAsyncFileReadStream, DeltaFunnelError> {
         self.validate_supported_read_mode(request.task, request.read_schema)?;
         let object = self.parquet_object_for_task(request.task)?;
         let reader =
@@ -218,7 +246,7 @@ impl DeltaNativeAsyncFileReader {
             .iter()
             .map(|field| field.name().as_str());
         let projection = ProjectionMask::columns(builder.parquet_schema(), projected_fields);
-        let mut stream = builder
+        let stream = builder
             .with_projection(projection)
             .build()
             .map_err(delta_kernel::Error::from)
@@ -229,64 +257,99 @@ impl DeltaNativeAsyncFileReader {
                 path: request.task.path.clone(),
                 phase: DeltaScanFileReadPhase::ParquetReadSetup,
             })?;
-        let mut batches = Vec::new();
-
-        while let Some(batch) = stream.next().await {
-            let batch =
-                batch
-                    .map_err(delta_kernel::Error::from)
-                    .context(DeltaScanFileReadSnafu {
-                        source_name: self.source_name.clone(),
-                        table_uri: self.table_uri.clone(),
-                        snapshot_version: self.snapshot_version,
-                        path: request.task.path.clone(),
-                        phase: DeltaScanFileReadPhase::ParquetBatchRead,
-                    })?;
-            batches.push(self.project_batch_to_schema(request.task, batch, &arrow_schema)?);
-        }
-
-        Ok(DeltaFileReadResult {
-            batches,
-            deletion_vector_stats: DeltaFileReadDeletionVectorStats::default(),
-        })
-    }
-
-    fn project_batch_to_schema(
-        &self,
-        task: &DeltaScanFileTask,
-        batch: RecordBatch,
-        schema: &SchemaRef,
-    ) -> Result<RecordBatch, DeltaFunnelError> {
-        let indices = schema
-            .fields
-            .iter()
-            .map(|field| {
-                batch
-                    .schema()
-                    .index_of(field.name())
-                    .map_err(delta_kernel::Error::from)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .context(DeltaScanFileReadSnafu {
+        let batch_projection = build_batch_projection(stream.schema(), &arrow_schema).context(
+            DeltaScanFileReadSnafu {
                 source_name: self.source_name.clone(),
                 table_uri: self.table_uri.clone(),
                 snapshot_version: self.snapshot_version,
-                path: task.path.clone(),
+                path: request.task.path.clone(),
                 phase: DeltaScanFileReadPhase::ArrowConversion,
-            })?;
+            },
+        )?;
 
-        batch
-            .project(&indices)
+        Ok(DeltaNativeAsyncFileReadStream {
+            stream,
+            batch_projection,
+            source_name: self.source_name.clone(),
+            table_uri: self.table_uri.clone(),
+            snapshot_version: self.snapshot_version,
+            path: request.task.path.clone(),
+            deletion_vector_stats: DeltaFileReadDeletionVectorStats::default(),
+            _permit: permit,
+        })
+    }
+}
+
+impl DeltaNativeAsyncFileReadStream {
+    /// File-local deletion-vector metrics observed during this read.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn deletion_vector_stats(&self) -> DeltaFileReadDeletionVectorStats {
+        self.deletion_vector_stats
+    }
+
+    /// Returns the next provider-visible batch for this file.
+    #[allow(dead_code)]
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<RecordBatch>, DeltaFunnelError> {
+        let Some(batch) = self.stream.next().await else {
+            return Ok(None);
+        };
+        let batch = batch
             .map_err(delta_kernel::Error::from)
             .context(DeltaScanFileReadSnafu {
                 source_name: self.source_name.clone(),
                 table_uri: self.table_uri.clone(),
                 snapshot_version: self.snapshot_version,
-                path: task.path.clone(),
+                path: self.path.clone(),
+                phase: DeltaScanFileReadPhase::ParquetBatchRead,
+            })?;
+
+        self.project_batch_to_schema(batch).map(Some)
+    }
+
+    /// Reorders the Parquet batch into the provider scan schema when needed.
+    ///
+    /// The file-level `batch_projection` is computed once when the Parquet
+    /// stream is opened. Each later batch from that stream has the same schema,
+    /// so the hot path can either pass aligned batches through unchanged or
+    /// apply a zero-copy column reorder.
+    fn project_batch_to_schema(&self, batch: RecordBatch) -> Result<RecordBatch, DeltaFunnelError> {
+        let Some(indices) = self.batch_projection.as_deref() else {
+            return Ok(batch);
+        };
+
+        batch
+            .project(indices)
+            .map_err(delta_kernel::Error::from)
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: self.path.clone(),
                 phase: DeltaScanFileReadPhase::ArrowConversion,
             })
     }
+}
 
+fn build_batch_projection(
+    stream_schema: &SchemaRef,
+    provider_schema: &SchemaRef,
+) -> Result<Option<Vec<usize>>, delta_kernel::Error> {
+    let indices = provider_schema
+        .fields
+        .iter()
+        .map(|field| {
+            stream_schema
+                .index_of(field.name())
+                .map_err(delta_kernel::Error::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let is_aligned = indices.iter().copied().eq(0..indices.len());
+
+    Ok((!is_aligned).then_some(indices))
+}
+
+impl DeltaNativeAsyncFileReader {
     fn validate_task_context(&self, task: &DeltaScanFileTask) -> Result<(), DeltaFunnelError> {
         if task.source_name == self.source_name
             && task.table_uri == self.table_uri
@@ -356,25 +419,27 @@ impl DeltaNativeAsyncPartitionFileReader {
     }
 }
 
-impl DeltaProviderAsyncFileReader<DeltaScanFileTask, DeltaFileReadResult>
+impl DeltaProviderAsyncFileReader<DeltaScanFileTask, DeltaNativeAsyncFileReadStream>
     for DeltaNativeAsyncPartitionFileReader
 {
-    fn read_file(
+    fn start_file_read(
         &self,
         task: DeltaScanFileTask,
         permit: DeltaProviderAsyncFileReadPermit,
-    ) -> DeltaProviderAsyncFileReadFuture<DeltaFileReadResult> {
+    ) -> DeltaProviderAsyncFileReadFuture<DeltaNativeAsyncFileReadStream> {
         let reader = Arc::clone(&self.reader);
         let read_schema = self.read_schema.clone();
         self.read_stats.record_file_started();
 
         Box::pin(async move {
-            let _permit = permit;
             reader
-                .read_file(DeltaNativeAsyncFileReadRequest {
-                    task: &task,
-                    read_schema: &read_schema,
-                })
+                .open_file_stream_with_permit(
+                    DeltaNativeAsyncFileReadRequest {
+                        task: &task,
+                        read_schema: &read_schema,
+                    },
+                    Some(permit),
+                )
                 .await
         })
     }
@@ -385,13 +450,16 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::arrow::array::{Array, Int32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
     use super::{
         DeltaNativeAsyncFileReadRequest, DeltaNativeAsyncFileReader,
-        DeltaNativeAsyncFileReaderConfig, validate_native_async_reader_config,
+        DeltaNativeAsyncFileReaderConfig, build_batch_projection,
+        validate_native_async_reader_config,
     };
     use crate::{
         DeltaFunnelError, DeltaSourceConfig,
@@ -454,6 +522,16 @@ mod tests {
         }
     }
 
+    async fn collect_file_stream(
+        mut stream: super::DeltaNativeAsyncFileReadStream,
+    ) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>, DeltaFunnelError> {
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next_batch().await? {
+            batches.push(batch);
+        }
+        Ok(batches)
+    }
+
     #[test]
     fn native_async_reader_resolves_local_file_task_to_object_store_path()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -500,6 +578,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn batch_projection_is_empty_when_parquet_stream_schema_is_aligned()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("customer_name", DataType::Utf8, true),
+        ]));
+
+        assert_eq!(build_batch_projection(&schema, &schema)?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn batch_projection_reorders_parquet_stream_schema_to_provider_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("customer_name", DataType::Utf8, true),
+        ]));
+        let stream_schema = Arc::new(Schema::new(vec![
+            Field::new("customer_name", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, true),
+        ]));
+
+        assert_eq!(
+            build_batch_projection(&stream_schema, &provider_schema)?,
+            Some(vec![1, 0])
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -553,20 +664,20 @@ mod tests {
             snapshot_version: source.version(),
         })?;
 
-        let result = reader
-            .read_file(DeltaNativeAsyncFileReadRequest {
+        let stream = reader
+            .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
             })
             .await?;
-
-        assert_eq!(result.batches.len(), 1);
         assert_eq!(
-            result.deletion_vector_stats,
+            stream.deletion_vector_stats(),
             DeltaFileReadDeletionVectorStats::default()
         );
+        let batches = collect_file_stream(stream).await?;
 
-        let batch = result.batches.first().ok_or("expected one record batch")?;
+        assert_eq!(batches.len(), 1);
+        let batch = batches.first().ok_or("expected one record batch")?;
         assert_eq!(batch.num_rows(), table.rows());
         assert_eq!(batch.num_columns(), 2);
         let ids = batch
@@ -618,13 +729,14 @@ mod tests {
             snapshot_version: source.version(),
         })?;
 
-        let result = reader
-            .read_file(DeltaNativeAsyncFileReadRequest {
+        let stream = reader
+            .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
             })
             .await?;
-        let batch = result.batches.first().ok_or("expected one record batch")?;
+        let batches = collect_file_stream(stream).await?;
+        let batch = batches.first().ok_or("expected one record batch")?;
 
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.schema().field(0).name(), "customer_name");
