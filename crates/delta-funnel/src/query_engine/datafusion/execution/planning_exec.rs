@@ -67,6 +67,7 @@ impl DeltaScanPlanningExec {
         let read_stats = Arc::new(DeltaProviderReadStats::new(
             scan_plan.source_name.clone(),
             scan_plan.snapshot_version,
+            execution_options.reader_backend,
             Some(partition_plan.scan_metadata_exhausted),
             partition_plan.partitions.len(),
             partition_plan
@@ -365,6 +366,7 @@ mod tests {
     use crate::query_engine::datafusion::catalog::registration::{
         DeltaTableProviderConfig, register_delta_sources,
     };
+    use crate::query_engine::datafusion::execution::DeltaProviderReaderBackend;
     use crate::query_engine::datafusion::execution::read_stats::DeltaProviderReadStats;
     use crate::query_engine::datafusion::planning::file_task::DeltaScanFileTask;
     use crate::query_engine::datafusion::test_support::{
@@ -404,6 +406,10 @@ mod tests {
         let read_stats = scans[0].read_stats_snapshot();
         assert_eq!(read_stats.source_name, "orders");
         assert_eq!(read_stats.snapshot_version, 1);
+        assert_eq!(
+            read_stats.reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
+        );
         assert_eq!(read_stats.scan_metadata_exhausted, Some(true));
         assert_eq!(
             read_stats.scan_partitions_planned,
@@ -1157,6 +1163,7 @@ mod tests {
         let read_stats = Arc::new(DeltaProviderReadStats::new(
             "orders",
             1,
+            DeltaProviderReaderBackend::OfficialKernel,
             Some(true),
             2,
             2,
@@ -1549,6 +1556,7 @@ mod tests {
         Arc::new(DeltaProviderReadStats::new(
             "orders",
             1,
+            DeltaProviderReaderBackend::OfficialKernel,
             Some(true),
             1,
             2,

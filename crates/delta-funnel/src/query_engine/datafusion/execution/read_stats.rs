@@ -6,6 +6,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::scheduling::DeltaProviderReaderBackend;
+
 /// Immutable view of provider read progress for one physical scan.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +16,8 @@ pub(crate) struct DeltaProviderReadStatsSnapshot {
     pub(crate) source_name: String,
     /// Delta snapshot version selected for this scan.
     pub(crate) snapshot_version: u64,
+    /// Provider file-reader backend selected for this scan.
+    pub(crate) reader_backend: DeltaProviderReaderBackend,
     /// Whether metadata expansion exhausted the upstream kernel scan iterator.
     pub(crate) scan_metadata_exhausted: Option<bool>,
     /// Planned DataFusion execution partitions for this scan.
@@ -54,6 +58,7 @@ pub(crate) struct DeltaProviderReadStatsSnapshot {
 pub(crate) struct DeltaProviderReadStats {
     source_name: String,
     snapshot_version: u64,
+    reader_backend: DeltaProviderReaderBackend,
     scan_metadata_exhausted: Option<bool>,
     scan_partitions_planned: u64,
     files_planned: u64,
@@ -80,6 +85,7 @@ impl DeltaProviderReadStats {
     pub(crate) fn new(
         source_name: impl Into<String>,
         snapshot_version: u64,
+        reader_backend: DeltaProviderReaderBackend,
         scan_metadata_exhausted: Option<bool>,
         scan_partitions_planned: usize,
         files_planned: usize,
@@ -89,6 +95,7 @@ impl DeltaProviderReadStats {
         Self {
             source_name: source_name.into(),
             snapshot_version,
+            reader_backend,
             scan_metadata_exhausted,
             scan_partitions_planned: usize_to_u64_saturating(scan_partitions_planned),
             files_planned: usize_to_u64_saturating(files_planned),
@@ -115,6 +122,7 @@ impl DeltaProviderReadStats {
         DeltaProviderReadStatsSnapshot {
             source_name: self.source_name.clone(),
             snapshot_version: self.snapshot_version,
+            reader_backend: self.reader_backend,
             scan_metadata_exhausted: self.scan_metadata_exhausted,
             scan_partitions_planned: self.scan_partitions_planned,
             files_planned: self.files_planned,
@@ -201,14 +209,28 @@ mod tests {
     use std::thread;
 
     use super::DeltaProviderReadStats;
+    use crate::query_engine::datafusion::execution::DeltaProviderReaderBackend;
 
     #[test]
     fn read_stats_snapshot_starts_with_context_and_zero_counters() {
-        let stats = DeltaProviderReadStats::new("orders", 7, Some(true), 3, 5, Some(99), Some(42));
+        let stats = DeltaProviderReadStats::new(
+            "orders",
+            7,
+            DeltaProviderReaderBackend::OfficialKernel,
+            Some(true),
+            3,
+            5,
+            Some(99),
+            Some(42),
+        );
         let snapshot = stats.snapshot();
 
         assert_eq!(snapshot.source_name, "orders");
         assert_eq!(snapshot.snapshot_version, 7);
+        assert_eq!(
+            snapshot.reader_backend,
+            DeltaProviderReaderBackend::OfficialKernel
+        );
         assert_eq!(snapshot.scan_metadata_exhausted, Some(true));
         assert_eq!(snapshot.scan_partitions_planned, 3);
         assert_eq!(snapshot.files_planned, 5);
@@ -229,7 +251,16 @@ mod tests {
 
     #[test]
     fn read_stats_records_partial_progress_without_completing_failed_work() {
-        let stats = DeltaProviderReadStats::new("orders", 7, Some(false), 1, 1, None, None);
+        let stats = DeltaProviderReadStats::new(
+            "orders",
+            7,
+            DeltaProviderReaderBackend::OfficialKernel,
+            Some(false),
+            1,
+            1,
+            None,
+            None,
+        );
 
         stats.record_scan_partition_started();
         stats.record_file_started();
@@ -259,7 +290,14 @@ mod tests {
         const ITERATIONS: usize = 100;
 
         let stats = Arc::new(DeltaProviderReadStats::new(
-            "orders", 7, None, THREADS, THREADS, None, None,
+            "orders",
+            7,
+            DeltaProviderReaderBackend::OfficialKernel,
+            None,
+            THREADS,
+            THREADS,
+            None,
+            None,
         ));
         let mut handles = Vec::new();
 
