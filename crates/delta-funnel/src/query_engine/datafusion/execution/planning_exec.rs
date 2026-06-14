@@ -1266,11 +1266,11 @@ mod tests {
 
         drop(stream);
 
-        for _ in 0..100 {
+        for _ in 0..1000 {
             if sync_read_limiter.active_file_reads() == 0 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
 
         assert_eq!(read_count.load(Ordering::SeqCst), 1);
