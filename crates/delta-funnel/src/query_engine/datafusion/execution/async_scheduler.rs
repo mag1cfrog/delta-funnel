@@ -117,9 +117,7 @@ where
             Ok(permit) => permit,
             Err(error) => return Some(Err(error)),
         };
-        let Some(task) = self.file_tasks.pop_front() else {
-            return None;
-        };
+        let task = self.file_tasks.pop_front()?;
         self.admitted_file_tasks = self.admitted_file_tasks.saturating_add(1);
 
         Some(self.reader.read_file(task, permit).await)

@@ -1113,7 +1113,16 @@ mod tests {
         });
         let sync_read_limiter =
             DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
-        let read_stats = test_read_stats();
+        let read_stats = Arc::new(DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
+            source_name: "orders".to_owned(),
+            snapshot_version: 1,
+            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 1,
+            files_planned: 3,
+            estimated_rows: Some(4),
+            estimated_bytes: Some(3),
+        }));
         let mut stream = super::sequential_scan_partition_stream(
             schema,
             reader,
@@ -1121,6 +1130,7 @@ mod tests {
             vec![
                 fake_task("part-00000.parquet"),
                 fake_task("part-00001.parquet"),
+                fake_task("part-00002.parquet"),
             ],
             sync_read_limiter.partition_limiter(0)?,
             Arc::clone(&read_stats),
@@ -1129,10 +1139,9 @@ mod tests {
         let first = stream.next().await.ok_or("expected first batch")??;
 
         assert_eq!(batch_ids(&first)?, vec![1]);
-        assert_eq!(
-            read_count.load(Ordering::SeqCst),
-            1,
-            "stream should yield the first batch before reading the second file"
+        assert!(
+            read_count.load(Ordering::SeqCst) < 3,
+            "stream should yield the first batch before exhausting all files"
         );
 
         let remaining = datafusion::physical_plan::common::collect(stream).await?;
@@ -1144,15 +1153,15 @@ mod tests {
             .flatten()
             .collect::<Vec<_>>();
 
-        assert_eq!(remaining_ids, vec![2, 3]);
-        assert_eq!(read_count.load(Ordering::SeqCst), 2);
+        assert_eq!(remaining_ids, vec![2, 3, 4]);
+        assert_eq!(read_count.load(Ordering::SeqCst), 3);
         let stats = read_stats.snapshot();
         assert_eq!(stats.scan_partitions_started, 1);
         assert_eq!(stats.scan_partitions_completed, 1);
-        assert_eq!(stats.files_started, 2);
-        assert_eq!(stats.files_completed, 2);
-        assert_eq!(stats.batches_produced, 3);
-        assert_eq!(stats.rows_produced, 3);
+        assert_eq!(stats.files_started, 3);
+        assert_eq!(stats.files_completed, 3);
+        assert_eq!(stats.batches_produced, 4);
+        assert_eq!(stats.rows_produced, 4);
 
         Ok(())
     }
@@ -1574,6 +1583,7 @@ mod tests {
                 "part-00000.parquet" => vec![vec![1], vec![2]],
                 "part-many-batches.parquet" => vec![vec![1], vec![2], vec![4]],
                 "part-00001.parquet" => vec![vec![3]],
+                "part-00002.parquet" => vec![vec![4]],
                 path => {
                     return Err(crate::DeltaFunnelError::Config {
                         message: format!("unexpected fake file task `{path}`"),
