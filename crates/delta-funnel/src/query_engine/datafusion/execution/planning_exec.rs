@@ -23,14 +23,22 @@ use super::super::planning::file_task::DeltaScanFileTask;
 use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
+use super::async_scheduler::{
+    DeltaProviderAsyncPartitionReadScheduler, DeltaProviderAsyncPartitionReadSchedulerConfig,
+};
 use super::file_reader::DeltaFileReadRequest;
+use super::native_async_reader::{
+    DeltaNativeAsyncFileReader, DeltaNativeAsyncFileReaderConfig,
+    DeltaNativeAsyncPartitionFileReader,
+};
 use super::read_stats::{DeltaProviderReadStats, DeltaProviderReadStatsConfig};
 use super::reader_backend::{
     DeltaProviderReaderBackendConfig, DeltaScanPartitionFileReader, build_partition_file_reader,
 };
 use super::scheduling::{
-    DeltaProviderScanExecutionOptions, DeltaProviderSyncPartitionReadLimiter,
-    DeltaProviderSyncReadLimiter,
+    DeltaProviderAsyncPartitionReadLimiter, DeltaProviderAsyncReadLimiter,
+    DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
+    DeltaProviderSyncPartitionReadLimiter, DeltaProviderSyncReadLimiter,
 };
 
 pub(crate) struct DeltaScanPlanningExec {
@@ -39,6 +47,7 @@ pub(crate) struct DeltaScanPlanningExec {
     partition_target_decision: DeltaScanPartitionTargetDecision,
     execution_options: DeltaProviderScanExecutionOptions,
     sync_read_limiter: Arc<DeltaProviderSyncReadLimiter>,
+    async_read_limiter: Arc<DeltaProviderAsyncReadLimiter>,
     read_stats: Arc<DeltaProviderReadStats>,
     properties: Arc<PlanProperties>,
 }
@@ -64,6 +73,8 @@ impl DeltaScanPlanningExec {
 
         let sync_read_limiter =
             DeltaProviderSyncReadLimiter::new(execution_options, partition_plan.partitions.len());
+        let async_read_limiter =
+            DeltaProviderAsyncReadLimiter::new(execution_options, partition_plan.partitions.len());
         let read_stats = Arc::new(DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
             source_name: scan_plan.source_name.clone(),
             snapshot_version: scan_plan.snapshot_version,
@@ -85,6 +96,7 @@ impl DeltaScanPlanningExec {
             partition_target_decision,
             execution_options,
             sync_read_limiter,
+            async_read_limiter,
             read_stats,
             properties: Arc::new(properties),
         }
@@ -215,29 +227,60 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             ))));
         }
 
-        let file_reader = build_partition_file_reader(DeltaProviderReaderBackendConfig {
-            reader_backend: self.execution_options.reader_backend,
-            source_name: &self.scan_plan.source_name,
-            table_uri: &self.scan_plan.table_uri,
-            snapshot_version: self.scan_plan.snapshot_version,
-        })
-        .map_err(DataFusionError::from)?;
         let file_tasks = scan_partition.file_tasks.clone();
         let read_schema =
             partition_read_schema(self.scan_plan.kernel_scan().read_schema(), &file_tasks);
-        let partition_limiter = self
-            .sync_read_limiter
-            .partition_limiter(partition)
-            .map_err(DataFusionError::from)?;
 
-        Ok(sequential_scan_partition_stream(
-            Arc::clone(&self.scan_plan.projected_schema),
-            file_reader,
-            read_schema,
-            file_tasks,
-            partition_limiter,
-            Arc::clone(&self.read_stats),
-        ))
+        match self.execution_options.reader_backend {
+            DeltaProviderReaderBackend::OfficialKernel => {
+                let file_reader = build_partition_file_reader(DeltaProviderReaderBackendConfig {
+                    reader_backend: self.execution_options.reader_backend,
+                    source_name: &self.scan_plan.source_name,
+                    table_uri: &self.scan_plan.table_uri,
+                    snapshot_version: self.scan_plan.snapshot_version,
+                })
+                .map_err(DataFusionError::from)?;
+                let partition_limiter = self
+                    .sync_read_limiter
+                    .partition_limiter(partition)
+                    .map_err(DataFusionError::from)?;
+
+                Ok(sequential_scan_partition_stream(
+                    Arc::clone(&self.scan_plan.projected_schema),
+                    file_reader,
+                    read_schema,
+                    file_tasks,
+                    partition_limiter,
+                    Arc::clone(&self.read_stats),
+                ))
+            }
+            DeltaProviderReaderBackend::NativeAsync => {
+                let file_reader = Arc::new(DeltaNativeAsyncFileReader::try_new(
+                    DeltaNativeAsyncFileReaderConfig {
+                        source_name: &self.scan_plan.source_name,
+                        table_uri: &self.scan_plan.table_uri,
+                        snapshot_version: self.scan_plan.snapshot_version,
+                    },
+                )?);
+                let partition_reader = Arc::new(DeltaNativeAsyncPartitionFileReader::new(
+                    file_reader,
+                    read_schema,
+                    Arc::clone(&self.read_stats),
+                ));
+                let partition_limiter = self
+                    .async_read_limiter
+                    .partition_limiter(partition)
+                    .map_err(DataFusionError::from)?;
+
+                Ok(native_async_scan_partition_stream(
+                    Arc::clone(&self.scan_plan.projected_schema),
+                    partition_reader,
+                    file_tasks,
+                    partition_limiter,
+                    Arc::clone(&self.read_stats),
+                ))
+            }
+        }
     }
 }
 
@@ -309,6 +352,62 @@ fn sequential_scan_partition_stream(
         }
 
         read_stats.record_scan_partition_completed();
+        Ok(())
+    });
+
+    builder.build()
+}
+
+fn native_async_scan_partition_stream(
+    schema: SchemaRef,
+    file_reader: Arc<DeltaNativeAsyncPartitionFileReader>,
+    file_tasks: Vec<DeltaScanFileTask>,
+    partition_limiter: DeltaProviderAsyncPartitionReadLimiter,
+    read_stats: Arc<DeltaProviderReadStats>,
+) -> SendableRecordBatchStream {
+    let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
+    let output = builder.tx();
+
+    builder.spawn(async move {
+        read_stats.record_scan_partition_started();
+        let mut scheduler = DeltaProviderAsyncPartitionReadScheduler::new(
+            DeltaProviderAsyncPartitionReadSchedulerConfig::new(
+                file_tasks,
+                file_reader,
+                partition_limiter,
+            ),
+        );
+
+        while !output.is_closed() {
+            let Some(file_result) = scheduler.next_file().await else {
+                read_stats.record_scan_partition_completed();
+                return Ok(());
+            };
+            let file_result = match file_result {
+                Ok(file_result) => file_result,
+                Err(error) => {
+                    record_deletion_vector_read_error(read_stats.as_ref(), &error);
+                    return Err(DataFusionError::from(error));
+                }
+            };
+            let deletion_vector_stats = file_result.deletion_vector_stats;
+            if deletion_vector_stats.payload_loaded {
+                read_stats.record_deletion_vector_payload_loaded();
+            }
+            if deletion_vector_stats.applied {
+                read_stats.record_deletion_vector_applied(deletion_vector_stats.deleted_rows);
+            }
+
+            for batch in file_result {
+                let rows = batch.num_rows();
+                if output.send(Ok(batch)).await.is_err() {
+                    return Ok(());
+                }
+                read_stats.record_batch_produced(rows);
+            }
+            read_stats.record_file_completed();
+        }
+
         Ok(())
     });
 
@@ -605,6 +704,71 @@ mod tests {
             scans[0].read_stats_snapshot().reader_backend,
             DeltaProviderReaderBackend::OfficialKernel
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_backend_reads_projected_non_dv_file_through_provider_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_default("native-async-provider-read")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx
+            .sql("select customer_name from orders order by customer_name nulls last")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].execution_options(), execution_options);
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+---------------+",
+                "| customer_name |",
+                "+---------------+",
+                "| alice         |",
+                "| bob           |",
+                "|               |",
+                "+---------------+",
+            ]
+            .join("\n")
+        );
+        let read_stats = scans[0].read_stats_snapshot();
+        assert_eq!(read_stats.files_started, 1);
+        assert_eq!(read_stats.files_completed, 1);
+        assert_eq!(read_stats.rows_produced, 3);
 
         Ok(())
     }
