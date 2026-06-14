@@ -119,6 +119,24 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local Delta table with two large real Parquet files.
+    pub(crate) fn new_with_two_large_files(
+        name: &str,
+        rows_per_file: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if rows_per_file == 0 {
+            return Err("row count must be positive".into());
+        }
+
+        Self::new_with_file_batches(
+            name,
+            vec![
+                sequential_file_batch(1, 1, rows_per_file, "file-a")?,
+                sequential_file_batch(2, rows_per_file.saturating_add(1), rows_per_file, "file-b")?,
+            ],
+        )
+    }
+
     /// Creates a local Delta table with one data file and a real deletion vector.
     pub(crate) fn new_with_deletion_vector(
         name: &str,
@@ -445,6 +463,39 @@ fn file_batch(
             min_customer,
             max_customer,
             customer_null_count,
+        },
+        partition_values_json: "{}".to_owned(),
+        deletion_vector: None,
+    })
+}
+
+fn sequential_file_batch(
+    index: usize,
+    first_id: usize,
+    rows: usize,
+    customer_name: &str,
+) -> Result<RealParquetDataFile, Box<dyn std::error::Error>> {
+    let first_id = i32::try_from(first_id)?;
+    let row_count = i32::try_from(rows)?;
+    let ids = (first_id..first_id + row_count).collect::<Vec<_>>();
+    let names = (0..rows)
+        .map(|_| Some(customer_name.to_owned()))
+        .collect::<Vec<_>>();
+    let max_id = ids.iter().copied().max().ok_or("file must have rows")?;
+    let columns = vec![
+        Arc::new(Int32Array::from(ids)) as Arc<dyn Array>,
+        Arc::new(StringArray::from(names)) as Arc<dyn Array>,
+    ];
+
+    Ok(RealParquetDataFile {
+        path: format!("part-{index:05}.parquet"),
+        batch: kernel::RecordBatch::try_new(schema(), columns)?,
+        stats: AddStats {
+            rows,
+            max_id,
+            min_customer: customer_name.to_owned(),
+            max_customer: customer_name.to_owned(),
+            customer_null_count: 0,
         },
         partition_values_json: "{}".to_owned(),
         deletion_vector: None,
