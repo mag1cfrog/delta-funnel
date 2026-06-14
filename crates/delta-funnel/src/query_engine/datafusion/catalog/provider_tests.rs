@@ -8,7 +8,9 @@ use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
-use super::super::super::execution::DeltaScanPlanningExec;
+use super::super::super::execution::{
+    DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions, DeltaScanPlanningExec,
+};
 use super::super::super::planning::partition_target::DeltaScanPartitionTargetSource;
 use super::*;
 use crate::query_engine::datafusion::catalog::registration::{
@@ -444,6 +446,69 @@ fn delta_provider_exposes_logical_arrow_schema() -> Result<(), Box<dyn std::erro
     assert_eq!(schema.field(1).name(), "customer_name");
     assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
     assert!(schema.field(1).is_nullable());
+
+    Ok(())
+}
+
+#[test]
+fn delta_provider_accepts_native_async_backend_for_local_file_uri()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new("native-async-local-file-provider")?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+
+    let provider = DeltaTableProvider::try_new_with_execution_options(
+        source,
+        preflight,
+        None,
+        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?,
+    )?;
+
+    assert_eq!(provider.source_name(), "orders");
+
+    Ok(())
+}
+
+#[test]
+fn native_async_backend_does_not_claim_exact_filter_pushdown()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new_with_schema(
+        "native-async-no-exact-filter-pushdown",
+        PARTITIONED_SCHEMA_FIELDS_JSON,
+        r#"["region"]"#,
+        r#""partitionValues":{"region":"us-west"}"#,
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new_with_execution_options(
+        source,
+        preflight,
+        None,
+        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?,
+    )?;
+    let filter =
+        datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("us-west"));
+
+    assert_eq!(
+        provider.supports_filters_pushdown(&[&filter])?,
+        vec![TableProviderFilterPushDown::Unsupported]
+    );
 
     Ok(())
 }

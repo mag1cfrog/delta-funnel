@@ -49,6 +49,11 @@ pub(crate) fn build_partition_file_reader(
             })?;
             Ok(Arc::new(reader))
         }
+        DeltaProviderReaderBackend::NativeAsync => Err(DeltaFunnelError::Config {
+            message:
+                "native async reader backend is not wired into sync partition reader execution"
+                    .to_owned(),
+        }),
     }
 }
 

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{
-    Column, Result as DataFusionResult,
+    Column, DataFusionError, Result as DataFusionResult,
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion::datasource::{TableProvider, TableType};
@@ -25,7 +25,10 @@ use crate::{
     },
 };
 
-use super::super::execution::{DeltaProviderScanExecutionOptions, DeltaScanPlanningExec};
+use super::super::execution::{
+    DeltaNativeAsyncFileReaderConfig, DeltaProviderReaderBackend,
+    DeltaProviderScanExecutionOptions, DeltaScanPlanningExec, validate_native_async_reader_config,
+};
 use super::super::planning::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
 use super::super::planning::partition_target::{
     DeltaScanPartitionTargetConfig, DeltaScanPartitionTargetContext, DeltaScanPartitionTargetPolicy,
@@ -75,6 +78,7 @@ impl DeltaTableProvider {
     ) -> Result<Self, DeltaFunnelError> {
         reject_mismatched_preflight(&source, preflight.protocol())?;
         execution_options.validate()?;
+        reject_unsupported_reader_backend_source(&execution_options, &source)?;
         let schema = delta_source_arrow_schema(&source)?;
 
         Ok(Self {
@@ -393,6 +397,22 @@ fn unqualify_filter_columns(filter: Expr, schema: &SchemaRef) -> Expr {
     }
 }
 
+fn reject_unsupported_reader_backend_source(
+    execution_options: &DeltaProviderScanExecutionOptions,
+    source: &PlannedDeltaSource,
+) -> Result<(), DeltaFunnelError> {
+    match execution_options.reader_backend {
+        DeltaProviderReaderBackend::OfficialKernel => Ok(()),
+        DeltaProviderReaderBackend::NativeAsync => {
+            validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
+                source_name: source.name(),
+                table_uri: source.table_uri(),
+                snapshot_version: source.version(),
+            })
+        }
+    }
+}
+
 fn is_relation_qualified_top_level_column(column: &Column, schema: &SchemaRef) -> bool {
     let flat_name = column.flat_name();
     let Some((first_segment, _remainder)) = flat_name.split_once('.') else {
@@ -437,6 +457,18 @@ impl TableProvider for DeltaTableProvider {
         // provider limit as advisory until a scan-local limit case is proven
         // safe across residual filters, joins, deletion vectors, transforms, and
         // ordering-sensitive plans.
+        if self.execution_options.reader_backend == DeltaProviderReaderBackend::NativeAsync
+            && !filters.is_empty()
+        {
+            return DeltaScanFilterSnafu {
+                source_name: self.source_name().to_owned(),
+                table_uri: self.source.table_uri().to_owned(),
+                reason: "native async reader backend does not support pushed filters yet; filters must remain as DataFusion residual filters".to_owned(),
+            }
+            .fail()
+            .map_err(DataFusionError::from);
+        }
+
         let scan_plan = self.plan_scan(ProviderScanPlanRequest {
             requested_projection: projection.cloned(),
             pushed_filters: filters.to_vec(),
@@ -467,6 +499,13 @@ impl TableProvider for DeltaTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        if self.execution_options.reader_backend == DeltaProviderReaderBackend::NativeAsync {
+            return Ok(vec![
+                TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ]);
+        }
+
         Ok(self
             .plan_supports_filters_pushdown(filters)
             .datafusion_pushdowns())
