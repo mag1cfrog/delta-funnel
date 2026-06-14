@@ -477,6 +477,42 @@ fn delta_provider_accepts_native_async_backend_for_local_file_uri()
     Ok(())
 }
 
+#[test]
+fn native_async_backend_does_not_claim_exact_filter_pushdown()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new_with_schema(
+        "native-async-no-exact-filter-pushdown",
+        PARTITIONED_SCHEMA_FIELDS_JSON,
+        r#"["region"]"#,
+        r#""partitionValues":{"region":"us-west"}"#,
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new_with_execution_options(
+        source,
+        preflight,
+        None,
+        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?,
+    )?;
+    let filter =
+        datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("us-west"));
+
+    assert_eq!(
+        provider.supports_filters_pushdown(&[&filter])?,
+        vec![TableProviderFilterPushDown::Unsupported]
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn table_provider_scan_returns_projected_non_reading_plan()
 -> Result<(), Box<dyn std::error::Error>> {

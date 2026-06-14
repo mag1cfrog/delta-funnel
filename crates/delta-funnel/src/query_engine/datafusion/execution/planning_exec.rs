@@ -774,6 +774,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_backend_keeps_data_filter_as_residual()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_default("native-async-residual-filter")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx
+            .sql("select customer_name from orders where id > 1 order by id")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+        assert_eq!(
+            scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+            0
+        );
+        assert!(
+            !scans[0]
+                .scan_plan()
+                .kernel_scan()
+                .read_schema()
+                .has_physical_predicate()
+        );
+
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let formatted = pretty_format_batches(&result)?.to_string();
+
+        assert_eq!(
+            formatted,
+            [
+                "+---------------+",
+                "| customer_name |",
+                "+---------------+",
+                "| bob           |",
+                "|               |",
+                "+---------------+",
+            ]
+            .join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn projection_execution_emits_requested_columns() -> Result<(), Box<dyn std::error::Error>>
     {
         let ctx = SessionContext::new();
