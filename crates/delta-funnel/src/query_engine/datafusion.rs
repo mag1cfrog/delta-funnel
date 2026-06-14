@@ -12,7 +12,7 @@ pub use catalog::registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources,
     register_delta_sources, register_delta_sources_with_scan_execution_options,
 };
-pub use execution::DeltaProviderScanExecutionOptions;
+pub use execution::{DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions};
 pub use planning::partition_target::{
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,

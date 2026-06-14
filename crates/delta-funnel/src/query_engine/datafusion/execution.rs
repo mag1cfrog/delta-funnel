@@ -7,4 +7,4 @@ pub(crate) mod read_stats;
 pub(crate) mod scheduling;
 
 pub(crate) use planning_exec::DeltaScanPlanningExec;
-pub use scheduling::DeltaProviderScanExecutionOptions;
+pub use scheduling::{DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions};

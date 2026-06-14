@@ -17,9 +17,9 @@ mod table_formats;
 
 pub use error::DeltaFunnelError;
 pub use query_engine::{
-    DeltaProviderScanExecutionOptions, DeltaScanPartitionTargetDiagnosticInput,
-    DeltaScanPartitionTargetDiagnosticOutput, DeltaScanPartitionTargetDiagnosticSource,
-    DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+    DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
+    DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
+    DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaTableProviderConfig,
     RegisteredDeltaSource, RegisteredDeltaSources,
     delta_scan_partition_target_local_environment_diagnostic,
