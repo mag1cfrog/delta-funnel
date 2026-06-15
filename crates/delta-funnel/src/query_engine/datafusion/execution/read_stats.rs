@@ -183,6 +183,10 @@ impl DeltaProviderReadStats {
 
     pub(crate) fn record_deletion_vector_applied(&self, deleted_rows: usize) {
         saturating_fetch_add(&self.deletion_vectors_applied, 1);
+        self.record_deletion_vector_rows_deleted(deleted_rows);
+    }
+
+    pub(crate) fn record_deletion_vector_rows_deleted(&self, deleted_rows: usize) {
         saturating_fetch_add(
             &self.deletion_vector_rows_deleted,
             usize_to_u64_saturating(deleted_rows),

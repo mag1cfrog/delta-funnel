@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use delta_kernel::Engine as _;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::deletion_vector_writer::{
     KernelDeletionVector, StreamingDeletionVectorWriter,
@@ -15,10 +14,10 @@ use delta_kernel::arrow::array::{
     Float64Array, Int32Array, ListArray, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
+use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
 
 use super::kernel;
-use super::uri::normalize_delta_table_uri;
-
 const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
 const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
 const COLUMN_MAPPING_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#;
@@ -100,7 +99,42 @@ impl RealParquetDeltaTable {
             DELETION_VECTOR_PROTOCOL_JSON,
             vec![RealParquetDataFile {
                 path: DATA_FILE.to_owned(),
-                batch: sequential_batch(rows)?,
+                batches: vec![sequential_batch(rows)?],
+                stats: AddStats {
+                    rows,
+                    max_id: i32::try_from(rows)?,
+                    min_customer: "customer-1".to_owned(),
+                    max_customer: format!("customer-{rows}"),
+                    customer_null_count: 0,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: Some(deletion_vector_fixture(deleted_rows)?),
+            }],
+        )
+    }
+
+    /// Creates a local Delta table whose single DV-backed Parquet file is
+    /// written from two record batches. The fixture exercises original row
+    /// indexes across physical Parquet row-group boundaries.
+    pub(crate) fn new_with_two_row_groups_and_deletion_vector(
+        name: &str,
+        rows_per_group: usize,
+        deleted_rows: &[u64],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if rows_per_group == 0 {
+            return Err("row count must be positive".into());
+        }
+        let rows = rows_per_group.saturating_mul(2);
+
+        Self::new_with_protocol_file_batches(
+            name,
+            DELETION_VECTOR_PROTOCOL_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![
+                    sequential_batch_starting_at(1, rows_per_group)?,
+                    sequential_batch_starting_at(rows_per_group.saturating_add(1), rows_per_group)?,
+                ],
                 stats: AddStats {
                     rows,
                     max_id: i32::try_from(rows)?,
@@ -153,7 +187,7 @@ impl RealParquetDeltaTable {
             DELETION_VECTOR_PROTOCOL_JSON,
             vec![RealParquetDataFile {
                 path: DATA_FILE.to_owned(),
-                batch: default_batch()?,
+                batches: vec![default_batch()?],
                 stats: AddStats {
                     rows: 3,
                     max_id: 3,
@@ -179,7 +213,7 @@ impl RealParquetDeltaTable {
             PARTITIONED_METADATA_JSON,
             vec![RealParquetDataFile {
                 path: DATA_FILE.to_owned(),
-                batch: default_batch()?,
+                batches: vec![default_batch()?],
                 stats: AddStats {
                     rows: 3,
                     max_id: 3,
@@ -206,7 +240,7 @@ impl RealParquetDeltaTable {
             PARTITIONED_METADATA_JSON,
             vec![RealParquetDataFile {
                 path: DATA_FILE.to_owned(),
-                batch: default_batch()?,
+                batches: vec![default_batch()?],
                 stats: AddStats {
                     rows: 3,
                     max_id: 3,
@@ -229,7 +263,7 @@ impl RealParquetDeltaTable {
             COLUMN_MAPPING_METADATA_JSON,
             vec![RealParquetDataFile {
                 path: DATA_FILE.to_owned(),
-                batch: physical_column_mapping_batch()?,
+                batches: vec![physical_column_mapping_batch()?],
                 stats: AddStats {
                     rows: 3,
                     max_id: 3,
@@ -253,7 +287,7 @@ impl RealParquetDeltaTable {
             SUPPORTED_TYPES_METADATA_JSON,
             vec![RealParquetDataFile {
                 path: DATA_FILE.to_owned(),
-                batch: supported_types_batch()?,
+                batches: vec![supported_types_batch()?],
                 stats: AddStats {
                     rows: 3,
                     max_id: 3,
@@ -278,7 +312,7 @@ impl RealParquetDeltaTable {
             MISSING_NULLABLE_METADATA_JSON,
             vec![RealParquetDataFile {
                 path: DATA_FILE.to_owned(),
-                batch: default_batch()?,
+                batches: vec![default_batch()?],
                 stats: AddStats {
                     rows: 3,
                     max_id: 3,
@@ -303,7 +337,7 @@ impl RealParquetDeltaTable {
             MISSING_NON_NULLABLE_METADATA_JSON,
             vec![RealParquetDataFile {
                 path: DATA_FILE.to_owned(),
-                batch: default_batch()?,
+                batches: vec![default_batch()?],
                 stats: AddStats {
                     rows: 3,
                     max_id: 3,
@@ -328,7 +362,7 @@ impl RealParquetDeltaTable {
             METADATA_JSON,
             vec![RealParquetDataFile {
                 path: DATA_FILE.to_owned(),
-                batch: reordered_physical_columns_batch()?,
+                batches: vec![reordered_physical_columns_batch()?],
                 stats: AddStats {
                     rows: 3,
                     max_id: 3,
@@ -351,7 +385,7 @@ impl RealParquetDeltaTable {
             name,
             vec![RealParquetDataFile {
                 path: DATA_FILE.to_owned(),
-                batch,
+                batches: vec![batch],
                 stats,
                 partition_values_json: "{}".to_owned(),
                 deletion_vector: None,
@@ -386,24 +420,40 @@ impl RealParquetDeltaTable {
         let log_path = path.join("_delta_log");
         fs::create_dir_all(&log_path)?;
 
-        let table_uri = normalize_delta_table_uri(path.to_string_lossy())?;
-        let table_url = kernel::try_parse_uri(&table_uri)?;
-        let store = kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
-        let engine = kernel::DefaultEngineBuilder::new(store).build();
         let mut add_actions = Vec::with_capacity(files.len());
         let mut rows = 0_usize;
         let mut total_data_file_size = 0_u64;
 
         for file in files {
-            rows = rows.saturating_add(file.batch.num_rows());
+            rows = rows.saturating_add(
+                file.batches
+                    .iter()
+                    .map(kernel::RecordBatch::num_rows)
+                    .sum::<usize>(),
+            );
 
-            let data_url = table_url.join(&file.path)?;
-            let engine_data: Box<dyn delta_kernel::EngineData> =
-                Box::new(kernel::ArrowEngineData::new(file.batch));
-
-            engine
-                .parquet_handler()
-                .write_parquet_file(data_url, Box::new(std::iter::once(Ok(engine_data))))?;
+            let first_batch = file
+                .batches
+                .first()
+                .ok_or("data file must have at least one record batch")?;
+            let max_row_group_size = file
+                .batches
+                .iter()
+                .map(kernel::RecordBatch::num_rows)
+                .min()
+                .ok_or("data file must have at least one record batch")?;
+            let writer_properties = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(max_row_group_size))
+                .build();
+            let mut writer = ArrowWriter::try_new(
+                fs::File::create(path.join(&file.path))?,
+                first_batch.schema(),
+                Some(writer_properties),
+            )?;
+            for batch in &file.batches {
+                writer.write(batch)?;
+            }
+            writer.close()?;
 
             let data_file_size = fs::metadata(path.join(&file.path))?.len();
             total_data_file_size = total_data_file_size.saturating_add(data_file_size);
@@ -461,7 +511,7 @@ impl RealParquetDeltaTable {
 
 struct RealParquetDataFile {
     path: String,
-    batch: kernel::RecordBatch,
+    batches: Vec<kernel::RecordBatch>,
     stats: AddStats,
     partition_values_json: String,
     deletion_vector: Option<RealParquetDeletionVector>,
@@ -619,10 +669,25 @@ fn supported_types_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Er
 }
 
 fn sequential_batch(rows: usize) -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    sequential_batch_starting_at(1, rows)
+}
+
+fn sequential_batch_starting_at(
+    first_id: usize,
+    rows: usize,
+) -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    if rows == 0 {
+        return Err("row count must be positive".into());
+    }
+
+    let first_id = i32::try_from(first_id)?;
     let row_count = i32::try_from(rows)?;
-    let ids = (1..=row_count).collect::<Vec<_>>();
+    let ids = (first_id..first_id + row_count).collect::<Vec<_>>();
     let names = (1..=row_count)
-        .map(|id| Some(format!("customer-{id}")))
+        .map(|offset| {
+            let id = first_id.saturating_add(offset).saturating_sub(1);
+            Some(format!("customer-{id}"))
+        })
         .collect::<Vec<_>>();
     let columns = vec![
         Arc::new(Int32Array::from(ids)) as Arc<dyn Array>,
@@ -664,7 +729,7 @@ fn file_batch(
 
     Ok(RealParquetDataFile {
         path,
-        batch: kernel::RecordBatch::try_new(schema(), columns)?,
+        batches: vec![kernel::RecordBatch::try_new(schema(), columns)?],
         stats: AddStats {
             rows: row_count,
             max_id,
@@ -697,7 +762,7 @@ fn sequential_file_batch(
 
     Ok(RealParquetDataFile {
         path: format!("part-{index:05}.parquet"),
-        batch: kernel::RecordBatch::try_new(schema(), columns)?,
+        batches: vec![kernel::RecordBatch::try_new(schema(), columns)?],
         stats: AddStats {
             rows,
             max_id,
