@@ -1071,6 +1071,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_matches_official_kernel_for_missing_nullable_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_missing_nullable_column(
+            "native-async-missing-nullable-equivalence",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select id, customer_name, loyalty_tier from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+        assert!(native.contains("loyalty_tier"), "{native}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_backend_preserves_file_order_in_one_partition()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
