@@ -20,6 +20,7 @@ pub(super) fn try_data_stats_kernel_filter(
         datafusion_expr: filter.clone(),
         kernel_predicate: datafusion_expr_to_kernel_predicate(filter).ok()?,
         kind: KernelScanFilterKind::DataStats,
+        native_row_predicate_exact_candidate: true,
     })
 }
 

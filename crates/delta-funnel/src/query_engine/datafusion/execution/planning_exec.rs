@@ -228,8 +228,14 @@ impl ExecutionPlan for DeltaScanPlanningExec {
         }
 
         let file_tasks = scan_partition.file_tasks.clone();
-        let read_schema =
-            partition_read_schema(self.scan_plan.kernel_scan().read_schema(), &file_tasks);
+        let read_schema = partition_read_schema(
+            self.scan_plan.kernel_scan().read_schema(),
+            &file_tasks,
+            self.execution_options.reader_backend,
+            self.scan_plan
+                .pushed_filter_plan
+                .has_provider_enforced_row_predicate(),
+        )?;
 
         match self.execution_options.reader_backend {
             DeltaProviderReaderBackend::OfficialKernel => {
@@ -287,19 +293,35 @@ impl ExecutionPlan for DeltaScanPlanningExec {
 fn partition_read_schema(
     read_schema: KernelScanReadSchema,
     file_tasks: &[DeltaScanFileTask],
-) -> KernelScanReadSchema {
-    if file_tasks
+    reader_backend: DeltaProviderReaderBackend,
+    enforce_physical_predicate_rows: bool,
+) -> DataFusionResult<KernelScanReadSchema> {
+    let has_deletion_vector_tasks = file_tasks
         .iter()
-        .any(|task| task.deletion_vector.is_present())
+        .any(|task| task.deletion_vector.is_present());
+    if enforce_physical_predicate_rows
+        && has_deletion_vector_tasks
+        && !reader_backend.supports_dv_row_index_predicate_reads()
     {
-        // Temporary #142 gate: the official-kernel reader does not expose
-        // original row indexes for predicate-filtered batches, so DV-backed
-        // partitions must not push physical predicates into Parquet reads.
-        // The #145 native async reader owns reopening this path through hidden
-        // row-index metadata and the DV row-index oracle.
-        read_schema.without_physical_predicate()
+        return Err(DataFusionError::Execution(
+            "Delta scan cannot drop an exact physical predicate for deletion-vector file tasks on a backend without original row-index accounting"
+                .to_owned(),
+        ));
+    }
+
+    let read_schema = if enforce_physical_predicate_rows {
+        read_schema.with_provider_enforced_physical_predicate_rows()
     } else {
         read_schema
+    };
+
+    if !reader_backend.supports_dv_row_index_predicate_reads() && has_deletion_vector_tasks {
+        // Backends without original row-index accounting cannot safely align
+        // predicate-pruned rows with DV row coordinates. Keep those backends on
+        // the residual-filter path for DV-backed file tasks.
+        Ok(read_schema.without_physical_predicate())
+    } else {
+        Ok(read_schema)
     }
 }
 
@@ -866,7 +888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_async_backend_keeps_data_filter_as_residual()
+    async fn native_async_backend_enforces_exact_data_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = RealParquetDeltaTable::new_default("native-async-residual-filter")?;
@@ -901,7 +923,7 @@ mod tests {
         let mut scans = Vec::new();
         find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
-        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert!(!plan_display.contains("FilterExec"), "{plan_display}");
         assert_eq!(scans.len(), 1);
         assert_eq!(
             scans[0].read_stats_snapshot().reader_backend,
@@ -909,10 +931,23 @@ mod tests {
         );
         assert_eq!(
             scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+            1
+        );
+        assert_eq!(
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .residual_filter_count,
             0
         );
         assert!(
-            !scans[0]
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .has_provider_enforced_row_predicate()
+        );
+        assert!(
+            scans[0]
                 .scan_plan()
                 .kernel_scan()
                 .read_schema()
@@ -1264,6 +1299,192 @@ mod tests {
         assert_eq!(native_stats.deletion_vector_rows_deleted, 1);
         assert_eq!(native_stats.deletion_vector_failures, 0);
         assert_eq!(native_stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_exact_predicate_can_select_only_deleted_dv_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_deletion_vector(
+            "native-async-dv-exact-predicate-only-deleted",
+            &[1],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders where id = 2").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(!plan_display.contains("FilterExec"), "{plan_display}");
+        assert_eq!(physical_plan.schema().field(0).name(), "id");
+        assert_eq!(scans.len(), 1);
+        assert!(
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .has_provider_enforced_row_predicate()
+        );
+
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let ids = collect_batch_ids(&result)?;
+
+        assert!(ids.is_empty());
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.rows_produced, 0);
+        assert_eq!(stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(stats.deletion_vectors_applied, 1);
+        assert_eq!(stats.deletion_vector_rows_deleted, 1);
+        assert_eq!(stats.deletion_vector_failures, 0);
+        assert_eq!(stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_exact_predicate_preserves_rows_not_targeted_by_dv()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_deletion_vector(
+            "native-async-dv-exact-predicate-non-overlap",
+            &[1],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders where id = 1").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(!plan_display.contains("FilterExec"), "{plan_display}");
+        assert_eq!(physical_plan.schema().field(0).name(), "id");
+        assert_eq!(scans.len(), 1);
+        assert!(
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .has_provider_enforced_row_predicate()
+        );
+
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let ids = collect_batch_ids(&result)?;
+
+        assert_eq!(ids, vec![1]);
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.rows_produced, 1);
+        assert_eq!(stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(stats.deletion_vectors_applied, 1);
+        assert_eq!(stats.deletion_vector_rows_deleted, 0);
+        assert_eq!(stats.deletion_vector_failures, 0);
+        assert_eq!(stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_exact_predicate_can_select_no_dv_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_deletion_vector(
+            "native-async-dv-exact-predicate-no-rows",
+            &[1],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders where id > 99").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert!(!plan_display.contains("FilterExec"), "{plan_display}");
+        assert_eq!(physical_plan.schema().field(0).name(), "id");
+        assert_eq!(scans.len(), 1);
+        assert!(
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .has_provider_enforced_row_predicate()
+        );
+
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let ids = collect_batch_ids(&result)?;
+
+        assert!(ids.is_empty());
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.rows_produced, 0);
+        assert_eq!(stats.deletion_vector_failures, 0);
+        assert_eq!(stats.deletion_vector_rejections, 0);
 
         Ok(())
     }
@@ -2751,7 +2972,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_read_schema_strips_physical_predicate_only_for_dv_tasks()
+    fn partition_read_schema_strips_dv_physical_predicate_only_for_backends_without_row_indexes()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("dv-partition-read-schema-gate")?;
         let source = load_delta_source(DeltaSourceConfig {
@@ -2767,10 +2988,47 @@ mod tests {
 
         assert!(read_schema.has_physical_predicate());
         assert!(
-            super::partition_read_schema(read_schema.clone(), &[fake_task("part-00000.parquet")])
-                .has_physical_predicate()
+            super::partition_read_schema(
+                read_schema.clone(),
+                &[fake_task("part-00000.parquet")],
+                DeltaProviderReaderBackend::OfficialKernel,
+                false,
+            )?
+            .has_physical_predicate()
         );
-        assert!(!super::partition_read_schema(read_schema, &[dv_task]).has_physical_predicate());
+        assert!(
+            !super::partition_read_schema(
+                read_schema.clone(),
+                std::slice::from_ref(&dv_task),
+                DeltaProviderReaderBackend::OfficialKernel,
+                false,
+            )?
+            .has_physical_predicate()
+        );
+        assert!(
+            super::partition_read_schema(
+                read_schema.clone(),
+                std::slice::from_ref(&dv_task),
+                DeltaProviderReaderBackend::NativeAsync,
+                false,
+            )?
+            .has_physical_predicate()
+        );
+        let error = match super::partition_read_schema(
+            read_schema,
+            &[dv_task],
+            DeltaProviderReaderBackend::OfficialKernel,
+            true,
+        ) {
+            Ok(_) => {
+                return Err("exact DV physical predicate must not be silently dropped".into());
+            }
+            Err(error) => error,
+        };
+        let display = error.to_string();
+
+        assert!(display.contains("cannot drop an exact physical predicate"));
+        assert!(display.contains("original row-index accounting"));
 
         Ok(())
     }

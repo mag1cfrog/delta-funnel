@@ -11,8 +11,19 @@ use crate::DeltaFunnelError;
 pub enum DeltaProviderReaderBackend {
     /// Current official delta_kernel reader baseline.
     OfficialKernel,
-    /// Native async Parquet reader for non-DV file tasks.
+    /// Native async Parquet reader for row-index-preserving file tasks.
     NativeAsync,
+}
+
+impl DeltaProviderReaderBackend {
+    /// Whether this backend can apply file-read predicates before DV masking
+    /// without losing each row's original physical Parquet row index.
+    pub(crate) fn supports_dv_row_index_predicate_reads(self) -> bool {
+        match self {
+            Self::OfficialKernel => false,
+            Self::NativeAsync => true,
+        }
+    }
 }
 
 /// Bounded scheduling options for one Delta DataFusion provider scan.

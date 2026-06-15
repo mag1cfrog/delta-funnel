@@ -137,6 +137,7 @@ fn try_exact_partition_kernel_filter(
         datafusion_expr,
         kernel_predicate,
         kind: KernelScanFilterKind::Partition,
+        native_row_predicate_exact_candidate: false,
     })
 }
 
@@ -207,6 +208,7 @@ fn try_mixed_and_kernel_filter(
         datafusion_expr,
         kernel_predicate,
         kind,
+        native_row_predicate_exact_candidate: false,
     })
 }
 
