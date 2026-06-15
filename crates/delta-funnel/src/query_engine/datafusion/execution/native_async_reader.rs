@@ -8,13 +8,15 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, new_null_array};
-use datafusion::arrow::datatypes::{Field, SchemaRef};
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array, new_null_array};
+use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::default::storage::store_from_url_opts;
 use futures_util::StreamExt;
 use object_store::{ObjectStore, path::Path};
+use parquet::arrow::RowNumber;
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
 };
@@ -41,6 +43,7 @@ use crate::table_formats::{
 };
 
 const TABLE_ROOT_CONTEXT: &str = "<table-root>";
+const ORIGINAL_ROW_INDEX_COLUMN: &str = "__delta_funnel_original_row_index";
 
 /// Context required to construct the native async reader.
 #[allow(dead_code)]
@@ -104,6 +107,7 @@ pub(crate) struct DeltaNativeAsyncFileReadStream {
     read_schema: KernelScanReadSchema,
     transform: KernelPhysicalToLogicalTransform,
     data_file_reader: Arc<KernelDataFileReader>,
+    include_original_row_index: bool,
     deletion_vector_stats: DeltaFileReadDeletionVectorStats,
     _permit: Option<DeltaProviderAsyncFileReadPermit>,
 }
@@ -222,6 +226,15 @@ impl DeltaNativeAsyncFileReader {
         self.open_file_stream_with_permit(request, None).await
     }
 
+    /// Opens one non-DV file task while requesting hidden original row indexes.
+    #[cfg(test)]
+    pub(crate) async fn open_file_stream_with_original_row_index(
+        &self,
+        request: DeltaNativeAsyncFileReadRequest<'_>,
+    ) -> Result<DeltaNativeAsyncFileReadStream, DeltaFunnelError> {
+        self.open_file_stream_internal(request, None, true).await
+    }
+
     /// Opens one non-DV file stream and holds the scheduler permit for its lifetime.
     ///
     /// The returned stream advances Parquet IO one batch at a time. Keeping the
@@ -231,6 +244,15 @@ impl DeltaNativeAsyncFileReader {
         &self,
         request: DeltaNativeAsyncFileReadRequest<'_>,
         permit: Option<DeltaProviderAsyncFileReadPermit>,
+    ) -> Result<DeltaNativeAsyncFileReadStream, DeltaFunnelError> {
+        self.open_file_stream_internal(request, permit, false).await
+    }
+
+    async fn open_file_stream_internal(
+        &self,
+        request: DeltaNativeAsyncFileReadRequest<'_>,
+        permit: Option<DeltaProviderAsyncFileReadPermit>,
+        include_original_row_index: bool,
     ) -> Result<DeltaNativeAsyncFileReadStream, DeltaFunnelError> {
         self.validate_supported_read_mode(request.task, request.read_schema)?;
         let object = self.parquet_object_for_task(request.task)?;
@@ -250,7 +272,16 @@ impl DeltaNativeAsyncFileReader {
                 path: request.task.path.clone(),
                 phase: DeltaScanFileReadPhase::ArrowConversion,
             })?;
-        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        let reader_options = native_async_arrow_reader_options(include_original_row_index)
+            .map_err(delta_kernel::Error::from)
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: request.task.path.clone(),
+                phase: DeltaScanFileReadPhase::RowIndexGeneration,
+            })?;
+        let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_options)
             .await
             .map_err(delta_kernel::Error::from)
             .context(DeltaScanFileReadSnafu {
@@ -296,6 +327,7 @@ impl DeltaNativeAsyncFileReader {
             read_schema: request.read_schema.clone(),
             transform: request.task.transform.clone(),
             data_file_reader: Arc::clone(&self.data_file_reader),
+            include_original_row_index,
             deletion_vector_stats: DeltaFileReadDeletionVectorStats::default(),
             _permit: permit,
         })
@@ -313,6 +345,14 @@ impl DeltaNativeAsyncFileReadStream {
     /// Returns the next provider-visible batch for this file.
     #[allow(dead_code)]
     pub(crate) async fn next_batch(&mut self) -> Result<Option<RecordBatch>, DeltaFunnelError> {
+        self.next_batch_with_original_row_indexes()
+            .await
+            .map(|batch| batch.map(|(batch, _original_row_indexes)| batch))
+    }
+
+    async fn next_batch_with_original_row_indexes(
+        &mut self,
+    ) -> Result<Option<(RecordBatch, Option<Vec<u64>>)>, DeltaFunnelError> {
         let Some(batch) = self.stream.next().await else {
             return Ok(None);
         };
@@ -326,10 +366,11 @@ impl DeltaNativeAsyncFileReadStream {
                 phase: DeltaScanFileReadPhase::ParquetBatchRead,
             })?;
 
+        let original_row_indexes = self.original_row_indexes_from_batch(&batch)?;
         let physical_batch = self.project_batch_to_schema(batch)?;
+        let logical_batch = self.apply_physical_to_logical_transform(physical_batch)?;
 
-        self.apply_physical_to_logical_transform(physical_batch)
-            .map(Some)
+        Ok(Some((logical_batch, original_row_indexes)))
     }
 
     /// Shapes the Parquet batch into the provider physical scan schema.
@@ -339,7 +380,7 @@ impl DeltaNativeAsyncFileReadStream {
     /// hot path only applies the precomputed column reorder, rename, or null
     /// fill needed before the kernel physical-to-logical transform runs.
     fn project_batch_to_schema(&self, batch: RecordBatch) -> Result<RecordBatch, DeltaFunnelError> {
-        if !self.schema_match.needs_batch_reshape {
+        if !self.include_original_row_index && !self.schema_match.needs_batch_reshape {
             return Ok(batch);
         }
 
@@ -352,6 +393,77 @@ impl DeltaNativeAsyncFileReadStream {
                 path: self.path.clone(),
                 phase: DeltaScanFileReadPhase::ArrowConversion,
             })
+    }
+
+    fn original_row_indexes_from_batch(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<Option<Vec<u64>>, DeltaFunnelError> {
+        if !self.include_original_row_index {
+            return Ok(None);
+        }
+
+        let row_index_column = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.name() == ORIGINAL_ROW_INDEX_COLUMN)
+            .ok_or_else(|| {
+                delta_kernel::Error::generic("missing native async original row-index column")
+            })
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: self.path.clone(),
+                phase: DeltaScanFileReadPhase::RowIndexGeneration,
+            })?;
+        let row_indexes = batch
+            .column(row_index_column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                delta_kernel::Error::generic("native async original row-index column is not Int64")
+            })
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: self.path.clone(),
+                phase: DeltaScanFileReadPhase::RowIndexGeneration,
+            })?;
+
+        (0..row_indexes.len())
+            .map(|index| {
+                if row_indexes.is_null(index) {
+                    return Err(delta_kernel::Error::generic(
+                        "native async original row-index column contains null",
+                    ))
+                    .context(DeltaScanFileReadSnafu {
+                        source_name: self.source_name.clone(),
+                        table_uri: self.table_uri.clone(),
+                        snapshot_version: self.snapshot_version,
+                        path: self.path.clone(),
+                        phase: DeltaScanFileReadPhase::RowIndexGeneration,
+                    });
+                }
+
+                u64::try_from(row_indexes.value(index))
+                    .map_err(|_| {
+                        delta_kernel::Error::generic(
+                            "native async original row-index value is negative",
+                        )
+                    })
+                    .context(DeltaScanFileReadSnafu {
+                        source_name: self.source_name.clone(),
+                        table_uri: self.table_uri.clone(),
+                        snapshot_version: self.snapshot_version,
+                        path: self.path.clone(),
+                        phase: DeltaScanFileReadPhase::RowIndexGeneration,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
     }
 
     fn apply_physical_to_logical_transform(
@@ -371,6 +483,21 @@ impl DeltaNativeAsyncFileReadStream {
                 transform: &self.transform,
             })
     }
+}
+
+fn native_async_arrow_reader_options(
+    include_original_row_index: bool,
+) -> parquet::errors::Result<ArrowReaderOptions> {
+    if !include_original_row_index {
+        return Ok(ArrowReaderOptions::new());
+    }
+
+    let row_number_field = Arc::new(
+        Field::new(ORIGINAL_ROW_INDEX_COLUMN, DataType::Int64, false)
+            .with_extension_type(RowNumber),
+    );
+
+    ArrowReaderOptions::new().with_virtual_columns(vec![row_number_field])
 }
 
 #[derive(Clone)]
@@ -1408,6 +1535,60 @@ mod tests {
         assert_eq!(names.value(0), "alice");
         assert_eq!(names.value(1), "bob");
         assert!(names.is_null(2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_reader_reads_hidden_original_row_indexes_without_exposing_helper()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("native-async-hidden-row-index")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
+        let read_schema = scan.read_schema();
+        let file = scan
+            .expand_kernel_scan_metadata(source.table_uri())?
+            .files
+            .into_iter()
+            .next()
+            .ok_or("expected one scan file")?;
+        let task = DeltaScanFileTask::from_kernel_metadata(
+            source.name(),
+            source.table_uri(),
+            source.version(),
+            file,
+        )?;
+        let reader = DeltaNativeAsyncFileReader::try_new(DeltaNativeAsyncFileReaderConfig {
+            source_name: source.name(),
+            table_uri: source.table_uri(),
+            snapshot_version: source.version(),
+        })?;
+
+        let mut stream = reader
+            .open_file_stream_with_original_row_index(DeltaNativeAsyncFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+            })
+            .await?;
+        let (batch, row_indexes) = stream
+            .next_batch_with_original_row_indexes()
+            .await?
+            .ok_or("expected one record batch")?;
+
+        assert_eq!(row_indexes, Some(vec![0, 1, 2]));
+        assert_eq!(batch.num_rows(), table.rows());
+        assert_eq!(batch.num_columns(), 2);
+        assert!(
+            batch
+                .schema()
+                .field_with_name(super::ORIGINAL_ROW_INDEX_COLUMN)
+                .is_err()
+        );
+        assert!(stream.next_batch().await?.is_none());
 
         Ok(())
     }
