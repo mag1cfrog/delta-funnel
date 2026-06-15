@@ -317,6 +317,31 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local Delta table whose Parquet columns are stored in a
+    /// different order from the Delta schema and have no field-id metadata.
+    pub(crate) fn new_with_reordered_physical_columns(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batch: reordered_physical_columns_batch()?,
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
     fn new_with_batch(
         name: &str,
         batch: kernel::RecordBatch,
@@ -469,6 +494,13 @@ fn physical_column_mapping_schema() -> Arc<Schema> {
     ]))
 }
 
+fn reordered_physical_columns_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("customer_name", DataType::Utf8, true),
+        Field::new("id", DataType::Int32, false),
+    ]))
+}
+
 fn supported_types_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -520,6 +552,18 @@ fn physical_column_mapping_batch() -> Result<kernel::RecordBatch, Box<dyn std::e
 
     Ok(kernel::RecordBatch::try_new(
         physical_column_mapping_schema(),
+        columns,
+    )?)
+}
+
+fn reordered_physical_columns_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let columns = vec![
+        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+    ];
+
+    Ok(kernel::RecordBatch::try_new(
+        reordered_physical_columns_schema(),
         columns,
     )?)
 }

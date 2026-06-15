@@ -1163,6 +1163,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_matches_official_kernel_for_name_fallback_reordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_reordered_physical_columns(
+            "native-async-name-fallback-reordering",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select id, customer_name from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+        assert!(native.contains("| id | customer_name |"), "{native}");
+        assert!(native.contains("| 1  | alice         |"), "{native}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_backend_preserves_file_order_in_one_partition()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
