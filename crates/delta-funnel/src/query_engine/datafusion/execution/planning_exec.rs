@@ -466,7 +466,7 @@ fn record_deletion_vector_read_error(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::fs;
+    use std::fs::{self, File};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -481,6 +481,7 @@ mod tests {
         DeletionVectorDescriptor, DeletionVectorStorageType,
     };
     use futures_util::StreamExt;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
 
     use super::super::file_reader::{DeltaFileReadRequest, DeltaFileReadResult};
     use super::{
@@ -1301,6 +1302,51 @@ mod tests {
             schema.fields().len() == 1 && schema.field(0).name() == "id"
         }));
         assert!(native.len() > 1);
+        assert_eq!(native_stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(native_stats.deletion_vectors_applied, 1);
+        assert_eq!(native_stats.deletion_vector_rows_deleted, 3);
+        assert_eq!(native_stats.deletion_vector_failures, 0);
+        assert_eq!(native_stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_deletion_vector_preserves_row_indexes_across_row_groups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_two_row_groups_and_deletion_vector(
+            "native-async-dv-multi-row-group-row-index",
+            3000,
+            &[2999, 3000, 5999],
+        )?;
+        let parquet_file = File::open(table.path().join(table.data_file_path()))?;
+        let parquet_reader = SerializedFileReader::new(parquet_file)?;
+        assert!(parquet_reader.metadata().num_row_groups() > 1);
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select id from orders order by id";
+        let (official, _official_stats) = collect_batches_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let (native, native_stats) = collect_batches_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+        let official_ids = collect_batch_ids(&official)?;
+        let native_ids = collect_batch_ids(&native)?;
+
+        assert_eq!(native_ids, official_ids);
+        assert!(!native_ids.contains(&3000));
+        assert!(!native_ids.contains(&3001));
+        assert!(!native_ids.contains(&6000));
+        assert!(native.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 1 && schema.field(0).name() == "id"
+        }));
         assert_eq!(native_stats.deletion_vector_payloads_loaded, 1);
         assert_eq!(native_stats.deletion_vectors_applied, 1);
         assert_eq!(native_stats.deletion_vector_rows_deleted, 3);
