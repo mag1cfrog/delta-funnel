@@ -19,7 +19,7 @@ pub(crate) use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArr
 pub(crate) use delta_kernel::engine::default::DefaultEngineBuilder;
 pub(crate) use delta_kernel::engine::default::storage::store_from_url_opts;
 pub(crate) use delta_kernel::expressions::{
-    ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar,
+    ColumnName, DecimalData, Expression, ExpressionRef, Predicate, PredicateRef, Scalar,
 };
 pub(crate) use delta_kernel::scan::Scan;
 pub(crate) use delta_kernel::scan::ScanMetadata;
@@ -27,7 +27,8 @@ pub(crate) use delta_kernel::scan::state::{DvInfo, ScanFile, transform_to_logica
 pub(crate) use delta_kernel::schema::{
     ColumnMetadataKey as KernelColumnMetadataKey, DataType as KernelDataType,
     MetadataColumnSpec as KernelMetadataColumnSpec, MetadataValue as KernelMetadataValue,
-    SchemaRef as KernelSchemaRef, StructField as KernelStructField, StructType as KernelStructType,
+    PrimitiveType as KernelPrimitiveType, SchemaRef as KernelSchemaRef,
+    StructField as KernelStructField, StructType as KernelStructType,
 };
 pub(crate) use delta_kernel::table_features::TABLE_FEATURES_MIN_READER_VERSION;
 use delta_kernel::table_features::TableFeature;
