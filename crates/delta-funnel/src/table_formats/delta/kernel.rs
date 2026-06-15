@@ -24,7 +24,11 @@ pub(crate) use delta_kernel::expressions::{
 pub(crate) use delta_kernel::scan::Scan;
 pub(crate) use delta_kernel::scan::ScanMetadata;
 pub(crate) use delta_kernel::scan::state::{DvInfo, ScanFile, transform_to_logical};
-pub(crate) use delta_kernel::schema::SchemaRef as KernelSchemaRef;
+pub(crate) use delta_kernel::schema::{
+    ColumnMetadataKey as KernelColumnMetadataKey, DataType as KernelDataType,
+    MetadataColumnSpec as KernelMetadataColumnSpec, MetadataValue as KernelMetadataValue,
+    SchemaRef as KernelSchemaRef, StructField as KernelStructField, StructType as KernelStructType,
+};
 pub(crate) use delta_kernel::table_features::TABLE_FEATURES_MIN_READER_VERSION;
 use delta_kernel::table_features::TableFeature;
 pub(crate) use delta_kernel::{

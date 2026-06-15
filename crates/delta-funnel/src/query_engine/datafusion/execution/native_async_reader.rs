@@ -25,7 +25,10 @@ use snafu::ResultExt;
 use crate::{
     DeltaFunnelError,
     error::{DeltaScanFileReadPhase, DeltaScanFileReadSnafu},
-    table_formats::{KernelPhysicalToLogicalTransform, KernelScanReadSchema},
+    table_formats::{
+        KernelColumnMetadataKey, KernelDataType, KernelMetadataColumnSpec, KernelMetadataValue,
+        KernelPhysicalToLogicalTransform, KernelScanReadSchema, KernelSchemaRef, KernelStructField,
+    },
 };
 
 use super::super::planning::file_task::DeltaScanFileTask;
@@ -678,11 +681,11 @@ impl DeltaNativeAsyncFileReader {
         read_schema: &KernelScanReadSchema,
     ) -> Result<(), DeltaFunnelError> {
         let reason = if task.deletion_vector.is_present() {
-            Some("native async reader does not support deletion-vector file tasks yet")
+            Some("native async reader does not support deletion-vector file tasks yet".to_owned())
         } else if read_schema.has_physical_predicate() {
-            Some("native async reader does not support kernel physical predicates yet")
+            Some("native async reader does not support kernel physical predicates yet".to_owned())
         } else {
-            None
+            unsupported_native_async_physical_schema_reason(read_schema.physical_schema())
         };
 
         match reason {
@@ -698,6 +701,103 @@ impl DeltaNativeAsyncFileReader {
             None => Ok(()),
         }
     }
+}
+
+fn unsupported_native_async_physical_schema_reason(
+    physical_schema: &KernelSchemaRef,
+) -> Option<String> {
+    physical_schema
+        .fields()
+        .find_map(|field| unsupported_native_async_field_reason(field, field.name(), true))
+}
+
+fn unsupported_native_async_field_reason(
+    field: &KernelStructField,
+    path: &str,
+    top_level: bool,
+) -> Option<String> {
+    if field.is_metadata_column() {
+        return Some(format!(
+            "native async reader does not support generated metadata column '{path}' yet"
+        ));
+    }
+    if field.is_internal_column() {
+        return Some(format!(
+            "native async reader does not support internal helper column '{path}' yet"
+        ));
+    }
+    if is_file_path_metadata_field(field) {
+        return Some(format!(
+            "native async reader does not support file path metadata column '{path}' yet"
+        ));
+    }
+    if has_nested_field_matching_metadata(field, top_level) {
+        return Some(format!(
+            "native async reader does not support nested field-id or physical-name matching at '{path}' yet"
+        ));
+    }
+
+    unsupported_native_async_data_type_reason(field.data_type(), path)
+}
+
+fn unsupported_native_async_data_type_reason(
+    data_type: &KernelDataType,
+    path: &str,
+) -> Option<String> {
+    match data_type {
+        KernelDataType::Struct(fields) | KernelDataType::Variant(fields) => {
+            fields.fields().find_map(|field| {
+                let child_path = format!("{path}.{}", field.name());
+                unsupported_native_async_field_reason(field, &child_path, false)
+            })
+        }
+        KernelDataType::Array(array) => {
+            let child_path = format!("{path}.element");
+            unsupported_native_async_data_type_reason(array.element_type(), &child_path)
+        }
+        KernelDataType::Map(map) => {
+            let key_path = format!("{path}.key");
+            unsupported_native_async_data_type_reason(map.key_type(), &key_path).or_else(|| {
+                let value_path = format!("{path}.value");
+                unsupported_native_async_data_type_reason(map.value_type(), &value_path)
+            })
+        }
+        KernelDataType::Primitive(_) => None,
+    }
+}
+
+fn is_file_path_metadata_field(field: &KernelStructField) -> bool {
+    let Some(KernelMetadataValue::Number(field_id)) =
+        field.get_config_value(&KernelColumnMetadataKey::ParquetFieldId)
+    else {
+        return false;
+    };
+
+    Some(*field_id) == KernelMetadataColumnSpec::FilePath.reserved_field_id()
+}
+
+fn has_nested_field_matching_metadata(field: &KernelStructField, top_level: bool) -> bool {
+    let nested_metadata_keys = [
+        KernelColumnMetadataKey::ColumnMappingNestedIds,
+        KernelColumnMetadataKey::ParquetFieldNestedIds,
+    ];
+    if nested_metadata_keys
+        .iter()
+        .any(|key| field.get_config_value(key).is_some())
+    {
+        return true;
+    }
+    if top_level {
+        return false;
+    }
+
+    [
+        KernelColumnMetadataKey::ColumnMappingId,
+        KernelColumnMetadataKey::ColumnMappingPhysicalName,
+        KernelColumnMetadataKey::ParquetFieldId,
+    ]
+    .iter()
+    .any(|key| field.get_config_value(key).is_some())
 }
 
 impl DeltaNativeAsyncPartitionFileReader {
@@ -759,7 +859,8 @@ mod tests {
 
     use super::{
         DeltaNativeAsyncFileReadRequest, DeltaNativeAsyncFileReader,
-        DeltaNativeAsyncFileReaderConfig, validate_native_async_reader_config,
+        DeltaNativeAsyncFileReaderConfig, unsupported_native_async_physical_schema_reason,
+        validate_native_async_reader_config,
     };
     use crate::{
         DeltaFunnelError, DeltaSourceConfig,
@@ -770,8 +871,10 @@ mod tests {
             planning::file_task::DeltaScanFileTask,
         },
         table_formats::{
+            KernelColumnMetadataKey, KernelDataType, KernelMetadataColumnSpec, KernelMetadataValue,
             KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata,
-            KernelScanReadSchema, RealParquetDeltaTable, build_projected_delta_scan,
+            KernelScanReadSchema, KernelSchemaRef, KernelStructField, KernelStructType,
+            RealParquetDeltaTable, build_projected_delta_scan,
             build_projected_predicated_stats_delta_scan,
         },
     };
@@ -877,6 +980,106 @@ mod tests {
 
     fn field_id_metadata(field_id: i32) -> HashMap<String, String> {
         HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_owned(), field_id.to_string())])
+    }
+
+    fn kernel_schema(
+        fields: impl IntoIterator<Item = KernelStructField>,
+    ) -> Result<KernelSchemaRef, Box<dyn std::error::Error>> {
+        Ok(Arc::new(KernelStructType::try_new(fields)?))
+    }
+
+    fn kernel_field_id_metadata(field_id: i64) -> [(String, KernelMetadataValue); 1] {
+        [(
+            KernelColumnMetadataKey::ParquetFieldId.as_ref().to_owned(),
+            KernelMetadataValue::Number(field_id),
+        )]
+    }
+
+    #[test]
+    fn native_async_schema_gate_allows_top_level_field_id_matching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = kernel_schema(
+            [KernelStructField::new("id", KernelDataType::INTEGER, false)
+                .add_metadata(kernel_field_id_metadata(1))],
+        )?;
+
+        assert_eq!(
+            unsupported_native_async_physical_schema_reason(&schema),
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_gate_rejects_generated_metadata_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = kernel_schema([KernelStructField::create_metadata_column(
+            "row_index",
+            KernelMetadataColumnSpec::RowIndex,
+        )])?;
+        let reason =
+            unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
+
+        assert!(reason.contains("generated metadata column"));
+        assert!(reason.contains("row_index"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_gate_rejects_internal_helper_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema =
+            kernel_schema([
+                KernelStructField::new("helper", KernelDataType::LONG, false).as_internal_column(),
+            ])?;
+        let reason =
+            unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
+
+        assert!(reason.contains("internal helper column"));
+        assert!(reason.contains("helper"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_gate_rejects_file_path_metadata_field_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file_path_field_id = KernelMetadataColumnSpec::FilePath
+            .reserved_field_id()
+            .ok_or("expected reserved file path field id")?;
+        let schema =
+            kernel_schema([
+                KernelStructField::new("_file", KernelDataType::STRING, false)
+                    .add_metadata(kernel_field_id_metadata(file_path_field_id)),
+            ])?;
+        let reason =
+            unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
+
+        assert!(reason.contains("file path metadata column"));
+        assert!(reason.contains("_file"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_gate_rejects_nested_field_id_matching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nested_type = KernelStructType::try_new([KernelStructField::new(
+            "inner",
+            KernelDataType::INTEGER,
+            true,
+        )
+        .add_metadata(kernel_field_id_metadata(2))])?;
+        let schema = kernel_schema([KernelStructField::new("nested", nested_type, true)])?;
+        let reason =
+            unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
+
+        assert!(reason.contains("nested field-id or physical-name matching"));
+        assert!(reason.contains("nested.inner"));
+
+        Ok(())
     }
 
     #[test]
