@@ -30,8 +30,8 @@ pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };
 pub(crate) use read::{
-    KernelDataFileReadRequest, KernelDataFileReader, KernelDataFileReaderConfig,
-    KernelDataFileTransformRequest, KernelScanReadSchema,
+    KernelDataFilePredicateEvalRequest, KernelDataFileReadRequest, KernelDataFileReader,
+    KernelDataFileReaderConfig, KernelDataFileTransformRequest, KernelScanReadSchema,
 };
 use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
 

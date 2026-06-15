@@ -9,6 +9,7 @@ use crate::{
     DeltaFunnelError,
     error::{DeltaScanFileReadPhase, DeltaScanFileReadSnafu},
 };
+use delta_kernel::arrow::array::BooleanArray;
 use snafu::ResultExt;
 
 use super::{KernelPhysicalToLogicalTransform, kernel};
@@ -65,11 +66,9 @@ impl KernelScanReadSchema {
 
     /// Returns this read schema without a kernel Parquet read predicate.
     ///
-    /// DV-backed reads need original physical row indexes before row-level
-    /// predicate pushdown can be used safely. Metadata pruning may still select
-    /// files with a kernel predicate, but the file read path can drop the
-    /// physical predicate and rely on DataFusion residual filters until the
-    /// row-index-aware reader path is available.
+    /// Backends that cannot preserve original physical row indexes for
+    /// predicate-pruned DV rows can drop the physical predicate and rely on
+    /// DataFusion residual filters when scan planning kept one.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn without_physical_predicate(mut self) -> Self {
@@ -139,6 +138,21 @@ pub(crate) struct KernelDataFileTransformRequest<'a> {
     pub(crate) schema: &'a KernelScanReadSchema,
     /// Kernel transform selected for the scan file.
     pub(crate) transform: &'a KernelPhysicalToLogicalTransform,
+}
+
+/// Request to evaluate one row-level scan predicate against a native batch.
+///
+/// This request is used by the native parquet-rs `RowFilter` path after the
+/// reader has materialized the predicate columns for rows that reached row-level
+/// evaluation. It is separate from file, row-group, or page metadata pruning.
+#[allow(dead_code)]
+pub(crate) struct KernelDataFilePredicateEvalRequest<'a> {
+    /// Delta add-action table-relative file path.
+    pub(crate) path: &'a str,
+    /// Provider physical batch to evaluate.
+    pub(crate) batch: kernel::RecordBatch,
+    /// Kernel scan schema state for this provider scan.
+    pub(crate) schema: &'a KernelScanReadSchema,
 }
 
 impl KernelDataFileReader {
@@ -325,6 +339,89 @@ impl KernelDataFileReader {
             path: request.path.to_owned(),
             phase: DeltaScanFileReadPhase::TransformApplication,
         })
+    }
+
+    /// Evaluates one row-level scan predicate against a provider physical batch.
+    ///
+    /// Native parquet-rs row filters receive batches outside the official kernel
+    /// Parquet handler. This keeps predicate evaluation on the same kernel
+    /// Arrow evaluator used by the baseline reader, but does not perform
+    /// metadata pruning.
+    #[allow(dead_code)]
+    pub(crate) fn evaluate_physical_predicate(
+        &self,
+        request: KernelDataFilePredicateEvalRequest<'_>,
+    ) -> Result<BooleanArray, DeltaFunnelError> {
+        let predicate = request
+            .schema
+            .physical_predicate
+            .clone()
+            .ok_or_else(|| {
+                kernel::DeltaKernelError::generic(
+                    "physical predicate evaluation requires a scan predicate",
+                )
+            })
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: request.path.to_owned(),
+                phase: DeltaScanFileReadPhase::PredicateEvaluation,
+            })?;
+        let evaluator = self
+            .engine
+            .evaluation_handler()
+            .new_predicate_evaluator(request.schema.physical_schema.clone(), predicate)
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: request.path.to_owned(),
+                phase: DeltaScanFileReadPhase::PredicateEvaluation,
+            })?;
+        let batch = kernel::ArrowEngineData::new(request.batch);
+        let result = evaluator.evaluate(&batch).context(DeltaScanFileReadSnafu {
+            source_name: self.source_name.clone(),
+            table_uri: self.table_uri.clone(),
+            snapshot_version: self.snapshot_version,
+            path: request.path.to_owned(),
+            phase: DeltaScanFileReadPhase::PredicateEvaluation,
+        })?;
+        // Kernel predicate evaluators return EngineData whose schema is a
+        // single nullable boolean column named "output". parquet-rs RowFilter
+        // needs that boolean array directly, so convert the EngineData back to
+        // a RecordBatch and extract the first column below.
+        let result = kernel::EngineDataArrowExt::try_into_record_batch(result).context(
+            DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: request.path.to_owned(),
+                phase: DeltaScanFileReadPhase::ArrowConversion,
+            },
+        )?;
+        // Treat any contract mismatch as a predicate-evaluation failure before
+        // rows can be exposed. A non-boolean mask would make parquet-rs row
+        // filtering ambiguous, and silently ignoring it could drop an exact
+        // pushed filter.
+        let Some(mask) = result
+            .columns()
+            .first()
+            .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+        else {
+            return Err(kernel::DeltaKernelError::generic(
+                "physical predicate evaluator did not return a BooleanArray",
+            ))
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: request.path.to_owned(),
+                phase: DeltaScanFileReadPhase::PredicateEvaluation,
+            });
+        };
+
+        Ok(mask.clone())
     }
 }
 

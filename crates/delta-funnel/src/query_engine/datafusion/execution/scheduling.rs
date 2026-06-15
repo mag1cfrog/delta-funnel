@@ -11,7 +11,7 @@ use crate::DeltaFunnelError;
 pub enum DeltaProviderReaderBackend {
     /// Current official delta_kernel reader baseline.
     OfficialKernel,
-    /// Native async Parquet reader for non-DV file tasks.
+    /// Native async Parquet reader for row-index-preserving file tasks.
     NativeAsync,
 }
 

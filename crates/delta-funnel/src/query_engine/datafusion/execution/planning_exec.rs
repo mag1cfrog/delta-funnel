@@ -297,11 +297,9 @@ fn partition_read_schema(
             .iter()
             .any(|task| task.deletion_vector.is_present())
     {
-        // Temporary #142 gate: the official-kernel reader does not expose
-        // original row indexes for predicate-filtered batches, so DV-backed
-        // partitions must not push physical predicates into Parquet reads.
-        // The #145 native async reader owns reopening this path through hidden
-        // row-index metadata and the DV row-index oracle.
+        // Backends without original row-index accounting cannot safely align
+        // predicate-pruned rows with DV row coordinates. Keep those backends on
+        // the residual-filter path for DV-backed file tasks.
         read_schema.without_physical_predicate()
     } else {
         read_schema

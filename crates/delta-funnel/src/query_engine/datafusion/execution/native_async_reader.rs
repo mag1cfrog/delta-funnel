@@ -11,13 +11,14 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, new_null_array};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
+use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::default::storage::store_from_url_opts;
 use futures_util::StreamExt;
 use object_store::{ObjectStore, path::Path};
 use parquet::arrow::RowNumber;
-use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::arrow_reader::{ArrowPredicateFn, ArrowReaderOptions, RowFilter};
 use parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
 };
@@ -29,11 +30,11 @@ use crate::{
     DeltaFunnelError,
     error::{DeltaScanFileReadPhase, DeltaScanFileReadSnafu},
     table_formats::{
-        KernelColumnMetadataKey, KernelDataType, KernelDeletionVectorReadRequest,
-        KernelDeletionVectorReader, KernelDeletionVectorReaderConfig, KernelMetadataColumnSpec,
-        KernelMetadataValue, KernelPhysicalToLogicalTransform, KernelScanReadSchema,
-        KernelSchemaRef, KernelStructField, ProviderDeletionVectorSelection,
-        ProviderDeletionVectorSelectionContext,
+        KernelColumnMetadataKey, KernelDataFilePredicateEvalRequest, KernelDataType,
+        KernelDeletionVectorReadRequest, KernelDeletionVectorReader,
+        KernelDeletionVectorReaderConfig, KernelMetadataColumnSpec, KernelMetadataValue,
+        KernelPhysicalToLogicalTransform, KernelScanReadSchema, KernelSchemaRef, KernelStructField,
+        ProviderDeletionVectorSelection, ProviderDeletionVectorSelectionContext,
     },
 };
 
@@ -227,12 +228,10 @@ impl DeltaNativeAsyncFileReader {
         })
     }
 
-    /// Opens one non-DV file task with parquet-rs async object-store reads.
+    /// Opens one file task with parquet-rs async object-store reads.
     ///
-    /// This first native implementation intentionally supports only file tasks
-    /// with async object-store Parquet reads and optional physical-to-logical
-    /// transforms. Deletion vectors and kernel physical predicates remain gated
-    /// until later native reader slices reopen those paths.
+    /// Tests use this path to exercise the native file reader without scheduler
+    /// permits. Production execution uses `open_file_stream_with_permit`.
     #[cfg(test)]
     pub(crate) async fn open_file_stream(
         &self,
@@ -241,7 +240,7 @@ impl DeltaNativeAsyncFileReader {
         self.open_file_stream_with_permit(request, None).await
     }
 
-    /// Opens one non-DV file task while requesting hidden original row indexes.
+    /// Opens one file task while requesting hidden original row indexes.
     #[cfg(test)]
     pub(crate) async fn open_file_stream_with_original_row_index(
         &self,
@@ -250,7 +249,7 @@ impl DeltaNativeAsyncFileReader {
         self.open_file_stream_internal(request, None, true).await
     }
 
-    /// Opens one non-DV file stream and holds the scheduler permit for its lifetime.
+    /// Opens one file stream and holds the scheduler permit for its lifetime.
     ///
     /// The returned stream advances Parquet IO one batch at a time. Keeping the
     /// file permit inside the stream ensures the async read limiter accounts for
@@ -322,6 +321,22 @@ impl DeltaNativeAsyncFileReader {
         })?;
         let projection =
             ProjectionMask::roots(builder.parquet_schema(), schema_match.projected_roots());
+        // This is row-level provider enforcement, not metadata pruning. The
+        // planner must only preserve `read_schema.physical_predicate` here when
+        // it is acceptable for this file read to enforce that predicate before
+        // rows are exposed. Inexact metadata-pruning predicates should not
+        // reach this helper unless duplicate residual filtering is intentional.
+        let row_filter = self.native_async_provider_enforced_row_filter(
+            request.task,
+            request.read_schema,
+            &schema_match,
+            builder.parquet_schema(),
+        )?;
+        let builder = if let Some(row_filter) = row_filter {
+            builder.with_row_filter(row_filter)
+        } else {
+            builder
+        };
         let stream = builder
             .with_projection(projection)
             .build()
@@ -360,6 +375,39 @@ impl DeltaNativeAsyncFileReader {
             deletion_vector_stats_reported: DeltaFileReadDeletionVectorStats::default(),
             _permit: permit,
         })
+    }
+
+    fn native_async_provider_enforced_row_filter(
+        &self,
+        task: &DeltaScanFileTask,
+        read_schema: &KernelScanReadSchema,
+        schema_match: &NativeAsyncSchemaMatch,
+        parquet_schema: &SchemaDescriptor,
+    ) -> Result<Option<RowFilter>, DeltaFunnelError> {
+        if !read_schema.has_physical_predicate() {
+            return Ok(None);
+        }
+
+        let projection = ProjectionMask::roots(parquet_schema, schema_match.projected_roots());
+        let data_file_reader = Arc::clone(&self.data_file_reader);
+        let read_schema = read_schema.clone();
+        let schema_match = schema_match.clone();
+        let path = task.path.clone();
+        let predicate = ArrowPredicateFn::new(projection, move |batch| {
+            let batch = schema_match
+                .reshape_batch_to_provider_schema(batch)
+                .map_err(|error| ArrowError::ComputeError(error.to_string()))?;
+
+            data_file_reader
+                .evaluate_physical_predicate(KernelDataFilePredicateEvalRequest {
+                    path: &path,
+                    batch,
+                    schema: &read_schema,
+                })
+                .map_err(|error| ArrowError::ExternalError(Box::new(error)))
+        });
+
+        Ok(Some(RowFilter::new(vec![Box::new(predicate)])))
     }
 }
 
@@ -953,16 +1001,7 @@ impl DeltaNativeAsyncFileReader {
         task: &DeltaScanFileTask,
         read_schema: &KernelScanReadSchema,
     ) -> Result<(), DeltaFunnelError> {
-        let reason = if task.deletion_vector.is_present() && read_schema.has_physical_predicate() {
-            Some(
-                "native async deletion-vector reads with kernel physical predicates require #160"
-                    .to_owned(),
-            )
-        } else if read_schema.has_physical_predicate() {
-            Some("native async reader does not support kernel physical predicates yet".to_owned())
-        } else {
-            unsupported_native_async_physical_schema_reason(read_schema.physical_schema())
-        };
+        let reason = unsupported_native_async_physical_schema_reason(read_schema.physical_schema());
 
         match reason {
             Some(reason) => {
@@ -1129,6 +1168,7 @@ mod tests {
     use datafusion::arrow::array::{Array, Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::logical_expr::{col, lit};
     use object_store::ObjectStoreExt;
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -1151,7 +1191,7 @@ mod tests {
             KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata,
             KernelScanReadSchema, KernelSchemaRef, KernelStructField, KernelStructType,
             RealParquetDeltaTable, build_projected_delta_scan,
-            build_projected_predicated_stats_delta_scan,
+            build_projected_predicated_stats_delta_scan, datafusion_expr_to_kernel_predicate,
         },
     };
 
@@ -1738,6 +1778,135 @@ mod tests {
                 .is_err()
         );
         assert!(stream.next_batch().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_reader_applies_provider_enforced_row_predicate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("native-async-physical-predicate")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
+        let read_schema = scan.read_schema();
+        let file = scan
+            .expand_kernel_scan_metadata(source.table_uri())?
+            .files
+            .into_iter()
+            .next()
+            .ok_or("expected one scan file")?;
+        let task = DeltaScanFileTask::from_kernel_metadata(
+            source.name(),
+            source.table_uri(),
+            source.version(),
+            file,
+        )?;
+        let reader = DeltaNativeAsyncFileReader::try_new(DeltaNativeAsyncFileReaderConfig {
+            source_name: source.name(),
+            table_uri: source.table_uri(),
+            snapshot_version: source.version(),
+        })?;
+
+        assert!(read_schema.has_physical_predicate());
+
+        let stream = reader
+            .open_file_stream(DeltaNativeAsyncFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+            })
+            .await?;
+        let batches = collect_file_stream(stream).await?;
+        let ids = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or("expected id Int32Array")
+                    .map(|ids| ids.values().to_vec())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![2, 3]);
+        assert!(batches.iter().all(|batch| batch.num_columns() == 2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_reader_applies_deletion_vector_after_provider_enforced_row_predicate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_deletion_vector(
+            "native-async-dv-physical-predicate",
+            &[1],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
+        let read_schema = scan.read_schema();
+        let file = scan
+            .expand_kernel_scan_metadata(source.table_uri())?
+            .files
+            .into_iter()
+            .next()
+            .ok_or("expected one scan file")?;
+        let task = DeltaScanFileTask::from_kernel_metadata(
+            source.name(),
+            source.table_uri(),
+            source.version(),
+            file,
+        )?;
+        let reader = DeltaNativeAsyncFileReader::try_new(DeltaNativeAsyncFileReaderConfig {
+            source_name: source.name(),
+            table_uri: source.table_uri(),
+            snapshot_version: source.version(),
+        })?;
+
+        assert!(task.deletion_vector.is_present());
+        assert!(read_schema.has_physical_predicate());
+
+        let stream = reader
+            .open_file_stream(DeltaNativeAsyncFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+            })
+            .await?;
+        let batches = collect_file_stream(stream).await?;
+        let ids = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or("expected id Int32Array")
+                    .map(|ids| ids.values().to_vec())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![3]);
+        assert!(batches.iter().all(|batch| {
+            batch
+                .schema()
+                .field_with_name(super::ORIGINAL_ROW_INDEX_COLUMN)
+                .is_err()
+        }));
 
         Ok(())
     }

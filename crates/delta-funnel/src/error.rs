@@ -21,6 +21,8 @@ pub enum DeltaScanFileReadPhase {
     ParquetBatchRead,
     /// Generating or decoding original row indexes failed.
     RowIndexGeneration,
+    /// Evaluating a kernel physical predicate failed.
+    PredicateEvaluation,
     /// Converting kernel engine data into Arrow failed.
     ArrowConversion,
     /// Applying a physical-to-logical transform failed.
@@ -43,6 +45,7 @@ impl std::fmt::Display for DeltaScanFileReadPhase {
             Self::ParquetReadSetup => "Parquet read setup",
             Self::ParquetBatchRead => "Parquet batch read",
             Self::RowIndexGeneration => "row-index generation",
+            Self::PredicateEvaluation => "physical predicate evaluation",
             Self::ArrowConversion => "Arrow conversion",
             Self::TransformApplication => "physical-to-logical transform application",
             Self::UnsupportedReadMode => "unsupported read mode",
