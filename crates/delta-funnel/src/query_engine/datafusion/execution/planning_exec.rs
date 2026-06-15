@@ -235,7 +235,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             self.scan_plan
                 .pushed_filter_plan
                 .has_provider_enforced_row_predicate(),
-        );
+        )?;
 
         match self.execution_options.reader_backend {
             DeltaProviderReaderBackend::OfficialKernel => {
@@ -295,24 +295,33 @@ fn partition_read_schema(
     file_tasks: &[DeltaScanFileTask],
     reader_backend: DeltaProviderReaderBackend,
     enforce_physical_predicate_rows: bool,
-) -> KernelScanReadSchema {
+) -> DataFusionResult<KernelScanReadSchema> {
+    let has_deletion_vector_tasks = file_tasks
+        .iter()
+        .any(|task| task.deletion_vector.is_present());
+    if enforce_physical_predicate_rows
+        && has_deletion_vector_tasks
+        && !reader_backend.supports_dv_row_index_predicate_reads()
+    {
+        return Err(DataFusionError::Execution(
+            "Delta scan cannot drop an exact physical predicate for deletion-vector file tasks on a backend without original row-index accounting"
+                .to_owned(),
+        ));
+    }
+
     let read_schema = if enforce_physical_predicate_rows {
         read_schema.with_provider_enforced_physical_predicate_rows()
     } else {
         read_schema
     };
 
-    if !reader_backend.supports_dv_row_index_predicate_reads()
-        && file_tasks
-            .iter()
-            .any(|task| task.deletion_vector.is_present())
-    {
+    if !reader_backend.supports_dv_row_index_predicate_reads() && has_deletion_vector_tasks {
         // Backends without original row-index accounting cannot safely align
         // predicate-pruned rows with DV row coordinates. Keep those backends on
         // the residual-filter path for DV-backed file tasks.
-        read_schema.without_physical_predicate()
+        Ok(read_schema.without_physical_predicate())
     } else {
-        read_schema
+        Ok(read_schema)
     }
 }
 
@@ -2921,7 +2930,7 @@ mod tests {
                 &[fake_task("part-00000.parquet")],
                 DeltaProviderReaderBackend::OfficialKernel,
                 false,
-            )
+            )?
             .has_physical_predicate()
         );
         assert!(
@@ -2930,18 +2939,33 @@ mod tests {
                 std::slice::from_ref(&dv_task),
                 DeltaProviderReaderBackend::OfficialKernel,
                 false,
-            )
+            )?
             .has_physical_predicate()
         );
         assert!(
             super::partition_read_schema(
-                read_schema,
-                &[dv_task],
+                read_schema.clone(),
+                std::slice::from_ref(&dv_task),
                 DeltaProviderReaderBackend::NativeAsync,
                 false,
-            )
+            )?
             .has_physical_predicate()
         );
+        let error = match super::partition_read_schema(
+            read_schema,
+            &[dv_task],
+            DeltaProviderReaderBackend::OfficialKernel,
+            true,
+        ) {
+            Ok(_) => {
+                return Err("exact DV physical predicate must not be silently dropped".into());
+            }
+            Err(error) => error,
+        };
+        let display = error.to_string();
+
+        assert!(display.contains("cannot drop an exact physical predicate"));
+        assert!(display.contains("original row-index accounting"));
 
         Ok(())
     }
