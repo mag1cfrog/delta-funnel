@@ -598,6 +598,45 @@ fn native_async_direct_data_filter_is_exact_only_for_native_backend()
     Ok(())
 }
 
+#[test]
+fn native_async_mixed_data_filter_remains_inexact_metadata_pruning()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new("native-async-inexact-mixed-data-filter")?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new_with_execution_options(
+        source,
+        preflight,
+        None,
+        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?,
+    )?;
+    let stats_filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1_i32));
+    let null_count_filter = datafusion::logical_expr::col("customer_name").is_not_null();
+    let mixed_filter = stats_filter.and(null_count_filter);
+
+    assert_eq!(
+        provider.supports_filters_pushdown(&[&mixed_filter])?,
+        vec![TableProviderFilterPushDown::Inexact]
+    );
+
+    let plan = provider.plan_supports_filters_pushdown(&[&mixed_filter]);
+    assert_eq!(plan.exact_count, 0);
+    assert_eq!(plan.inexact_count, 1);
+    assert_eq!(plan.residual_filter_count, 1);
+    assert!(plan.has_data_stats_filter());
+    assert!(!plan.has_provider_enforced_row_predicate());
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn native_async_unsupported_data_filter_keeps_residual_filter()
 -> Result<(), Box<dyn std::error::Error>> {
