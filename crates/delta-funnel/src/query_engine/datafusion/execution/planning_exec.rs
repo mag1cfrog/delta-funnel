@@ -228,8 +228,11 @@ impl ExecutionPlan for DeltaScanPlanningExec {
         }
 
         let file_tasks = scan_partition.file_tasks.clone();
-        let read_schema =
-            partition_read_schema(self.scan_plan.kernel_scan().read_schema(), &file_tasks);
+        let read_schema = partition_read_schema(
+            self.scan_plan.kernel_scan().read_schema(),
+            &file_tasks,
+            self.execution_options.reader_backend,
+        );
 
         match self.execution_options.reader_backend {
             DeltaProviderReaderBackend::OfficialKernel => {
@@ -287,10 +290,12 @@ impl ExecutionPlan for DeltaScanPlanningExec {
 fn partition_read_schema(
     read_schema: KernelScanReadSchema,
     file_tasks: &[DeltaScanFileTask],
+    reader_backend: DeltaProviderReaderBackend,
 ) -> KernelScanReadSchema {
-    if file_tasks
-        .iter()
-        .any(|task| task.deletion_vector.is_present())
+    if !reader_backend.supports_dv_row_index_predicate_reads()
+        && file_tasks
+            .iter()
+            .any(|task| task.deletion_vector.is_present())
     {
         // Temporary #142 gate: the official-kernel reader does not expose
         // original row indexes for predicate-filtered batches, so DV-backed
@@ -2751,7 +2756,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_read_schema_strips_physical_predicate_only_for_dv_tasks()
+    fn partition_read_schema_strips_dv_physical_predicate_only_for_backends_without_row_indexes()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("dv-partition-read-schema-gate")?;
         let source = load_delta_source(DeltaSourceConfig {
@@ -2767,10 +2772,29 @@ mod tests {
 
         assert!(read_schema.has_physical_predicate());
         assert!(
-            super::partition_read_schema(read_schema.clone(), &[fake_task("part-00000.parquet")])
-                .has_physical_predicate()
+            super::partition_read_schema(
+                read_schema.clone(),
+                &[fake_task("part-00000.parquet")],
+                DeltaProviderReaderBackend::OfficialKernel,
+            )
+            .has_physical_predicate()
         );
-        assert!(!super::partition_read_schema(read_schema, &[dv_task]).has_physical_predicate());
+        assert!(
+            !super::partition_read_schema(
+                read_schema.clone(),
+                std::slice::from_ref(&dv_task),
+                DeltaProviderReaderBackend::OfficialKernel,
+            )
+            .has_physical_predicate()
+        );
+        assert!(
+            super::partition_read_schema(
+                read_schema,
+                &[dv_task],
+                DeltaProviderReaderBackend::NativeAsync,
+            )
+            .has_physical_predicate()
+        );
 
         Ok(())
     }

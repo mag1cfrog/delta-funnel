@@ -15,6 +15,17 @@ pub enum DeltaProviderReaderBackend {
     NativeAsync,
 }
 
+impl DeltaProviderReaderBackend {
+    /// Whether this backend can apply file-read predicates before DV masking
+    /// without losing each row's original physical Parquet row index.
+    pub(crate) fn supports_dv_row_index_predicate_reads(self) -> bool {
+        match self {
+            Self::OfficialKernel => false,
+            Self::NativeAsync => true,
+        }
+    }
+}
+
 /// Bounded scheduling options for one Delta DataFusion provider scan.
 ///
 /// These limits apply to provider-scheduled physical Delta file reads. The
