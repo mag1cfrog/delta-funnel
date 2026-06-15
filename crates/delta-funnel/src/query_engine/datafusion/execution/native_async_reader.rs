@@ -369,6 +369,15 @@ impl DeltaNativeAsyncFileReadStream {
         self.deletion_vector_stats
     }
 
+    /// Drains file-local deletion-vector metrics observed since the previous drain.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn take_deletion_vector_stats(&mut self) -> DeltaFileReadDeletionVectorStats {
+        let deletion_vector_stats = self.deletion_vector_stats;
+        self.deletion_vector_stats = DeltaFileReadDeletionVectorStats::default();
+        deletion_vector_stats
+    }
+
     /// Returns the next provider-visible batch for this file.
     #[allow(dead_code)]
     pub(crate) async fn next_batch(&mut self) -> Result<Option<RecordBatch>, DeltaFunnelError> {

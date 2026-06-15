@@ -26,7 +26,7 @@ use super::super::planning::scan_plan::ProviderScanPlan;
 use super::async_scheduler::{
     DeltaProviderAsyncPartitionReadScheduler, DeltaProviderAsyncPartitionReadSchedulerConfig,
 };
-use super::file_reader::DeltaFileReadRequest;
+use super::file_reader::{DeltaFileReadDeletionVectorStats, DeltaFileReadRequest};
 use super::native_async_reader::{
     DeltaNativeAsyncFileReader, DeltaNativeAsyncFileReaderConfig,
     DeltaNativeAsyncPartitionFileReader,
@@ -333,13 +333,10 @@ fn sequential_scan_partition_stream(
                     return Err(DataFusionError::from(error));
                 }
             };
-            let deletion_vector_stats = file_result.deletion_vector_stats;
-            if deletion_vector_stats.payload_loaded {
-                read_stats.record_deletion_vector_payload_loaded();
-            }
-            if deletion_vector_stats.applied {
-                read_stats.record_deletion_vector_applied(deletion_vector_stats.deleted_rows);
-            }
+            record_deletion_vector_read_stats(
+                read_stats.as_ref(),
+                file_result.deletion_vector_stats,
+            );
 
             for batch in file_result {
                 let rows = batch.num_rows();
@@ -390,16 +387,18 @@ fn native_async_scan_partition_stream(
                     return Err(DataFusionError::from(error));
                 }
             };
-            let deletion_vector_stats = file_stream.deletion_vector_stats();
-            if deletion_vector_stats.payload_loaded {
-                read_stats.record_deletion_vector_payload_loaded();
-            }
-            if deletion_vector_stats.applied {
-                read_stats.record_deletion_vector_applied(deletion_vector_stats.deleted_rows);
-            }
+            record_deletion_vector_read_stats(
+                read_stats.as_ref(),
+                file_stream.take_deletion_vector_stats(),
+            );
 
             while !output.is_closed() {
-                let batch = match file_stream.next_batch().await {
+                let next_batch = file_stream.next_batch().await;
+                record_deletion_vector_read_stats(
+                    read_stats.as_ref(),
+                    file_stream.take_deletion_vector_stats(),
+                );
+                let batch = match next_batch {
                     Ok(Some(batch)) => batch,
                     Ok(None) => break,
                     Err(error) => {
@@ -423,6 +422,18 @@ fn native_async_scan_partition_stream(
     });
 
     builder.build()
+}
+
+fn record_deletion_vector_read_stats(
+    read_stats: &DeltaProviderReadStats,
+    deletion_vector_stats: DeltaFileReadDeletionVectorStats,
+) {
+    if deletion_vector_stats.payload_loaded {
+        read_stats.record_deletion_vector_payload_loaded();
+    }
+    if deletion_vector_stats.applied {
+        read_stats.record_deletion_vector_applied(deletion_vector_stats.deleted_rows);
+    }
 }
 
 fn record_deletion_vector_read_error(
@@ -479,7 +490,7 @@ mod tests {
     };
     use crate::query_engine::datafusion::execution::DeltaProviderReaderBackend;
     use crate::query_engine::datafusion::execution::read_stats::{
-        DeltaProviderReadStats, DeltaProviderReadStatsConfig,
+        DeltaProviderReadStats, DeltaProviderReadStatsConfig, DeltaProviderReadStatsSnapshot,
     };
     use crate::query_engine::datafusion::planning::file_task::DeltaScanFileTask;
     use crate::query_engine::datafusion::test_support::{
@@ -496,6 +507,17 @@ mod tests {
         reader_backend: DeltaProviderReaderBackend,
         sql: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        let (formatted, _read_stats) =
+            collect_sql_with_reader_backend_and_stats(table_uri, reader_backend, sql).await?;
+
+        Ok(formatted)
+    }
+
+    async fn collect_sql_with_reader_backend_and_stats(
+        table_uri: &str,
+        reader_backend: DeltaProviderReaderBackend,
+        sql: &str,
+    ) -> Result<(String, DeltaProviderReadStatsSnapshot), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
@@ -526,9 +548,11 @@ mod tests {
             reader_backend
         );
 
-        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let read_stats = scans[0].read_stats_snapshot();
 
-        Ok(pretty_format_batches(&result)?.to_string())
+        Ok((pretty_format_batches(&result)?.to_string(), read_stats))
     }
 
     #[tokio::test]
@@ -1203,7 +1227,7 @@ mod tests {
             sql,
         )
         .await?;
-        let native = collect_sql_with_reader_backend(
+        let (native, native_stats) = collect_sql_with_reader_backend_and_stats(
             &table_uri,
             DeltaProviderReaderBackend::NativeAsync,
             sql,
@@ -1218,6 +1242,11 @@ mod tests {
             !native.contains("__delta_funnel_original_row_index"),
             "{native}"
         );
+        assert_eq!(native_stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(native_stats.deletion_vectors_applied, 1);
+        assert_eq!(native_stats.deletion_vector_rows_deleted, 1);
+        assert_eq!(native_stats.deletion_vector_failures, 0);
+        assert_eq!(native_stats.deletion_vector_rejections, 0);
 
         Ok(())
     }
