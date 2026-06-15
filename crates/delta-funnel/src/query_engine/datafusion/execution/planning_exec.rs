@@ -466,6 +466,7 @@ fn record_deletion_vector_read_error(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1368,6 +1369,69 @@ mod tests {
         assert_eq!(native_stats.deletion_vector_rows_deleted, 3);
         assert_eq!(native_stats.deletion_vector_failures, 0);
         assert_eq!(native_stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_deletion_vector_payload_error_records_failure_metric()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const RELATIVE_DV_FILE: &str = "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
+
+        let ctx = SessionContext::new();
+        let table =
+            RealParquetDeltaTable::new_with_deletion_vector("native-async-dv-payload-error", &[1])?;
+        fs::remove_file(table.path().join(RELATIVE_DV_FILE))?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await;
+        let error = match result {
+            Ok(_) => return Err("missing native async DV payload must fail".into()),
+            Err(error) => error,
+        };
+        let display = error.to_string();
+
+        assert!(display.contains("source `orders`"), "{display}");
+        assert!(display.contains("snapshot version 1"), "{display}");
+        assert!(display.contains("part-00000.parquet"), "{display}");
+        assert!(
+            display.contains("deletion-vector payload read"),
+            "{display}"
+        );
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.files_started, 1);
+        assert_eq!(stats.files_completed, 0);
+        assert_eq!(stats.batches_produced, 0);
+        assert_eq!(stats.rows_produced, 0);
+        assert_eq!(stats.deletion_vector_payloads_loaded, 0);
+        assert_eq!(stats.deletion_vectors_applied, 0);
+        assert_eq!(stats.deletion_vector_rows_deleted, 0);
+        assert_eq!(stats.deletion_vector_failures, 1);
+        assert_eq!(stats.deletion_vector_rejections, 0);
 
         Ok(())
     }
