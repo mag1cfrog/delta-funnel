@@ -10,8 +10,11 @@ use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionV
 use delta_kernel::actions::deletion_vector_writer::{
     KernelDeletionVector, StreamingDeletionVectorWriter,
 };
-use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
-use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
+use delta_kernel::arrow::array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int32Array, ListArray, StringArray, StructArray, TimestampMicrosecondArray,
+};
+use delta_kernel::arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 
 use super::kernel;
 use super::uri::normalize_delta_table_uri;
@@ -22,6 +25,7 @@ const COLUMN_MAPPING_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,
 const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
 const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"},"createdTime":1587968585495}}"#;
+const SUPPORTED_TYPES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"active\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}},{\"name\":\"score_f32\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"score_f64\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"level\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const DATA_FILE: &str = "part-00000.parquet";
 const MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
@@ -237,6 +241,30 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local Delta table covering the scalar and nested data types
+    /// the native async reader is expected to preserve without special Delta
+    /// metadata features.
+    pub(crate) fn new_with_supported_types(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            SUPPORTED_TYPES_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batch: supported_types_batch()?,
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
     fn new_with_batch(
         name: &str,
         batch: kernel::RecordBatch,
@@ -389,6 +417,40 @@ fn physical_column_mapping_schema() -> Arc<Schema> {
     ]))
 }
 
+fn supported_types_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("customer_name", DataType::Utf8, true),
+        Field::new("active", DataType::Boolean, true),
+        Field::new("payload", DataType::Binary, true),
+        Field::new("event_date", DataType::Date32, true),
+        Field::new(
+            "event_ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
+        Field::new("amount", DataType::Decimal128(10, 2), true),
+        Field::new("score_f32", DataType::Float32, true),
+        Field::new("score_f64", DataType::Float64, true),
+        Field::new(
+            "attributes",
+            DataType::Struct(
+                vec![
+                    Field::new("level", DataType::Int32, true),
+                    Field::new("label", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        ),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
+    ]))
+}
+
 fn default_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
     let columns = vec![
         Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
@@ -406,6 +468,56 @@ fn physical_column_mapping_batch() -> Result<kernel::RecordBatch, Box<dyn std::e
 
     Ok(kernel::RecordBatch::try_new(
         physical_column_mapping_schema(),
+        columns,
+    )?)
+}
+
+fn supported_types_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let attributes = StructArray::from(vec![
+        (
+            Arc::new(Field::new("level", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![Some(1), Some(2), None])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("label", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("low"), Some("high"), None])) as ArrayRef,
+        ),
+    ]);
+    let tags = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(10), Some(20)]),
+        Some(vec![Some(30)]),
+        None,
+    ]);
+    let columns = vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
+        Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as Arc<dyn Array>,
+        Arc::new(BinaryArray::from(vec![
+            Some(b"alpha".as_ref()),
+            Some(b"beta".as_ref()),
+            None,
+        ])) as Arc<dyn Array>,
+        Arc::new(Date32Array::from(vec![Some(19_723), Some(19_724), None])) as Arc<dyn Array>,
+        Arc::new(
+            TimestampMicrosecondArray::from(vec![
+                Some(1_704_067_200_000_000),
+                Some(1_704_153_600_000_000),
+                None,
+            ])
+            .with_timezone("UTC"),
+        ) as Arc<dyn Array>,
+        Arc::new(
+            Decimal128Array::from(vec![Some(12_345), Some(-6_789), None])
+                .with_precision_and_scale(10, 2)?,
+        ) as Arc<dyn Array>,
+        Arc::new(Float32Array::from(vec![Some(1.25), Some(-2.5), None])) as Arc<dyn Array>,
+        Arc::new(Float64Array::from(vec![Some(10.5), Some(-20.25), None])) as Arc<dyn Array>,
+        Arc::new(attributes) as Arc<dyn Array>,
+        Arc::new(tags) as Arc<dyn Array>,
+    ];
+
+    Ok(kernel::RecordBatch::try_new(
+        supported_types_schema(),
         columns,
     )?)
 }

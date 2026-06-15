@@ -1031,6 +1031,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_matches_official_kernel_for_supported_data_types()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_supported_types(
+            "native-async-supported-types-equivalence",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "\
+            select \
+                id, \
+                customer_name, \
+                active, \
+                payload, \
+                event_date, \
+                event_ts, \
+                amount, \
+                score_f32, \
+                score_f64, \
+                attributes, \
+                tags \
+            from orders \
+            order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_backend_preserves_file_order_in_one_partition()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
