@@ -1606,6 +1606,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_deletion_vector_stream_drop_records_partial_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_rows_and_deletion_vector(
+            "native-async-dv-drop-partial-progress",
+            20_000,
+            &[0, 8191, 8192, 19_999],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+
+        let mut stream = scans[0].execute(0, ctx.task_ctx())?;
+        let first = stream.next().await.ok_or("expected first batch")??;
+        let first_ids = batch_ids(&first)?;
+
+        assert_eq!(first_ids.first().copied(), Some(2));
+        assert!(!first_ids.contains(&1));
+        assert!(!first_ids.contains(&8192));
+
+        drop(stream);
+
+        for _ in 0..1000 {
+            let stats = scans[0].read_stats_snapshot();
+            if stats.files_started == 1 && stats.files_completed == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.scan_partitions_started, 1);
+        assert_eq!(stats.scan_partitions_completed, 0);
+        assert_eq!(stats.files_started, 1);
+        assert_eq!(stats.files_completed, 0);
+        assert!((1..=2).contains(&stats.batches_produced));
+        assert!((1..=16_384).contains(&stats.rows_produced));
+        assert_eq!(stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(stats.deletion_vectors_applied, 1);
+        assert!((1..=3).contains(&stats.deletion_vector_rows_deleted));
+        assert_eq!(stats.deletion_vector_failures, 0);
+        assert_eq!(stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_stream_backpressure_bounds_future_file_scheduling()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
