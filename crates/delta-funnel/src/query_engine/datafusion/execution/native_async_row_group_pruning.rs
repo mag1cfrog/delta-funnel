@@ -303,11 +303,52 @@ fn decimal_scalar_from_bytes(
         return None;
     }
 
+    // Parquet fixed-length decimal stats are stored as big-endian two's
+    // complement bytes. Convert to little-endian i128 bytes and preserve the
+    // sign when the encoded value is narrower than 16 bytes.
+    let pad = bytes
+        .first()
+        .is_some_and(|byte| byte & 0x80 != 0)
+        .then_some(0xff)
+        .unwrap_or(0x00);
     let mut bytes = Vec::from(bytes);
     bytes.reverse();
-    bytes.resize(16, 0);
+    bytes.resize(16, pad);
     let bytes: [u8; 16] = bytes.try_into().ok()?;
     KernelDecimalData::try_new(i128::from_le_bytes(bytes), data_type)
         .ok()
         .map(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decimal_scalar_from_fixed_len_bytes_sign_extends_negative_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let decimal_type = delta_kernel::schema::DecimalType::try_new(10, 2)?;
+        let negative_one = match decimal_scalar_from_bytes(&[0xff], decimal_type) {
+            Some(KernelScalar::Decimal(value)) => value,
+            other => return Err(format!("expected decimal scalar, got {other:?}").into()),
+        };
+
+        assert_eq!(negative_one.bits(), -1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn decimal_scalar_from_fixed_len_bytes_preserves_positive_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let decimal_type = delta_kernel::schema::DecimalType::try_new(10, 2)?;
+        let positive_one = match decimal_scalar_from_bytes(&[0x01], decimal_type) {
+            Some(KernelScalar::Decimal(value)) => value,
+            other => return Err(format!("expected decimal scalar, got {other:?}").into()),
+        };
+
+        assert_eq!(positive_one.bits(), 1);
+
+        Ok(())
+    }
 }

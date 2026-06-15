@@ -1172,14 +1172,17 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use datafusion::arrow::array::{Array, Int32Array, StringArray};
+    use datafusion::arrow::array::{Array, Decimal128Array, Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::{Expr, col, lit};
     use object_store::ObjectStoreExt;
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
 
     use super::{
         DeltaNativeAsyncFileReadRequest, DeltaNativeAsyncFileReader,
@@ -1965,6 +1968,52 @@ mod tests {
         assert_eq!(
             native_async_pruned_row_groups(builder.metadata(), &read_schema),
             Some(vec![1])
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_row_group_pruning_preserves_negative_fixed_len_decimal_stats()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_supported_types(
+            "native-async-row-group-negative-decimal",
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+        })?;
+        let negative = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
+        let predicate = datafusion_expr_to_kernel_predicate(&col("amount").lt(negative))?;
+        let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
+        let read_schema = scan.read_schema();
+        let (test_dir, _table_uri) = local_table_uri("negative-decimal-row-groups")?;
+        let file_path = test_dir.path.join("negative-decimal.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            true,
+        )]));
+        let amounts =
+            Decimal128Array::from(vec![Some(-100), Some(100)]).with_precision_and_scale(10, 2)?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(amounts)])?;
+        let writer_properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            fs::File::create(&file_path)?,
+            schema,
+            Some(writer_properties),
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let parquet_reader = SerializedFileReader::new(fs::File::open(file_path)?)?;
+
+        assert_eq!(parquet_reader.metadata().num_row_groups(), 2);
+        assert_eq!(
+            native_async_pruned_row_groups(parquet_reader.metadata(), &read_schema),
+            Some(vec![0])
         );
 
         Ok(())
