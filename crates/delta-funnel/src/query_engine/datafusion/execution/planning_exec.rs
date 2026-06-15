@@ -432,7 +432,10 @@ fn record_deletion_vector_read_stats(
         read_stats.record_deletion_vector_payload_loaded();
     }
     if deletion_vector_stats.applied {
-        read_stats.record_deletion_vector_applied(deletion_vector_stats.deleted_rows);
+        read_stats.record_deletion_vector_applied(0);
+    }
+    if deletion_vector_stats.deleted_rows > 0 {
+        read_stats.record_deletion_vector_rows_deleted(deletion_vector_stats.deleted_rows);
     }
 }
 
@@ -518,6 +521,18 @@ mod tests {
         reader_backend: DeltaProviderReaderBackend,
         sql: &str,
     ) -> Result<(String, DeltaProviderReadStatsSnapshot), Box<dyn std::error::Error>> {
+        let (result, read_stats) =
+            collect_batches_with_reader_backend_and_stats(table_uri, reader_backend, sql).await?;
+
+        Ok((pretty_format_batches(&result)?.to_string(), read_stats))
+    }
+
+    async fn collect_batches_with_reader_backend_and_stats(
+        table_uri: &str,
+        reader_backend: DeltaProviderReaderBackend,
+        sql: &str,
+    ) -> Result<(Vec<RecordBatch>, DeltaProviderReadStatsSnapshot), Box<dyn std::error::Error>>
+    {
         let ctx = SessionContext::new();
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
@@ -552,7 +567,7 @@ mod tests {
             datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
         let read_stats = scans[0].read_stats_snapshot();
 
-        Ok((pretty_format_batches(&result)?.to_string(), read_stats))
+        Ok((result, read_stats))
     }
 
     #[tokio::test]
@@ -1245,6 +1260,112 @@ mod tests {
         assert_eq!(native_stats.deletion_vector_payloads_loaded, 1);
         assert_eq!(native_stats.deletion_vectors_applied, 1);
         assert_eq!(native_stats.deletion_vector_rows_deleted, 1);
+        assert_eq!(native_stats.deletion_vector_failures, 0);
+        assert_eq!(native_stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_deletion_vector_preserves_row_indexes_across_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_rows_and_deletion_vector(
+            "native-async-dv-multi-batch-row-index",
+            9000,
+            &[8191, 8192, 8999],
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select id from orders order by id";
+        let (official, _official_stats) = collect_batches_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let (native, native_stats) = collect_batches_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+        let official_ids = collect_batch_ids(&official)?;
+        let native_ids = collect_batch_ids(&native)?;
+
+        assert_eq!(native_ids, official_ids);
+        assert!(!native_ids.contains(&8192));
+        assert!(!native_ids.contains(&8193));
+        assert!(!native_ids.contains(&9000));
+        assert!(native.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 1 && schema.field(0).name() == "id"
+        }));
+        assert!(native.len() > 1);
+        assert_eq!(native_stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(native_stats.deletion_vectors_applied, 1);
+        assert_eq!(native_stats.deletion_vector_rows_deleted, 3);
+        assert_eq!(native_stats.deletion_vector_failures, 0);
+        assert_eq!(native_stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_deletion_vector_preserves_all_live_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table =
+            RealParquetDeltaTable::new_with_deletion_vector("native-async-dv-all-live", &[])?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select id, customer_name from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let (native, native_stats) = collect_sql_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+        assert!(native.contains("| 1  | alice         |"), "{native}");
+        assert!(native.contains("| 2  | bob           |"), "{native}");
+        assert!(native.contains("| 3  |               |"), "{native}");
+        assert_eq!(native_stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(native_stats.deletion_vectors_applied, 1);
+        assert_eq!(native_stats.deletion_vector_rows_deleted, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_deletion_vector_keeps_schema_when_all_rows_deleted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_deletion_vector(
+            "native-async-dv-all-deleted",
+            &[0, 1, 2],
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select id, customer_name from orders order by id";
+        let (native, native_stats) = collect_batches_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert!(collect_batch_ids(&native)?.is_empty());
+        assert!(native.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 2
+                && schema.field(0).name() == "id"
+                && schema.field(1).name() == "customer_name"
+        }));
+        assert_eq!(native_stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(native_stats.deletion_vectors_applied, 1);
+        assert_eq!(native_stats.deletion_vector_rows_deleted, 3);
         assert_eq!(native_stats.deletion_vector_failures, 0);
         assert_eq!(native_stats.deletion_vector_rejections, 0);
 

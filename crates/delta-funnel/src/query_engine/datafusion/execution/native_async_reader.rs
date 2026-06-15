@@ -115,6 +115,7 @@ pub(crate) struct DeltaNativeAsyncFileReadStream {
     include_original_row_index: bool,
     deletion_vector: Option<ProviderDeletionVectorSelection>,
     deletion_vector_stats: DeltaFileReadDeletionVectorStats,
+    deletion_vector_stats_reported: DeltaFileReadDeletionVectorStats,
     _permit: Option<DeltaProviderAsyncFileReadPermit>,
 }
 
@@ -356,6 +357,7 @@ impl DeltaNativeAsyncFileReader {
             include_original_row_index,
             deletion_vector,
             deletion_vector_stats,
+            deletion_vector_stats_reported: DeltaFileReadDeletionVectorStats::default(),
             _permit: permit,
         })
     }
@@ -373,8 +375,24 @@ impl DeltaNativeAsyncFileReadStream {
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn take_deletion_vector_stats(&mut self) -> DeltaFileReadDeletionVectorStats {
-        let deletion_vector_stats = self.deletion_vector_stats;
-        self.deletion_vector_stats = DeltaFileReadDeletionVectorStats::default();
+        let deletion_vector_stats = DeltaFileReadDeletionVectorStats {
+            payload_loaded: self.deletion_vector_stats.payload_loaded
+                && !self.deletion_vector_stats_reported.payload_loaded,
+            applied: self.deletion_vector_stats.applied
+                && !self.deletion_vector_stats_reported.applied,
+            deleted_rows: self
+                .deletion_vector_stats
+                .deleted_rows
+                .saturating_sub(self.deletion_vector_stats_reported.deleted_rows),
+        };
+        if deletion_vector_stats.payload_loaded {
+            self.deletion_vector_stats_reported.payload_loaded = true;
+        }
+        if deletion_vector_stats.applied {
+            self.deletion_vector_stats_reported.applied = true;
+        }
+        self.deletion_vector_stats_reported.deleted_rows = self.deletion_vector_stats.deleted_rows;
+
         deletion_vector_stats
     }
 
