@@ -391,7 +391,7 @@ impl DeltaNativeAsyncFileReader {
         schema_match: &NativeAsyncSchemaMatch,
         parquet_schema: &SchemaDescriptor,
     ) -> Result<Option<RowFilter>, DeltaFunnelError> {
-        if !read_schema.has_physical_predicate() {
+        if !read_schema.enforces_physical_predicate_rows() {
             return Ok(None);
         }
 
@@ -1802,7 +1802,9 @@ mod tests {
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
-        let read_schema = scan.read_schema();
+        let read_schema = scan
+            .read_schema()
+            .with_provider_enforced_physical_predicate_rows();
         let file = scan
             .expand_kernel_scan_metadata(source.table_uri())?
             .files
@@ -1821,7 +1823,7 @@ mod tests {
             snapshot_version: source.version(),
         })?;
 
-        assert!(read_schema.has_physical_predicate());
+        assert!(read_schema.enforces_physical_predicate_rows());
 
         let stream = reader
             .open_file_stream(DeltaNativeAsyncFileReadRequest {
@@ -1865,7 +1867,9 @@ mod tests {
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
-        let read_schema = scan.read_schema();
+        let read_schema = scan
+            .read_schema()
+            .with_provider_enforced_physical_predicate_rows();
         let file = scan
             .expand_kernel_scan_metadata(source.table_uri())?
             .files
@@ -1885,7 +1889,7 @@ mod tests {
         })?;
 
         assert!(task.deletion_vector.is_present());
-        assert!(read_schema.has_physical_predicate());
+        assert!(read_schema.enforces_physical_predicate_rows());
 
         let stream = reader
             .open_file_stream(DeltaNativeAsyncFileReadRequest {

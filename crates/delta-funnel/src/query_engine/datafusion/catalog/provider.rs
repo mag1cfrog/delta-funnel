@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{
-    Column, DataFusionError, Result as DataFusionResult,
+    Column, Result as DataFusionResult,
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion::datasource::{TableProvider, TableType};
@@ -457,18 +457,6 @@ impl TableProvider for DeltaTableProvider {
         // provider limit as advisory until a scan-local limit case is proven
         // safe across residual filters, joins, deletion vectors, transforms, and
         // ordering-sensitive plans.
-        if self.execution_options.reader_backend == DeltaProviderReaderBackend::NativeAsync
-            && !filters.is_empty()
-        {
-            return DeltaScanFilterSnafu {
-                source_name: self.source_name().to_owned(),
-                table_uri: self.source.table_uri().to_owned(),
-                reason: "native async reader backend does not support pushed filters yet; filters must remain as DataFusion residual filters".to_owned(),
-            }
-            .fail()
-            .map_err(DataFusionError::from);
-        }
-
         let scan_plan = self.plan_scan(ProviderScanPlanRequest {
             requested_projection: projection.cloned(),
             pushed_filters: filters.to_vec(),
@@ -499,13 +487,6 @@ impl TableProvider for DeltaTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        if self.execution_options.reader_backend == DeltaProviderReaderBackend::NativeAsync {
-            return Ok(vec![
-                TableProviderFilterPushDown::Unsupported;
-                filters.len()
-            ]);
-        }
-
         Ok(self
             .plan_supports_filters_pushdown(filters)
             .datafusion_pushdowns())

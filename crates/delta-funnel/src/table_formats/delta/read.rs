@@ -21,6 +21,7 @@ pub(crate) struct KernelScanReadSchema {
     physical_schema: kernel::KernelSchemaRef,
     logical_schema: kernel::KernelSchemaRef,
     physical_predicate: Option<kernel::PredicateRef>,
+    enforce_physical_predicate_rows: bool,
 }
 
 impl KernelScanReadSchema {
@@ -33,6 +34,7 @@ impl KernelScanReadSchema {
             physical_schema,
             logical_schema,
             physical_predicate,
+            enforce_physical_predicate_rows: false,
         }
     }
 
@@ -64,6 +66,30 @@ impl KernelScanReadSchema {
         self.physical_predicate.is_some()
     }
 
+    /// Whether the file reader must apply the physical predicate as a
+    /// provider-enforced row-level filter.
+    ///
+    /// This is intentionally separate from `physical_predicate`: the same
+    /// predicate can be used for metadata pruning while DataFusion keeps a
+    /// residual filter for inexact pushdown.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn enforces_physical_predicate_rows(&self) -> bool {
+        self.enforce_physical_predicate_rows && self.physical_predicate.is_some()
+    }
+
+    /// Enables provider-enforced row-level filtering for the physical predicate.
+    ///
+    /// Callers should only use this when provider planning reports an equivalent
+    /// filter as exact or otherwise explicitly accepts duplicate residual
+    /// evaluation.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn with_provider_enforced_physical_predicate_rows(mut self) -> Self {
+        self.enforce_physical_predicate_rows = true;
+        self
+    }
+
     /// Returns this read schema without a kernel Parquet read predicate.
     ///
     /// Backends that cannot preserve original physical row indexes for
@@ -73,6 +99,7 @@ impl KernelScanReadSchema {
     #[must_use]
     pub(crate) fn without_physical_predicate(mut self) -> Self {
         self.physical_predicate = None;
+        self.enforce_physical_predicate_rows = false;
         self
     }
 

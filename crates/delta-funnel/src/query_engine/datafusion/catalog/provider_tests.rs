@@ -1,5 +1,6 @@
 //! Tests for the Delta DataFusion table provider.
 
+use datafusion::arrow::array::Int32Array;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::{DataFusionError, ScalarValue};
 use datafusion::datasource::empty::EmptyTable;
@@ -15,13 +16,17 @@ use super::super::super::planning::partition_target::DeltaScanPartitionTargetSou
 use super::*;
 use crate::query_engine::datafusion::catalog::registration::{
     DeltaTableProviderConfig, register_delta_sources,
+    register_delta_sources_with_scan_execution_options,
 };
 use crate::query_engine::datafusion::test_support::{
     DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
     NESTED_SCHEMA_FIELDS_JSON, PARTITIONED_SCHEMA_FIELDS_JSON, find_delta_scan_plans,
     register_fixture_source,
 };
-use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+use crate::{
+    DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol,
+    table_formats::RealParquetDeltaTable,
+};
 
 const INTEGER_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]"#;
 const BOOLEAN_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"is_current\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]"#;
@@ -408,6 +413,35 @@ fn temporal_partial_stats_add_json(
     )
 }
 
+fn register_native_delta_source(
+    ctx: &SessionContext,
+    source_name: &str,
+    table_uri: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = load_delta_source(DeltaSourceConfig {
+        name: source_name.to_owned(),
+        table_uri,
+        version: None,
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+
+    register_delta_sources_with_scan_execution_options(
+        ctx,
+        vec![DeltaTableProviderConfig {
+            source,
+            protocol: preflight,
+            scan_target_partitions: None,
+        }],
+        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?,
+    )?;
+
+    Ok(())
+}
+
 #[test]
 fn datafusion_table_provider_api_symbols_are_available() -> datafusion::error::Result<()> {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -478,7 +512,7 @@ fn delta_provider_accepts_native_async_backend_for_local_file_uri()
 }
 
 #[test]
-fn native_async_backend_does_not_claim_exact_filter_pushdown()
+fn native_async_backend_uses_existing_filter_pushdown_plan()
 -> Result<(), Box<dyn std::error::Error>> {
     let table = DeltaLogTable::new_with_schema(
         "native-async-no-exact-filter-pushdown",
@@ -507,8 +541,76 @@ fn native_async_backend_does_not_claim_exact_filter_pushdown()
 
     assert_eq!(
         provider.supports_filters_pushdown(&[&filter])?,
-        vec![TableProviderFilterPushDown::Unsupported]
+        vec![TableProviderFilterPushDown::Exact]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_async_inexact_data_filter_keeps_residual_filter()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let table = RealParquetDeltaTable::new_default("native-async-inexact-data-filter-residual")?;
+    register_native_delta_source(&ctx, "orders", table.path().to_string_lossy().to_string())?;
+
+    let dataframe = ctx
+        .sql("select customer_name from orders where id > 1")
+        .await?;
+    let physical_plan = dataframe.create_physical_plan().await?;
+    let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut scans = Vec::new();
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+    assert!(plan_display.contains("FilterExec"), "{plan_display}");
+    assert!(
+        plan_display.contains("DeltaScanPlanningExec"),
+        "{plan_display}"
+    );
+    assert_eq!(scans.len(), 1);
+    assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
+    assert_eq!(
+        scans[0]
+            .scan_plan()
+            .pushed_filter_plan
+            .residual_filter_count,
+        1
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_async_provider_scan_applies_dv_after_predicate_pruning()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let table = RealParquetDeltaTable::new_with_two_row_groups_and_deletion_vector(
+        "native-async-provider-dv-predicate-pruning",
+        3,
+        &[4],
+    )?;
+    register_native_delta_source(&ctx, "orders", table.path().to_string_lossy().to_string())?;
+
+    let batches = ctx
+        .sql("select id from orders where id > 3 order by id")
+        .await?
+        .collect()
+        .await?;
+    let ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .into_iter()
+                .flat_map(|ids| ids.values().iter().copied())
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec![4, 6]);
 
     Ok(())
 }
