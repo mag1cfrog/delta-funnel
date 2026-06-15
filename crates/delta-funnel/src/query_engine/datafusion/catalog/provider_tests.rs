@@ -547,17 +547,68 @@ fn native_async_backend_uses_existing_filter_pushdown_plan()
     Ok(())
 }
 
+#[test]
+fn native_async_direct_data_filter_is_exact_only_for_native_backend()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new("native-async-exact-data-filter-pushdown")?;
+    let official_source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let official_preflight = preflight_delta_protocol(&official_source)?;
+    let official_provider = DeltaTableProvider::try_new(official_source, official_preflight)?;
+
+    let native_source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+    })?;
+    let native_preflight = preflight_delta_protocol(&native_source)?;
+    let native_provider = DeltaTableProvider::try_new_with_execution_options(
+        native_source,
+        native_preflight,
+        None,
+        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?,
+    )?;
+    let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(1_i32));
+
+    assert_eq!(
+        official_provider.supports_filters_pushdown(&[&filter])?,
+        vec![TableProviderFilterPushDown::Inexact]
+    );
+    assert_eq!(
+        native_provider.supports_filters_pushdown(&[&filter])?,
+        vec![TableProviderFilterPushDown::Exact]
+    );
+
+    let official_plan = official_provider.plan_supports_filters_pushdown(&[&filter]);
+    let native_plan = native_provider.plan_supports_filters_pushdown(&[&filter]);
+    assert_eq!(official_plan.inexact_count, 1);
+    assert_eq!(official_plan.residual_filter_count, 1);
+    assert!(!official_plan.has_provider_enforced_row_predicate());
+    assert_eq!(native_plan.exact_count, 1);
+    assert_eq!(native_plan.residual_filter_count, 0);
+    assert!(native_plan.has_provider_enforced_row_predicate());
+
+    Ok(())
+}
+
 #[tokio::test]
-async fn native_async_inexact_data_filter_keeps_residual_filter()
+async fn native_async_unsupported_data_filter_keeps_residual_filter()
 -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
     let table = RealParquetDeltaTable::new_default("native-async-inexact-data-filter-residual")?;
     register_native_delta_source(&ctx, "orders", table.path().to_string_lossy().to_string())?;
 
     let dataframe = ctx
-        .sql("select customer_name from orders where id > 1")
+        .sql("select customer_name from orders where id > 1 and customer_name like 'b%'")
         .await?;
-    let physical_plan = dataframe.create_physical_plan().await?;
+    let physical_plan = dataframe.clone().create_physical_plan().await?;
     let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
         .indent(true)
         .to_string();
@@ -570,13 +621,14 @@ async fn native_async_inexact_data_filter_keeps_residual_filter()
         "{plan_display}"
     );
     assert_eq!(scans.len(), 1);
-    assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 1);
+    assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+    assert_eq!(scans[0].scan_plan().pushed_filter_plan.inexact_count, 0);
     assert_eq!(
         scans[0]
             .scan_plan()
             .pushed_filter_plan
             .residual_filter_count,
-        1
+        0
     );
 
     Ok(())
@@ -593,11 +645,34 @@ async fn native_async_provider_scan_applies_dv_after_predicate_pruning()
     )?;
     register_native_delta_source(&ctx, "orders", table.path().to_string_lossy().to_string())?;
 
-    let batches = ctx
+    let dataframe = ctx
         .sql("select id from orders where id > 3 order by id")
-        .await?
-        .collect()
         .await?;
+    let physical_plan = dataframe.clone().create_physical_plan().await?;
+    let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut scans = Vec::new();
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+    assert!(!plan_display.contains("FilterExec"), "{plan_display}");
+    assert_eq!(scans.len(), 1);
+    assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 1);
+    assert_eq!(
+        scans[0]
+            .scan_plan()
+            .pushed_filter_plan
+            .residual_filter_count,
+        0
+    );
+    assert!(
+        scans[0]
+            .scan_plan()
+            .pushed_filter_plan
+            .has_provider_enforced_row_predicate()
+    );
+
+    let batches = dataframe.collect().await?;
     let ids = batches
         .iter()
         .flat_map(|batch| {

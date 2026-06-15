@@ -75,6 +75,12 @@ pub(crate) struct ExactPartitionKernelFilter {
     pub(crate) kernel_predicate: DeltaKernelPredicate,
     /// Metadata pruning path that owns this kernel predicate.
     pub(crate) kind: KernelScanFilterKind,
+    /// Whether this predicate is the complete original data-only filter and can
+    /// be enforced by a native row-level reader without a DataFusion residual.
+    ///
+    /// Mixed `AND` extraction may omit safe residual terms or include partition
+    /// columns, so those predicates remain metadata-pruning only.
+    pub(crate) native_row_predicate_exact_candidate: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +178,40 @@ impl DeltaFilterPushdownPlan {
                 .as_ref()
                 .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
         })
+    }
+
+    #[must_use]
+    pub(crate) fn has_provider_enforced_row_predicate(&self) -> bool {
+        self.decisions.iter().any(|decision| {
+            decision.outcome == DeltaFilterPushdownOutcome::Exact
+                && decision.kernel_scan_filter.as_ref().is_some_and(|filter| {
+                    filter.kind == KernelScanFilterKind::DataStats
+                        && filter.native_row_predicate_exact_candidate
+                })
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn with_native_row_predicate_exactness(self) -> Self {
+        let decisions = self
+            .decisions
+            .into_iter()
+            .map(|mut decision| {
+                if decision.outcome == DeltaFilterPushdownOutcome::Inexact
+                    && decision.kernel_scan_filter.as_ref().is_some_and(|filter| {
+                        filter.kind == KernelScanFilterKind::DataStats
+                            && filter.native_row_predicate_exact_candidate
+                    })
+                {
+                    decision.outcome = DeltaFilterPushdownOutcome::Exact;
+                    decision.residual = false;
+                }
+
+                decision
+            })
+            .collect();
+
+        Self::from_decisions(decisions)
     }
 }
 

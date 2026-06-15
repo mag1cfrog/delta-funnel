@@ -232,6 +232,9 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             self.scan_plan.kernel_scan().read_schema(),
             &file_tasks,
             self.execution_options.reader_backend,
+            self.scan_plan
+                .pushed_filter_plan
+                .has_provider_enforced_row_predicate(),
         );
 
         match self.execution_options.reader_backend {
@@ -291,7 +294,14 @@ fn partition_read_schema(
     read_schema: KernelScanReadSchema,
     file_tasks: &[DeltaScanFileTask],
     reader_backend: DeltaProviderReaderBackend,
+    enforce_physical_predicate_rows: bool,
 ) -> KernelScanReadSchema {
+    let read_schema = if enforce_physical_predicate_rows {
+        read_schema.with_provider_enforced_physical_predicate_rows()
+    } else {
+        read_schema
+    };
+
     if !reader_backend.supports_dv_row_index_predicate_reads()
         && file_tasks
             .iter()
@@ -869,7 +879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_async_backend_keeps_data_filter_as_residual()
+    async fn native_async_backend_enforces_exact_data_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
         let table = RealParquetDeltaTable::new_default("native-async-residual-filter")?;
@@ -904,7 +914,7 @@ mod tests {
         let mut scans = Vec::new();
         find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
 
-        assert!(plan_display.contains("FilterExec"), "{plan_display}");
+        assert!(!plan_display.contains("FilterExec"), "{plan_display}");
         assert_eq!(scans.len(), 1);
         assert_eq!(
             scans[0].read_stats_snapshot().reader_backend,
@@ -912,10 +922,23 @@ mod tests {
         );
         assert_eq!(
             scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+            1
+        );
+        assert_eq!(
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .residual_filter_count,
             0
         );
         assert!(
-            !scans[0]
+            scans[0]
+                .scan_plan()
+                .pushed_filter_plan
+                .has_provider_enforced_row_predicate()
+        );
+        assert!(
+            scans[0]
                 .scan_plan()
                 .kernel_scan()
                 .read_schema()
@@ -2774,6 +2797,7 @@ mod tests {
                 read_schema.clone(),
                 &[fake_task("part-00000.parquet")],
                 DeltaProviderReaderBackend::OfficialKernel,
+                false,
             )
             .has_physical_predicate()
         );
@@ -2782,6 +2806,7 @@ mod tests {
                 read_schema.clone(),
                 std::slice::from_ref(&dv_task),
                 DeltaProviderReaderBackend::OfficialKernel,
+                false,
             )
             .has_physical_predicate()
         );
@@ -2790,6 +2815,7 @@ mod tests {
                 read_schema,
                 &[dv_task],
                 DeltaProviderReaderBackend::NativeAsync,
+                false,
             )
             .has_physical_predicate()
         );

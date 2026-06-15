@@ -199,12 +199,16 @@ impl DeltaTableProvider {
     /// different column names.
     fn plan_normalized_provider_filters(&self, filters: &[Expr]) -> DeltaFilterPushdownPlan {
         let filter_refs = filters.iter().collect::<Vec<_>>();
-
-        DeltaFilterPushdownPlan::partition_operator_pushdown(
+        let plan = DeltaFilterPushdownPlan::partition_operator_pushdown(
             &filter_refs,
             &self.schema,
             &self.partition_columns(),
-        )
+        );
+
+        match self.execution_options.reader_backend {
+            DeltaProviderReaderBackend::OfficialKernel => plan,
+            DeltaProviderReaderBackend::NativeAsync => plan.with_native_row_predicate_exactness(),
+        }
     }
 
     /// Rejects pushed filters that this provider cannot safely use.
