@@ -491,6 +491,46 @@ mod tests {
     };
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
+    async fn collect_sql_with_reader_backend(
+        table_uri: &str,
+        reader_backend: DeltaProviderReaderBackend,
+        sql: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table_uri.to_owned(),
+            version: None,
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options =
+            DeltaProviderScanExecutionOptions::try_new_with_reader_backend(reader_backend, 1, 1)?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql(sql).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            reader_backend
+        );
+
+        let result = datafusion::physical_plan::collect(physical_plan, ctx.task_ctx()).await?;
+
+        Ok(pretty_format_batches(&result)?.to_string())
+    }
+
     #[tokio::test]
     async fn sql_limit_stays_above_non_reading_delta_scan() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -929,6 +969,63 @@ mod tests {
             ]
             .join("\n")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_matches_official_kernel_for_column_mapping_transform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_column_mapping(
+            "native-async-column-mapping-equivalence",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select customer_name, id from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+        assert!(
+            !native.contains("phys_customer_name") && !native.contains("phys_id"),
+            "{native}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_matches_official_kernel_for_partition_transform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_partition_value(
+            "native-async-partition-transform-equivalence",
+            "us-west",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select region, id from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
 
         Ok(())
     }
