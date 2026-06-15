@@ -1191,6 +1191,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_matches_official_kernel_for_simple_deletion_vector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table =
+            RealParquetDeltaTable::new_with_deletion_vector("native-async-simple-dv", &[1])?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select id, customer_name from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+        assert!(native.contains("| 1  | alice         |"), "{native}");
+        assert!(native.contains("| 3  |               |"), "{native}");
+        assert!(!native.contains("| 2  | bob           |"), "{native}");
+        assert!(
+            !native.contains("__delta_funnel_original_row_index"),
+            "{native}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_backend_preserves_file_order_in_one_partition()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();

@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, new_null_array};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, new_null_array};
+use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
@@ -28,8 +29,11 @@ use crate::{
     DeltaFunnelError,
     error::{DeltaScanFileReadPhase, DeltaScanFileReadSnafu},
     table_formats::{
-        KernelColumnMetadataKey, KernelDataType, KernelMetadataColumnSpec, KernelMetadataValue,
-        KernelPhysicalToLogicalTransform, KernelScanReadSchema, KernelSchemaRef, KernelStructField,
+        KernelColumnMetadataKey, KernelDataType, KernelDeletionVectorReadRequest,
+        KernelDeletionVectorReader, KernelDeletionVectorReaderConfig, KernelMetadataColumnSpec,
+        KernelMetadataValue, KernelPhysicalToLogicalTransform, KernelScanReadSchema,
+        KernelSchemaRef, KernelStructField, ProviderDeletionVectorSelection,
+        ProviderDeletionVectorSelectionContext,
     },
 };
 
@@ -64,6 +68,7 @@ pub(crate) struct DeltaNativeAsyncFileReader {
     snapshot_version: u64,
     store: Arc<dyn ObjectStore>,
     data_file_reader: Arc<KernelDataFileReader>,
+    deletion_vector_reader: Arc<KernelDeletionVectorReader>,
 }
 
 /// Object-store input for a single native async Parquet file read.
@@ -108,6 +113,7 @@ pub(crate) struct DeltaNativeAsyncFileReadStream {
     transform: KernelPhysicalToLogicalTransform,
     data_file_reader: Arc<KernelDataFileReader>,
     include_original_row_index: bool,
+    deletion_vector: Option<ProviderDeletionVectorSelection>,
     deletion_vector_stats: DeltaFileReadDeletionVectorStats,
     _permit: Option<DeltaProviderAsyncFileReadPermit>,
 }
@@ -148,6 +154,13 @@ impl DeltaNativeAsyncFileReader {
                 table_uri: config.table_uri,
                 snapshot_version: config.snapshot_version,
             })?);
+        let deletion_vector_reader = Arc::new(KernelDeletionVectorReader::try_new(
+            KernelDeletionVectorReaderConfig {
+                source_name: config.source_name,
+                table_uri: config.table_uri,
+                snapshot_version: config.snapshot_version,
+            },
+        )?);
 
         Ok(Self {
             source_name: config.source_name.to_owned(),
@@ -155,6 +168,7 @@ impl DeltaNativeAsyncFileReader {
             snapshot_version: config.snapshot_version,
             store,
             data_file_reader,
+            deletion_vector_reader,
         })
     }
 
@@ -255,6 +269,8 @@ impl DeltaNativeAsyncFileReader {
         include_original_row_index: bool,
     ) -> Result<DeltaNativeAsyncFileReadStream, DeltaFunnelError> {
         self.validate_supported_read_mode(request.task, request.read_schema)?;
+        let include_original_row_index =
+            include_original_row_index || request.task.deletion_vector.is_present();
         let object = self.parquet_object_for_task(request.task)?;
         let reader =
             ParquetObjectReader::new(object.store, object.path).with_file_size(object.file_size);
@@ -316,6 +332,16 @@ impl DeltaNativeAsyncFileReader {
                 path: request.task.path.clone(),
                 phase: DeltaScanFileReadPhase::ParquetReadSetup,
             })?;
+        let deletion_vector =
+            self.deletion_vector_reader
+                .read_selection(KernelDeletionVectorReadRequest {
+                    path: &request.task.path,
+                    deletion_vector: &request.task.deletion_vector,
+                })?;
+        let deletion_vector_stats = DeltaFileReadDeletionVectorStats {
+            payload_loaded: deletion_vector.is_some(),
+            ..DeltaFileReadDeletionVectorStats::default()
+        };
 
         Ok(DeltaNativeAsyncFileReadStream {
             stream,
@@ -328,7 +354,8 @@ impl DeltaNativeAsyncFileReader {
             transform: request.task.transform.clone(),
             data_file_reader: Arc::clone(&self.data_file_reader),
             include_original_row_index,
-            deletion_vector_stats: DeltaFileReadDeletionVectorStats::default(),
+            deletion_vector,
+            deletion_vector_stats,
             _permit: permit,
         })
     }
@@ -354,6 +381,7 @@ impl DeltaNativeAsyncFileReadStream {
         &mut self,
     ) -> Result<Option<(RecordBatch, Option<Vec<u64>>)>, DeltaFunnelError> {
         let Some(batch) = self.stream.next().await else {
+            self.finish_deletion_vector_selection()?;
             return Ok(None);
         };
         let batch = batch
@@ -369,6 +397,8 @@ impl DeltaNativeAsyncFileReadStream {
         let original_row_indexes = self.original_row_indexes_from_batch(&batch)?;
         let physical_batch = self.project_batch_to_schema(batch)?;
         let logical_batch = self.apply_physical_to_logical_transform(physical_batch)?;
+        let logical_batch =
+            self.apply_deletion_vector_mask(logical_batch, original_row_indexes.as_deref())?;
 
         Ok(Some((logical_batch, original_row_indexes)))
     }
@@ -482,6 +512,95 @@ impl DeltaNativeAsyncFileReadStream {
                 schema: &self.read_schema,
                 transform: &self.transform,
             })
+    }
+
+    fn apply_deletion_vector_mask(
+        &mut self,
+        batch: RecordBatch,
+        original_row_indexes: Option<&[u64]>,
+    ) -> Result<RecordBatch, DeltaFunnelError> {
+        if self.deletion_vector.is_none() {
+            return Ok(batch);
+        }
+        let row_indexes = original_row_indexes
+            .ok_or_else(|| {
+                delta_kernel::Error::generic(
+                    "native async deletion-vector masking requires original row indexes",
+                )
+            })
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: self.path.clone(),
+                phase: DeltaScanFileReadPhase::RowIndexGeneration,
+            })?;
+        let source_name = self.source_name.clone();
+        let table_uri = self.table_uri.clone();
+        let path = self.path.clone();
+        let context = ProviderDeletionVectorSelectionContext {
+            source_name: &source_name,
+            table_uri: &table_uri,
+            snapshot_version: self.snapshot_version,
+            path: &path,
+        };
+        let keep_mask = self
+            .deletion_vector
+            .as_mut()
+            .ok_or_else(|| {
+                delta_kernel::Error::generic("missing native async deletion-vector selection")
+            })
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: self.path.clone(),
+                phase: DeltaScanFileReadPhase::DeletionVectorMasking,
+            })?
+            .select_original_row_indexes(row_indexes.iter().copied(), context)?;
+
+        self.deletion_vector_stats.applied = true;
+        let deleted_rows = keep_mask.iter().filter(|selected| !**selected).count();
+        self.deletion_vector_stats.deleted_rows = self
+            .deletion_vector_stats
+            .deleted_rows
+            .saturating_add(deleted_rows);
+        if keep_mask.iter().all(|selected| *selected) {
+            return Ok(batch);
+        }
+        if keep_mask.iter().all(|selected| !*selected) {
+            return Ok(RecordBatch::new_empty(batch.schema()));
+        }
+
+        let keep_mask = BooleanArray::from(keep_mask);
+
+        filter_record_batch(&batch, &keep_mask)
+            .map_err(delta_kernel::Error::from)
+            .context(DeltaScanFileReadSnafu {
+                source_name: self.source_name.clone(),
+                table_uri: self.table_uri.clone(),
+                snapshot_version: self.snapshot_version,
+                path: self.path.clone(),
+                phase: DeltaScanFileReadPhase::DeletionVectorMasking,
+            })
+    }
+
+    fn finish_deletion_vector_selection(&mut self) -> Result<(), DeltaFunnelError> {
+        let Some(mut deletion_vector) = self.deletion_vector.take() else {
+            return Ok(());
+        };
+        let context = self.deletion_vector_context_for_path();
+
+        deletion_vector.finish(context)
+    }
+
+    fn deletion_vector_context_for_path(&self) -> ProviderDeletionVectorSelectionContext<'_> {
+        ProviderDeletionVectorSelectionContext {
+            source_name: &self.source_name,
+            table_uri: &self.table_uri,
+            snapshot_version: self.snapshot_version,
+            path: &self.path,
+        }
     }
 }
 
@@ -807,8 +926,11 @@ impl DeltaNativeAsyncFileReader {
         task: &DeltaScanFileTask,
         read_schema: &KernelScanReadSchema,
     ) -> Result<(), DeltaFunnelError> {
-        let reason = if task.deletion_vector.is_present() {
-            Some("native async reader does not support deletion-vector file tasks yet".to_owned())
+        let reason = if task.deletion_vector.is_present() && read_schema.has_physical_predicate() {
+            Some(
+                "native async deletion-vector reads with kernel physical predicates require #160"
+                    .to_owned(),
+            )
         } else if read_schema.has_physical_predicate() {
             Some("native async reader does not support kernel physical predicates yet".to_owned())
         } else {
