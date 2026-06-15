@@ -19,8 +19,13 @@ pub(crate) use deletion_vector::{
     KernelDeletionVectorReadRequest, KernelDeletionVectorReader, KernelDeletionVectorReaderConfig,
     ProviderDeletionVectorSelection, ProviderDeletionVectorSelectionContext,
 };
+#[cfg(test)]
+pub(crate) use kernel::KernelStructType;
 use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
-pub(crate) use kernel::{DeltaKernelPredicate, datafusion_expr_to_kernel_predicate};
+pub(crate) use kernel::{
+    DeltaKernelPredicate, KernelColumnMetadataKey, KernelDataType, KernelMetadataColumnSpec,
+    KernelMetadataValue, KernelSchemaRef, KernelStructField, datafusion_expr_to_kernel_predicate,
+};
 pub use protocol::{
     DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
 };
