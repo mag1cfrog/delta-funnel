@@ -745,6 +745,7 @@ enum NativeAsyncFieldPlan {
         element_plan: Box<NativeAsyncFieldPlan>,
     },
     Map {
+        key_plan: Box<NativeAsyncFieldPlan>,
         value_plan: Box<NativeAsyncFieldPlan>,
     },
 }
@@ -1104,10 +1105,12 @@ fn build_matched_map_field_plan(
     let value_plan =
         build_matched_field_plan(provider_value, file_value, parquet_value, &value_path)?;
     let provider_map_type = DataType::Map(Arc::clone(provider_entries), provider_ordered);
+    let key_plan = NativeAsyncFieldPlan::Identity;
     let needs_reshape = file_field.data_type() != &provider_map_type || !value_plan.is_identity();
 
     if needs_reshape {
         Ok(NativeAsyncFieldPlan::Map {
+            key_plan: Box::new(key_plan),
             value_plan: Box::new(value_plan),
         })
     } else {
@@ -1453,7 +1456,10 @@ fn reshape_array_to_provider_field(
             .map(|array| Arc::new(array) as ArrayRef)
             .map_err(delta_kernel::Error::from)
         }
-        NativeAsyncFieldPlan::Map { value_plan } => {
+        NativeAsyncFieldPlan::Map {
+            key_plan,
+            value_plan,
+        } => {
             let DataType::Map(provider_entries, provider_ordered) = provider_field.data_type()
             else {
                 return Err(delta_kernel::Error::generic(format!(
@@ -1471,6 +1477,11 @@ fn reshape_array_to_provider_field(
             })?;
             let (provider_key, provider_value) =
                 map_entry_fields(provider_entries, provider_field.name())?;
+            let keys = reshape_array_to_provider_field(
+                Arc::clone(map_array.keys()),
+                provider_key,
+                key_plan,
+            )?;
             let values = reshape_array_to_provider_field(
                 Arc::clone(map_array.values()),
                 provider_value,
@@ -1482,7 +1493,7 @@ fn reshape_array_to_provider_field(
                     Arc::new(provider_value.clone()),
                 ]
                 .into(),
-                vec![Arc::clone(map_array.keys()), values],
+                vec![keys, values],
                 map_array.entries().nulls().cloned(),
             );
 
