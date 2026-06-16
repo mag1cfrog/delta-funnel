@@ -459,7 +459,7 @@ mod tests {
         let _ = super::build_projected_scan;
         let _ = Scan::scan_metadata;
         let _ = ScanMetadata::visit_scan_files::<Vec<ScanFile>>;
-        let _ = DvInfo::get_selection_vector;
+        let _ = DvInfo::get_row_indexes;
         let _ = transform_to_logical;
         let _ = ArrowEngineData::new;
         let _ = <Box<dyn delta_kernel::EngineData> as EngineDataArrowExt>::try_into_record_batch;

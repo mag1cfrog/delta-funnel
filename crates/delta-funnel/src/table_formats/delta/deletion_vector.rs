@@ -2,7 +2,7 @@
 //!
 //! This module keeps deletion-vector payload reads lazy and scoped to one
 //! provider data-file read. Scan metadata planning preserves only descriptors;
-//! execution code must come through this boundary to materialize a keep mask.
+//! execution code must come through this boundary to materialize row selection.
 
 use crate::{
     DeltaFunnelError,
@@ -43,12 +43,12 @@ pub(crate) struct KernelDeletionVectorReadRequest<'a> {
     pub(crate) deletion_vector: &'a KernelScanDeletionVectorMetadata,
 }
 
-/// Provider-owned live-row keep mask for one physical Delta data file.
+/// Provider-owned deleted row indexes for one physical Delta data file.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderDeletionVectorSelection {
-    keep_mask: Vec<bool>,
-    consumed: usize,
+    deleted_row_indexes: Box<[u64]>,
+    consumed_row_count: u64,
     closed: bool,
     /// Tracks which row-coordinate contract this selection is using.
     ///
@@ -61,9 +61,10 @@ pub(crate) struct ProviderDeletionVectorSelection {
 /// Mutually exclusive ways to apply one DV selection.
 ///
 /// Mixing these modes can silently shift the DV coordinate system. Once a
-/// reader starts consuming a file sequentially, `consumed` is the original row
-/// cursor. Once a reader starts querying by original row index, there is no
-/// sequential cursor to validate because pruning or pushdown may skip rows.
+/// reader starts consuming a file sequentially, `consumed_row_count` is the
+/// original row cursor. Once a reader starts querying by original row index,
+/// there is no sequential cursor to validate because pruning or pushdown may
+/// skip rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderDeletionVectorSelectionAccessMode {
     /// No masking API has been chosen yet.
@@ -114,7 +115,7 @@ impl KernelDeletionVectorReader {
         })
     }
 
-    /// Lazily loads the provider keep mask for one selected data file.
+    /// Lazily loads the provider deleted row indexes for one selected data file.
     #[allow(dead_code)]
     pub(crate) fn read_selection(
         &self,
@@ -132,9 +133,9 @@ impl KernelDeletionVectorReader {
                 phase: DeltaScanDeletionVectorPhase::TableUriParsing,
             })?;
 
-        let keep_mask = handle
+        let deleted_row_indexes = handle
             .dv_info
-            .get_selection_vector(self.engine.as_ref(), &table_url)
+            .get_row_indexes(self.engine.as_ref(), &table_url)
             .context(DeltaScanDeletionVectorSnafu {
                 source_name: self.source_name.clone(),
                 table_uri: self.table_uri.clone(),
@@ -144,45 +145,65 @@ impl KernelDeletionVectorReader {
             })?
             .unwrap_or_default();
 
-        Ok(Some(ProviderDeletionVectorSelection::from_keep_mask(
-            keep_mask,
-        )))
+        Ok(Some(
+            ProviderDeletionVectorSelection::from_deleted_row_indexes(deleted_row_indexes),
+        ))
     }
 }
 
 impl ProviderDeletionVectorSelection {
-    /// Creates an owned keep mask where `true` means emit the physical row.
+    /// Creates an owned deleted-row index set where each entry is a physical row to drop.
     #[allow(dead_code)]
     #[must_use]
-    pub(crate) fn from_keep_mask(keep_mask: Vec<bool>) -> Self {
+    pub(crate) fn from_deleted_row_indexes(mut deleted_row_indexes: Vec<u64>) -> Self {
+        deleted_row_indexes.sort_unstable();
+        deleted_row_indexes.dedup();
+
         Self {
-            keep_mask,
-            consumed: 0,
+            deleted_row_indexes: deleted_row_indexes.into_boxed_slice(),
+            consumed_row_count: 0,
             closed: false,
             access_mode: ProviderDeletionVectorSelectionAccessMode::Unused,
         }
     }
 
+    /// Creates an owned keep mask where `true` means emit the physical row.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn from_keep_mask(keep_mask: Vec<bool>) -> Self {
+        let deleted_row_indexes = keep_mask
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, keep)| (!keep).then_some(index as u64))
+            .collect();
+
+        Self::from_deleted_row_indexes(deleted_row_indexes)
+    }
+
     /// Creates an all-live keep mask for tests and future no-DV normalization.
     #[allow(dead_code)]
     #[must_use]
-    pub(crate) fn all_live(row_count: usize) -> Self {
-        Self::from_keep_mask(vec![true; row_count])
+    pub(crate) fn all_live(_row_count: usize) -> Self {
+        Self::from_deleted_row_indexes(Vec::new())
     }
 
-    /// Returns the number of kernel-provided mask entries not yet consumed.
+    /// Returns the number of deleted row indexes at or after the ordered cursor.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn remaining_kernel_entries(&self) -> usize {
-        self.keep_mask.len().saturating_sub(self.consumed)
+        let consumed = self.consumed_row_count;
+        let consumed_deleted = self
+            .deleted_row_indexes
+            .partition_point(|row_index| *row_index < consumed);
+        self.deleted_row_indexes
+            .len()
+            .saturating_sub(consumed_deleted)
     }
 
     /// Consumes the next physical batch and returns an exact-length keep mask.
     ///
-    /// Kernel selection vectors may be shorter than the physical file when the
-    /// tail rows are all live. In that case this pads only the requested batch
-    /// with `true`, matching Delta Kernel's Arrow engine behavior while keeping
-    /// the provider-owned cursor explicit.
+    /// Delta deletion vectors store only removed rows. This derives a dense
+    /// keep mask for the requested batch without materializing a full-file mask.
     #[allow(dead_code)]
     pub(crate) fn consume_batch(
         &mut self,
@@ -220,8 +241,19 @@ impl ProviderDeletionVectorSelection {
             }
         }
 
+        let batch_len = u64::try_from(batch_len)
+            .map_err(|_| {
+                kernel::DeltaKernelError::generic("selection-vector batch length overflow")
+            })
+            .context(DeltaScanDeletionVectorSnafu {
+                source_name: context.source_name.to_owned(),
+                table_uri: context.table_uri.to_owned(),
+                snapshot_version: context.snapshot_version,
+                path: context.path.to_owned(),
+                phase: DeltaScanDeletionVectorPhase::SelectionVectorLengthMismatch,
+            })?;
         let requested_end = self
-            .consumed
+            .consumed_row_count
             .checked_add(batch_len)
             .ok_or_else(|| {
                 kernel::DeltaKernelError::generic("selection-vector batch length overflow")
@@ -233,11 +265,41 @@ impl ProviderDeletionVectorSelection {
                 path: context.path.to_owned(),
                 phase: DeltaScanDeletionVectorPhase::SelectionVectorLengthMismatch,
             })?;
-        let copied_start = self.consumed.min(self.keep_mask.len());
-        let copied_end = requested_end.min(self.keep_mask.len());
-        let mut batch_mask = self.keep_mask[copied_start..copied_end].to_vec();
-        batch_mask.resize(batch_len, true);
-        self.consumed = requested_end;
+        let batch_len = usize::try_from(batch_len)
+            .map_err(|_| {
+                kernel::DeltaKernelError::generic("selection-vector batch length overflow")
+            })
+            .context(DeltaScanDeletionVectorSnafu {
+                source_name: context.source_name.to_owned(),
+                table_uri: context.table_uri.to_owned(),
+                snapshot_version: context.snapshot_version,
+                path: context.path.to_owned(),
+                phase: DeltaScanDeletionVectorPhase::SelectionVectorLengthMismatch,
+            })?;
+        let mut batch_mask = vec![true; batch_len];
+        let deleted_start = self
+            .deleted_row_indexes
+            .partition_point(|row_index| *row_index < self.consumed_row_count);
+        let deleted_end = self
+            .deleted_row_indexes
+            .partition_point(|row_index| *row_index < requested_end);
+        for deleted_row_index in &self.deleted_row_indexes[deleted_start..deleted_end] {
+            let batch_index = usize::try_from(*deleted_row_index - self.consumed_row_count)
+                .map_err(|_| {
+                    kernel::DeltaKernelError::generic("deleted row index does not fit host usize")
+                })
+                .context(DeltaScanDeletionVectorSnafu {
+                    source_name: context.source_name.to_owned(),
+                    table_uri: context.table_uri.to_owned(),
+                    snapshot_version: context.snapshot_version,
+                    path: context.path.to_owned(),
+                    phase: DeltaScanDeletionVectorPhase::SelectionVectorLengthMismatch,
+                })?;
+            if let Some(selected) = batch_mask.get_mut(batch_index) {
+                *selected = false;
+            }
+        }
+        self.consumed_row_count = requested_end;
 
         Ok(batch_mask)
     }
@@ -288,26 +350,10 @@ impl ProviderDeletionVectorSelection {
             }
         }
 
-        row_indexes
+        Ok(row_indexes
             .into_iter()
-            .map(|row_index| {
-                let row_index = usize::try_from(row_index)
-                    .map_err(|_| {
-                        kernel::DeltaKernelError::generic(
-                            "original row index does not fit host usize",
-                        )
-                    })
-                    .context(DeltaScanDeletionVectorSnafu {
-                        source_name: context.source_name.to_owned(),
-                        table_uri: context.table_uri.to_owned(),
-                        snapshot_version: context.snapshot_version,
-                        path: context.path.to_owned(),
-                        phase: DeltaScanDeletionVectorPhase::SelectionVectorLengthMismatch,
-                    })?;
-
-                Ok(self.keep_mask.get(row_index).copied().unwrap_or(true))
-            })
-            .collect()
+            .map(|row_index| self.deleted_row_indexes.binary_search(&row_index).is_err())
+            .collect())
     }
 
     /// Closes consumption after the physical file reader reaches EOF.
@@ -324,10 +370,13 @@ impl ProviderDeletionVectorSelection {
             return Ok(());
         }
 
-        if self.consumed < self.keep_mask.len() {
+        let consumed_deleted = self
+            .deleted_row_indexes
+            .partition_point(|row_index| *row_index < self.consumed_row_count);
+        if consumed_deleted < self.deleted_row_indexes.len() {
             return Err(kernel::DeltaKernelError::generic(format!(
-                "selection vector has {} unconsumed entries after file completion",
-                self.keep_mask.len() - self.consumed
+                "selection vector has {} unconsumed deleted row indexes after file completion",
+                self.deleted_row_indexes.len() - consumed_deleted
             )))
             .context(DeltaScanDeletionVectorSnafu {
                 source_name: context.source_name.to_owned(),
@@ -375,11 +424,7 @@ mod tests {
         KernelDeletionVector, StreamingDeletionVectorWriter,
     };
 
-    const INLINE_DV_KEEP_MASK: &[bool] = &[
-        true, true, true, false, false, true, true, false, true, true, true, false, true, true,
-        true, true, true, true, false, true, true, true, true, true, true, true, true, true, true,
-        false,
-    ];
+    const INLINE_DV_DELETED_ROW_INDEXES: &[u64] = &[3, 4, 7, 11, 18, 29];
 
     #[test]
     fn consume_batch_splits_partial_selection_vectors() -> Result<(), Box<dyn std::error::Error>> {
@@ -419,6 +464,22 @@ mod tests {
         assert_eq!(selection.consume_batch(0, context)?, Vec::<bool>::new());
         assert_eq!(selection.remaining_kernel_entries(), 1);
         assert_eq!(selection.consume_batch(1, context)?, vec![false]);
+        selection.finish(context)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_row_indexes_are_sorted_deduplicated_and_inverted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = test_context();
+        let mut selection =
+            ProviderDeletionVectorSelection::from_deleted_row_indexes(vec![3, 1, 3]);
+
+        assert_eq!(
+            selection.select_original_row_indexes(0_u64..5, context)?,
+            vec![true, false, true, false, true]
+        );
         selection.finish(context)?;
 
         Ok(())
@@ -546,7 +607,10 @@ mod tests {
             display.contains("selection-vector length mismatch"),
             "{display}"
         );
-        assert!(display.contains("unconsumed entries"), "{display}");
+        assert!(
+            display.contains("unconsumed deleted row indexes"),
+            "{display}"
+        );
 
         Ok(())
     }
@@ -584,12 +648,12 @@ mod tests {
 
         assert_eq!(
             selection.remaining_kernel_entries(),
-            INLINE_DV_KEEP_MASK.len()
+            INLINE_DV_DELETED_ROW_INDEXES.len()
         );
         assert_eq!(
-            selection.keep_mask.as_slice(),
-            INLINE_DV_KEEP_MASK,
-            "kernel inline DV should decode to provider live-row keep mask"
+            selection.deleted_row_indexes.as_ref(),
+            INLINE_DV_DELETED_ROW_INDEXES,
+            "kernel inline DV should decode to provider deleted row indexes"
         );
 
         Ok(())
@@ -624,10 +688,7 @@ mod tests {
             })?
             .ok_or("expected on-disk DV selection")?;
 
-        assert_eq!(
-            selection.keep_mask.as_slice(),
-            &[false, true, true, true, true, true, true, true, true, false]
-        );
+        assert_eq!(selection.deleted_row_indexes.as_ref(), &[0, 9]);
 
         Ok(())
     }
