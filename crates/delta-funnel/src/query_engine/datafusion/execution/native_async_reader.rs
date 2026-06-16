@@ -1545,16 +1545,33 @@ impl DeltaNativeAsyncFileReader {
 fn unsupported_native_async_physical_schema_reason(
     physical_schema: &KernelSchemaRef,
 ) -> Option<String> {
-    physical_schema
-        .fields()
-        .find_map(|field| unsupported_native_async_field_reason(field, field.name(), true, false))
+    physical_schema.fields().find_map(|field| {
+        unsupported_native_async_field_reason(
+            field,
+            field.name(),
+            true,
+            NativeAsyncMapContext::Outside,
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeAsyncMapContext {
+    /// The field is not under a map key or map value subtree.
+    Outside,
+    /// The field is under a map key subtree. Native async does not reshape keys
+    /// because that could change key equality or key/value association.
+    Key,
+    /// The field is under a map value subtree. Value fields can be reshaped the
+    /// same way as nested struct/list fields while preserving map keys.
+    Value,
 }
 
 fn unsupported_native_async_field_reason(
     field: &KernelStructField,
     path: &str,
     top_level: bool,
-    inside_map: bool,
+    map_context: NativeAsyncMapContext,
 ) -> Option<String> {
     if field.is_metadata_column() {
         return Some(format!(
@@ -1571,46 +1588,66 @@ fn unsupported_native_async_field_reason(
             "native async reader does not support file path metadata column '{path}' yet"
         ));
     }
-    if has_nested_field_id_map_metadata(field)
-        && matches!(field.data_type(), KernelDataType::Map(_))
+    // Map values can be reshaped independently, but map keys define entry
+    // identity. Reject any key-side field matching until key reshaping is
+    // explicitly supported.
+    if matches!(map_context, NativeAsyncMapContext::Key)
+        && has_field_matching_metadata(field, top_level)
     {
         return Some(format!(
-            "native async reader does not support map nested field-id or physical-name matching at '{path}' yet"
+            "native async reader does not support map key field-id or physical-name matching at '{path}' yet"
         ));
     }
-    if inside_map && has_field_matching_metadata(field, top_level) {
+    // Delta stores synthetic map key/value field ids on the map field itself.
+    // A primitive key only needs that synthetic key id preserved by the
+    // provider transform. A complex key can also need recursive key-side
+    // matching, which native async intentionally rejects above.
+    if has_nested_field_id_map_metadata(field)
+        && matches!(field.data_type(), KernelDataType::Map(map) if !matches!(map.key_type(), KernelDataType::Primitive(_)))
+    {
         return Some(format!(
-            "native async reader does not support map nested field-id or physical-name matching at '{path}' yet"
+            "native async reader does not support complex map key field-id or physical-name matching at '{path}' yet"
         ));
     }
 
-    unsupported_native_async_data_type_reason(field.data_type(), path, inside_map)
+    unsupported_native_async_data_type_reason(field.data_type(), path, map_context)
 }
 
 fn unsupported_native_async_data_type_reason(
     data_type: &KernelDataType,
     path: &str,
-    inside_map: bool,
+    map_context: NativeAsyncMapContext,
 ) -> Option<String> {
     match data_type {
         KernelDataType::Struct(fields) | KernelDataType::Variant(fields) => {
             fields.fields().find_map(|field| {
                 let child_path = format!("{path}.{}", field.name());
-                unsupported_native_async_field_reason(field, &child_path, false, inside_map)
+                unsupported_native_async_field_reason(field, &child_path, false, map_context)
             })
         }
         KernelDataType::Array(array) => {
             let child_path = format!("{path}.element");
-            unsupported_native_async_data_type_reason(array.element_type(), &child_path, inside_map)
+            unsupported_native_async_data_type_reason(
+                array.element_type(),
+                &child_path,
+                map_context,
+            )
         }
         KernelDataType::Map(map) => {
             let key_path = format!("{path}.key");
-            unsupported_native_async_data_type_reason(map.key_type(), &key_path, true).or_else(
-                || {
-                    let value_path = format!("{path}.value");
-                    unsupported_native_async_data_type_reason(map.value_type(), &value_path, true)
-                },
+            unsupported_native_async_data_type_reason(
+                map.key_type(),
+                &key_path,
+                NativeAsyncMapContext::Key,
             )
+            .or_else(|| {
+                let value_path = format!("{path}.value");
+                unsupported_native_async_data_type_reason(
+                    map.value_type(),
+                    &value_path,
+                    NativeAsyncMapContext::Value,
+                )
+            })
         }
         KernelDataType::Primitive(_) => None,
     }
@@ -2142,7 +2179,7 @@ mod tests {
     }
 
     #[test]
-    fn native_async_schema_gate_rejects_map_nested_field_id_matching()
+    fn native_async_schema_gate_allows_map_value_nested_field_id_matching()
     -> Result<(), Box<dyn std::error::Error>> {
         let schema = kernel_schema([KernelStructField::new(
             "attributes",
@@ -2159,10 +2196,64 @@ mod tests {
                 .to_owned(),
             KernelMetadataValue::String(r#"{"attributes.value":2}"#.to_owned()),
         )])])?;
+
+        assert_eq!(
+            unsupported_native_async_physical_schema_reason(&schema),
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_gate_rejects_map_key_field_id_matching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let key_type = KernelStructType::try_new([KernelStructField::new(
+            "name",
+            KernelDataType::STRING,
+            true,
+        )
+        .add_metadata(kernel_field_id_metadata(2))])?;
+        let schema = kernel_schema([KernelStructField::new(
+            "attributes",
+            delta_kernel::schema::MapType::new(
+                KernelDataType::Struct(Box::new(key_type)),
+                KernelDataType::INTEGER,
+                true,
+            ),
+            true,
+        )])?;
         let reason =
             unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
 
-        assert!(reason.contains("map nested field-id"));
+        assert!(reason.contains("map key field-id"));
+        assert!(reason.contains("attributes.key.name"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_gate_rejects_complex_map_key_nested_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = kernel_schema([KernelStructField::new(
+            "attributes",
+            delta_kernel::schema::MapType::new(
+                delta_kernel::schema::ArrayType::new(KernelDataType::STRING, true),
+                KernelDataType::INTEGER,
+                true,
+            ),
+            true,
+        )
+        .add_metadata([(
+            KernelColumnMetadataKey::ColumnMappingNestedIds
+                .as_ref()
+                .to_owned(),
+            KernelMetadataValue::String(r#"{"attributes.key":2}"#.to_owned()),
+        )])])?;
+        let reason =
+            unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
+
+        assert!(reason.contains("complex map key field-id"));
         assert!(reason.contains("attributes"));
 
         Ok(())
