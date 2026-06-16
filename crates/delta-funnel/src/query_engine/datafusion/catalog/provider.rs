@@ -45,6 +45,7 @@ pub(crate) struct DeltaTableProvider {
     schema: SchemaRef,
     scan_target_partitions: Option<usize>,
     execution_options: DeltaProviderScanExecutionOptions,
+    resolve_default_scan_wide_capacity: bool,
 }
 
 impl DeltaTableProvider {
@@ -62,19 +63,42 @@ impl DeltaTableProvider {
         preflight: ProtocolPreflight,
         scan_target_partitions: Option<usize>,
     ) -> Result<Self, DeltaFunnelError> {
-        Self::try_new_with_execution_options(
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::OfficialKernel,
+            1,
+            1,
+        )?;
+        Self::try_new_with_execution_options_and_default_capacity_resolution(
             source,
             preflight,
             scan_target_partitions,
-            DeltaProviderScanExecutionOptions::default(),
+            execution_options,
+            false,
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn try_new_with_execution_options(
         source: PlannedDeltaSource,
         preflight: ProtocolPreflight,
         scan_target_partitions: Option<usize>,
         execution_options: DeltaProviderScanExecutionOptions,
+    ) -> Result<Self, DeltaFunnelError> {
+        Self::try_new_with_execution_options_and_default_capacity_resolution(
+            source,
+            preflight,
+            scan_target_partitions,
+            execution_options,
+            false,
+        )
+    }
+
+    pub(crate) fn try_new_with_execution_options_and_default_capacity_resolution(
+        source: PlannedDeltaSource,
+        preflight: ProtocolPreflight,
+        scan_target_partitions: Option<usize>,
+        execution_options: DeltaProviderScanExecutionOptions,
+        resolve_default_scan_wide_capacity: bool,
     ) -> Result<Self, DeltaFunnelError> {
         reject_mismatched_preflight(&source, preflight.protocol())?;
         execution_options.validate()?;
@@ -87,6 +111,7 @@ impl DeltaTableProvider {
             schema,
             scan_target_partitions,
             execution_options,
+            resolve_default_scan_wide_capacity,
         })
     }
 
@@ -480,12 +505,20 @@ impl TableProvider for DeltaTableProvider {
         )?;
         let partition_plan = scan_plan
             .plan_file_task_partitions(partition_target_decision.file_task_partition_options())?;
+        let execution_options = if self.resolve_default_scan_wide_capacity {
+            self.execution_options
+                .with_default_scan_wide_capacity_for_target_partitions(
+                    partition_target_decision.target_partitions,
+                )?
+        } else {
+            self.execution_options
+        };
 
         Ok(Arc::new(DeltaScanPlanningExec::new(
             scan_plan,
             partition_plan,
             partition_target_decision,
-            self.execution_options,
+            execution_options,
         )))
     }
 

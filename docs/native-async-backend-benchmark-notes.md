@@ -34,7 +34,9 @@ The matrix covered:
 - Reader backends: `official_kernel`, `native_async`.
 - Scheduling profiles: `lazy_serial_buffer_1`, `lazy_parallel_buffer_1`,
   `lazy_parallel_buffer_4`, `prefetch_1_parallel_buffer_1`, and
-  `prefetch_2_parallel_buffer_1`.
+  `prefetch_2_parallel_buffer_1`, plus available-parallelism multiplier sweep
+  profiles `prefetch_2_ap_target_scan_1x` through
+  `prefetch_2_ap_target_scan_4x`.
 - Workloads: many small files, fewer larger files, and sparse-DV variants of
   both shapes.
 - Queries: projection, count-style aggregate, and predicate-filtered scan.
@@ -323,17 +325,60 @@ count. On the few-larger-files sparse-DV workload, prefetch was neutral for
 projection and slightly slower for count, where only 4 files are available and
 there is little file-open latency to hide.
 
+## Available-Parallelism Scan-Cap Sweep
+
+A scan-wide capacity sweep used the 12M mimic workload, `s3-normal`, native
+async only, repetitions set to 3, 16 scan partitions from detected host
+available parallelism, per-partition file-read capacity 3, prefetch depth 2, and
+scan-wide file-read capacity from 1x through 4x available parallelism:
+
+```bash
+target/release/delta_scan_partition_bench \
+  --mode provider-exec \
+  --provider-exec-repetitions 3 \
+  --provider-exec-workload provider_partitioned_event_log_12m \
+  --provider-exec-query project_event_keys \
+  --provider-exec-backend native_async \
+  --provider-exec-storage-profile s3-normal \
+  --provider-exec-scheduling-profile prefetch_2_ap_target_scan_3x \
+  --output /tmp/delta-provider-ap-sweep-project-prefetch_2_ap_target_scan_3x-rep3.csv
+```
+
+| Query | Scheduling profile | Scan partitions | Scan-wide cap | Total p50 | Total p99 | Time to first batch p50 | Rows/sec p50 | Batch latency p99 | Peak RSS | Peak RSS delta |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| project_event_keys | prefetch_2_ap_target_scan_1x | 16 | 16 | 3.807 s | 3.848 s | 0.105 s | 3,364,378 | 8.255 ms | 216.3 MiB | 120.7 MiB |
+| project_event_keys | prefetch_2_ap_target_scan_2x | 16 | 32 | 2.180 s | 2.321 s | 0.103 s | 5,875,441 | 4.706 ms | 246.9 MiB | 148.8 MiB |
+| project_event_keys | prefetch_2_ap_target_scan_3x | 16 | 48 | 2.006 s | 2.040 s | 0.108 s | 6,383,527 | 4.382 ms | 269.4 MiB | 179.5 MiB |
+| project_event_keys | prefetch_2_ap_target_scan_4x | 16 | 64 | 2.002 s | 2.075 s | 0.109 s | 6,398,023 | 4.261 ms | 275.3 MiB | 175.8 MiB |
+| count_events | prefetch_2_ap_target_scan_1x | 16 | 16 | 3.312 s | 3.319 s | 3.282 s | 3,866,667 | 3284.793 ms | 136.9 MiB | 54.7 MiB |
+| count_events | prefetch_2_ap_target_scan_2x | 16 | 32 | 1.835 s | 1.843 s | 1.800 s | 6,981,278 | 1808.039 ms | 143.6 MiB | 65.2 MiB |
+| count_events | prefetch_2_ap_target_scan_3x | 16 | 48 | 1.741 s | 1.786 s | 1.707 s | 7,356,569 | 1751.387 ms | 152.0 MiB | 73.4 MiB |
+| count_events | prefetch_2_ap_target_scan_4x | 16 | 64 | 1.595 s | 1.773 s | 1.561 s | 8,032,533 | 1739.661 ms | 152.3 MiB | 71.7 MiB |
+
+The 1x scan cap is too low for prefetch depth 2 because it gives every scan
+partition only one scan-wide read slot on average. The 2x cap gets most of the
+benefit, but 3x still improves projection total p50 by about 8% and
+substantially improves projection p99. The 4x cap provides no meaningful
+projection gain over 3x and slightly worsens projection p99 while using more
+peak RSS. Count p50 improves at 4x, but count p99 is nearly tied with 3x and
+does not offset the projection result. Based on this sweep, 3x available
+parallelism is the conservative scan-wide native-async capacity multiplier.
+
 ## Decision
 
-Keep the public provider default unchanged, and keep the official-kernel backend
-as the `DeltaProviderScanExecutionOptions::default()` backend for this slice.
+Make native async the default provider backend for this slice.
 
-For the native async backend specifically, the benchmark evidence supports a
-bounded prefetch profile under remote-object-store-like latency. Parallel lazy
-profiles were materially faster than serial lazy profiles on the local
-small-file matrix. Increasing the output handoff buffer from 1 to 4 was a small
-improvement in that run, but file-level prefetch produced the dominant delayed
-storage gains.
+The default keeps the output handoff buffer at 1 and uses the benchmark-backed
+native async file-read shape: per-partition file-read capacity 3 and prefetch
+depth 2. Default registration resolves scan-wide file-read capacity after scan
+partition planning, using `target_partitions * 3`. Explicit execution options
+remain explicit, including depth 0 for fully lazy native async execution and
+the official-kernel backend for compatibility or comparison.
+
+Parallel lazy profiles were materially faster than serial lazy profiles on the
+local small-file matrix. Increasing the output handoff buffer from 1 to 4 was a
+small improvement in that run, but file-level prefetch produced the dominant
+delayed storage gains.
 
 The repeated 12M count and projection matrices make
 `prefetch_2_parallel_buffer_1` the best native-async default candidate for
@@ -344,9 +389,13 @@ and depth 2 are effectively tied but depth 2 uses about 20.4 MiB more peak RSS.
 The sparse-DV sanity matrix does not show a correctness or memory blocker for
 depth 2.
 
-The native-async selected-backend defaults now apply a capacity-aware bounded
-prefetch depth. Per-partition file-read capacity 1 stays lazy, capacity 2
-defaults to prefetch depth 1, and capacity 3 or greater defaults to prefetch
-depth 2. This lets callers use the benchmark-backed profile by selecting
-capacity 3 per partition and scan-wide capacity sized for the scan partition
-count, while still allowing depth 0 as an explicit lazy override.
+The selected-backend constructor still applies capacity-aware bounded prefetch
+depth. Per-partition file-read capacity 1 stays lazy, capacity 2 defaults to
+prefetch depth 1, and capacity 3 or greater defaults to prefetch depth 2.
+
+The scan-wide capacity sweep supports 3x detected host available parallelism
+without a fixed absolute cap. Because default scan partition planning already
+derives and caps `target_partitions` from DataFusion, available parallelism,
+file-descriptor hints, and memory hints, resolving default scan-wide capacity as
+`target_partitions * 3` applies the same effective multiplier while preserving
+the existing partition-count resource policy.

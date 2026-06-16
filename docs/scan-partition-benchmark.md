@@ -70,7 +70,19 @@ handoff buffer. It also includes native async prefetch profiles that open up to
 one or two additional file streams per execution partition while the current
 file is producing batches. Prefetch depth is bounded by
 `native_async_prefetch_file_count_per_partition` plus the existing scan-wide and
-per-partition file-read limits.
+per-partition file-read limits. The provider-exec matrix also includes
+available-parallelism sweep profiles named
+`prefetch_2_ap_target_scan_1x` through `prefetch_2_ap_target_scan_4x`.
+These profiles set scan partitions to the detected host available parallelism,
+keep per-partition file-read capacity at 3, and vary scan-wide file-read
+capacity as 1x through 4x available parallelism without applying a fixed
+absolute cap.
+
+Production provider registration defaults to the native async backend with
+per-partition file-read capacity 3, prefetch depth 2, output buffer capacity 1,
+and scan-wide capacity resolved as `target_partitions * 3` after scan partition
+planning. Provider-exec benchmark filters can still select the official backend
+or lazy native async profiles explicitly.
 
 Provider-exec mode defaults to local filesystem reads. To compare production
 provider execution under remote-like storage latency, use an opt-in delayed
@@ -86,6 +98,20 @@ cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
   --provider-exec-scheduling-profile lazy_parallel_buffer_4 \
   --provider-exec-repetitions 1 \
   --output target/delta-provider-exec-s3-normal-project.csv
+```
+
+Run one available-parallelism multiplier sweep case:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode provider-exec \
+  --provider-exec-storage-profile s3-normal \
+  --provider-exec-workload provider_partitioned_event_log_12m \
+  --provider-exec-query project_event_keys \
+  --provider-exec-backend native_async \
+  --provider-exec-scheduling-profile prefetch_2_ap_target_scan_3x \
+  --provider-exec-repetitions 3 \
+  --output target/delta-provider-exec-ap-sweep-project.csv
 ```
 
 Supported provider-exec storage profiles are:

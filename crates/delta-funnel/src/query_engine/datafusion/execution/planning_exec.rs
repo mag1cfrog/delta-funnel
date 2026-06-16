@@ -869,15 +869,27 @@ mod tests {
         assert_eq!(scans.len(), 1);
         assert_eq!(scans[0].scan_plan().scan_projection, Some(vec![0]));
         assert_eq!(
-            scans[0].execution_options(),
-            super::DeltaProviderScanExecutionOptions::default()
+            scans[0].execution_options().reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+        assert_eq!(
+            scans[0]
+                .execution_options()
+                .max_concurrent_file_reads_per_partition,
+            3
+        );
+        assert_eq!(
+            scans[0]
+                .execution_options()
+                .max_concurrent_file_reads_per_scan,
+            scans[0].partition_target_decision().target_partitions * 3
         );
         let read_stats = scans[0].read_stats_snapshot();
         assert_eq!(read_stats.source_name, "orders");
         assert_eq!(read_stats.snapshot_version, 1);
         assert_eq!(
             read_stats.reader_backend,
-            DeltaProviderReaderBackend::OfficialKernel
+            DeltaProviderReaderBackend::NativeAsync
         );
         assert_eq!(read_stats.scan_metadata_exhausted, Some(true));
         assert_eq!(
@@ -928,13 +940,19 @@ mod tests {
             storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
-        register_delta_sources(
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::OfficialKernel,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
             &ctx,
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
                 scan_target_partitions: None,
             }],
+            execution_options,
         )?;
 
         let dataframe = ctx.sql("select * from orders").await?;
@@ -991,11 +1009,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequential_execution_reads_real_delta_file() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn default_execution_reads_real_delta_file() -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
-        let _table =
-            register_real_parquet_source(&ctx, "orders", "sequential-execution-real-read")?;
+        let _table = register_real_parquet_source(&ctx, "orders", "default-execution-real-read")?;
 
         let dataframe = ctx
             .sql("select id, customer_name from orders order by id")
@@ -1007,11 +1023,11 @@ mod tests {
         assert_eq!(scans.len(), 1);
         assert_eq!(
             scans[0].execution_options().reader_backend,
-            DeltaProviderReaderBackend::OfficialKernel
+            DeltaProviderReaderBackend::NativeAsync
         );
         assert_eq!(
             scans[0].read_stats_snapshot().reader_backend,
-            DeltaProviderReaderBackend::OfficialKernel
+            DeltaProviderReaderBackend::NativeAsync
         );
 
         let result =
@@ -1072,6 +1088,57 @@ mod tests {
         assert_eq!(
             scans[0].read_stats_snapshot().reader_backend,
             DeltaProviderReaderBackend::OfficialKernel
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_default_valued_execution_options_keep_explicit_scan_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_sized_adds(
+            "explicit-default-valued-execution-options",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            r#"[]"#,
+            &[
+                (r#""partitionValues":{}"#, 10),
+                (r#""partitionValues":{}"#, 10),
+                (r#""partitionValues":{}"#, 10),
+                (r#""partitionValues":{}"#, 10),
+            ],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+            storage_options: Default::default(),
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::default();
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(4),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].partition_target_decision().target_partitions, 4);
+        assert_eq!(scans[0].execution_options(), execution_options);
+        assert_eq!(
+            scans[0]
+                .execution_options()
+                .max_concurrent_file_reads_per_scan,
+            3
         );
 
         Ok(())
@@ -3167,13 +3234,19 @@ mod tests {
             storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
-        register_delta_sources(
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::OfficialKernel,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
             &ctx,
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
                 scan_target_partitions: None,
             }],
+            execution_options,
         )?;
 
         let dataframe = ctx.sql("select region, id from orders order by id").await?;
@@ -3490,13 +3563,19 @@ mod tests {
             storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
-        register_delta_sources(
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::OfficialKernel,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
             &ctx,
             vec![DeltaTableProviderConfig {
                 source,
                 protocol: preflight,
                 scan_target_partitions: None,
             }],
+            execution_options,
         )?;
 
         let id_dataframe = ctx

@@ -79,6 +79,45 @@ fn assert_scan_does_not_support_limit_pushdown(scan: &DeltaScanPlanningExec) {
     assert!(scan.with_fetch(Some(1)).is_none());
 }
 
+fn register_delta_sources_with_official_kernel(
+    ctx: &SessionContext,
+    configs: Vec<DeltaTableProviderConfig>,
+) -> Result<(), DeltaFunnelError> {
+    let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+        DeltaProviderReaderBackend::OfficialKernel,
+        1,
+        1,
+    )?;
+    register_delta_sources_with_scan_execution_options(ctx, configs, execution_options)?;
+
+    Ok(())
+}
+
+fn register_fixture_source_with_official_kernel(
+    ctx: &SessionContext,
+    name: &str,
+    table_name_suffix: &str,
+) -> Result<DeltaLogTable, Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new(table_name_suffix)?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: name.to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+        storage_options: Default::default(),
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    register_delta_sources_with_official_kernel(
+        ctx,
+        vec![DeltaTableProviderConfig {
+            source,
+            protocol: preflight,
+            scan_target_partitions: None,
+        }],
+    )?;
+
+    Ok(table)
+}
+
 fn id_stats_add_json(num_records: i64, min_value: i32, max_value: i32, null_count: i64) -> String {
     format!(
         r#""partitionValues":{{}},"stats":"{{\"numRecords\":{num_records},\"minValues\":{{\"id\":{min_value}}},\"maxValues\":{{\"id\":{max_value}}},\"nullCount\":{{\"id\":{null_count}}}}}""#
@@ -5213,7 +5252,7 @@ async fn sql_limit_stays_above_inexact_residual_filter_scan()
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -5337,7 +5376,8 @@ async fn sql_analysis_works_for_projection_without_delta_projection_config()
 async fn residual_filter_column_remains_available_below_final_projection()
 -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
-    let _table = register_fixture_source(&ctx, "orders", "residual-filter-projection")?;
+    let _table =
+        register_fixture_source_with_official_kernel(&ctx, "orders", "residual-filter-projection")?;
 
     let dataframe = ctx
         .sql("select id from orders where customer_name = 'alice'")
@@ -5388,7 +5428,7 @@ async fn data_stats_residual_column_remains_available_below_final_projection()
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -5451,7 +5491,7 @@ async fn string_data_stats_residual_column_remains_available_below_final_project
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -5514,7 +5554,7 @@ async fn floating_data_stats_residual_column_remains_available_below_final_proje
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -5583,7 +5623,7 @@ async fn sql_floating_data_stats_supported_filters_remain_residual()
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -5687,7 +5727,7 @@ async fn boolean_data_stats_residual_column_remains_available_below_final_projec
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -5750,7 +5790,7 @@ async fn binary_data_stats_residual_column_remains_available_below_final_project
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -5814,7 +5854,7 @@ async fn temporal_data_stats_residual_column_remains_available_below_final_proje
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -5877,7 +5917,7 @@ async fn decimal_data_stats_residual_column_remains_available_below_final_projec
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -5942,7 +5982,7 @@ async fn composed_stats_residual_column_remains_available_below_final_projection
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -6026,7 +6066,7 @@ async fn mixed_partition_pruning_keeps_residual_column_below_final_projection()
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -6112,7 +6152,7 @@ async fn sql_exact_partition_filter_is_pushed_without_residual_filter()
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -6182,7 +6222,7 @@ async fn sql_partition_in_filter_is_exact_kernel_pushdown() -> Result<(), Box<dy
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
@@ -6477,7 +6517,7 @@ async fn sql_mixed_boolean_partition_filters_keep_required_residual_filters()
         storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
+    register_delta_sources_with_official_kernel(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,

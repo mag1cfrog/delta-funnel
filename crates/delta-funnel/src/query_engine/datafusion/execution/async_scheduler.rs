@@ -180,7 +180,7 @@ mod tests {
     use crate::DeltaFunnelError;
     use crate::query_engine::datafusion::execution::scheduling::{
         DeltaProviderAsyncFileReadPermit, DeltaProviderAsyncReadLimiter,
-        DeltaProviderScanExecutionOptions,
+        DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
     };
 
     #[derive(Clone, Copy)]
@@ -396,8 +396,14 @@ mod tests {
     #[tokio::test]
     async fn scheduler_does_not_admit_file_work_before_permits()
     -> Result<(), Box<dyn std::error::Error>> {
-        let limiter =
-            DeltaProviderAsyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let limiter = DeltaProviderAsyncReadLimiter::new(
+            DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+                DeltaProviderReaderBackend::NativeAsync,
+                1,
+                1,
+            )?,
+            1,
+        );
         let partition = limiter.partition_limiter(0)?;
         let held_permit = partition.acquire_file_permit().await?;
         let reader = Arc::new(CountingAsyncFileReader::new());

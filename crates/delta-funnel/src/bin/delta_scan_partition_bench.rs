@@ -345,7 +345,7 @@ async fn write_provider_exec_benchmark_csv_async(
         .filter(|workload| provider_exec_filter_matches(&config.workload_filter, workload.name))
         .collect::<Vec<_>>();
     validate_provider_exec_filter_result("workload", &config.workload_filter, workloads.len())?;
-    let scheduling_profiles = ProviderExecSchedulingProfile::standard_cases();
+    let scheduling_profiles = ProviderExecSchedulingProfile::standard_cases(run_environment);
     let scheduling_profiles = scheduling_profiles
         .into_iter()
         .filter(|profile| {
@@ -1118,8 +1118,9 @@ impl ProviderExecQueryCase {
 }
 
 impl ProviderExecSchedulingProfile {
-    fn standard_cases() -> [Self; 5] {
-        [
+    fn standard_cases(run_environment: BenchmarkRunEnvironment) -> Vec<Self> {
+        let available_parallelism = run_environment.available_parallelism.unwrap_or(4).max(1);
+        let mut profiles = vec![
             Self {
                 name: "lazy_serial_buffer_1",
                 scan_target_partitions: 1,
@@ -1160,7 +1161,27 @@ impl ProviderExecSchedulingProfile {
                 output_buffer_capacity_per_partition: 1,
                 native_async_prefetch_file_count_per_partition: 2,
             },
-        ]
+        ];
+        profiles.extend(
+            [
+                ("prefetch_2_ap_target_scan_1x", 1_usize),
+                ("prefetch_2_ap_target_scan_2x", 2),
+                ("prefetch_2_ap_target_scan_3x", 3),
+                ("prefetch_2_ap_target_scan_4x", 4),
+            ]
+            .into_iter()
+            .map(|(name, scan_multiplier)| Self {
+                name,
+                scan_target_partitions: available_parallelism,
+                max_concurrent_file_reads_per_scan: available_parallelism
+                    .saturating_mul(scan_multiplier)
+                    .max(1),
+                max_concurrent_file_reads_per_partition: 3,
+                output_buffer_capacity_per_partition: 1,
+                native_async_prefetch_file_count_per_partition: 2,
+            }),
+        );
+        profiles
     }
 }
 
@@ -6661,7 +6682,13 @@ mod tests {
             .iter()
             .map(|query| query.name)
             .collect::<Vec<_>>();
-        let scheduling_profiles = ProviderExecSchedulingProfile::standard_cases();
+        let scheduling_profiles =
+            ProviderExecSchedulingProfile::standard_cases(BenchmarkRunEnvironment {
+                schema_version: BENCHMARK_SCHEMA_VERSION,
+                host_os: "test-os",
+                host_arch: "test-arch",
+                available_parallelism: Some(8),
+            });
         let scheduling_profile_names = scheduling_profiles
             .iter()
             .map(|profile| profile.name)
@@ -6699,7 +6726,11 @@ mod tests {
                 "lazy_parallel_buffer_1",
                 "lazy_parallel_buffer_4",
                 "prefetch_1_parallel_buffer_1",
-                "prefetch_2_parallel_buffer_1"
+                "prefetch_2_parallel_buffer_1",
+                "prefetch_2_ap_target_scan_1x",
+                "prefetch_2_ap_target_scan_2x",
+                "prefetch_2_ap_target_scan_3x",
+                "prefetch_2_ap_target_scan_4x"
             ]
         );
         assert_eq!(
@@ -6713,6 +6744,24 @@ mod tests {
         assert_eq!(
             scheduling_profiles[4].native_async_prefetch_file_count_per_partition,
             2
+        );
+        assert_eq!(scheduling_profiles[5].scan_target_partitions, 8);
+        assert_eq!(scheduling_profiles[5].max_concurrent_file_reads_per_scan, 8);
+        assert_eq!(
+            scheduling_profiles[5].max_concurrent_file_reads_per_partition,
+            3
+        );
+        assert_eq!(
+            scheduling_profiles[6].max_concurrent_file_reads_per_scan,
+            16
+        );
+        assert_eq!(
+            scheduling_profiles[7].max_concurrent_file_reads_per_scan,
+            24
+        );
+        assert_eq!(
+            scheduling_profiles[8].max_concurrent_file_reads_per_scan,
+            32
         );
         Ok(())
     }
