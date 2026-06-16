@@ -92,7 +92,9 @@ where
 #[allow(dead_code)]
 impl<Task, Output, Reader> DeltaProviderAsyncPartitionReadScheduler<Task, Output, Reader>
 where
-    Reader: DeltaProviderAsyncFileReader<Task, Output> + ?Sized,
+    Task: Send + 'static,
+    Output: 'static,
+    Reader: DeltaProviderAsyncFileReader<Task, Output> + ?Sized + 'static,
 {
     /// Builds a lazy native async scheduler for one execution partition.
     pub(crate) fn new(
@@ -125,6 +127,27 @@ where
         self.admitted_file_tasks = self.admitted_file_tasks.saturating_add(1);
 
         Some(self.reader.start_file_read(task, permit).await)
+    }
+
+    /// Starts opening one future file without borrowing the scheduler.
+    ///
+    /// This is used only by the bounded prefetch stream adapter. Creating the
+    /// future admits the task to the prefetch window, but permits are still
+    /// acquired inside the future before reader work starts. Dropping the
+    /// future cancels setup and releases any permit already acquired.
+    pub(crate) fn start_prefetch_file(
+        &mut self,
+    ) -> Option<DeltaProviderAsyncFileReadFuture<Output>> {
+        let task = self.file_tasks.pop_front()?;
+        let reader = Arc::clone(&self.reader);
+        let partition_limiter = self.partition_limiter.clone();
+        self.admitted_file_tasks = self.admitted_file_tasks.saturating_add(1);
+
+        Some(Box::pin(async move {
+            let permit = partition_limiter.acquire_file_permit().await?;
+
+            reader.start_file_read(task, permit).await
+        }))
     }
 
     /// Planned file tasks not yet admitted to a read future.
@@ -478,6 +501,78 @@ mod tests {
         assert_eq!(scheduler.admitted_file_tasks(), 1);
         assert_eq!(scheduler.remaining_file_tasks(), 1);
         assert_eq!(limiter.active_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prefetch_file_future_is_cancellable_before_polling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter =
+            DeltaProviderAsyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let partition = limiter.partition_limiter(0)?;
+        let reader = Arc::new(CountingAsyncFileReader::new());
+        let mut scheduler = DeltaProviderAsyncPartitionReadScheduler::new(
+            DeltaProviderAsyncPartitionReadSchedulerConfig::new(
+                vec![FakeFileTask { id: 1 }, FakeFileTask { id: 2 }],
+                Arc::clone(&reader),
+                partition,
+            ),
+        );
+
+        let prefetched = scheduler
+            .start_prefetch_file()
+            .ok_or("expected prefetched file future")?;
+
+        assert_eq!(scheduler.admitted_file_tasks(), 1);
+        assert_eq!(scheduler.remaining_file_tasks(), 1);
+        assert_eq!(reader.futures_created(), 0);
+        assert_eq!(reader.reads_started(), 0);
+        assert_eq!(limiter.active_file_reads(), 0);
+
+        drop(prefetched);
+
+        assert_eq!(reader.futures_created(), 0);
+        assert_eq!(reader.reads_started(), 0);
+        assert_eq!(limiter.active_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_in_flight_prefetch_future_releases_permits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter =
+            DeltaProviderAsyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let partition = limiter.partition_limiter(0)?;
+        let reader = Arc::new(PendingAsyncFileReader::new());
+        let mut scheduler = DeltaProviderAsyncPartitionReadScheduler::new(
+            DeltaProviderAsyncPartitionReadSchedulerConfig::new(
+                vec![FakeFileTask { id: 1 }],
+                Arc::clone(&reader),
+                partition,
+            ),
+        );
+        let mut prefetched = scheduler
+            .start_prefetch_file()
+            .ok_or("expected prefetched file future")?;
+
+        tokio::select! {
+            output = &mut prefetched => {
+                return Err(format!("pending prefetch should not complete: {output:?}").into());
+            }
+            () = tokio::task::yield_now() => {}
+        }
+
+        assert_eq!(reader.futures_created(), 1);
+        assert_eq!(reader.reads_started(), 1);
+        assert_eq!(limiter.active_file_reads(), 1);
+
+        drop(prefetched);
+
+        assert_eq!(limiter.active_file_reads(), 0);
+        assert_eq!(scheduler.admitted_file_tasks(), 1);
+        assert_eq!(scheduler.remaining_file_tasks(), 0);
 
         Ok(())
     }

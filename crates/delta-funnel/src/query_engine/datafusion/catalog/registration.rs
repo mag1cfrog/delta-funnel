@@ -290,6 +290,7 @@ mod tests {
                 max_concurrent_file_reads_per_scan: 0,
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 1,
+                native_async_prefetch_file_count_per_partition: 0,
             },
         );
 
@@ -328,6 +329,7 @@ mod tests {
                 max_concurrent_file_reads_per_scan: 1,
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 1,
+                native_async_prefetch_file_count_per_partition: 0,
             },
         )?;
 

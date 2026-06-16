@@ -58,16 +58,19 @@ DataFusion provider registration, selects the requested provider backend through
 provider execution output. It does not use a benchmark-only reader path.
 
 The provider-exec matrix compares the official kernel backend against the
-native async backend with lazy scheduling. It covers non-DV and sparse-DV
-versions of a many-small-files shape, a fewer-larger-files shape, and a
-12,808,140-row `provider_partitioned_event_log_12m` shape based on the
-synthetic partitioned event log model. Each workload runs a projection query, a
-count-style query, and a predicate query that exercises provider predicate
-handling. Each case runs production scheduling profiles for serial lazy reads,
+native async backend with lazy and bounded-prefetch scheduling profiles. It
+covers non-DV and sparse-DV versions of a many-small-files shape, a
+fewer-larger-files shape, and a 12,808,140-row
+`provider_partitioned_event_log_12m` shape based on the synthetic partitioned
+event log model. Each workload runs a projection query, a count-style query,
+and a predicate query that exercises provider predicate handling. Each case runs
+production scheduling profiles for serial lazy reads,
 parallel lazy reads, and parallel lazy reads with a larger bounded output
-handoff buffer. Later #161 slices should extend this same mode with a bounded
-prefetch scheduler only if that variant exists in the production native
-execution path.
+handoff buffer. It also includes native async prefetch profiles that open up to
+one or two additional file streams per execution partition while the current
+file is producing batches. Prefetch depth is bounded by
+`native_async_prefetch_file_count_per_partition` plus the existing scan-wide and
+per-partition file-read limits.
 
 Provider-exec mode defaults to local filesystem reads. To compare production
 provider execution under remote-like storage latency, use an opt-in delayed
@@ -266,10 +269,13 @@ important field groups are:
   - `max_concurrent_file_reads_per_scan`
   - `max_concurrent_file_reads_per_partition`
   - `output_buffer_capacity_per_partition`
+  - `native_async_prefetch_file_count_per_partition`
   - `repetitions`
   - `file_count`
   - `row_count`
   - `data_file_bytes`
+  - `process_peak_rss_bytes`
+  - `process_peak_rss_delta_bytes`
   - `deletion_vector_file_count`
   - `deletion_vector_deleted_rows`
   - `deletion_vector_deleted_rows_per_file`
@@ -359,11 +365,10 @@ temporary Delta tables, Parquet decoding, Arrow batch production, provider
 backend selection, DataFusion SQL planning, and DataFusion collection. The
 default provider-exec mode is local-file based. Opt-in delayed HTTP storage
 profiles add controlled object-store-like latency and byte-range reads without
-changing the production provider reader path. Provider-exec mode does not expose
-a bounded prefetch scheduler. It does compare existing production
-read-admission and output-buffer settings, and it records provider owned read
-stats from the physical Delta scan plan. Any later prefetch work must still use
-production provider execution paths.
+changing the production provider reader path. Provider-exec mode compares
+production read-admission, output-buffer, and bounded native async prefetch
+settings, and it records provider owned read stats from the physical Delta scan
+plan.
 
 Representative native async backend benchmark notes and the current scheduling
 decision are recorded in

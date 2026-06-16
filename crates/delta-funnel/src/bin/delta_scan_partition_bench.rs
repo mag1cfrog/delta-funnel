@@ -52,7 +52,7 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 14;
+const BENCHMARK_SCHEMA_VERSION: u32 = 16;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
@@ -145,7 +145,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 59] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 62] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -162,6 +162,7 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 59] = [
     "max_concurrent_file_reads_per_scan",
     "max_concurrent_file_reads_per_partition",
     "output_buffer_capacity_per_partition",
+    "native_async_prefetch_file_count_per_partition",
     "repetitions",
     "file_count",
     "row_count",
@@ -188,6 +189,8 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 59] = [
     "provider_stats_deletion_vector_rejections_p50",
     "produced_rows",
     "produced_batches",
+    "process_peak_rss_bytes",
+    "process_peak_rss_delta_bytes",
     "planning_micros_p50",
     "planning_micros_p95",
     "planning_micros_p99",
@@ -532,6 +535,7 @@ struct ProviderExecSchedulingProfile {
     max_concurrent_file_reads_per_scan: usize,
     max_concurrent_file_reads_per_partition: usize,
     output_buffer_capacity_per_partition: usize,
+    native_async_prefetch_file_count_per_partition: usize,
 }
 
 struct ProviderExecDeltaTable {
@@ -584,6 +588,8 @@ struct ProviderExecRunMeasurement {
     source_rows_per_second: u64,
     produced_rows: usize,
     produced_batches: usize,
+    process_peak_rss_bytes: Option<u64>,
+    process_peak_rss_delta_bytes: Option<u64>,
     batch_latency_micros: Vec<u64>,
     read_stats: ProviderExecReadStatsMeasurement,
 }
@@ -617,6 +623,8 @@ struct ProviderExecSummary {
     total_micros: PercentileSummary,
     source_rows_per_second: PercentileSummary,
     batch_latency_micros: PercentileSummary,
+    process_peak_rss_bytes: Option<u64>,
+    process_peak_rss_delta_bytes: Option<u64>,
     min_total_micros: u64,
     max_total_micros: u64,
     read_stats: ProviderExecReadStatsSummary,
@@ -1110,7 +1118,7 @@ impl ProviderExecQueryCase {
 }
 
 impl ProviderExecSchedulingProfile {
-    fn standard_cases() -> [Self; 3] {
+    fn standard_cases() -> [Self; 5] {
         [
             Self {
                 name: "lazy_serial_buffer_1",
@@ -1118,6 +1126,7 @@ impl ProviderExecSchedulingProfile {
                 max_concurrent_file_reads_per_scan: 1,
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 1,
+                native_async_prefetch_file_count_per_partition: 0,
             },
             Self {
                 name: "lazy_parallel_buffer_1",
@@ -1125,6 +1134,7 @@ impl ProviderExecSchedulingProfile {
                 max_concurrent_file_reads_per_scan: 4,
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 1,
+                native_async_prefetch_file_count_per_partition: 0,
             },
             Self {
                 name: "lazy_parallel_buffer_4",
@@ -1132,6 +1142,23 @@ impl ProviderExecSchedulingProfile {
                 max_concurrent_file_reads_per_scan: 4,
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 4,
+                native_async_prefetch_file_count_per_partition: 0,
+            },
+            Self {
+                name: "prefetch_1_parallel_buffer_1",
+                scan_target_partitions: 4,
+                max_concurrent_file_reads_per_scan: 8,
+                max_concurrent_file_reads_per_partition: 2,
+                output_buffer_capacity_per_partition: 1,
+                native_async_prefetch_file_count_per_partition: 1,
+            },
+            Self {
+                name: "prefetch_2_parallel_buffer_1",
+                scan_target_partitions: 4,
+                max_concurrent_file_reads_per_scan: 12,
+                max_concurrent_file_reads_per_partition: 3,
+                output_buffer_capacity_per_partition: 1,
+                native_async_prefetch_file_count_per_partition: 2,
             },
         ]
     }
@@ -1796,6 +1823,9 @@ async fn run_provider_exec_once(
     )?
     .with_output_buffer_capacity_per_partition(
         scheduling_profile.output_buffer_capacity_per_partition,
+    )?
+    .with_native_async_prefetch_file_count_per_partition(
+        scheduling_profile.native_async_prefetch_file_count_per_partition,
     )?;
     register_delta_sources_with_scan_execution_options(
         &ctx,
@@ -1813,6 +1843,7 @@ async fn run_provider_exec_once(
     let physical_plan = dataframe.create_physical_plan().await?;
     let stats_plan = Arc::clone(&physical_plan);
     let planning_micros = u128_to_u64_saturating(planning_started.elapsed().as_micros());
+    let process_peak_rss_before_bytes = process_peak_rss_bytes();
     let execution_started = Instant::now();
     let mut stream = datafusion::physical_plan::execute_stream(physical_plan, ctx.task_ctx())?;
     let mut produced_rows = 0_usize;
@@ -1838,6 +1869,12 @@ async fn run_provider_exec_once(
     }
 
     let total_micros = u128_to_u64_saturating(query_started.elapsed().as_micros()).max(1);
+    let process_peak_rss_bytes = process_peak_rss_bytes();
+    let process_peak_rss_delta_bytes = match (process_peak_rss_before_bytes, process_peak_rss_bytes)
+    {
+        (Some(before), Some(after)) => Some(after.saturating_sub(before)),
+        _ => None,
+    };
     let read_stats = provider_exec_read_stats_measurement(&collect_delta_provider_read_stats(
         stats_plan.as_ref(),
     ));
@@ -1852,6 +1889,8 @@ async fn run_provider_exec_once(
         source_rows_per_second,
         produced_rows,
         produced_batches,
+        process_peak_rss_bytes,
+        process_peak_rss_delta_bytes,
         batch_latency_micros,
         read_stats,
     })
@@ -1901,6 +1940,14 @@ fn provider_exec_summary(measurements: &[ProviderExecRunMeasurement]) -> Provide
                 .collect::<Vec<_>>(),
         ),
         batch_latency_micros: percentile_summary(&batch_latency_micros),
+        process_peak_rss_bytes: measurements
+            .iter()
+            .filter_map(|measurement| measurement.process_peak_rss_bytes)
+            .max(),
+        process_peak_rss_delta_bytes: measurements
+            .iter()
+            .filter_map(|measurement| measurement.process_peak_rss_delta_bytes)
+            .max(),
         min_total_micros: total_micros.iter().copied().min().unwrap_or(0),
         max_total_micros: total_micros.iter().copied().max().unwrap_or(0),
         read_stats: provider_exec_read_stats_summary(measurements),
@@ -2162,6 +2209,10 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
             .scheduling_profile
             .output_buffer_capacity_per_partition
             .to_string(),
+        input
+            .scheduling_profile
+            .native_async_prefetch_file_count_per_partition
+            .to_string(),
         summary.repetitions.to_string(),
         input.table.file_count.to_string(),
         input.table.row_count.to_string(),
@@ -2191,6 +2242,8 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         read_stats.deletion_vector_rejections.to_string(),
         summary.produced_rows.to_string(),
         summary.produced_batches.to_string(),
+        optional_u64(summary.process_peak_rss_bytes),
+        optional_u64(summary.process_peak_rss_delta_bytes),
         summary.planning_micros.p50.to_string(),
         summary.planning_micros.p95.to_string(),
         summary.planning_micros.p99.to_string(),
@@ -4816,6 +4869,36 @@ fn u128_to_u64_saturating(value: u128) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+fn process_peak_rss_bytes() -> Option<u64> {
+    process_status_memory_kib("VmHWM").map(|kib| kib.saturating_mul(1024))
+}
+
+fn process_status_memory_kib(key: &str) -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    process_status_memory_kib_from_status(&status, key)
+}
+
+fn process_status_memory_kib_from_status(status: &str, key: &str) -> Option<u64> {
+    for line in status.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name != key {
+            continue;
+        }
+        let mut fields = value.split_whitespace();
+        let kib = fields.next()?.parse::<u64>().ok()?;
+        let unit = fields.next();
+        if unit.is_some_and(|unit| unit != "kB") {
+            return None;
+        }
+
+        return Some(kib);
+    }
+
+    None
+}
+
 fn benchmark_csv_row(input: BenchmarkCsvRowInput<'_>) -> Vec<String> {
     let shape = input.shape;
     let file_set = input.file_set;
@@ -6490,6 +6573,25 @@ mod tests {
     }
 
     #[test]
+    fn process_status_memory_kib_parses_linux_status_fields() {
+        let status = [
+            "Name:\tdelta_scan_partition_bench",
+            "VmRSS:\t  1000 kB",
+            "VmHWM:\t  2048 kB",
+        ]
+        .join("\n");
+
+        assert_eq!(
+            process_status_memory_kib_from_status(&status, "VmHWM"),
+            Some(2048)
+        );
+        assert_eq!(
+            process_status_memory_kib_from_status(&status, "VmSwap"),
+            None
+        );
+    }
+
+    #[test]
     fn policy_source_name_renders_csv_fields() {
         assert_eq!(
             policy_source_name(DeltaScanPartitionTargetDiagnosticSource::ExplicitOverride),
@@ -6523,12 +6625,17 @@ mod tests {
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"max_concurrent_file_reads_per_scan"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"max_concurrent_file_reads_per_partition"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"output_buffer_capacity_per_partition"));
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER.contains(&"native_async_prefetch_file_count_per_partition")
+        );
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_file_count"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_deleted_rows"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_deleted_rows_per_file"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_scan_count"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_files_started_p50"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_rows_produced_p50"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_bytes"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_delta_bytes"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"planning_micros_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"time_to_first_batch_micros_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"total_micros_p99"));
@@ -6590,12 +6697,22 @@ mod tests {
             [
                 "lazy_serial_buffer_1",
                 "lazy_parallel_buffer_1",
-                "lazy_parallel_buffer_4"
+                "lazy_parallel_buffer_4",
+                "prefetch_1_parallel_buffer_1",
+                "prefetch_2_parallel_buffer_1"
             ]
         );
         assert_eq!(
             scheduling_profiles[2].output_buffer_capacity_per_partition,
             4
+        );
+        assert_eq!(
+            scheduling_profiles[3].native_async_prefetch_file_count_per_partition,
+            1
+        );
+        assert_eq!(
+            scheduling_profiles[4].native_async_prefetch_file_count_per_partition,
+            2
         );
         Ok(())
     }
@@ -6699,6 +6816,7 @@ mod tests {
             max_concurrent_file_reads_per_scan: 1,
             max_concurrent_file_reads_per_partition: 1,
             output_buffer_capacity_per_partition: 1,
+            native_async_prefetch_file_count_per_partition: 0,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6755,6 +6873,7 @@ mod tests {
             max_concurrent_file_reads_per_scan: 1,
             max_concurrent_file_reads_per_partition: 1,
             output_buffer_capacity_per_partition: 1,
+            native_async_prefetch_file_count_per_partition: 0,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6843,6 +6962,8 @@ mod tests {
                 p95: 51,
                 p99: 52,
             },
+            process_peak_rss_bytes: Some(4096),
+            process_peak_rss_delta_bytes: Some(1024),
             min_total_micros: 29,
             max_total_micros: 33,
             read_stats: ProviderExecReadStatsSummary {
@@ -6887,12 +7008,13 @@ mod tests {
                 max_concurrent_file_reads_per_scan: 4,
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 4,
+                native_async_prefetch_file_count_per_partition: 0,
             },
             summary: &summary,
         });
 
         assert_eq!(row.len(), PROVIDER_EXEC_CSV_HEADER.len());
-        assert_eq!(row[0], "14");
+        assert_eq!(row[0], "16");
         assert_eq!(row[7], "test_sparse_dv");
         assert_eq!(row[8], "local");
         assert_eq!(row[10], "native_async");
@@ -6901,15 +7023,18 @@ mod tests {
         assert_eq!(row[13], "4");
         assert_eq!(row[14], "1");
         assert_eq!(row[15], "4");
-        assert_eq!(row[20], "2");
-        assert_eq!(row[21], "4");
-        assert_eq!(row[22], "2");
-        assert_eq!(row[23], "1");
-        assert_eq!(row[24], "true");
-        assert_eq!(row[27], "16");
-        assert_eq!(row[31], "2");
-        assert_eq!(row[34], "12");
-        assert_eq!(row[40], "12");
+        assert_eq!(row[16], "0");
+        assert_eq!(row[21], "2");
+        assert_eq!(row[22], "4");
+        assert_eq!(row[23], "2");
+        assert_eq!(row[24], "1");
+        assert_eq!(row[25], "true");
+        assert_eq!(row[28], "16");
+        assert_eq!(row[32], "2");
+        assert_eq!(row[35], "12");
+        assert_eq!(row[41], "12");
+        assert_eq!(row[43], "4096");
+        assert_eq!(row[44], "1024");
     }
 
     #[test]

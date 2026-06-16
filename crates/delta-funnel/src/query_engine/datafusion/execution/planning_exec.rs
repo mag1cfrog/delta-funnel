@@ -1,10 +1,12 @@
 //! DataFusion physical execution plan for Delta scans.
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -14,6 +16,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, Partitioning,
     PlanProperties, SendableRecordBatchStream,
 };
+use futures_util::{StreamExt, stream::FuturesOrdered};
+use tokio::sync::mpsc::Sender;
 
 use crate::DeltaFunnelError;
 use crate::error::DeltaScanFileReadPhase;
@@ -24,11 +28,12 @@ use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
 use super::super::planning::scan_plan::ProviderScanPlan;
 use super::async_scheduler::{
-    DeltaProviderAsyncPartitionReadScheduler, DeltaProviderAsyncPartitionReadSchedulerConfig,
+    DeltaProviderAsyncFileReadFuture, DeltaProviderAsyncPartitionReadScheduler,
+    DeltaProviderAsyncPartitionReadSchedulerConfig,
 };
 use super::file_reader::{DeltaFileReadDeletionVectorStats, DeltaFileReadRequest};
 use super::native_async_reader::{
-    DeltaNativeAsyncFileReader, DeltaNativeAsyncFileReaderConfig,
+    DeltaNativeAsyncFileReadStream, DeltaNativeAsyncFileReader, DeltaNativeAsyncFileReaderConfig,
     DeltaNativeAsyncPartitionFileReader,
 };
 use super::read_stats::{DeltaProviderReadStats, DeltaProviderReadStatsConfig};
@@ -292,6 +297,8 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                     file_tasks,
                     partition_limiter,
                     self.execution_options.output_buffer_capacity_per_partition,
+                    self.execution_options
+                        .native_async_prefetch_file_count_per_partition,
                     Arc::clone(&self.read_stats),
                 ))
             }
@@ -393,6 +400,7 @@ fn native_async_scan_partition_stream(
     file_tasks: Vec<DeltaScanFileTask>,
     partition_limiter: DeltaProviderAsyncPartitionReadLimiter,
     output_buffer_capacity: usize,
+    prefetch_file_count: usize,
     read_stats: Arc<DeltaProviderReadStats>,
 ) -> SendableRecordBatchStream {
     let mut builder = RecordBatchReceiverStreamBuilder::new(schema, output_buffer_capacity);
@@ -407,6 +415,15 @@ fn native_async_scan_partition_stream(
                 partition_limiter,
             ),
         );
+        if prefetch_file_count > 0 {
+            return native_async_prefetch_scan_partition(
+                output,
+                scheduler,
+                prefetch_file_count,
+                read_stats,
+            )
+            .await;
+        }
 
         while !output.is_closed() {
             let Some(file_stream) = scheduler.next_file().await else {
@@ -455,6 +472,146 @@ fn native_async_scan_partition_stream(
     });
 
     builder.build()
+}
+
+/// Executes one native async scan partition with bounded file-stream prefetch.
+///
+/// The active file still drives output ordering: batches are emitted only from
+/// the current file stream. Prefetch only overlaps opening later file streams
+/// and Parquet setup while the current stream is producing batches. The bound
+/// is one current file plus `prefetch_file_count` additional ready or in-flight
+/// file streams for this execution partition.
+async fn native_async_prefetch_scan_partition(
+    output: Sender<DataFusionResult<RecordBatch>>,
+    mut scheduler: DeltaProviderAsyncPartitionReadScheduler<
+        DeltaScanFileTask,
+        DeltaNativeAsyncFileReadStream,
+        DeltaNativeAsyncPartitionFileReader,
+    >,
+    prefetch_file_count: usize,
+    read_stats: Arc<DeltaProviderReadStats>,
+) -> DataFusionResult<()> {
+    let mut in_flight = FuturesOrdered::new();
+    let mut ready_file_streams = VecDeque::new();
+    // Before there is a current file, fill the queue with the first file plus
+    // the configured prefetch window.
+    refill_native_async_prefetch_queue(
+        &mut scheduler,
+        &mut in_flight,
+        prefetch_file_count.saturating_add(1),
+    );
+
+    while !output.is_closed() {
+        let file_stream = match ready_file_streams.pop_front() {
+            Some(file_stream) => file_stream,
+            None => {
+                let Some(file_stream) = in_flight.next().await else {
+                    read_stats.record_scan_partition_completed();
+                    return Ok(());
+                };
+                file_stream
+            }
+        };
+        refill_native_async_prefetch_queue(
+            &mut scheduler,
+            &mut in_flight,
+            // A ready prefetched stream already holds a file permit and counts
+            // against the prefetch window even though it is not producing
+            // output yet.
+            prefetch_file_count.saturating_sub(ready_file_streams.len()),
+        );
+        let mut file_stream = native_async_file_stream_from_result(file_stream, &read_stats)?;
+
+        while !output.is_closed() {
+            let next_batch = if ready_file_streams.is_empty() && !in_flight.is_empty() {
+                let next_prefetched_file = in_flight.next();
+                tokio::pin!(next_prefetched_file);
+                tokio::select! {
+                    next_batch = file_stream.next_batch() => next_batch,
+                    next_prefetched_file = &mut next_prefetched_file => {
+                        if let Some(next_prefetched_file) = next_prefetched_file {
+                            ready_file_streams.push_back(next_prefetched_file);
+                        }
+                        refill_native_async_prefetch_queue(
+                            &mut scheduler,
+                            &mut in_flight,
+                            // Keep ready streams and in-flight setup together
+                            // within the configured prefetch window.
+                            prefetch_file_count.saturating_sub(ready_file_streams.len()),
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                file_stream.next_batch().await
+            };
+            record_deletion_vector_read_stats(
+                read_stats.as_ref(),
+                file_stream.take_deletion_vector_stats(),
+            );
+            let batch = match next_batch {
+                Ok(Some(batch)) => batch,
+                Ok(None) => break,
+                Err(error) => {
+                    record_deletion_vector_read_error(read_stats.as_ref(), &error);
+                    return Err(DataFusionError::from(error));
+                }
+            };
+            let rows = batch.num_rows();
+            if output.send(Ok(batch)).await.is_err() {
+                return Ok(());
+            }
+            read_stats.record_batch_produced(rows);
+        }
+        if output.is_closed() {
+            return Ok(());
+        }
+        read_stats.record_file_completed();
+    }
+
+    Ok(())
+}
+
+/// Refills ordered native async file setup up to the requested in-flight target.
+///
+/// `target_in_flight` is the remaining setup capacity after subtracting any
+/// already-ready prefetched file streams. Futures are kept in `FuturesOrdered`
+/// so file streams are consumed in planned file order even when later setup
+/// could complete first.
+fn refill_native_async_prefetch_queue(
+    scheduler: &mut DeltaProviderAsyncPartitionReadScheduler<
+        DeltaScanFileTask,
+        DeltaNativeAsyncFileReadStream,
+        DeltaNativeAsyncPartitionFileReader,
+    >,
+    in_flight: &mut FuturesOrdered<
+        DeltaProviderAsyncFileReadFuture<DeltaNativeAsyncFileReadStream>,
+    >,
+    target_in_flight: usize,
+) {
+    while in_flight.len() < target_in_flight {
+        let Some(file) = scheduler.start_prefetch_file() else {
+            return;
+        };
+        in_flight.push_back(file);
+    }
+}
+
+/// Converts a scheduled file setup result into a stream and records setup-time DV stats.
+fn native_async_file_stream_from_result(
+    file_stream: Result<DeltaNativeAsyncFileReadStream, DeltaFunnelError>,
+    read_stats: &DeltaProviderReadStats,
+) -> DataFusionResult<DeltaNativeAsyncFileReadStream> {
+    let mut file_stream = match file_stream {
+        Ok(file_stream) => file_stream,
+        Err(error) => {
+            record_deletion_vector_read_error(read_stats, &error);
+            return Err(DataFusionError::from(error));
+        }
+    };
+    record_deletion_vector_read_stats(read_stats, file_stream.take_deletion_vector_stats());
+
+    Ok(file_stream)
 }
 
 fn record_deletion_vector_read_stats(
@@ -2806,6 +2963,64 @@ mod tests {
         assert_eq!(stats.files_started, 2);
         assert_eq!(stats.files_completed, 2);
         assert_eq!(stats.rows_produced, 40_000);
+        assert_eq!(scans[0].active_async_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_prefetch_preserves_file_order_and_releases_permits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table =
+            RealParquetDeltaTable::new_with_two_large_files("native-async-prefetch-order", 9000)?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+            storage_options: Default::default(),
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            2,
+            2,
+        )?
+        .with_native_async_prefetch_file_count_per_partition(1)?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        let result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let ids = collect_batch_ids(&result)?;
+        let expected_ids = (1..=18_000).collect::<Vec<_>>();
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0]
+                .execution_options()
+                .native_async_prefetch_file_count_per_partition,
+            1
+        );
+        assert_eq!(scans[0].partition_plan().partitions.len(), 1);
+        assert_eq!(scans[0].partition_plan().partitions[0].file_tasks.len(), 2);
+        assert_eq!(ids, expected_ids);
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.scan_partitions_completed, 1);
+        assert_eq!(stats.files_started, 2);
+        assert_eq!(stats.files_completed, 2);
+        assert_eq!(stats.rows_produced, 18_000);
         assert_eq!(scans[0].active_async_file_reads(), 0);
 
         Ok(())

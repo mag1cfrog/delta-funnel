@@ -56,6 +56,15 @@ pub struct DeltaProviderScanExecutionOptions {
     /// This is the producer-to-DataFusion handoff queue used after file reads
     /// produce Arrow batches. A value of `1` preserves the historical behavior.
     pub output_buffer_capacity_per_partition: usize,
+
+    /// Native async file reads to prefetch ahead of downstream demand per partition.
+    ///
+    /// A value of `0` keeps the native async backend fully lazy: each file is
+    /// opened only after the previous file is drained. Positive values allow
+    /// the native async backend to begin opening additional files while the
+    /// current file is still producing batches. This setting is internal
+    /// hardening and benchmark surface; the official-kernel backend ignores it.
+    pub native_async_prefetch_file_count_per_partition: usize,
 }
 
 /// Sync fallback limiter for provider-scheduled file work in one Delta scan.
@@ -380,6 +389,7 @@ impl Default for DeltaProviderScanExecutionOptions {
             max_concurrent_file_reads_per_scan: 1,
             max_concurrent_file_reads_per_partition: 1,
             output_buffer_capacity_per_partition: 1,
+            native_async_prefetch_file_count_per_partition: 0,
         }
     }
 }
@@ -395,6 +405,7 @@ impl DeltaProviderScanExecutionOptions {
             max_concurrent_file_reads_per_scan,
             max_concurrent_file_reads_per_partition,
             output_buffer_capacity_per_partition: 1,
+            native_async_prefetch_file_count_per_partition: 0,
         };
         options.validate()?;
         Ok(options)
@@ -411,6 +422,7 @@ impl DeltaProviderScanExecutionOptions {
             max_concurrent_file_reads_per_scan,
             max_concurrent_file_reads_per_partition,
             output_buffer_capacity_per_partition: 1,
+            native_async_prefetch_file_count_per_partition: 0,
         };
         options.validate()?;
         Ok(options)
@@ -422,6 +434,17 @@ impl DeltaProviderScanExecutionOptions {
         output_buffer_capacity_per_partition: usize,
     ) -> Result<Self, DeltaFunnelError> {
         self.output_buffer_capacity_per_partition = output_buffer_capacity_per_partition;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Sets native async file-read prefetch depth per execution partition.
+    pub fn with_native_async_prefetch_file_count_per_partition(
+        mut self,
+        native_async_prefetch_file_count_per_partition: usize,
+    ) -> Result<Self, DeltaFunnelError> {
+        self.native_async_prefetch_file_count_per_partition =
+            native_async_prefetch_file_count_per_partition;
         self.validate()?;
         Ok(self)
     }
@@ -489,6 +512,7 @@ mod tests {
             DeltaProviderReaderBackend::OfficialKernel
         );
         assert_eq!(options.output_buffer_capacity_per_partition, 1);
+        assert_eq!(options.native_async_prefetch_file_count_per_partition, 0);
         options.validate()?;
 
         Ok(())
@@ -510,6 +534,7 @@ mod tests {
         assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
         assert_eq!(options.output_buffer_capacity_per_partition, 1);
+        assert_eq!(options.native_async_prefetch_file_count_per_partition, 0);
 
         Ok(())
     }
@@ -530,6 +555,7 @@ mod tests {
         assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
         assert_eq!(options.output_buffer_capacity_per_partition, 1);
+        assert_eq!(options.native_async_prefetch_file_count_per_partition, 0);
 
         Ok(())
     }
@@ -545,6 +571,21 @@ mod tests {
         .with_output_buffer_capacity_per_partition(4)?;
 
         assert_eq!(options.output_buffer_capacity_per_partition, 4);
+
+        Ok(())
+    }
+
+    #[test]
+    fn execution_options_can_set_native_async_prefetch_depth()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            2,
+            2,
+        )?
+        .with_native_async_prefetch_file_count_per_partition(1)?;
+
+        assert_eq!(options.native_async_prefetch_file_count_per_partition, 1);
 
         Ok(())
     }

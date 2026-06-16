@@ -2,8 +2,8 @@
 
 These notes record representative local evidence for issue #161. They are not
 golden performance assertions. They document the command, workload shape, and
-current scheduling decision so future reviewers can audit why no bounded
-prefetch mode is exposed yet.
+current scheduling decision so future reviewers can audit why bounded prefetch
+is benchmark-only and not the default.
 
 ## Command
 
@@ -17,9 +17,11 @@ cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
 ```
 
 The earlier local run used schema version `13` and produced 73 CSV lines: one
-header plus 72 benchmark rows. The current benchmark schema is version `14`,
-which adds `provider_exec_storage_profile` and includes the 12,808,140-row
-`provider_partitioned_event_log_12m` workload.
+header plus 72 benchmark rows. The current benchmark schema is version `16`,
+which adds `provider_exec_storage_profile`, includes the 12,808,140-row
+`provider_partitioned_event_log_12m` workload, and records
+`native_async_prefetch_file_count_per_partition`, `process_peak_rss_bytes`,
+and `process_peak_rss_delta_bytes`.
 
 ## Workloads
 
@@ -31,7 +33,8 @@ The matrix covered:
 
 - Reader backends: `official_kernel`, `native_async`.
 - Scheduling profiles: `lazy_serial_buffer_1`, `lazy_parallel_buffer_1`,
-  `lazy_parallel_buffer_4`.
+  `lazy_parallel_buffer_4`, `prefetch_1_parallel_buffer_1`, and
+  `prefetch_2_parallel_buffer_1`.
 - Workloads: many small files, fewer larger files, and sparse-DV variants of
   both shapes.
 - Queries: projection, count-style aggregate, and predicate-filtered scan.
@@ -128,6 +131,64 @@ The full 12M `s3-normal` provider-exec matrix with repetitions set to 1 exceeded
 scoped to selected workloads, queries, backends, or scheduling profiles unless a
 long benchmark run is explicitly desired.
 
+## Delayed HTTP Native Async Prefetch Comparison
+
+After adding bounded native async prefetch profiles, focused release runs used
+`s3-normal`, the 12M workload, native async only, and repetitions set to 1:
+
+```bash
+target/release/delta_scan_partition_bench \
+  --mode provider-exec \
+  --provider-exec-repetitions 1 \
+  --provider-exec-workload provider_partitioned_event_log_12m \
+  --provider-exec-storage-profile s3-normal \
+  --provider-exec-backend native_async \
+  --provider-exec-query project_event_keys \
+  --output /tmp/delta-provider-exec-12m-s3-normal-native-prefetch-project.csv
+```
+
+The first run executed all native async scheduling profiles in one process and
+did not have clean per-profile RSS isolation:
+
+| Query | Scheduling profile | Prefetch depth | Total | Time to first batch | Rows/sec |
+| --- | --- | ---: | ---: | ---: | ---: |
+| project_event_keys | lazy_parallel_buffer_1 | 0 | 15.765 s | 0.086 s | 812,453 |
+| project_event_keys | lazy_parallel_buffer_4 | 0 | 15.624 s | 0.083 s | 819,761 |
+| project_event_keys | prefetch_1_parallel_buffer_1 | 1 | 8.647 s | 0.086 s | 1,481,244 |
+| project_event_keys | prefetch_2_parallel_buffer_1 | 2 | 7.223 s | 0.087 s | 1,773,348 |
+| count_events | lazy_parallel_buffer_1 | 0 | 14.266 s | 14.233 s | 897,783 |
+| count_events | lazy_parallel_buffer_4 | 0 | 14.260 s | 14.227 s | 898,211 |
+| count_events | prefetch_1_parallel_buffer_1 | 1 | 8.720 s | 8.688 s | 1,468,830 |
+| count_events | prefetch_2_parallel_buffer_1 | 2 | 5.249 s | 5.215 s | 2,440,123 |
+
+On this delayed-storage mimic, prefetch depth 1 materially outperformed lazy
+parallel execution, and prefetch depth 2 improved further. The projection query
+did not materially change time to first batch because all profiles emit quickly
+after the first file opens. The aggregate query showed a stronger end-to-end
+latency signal because it emits only after scanning all selected input.
+
+The RSS values come from Linux `VmHWM` in `/proc/self/status`. Because `VmHWM`
+is process-lifetime peak RSS, compare memory-sensitive profiles with one
+scheduling profile per benchmark process. If several profiles run in one
+process, later rows can inherit an earlier peak.
+
+Separate-process release runs then compared RSS for the focused lazy and
+prefetch profiles:
+
+| Query | Scheduling profile | Total | Time to first batch | Peak RSS | Peak RSS delta |
+| --- | --- | ---: | ---: | ---: | ---: |
+| project_event_keys | lazy_parallel_buffer_1 | 15.761 s | 0.088 s | 106.8 MiB | 44.0 MiB |
+| project_event_keys | prefetch_1_parallel_buffer_1 | 8.648 s | 0.092 s | 124.9 MiB | 64.0 MiB |
+| project_event_keys | prefetch_2_parallel_buffer_1 | 7.259 s | 0.093 s | 121.5 MiB | 63.1 MiB |
+| count_events | lazy_parallel_buffer_1 | 14.329 s | 14.294 s | 91.3 MiB | 24.4 MiB |
+| count_events | prefetch_1_parallel_buffer_1 | 8.715 s | 8.682 s | 92.2 MiB | 26.3 MiB |
+| count_events | prefetch_2_parallel_buffer_1 | 5.209 s | 5.175 s | 98.5 MiB | 30.2 MiB |
+
+In these one-profile-per-process runs, prefetch depth 2 improved total time by
+about 54% on `project_event_keys` and about 64% on `count_events`. Peak RSS
+rose by about 14.7 MiB for `project_event_keys` and about 7.2 MiB for
+`count_events` compared with `lazy_parallel_buffer_1`.
+
 ## Decision
 
 Keep lazy scheduling as the default.
@@ -139,9 +200,11 @@ small-file matrix. Increasing the output handoff buffer from 1 to 4 was a small
 improvement in this run, but it is not enough evidence to expose a new public
 prefetch scheduler.
 
-No bounded prefetch mode is exposed by this branch. The delayed HTTP evidence
-shows a clearer native async advantage under object-store-like latency, but it
-does not by itself justify exposing a new prefetch scheduler. A future prefetch
-mode must first land in the production execution path with explicit
-active-plus-queued file task bounds and cancellation tests that do not require
-draining unrelated prefetched data.
+Bounded prefetch is available as an internal execution option and benchmark
+profile, but this branch does not make it the default. The delayed HTTP evidence
+shows a clearer native async advantage under object-store-like latency, and the
+focused prefetch runs show that a small bounded prefetch window can hide file
+open and Parquet setup latency on the 12M mimic workload. Keep the default lazy
+until the prefetch path has broader review and at least one repeated benchmark
+run, but this is now a strong candidate for the native async default under
+remote-object-store-like latency.
