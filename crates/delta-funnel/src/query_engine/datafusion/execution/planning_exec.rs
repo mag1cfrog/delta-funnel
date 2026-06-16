@@ -122,6 +122,11 @@ impl DeltaScanPlanningExec {
         self.execution_options
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_async_file_reads(&self) -> usize {
+        self.async_read_limiter.active_file_reads()
+    }
+
     /// Returns a cheap point-in-time snapshot of provider-owned read progress.
     ///
     /// This is the internal handoff for later orchestration and progress
@@ -2639,7 +2644,10 @@ mod tests {
 
         for _ in 0..1000 {
             let stats = scans[0].read_stats_snapshot();
-            if stats.files_started == 1 && stats.files_completed == 0 {
+            if stats.files_started == 1
+                && stats.files_completed == 0
+                && scans[0].active_async_file_reads() == 0
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -2650,6 +2658,7 @@ mod tests {
         assert_eq!(stats.scan_partitions_completed, 0);
         assert_eq!(stats.files_started, 1);
         assert_eq!(stats.files_completed, 0);
+        assert_eq!(scans[0].active_async_file_reads(), 0);
         assert!((1..=2).contains(&stats.batches_produced));
         assert!((1..=16_384).contains(&stats.rows_produced));
 
@@ -2710,7 +2719,10 @@ mod tests {
 
         for _ in 0..1000 {
             let stats = scans[0].read_stats_snapshot();
-            if stats.files_started == 1 && stats.files_completed == 0 {
+            if stats.files_started == 1
+                && stats.files_completed == 0
+                && scans[0].active_async_file_reads() == 0
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -2721,6 +2733,7 @@ mod tests {
         assert_eq!(stats.scan_partitions_completed, 0);
         assert_eq!(stats.files_started, 1);
         assert_eq!(stats.files_completed, 0);
+        assert_eq!(scans[0].active_async_file_reads(), 0);
         assert!((1..=2).contains(&stats.batches_produced));
         assert!((1..=16_384).contains(&stats.rows_produced));
         assert_eq!(stats.deletion_vector_payloads_loaded, 1);
@@ -2780,6 +2793,7 @@ mod tests {
         assert_eq!(stats_after_first_batch.files_started, 1);
         assert_eq!(stats_after_first_batch.files_completed, 0);
         assert_eq!(stats_after_first_batch.scan_partitions_completed, 0);
+        assert_eq!(scans[0].active_async_file_reads(), 1);
 
         let remaining = datafusion::physical_plan::common::collect(stream).await?;
         let mut ids = first_ids;
@@ -2792,6 +2806,7 @@ mod tests {
         assert_eq!(stats.files_started, 2);
         assert_eq!(stats.files_completed, 2);
         assert_eq!(stats.rows_produced, 40_000);
+        assert_eq!(scans[0].active_async_file_reads(), 0);
 
         Ok(())
     }
