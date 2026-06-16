@@ -8,9 +8,11 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, new_null_array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, Int64Array, StructArray, new_null_array,
+};
 use datafusion::arrow::compute::filter_record_batch;
-use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Fields, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
@@ -718,16 +720,48 @@ struct NativeAsyncSchemaMatch {
     needs_batch_reshape: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum NativeAsyncProviderColumn {
     /// Column index in the projected Parquet stream batch.
     ///
     /// This is not the original Parquet file root index. The stream only emits
     /// the roots selected by `projected_roots`, in file order, so this index is
     /// relative to that projected output batch.
-    ProjectedStreamColumnIndex(usize),
+    ProjectedStreamColumn {
+        stream_index: usize,
+        field_plan: NativeAsyncFieldPlan,
+    },
     /// Missing nullable provider field that must be materialized as all nulls.
     Null,
+}
+
+#[derive(Clone)]
+enum NativeAsyncFieldPlan {
+    Identity,
+    Struct {
+        children: Vec<NativeAsyncStructChild>,
+    },
+}
+
+impl NativeAsyncFieldPlan {
+    fn is_identity(&self) -> bool {
+        matches!(self, Self::Identity)
+    }
+}
+
+#[derive(Clone)]
+enum NativeAsyncStructChild {
+    ProjectedChild {
+        child_index: usize,
+        field_plan: NativeAsyncFieldPlan,
+    },
+    Null,
+}
+
+#[derive(Clone)]
+struct NativeAsyncRootMatch {
+    parquet_root_index: usize,
+    field_plan: NativeAsyncFieldPlan,
 }
 
 impl NativeAsyncSchemaMatch {
@@ -749,14 +783,19 @@ impl NativeAsyncSchemaMatch {
             .iter()
             .zip(self.provider_schema.fields())
             .map(|(column, field)| match column {
-                NativeAsyncProviderColumn::ProjectedStreamColumnIndex(index) => {
-                    Arc::clone(batch.column(*index))
-                }
+                NativeAsyncProviderColumn::ProjectedStreamColumn {
+                    stream_index,
+                    field_plan,
+                } => reshape_array_to_provider_field(
+                    Arc::clone(batch.column(*stream_index)),
+                    field,
+                    field_plan,
+                ),
                 NativeAsyncProviderColumn::Null => {
-                    new_null_array(field.data_type(), batch.num_rows())
+                    Ok(new_null_array(field.data_type(), batch.num_rows()))
                 }
             })
-            .collect::<Vec<ArrayRef>>();
+            .collect::<Result<Vec<ArrayRef>, _>>()?;
 
         RecordBatch::try_new(Arc::clone(&self.provider_schema), columns)
             .map_err(delta_kernel::Error::from)
@@ -818,7 +857,7 @@ fn match_provider_fields_to_parquet_roots(
     provider_schema: &SchemaRef,
     parquet_roots: &[TypePtr],
     parquet_arrow_schema: &SchemaRef,
-) -> Result<Vec<Option<usize>>, delta_kernel::Error> {
+) -> Result<Vec<Option<NativeAsyncRootMatch>>, delta_kernel::Error> {
     provider_schema
         .fields()
         .iter()
@@ -832,12 +871,16 @@ fn match_provider_fields_to_parquet_roots(
         .collect()
 }
 
-fn projected_roots_from_matches(root_matches: &[Option<usize>]) -> Vec<usize> {
+fn projected_roots_from_matches(root_matches: &[Option<NativeAsyncRootMatch>]) -> Vec<usize> {
     // Keep only matched Parquet root indexes. Unmatched nullable provider fields
     // are represented by None and become null-filled columns later.
     let mut projected_roots = root_matches
         .iter()
-        .filter_map(|root_index| *root_index)
+        .filter_map(|root_match| {
+            root_match
+                .as_ref()
+                .map(|root_match| root_match.parquet_root_index)
+        })
         .collect::<Vec<_>>();
     projected_roots.sort_unstable();
     projected_roots.dedup();
@@ -846,7 +889,7 @@ fn projected_roots_from_matches(root_matches: &[Option<usize>]) -> Vec<usize> {
 }
 
 fn provider_columns_from_root_matches(
-    root_matches: &[Option<usize>],
+    root_matches: &[Option<NativeAsyncRootMatch>],
     projected_roots: &[usize],
     provider_schema: &SchemaRef,
 ) -> Result<Vec<NativeAsyncProviderColumn>, delta_kernel::Error> {
@@ -858,10 +901,15 @@ fn provider_columns_from_root_matches(
             // not the original Parquet root index. parquet-rs emits projected
             // roots in file order, so this mapping captures any Delta/provider
             // physical schema order difference.
-            Some(root_index) => projected_roots
+            Some(root_match) => projected_roots
                 .iter()
-                .position(|projected_root| projected_root == root_index)
-                .map(NativeAsyncProviderColumn::ProjectedStreamColumnIndex)
+                .position(|projected_root| projected_root == &root_match.parquet_root_index)
+                .map(
+                    |stream_index| NativeAsyncProviderColumn::ProjectedStreamColumn {
+                        stream_index,
+                        field_plan: root_match.field_plan.clone(),
+                    },
+                )
                 .ok_or_else(|| {
                     delta_kernel::Error::generic("matched Parquet root was not projected")
                 }),
@@ -893,8 +941,12 @@ fn needs_native_async_batch_reshape(
         .zip(provider_schema.fields())
         .enumerate()
         .any(|(provider_index, (column, provider_field))| match column {
-            NativeAsyncProviderColumn::ProjectedStreamColumnIndex(stream_index) => {
+            NativeAsyncProviderColumn::ProjectedStreamColumn {
+                stream_index,
+                field_plan,
+            } => {
                 *stream_index != provider_index
+                    || !field_plan.is_identity()
                     || projected_roots
                         .get(*stream_index)
                         .and_then(|root_index| parquet_arrow_schema.fields().get(*root_index))
@@ -908,7 +960,7 @@ fn match_provider_field_to_parquet_root(
     provider_field: &Field,
     parquet_roots: &[TypePtr],
     parquet_arrow_schema: &SchemaRef,
-) -> Result<Option<usize>, delta_kernel::Error> {
+) -> Result<Option<NativeAsyncRootMatch>, delta_kernel::Error> {
     // Delta schema matching uses field ids first. Column mapping tables can
     // rename logical or physical columns over time, but a stable field id still
     // identifies the same Delta column in Parquet metadata.
@@ -918,14 +970,22 @@ fn match_provider_field_to_parquet_root(
             .iter()
             .enumerate()
             .filter_map(|(index, parquet_root)| {
-                (parquet_root_field_id(parquet_root) == Some(field_id)).then_some(index)
+                (parquet_field_id(parquet_root) == Some(field_id)).then_some(index)
             })
             .collect::<Vec<_>>();
 
         match matches.as_slice() {
             [index] => {
-                validate_matched_field_type(provider_field, parquet_arrow_schema.field(*index))?;
-                return Ok(Some(*index));
+                let field_plan = build_matched_field_plan(
+                    provider_field,
+                    parquet_arrow_schema.field(*index),
+                    parquet_roots[*index].as_ref(),
+                    provider_field.name(),
+                )?;
+                return Ok(Some(NativeAsyncRootMatch {
+                    parquet_root_index: *index,
+                    field_plan,
+                }));
             }
             [] => {}
             _ => {
@@ -947,28 +1007,165 @@ fn match_provider_field_to_parquet_root(
         return Ok(None);
     };
 
-    validate_matched_field_type(provider_field, file_field)?;
+    let field_plan = build_matched_field_plan(
+        provider_field,
+        file_field,
+        parquet_roots[index].as_ref(),
+        provider_field.name(),
+    )?;
 
-    Ok(Some(index))
+    Ok(Some(NativeAsyncRootMatch {
+        parquet_root_index: index,
+        field_plan,
+    }))
 }
 
-fn validate_matched_field_type(
+fn build_matched_field_plan(
     provider_field: &Field,
     file_field: &Field,
-) -> Result<(), delta_kernel::Error> {
-    if file_field
-        .data_type()
-        .equals_datatype(provider_field.data_type())
-    {
-        return Ok(());
+    parquet_field: &parquet::schema::types::Type,
+    path: &str,
+) -> Result<NativeAsyncFieldPlan, delta_kernel::Error> {
+    match (provider_field.data_type(), file_field.data_type()) {
+        (DataType::Struct(provider_fields), DataType::Struct(file_fields)) => {
+            build_matched_struct_field_plan(
+                provider_field,
+                provider_fields,
+                file_field,
+                file_fields,
+                parquet_field,
+                path,
+            )
+        }
+        _ if file_field
+            .data_type()
+            .equals_datatype(provider_field.data_type()) =>
+        {
+            Ok(NativeAsyncFieldPlan::Identity)
+        }
+        _ => Err(delta_kernel::Error::generic(format!(
+            "provider field '{path}' expected Parquet type {} but found {}",
+            provider_field.data_type(),
+            file_field.data_type()
+        ))),
+    }
+}
+
+fn build_matched_struct_field_plan(
+    provider_field: &Field,
+    provider_fields: &Fields,
+    file_field: &Field,
+    file_fields: &Fields,
+    parquet_field: &parquet::schema::types::Type,
+    path: &str,
+) -> Result<NativeAsyncFieldPlan, delta_kernel::Error> {
+    let parquet_children = parquet_field.get_fields();
+    if parquet_children.len() != file_fields.len() {
+        return Err(delta_kernel::Error::generic(format!(
+            "provider field '{path}' expected Parquet struct field metadata to match Arrow child count"
+        )));
     }
 
-    Err(delta_kernel::Error::generic(format!(
-        "provider field '{}' expected Parquet type {} but found {}",
-        provider_field.name(),
-        provider_field.data_type(),
-        file_field.data_type()
-    )))
+    let children = provider_fields
+        .iter()
+        .map(|provider_child| {
+            let child_path = format!("{path}.{}", provider_child.name());
+            match_provider_struct_child(provider_child, file_fields, parquet_children, &child_path)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let needs_reshape = file_field.data_type() != provider_field.data_type()
+        || children.iter().zip(provider_fields.iter()).enumerate().any(
+            |(provider_index, (child, provider_child))| match child {
+                NativeAsyncStructChild::ProjectedChild {
+                    child_index,
+                    field_plan,
+                } => {
+                    *child_index != provider_index
+                        || !field_plan.is_identity()
+                        || file_fields
+                            .get(*child_index)
+                            .is_none_or(|file_child| file_child.name() != provider_child.name())
+                }
+                NativeAsyncStructChild::Null => true,
+            },
+        );
+
+    if needs_reshape {
+        Ok(NativeAsyncFieldPlan::Struct { children })
+    } else {
+        Ok(NativeAsyncFieldPlan::Identity)
+    }
+}
+
+fn match_provider_struct_child(
+    provider_child: &Field,
+    file_fields: &Fields,
+    parquet_children: &[TypePtr],
+    path: &str,
+) -> Result<NativeAsyncStructChild, delta_kernel::Error> {
+    let provider_field_id = arrow_field_id(provider_child)?;
+    if let Some(field_id) = provider_field_id {
+        let matches = parquet_children
+            .iter()
+            .enumerate()
+            .filter_map(|(index, parquet_child)| {
+                (parquet_field_id(parquet_child) == Some(field_id)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        match matches.as_slice() {
+            [index] => {
+                let file_child = file_fields.get(*index).ok_or_else(|| {
+                    delta_kernel::Error::generic(format!(
+                        "provider field '{path}' matched Parquet field id {field_id} without Arrow metadata"
+                    ))
+                })?;
+                let field_plan = build_matched_field_plan(
+                    provider_child,
+                    file_child,
+                    parquet_children[*index].as_ref(),
+                    path,
+                )?;
+                return Ok(NativeAsyncStructChild::ProjectedChild {
+                    child_index: *index,
+                    field_plan,
+                });
+            }
+            [] => {}
+            _ => {
+                return Err(delta_kernel::Error::generic(format!(
+                    "multiple Parquet fields matched provider field id {field_id} at '{path}'"
+                )));
+            }
+        }
+    }
+
+    let Some((index, file_child)) = file_fields
+        .iter()
+        .enumerate()
+        .find(|(_, file_child)| file_child.name() == provider_child.name())
+    else {
+        if provider_child.is_nullable() {
+            return Ok(NativeAsyncStructChild::Null);
+        }
+
+        return Err(delta_kernel::Error::generic(format!(
+            "non-nullable provider field '{path}' is missing from the Parquet file"
+        )));
+    };
+
+    let field_plan = build_matched_field_plan(
+        provider_child,
+        file_child,
+        parquet_children[index].as_ref(),
+        path,
+    )?;
+
+    Ok(NativeAsyncStructChild::ProjectedChild {
+        child_index: index,
+        field_plan,
+    })
 }
 
 fn arrow_field_id(field: &Field) -> Result<Option<i32>, delta_kernel::Error> {
@@ -986,9 +1183,65 @@ fn arrow_field_id(field: &Field) -> Result<Option<i32>, delta_kernel::Error> {
         .transpose()
 }
 
-fn parquet_root_field_id(parquet_root: &TypePtr) -> Option<i32> {
-    let basic_info = parquet_root.get_basic_info();
+fn parquet_field_id(parquet_field: &TypePtr) -> Option<i32> {
+    let basic_info = parquet_field.get_basic_info();
     basic_info.has_id().then(|| basic_info.id())
+}
+
+fn reshape_array_to_provider_field(
+    array: ArrayRef,
+    provider_field: &Field,
+    field_plan: &NativeAsyncFieldPlan,
+) -> Result<ArrayRef, delta_kernel::Error> {
+    match field_plan {
+        NativeAsyncFieldPlan::Identity => Ok(array),
+        NativeAsyncFieldPlan::Struct { children } => {
+            let DataType::Struct(provider_fields) = provider_field.data_type() else {
+                return Err(delta_kernel::Error::generic(format!(
+                    "provider field '{}' expected struct reshape plan but has type {}",
+                    provider_field.name(),
+                    provider_field.data_type()
+                )));
+            };
+            let struct_array = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    delta_kernel::Error::generic(format!(
+                        "provider field '{}' expected Parquet struct array but found {}",
+                        provider_field.name(),
+                        array.data_type()
+                    ))
+                })?;
+            let columns = children
+                .iter()
+                .zip(provider_fields.iter())
+                .map(|(child, provider_child)| match child {
+                    NativeAsyncStructChild::ProjectedChild {
+                        child_index,
+                        field_plan,
+                    } => {
+                        let child_array = struct_array.column(*child_index);
+                        reshape_array_to_provider_field(
+                            Arc::clone(child_array),
+                            provider_child,
+                            field_plan,
+                        )
+                    }
+                    NativeAsyncStructChild::Null => Ok(new_null_array(
+                        provider_child.data_type(),
+                        struct_array.len(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(Arc::new(StructArray::new(
+                provider_fields.clone(),
+                columns,
+                struct_array.nulls().cloned(),
+            )))
+        }
+    }
 }
 
 impl DeltaNativeAsyncFileReader {
@@ -1039,13 +1292,14 @@ fn unsupported_native_async_physical_schema_reason(
 ) -> Option<String> {
     physical_schema
         .fields()
-        .find_map(|field| unsupported_native_async_field_reason(field, field.name(), true))
+        .find_map(|field| unsupported_native_async_field_reason(field, field.name(), true, false))
 }
 
 fn unsupported_native_async_field_reason(
     field: &KernelStructField,
     path: &str,
     top_level: bool,
+    inside_repeated: bool,
 ) -> Option<String> {
     if field.is_metadata_column() {
         return Some(format!(
@@ -1062,36 +1316,49 @@ fn unsupported_native_async_field_reason(
             "native async reader does not support file path metadata column '{path}' yet"
         ));
     }
-    if has_nested_field_matching_metadata(field, top_level) {
+    if has_nested_field_id_map_metadata(field)
+        && matches!(
+            field.data_type(),
+            KernelDataType::Array(_) | KernelDataType::Map(_)
+        )
+    {
         return Some(format!(
-            "native async reader does not support nested field-id or physical-name matching at '{path}' yet"
+            "native async reader does not support list or map nested field-id or physical-name matching at '{path}' yet"
+        ));
+    }
+    if inside_repeated && has_field_matching_metadata(field, top_level) {
+        return Some(format!(
+            "native async reader does not support list or map nested field-id or physical-name matching at '{path}' yet"
         ));
     }
 
-    unsupported_native_async_data_type_reason(field.data_type(), path)
+    unsupported_native_async_data_type_reason(field.data_type(), path, inside_repeated)
 }
 
 fn unsupported_native_async_data_type_reason(
     data_type: &KernelDataType,
     path: &str,
+    inside_repeated: bool,
 ) -> Option<String> {
     match data_type {
         KernelDataType::Struct(fields) | KernelDataType::Variant(fields) => {
             fields.fields().find_map(|field| {
                 let child_path = format!("{path}.{}", field.name());
-                unsupported_native_async_field_reason(field, &child_path, false)
+                unsupported_native_async_field_reason(field, &child_path, false, inside_repeated)
             })
         }
         KernelDataType::Array(array) => {
             let child_path = format!("{path}.element");
-            unsupported_native_async_data_type_reason(array.element_type(), &child_path)
+            unsupported_native_async_data_type_reason(array.element_type(), &child_path, true)
         }
         KernelDataType::Map(map) => {
             let key_path = format!("{path}.key");
-            unsupported_native_async_data_type_reason(map.key_type(), &key_path).or_else(|| {
-                let value_path = format!("{path}.value");
-                unsupported_native_async_data_type_reason(map.value_type(), &value_path)
-            })
+            unsupported_native_async_data_type_reason(map.key_type(), &key_path, true).or_else(
+                || {
+                    let value_path = format!("{path}.value");
+                    unsupported_native_async_data_type_reason(map.value_type(), &value_path, true)
+                },
+            )
         }
         KernelDataType::Primitive(_) => None,
     }
@@ -1107,15 +1374,8 @@ fn is_file_path_metadata_field(field: &KernelStructField) -> bool {
     Some(*field_id) == KernelMetadataColumnSpec::FilePath.reserved_field_id()
 }
 
-fn has_nested_field_matching_metadata(field: &KernelStructField, top_level: bool) -> bool {
-    let nested_metadata_keys = [
-        KernelColumnMetadataKey::ColumnMappingNestedIds,
-        KernelColumnMetadataKey::ParquetFieldNestedIds,
-    ];
-    if nested_metadata_keys
-        .iter()
-        .any(|key| field.get_config_value(key).is_some())
-    {
+fn has_field_matching_metadata(field: &KernelStructField, top_level: bool) -> bool {
+    if has_nested_field_id_map_metadata(field) {
         return true;
     }
     if top_level {
@@ -1129,6 +1389,16 @@ fn has_nested_field_matching_metadata(field: &KernelStructField, top_level: bool
     ]
     .iter()
     .any(|key| field.get_config_value(key).is_some())
+}
+
+fn has_nested_field_id_map_metadata(field: &KernelStructField) -> bool {
+    let nested_metadata_keys = [
+        KernelColumnMetadataKey::ColumnMappingNestedIds,
+        KernelColumnMetadataKey::ParquetFieldNestedIds,
+    ];
+    nested_metadata_keys
+        .iter()
+        .any(|key| field.get_config_value(key).is_some())
 }
 
 impl DeltaNativeAsyncPartitionFileReader {
@@ -1181,16 +1451,20 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use datafusion::arrow::array::{Array, Decimal128Array, Int32Array, StringArray};
+    use datafusion::arrow::array::{
+        Array, ArrayRef, Decimal128Array, Int32Array, StringArray, StructArray,
+    };
+    use datafusion::arrow::buffer::NullBuffer;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Expr, col, lit};
     use delta_kernel::object_store::{memory::InMemory, path::Path as ObjectStorePath};
     use object_store::ObjectStoreExt;
-    use parquet::arrow::ArrowWriter;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+    use parquet::arrow::{ArrowWriter, ProjectionMask};
     use parquet::file::properties::WriterProperties;
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
@@ -1376,6 +1650,69 @@ mod tests {
         Ok(writer.into_inner()?)
     }
 
+    fn struct_field(name: &str, fields: Vec<Field>, nullable: bool) -> Field {
+        Field::new(name, DataType::Struct(fields.into()), nullable)
+    }
+
+    fn struct_array(fields: Vec<Field>, columns: Vec<ArrayRef>) -> ArrayRef {
+        struct_array_with_nulls(fields, columns, None)
+    }
+
+    fn struct_array_with_nulls(
+        fields: Vec<Field>,
+        columns: Vec<ArrayRef>,
+        nulls: Option<NullBuffer>,
+    ) -> ArrayRef {
+        let children = fields
+            .into_iter()
+            .map(Arc::new)
+            .zip(columns)
+            .collect::<Vec<_>>();
+
+        let fields = children
+            .iter()
+            .map(|(field, _column)| Arc::clone(field))
+            .collect::<Vec<_>>()
+            .into();
+        let columns = children
+            .into_iter()
+            .map(|(_field, column)| column)
+            .collect::<Vec<_>>();
+
+        Arc::new(StructArray::new(fields, columns, nulls))
+    }
+
+    fn project_parquet_batch_to_provider_schema(
+        name: &str,
+        file_schema: Arc<Schema>,
+        columns: Vec<ArrayRef>,
+        provider_schema: Arc<Schema>,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        let (test_dir, _table_uri) = local_table_uri(name)?;
+        let file_path = test_dir.path.join("part-00000.parquet");
+        let batch = RecordBatch::try_new(Arc::clone(&file_schema), columns)?;
+        let mut writer = ArrowWriter::try_new(fs::File::create(&file_path)?, file_schema, None)?;
+
+        writer.write(&batch)?;
+        writer.close()?;
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(file_path)?)?;
+        let schema_match = super::build_native_async_schema_match(
+            builder.parquet_schema(),
+            builder.schema(),
+            provider_schema,
+        )?;
+        let projection =
+            ProjectionMask::roots(builder.parquet_schema(), schema_match.projected_roots());
+        let mut reader = builder.with_projection(projection).build()?;
+        let projected_batch = reader
+            .next()
+            .transpose()?
+            .ok_or("expected one projected Parquet batch")?;
+
+        Ok(schema_match.reshape_batch_to_provider_schema(projected_batch)?)
+    }
+
     fn field_id_metadata(field_id: i32) -> HashMap<String, String> {
         HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_owned(), field_id.to_string())])
     }
@@ -1462,7 +1799,7 @@ mod tests {
     }
 
     #[test]
-    fn native_async_schema_gate_rejects_nested_field_id_matching()
+    fn native_async_schema_gate_allows_nested_struct_field_id_matching()
     -> Result<(), Box<dyn std::error::Error>> {
         let nested_type = KernelStructType::try_new([KernelStructField::new(
             "inner",
@@ -1471,11 +1808,34 @@ mod tests {
         )
         .add_metadata(kernel_field_id_metadata(2))])?;
         let schema = kernel_schema([KernelStructField::new("nested", nested_type, true)])?;
+
+        assert_eq!(
+            unsupported_native_async_physical_schema_reason(&schema),
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_gate_rejects_list_nested_field_id_matching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = kernel_schema([KernelStructField::new(
+            "tags",
+            delta_kernel::schema::ArrayType::new(KernelDataType::STRING, true),
+            true,
+        )
+        .add_metadata([(
+            KernelColumnMetadataKey::ColumnMappingNestedIds
+                .as_ref()
+                .to_owned(),
+            KernelMetadataValue::String(r#"{"tags.element":2}"#.to_owned()),
+        )])])?;
         let reason =
             unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
 
-        assert!(reason.contains("nested field-id or physical-name matching"));
-        assert!(reason.contains("nested.inner"));
+        assert!(reason.contains("list or map nested field-id"));
+        assert!(reason.contains("tags"));
 
         Ok(())
     }
@@ -1618,6 +1978,218 @@ mod tests {
                 ..
             }
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_recurses_by_nested_field_id_before_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_profile_fields = vec![
+            Field::new("first_name", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+            Field::new("age", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+        ];
+        let provider_schema = Arc::new(Schema::new(vec![struct_field(
+            "profile",
+            provider_profile_fields,
+            true,
+        )]));
+        let file_profile_fields = vec![
+            Field::new("stale_age", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+            Field::new("stale_name", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+        ];
+        let file_schema = Arc::new(Schema::new(vec![struct_field(
+            "profile",
+            file_profile_fields.clone(),
+            true,
+        )]));
+        let profile = struct_array_with_nulls(
+            file_profile_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![34, 41])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("alice"), Some("bob")])) as ArrayRef,
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "nested-field-id-schema-match",
+            file_schema,
+            vec![profile],
+            provider_schema,
+        )?;
+        let profile = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected profile StructArray")?;
+        let names = profile
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected first_name StringArray")?;
+        let ages = profile
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected age Int32Array")?;
+
+        assert_eq!(profile.fields()[0].name(), "first_name");
+        assert_eq!(profile.fields()[1].name(), "age");
+        assert!(profile.is_valid(0));
+        assert!(profile.is_null(1));
+        assert_eq!(names.value(0), "alice");
+        assert_eq!(ages.value(0), 34);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_recurses_by_local_nested_name_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_profile_fields = vec![
+            Field::new("age", DataType::Int32, true),
+            Field::new("first_name", DataType::Utf8, true),
+        ];
+        let provider_schema = Arc::new(Schema::new(vec![struct_field(
+            "profile",
+            provider_profile_fields,
+            true,
+        )]));
+        let file_profile_fields = vec![
+            Field::new("first_name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ];
+        let file_schema = Arc::new(Schema::new(vec![struct_field(
+            "profile",
+            file_profile_fields.clone(),
+            true,
+        )]));
+        let profile = struct_array(
+            file_profile_fields,
+            vec![
+                Arc::new(StringArray::from(vec![Some("alice"), Some("bob")])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![34, 41])) as ArrayRef,
+            ],
+        );
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "nested-name-fallback-schema-match",
+            file_schema,
+            vec![profile],
+            provider_schema,
+        )?;
+        let profile = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected profile StructArray")?;
+        let ages = profile
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected age Int32Array")?;
+        let names = profile
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected first_name StringArray")?;
+
+        assert_eq!(profile.fields()[0].name(), "age");
+        assert_eq!(profile.fields()[1].name(), "first_name");
+        assert_eq!(ages.values(), &[34, 41]);
+        assert_eq!(names.value(0), "alice");
+        assert_eq!(names.value(1), "bob");
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_null_fills_missing_nullable_nested_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_profile_fields = vec![
+            Field::new("age", DataType::Int32, true),
+            Field::new("loyalty_tier", DataType::Utf8, true),
+        ];
+        let provider_schema = Arc::new(Schema::new(vec![struct_field(
+            "profile",
+            provider_profile_fields,
+            true,
+        )]));
+        let file_profile_fields = vec![Field::new("age", DataType::Int32, true)];
+        let file_schema = Arc::new(Schema::new(vec![struct_field(
+            "profile",
+            file_profile_fields.clone(),
+            true,
+        )]));
+        let profile = struct_array(
+            file_profile_fields,
+            vec![Arc::new(Int32Array::from(vec![34, 41])) as ArrayRef],
+        );
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "nested-missing-nullable-schema-match",
+            file_schema,
+            vec![profile],
+            provider_schema,
+        )?;
+        let profile = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected profile StructArray")?;
+        let loyalty_tiers = profile
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected loyalty_tier StringArray")?;
+
+        assert_eq!(profile.fields()[1].name(), "loyalty_tier");
+        assert_eq!(loyalty_tiers.len(), 2);
+        assert_eq!(loyalty_tiers.null_count(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_rejects_missing_non_nullable_nested_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_profile_fields = vec![
+            Field::new("age", DataType::Int32, true),
+            Field::new("required_code", DataType::Utf8, false),
+        ];
+        let provider_schema = Arc::new(Schema::new(vec![struct_field(
+            "profile",
+            provider_profile_fields,
+            true,
+        )]));
+        let file_profile_fields = vec![Field::new("age", DataType::Int32, true)];
+        let file_schema = Arc::new(Schema::new(vec![struct_field(
+            "profile",
+            file_profile_fields.clone(),
+            true,
+        )]));
+        let profile = struct_array(
+            file_profile_fields,
+            vec![Arc::new(Int32Array::from(vec![34, 41])) as ArrayRef],
+        );
+        let error = match project_parquet_batch_to_provider_schema(
+            "nested-missing-required-schema-match",
+            file_schema,
+            vec![profile],
+            provider_schema,
+        ) {
+            Ok(_) => return Err("missing nested required child must fail".into()),
+            Err(error) => error,
+        };
+        let display = error.to_string();
+
+        assert!(display.contains("non-nullable provider field"), "{display}");
+        assert!(display.contains("profile.required_code"), "{display}");
+        assert!(
+            display.contains("is missing from the Parquet file"),
+            "{display}"
+        );
 
         Ok(())
     }

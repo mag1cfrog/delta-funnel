@@ -1,5 +1,6 @@
 //! Test fixtures for local Delta tables with real Parquet data files.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use delta_kernel::arrow::array::{
     Float64Array, Int32Array, ListArray, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::file::properties::WriterProperties;
 
 use super::kernel;
@@ -27,6 +28,10 @@ const MISSING_NON_NULLABLE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-fun
 const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
 const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"},"createdTime":1587968585495}}"#;
 const SUPPORTED_TYPES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"active\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}},{\"name\":\"score_f32\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"score_f64\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"level\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+const NESTED_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+const MISSING_NULLABLE_NESTED_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"loyalty_tier\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+const MISSING_NON_NULLABLE_NESTED_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"required_code\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+const NESTED_COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":4,\"delta.columnMapping.physicalName\":\"phys_first_name\"}},{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":\"phys_age\"}}]},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"phys_profile\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"5"},"createdTime":1587968585495}}"#;
 const DATA_FILE: &str = "part-00000.parquet";
 const MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
@@ -301,6 +306,107 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local Delta table whose nested struct children are stored in a
+    /// different order from the Delta schema and have no field-id metadata.
+    pub(crate) fn new_with_reordered_nested_struct_fields(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            NESTED_PROFILE_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![reordered_nested_profile_batch()?],
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
+    /// Creates a local Delta table whose log schema has a nullable nested
+    /// struct child absent from the older Parquet data file.
+    pub(crate) fn new_with_missing_nullable_nested_struct_field(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            MISSING_NULLABLE_NESTED_PROFILE_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![reordered_nested_profile_batch()?],
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
+    /// Creates a local Delta table whose log schema has a non-nullable nested
+    /// struct child absent from the older Parquet data file.
+    pub(crate) fn new_with_missing_non_nullable_nested_struct_field(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            MISSING_NON_NULLABLE_NESTED_PROFILE_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![reordered_nested_profile_batch()?],
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
+    /// Creates a local Delta table whose nested struct uses column mapping
+    /// metadata and whose Parquet child names intentionally differ from Delta
+    /// physical names.
+    pub(crate) fn new_with_nested_column_mapping(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            COLUMN_MAPPING_PROTOCOL_JSON,
+            NESTED_COLUMN_MAPPING_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![nested_column_mapping_batch()?],
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
     /// Creates a local Delta table whose log schema has a nullable column that
     /// is absent from the older Parquet data file.
     pub(crate) fn new_with_missing_nullable_column(
@@ -544,6 +650,45 @@ fn physical_column_mapping_schema() -> Arc<Schema> {
     ]))
 }
 
+fn nested_profile_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("customer_name", DataType::Utf8, true),
+        Field::new(
+            "profile",
+            DataType::Struct(
+                vec![
+                    Field::new("first_name", DataType::Utf8, true),
+                    Field::new("age", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            true,
+        ),
+    ]))
+}
+
+fn nested_column_mapping_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("phys_id", DataType::Int32, false).with_metadata(field_id_metadata(1)),
+        Field::new("phys_customer_name", DataType::Utf8, true).with_metadata(field_id_metadata(2)),
+        Field::new(
+            "phys_profile",
+            DataType::Struct(
+                vec![
+                    Field::new("stale_age", DataType::Int32, true)
+                        .with_metadata(field_id_metadata(5)),
+                    Field::new("stale_first_name", DataType::Utf8, true)
+                        .with_metadata(field_id_metadata(4)),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(field_id_metadata(3)),
+    ]))
+}
+
 fn reordered_physical_columns_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("customer_name", DataType::Utf8, true),
@@ -602,6 +747,57 @@ fn physical_column_mapping_batch() -> Result<kernel::RecordBatch, Box<dyn std::e
 
     Ok(kernel::RecordBatch::try_new(
         physical_column_mapping_schema(),
+        columns,
+    )?)
+}
+
+fn reordered_nested_profile_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let profile = StructArray::from(vec![
+        (
+            Arc::new(Field::new("first_name", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("age", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![Some(34), Some(41), None])) as ArrayRef,
+        ),
+    ]);
+    let columns = vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
+        Arc::new(profile) as Arc<dyn Array>,
+    ];
+
+    Ok(kernel::RecordBatch::try_new(
+        nested_profile_schema(),
+        columns,
+    )?)
+}
+
+fn nested_column_mapping_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let profile = StructArray::from(vec![
+        (
+            Arc::new(
+                Field::new("stale_age", DataType::Int32, true).with_metadata(field_id_metadata(5)),
+            ),
+            Arc::new(Int32Array::from(vec![Some(34), Some(41), None])) as ArrayRef,
+        ),
+        (
+            Arc::new(
+                Field::new("stale_first_name", DataType::Utf8, true)
+                    .with_metadata(field_id_metadata(4)),
+            ),
+            Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as ArrayRef,
+        ),
+    ]);
+    let columns = vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
+        Arc::new(profile) as Arc<dyn Array>,
+    ];
+
+    Ok(kernel::RecordBatch::try_new(
+        nested_column_mapping_schema(),
         columns,
     )?)
 }
@@ -695,6 +891,10 @@ fn sequential_batch_starting_at(
     ];
 
     Ok(kernel::RecordBatch::try_new(schema(), columns)?)
+}
+
+fn field_id_metadata(field_id: i32) -> HashMap<String, String> {
+    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_owned(), field_id.to_string())])
 }
 
 fn file_batch(
