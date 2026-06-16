@@ -413,6 +413,7 @@ fn reject_unsupported_reader_backend_source(
                 source_name: source.name(),
                 table_uri: source.table_uri(),
                 snapshot_version: source.version(),
+                storage_options: source.storage_options(),
             })
         }
     }

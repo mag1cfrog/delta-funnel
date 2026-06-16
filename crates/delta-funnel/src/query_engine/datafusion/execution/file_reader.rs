@@ -14,10 +14,11 @@ use crate::{
     DeltaFunnelError,
     error::{DeltaScanFileReadPhase, DeltaScanFileReadSnafu},
     table_formats::{
-        KernelDataFileReadRequest, KernelDataFileReader, KernelDataFileReaderConfig,
-        KernelDataFileTransformRequest, KernelDeletionVectorReadRequest,
-        KernelDeletionVectorReader, KernelDeletionVectorReaderConfig, KernelScanReadSchema,
-        ProviderDeletionVectorSelection, ProviderDeletionVectorSelectionContext,
+        DeltaStorageOptions, KernelDataFileReadRequest, KernelDataFileReader,
+        KernelDataFileReaderConfig, KernelDataFileTransformRequest,
+        KernelDeletionVectorReadRequest, KernelDeletionVectorReader,
+        KernelDeletionVectorReaderConfig, KernelScanReadSchema, ProviderDeletionVectorSelection,
+        ProviderDeletionVectorSelectionContext,
     },
 };
 
@@ -42,6 +43,8 @@ pub(crate) struct DeltaFileReaderConfig<'a> {
     pub(crate) table_uri: &'a str,
     /// Snapshot version that selected the file tasks.
     pub(crate) snapshot_version: u64,
+    /// Source-local options forwarded to Delta Kernel object-store construction.
+    pub(crate) storage_options: &'a DeltaStorageOptions,
 }
 
 /// Request to read exactly one provider file task.
@@ -94,12 +97,14 @@ impl DeltaFileReader {
             source_name: config.source_name,
             table_uri: config.table_uri,
             snapshot_version: config.snapshot_version,
+            storage_options: config.storage_options,
         })?;
         let deletion_vector_reader =
             KernelDeletionVectorReader::try_new(KernelDeletionVectorReaderConfig {
                 source_name: config.source_name,
                 table_uri: config.table_uri,
                 snapshot_version: config.snapshot_version,
+                storage_options: config.storage_options,
             })?;
 
         Ok(Self {
@@ -732,6 +737,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?)
     }
 }

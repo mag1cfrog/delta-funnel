@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::DeltaFunnelError;
+use crate::{DeltaFunnelError, DeltaStorageOptions};
 
 use super::file_reader::{
     DeltaFileReadRequest, DeltaFileReadResult, DeltaFileReader, DeltaFileReaderConfig,
@@ -25,6 +25,8 @@ pub(crate) struct DeltaProviderReaderBackendConfig<'a> {
     pub(crate) table_uri: &'a str,
     /// Snapshot version that selected the file tasks.
     pub(crate) snapshot_version: u64,
+    /// Source-local options forwarded to Delta Kernel object-store construction.
+    pub(crate) storage_options: &'a DeltaStorageOptions,
 }
 
 /// File reader used by one DataFusion execution partition.
@@ -46,6 +48,7 @@ pub(crate) fn build_partition_file_reader(
                 source_name: config.source_name,
                 table_uri: config.table_uri,
                 snapshot_version: config.snapshot_version,
+                storage_options: config.storage_options,
             })?;
             Ok(Arc::new(reader))
         }

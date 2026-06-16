@@ -14,7 +14,6 @@ use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::engine::default::storage::store_from_url_opts;
 use futures_util::StreamExt;
 use object_store::{ObjectStore, path::Path};
 use parquet::arrow::RowNumber;
@@ -45,7 +44,8 @@ use super::native_async_row_group_pruning::native_async_pruned_row_groups;
 use super::read_stats::DeltaProviderReadStats;
 use super::scheduling::DeltaProviderAsyncFileReadPermit;
 use crate::table_formats::{
-    KernelDataFileReader, KernelDataFileReaderConfig, KernelDataFileTransformRequest,
+    DeltaStorageOptions, KernelDataFileReader, KernelDataFileReaderConfig,
+    KernelDataFileTransformRequest,
 };
 
 const TABLE_ROOT_CONTEXT: &str = "<table-root>";
@@ -60,6 +60,8 @@ pub(crate) struct DeltaNativeAsyncFileReaderConfig<'a> {
     pub(crate) table_uri: &'a str,
     /// Snapshot version that selected the file tasks.
     pub(crate) snapshot_version: u64,
+    /// Source-local options forwarded to Delta Kernel object-store construction.
+    pub(crate) storage_options: &'a DeltaStorageOptions,
 }
 
 /// Reusable native async file reader context for one provider scan.
@@ -142,26 +144,33 @@ impl DeltaNativeAsyncFileReader {
                 path: TABLE_ROOT_CONTEXT.to_owned(),
                 phase: DeltaScanFileReadPhase::TableUriParsing,
             })?;
-        let store = store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>()).context(
-            DeltaScanFileReadSnafu {
-                source_name: config.source_name.to_owned(),
-                table_uri: config.table_uri.to_owned(),
-                snapshot_version: config.snapshot_version,
-                path: TABLE_ROOT_CONTEXT.to_owned(),
-                phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
-            },
-        )?;
+        let store = delta_kernel::engine::default::storage::store_from_url_opts(
+            &table_url,
+            config
+                .storage_options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .context(DeltaScanFileReadSnafu {
+            source_name: config.source_name.to_owned(),
+            table_uri: config.table_uri.to_owned(),
+            snapshot_version: config.snapshot_version,
+            path: TABLE_ROOT_CONTEXT.to_owned(),
+            phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
+        })?;
         let data_file_reader =
             Arc::new(KernelDataFileReader::try_new(KernelDataFileReaderConfig {
                 source_name: config.source_name,
                 table_uri: config.table_uri,
                 snapshot_version: config.snapshot_version,
+                storage_options: config.storage_options,
             })?);
         let deletion_vector_reader = Arc::new(KernelDeletionVectorReader::try_new(
             KernelDeletionVectorReaderConfig {
                 source_name: config.source_name,
                 table_uri: config.table_uri,
                 snapshot_version: config.snapshot_version,
+                storage_options: config.storage_options,
             },
         )?);
 
@@ -1190,7 +1199,7 @@ mod tests {
         validate_native_async_reader_config,
     };
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig,
+        DeltaFunnelError, DeltaSourceConfig, DeltaStorageOptions,
         error::DeltaScanFileReadPhase,
         load_delta_source,
         query_engine::datafusion::{
@@ -1230,10 +1239,12 @@ mod tests {
     }
 
     fn reader(table_uri: &str) -> Result<DeltaNativeAsyncFileReader, DeltaFunnelError> {
+        let storage_options = DeltaStorageOptions::default();
         DeltaNativeAsyncFileReader::try_new(DeltaNativeAsyncFileReaderConfig {
             source_name: "orders",
             table_uri,
             snapshot_version: 42,
+            storage_options: &storage_options,
         })
     }
 
@@ -1428,10 +1439,12 @@ mod tests {
     fn native_async_reader_constructs_memory_object_store_for_remote_like_uri()
     -> Result<(), Box<dyn std::error::Error>> {
         let table_uri = "memory:///table/root/";
+        let storage_options = DeltaStorageOptions::default();
         validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
             source_name: "orders",
             table_uri,
             snapshot_version: 42,
+            storage_options: &storage_options,
         })?;
         let reader = reader(table_uri)?;
         let object = reader.parquet_object_for_task(&task(table_uri, "part-00000.parquet"))?;
@@ -1485,10 +1498,12 @@ mod tests {
 
     #[test]
     fn native_async_reader_rejects_unsupported_object_store_scheme() {
+        let storage_options = DeltaStorageOptions::default();
         let error = validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
             source_name: "orders",
             table_uri: "ftp://example.com/table/",
             snapshot_version: 42,
+            storage_options: &storage_options,
         })
         .expect_err("unsupported object store scheme must fail");
 
@@ -1706,6 +1721,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         let stream = reader
@@ -1771,6 +1787,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         let mut stream = reader
@@ -1829,6 +1846,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         assert!(read_schema.enforces_physical_predicate_rows());
@@ -1895,6 +1913,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         assert!(task.deletion_vector.is_present());
@@ -1966,6 +1985,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
         let object = reader.parquet_object_for_task(&task)?;
         let parquet_reader =
@@ -2060,6 +2080,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         let stream = reader
@@ -2118,6 +2139,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         let stream = reader

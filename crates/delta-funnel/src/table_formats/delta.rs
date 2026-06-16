@@ -2477,9 +2477,14 @@ mod tests {
         scan: &ProjectedDeltaScan,
         table_uri: &str,
     ) -> Result<KernelStatsMetadataBoundary, Box<dyn std::error::Error>> {
+        let storage_options = DeltaStorageOptions::default();
         let table_url = super::kernel::try_parse_uri(table_uri)?;
-        let store =
-            super::kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
+        let store = super::kernel::store_from_url_opts(
+            &table_url,
+            storage_options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )?;
         let engine = super::kernel::DefaultEngineBuilder::new(store).build();
         let mut boundary = KernelStatsMetadataBoundary::default();
 
