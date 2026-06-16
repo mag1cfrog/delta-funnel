@@ -61,9 +61,11 @@ The provider-exec matrix compares the official kernel backend against the
 native async backend with lazy scheduling. It covers non-DV and sparse-DV
 versions of a many-small-files shape and a fewer-larger-files shape. Each
 workload runs a projection query, a count-style query, and a predicate query
-that exercises provider predicate handling. Later #161 slices should extend
-this same mode with any bounded prefetch or admission scheduling variant that
-exists in the production native execution path.
+that exercises provider predicate handling. Each case runs production
+scheduling profiles for serial lazy reads, parallel lazy reads, and parallel
+lazy reads with a larger bounded output handoff buffer. Later #161 slices
+should extend this same mode with a bounded prefetch scheduler only if that
+variant exists in the production native execution path.
 
 Run the opt-in local IO read probe:
 
@@ -227,6 +229,10 @@ important field groups are:
   - `query_case`
   - `reader_backend`
   - `scheduling_mode`
+  - `scan_target_partitions`
+  - `max_concurrent_file_reads_per_scan`
+  - `max_concurrent_file_reads_per_partition`
+  - `output_buffer_capacity_per_partition`
   - `repetitions`
   - `file_count`
   - `row_count`
@@ -301,5 +307,6 @@ Provider-exec mode is the production read benchmark path. It measures real
 temporary local Delta tables, Parquet decoding, Arrow batch production, provider
 backend selection, DataFusion SQL planning, and DataFusion collection. The
 provider-exec mode is local-file based and does not yet inject object-store
-latency or expose bounded prefetch/admission. Those belong to later #161 slices
-and must still use production provider execution paths.
+latency or expose a bounded prefetch scheduler. It does compare existing
+production read-admission and output-buffer settings. Any later prefetch work
+must still use production provider execution paths.

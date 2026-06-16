@@ -289,6 +289,7 @@ mod tests {
                 reader_backend: DeltaProviderReaderBackend::OfficialKernel,
                 max_concurrent_file_reads_per_scan: 0,
                 max_concurrent_file_reads_per_partition: 1,
+                output_buffer_capacity_per_partition: 1,
             },
         );
 
@@ -326,6 +327,7 @@ mod tests {
                 reader_backend: DeltaProviderReaderBackend::NativeAsync,
                 max_concurrent_file_reads_per_scan: 1,
                 max_concurrent_file_reads_per_partition: 1,
+                output_buffer_capacity_per_partition: 1,
             },
         )?;
 

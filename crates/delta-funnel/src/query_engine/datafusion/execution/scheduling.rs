@@ -50,6 +50,12 @@ pub struct DeltaProviderScanExecutionOptions {
     /// This prevents a single DataFusion execution partition from consuming all
     /// scan-wide read capacity when multiple scan partitions are active.
     pub max_concurrent_file_reads_per_partition: usize,
+
+    /// Bounded output channel capacity for each DataFusion execution partition.
+    ///
+    /// This is the producer-to-DataFusion handoff queue used after file reads
+    /// produce Arrow batches. A value of `1` preserves the historical behavior.
+    pub output_buffer_capacity_per_partition: usize,
 }
 
 /// Sync fallback limiter for provider-scheduled file work in one Delta scan.
@@ -373,6 +379,7 @@ impl Default for DeltaProviderScanExecutionOptions {
             reader_backend: DeltaProviderReaderBackend::OfficialKernel,
             max_concurrent_file_reads_per_scan: 1,
             max_concurrent_file_reads_per_partition: 1,
+            output_buffer_capacity_per_partition: 1,
         }
     }
 }
@@ -387,6 +394,7 @@ impl DeltaProviderScanExecutionOptions {
             reader_backend: DeltaProviderReaderBackend::OfficialKernel,
             max_concurrent_file_reads_per_scan,
             max_concurrent_file_reads_per_partition,
+            output_buffer_capacity_per_partition: 1,
         };
         options.validate()?;
         Ok(options)
@@ -402,9 +410,20 @@ impl DeltaProviderScanExecutionOptions {
             reader_backend,
             max_concurrent_file_reads_per_scan,
             max_concurrent_file_reads_per_partition,
+            output_buffer_capacity_per_partition: 1,
         };
         options.validate()?;
         Ok(options)
+    }
+
+    /// Sets the per-partition bounded output buffer capacity.
+    pub fn with_output_buffer_capacity_per_partition(
+        mut self,
+        output_buffer_capacity_per_partition: usize,
+    ) -> Result<Self, DeltaFunnelError> {
+        self.output_buffer_capacity_per_partition = output_buffer_capacity_per_partition;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Validates provider scan execution bounds before registration or scan execution.
@@ -417,6 +436,10 @@ impl DeltaProviderScanExecutionOptions {
         validate_positive(
             "max_concurrent_file_reads_per_partition",
             self.max_concurrent_file_reads_per_partition,
+        )?;
+        validate_positive(
+            "output_buffer_capacity_per_partition",
+            self.output_buffer_capacity_per_partition,
         )?;
         Ok(())
     }
@@ -465,6 +488,7 @@ mod tests {
             options.reader_backend,
             DeltaProviderReaderBackend::OfficialKernel
         );
+        assert_eq!(options.output_buffer_capacity_per_partition, 1);
         options.validate()?;
 
         Ok(())
@@ -485,6 +509,7 @@ mod tests {
         );
         assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
+        assert_eq!(options.output_buffer_capacity_per_partition, 1);
 
         Ok(())
     }
@@ -504,6 +529,22 @@ mod tests {
         );
         assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
+        assert_eq!(options.output_buffer_capacity_per_partition, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn execution_options_can_set_output_buffer_capacity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            2,
+            1,
+        )?
+        .with_output_buffer_capacity_per_partition(4)?;
+
+        assert_eq!(options.output_buffer_capacity_per_partition, 4);
 
         Ok(())
     }
@@ -527,6 +568,18 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "configuration error: max_concurrent_file_reads_per_partition must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn execution_options_reject_zero_output_buffer_capacity() {
+        let error = DeltaProviderScanExecutionOptions::default()
+            .with_output_buffer_capacity_per_partition(0)
+            .expect_err("zero output_buffer_capacity_per_partition must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "configuration error: output_buffer_capacity_per_partition must be greater than zero"
         );
     }
 

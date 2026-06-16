@@ -46,7 +46,7 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 11;
+const BENCHMARK_SCHEMA_VERSION: u32 = 12;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
@@ -140,7 +140,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 37] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 41] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -152,6 +152,10 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 37] = [
     "query_case",
     "reader_backend",
     "scheduling_mode",
+    "scan_target_partitions",
+    "max_concurrent_file_reads_per_scan",
+    "max_concurrent_file_reads_per_partition",
+    "output_buffer_capacity_per_partition",
     "repetitions",
     "file_count",
     "row_count",
@@ -312,6 +316,7 @@ async fn write_provider_exec_benchmark_csv_async(
     let run_environment = BenchmarkRunEnvironment::local();
     let workloads = ProviderExecWorkloadCase::standard_cases();
     let query_cases = ProviderExecQueryCase::standard_cases();
+    let scheduling_profiles = ProviderExecSchedulingProfile::standard_cases();
     let backends = [
         DeltaProviderReaderBackend::OfficialKernel,
         DeltaProviderReaderBackend::NativeAsync,
@@ -323,24 +328,33 @@ async fn write_provider_exec_benchmark_csv_async(
         let table = ProviderExecDeltaTable::create(&temp_root, workload)?;
         for query in query_cases {
             for backend in backends {
-                let summary =
-                    run_provider_exec_benchmark_case(&table, workload, query, backend, config)
-                        .await?;
-                writeln!(
-                    output,
-                    "{}",
-                    provider_exec_csv_row(ProviderExecCsvRowInput {
-                        run_environment,
-                        seed,
-                        workload_case_count: workloads.len(),
-                        table: &table,
+                for scheduling_profile in scheduling_profiles {
+                    let summary = run_provider_exec_benchmark_case(
+                        &table,
                         workload,
                         query,
                         backend,
-                        summary: &summary,
-                    })
-                    .join(",")
-                )?;
+                        scheduling_profile,
+                        config,
+                    )
+                    .await?;
+                    writeln!(
+                        output,
+                        "{}",
+                        provider_exec_csv_row(ProviderExecCsvRowInput {
+                            run_environment,
+                            seed,
+                            workload_case_count: workloads.len(),
+                            table: &table,
+                            workload,
+                            query,
+                            backend,
+                            scheduling_profile,
+                            summary: &summary,
+                        })
+                        .join(",")
+                    )?;
+                }
             }
         }
     }
@@ -428,6 +442,15 @@ struct ProviderExecQueryCase {
     sql: &'static str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProviderExecSchedulingProfile {
+    name: &'static str,
+    scan_target_partitions: usize,
+    max_concurrent_file_reads_per_scan: usize,
+    max_concurrent_file_reads_per_partition: usize,
+    output_buffer_capacity_per_partition: usize,
+}
+
 struct ProviderExecDeltaTable {
     path: PathBuf,
     file_count: usize,
@@ -480,6 +503,7 @@ struct ProviderExecCsvRowInput<'a> {
     workload: &'a ProviderExecWorkloadCase,
     query: ProviderExecQueryCase,
     backend: DeltaProviderReaderBackend,
+    scheduling_profile: ProviderExecSchedulingProfile,
     summary: &'a ProviderExecSummary,
 }
 
@@ -749,6 +773,34 @@ impl ProviderExecQueryCase {
     }
 }
 
+impl ProviderExecSchedulingProfile {
+    fn standard_cases() -> [Self; 3] {
+        [
+            Self {
+                name: "lazy_serial_buffer_1",
+                scan_target_partitions: 1,
+                max_concurrent_file_reads_per_scan: 1,
+                max_concurrent_file_reads_per_partition: 1,
+                output_buffer_capacity_per_partition: 1,
+            },
+            Self {
+                name: "lazy_parallel_buffer_1",
+                scan_target_partitions: 4,
+                max_concurrent_file_reads_per_scan: 4,
+                max_concurrent_file_reads_per_partition: 1,
+                output_buffer_capacity_per_partition: 1,
+            },
+            Self {
+                name: "lazy_parallel_buffer_4",
+                scan_target_partitions: 4,
+                max_concurrent_file_reads_per_scan: 4,
+                max_concurrent_file_reads_per_partition: 1,
+                output_buffer_capacity_per_partition: 4,
+            },
+        ]
+    }
+}
+
 impl ProviderExecDeltaTable {
     fn create(
         temp_root: &std::path::Path,
@@ -841,11 +893,12 @@ async fn run_provider_exec_benchmark_case(
     _workload: &ProviderExecWorkloadCase,
     query: ProviderExecQueryCase,
     backend: DeltaProviderReaderBackend,
+    scheduling_profile: ProviderExecSchedulingProfile,
     config: &ProviderExecConfig,
 ) -> Result<ProviderExecSummary, Box<dyn Error>> {
     let mut measurements = Vec::with_capacity(config.repetitions);
     for _ in 0..config.repetitions {
-        measurements.push(run_provider_exec_once(table, query, backend).await?);
+        measurements.push(run_provider_exec_once(table, query, backend, scheduling_profile).await?);
     }
 
     Ok(provider_exec_summary(&measurements))
@@ -855,6 +908,7 @@ async fn run_provider_exec_once(
     table: &ProviderExecDeltaTable,
     query: ProviderExecQueryCase,
     backend: DeltaProviderReaderBackend,
+    scheduling_profile: ProviderExecSchedulingProfile,
 ) -> Result<ProviderExecRunMeasurement, Box<dyn Error>> {
     let ctx = SessionContext::new();
     let source = load_delta_source(DeltaSourceConfig::new(
@@ -862,14 +916,20 @@ async fn run_provider_exec_once(
         table.path.to_string_lossy().to_string(),
     ))?;
     let protocol = preflight_delta_protocol(&source)?;
-    let execution_options =
-        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(backend, 1, 1)?;
+    let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+        backend,
+        scheduling_profile.max_concurrent_file_reads_per_scan,
+        scheduling_profile.max_concurrent_file_reads_per_partition,
+    )?
+    .with_output_buffer_capacity_per_partition(
+        scheduling_profile.output_buffer_capacity_per_partition,
+    )?;
     register_delta_sources_with_scan_execution_options(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
             protocol,
-            scan_target_partitions: Some(1),
+            scan_target_partitions: Some(scheduling_profile.scan_target_partitions),
         }],
         execution_options,
     )?;
@@ -981,7 +1041,20 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         input.workload.name.to_owned(),
         input.query.name.to_owned(),
         provider_exec_backend_name(input.backend).to_owned(),
-        "lazy".to_owned(),
+        input.scheduling_profile.name.to_owned(),
+        input.scheduling_profile.scan_target_partitions.to_string(),
+        input
+            .scheduling_profile
+            .max_concurrent_file_reads_per_scan
+            .to_string(),
+        input
+            .scheduling_profile
+            .max_concurrent_file_reads_per_partition
+            .to_string(),
+        input
+            .scheduling_profile
+            .output_buffer_capacity_per_partition
+            .to_string(),
         summary.repetitions.to_string(),
         input.table.file_count.to_string(),
         input.table.row_count.to_string(),
@@ -3796,7 +3869,7 @@ mod tests {
 
         assert_eq!(lines.len(), 1111);
         assert!(lines[0].starts_with("benchmark_schema_version,benchmark_mode,host_os,host_arch"));
-        assert!(csv.contains("\n11,synthetic,"));
+        assert!(csv.contains("\n12,synthetic,"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
@@ -3832,7 +3905,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "11");
+        assert_eq!(row[0], "12");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[5], "42");
         assert_eq!(row[6], "0");
@@ -3912,7 +3985,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "11");
+        assert_eq!(row[0], "12");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
@@ -4839,6 +4912,10 @@ mod tests {
     fn provider_exec_csv_header_contains_latency_signals() {
         assert_eq!(PROVIDER_EXEC_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(PROVIDER_EXEC_CSV_HEADER[1], "benchmark_mode");
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"scan_target_partitions"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"max_concurrent_file_reads_per_scan"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"max_concurrent_file_reads_per_partition"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"output_buffer_capacity_per_partition"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_file_count"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_deleted_rows"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_deleted_rows_per_file"));
@@ -4861,6 +4938,11 @@ mod tests {
             .iter()
             .map(|query| query.name)
             .collect::<Vec<_>>();
+        let scheduling_profiles = ProviderExecSchedulingProfile::standard_cases();
+        let scheduling_profile_names = scheduling_profiles
+            .iter()
+            .map(|profile| profile.name)
+            .collect::<Vec<_>>();
 
         assert_eq!(
             workload_names,
@@ -4877,6 +4959,18 @@ mod tests {
         assert!(query_names.contains(&"project_id"));
         assert!(query_names.contains(&"count_rows"));
         assert!(query_names.contains(&"filter_tail_ids"));
+        assert_eq!(
+            scheduling_profile_names,
+            [
+                "lazy_serial_buffer_1",
+                "lazy_parallel_buffer_1",
+                "lazy_parallel_buffer_4"
+            ]
+        );
+        assert_eq!(
+            scheduling_profiles[2].output_buffer_capacity_per_partition,
+            4
+        );
     }
 
     #[test]
@@ -4944,17 +5038,29 @@ mod tests {
                 sql: "select id from orders",
             },
             backend: DeltaProviderReaderBackend::NativeAsync,
+            scheduling_profile: ProviderExecSchedulingProfile {
+                name: "lazy_parallel_buffer_4",
+                scan_target_partitions: 4,
+                max_concurrent_file_reads_per_scan: 4,
+                max_concurrent_file_reads_per_partition: 1,
+                output_buffer_capacity_per_partition: 4,
+            },
             summary: &summary,
         });
 
         assert_eq!(row.len(), PROVIDER_EXEC_CSV_HEADER.len());
-        assert_eq!(row[0], "11");
+        assert_eq!(row[0], "12");
         assert_eq!(row[7], "test_sparse_dv");
         assert_eq!(row[9], "native_async");
-        assert_eq!(row[15], "2");
-        assert_eq!(row[16], "4");
-        assert_eq!(row[17], "2");
-        assert_eq!(row[18], "12");
+        assert_eq!(row[10], "lazy_parallel_buffer_4");
+        assert_eq!(row[11], "4");
+        assert_eq!(row[12], "4");
+        assert_eq!(row[13], "1");
+        assert_eq!(row[14], "4");
+        assert_eq!(row[19], "2");
+        assert_eq!(row[20], "4");
+        assert_eq!(row[21], "2");
+        assert_eq!(row[22], "12");
     }
 
     #[test]
@@ -5077,7 +5183,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "11");
+        assert_eq!(row[0], "12");
         assert_eq!(row[1], "synthetic");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");

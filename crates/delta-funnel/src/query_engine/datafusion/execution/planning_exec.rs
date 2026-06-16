@@ -258,6 +258,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                     read_schema,
                     file_tasks,
                     partition_limiter,
+                    self.execution_options.output_buffer_capacity_per_partition,
                     Arc::clone(&self.read_stats),
                 ))
             }
@@ -285,6 +286,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                     partition_reader,
                     file_tasks,
                     partition_limiter,
+                    self.execution_options.output_buffer_capacity_per_partition,
                     Arc::clone(&self.read_stats),
                 ))
             }
@@ -333,9 +335,10 @@ fn sequential_scan_partition_stream(
     read_schema: KernelScanReadSchema,
     file_tasks: Vec<DeltaScanFileTask>,
     partition_limiter: DeltaProviderSyncPartitionReadLimiter,
+    output_buffer_capacity: usize,
     read_stats: Arc<DeltaProviderReadStats>,
 ) -> SendableRecordBatchStream {
-    let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
+    let mut builder = RecordBatchReceiverStreamBuilder::new(schema, output_buffer_capacity);
     let output = builder.tx();
 
     builder.spawn_blocking(move || {
@@ -384,9 +387,10 @@ fn native_async_scan_partition_stream(
     file_reader: Arc<DeltaNativeAsyncPartitionFileReader>,
     file_tasks: Vec<DeltaScanFileTask>,
     partition_limiter: DeltaProviderAsyncPartitionReadLimiter,
+    output_buffer_capacity: usize,
     read_stats: Arc<DeltaProviderReadStats>,
 ) -> SendableRecordBatchStream {
-    let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
+    let mut builder = RecordBatchReceiverStreamBuilder::new(schema, output_buffer_capacity);
     let output = builder.tx();
 
     builder.spawn(async move {
@@ -3324,6 +3328,7 @@ mod tests {
                 fake_task("part-00002.parquet"),
             ],
             sync_read_limiter.partition_limiter(0)?,
+            1,
             Arc::clone(&read_stats),
         );
 
@@ -3383,6 +3388,7 @@ mod tests {
             scan.read_schema(),
             vec![fake_task("part-00001.parquet")],
             sync_read_limiter.partition_limiter(0)?,
+            1,
             Arc::clone(&read_stats),
         );
 
@@ -3437,6 +3443,7 @@ mod tests {
             scan.read_schema(),
             vec![fake_task("part-00000.parquet")],
             sync_read_limiter.partition_limiter(0)?,
+            1,
             Arc::clone(&read_stats),
         );
         let stream_b = super::sequential_scan_partition_stream(
@@ -3445,6 +3452,7 @@ mod tests {
             scan.read_schema(),
             vec![fake_task("part-00001.parquet")],
             sync_read_limiter.partition_limiter(1)?,
+            1,
             Arc::clone(&read_stats),
         );
 
@@ -3511,6 +3519,7 @@ mod tests {
                 fake_task("part-00001.parquet"),
             ],
             sync_read_limiter.partition_limiter(0)?,
+            1,
             Arc::clone(&read_stats),
         );
 
@@ -3567,6 +3576,7 @@ mod tests {
             scan.read_schema(),
             vec![fake_task("part-00001.parquet")],
             sync_read_limiter.partition_limiter(0)?,
+            1,
             Arc::clone(&read_stats),
         );
 
@@ -3620,6 +3630,7 @@ mod tests {
             scan.read_schema(),
             vec![task],
             sync_read_limiter.partition_limiter(0)?,
+            1,
             Arc::clone(&read_stats),
         );
 
@@ -3676,6 +3687,7 @@ mod tests {
             scan.read_schema(),
             vec![task],
             sync_read_limiter.partition_limiter(0)?,
+            1,
             Arc::clone(&read_stats),
         );
 
