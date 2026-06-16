@@ -11,45 +11,45 @@ use super::scheduling::DeltaProviderReaderBackend;
 /// Immutable view of provider read progress for one physical scan.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DeltaProviderReadStatsSnapshot {
+pub struct DeltaProviderReadStatsSnapshot {
     /// DataFusion table name for this source.
-    pub(crate) source_name: String,
+    pub source_name: String,
     /// Delta snapshot version selected for this scan.
-    pub(crate) snapshot_version: u64,
+    pub snapshot_version: u64,
     /// Provider file-reader backend selected for this scan.
-    pub(crate) reader_backend: DeltaProviderReaderBackend,
+    pub reader_backend: DeltaProviderReaderBackend,
     /// Whether metadata expansion exhausted the upstream kernel scan iterator.
-    pub(crate) scan_metadata_exhausted: Option<bool>,
+    pub scan_metadata_exhausted: Option<bool>,
     /// Planned DataFusion execution partitions for this scan.
-    pub(crate) scan_partitions_planned: u64,
+    pub scan_partitions_planned: u64,
     /// Selected provider file tasks planned for this scan.
-    pub(crate) files_planned: u64,
+    pub files_planned: u64,
     /// Estimated output rows from planning when every selected file had stats.
-    pub(crate) estimated_rows: Option<u64>,
+    pub estimated_rows: Option<u64>,
     /// Estimated bytes from planning when every selected file had a byte size.
-    pub(crate) estimated_bytes: Option<u64>,
+    pub estimated_bytes: Option<u64>,
     /// Execution partitions whose stream was started by DataFusion.
-    pub(crate) scan_partitions_started: u64,
+    pub scan_partitions_started: u64,
     /// Execution partitions whose stream reached normal completion.
-    pub(crate) scan_partitions_completed: u64,
+    pub scan_partitions_completed: u64,
     /// File-read handoffs that were started.
-    pub(crate) files_started: u64,
+    pub files_started: u64,
     /// File-read handoffs that finished successfully.
-    pub(crate) files_completed: u64,
+    pub files_completed: u64,
     /// Record batches sent toward DataFusion.
-    pub(crate) batches_produced: u64,
+    pub batches_produced: u64,
     /// Rows sent toward DataFusion after transform and DV filtering.
-    pub(crate) rows_produced: u64,
+    pub rows_produced: u64,
     /// Deletion-vector payloads loaded for selected files.
-    pub(crate) deletion_vector_payloads_loaded: u64,
+    pub deletion_vector_payloads_loaded: u64,
     /// Deletion-vector masks applied to selected files.
-    pub(crate) deletion_vectors_applied: u64,
+    pub deletion_vectors_applied: u64,
     /// Rows removed by deletion-vector masks when known.
-    pub(crate) deletion_vector_rows_deleted: u64,
+    pub deletion_vector_rows_deleted: u64,
     /// Deletion-vector read or masking failures.
-    pub(crate) deletion_vector_failures: u64,
+    pub deletion_vector_failures: u64,
     /// Deletion-vector reads rejected by safety gates.
-    pub(crate) deletion_vector_rejections: u64,
+    pub deletion_vector_rejections: u64,
 }
 
 /// Static context and planning estimates for one provider read stats instance.

@@ -17,11 +17,12 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use delta_funnel::{
-    DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
+    DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaSourceConfig,
-    DeltaTableProviderConfig, delta_scan_partition_target_local_environment_diagnostic,
+    DeltaTableProviderConfig, collect_delta_provider_read_stats,
+    delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic, load_delta_source, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options,
 };
@@ -46,7 +47,7 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 12;
+const BENCHMARK_SCHEMA_VERSION: u32 = 13;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
@@ -140,7 +141,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 41] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 58] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -163,6 +164,23 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 41] = [
     "deletion_vector_file_count",
     "deletion_vector_deleted_rows",
     "deletion_vector_deleted_rows_per_file",
+    "provider_stats_scan_count",
+    "provider_stats_scan_metadata_exhausted",
+    "provider_stats_scan_partitions_planned",
+    "provider_stats_files_planned",
+    "provider_stats_estimated_rows",
+    "provider_stats_estimated_bytes",
+    "provider_stats_scan_partitions_started_p50",
+    "provider_stats_scan_partitions_completed_p50",
+    "provider_stats_files_started_p50",
+    "provider_stats_files_completed_p50",
+    "provider_stats_batches_produced_p50",
+    "provider_stats_rows_produced_p50",
+    "provider_stats_deletion_vector_payloads_loaded_p50",
+    "provider_stats_deletion_vectors_applied_p50",
+    "provider_stats_deletion_vector_rows_deleted_p50",
+    "provider_stats_deletion_vector_failures_p50",
+    "provider_stats_deletion_vector_rejections_p50",
     "produced_rows",
     "produced_batches",
     "planning_micros_p50",
@@ -480,6 +498,27 @@ struct ProviderExecRunMeasurement {
     produced_rows: usize,
     produced_batches: usize,
     batch_latency_micros: Vec<u64>,
+    read_stats: ProviderExecReadStatsMeasurement,
+}
+
+struct ProviderExecReadStatsMeasurement {
+    scan_count: usize,
+    scan_metadata_exhausted: ProviderExecScanMetadataExhausted,
+    scan_partitions_planned: u64,
+    files_planned: u64,
+    estimated_rows: Option<u64>,
+    estimated_bytes: Option<u64>,
+    scan_partitions_started: u64,
+    scan_partitions_completed: u64,
+    files_started: u64,
+    files_completed: u64,
+    batches_produced: u64,
+    rows_produced: u64,
+    deletion_vector_payloads_loaded: u64,
+    deletion_vectors_applied: u64,
+    deletion_vector_rows_deleted: u64,
+    deletion_vector_failures: u64,
+    deletion_vector_rejections: u64,
 }
 
 struct ProviderExecSummary {
@@ -493,6 +532,35 @@ struct ProviderExecSummary {
     batch_latency_micros: PercentileSummary,
     min_total_micros: u64,
     max_total_micros: u64,
+    read_stats: ProviderExecReadStatsSummary,
+}
+
+struct ProviderExecReadStatsSummary {
+    scan_count: usize,
+    scan_metadata_exhausted: ProviderExecScanMetadataExhausted,
+    scan_partitions_planned: u64,
+    files_planned: u64,
+    estimated_rows: Option<u64>,
+    estimated_bytes: Option<u64>,
+    scan_partitions_started: u64,
+    scan_partitions_completed: u64,
+    files_started: u64,
+    files_completed: u64,
+    batches_produced: u64,
+    rows_produced: u64,
+    deletion_vector_payloads_loaded: u64,
+    deletion_vectors_applied: u64,
+    deletion_vector_rows_deleted: u64,
+    deletion_vector_failures: u64,
+    deletion_vector_rejections: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderExecScanMetadataExhausted {
+    True,
+    False,
+    Unknown,
+    Mixed,
 }
 
 struct ProviderExecCsvRowInput<'a> {
@@ -938,6 +1006,7 @@ async fn run_provider_exec_once(
     let planning_started = Instant::now();
     let dataframe = ctx.sql(query.sql).await?;
     let physical_plan = dataframe.create_physical_plan().await?;
+    let stats_plan = Arc::clone(&physical_plan);
     let planning_micros = u128_to_u64_saturating(planning_started.elapsed().as_micros());
     let execution_started = Instant::now();
     let mut stream = datafusion::physical_plan::execute_stream(physical_plan, ctx.task_ctx())?;
@@ -964,6 +1033,9 @@ async fn run_provider_exec_once(
     }
 
     let total_micros = u128_to_u64_saturating(query_started.elapsed().as_micros()).max(1);
+    let read_stats = provider_exec_read_stats_measurement(&collect_delta_provider_read_stats(
+        stats_plan.as_ref(),
+    ));
     let source_rows_per_second = u128_to_u64_saturating(
         (table.row_count as u128).saturating_mul(1_000_000) / u128::from(total_micros),
     );
@@ -976,6 +1048,7 @@ async fn run_provider_exec_once(
         produced_rows,
         produced_batches,
         batch_latency_micros,
+        read_stats,
     })
 }
 
@@ -1025,11 +1098,239 @@ fn provider_exec_summary(measurements: &[ProviderExecRunMeasurement]) -> Provide
         batch_latency_micros: percentile_summary(&batch_latency_micros),
         min_total_micros: total_micros.iter().copied().min().unwrap_or(0),
         max_total_micros: total_micros.iter().copied().max().unwrap_or(0),
+        read_stats: provider_exec_read_stats_summary(measurements),
     }
+}
+
+fn provider_exec_read_stats_measurement(
+    snapshots: &[DeltaProviderReadStatsSnapshot],
+) -> ProviderExecReadStatsMeasurement {
+    ProviderExecReadStatsMeasurement {
+        scan_count: snapshots.len(),
+        scan_metadata_exhausted: provider_exec_scan_metadata_exhausted(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.scan_metadata_exhausted),
+        ),
+        scan_partitions_planned: snapshots
+            .iter()
+            .map(|snapshot| snapshot.scan_partitions_planned)
+            .sum(),
+        files_planned: snapshots
+            .iter()
+            .map(|snapshot| snapshot.files_planned)
+            .sum(),
+        estimated_rows: sum_provider_exec_read_stats_optional(
+            snapshots.iter().map(|snapshot| snapshot.estimated_rows),
+        ),
+        estimated_bytes: sum_provider_exec_read_stats_optional(
+            snapshots.iter().map(|snapshot| snapshot.estimated_bytes),
+        ),
+        scan_partitions_started: snapshots
+            .iter()
+            .map(|snapshot| snapshot.scan_partitions_started)
+            .sum(),
+        scan_partitions_completed: snapshots
+            .iter()
+            .map(|snapshot| snapshot.scan_partitions_completed)
+            .sum(),
+        files_started: snapshots
+            .iter()
+            .map(|snapshot| snapshot.files_started)
+            .sum(),
+        files_completed: snapshots
+            .iter()
+            .map(|snapshot| snapshot.files_completed)
+            .sum(),
+        batches_produced: snapshots
+            .iter()
+            .map(|snapshot| snapshot.batches_produced)
+            .sum(),
+        rows_produced: snapshots
+            .iter()
+            .map(|snapshot| snapshot.rows_produced)
+            .sum(),
+        deletion_vector_payloads_loaded: snapshots
+            .iter()
+            .map(|snapshot| snapshot.deletion_vector_payloads_loaded)
+            .sum(),
+        deletion_vectors_applied: snapshots
+            .iter()
+            .map(|snapshot| snapshot.deletion_vectors_applied)
+            .sum(),
+        deletion_vector_rows_deleted: snapshots
+            .iter()
+            .map(|snapshot| snapshot.deletion_vector_rows_deleted)
+            .sum(),
+        deletion_vector_failures: snapshots
+            .iter()
+            .map(|snapshot| snapshot.deletion_vector_failures)
+            .sum(),
+        deletion_vector_rejections: snapshots
+            .iter()
+            .map(|snapshot| snapshot.deletion_vector_rejections)
+            .sum(),
+    }
+}
+
+fn provider_exec_read_stats_summary(
+    measurements: &[ProviderExecRunMeasurement],
+) -> ProviderExecReadStatsSummary {
+    let stats = measurements
+        .iter()
+        .map(|measurement| &measurement.read_stats)
+        .collect::<Vec<_>>();
+
+    ProviderExecReadStatsSummary {
+        scan_count: stats
+            .iter()
+            .map(|stats| stats.scan_count)
+            .max()
+            .unwrap_or(0),
+        scan_metadata_exhausted: provider_exec_scan_metadata_exhausted_from_measurements(
+            stats.iter().map(|stats| stats.scan_metadata_exhausted),
+        ),
+        scan_partitions_planned: stats
+            .iter()
+            .map(|stats| stats.scan_partitions_planned)
+            .max()
+            .unwrap_or(0),
+        files_planned: stats
+            .iter()
+            .map(|stats| stats.files_planned)
+            .max()
+            .unwrap_or(0),
+        estimated_rows: provider_exec_read_stats_optional_max(
+            stats.iter().map(|stats| stats.estimated_rows),
+        ),
+        estimated_bytes: provider_exec_read_stats_optional_max(
+            stats.iter().map(|stats| stats.estimated_bytes),
+        ),
+        scan_partitions_started: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.scan_partitions_started
+        }),
+        scan_partitions_completed: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.scan_partitions_completed
+        }),
+        files_started: provider_exec_read_stats_counter_p50(&stats, |stats| stats.files_started),
+        files_completed: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.files_completed
+        }),
+        batches_produced: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.batches_produced
+        }),
+        rows_produced: provider_exec_read_stats_counter_p50(&stats, |stats| stats.rows_produced),
+        deletion_vector_payloads_loaded: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.deletion_vector_payloads_loaded
+        }),
+        deletion_vectors_applied: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.deletion_vectors_applied
+        }),
+        deletion_vector_rows_deleted: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.deletion_vector_rows_deleted
+        }),
+        deletion_vector_failures: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.deletion_vector_failures
+        }),
+        deletion_vector_rejections: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.deletion_vector_rejections
+        }),
+    }
+}
+
+fn provider_exec_read_stats_counter_p50(
+    stats: &[&ProviderExecReadStatsMeasurement],
+    value: impl Fn(&ProviderExecReadStatsMeasurement) -> u64,
+) -> u64 {
+    percentile(
+        &stats.iter().map(|stats| value(stats)).collect::<Vec<_>>(),
+        50,
+    )
+}
+
+fn provider_exec_scan_metadata_exhausted(
+    values: impl IntoIterator<Item = Option<bool>>,
+) -> ProviderExecScanMetadataExhausted {
+    let mut saw_true = false;
+    let mut saw_false = false;
+    let mut saw_unknown = false;
+
+    for value in values {
+        match value {
+            Some(true) => saw_true = true,
+            Some(false) => saw_false = true,
+            None => saw_unknown = true,
+        }
+    }
+
+    if (saw_unknown && (saw_true || saw_false)) || (saw_true && saw_false) {
+        ProviderExecScanMetadataExhausted::Mixed
+    } else if saw_true {
+        ProviderExecScanMetadataExhausted::True
+    } else if saw_false {
+        ProviderExecScanMetadataExhausted::False
+    } else {
+        ProviderExecScanMetadataExhausted::Unknown
+    }
+}
+
+fn provider_exec_scan_metadata_exhausted_from_measurements(
+    values: impl IntoIterator<Item = ProviderExecScanMetadataExhausted>,
+) -> ProviderExecScanMetadataExhausted {
+    let mut saw_true = false;
+    let mut saw_false = false;
+    let mut saw_unknown = false;
+    let mut saw_mixed = false;
+
+    for value in values {
+        match value {
+            ProviderExecScanMetadataExhausted::True => saw_true = true,
+            ProviderExecScanMetadataExhausted::False => saw_false = true,
+            ProviderExecScanMetadataExhausted::Unknown => saw_unknown = true,
+            ProviderExecScanMetadataExhausted::Mixed => saw_mixed = true,
+        }
+    }
+
+    if saw_mixed || (saw_unknown && (saw_true || saw_false)) || (saw_true && saw_false) {
+        ProviderExecScanMetadataExhausted::Mixed
+    } else if saw_true {
+        ProviderExecScanMetadataExhausted::True
+    } else if saw_false {
+        ProviderExecScanMetadataExhausted::False
+    } else {
+        ProviderExecScanMetadataExhausted::Unknown
+    }
+}
+
+fn sum_provider_exec_read_stats_optional(
+    values: impl IntoIterator<Item = Option<u64>>,
+) -> Option<u64> {
+    let mut sum = 0_u64;
+    for value in values {
+        sum = sum.checked_add(value?)?;
+    }
+    Some(sum)
+}
+
+fn provider_exec_read_stats_optional_max(
+    values: impl IntoIterator<Item = Option<u64>>,
+) -> Option<u64> {
+    values.into_iter().flatten().max()
+}
+
+fn provider_exec_scan_metadata_exhausted_value(value: ProviderExecScanMetadataExhausted) -> String {
+    match value {
+        ProviderExecScanMetadataExhausted::True => "true",
+        ProviderExecScanMetadataExhausted::False => "false",
+        ProviderExecScanMetadataExhausted::Unknown => "",
+        ProviderExecScanMetadataExhausted::Mixed => "mixed",
+    }
+    .to_owned()
 }
 
 fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
     let summary = input.summary;
+    let read_stats = &summary.read_stats;
     vec![
         input.run_environment.schema_version.to_string(),
         BenchmarkMode::ProviderExec.as_csv_value().to_owned(),
@@ -1065,6 +1366,23 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
             .table
             .deletion_vector_deleted_rows_per_file
             .to_string(),
+        read_stats.scan_count.to_string(),
+        provider_exec_scan_metadata_exhausted_value(read_stats.scan_metadata_exhausted),
+        read_stats.scan_partitions_planned.to_string(),
+        read_stats.files_planned.to_string(),
+        optional_u64(read_stats.estimated_rows),
+        optional_u64(read_stats.estimated_bytes),
+        read_stats.scan_partitions_started.to_string(),
+        read_stats.scan_partitions_completed.to_string(),
+        read_stats.files_started.to_string(),
+        read_stats.files_completed.to_string(),
+        read_stats.batches_produced.to_string(),
+        read_stats.rows_produced.to_string(),
+        read_stats.deletion_vector_payloads_loaded.to_string(),
+        read_stats.deletion_vectors_applied.to_string(),
+        read_stats.deletion_vector_rows_deleted.to_string(),
+        read_stats.deletion_vector_failures.to_string(),
+        read_stats.deletion_vector_rejections.to_string(),
         summary.produced_rows.to_string(),
         summary.produced_batches.to_string(),
         summary.planning_micros.p50.to_string(),
@@ -3869,7 +4187,7 @@ mod tests {
 
         assert_eq!(lines.len(), 1111);
         assert!(lines[0].starts_with("benchmark_schema_version,benchmark_mode,host_os,host_arch"));
-        assert!(csv.contains("\n12,synthetic,"));
+        assert!(csv.contains("\n13,synthetic,"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
@@ -3905,7 +4223,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "12");
+        assert_eq!(row[0], "13");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[5], "42");
         assert_eq!(row[6], "0");
@@ -3985,7 +4303,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "12");
+        assert_eq!(row[0], "13");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
@@ -4919,6 +5237,9 @@ mod tests {
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_file_count"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_deleted_rows"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_deleted_rows_per_file"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_scan_count"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_files_started_p50"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_rows_produced_p50"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"planning_micros_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"time_to_first_batch_micros_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"total_micros_p99"));
@@ -5021,6 +5342,25 @@ mod tests {
             },
             min_total_micros: 29,
             max_total_micros: 33,
+            read_stats: ProviderExecReadStatsSummary {
+                scan_count: 1,
+                scan_metadata_exhausted: ProviderExecScanMetadataExhausted::True,
+                scan_partitions_planned: 4,
+                files_planned: 2,
+                estimated_rows: Some(16),
+                estimated_bytes: Some(1024),
+                scan_partitions_started: 4,
+                scan_partitions_completed: 4,
+                files_started: 2,
+                files_completed: 2,
+                batches_produced: 2,
+                rows_produced: 12,
+                deletion_vector_payloads_loaded: 2,
+                deletion_vectors_applied: 2,
+                deletion_vector_rows_deleted: 4,
+                deletion_vector_failures: 0,
+                deletion_vector_rejections: 0,
+            },
         };
         let row = provider_exec_csv_row(ProviderExecCsvRowInput {
             run_environment: BenchmarkRunEnvironment {
@@ -5049,7 +5389,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), PROVIDER_EXEC_CSV_HEADER.len());
-        assert_eq!(row[0], "12");
+        assert_eq!(row[0], "13");
         assert_eq!(row[7], "test_sparse_dv");
         assert_eq!(row[9], "native_async");
         assert_eq!(row[10], "lazy_parallel_buffer_4");
@@ -5060,7 +5400,12 @@ mod tests {
         assert_eq!(row[19], "2");
         assert_eq!(row[20], "4");
         assert_eq!(row[21], "2");
-        assert_eq!(row[22], "12");
+        assert_eq!(row[22], "1");
+        assert_eq!(row[23], "true");
+        assert_eq!(row[26], "16");
+        assert_eq!(row[30], "2");
+        assert_eq!(row[33], "12");
+        assert_eq!(row[39], "12");
     }
 
     #[test]
@@ -5183,7 +5528,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "12");
+        assert_eq!(row[0], "13");
         assert_eq!(row[1], "synthetic");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");

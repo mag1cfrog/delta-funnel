@@ -1,6 +1,7 @@
 //! DataFusion integration.
 
 use datafusion::common::DataFusionError;
+use datafusion::physical_plan::ExecutionPlan;
 
 use crate::DeltaFunnelError;
 
@@ -12,7 +13,9 @@ pub use catalog::registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources,
     register_delta_sources, register_delta_sources_with_scan_execution_options,
 };
-pub use execution::{DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions};
+pub use execution::{
+    DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
+};
 pub use planning::partition_target::{
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
@@ -24,6 +27,32 @@ pub use planning::partition_target::{
 impl From<DeltaFunnelError> for DataFusionError {
     fn from(error: DeltaFunnelError) -> Self {
         Self::External(Box::new(error))
+    }
+}
+
+/// Collects provider-owned Delta read stats snapshots from a DataFusion
+/// physical plan.
+#[must_use]
+pub fn collect_delta_provider_read_stats(
+    plan: &dyn ExecutionPlan,
+) -> Vec<DeltaProviderReadStatsSnapshot> {
+    let mut found = Vec::new();
+    collect_delta_provider_read_stats_into(plan, &mut found);
+    found
+}
+
+fn collect_delta_provider_read_stats_into(
+    plan: &dyn ExecutionPlan,
+    found: &mut Vec<DeltaProviderReadStatsSnapshot>,
+) {
+    if let Some(scan) = plan
+        .as_any()
+        .downcast_ref::<execution::DeltaScanPlanningExec>()
+    {
+        found.push(scan.read_stats_snapshot());
+    }
+    for child in plan.children() {
+        collect_delta_provider_read_stats_into(child.as_ref(), found);
     }
 }
 

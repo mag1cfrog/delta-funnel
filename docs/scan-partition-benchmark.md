@@ -240,6 +240,24 @@ important field groups are:
   - `deletion_vector_file_count`
   - `deletion_vector_deleted_rows`
   - `deletion_vector_deleted_rows_per_file`
+- Provider read stats:
+  - `provider_stats_scan_count`
+  - `provider_stats_scan_metadata_exhausted`
+  - `provider_stats_scan_partitions_planned`
+  - `provider_stats_files_planned`
+  - `provider_stats_estimated_rows`
+  - `provider_stats_estimated_bytes`
+  - `provider_stats_scan_partitions_started_p50`
+  - `provider_stats_scan_partitions_completed_p50`
+  - `provider_stats_files_started_p50`
+  - `provider_stats_files_completed_p50`
+  - `provider_stats_batches_produced_p50`
+  - `provider_stats_rows_produced_p50`
+  - `provider_stats_deletion_vector_payloads_loaded_p50`
+  - `provider_stats_deletion_vectors_applied_p50`
+  - `provider_stats_deletion_vector_rows_deleted_p50`
+  - `provider_stats_deletion_vector_failures_p50`
+  - `provider_stats_deletion_vector_rejections_p50`
 - Output shape:
   - `produced_rows`
   - `produced_batches`
@@ -308,5 +326,6 @@ temporary local Delta tables, Parquet decoding, Arrow batch production, provider
 backend selection, DataFusion SQL planning, and DataFusion collection. The
 provider-exec mode is local-file based and does not yet inject object-store
 latency or expose a bounded prefetch scheduler. It does compare existing
-production read-admission and output-buffer settings. Any later prefetch work
-must still use production provider execution paths.
+production read-admission and output-buffer settings, and it records provider
+owned read stats from the physical Delta scan plan. Any later prefetch work must
+still use production provider execution paths.
