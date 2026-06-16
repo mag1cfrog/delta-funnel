@@ -12,7 +12,8 @@ use delta_kernel::actions::deletion_vector_writer::{
 };
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int32Array, ListArray, StringArray, StructArray, TimestampMicrosecondArray,
+    Float64Array, Int32Array, ListArray, MapArray, StringArray, StructArray,
+    TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use delta_kernel::arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
@@ -37,6 +38,9 @@ const ARRAY_ADDRESSES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-r
 const MISSING_NULLABLE_ARRAY_ADDRESSES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"addresses\",\"type\":{\"type\":\"array\",\"elementType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"country\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const MISSING_NON_NULLABLE_ARRAY_ADDRESSES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"addresses\",\"type\":{\"type\":\"array\",\"elementType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"required_country\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]},\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const ARRAY_COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}},{\"name\":\"addresses\",\"type\":{\"type\":\"array\",\"elementType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":\"phys_city\"}},{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":6,\"delta.columnMapping.physicalName\":\"phys_zip\"}}]},\"containsNull\":true},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"phys_addresses\",\"delta.columnMapping.nested.ids\":{\"phys_addresses.element\":4}}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"6"},"createdTime":1587968585495}}"#;
+const MAP_ATTRIBUTES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+const MISSING_NULLABLE_MAP_ATTRIBUTES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"country\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+const MISSING_NON_NULLABLE_MAP_ATTRIBUTES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"required_country\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]},\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const DATA_FILE: &str = "part-00000.parquet";
 const MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
@@ -513,6 +517,81 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local Delta table whose map value struct children are stored
+    /// in a different order from the Delta schema.
+    pub(crate) fn new_with_reordered_map_value_struct_fields(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            MAP_ATTRIBUTES_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![map_attributes_batch()?],
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
+    /// Creates a local Delta table whose log schema has a nullable map value
+    /// struct child absent from the older Parquet data file.
+    pub(crate) fn new_with_missing_nullable_map_value_struct_field(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            MISSING_NULLABLE_MAP_ATTRIBUTES_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![map_attributes_batch()?],
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
+    /// Creates a local Delta table whose log schema has a non-nullable map
+    /// value struct child absent from the older Parquet data file.
+    pub(crate) fn new_with_missing_non_nullable_map_value_struct_field(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            MISSING_NON_NULLABLE_MAP_ATTRIBUTES_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![map_attributes_batch()?],
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
     /// Creates a local Delta table whose log schema has a nullable column that
     /// is absent from the older Parquet data file.
     pub(crate) fn new_with_missing_nullable_column(
@@ -845,6 +924,41 @@ fn array_column_mapping_schema() -> Arc<Schema> {
     ]))
 }
 
+fn map_attributes_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("customer_name", DataType::Utf8, true),
+        Field::new(
+            "attributes",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new(
+                                "value",
+                                DataType::Struct(
+                                    vec![
+                                        Field::new("city", DataType::Utf8, true),
+                                        Field::new("zip", DataType::Int32, true),
+                                    ]
+                                    .into(),
+                                ),
+                                true,
+                            ),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        ),
+    ]))
+}
+
 fn reordered_physical_columns_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("customer_name", DataType::Utf8, true),
@@ -1039,6 +1153,68 @@ fn array_column_mapping_batch() -> Result<kernel::RecordBatch, Box<dyn std::erro
 
     Ok(kernel::RecordBatch::try_new(
         array_column_mapping_schema(),
+        columns,
+    )?)
+}
+
+fn map_attributes_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let key_field = Field::new("key", DataType::Utf8, false);
+    let value_field = Field::new(
+        "value",
+        DataType::Struct(
+            vec![
+                Field::new("city", DataType::Utf8, true),
+                Field::new("zip", DataType::Int32, true),
+            ]
+            .into(),
+        ),
+        true,
+    );
+    let value_array = Arc::new(StructArray::from(vec![
+        (
+            Arc::new(Field::new("city", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![
+                Some("san francisco"),
+                Some("new york"),
+                Some("phoenix"),
+            ])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("zip", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![Some(94110), Some(10001), None])) as ArrayRef,
+        ),
+    ])) as ArrayRef;
+    let entries = StructArray::new(
+        vec![Arc::new(key_field.clone()), Arc::new(value_field.clone())].into(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("home"),
+                Some("work"),
+                Some("mailing"),
+            ])) as ArrayRef,
+            value_array,
+        ],
+        None,
+    );
+    let attributes = MapArray::try_new(
+        Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(vec![key_field, value_field].into()),
+            false,
+        )),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 3])),
+        entries,
+        None,
+        false,
+    )?;
+    let columns = vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
+        Arc::new(attributes) as Arc<dyn Array>,
+    ];
+
+    Ok(kernel::RecordBatch::try_new(
+        map_attributes_schema(),
         columns,
     )?)
 }
