@@ -1649,6 +1649,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_matches_official_kernel_for_map_list_key_struct_name_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_reordered_map_list_key_struct_fields(
+            "native-async-map-list-key-struct-name-fallback",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select attributes, id from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let (native, native_stats) = collect_sql_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(
+            native_stats.reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+        assert_eq!(native, official);
+        assert!(native.contains("attributes"), "{native}");
+        assert!(native.contains("city"), "{native}");
+        assert!(native.contains("zip"), "{native}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_matches_official_kernel_for_nested_map_key_struct_name_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_reordered_nested_map_key_struct_fields(
+            "native-async-nested-map-key-struct-name-fallback",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select attributes, id from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let (native, native_stats) = collect_sql_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(
+            native_stats.reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+        assert_eq!(native, official);
+        assert!(native.contains("attributes"), "{native}");
+        assert!(native.contains("city"), "{native}");
+        assert!(native.contains("zip"), "{native}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_matches_official_kernel_for_missing_nullable_nested_struct_field()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_missing_nullable_nested_struct_field(
