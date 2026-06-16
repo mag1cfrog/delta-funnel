@@ -548,21 +548,23 @@ fn load_delta_source_after_name_validation(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Expr, col, lit};
     use delta_kernel::arrow::array::{Array, StructArray};
     use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::object_store::{memory::InMemory, path::Path as ObjectStorePath};
 
     use super::kernel::{ColumnName, Expression, Predicate, Scalar};
     use super::{
-        DeltaKernelPredicate, DeltaSourceConfig, DeltaStorageOptions, ProjectedDeltaScan,
-        build_projected_delta_scan, build_projected_predicated_delta_scan,
+        DeltaKernelPredicate, DeltaSourceConfig, DeltaStorageOptions, KernelDataFileReader,
+        KernelDataFileReaderConfig, KernelDeletionVectorReader, KernelDeletionVectorReaderConfig,
+        ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
         datafusion_expr_to_kernel_predicate, load_delta_source, load_delta_sources,
     };
     use crate::DeltaFunnelError;
@@ -962,6 +964,90 @@ mod tests {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
 
         Ok(format!("{}-{}-{nanos}", std::process::id(), name))
+    }
+
+    type CapturedStorageOptions = Arc<Mutex<Vec<DeltaStorageOptions>>>;
+
+    fn storage_options(entries: &[(&str, &str)]) -> DeltaStorageOptions {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn unique_storage_scheme(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sanitized_name = name
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .collect::<String>();
+
+        Ok(format!("df{sanitized_name}{}{}", std::process::id(), nanos))
+    }
+
+    fn register_capturing_storage_handler(
+        scheme: &str,
+        captured: CapturedStorageOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        super::kernel::insert_url_handler(
+            scheme,
+            Arc::new(move |_url, options| {
+                let options = options.into_iter().collect::<BTreeMap<_, _>>();
+                captured
+                    .lock()
+                    .map_err(|_| delta_kernel::object_store::Error::Generic {
+                        store: "capture",
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "captured storage options lock poisoned",
+                        )
+                        .into(),
+                    })?
+                    .push(options);
+
+                Ok((Box::new(InMemory::new()), ObjectStorePath::from("")))
+            }),
+        )?;
+
+        Ok(())
+    }
+
+    fn register_failing_storage_handler(
+        scheme: &str,
+        captured: CapturedStorageOptions,
+        secret_value: &'static str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        super::kernel::insert_url_handler(
+            scheme,
+            Arc::new(move |_url, options| {
+                let options = options.into_iter().collect::<BTreeMap<_, _>>();
+                captured
+                    .lock()
+                    .map_err(|_| delta_kernel::object_store::Error::Generic {
+                        store: "capture",
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "captured storage options lock poisoned",
+                        )
+                        .into(),
+                    })?
+                    .push(options);
+
+                Err(delta_kernel::object_store::Error::Generic {
+                    store: "capture",
+                    source: std::io::Error::new(std::io::ErrorKind::Other, secret_value).into(),
+                })
+            }),
+        )?;
+
+        Ok(())
+    }
+
+    fn captured_storage_options(captured: &CapturedStorageOptions) -> Vec<DeltaStorageOptions> {
+        captured
+            .lock()
+            .map(|options| options.clone())
+            .unwrap_or_default()
     }
 
     fn kernel_scan_file_paths(
@@ -6259,6 +6345,117 @@ mod tests {
         assert!(source.table_uri().starts_with("file://"));
         assert_eq!(source.version(), 1);
         assert_eq!(source.loaded_snapshot().version(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn planned_delta_source_owns_and_isolates_storage_options()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("storage-options-owned")?;
+        let mut caller_options = storage_options(&[
+            ("authorization", "caller-original"),
+            ("region", "us-west-2"),
+        ]);
+        let source = load_delta_source(
+            DeltaSourceConfig::new("orders", table.path.to_string_lossy())
+                .with_storage_options(caller_options.clone()),
+        )?;
+
+        caller_options.insert("authorization".to_owned(), "caller-mutated".to_owned());
+        caller_options.insert("new-secret".to_owned(), "caller-added".to_owned());
+
+        assert_eq!(
+            source
+                .storage_options()
+                .get("authorization")
+                .map(String::as_str),
+            Some("caller-original")
+        );
+        assert_eq!(
+            source.storage_options().get("region").map(String::as_str),
+            Some("us-west-2")
+        );
+        assert!(!source.storage_options().contains_key("new-secret"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn source_loading_passes_storage_options_to_kernel_store_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = unique_storage_scheme("sourceoptions")?;
+        let captured = CapturedStorageOptions::default();
+        register_capturing_storage_handler(&scheme, Arc::clone(&captured))?;
+        let options =
+            storage_options(&[("authorization", "source-token"), ("region", "us-east-1")]);
+
+        let result = load_delta_source(
+            DeltaSourceConfig::new("orders", format!("{scheme}://table/root"))
+                .with_storage_options(options.clone()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaSnapshotLoad { .. })
+        ));
+        assert_eq!(captured_storage_options(&captured), vec![options]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn reader_construction_passes_storage_options_to_each_store_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = unique_storage_scheme("readeroptions")?;
+        let captured = CapturedStorageOptions::default();
+        register_capturing_storage_handler(&scheme, Arc::clone(&captured))?;
+        let table_uri = format!("{scheme}://table/root/");
+        let options = storage_options(&[
+            ("authorization", "reader-token"),
+            ("endpoint", "http://storage.example"),
+        ]);
+
+        let _data_reader = KernelDataFileReader::try_new(KernelDataFileReaderConfig {
+            source_name: "orders",
+            table_uri: &table_uri,
+            snapshot_version: 42,
+            storage_options: &options,
+        })?;
+        let _dv_reader = KernelDeletionVectorReader::try_new(KernelDeletionVectorReaderConfig {
+            source_name: "orders",
+            table_uri: &table_uri,
+            snapshot_version: 42,
+            storage_options: &options,
+        })?;
+        let captured_options = captured_storage_options(&captured);
+        assert_eq!(captured_options.len(), 2);
+        assert!(captured_options.iter().all(|captured| captured == &options));
+
+        Ok(())
+    }
+
+    #[test]
+    fn storage_option_values_are_not_exposed_when_store_construction_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = unique_storage_scheme("redactedoptions")?;
+        let captured = CapturedStorageOptions::default();
+        let secret_value = "super-secret-token-value";
+        register_failing_storage_handler(&scheme, Arc::clone(&captured), secret_value)?;
+        let options = storage_options(&[("authorization", secret_value), ("region", "us-west-2")]);
+
+        let result = load_delta_source(
+            DeltaSourceConfig::new("orders", format!("{scheme}://table/root"))
+                .with_storage_options(options.clone()),
+        );
+        let error = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+
+        assert_eq!(captured_storage_options(&captured), vec![options]);
+        assert!(!error.contains(secret_value));
+        assert!(!error.contains("authorization"));
 
         Ok(())
     }
