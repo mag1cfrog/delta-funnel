@@ -14,7 +14,6 @@ use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::engine::default::storage::store_from_url_opts;
 use futures_util::StreamExt;
 use object_store::{ObjectStore, path::Path};
 use parquet::arrow::RowNumber;
@@ -45,7 +44,8 @@ use super::native_async_row_group_pruning::native_async_pruned_row_groups;
 use super::read_stats::DeltaProviderReadStats;
 use super::scheduling::DeltaProviderAsyncFileReadPermit;
 use crate::table_formats::{
-    KernelDataFileReader, KernelDataFileReaderConfig, KernelDataFileTransformRequest,
+    DeltaStorageOptions, KernelDataFileReader, KernelDataFileReaderConfig,
+    KernelDataFileTransformRequest,
 };
 
 const TABLE_ROOT_CONTEXT: &str = "<table-root>";
@@ -60,6 +60,8 @@ pub(crate) struct DeltaNativeAsyncFileReaderConfig<'a> {
     pub(crate) table_uri: &'a str,
     /// Snapshot version that selected the file tasks.
     pub(crate) snapshot_version: u64,
+    /// Source-local options forwarded to Delta Kernel object-store construction.
+    pub(crate) storage_options: &'a DeltaStorageOptions,
 }
 
 /// Reusable native async file reader context for one provider scan.
@@ -142,26 +144,33 @@ impl DeltaNativeAsyncFileReader {
                 path: TABLE_ROOT_CONTEXT.to_owned(),
                 phase: DeltaScanFileReadPhase::TableUriParsing,
             })?;
-        let store = store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>()).context(
-            DeltaScanFileReadSnafu {
-                source_name: config.source_name.to_owned(),
-                table_uri: config.table_uri.to_owned(),
-                snapshot_version: config.snapshot_version,
-                path: TABLE_ROOT_CONTEXT.to_owned(),
-                phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
-            },
-        )?;
+        let store = delta_kernel::engine::default::storage::store_from_url_opts(
+            &table_url,
+            config
+                .storage_options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .context(DeltaScanFileReadSnafu {
+            source_name: config.source_name.to_owned(),
+            table_uri: config.table_uri.to_owned(),
+            snapshot_version: config.snapshot_version,
+            path: TABLE_ROOT_CONTEXT.to_owned(),
+            phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
+        })?;
         let data_file_reader =
             Arc::new(KernelDataFileReader::try_new(KernelDataFileReaderConfig {
                 source_name: config.source_name,
                 table_uri: config.table_uri,
                 snapshot_version: config.snapshot_version,
+                storage_options: config.storage_options,
             })?);
         let deletion_vector_reader = Arc::new(KernelDeletionVectorReader::try_new(
             KernelDeletionVectorReaderConfig {
                 source_name: config.source_name,
                 table_uri: config.table_uri,
                 snapshot_version: config.snapshot_version,
+                storage_options: config.storage_options,
             },
         )?);
 
@@ -1169,7 +1178,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::arrow::array::{Array, Decimal128Array, Int32Array, StringArray};
@@ -1177,6 +1186,7 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Expr, col, lit};
+    use delta_kernel::object_store::{memory::InMemory, path::Path as ObjectStorePath};
     use object_store::ObjectStoreExt;
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -1190,7 +1200,7 @@ mod tests {
         validate_native_async_reader_config,
     };
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig,
+        DeltaFunnelError, DeltaSourceConfig, DeltaStorageOptions,
         error::DeltaScanFileReadPhase,
         load_delta_source,
         query_engine::datafusion::{
@@ -1229,11 +1239,70 @@ mod tests {
         Ok((TestDir { path }, table_uri))
     }
 
+    type CapturedStorageOptions = Arc<Mutex<Vec<DeltaStorageOptions>>>;
+
+    fn storage_options(entries: &[(&str, &str)]) -> DeltaStorageOptions {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn unique_storage_scheme(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sanitized_name = name
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .collect::<String>();
+
+        Ok(format!(
+            "dfnative{sanitized_name}{}{}",
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    fn register_capturing_storage_handler(
+        scheme: &str,
+        captured: CapturedStorageOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        delta_kernel::engine::default::storage::insert_url_handler(
+            scheme,
+            Arc::new(move |_url, options| {
+                let options = options.into_iter().collect::<BTreeMap<_, _>>();
+                captured
+                    .lock()
+                    .map_err(|_| delta_kernel::object_store::Error::Generic {
+                        store: "capture",
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "captured storage options lock poisoned",
+                        )
+                        .into(),
+                    })?
+                    .push(options);
+
+                Ok((Box::new(InMemory::new()), ObjectStorePath::from("")))
+            }),
+        )?;
+
+        Ok(())
+    }
+
+    fn captured_storage_options(captured: &CapturedStorageOptions) -> Vec<DeltaStorageOptions> {
+        captured
+            .lock()
+            .map(|options| options.clone())
+            .unwrap_or_default()
+    }
+
     fn reader(table_uri: &str) -> Result<DeltaNativeAsyncFileReader, DeltaFunnelError> {
+        let storage_options = DeltaStorageOptions::default();
         DeltaNativeAsyncFileReader::try_new(DeltaNativeAsyncFileReaderConfig {
             source_name: "orders",
             table_uri,
             snapshot_version: 42,
+            storage_options: &storage_options,
         })
     }
 
@@ -1269,6 +1338,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
 
@@ -1427,15 +1497,43 @@ mod tests {
     fn native_async_reader_constructs_memory_object_store_for_remote_like_uri()
     -> Result<(), Box<dyn std::error::Error>> {
         let table_uri = "memory:///table/root/";
+        let storage_options = DeltaStorageOptions::default();
         validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
             source_name: "orders",
             table_uri,
             snapshot_version: 42,
+            storage_options: &storage_options,
         })?;
         let reader = reader(table_uri)?;
         let object = reader.parquet_object_for_task(&task(table_uri, "part-00000.parquet"))?;
 
         assert_eq!(object.path.as_ref(), "table/root/part-00000.parquet");
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_reader_config_passes_storage_options_to_each_store_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = unique_storage_scheme("options")?;
+        let captured = CapturedStorageOptions::default();
+        register_capturing_storage_handler(&scheme, Arc::clone(&captured))?;
+        let table_uri = format!("{scheme}://table/root/");
+        let options = storage_options(&[
+            ("authorization", "native-token"),
+            ("endpoint", "http://storage.example"),
+        ]);
+
+        validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
+            source_name: "orders",
+            table_uri: &table_uri,
+            snapshot_version: 42,
+            storage_options: &options,
+        })?;
+
+        let captured_options = captured_storage_options(&captured);
+        assert_eq!(captured_options.len(), 3);
+        assert!(captured_options.iter().all(|captured| captured == &options));
 
         Ok(())
     }
@@ -1484,10 +1582,12 @@ mod tests {
 
     #[test]
     fn native_async_reader_rejects_unsupported_object_store_scheme() {
+        let storage_options = DeltaStorageOptions::default();
         let error = validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
             source_name: "orders",
             table_uri: "ftp://example.com/table/",
             snapshot_version: 42,
+            storage_options: &storage_options,
         })
         .expect_err("unsupported object store scheme must fail");
 
@@ -1531,11 +1631,12 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1684,11 +1785,12 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1703,6 +1805,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         let stream = reader
@@ -1748,11 +1851,12 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1767,6 +1871,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         let mut stream = reader
@@ -1802,6 +1907,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
@@ -1809,7 +1915,7 @@ mod tests {
             .read_schema()
             .with_provider_enforced_physical_predicate_rows();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1824,6 +1930,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         assert!(read_schema.enforces_physical_predicate_rows());
@@ -1867,6 +1974,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
@@ -1874,7 +1982,7 @@ mod tests {
             .read_schema()
             .with_provider_enforced_physical_predicate_rows();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1889,6 +1997,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         assert!(task.deletion_vector.is_present());
@@ -1939,12 +2048,13 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(3_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1959,6 +2069,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
         let object = reader.parquet_object_for_task(&task)?;
         let parquet_reader =
@@ -1983,6 +2094,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let negative = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
         let predicate = datafusion_expr_to_kernel_predicate(&col("amount").lt(negative))?;
@@ -2031,12 +2143,13 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(3_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -2051,6 +2164,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         let stream = reader
@@ -2088,12 +2202,13 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let projected_columns = vec!["customer_name".to_owned()];
         let scan = build_projected_delta_scan(&source, Some(&projected_columns))?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -2108,6 +2223,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?;
 
         let stream = reader

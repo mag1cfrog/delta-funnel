@@ -12,7 +12,7 @@ use crate::{
 use delta_kernel::arrow::array::BooleanArray;
 use snafu::ResultExt;
 
-use super::{KernelPhysicalToLogicalTransform, kernel};
+use super::{DeltaStorageOptions, KernelPhysicalToLogicalTransform, kernel};
 
 /// Kernel scan schema state required to read physical Parquet data.
 #[allow(dead_code)]
@@ -121,6 +121,8 @@ pub(crate) struct KernelDataFileReaderConfig<'a> {
     pub(crate) table_uri: &'a str,
     /// Snapshot version that selected this file.
     pub(crate) snapshot_version: u64,
+    /// Source-local options forwarded to Delta Kernel object-store construction.
+    pub(crate) storage_options: &'a DeltaStorageOptions,
 }
 
 /// Reusable official-kernel reader baseline for one provider scan context.
@@ -198,14 +200,20 @@ impl KernelDataFileReader {
                 path: TABLE_ROOT_CONTEXT.to_owned(),
                 phase: DeltaScanFileReadPhase::TableUriParsing,
             })?;
-        let store = kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())
-            .context(DeltaScanFileReadSnafu {
-                source_name: config.source_name.to_owned(),
-                table_uri: config.table_uri.to_owned(),
-                snapshot_version: config.snapshot_version,
-                path: TABLE_ROOT_CONTEXT.to_owned(),
-                phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
-            })?;
+        let store = kernel::store_from_url_opts(
+            &table_url,
+            config
+                .storage_options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .context(DeltaScanFileReadSnafu {
+            source_name: config.source_name.to_owned(),
+            table_uri: config.table_uri.to_owned(),
+            snapshot_version: config.snapshot_version,
+            path: TABLE_ROOT_CONTEXT.to_owned(),
+            phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
+        })?;
         let engine = std::sync::Arc::new(kernel::DefaultEngineBuilder::new(store).build());
 
         Ok(Self {
@@ -480,7 +488,7 @@ mod tests {
         let read_schema = scan.read_schema();
         let reader = test_reader(&source)?;
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -534,7 +542,7 @@ mod tests {
         let read_schema = scan.read_schema();
         let reader = test_reader(&source)?;
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -599,6 +607,7 @@ mod tests {
             name: source_name.to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?)
     }
 
@@ -609,6 +618,7 @@ mod tests {
             source_name: source.name(),
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
+            storage_options: source.storage_options(),
         })?)
     }
 }

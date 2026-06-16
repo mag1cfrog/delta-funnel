@@ -244,6 +244,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                     source_name: &self.scan_plan.source_name,
                     table_uri: &self.scan_plan.table_uri,
                     snapshot_version: self.scan_plan.snapshot_version,
+                    storage_options: &self.scan_plan.storage_options,
                 })
                 .map_err(DataFusionError::from)?;
                 let partition_limiter = self
@@ -266,6 +267,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                         source_name: &self.scan_plan.source_name,
                         table_uri: &self.scan_plan.table_uri,
                         snapshot_version: self.scan_plan.snapshot_version,
+                        storage_options: &self.scan_plan.storage_options,
                     },
                 )?);
                 let partition_reader = Arc::new(DeltaNativeAsyncPartitionFileReader::new(
@@ -562,6 +564,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table_uri.to_owned(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options =
@@ -672,6 +675,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(
@@ -790,6 +794,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -831,6 +836,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -896,6 +902,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -985,6 +992,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -1184,6 +1192,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -1315,6 +1324,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -1378,6 +1388,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -1441,6 +1452,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -1653,6 +1665,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -1712,6 +1725,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -1764,6 +1778,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -1815,6 +1830,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -1876,6 +1892,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -1949,6 +1966,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -2023,6 +2041,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
@@ -2128,6 +2147,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(
@@ -2188,6 +2208,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(
@@ -2291,6 +2312,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(
@@ -2344,6 +2366,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(
@@ -2400,6 +2423,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(
@@ -2446,6 +2470,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(
@@ -2510,6 +2535,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(
@@ -2567,6 +2593,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
         let read_schema = scan.read_schema();
@@ -2640,6 +2667,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
         let sync_read_limiter =
@@ -2683,6 +2711,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
         let read_count = Arc::new(AtomicUsize::new(0));
@@ -2762,6 +2791,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
         let read_count = Arc::new(AtomicUsize::new(0));
@@ -2821,6 +2851,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
         let sync_read_limiter =
@@ -2871,6 +2902,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
         let sync_read_limiter =
@@ -2925,6 +2957,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
@@ -2979,6 +3012,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
@@ -3210,6 +3244,7 @@ mod tests {
             name: source_name.to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         register_delta_sources(

@@ -17,6 +17,8 @@ pub(crate) use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 pub(crate) use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 pub(crate) use delta_kernel::engine::default::DefaultEngineBuilder;
+#[cfg(test)]
+pub(crate) use delta_kernel::engine::default::storage::insert_url_handler;
 pub(crate) use delta_kernel::engine::default::storage::store_from_url_opts;
 pub(crate) use delta_kernel::expressions::{
     ColumnName, DecimalData, Expression, ExpressionRef, Predicate, PredicateRef, Scalar,

@@ -242,6 +242,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let ctx = SessionContext::new();
@@ -272,6 +273,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let ctx = SessionContext::new();
@@ -308,6 +310,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let ctx = SessionContext::new();
@@ -367,6 +370,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let ctx = SessionContext::new();
@@ -407,11 +411,13 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: orders.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let customers_source = load_delta_source(DeltaSourceConfig {
             name: "customers".to_owned(),
             table_uri: customers.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let customers_preflight = preflight_delta_protocol(&customers_source)?;
         let ctx = SessionContext::new();
@@ -448,11 +454,13 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: orders.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let customers_source = load_delta_source(DeltaSourceConfig {
             name: "customers".to_owned(),
             table_uri: customers.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let orders_preflight = preflight_delta_protocol(&orders_source)?;
         let customers_preflight = preflight_delta_protocol(&customers_source)?;
@@ -503,11 +511,13 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: orders.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let customers_source = load_delta_source(DeltaSourceConfig {
             name: "customers".to_owned(),
             table_uri: customers.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let orders_preflight = preflight_delta_protocol(&orders_source)?;
         let customers_preflight = preflight_delta_protocol(&customers_source)?;
@@ -561,11 +571,13 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: orders.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let customers_source = load_delta_source(DeltaSourceConfig {
             name: "customers".to_owned(),
             table_uri: customers.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let orders_preflight = preflight_delta_protocol(&orders_source)?;
         let customers_preflight = preflight_delta_protocol(&customers_source)?;
@@ -623,11 +635,13 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: orders.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let customers_source = load_delta_source(DeltaSourceConfig {
             name: "customers".to_owned(),
             table_uri: customers.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let orders_preflight = preflight_delta_protocol(&orders_source)?;
         let customers_preflight = preflight_delta_protocol(&customers_source)?;
@@ -674,11 +688,13 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: orders.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let customers_source = load_delta_source(DeltaSourceConfig {
             name: "Orders".to_owned(),
             table_uri: customers.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let orders_preflight = preflight_delta_protocol(&orders_source)?;
         let customers_preflight = preflight_delta_protocol(&customers_source)?;

@@ -53,7 +53,7 @@ fn scan_file_paths(
     let scan_plan = scan.scan_plan();
     scan_plan
         .kernel_scan()
-        .scan_file_paths(&scan_plan.table_uri)
+        .scan_file_paths(&scan_plan.table_uri, &scan_plan.storage_options)
 }
 
 fn scan_partition_file_paths(scan: &DeltaScanPlanningExec) -> Vec<Vec<String>> {
@@ -422,6 +422,7 @@ fn register_native_delta_source(
         name: source_name.to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -463,6 +464,7 @@ fn delta_provider_exposes_logical_arrow_schema() -> Result<(), Box<dyn std::erro
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -492,6 +494,7 @@ fn delta_provider_accepts_native_async_backend_for_local_file_uri()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -524,6 +527,7 @@ fn native_async_backend_uses_existing_filter_pushdown_plan()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new_with_execution_options(
@@ -555,6 +559,7 @@ fn native_async_direct_data_filter_is_exact_only_for_native_backend()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let official_preflight = preflight_delta_protocol(&official_source)?;
     let official_provider = DeltaTableProvider::try_new(official_source, official_preflight)?;
@@ -563,6 +568,7 @@ fn native_async_direct_data_filter_is_exact_only_for_native_backend()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let native_preflight = preflight_delta_protocol(&native_source)?;
     let native_provider = DeltaTableProvider::try_new_with_execution_options(
@@ -606,6 +612,7 @@ fn native_async_mixed_data_filter_remains_inexact_metadata_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new_with_execution_options(
@@ -737,6 +744,7 @@ async fn table_provider_scan_returns_projected_non_reading_plan()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -767,6 +775,7 @@ async fn table_provider_scan_without_projection_returns_full_non_reading_plan()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -804,6 +813,7 @@ async fn table_provider_scan_records_session_target_but_uses_auto_file_task_grou
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -870,6 +880,7 @@ async fn table_provider_scan_uses_explicit_delta_target_override()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider =
@@ -923,6 +934,7 @@ async fn registered_table_provider_scan_uses_configured_delta_target_override()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -968,6 +980,7 @@ async fn table_provider_scan_does_not_create_empty_partitions_when_target_exceed
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1006,6 +1019,7 @@ async fn table_provider_scan_with_no_active_files_reports_zero_partitions()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1044,6 +1058,7 @@ async fn table_provider_scan_exec_carries_direct_partition_execution_handoff()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1103,6 +1118,7 @@ async fn table_provider_scan_rejects_invalid_projection_before_execution()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1128,6 +1144,7 @@ async fn table_provider_scan_rejects_duplicate_projection_at_public_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1153,6 +1170,7 @@ async fn table_provider_scan_rejects_unsupported_pushed_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1187,6 +1205,7 @@ async fn table_provider_scan_accepts_exact_partition_equality_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1231,6 +1250,7 @@ async fn table_provider_scan_accepts_exact_partition_in_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1288,6 +1308,7 @@ async fn table_provider_scan_accepts_inexact_integer_data_stats_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1333,6 +1354,7 @@ fn datafusion_provider_preflight_allows_deletion_vectors_before_stats_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
 
     let preflight = preflight_delta_protocol(&source)?;
@@ -1369,6 +1391,7 @@ async fn table_provider_scan_combines_exact_partition_and_integer_data_stats_fil
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1435,6 +1458,7 @@ async fn table_provider_scan_uses_top_level_and_partition_and_integer_data_stats
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1487,6 +1511,7 @@ async fn table_provider_scan_uses_top_level_and_integer_data_stats_with_data_res
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1537,6 +1562,7 @@ async fn table_provider_scan_rejects_projected_integer_data_stats_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1578,6 +1604,7 @@ async fn table_provider_scan_uses_integer_stats_pruning_for_supported_operators(
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1682,6 +1709,7 @@ async fn table_provider_scan_uses_integer_stats_pruning_for_not_equals_null_boun
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1728,6 +1756,7 @@ async fn table_provider_scan_uses_decimal_stats_pruning_for_supported_operators(
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1841,6 +1870,7 @@ async fn table_provider_scan_uses_decimal_null_count_stats_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1919,6 +1949,7 @@ async fn table_provider_scan_uses_string_stats_pruning_for_supported_operators()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2032,6 +2063,7 @@ async fn table_provider_scan_uses_string_null_count_stats_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2112,6 +2144,7 @@ async fn table_provider_scan_uses_floating_stats_pruning_for_supported_operators
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2240,6 +2273,7 @@ async fn table_provider_scan_uses_floating_null_count_stats_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2311,6 +2345,7 @@ async fn table_provider_scan_rejects_unproven_floating_data_stats_shapes()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2345,6 +2380,7 @@ async fn table_provider_scan_rejects_projected_floating_data_stats_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2380,6 +2416,7 @@ async fn table_provider_scan_accepts_projected_floating_data_stats_when_residual
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2453,6 +2490,7 @@ async fn table_provider_scan_uses_top_level_and_partition_and_floating_data_stat
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2508,6 +2546,7 @@ async fn table_provider_scan_keeps_partial_string_bounds_uncertain()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2555,6 +2594,7 @@ async fn table_provider_scan_rejects_projected_string_data_stats_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2590,6 +2630,7 @@ async fn table_provider_scan_accepts_projected_string_data_stats_when_residual_c
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2642,6 +2683,7 @@ async fn table_provider_scan_uses_top_level_and_partition_and_string_data_stats_
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2690,6 +2732,7 @@ async fn table_provider_scan_rejects_unproven_string_data_stats_shapes()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2724,6 +2767,7 @@ async fn table_provider_scan_rejects_unproven_decimal_data_stats_shapes()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2758,6 +2802,7 @@ async fn table_provider_scan_rejects_projected_decimal_data_stats_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2793,6 +2838,7 @@ async fn table_provider_scan_accepts_projected_decimal_data_stats_when_residual_
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2845,6 +2891,7 @@ async fn table_provider_scan_uses_top_level_and_partition_and_decimal_data_stats
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2902,6 +2949,7 @@ async fn table_provider_scan_uses_boolean_null_count_stats_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -2980,6 +3028,7 @@ async fn table_provider_scan_keeps_missing_boolean_null_count_uncertain()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3031,6 +3080,7 @@ async fn table_provider_scan_uses_binary_null_count_stats_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3104,6 +3154,7 @@ async fn table_provider_scan_rejects_binary_data_stats_comparators()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3137,6 +3188,7 @@ async fn table_provider_scan_rejects_unsupported_data_stats_matrix_entries()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let mut provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3273,6 +3325,7 @@ async fn table_provider_scan_rejects_projected_boolean_data_stats_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3307,6 +3360,7 @@ async fn table_provider_scan_accepts_projected_boolean_data_stats_when_residual_
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3358,6 +3412,7 @@ async fn table_provider_scan_uses_top_level_and_partition_and_boolean_data_stats
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3410,6 +3465,7 @@ async fn table_provider_scan_uses_date_stats_pruning_for_supported_operators()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3518,6 +3574,7 @@ async fn table_provider_scan_uses_timestamp_stats_pruning_for_supported_operator
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3624,6 +3681,7 @@ async fn table_provider_scan_uses_timestamp_ntz_stats_pruning_for_supported_oper
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3711,6 +3769,7 @@ async fn table_provider_scan_uses_temporal_null_count_stats_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3788,6 +3847,7 @@ async fn table_provider_scan_rejects_unproven_temporal_data_stats_shapes()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3853,6 +3913,7 @@ async fn table_provider_scan_uses_top_level_and_partition_and_temporal_data_stat
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3899,6 +3960,7 @@ async fn table_provider_scan_rejects_projected_temporal_data_stats_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3934,6 +3996,7 @@ async fn table_provider_scan_accepts_projected_temporal_data_stats_when_residual
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -3982,6 +4045,7 @@ async fn table_provider_scan_keeps_partial_integer_stats_uncertain()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4062,6 +4126,7 @@ async fn table_provider_scan_keeps_invalid_integer_stats_uncertain()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4108,6 +4173,7 @@ async fn exact_string_partition_predicates_use_kernel_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4362,6 +4428,7 @@ async fn table_provider_scan_mixed_string_null_and_empty_terms_use_kernel_prunin
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4447,6 +4514,7 @@ async fn table_provider_scan_rejects_unsupported_string_partition_shapes()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4498,6 +4566,7 @@ async fn table_provider_scan_rejects_unproven_partition_in_filters()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4587,6 +4656,7 @@ async fn table_provider_scan_rejects_unsafe_negated_partition_filters()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4627,6 +4697,7 @@ async fn table_provider_scan_handles_mixed_boolean_partition_filters()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4759,6 +4830,7 @@ async fn table_provider_scan_accepts_qualified_exact_partition_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4831,6 +4903,7 @@ async fn table_provider_scan_rejects_ambiguous_partition_column_references()
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4865,6 +4938,7 @@ async fn table_provider_scan_accepts_inexact_mixed_partition_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4915,6 +4989,7 @@ async fn table_provider_scan_combines_mixed_and_exact_kernel_filters()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4962,6 +5037,7 @@ async fn table_provider_scan_rejects_projected_inexact_mixed_partition_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -4997,6 +5073,7 @@ async fn table_provider_scan_accepts_projected_mixed_partition_filter_when_resid
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -5040,6 +5117,7 @@ async fn table_provider_scan_limit_does_not_change_scan_planning_contract()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -5132,6 +5210,7 @@ async fn sql_limit_stays_above_inexact_residual_filter_scan()
         name: "orders".to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -5306,6 +5385,7 @@ async fn data_stats_residual_column_remains_available_below_final_projection()
         name: "orders".to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -5368,6 +5448,7 @@ async fn string_data_stats_residual_column_remains_available_below_final_project
         name: "orders".to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -5430,6 +5511,7 @@ async fn floating_data_stats_residual_column_remains_available_below_final_proje
         name: "orders".to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -5498,6 +5580,7 @@ async fn sql_floating_data_stats_supported_filters_remain_residual()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -5601,6 +5684,7 @@ async fn boolean_data_stats_residual_column_remains_available_below_final_projec
         name: "orders".to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -5663,6 +5747,7 @@ async fn binary_data_stats_residual_column_remains_available_below_final_project
         name: "orders".to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -5726,6 +5811,7 @@ async fn temporal_data_stats_residual_column_remains_available_below_final_proje
         name: "orders".to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -5788,6 +5874,7 @@ async fn decimal_data_stats_residual_column_remains_available_below_final_projec
         name: "orders".to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -5852,6 +5939,7 @@ async fn composed_stats_residual_column_remains_available_below_final_projection
         name: "orders".to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -5916,6 +6004,7 @@ async fn mixed_partition_pruning_keeps_residual_column_below_final_projection()
         name: "orders".to_owned(),
         table_uri: table_uri.clone(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let probe_preflight = preflight_delta_protocol(&probe_source)?;
     let provider = DeltaTableProvider::try_new(probe_source, probe_preflight)?;
@@ -5934,6 +6023,7 @@ async fn mixed_partition_pruning_keeps_residual_column_below_final_projection()
         name: "orders".to_owned(),
         table_uri,
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -6019,6 +6109,7 @@ async fn sql_exact_partition_filter_is_pushed_without_residual_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -6088,6 +6179,7 @@ async fn sql_partition_in_filter_is_exact_kernel_pushdown() -> Result<(), Box<dy
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -6163,6 +6255,7 @@ async fn sql_duplicate_and_contradictory_partition_filters_are_exact_kernel_push
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -6258,6 +6351,7 @@ async fn sql_partition_in_edge_variants_document_rewrite_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -6380,6 +6474,7 @@ async fn sql_mixed_boolean_partition_filters_keep_required_residual_filters()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -6483,6 +6578,7 @@ async fn sql_null_partition_filters_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -6573,6 +6669,7 @@ async fn sql_negated_partition_filters_follow_supported_kernel_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -6678,6 +6775,7 @@ async fn sql_partition_comparison_filters_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -6786,6 +6884,7 @@ async fn sql_empty_string_partition_filters_follow_kernel_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -6898,6 +6997,7 @@ fn provider_schema_includes_partition_columns() -> Result<(), Box<dyn std::error
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -6926,6 +7026,7 @@ fn integer_partition_schema_maps_delta_types_to_arrow_widths()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -6965,6 +7066,7 @@ fn boolean_partition_schema_maps_delta_type_to_arrow_boolean()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -6992,6 +7094,7 @@ fn date_partition_schema_maps_delta_type_to_arrow_date32() -> Result<(), Box<dyn
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -7019,6 +7122,7 @@ fn decimal_partition_schema_maps_delta_type_to_arrow_decimal128()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -7046,6 +7150,7 @@ fn floating_partition_schema_maps_delta_types_to_arrow_float_widths()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -7077,6 +7182,7 @@ fn timestamp_partition_schema_maps_delta_type_to_arrow_timestamp_microseconds()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -7105,6 +7211,7 @@ fn timestamp_ntz_partition_schema_maps_delta_type_to_arrow_timestamp_microsecond
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -7132,6 +7239,7 @@ fn binary_partition_schema_maps_delta_type_to_arrow_binary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 
@@ -7166,6 +7274,7 @@ async fn date_partition_null_checks_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -7214,6 +7323,7 @@ async fn date_partition_equality_and_membership_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -7276,6 +7386,7 @@ async fn date_partition_unsafe_literal_shapes_are_rejected_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -7364,6 +7475,7 @@ async fn decimal_partition_unsafe_literal_filters_are_rejected_at_scan_boundary(
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -7493,6 +7605,7 @@ async fn timestamp_partition_unsafe_filters_are_rejected_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -7623,6 +7736,7 @@ async fn binary_partition_null_checks_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -7696,6 +7810,7 @@ async fn binary_partition_equality_and_membership_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -7788,6 +7903,7 @@ async fn binary_partition_boolean_composition_and_projection_are_exact_at_scan_b
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -7890,6 +8006,7 @@ async fn binary_partition_unsafe_filters_are_rejected_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -8003,6 +8120,7 @@ async fn timestamp_ntz_partition_unsafe_filters_are_rejected_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -8115,6 +8233,7 @@ async fn timestamp_partition_equality_and_membership_are_exact_at_scan_boundary(
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -8242,6 +8361,7 @@ async fn timestamp_ntz_partition_equality_and_membership_are_exact_at_scan_bound
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -8339,6 +8459,7 @@ async fn timestamp_partition_comparisons_and_between_are_exact_at_scan_boundary(
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -8481,6 +8602,7 @@ async fn timestamp_ntz_partition_comparisons_and_between_are_exact_at_scan_bound
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -8613,6 +8735,7 @@ async fn timestamp_partition_boolean_composition_and_projection_are_exact_at_sca
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -8731,6 +8854,7 @@ async fn timestamp_ntz_partition_boolean_composition_and_projection_are_exact_at
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -8838,6 +8962,7 @@ async fn timestamp_partition_null_checks_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -8910,6 +9035,7 @@ async fn timestamp_ntz_partition_null_checks_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -8985,6 +9111,7 @@ async fn sql_timestamp_partition_comparisons_and_between_are_exact_kernel_pushdo
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -9085,6 +9212,7 @@ async fn sql_timestamp_ntz_partition_comparisons_and_between_are_exact_kernel_pu
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -9184,6 +9312,7 @@ async fn sql_timestamp_partition_equality_and_membership_are_exact_kernel_pushdo
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -9282,6 +9411,7 @@ async fn sql_timestamp_ntz_partition_equality_and_membership_are_exact_kernel_pu
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -9371,6 +9501,7 @@ async fn sql_timestamp_partition_null_checks_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -9454,6 +9585,7 @@ async fn sql_timestamp_ntz_partition_null_checks_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -9529,6 +9661,7 @@ async fn floating_partition_value_filters_remain_unsupported_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -9724,6 +9857,7 @@ async fn floating_partition_equality_and_membership_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -9799,6 +9933,7 @@ async fn floating_partition_comparisons_and_between_are_rejected_at_scan_boundar
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -9891,6 +10026,7 @@ async fn floating_partition_boolean_composition_and_projection_are_exact_at_scan
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -9955,6 +10091,7 @@ async fn floating_partition_null_checks_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -10028,6 +10165,7 @@ async fn floating_partition_exact_filters_prune_files_through_kernel_scan_plan()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -10210,6 +10348,7 @@ async fn floating_partition_mixed_and_filter_uses_kernel_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -10262,6 +10401,7 @@ async fn timestamp_partition_mixed_and_filter_uses_kernel_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -10321,6 +10461,7 @@ async fn timestamp_ntz_partition_mixed_and_filter_uses_kernel_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -10376,6 +10517,7 @@ async fn binary_partition_mixed_and_filter_uses_kernel_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -10429,6 +10571,7 @@ async fn sql_floating_partition_null_checks_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -10521,6 +10664,7 @@ async fn sql_floating_partition_equality_and_membership_are_exact_kernel_pushdow
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -10615,6 +10759,7 @@ async fn sql_floating_partition_comparisons_and_between_keep_residual_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -10711,6 +10856,7 @@ async fn sql_floating_partition_unsafe_literal_filters_keep_residual_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -10790,6 +10936,7 @@ async fn decimal_partition_comparisons_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -10849,6 +10996,7 @@ async fn decimal_partition_between_filters_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -10899,6 +11047,7 @@ async fn decimal_partition_boolean_composition_and_projection_are_exact_at_scan_
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -10961,6 +11110,7 @@ async fn decimal_partition_high_precision_values_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -11027,6 +11177,7 @@ async fn decimal_partition_exponent_metadata_is_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -11065,6 +11216,7 @@ async fn decimal_partition_equality_and_membership_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -11129,6 +11281,7 @@ async fn decimal_partition_null_checks_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -11175,6 +11328,7 @@ async fn decimal_partition_exact_filters_prune_files_through_kernel_scan_plan()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -11391,6 +11545,7 @@ async fn decimal_partition_mixed_and_filter_uses_kernel_pruning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -11447,6 +11602,7 @@ async fn date_partition_comparisons_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -11510,6 +11666,7 @@ async fn date_partition_between_filters_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -11572,6 +11729,7 @@ async fn date_partition_boolean_composition_and_projection_are_exact_at_scan_bou
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -11638,6 +11796,7 @@ async fn date_partition_exact_filters_prune_files_through_kernel_scan_plan()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -11851,6 +12010,7 @@ async fn boolean_partition_exact_filters_prune_files_through_kernel_scan_plan()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12018,6 +12178,7 @@ async fn boolean_partition_unsafe_literal_shapes_are_rejected_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12103,6 +12264,7 @@ async fn boolean_partition_unsafe_ordering_shapes_are_rejected_at_scan_boundary(
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12191,6 +12353,7 @@ fn integer_partition_uncoerced_literals_remain_unsupported()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12230,6 +12393,7 @@ async fn integer_partition_unsafe_direct_shapes_are_rejected_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12351,6 +12515,7 @@ async fn integer_partition_exact_filters_prune_files_through_kernel_scan_plan()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12557,6 +12722,7 @@ async fn integer_partition_between_filters_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12625,6 +12791,7 @@ async fn integer_partition_boolean_composition_and_projection_are_exact_at_scan_
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12686,6 +12853,7 @@ async fn integer_partition_comparisons_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12745,6 +12913,7 @@ async fn integer_partition_equality_and_membership_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12804,6 +12973,7 @@ fn integer_partition_width_bounds_remain_unsupported_for_direct_filters()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12867,6 +13037,7 @@ async fn integer_partition_null_checks_are_exact_at_scan_boundary()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -12914,6 +13085,7 @@ async fn sql_integer_partition_null_checks_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -12989,6 +13161,7 @@ async fn sql_boolean_partition_null_checks_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13063,6 +13236,7 @@ async fn sql_binary_partition_null_checks_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13138,6 +13312,7 @@ async fn sql_binary_partition_equality_and_membership_are_exact_kernel_pushdown(
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13234,6 +13409,7 @@ async fn sql_date_partition_equality_and_membership_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13331,6 +13507,7 @@ async fn sql_decimal_partition_unsafe_literal_filters_keep_residual_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13398,6 +13575,7 @@ async fn sql_decimal_partition_comparisons_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13492,6 +13670,7 @@ async fn sql_decimal_partition_equality_and_membership_are_exact_kernel_pushdown
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13590,6 +13769,7 @@ async fn sql_decimal_partition_null_checks_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13671,6 +13851,7 @@ async fn sql_date_partition_range_filters_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13767,6 +13948,7 @@ async fn sql_date_partition_null_checks_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13846,6 +14028,7 @@ async fn sql_boolean_partition_literal_operators_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -13956,6 +14139,7 @@ async fn sql_boolean_partition_ordering_filters_keep_residual_filter()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -14025,6 +14209,7 @@ async fn sql_integer_partition_literal_operators_are_exact_kernel_pushdown()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     register_delta_sources(
@@ -14139,6 +14324,7 @@ async fn sql_analysis_accepts_nested_source_columns_without_target_planning()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
     let ctx = SessionContext::new();
@@ -14174,6 +14360,7 @@ fn schema_conversion_failure_reports_source_and_field_context()
         name: "orders".to_owned(),
         table_uri: table.path().to_string_lossy().to_string(),
         version: None,
+        storage_options: Default::default(),
     })?;
     let preflight = preflight_delta_protocol(&source)?;
 

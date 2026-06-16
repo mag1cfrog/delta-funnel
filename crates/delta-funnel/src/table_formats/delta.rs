@@ -1,6 +1,6 @@
 //! Delta table-format source loading.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{DeltaFunnelError, error::DeltaSourceSchemaSnafu};
 
@@ -170,6 +170,9 @@ pub(crate) struct KernelPhysicalToLogicalTransformHandle {
     transform: kernel::ExpressionRef,
 }
 
+/// Caller-provided storage options for one Delta source.
+pub type DeltaStorageOptions = BTreeMap<String, String>;
+
 /// Caller-provided configuration for one named Delta source.
 pub struct DeltaSourceConfig {
     /// DataFusion table name that will identify this source.
@@ -178,12 +181,42 @@ pub struct DeltaSourceConfig {
     pub table_uri: String,
     /// Optional fixed Delta table version.
     pub version: Option<Version>,
+    /// Source-local options forwarded to Delta Kernel object-store construction.
+    pub storage_options: DeltaStorageOptions,
+}
+
+impl DeltaSourceConfig {
+    /// Builds a Delta source config with no fixed version or storage options.
+    #[must_use]
+    pub fn new(name: impl Into<String>, table_uri: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            table_uri: table_uri.into(),
+            version: None,
+            storage_options: DeltaStorageOptions::default(),
+        }
+    }
+
+    /// Sets an optional fixed Delta table version.
+    #[must_use]
+    pub fn with_version(mut self, version: Option<Version>) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Sets source-local storage options.
+    #[must_use]
+    pub fn with_storage_options(mut self, storage_options: DeltaStorageOptions) -> Self {
+        self.storage_options = storage_options;
+        self
+    }
 }
 
 /// Loaded named Delta source state.
 pub struct PlannedDeltaSource {
     name: String,
     requested_table_uri: String,
+    storage_options: DeltaStorageOptions,
     snapshot: LoadedDeltaTableSnapshot,
 }
 
@@ -229,13 +262,19 @@ impl ProjectedDeltaScan {
     pub(crate) fn expand_kernel_scan_metadata(
         &self,
         table_uri: &str,
+        storage_options: &DeltaStorageOptions,
     ) -> Result<KernelScanMetadataExpansion, delta_kernel::Error> {
         fn collect_scan_file(files: &mut Vec<KernelScanFileMetadata>, file: kernel::ScanFile) {
             files.push(KernelScanFileMetadata::from_kernel_scan_file(file));
         }
 
         let table_url = kernel::try_parse_uri(table_uri)?;
-        let store = kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
+        let store = kernel::store_from_url_opts(
+            &table_url,
+            storage_options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )?;
         let engine = kernel::DefaultEngineBuilder::new(store).build();
         let mut files = Vec::new();
 
@@ -254,9 +293,10 @@ impl ProjectedDeltaScan {
     pub(crate) fn scan_file_paths(
         &self,
         table_uri: &str,
+        storage_options: &DeltaStorageOptions,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let mut paths = self
-            .expand_kernel_scan_metadata(table_uri)?
+            .expand_kernel_scan_metadata(table_uri, storage_options)?
             .files
             .into_iter()
             .map(|file| file.path)
@@ -351,6 +391,12 @@ impl PlannedDeltaSource {
     #[must_use]
     pub fn requested_table_uri(&self) -> &str {
         &self.requested_table_uri
+    }
+
+    /// Source-local options forwarded to Delta Kernel object-store construction.
+    #[must_use]
+    pub fn storage_options(&self) -> &DeltaStorageOptions {
+        &self.storage_options
     }
 
     /// Normalized Delta table URI used for snapshot loading.
@@ -487,35 +533,39 @@ fn load_delta_source_after_name_validation(
         name,
         table_uri,
         version,
+        storage_options,
     } = config;
 
-    let snapshot = load_delta_table_snapshot(&table_uri, version)?;
+    let snapshot = load_delta_table_snapshot(&table_uri, version, &storage_options)?;
 
     Ok(PlannedDeltaSource {
         name,
         requested_table_uri: table_uri,
+        storage_options,
         snapshot,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Expr, col, lit};
     use delta_kernel::arrow::array::{Array, StructArray};
     use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::object_store::{memory::InMemory, path::Path as ObjectStorePath};
 
     use super::kernel::{ColumnName, Expression, Predicate, Scalar};
     use super::{
-        DeltaKernelPredicate, DeltaSourceConfig, ProjectedDeltaScan, build_projected_delta_scan,
-        build_projected_predicated_delta_scan, datafusion_expr_to_kernel_predicate,
-        load_delta_source, load_delta_sources,
+        DeltaKernelPredicate, DeltaSourceConfig, DeltaStorageOptions, KernelDataFileReader,
+        KernelDataFileReaderConfig, KernelDeletionVectorReader, KernelDeletionVectorReaderConfig,
+        ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
+        datafusion_expr_to_kernel_predicate, load_delta_source, load_delta_sources,
     };
     use crate::DeltaFunnelError;
 
@@ -916,12 +966,97 @@ mod tests {
         Ok(format!("{}-{}-{nanos}", std::process::id(), name))
     }
 
+    type CapturedStorageOptions = Arc<Mutex<Vec<DeltaStorageOptions>>>;
+
+    fn storage_options(entries: &[(&str, &str)]) -> DeltaStorageOptions {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn unique_storage_scheme(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sanitized_name = name
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .collect::<String>();
+
+        Ok(format!("df{sanitized_name}{}{}", std::process::id(), nanos))
+    }
+
+    fn register_capturing_storage_handler(
+        scheme: &str,
+        captured: CapturedStorageOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        super::kernel::insert_url_handler(
+            scheme,
+            Arc::new(move |_url, options| {
+                let options = options.into_iter().collect::<BTreeMap<_, _>>();
+                captured
+                    .lock()
+                    .map_err(|_| delta_kernel::object_store::Error::Generic {
+                        store: "capture",
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "captured storage options lock poisoned",
+                        )
+                        .into(),
+                    })?
+                    .push(options);
+
+                Ok((Box::new(InMemory::new()), ObjectStorePath::from("")))
+            }),
+        )?;
+
+        Ok(())
+    }
+
+    fn register_failing_storage_handler(
+        scheme: &str,
+        captured: CapturedStorageOptions,
+        secret_value: &'static str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        super::kernel::insert_url_handler(
+            scheme,
+            Arc::new(move |_url, options| {
+                let options = options.into_iter().collect::<BTreeMap<_, _>>();
+                captured
+                    .lock()
+                    .map_err(|_| delta_kernel::object_store::Error::Generic {
+                        store: "capture",
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "captured storage options lock poisoned",
+                        )
+                        .into(),
+                    })?
+                    .push(options);
+
+                Err(delta_kernel::object_store::Error::Generic {
+                    store: "capture",
+                    source: std::io::Error::new(std::io::ErrorKind::Other, secret_value).into(),
+                })
+            }),
+        )?;
+
+        Ok(())
+    }
+
+    fn captured_storage_options(captured: &CapturedStorageOptions) -> Vec<DeltaStorageOptions> {
+        captured
+            .lock()
+            .map(|options| options.clone())
+            .unwrap_or_default()
+    }
+
     fn kernel_scan_file_paths(
         scan: &ProjectedDeltaScan,
         table_uri: &str,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let storage_options = DeltaStorageOptions::default();
         let mut paths = scan
-            .expand_kernel_scan_metadata(table_uri)?
+            .expand_kernel_scan_metadata(table_uri, &storage_options)?
             .files
             .into_iter()
             .map(|file| file.path)
@@ -940,8 +1075,9 @@ mod tests {
         scan: &ProjectedDeltaScan,
         table_uri: &str,
     ) -> Result<Vec<KernelScanFileBoundary>, Box<dyn std::error::Error>> {
+        let storage_options = DeltaStorageOptions::default();
         let mut boundaries = scan
-            .expand_kernel_scan_metadata(table_uri)?
+            .expand_kernel_scan_metadata(table_uri, &storage_options)?
             .files
             .into_iter()
             .map(|file| KernelScanFileBoundary {
@@ -974,10 +1110,12 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None)?;
 
-        let expansion = scan.expand_kernel_scan_metadata(source.table_uri())?;
+        let expansion =
+            scan.expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?;
 
         assert!(expansion.scan_metadata_exhausted);
         assert_eq!(expansion.files.len(), 1);
@@ -1007,10 +1145,12 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None)?;
 
-        let expansion = scan.expand_kernel_scan_metadata(source.table_uri())?;
+        let expansion =
+            scan.expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?;
 
         assert!(expansion.scan_metadata_exhausted);
         assert!(expansion.files.is_empty());
@@ -1075,6 +1215,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1101,6 +1242,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1123,6 +1265,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1147,6 +1290,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1172,6 +1316,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1218,6 +1363,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1241,6 +1387,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1277,6 +1424,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1314,6 +1462,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1334,6 +1483,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1364,6 +1514,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1410,6 +1561,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1528,6 +1680,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1574,6 +1727,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1618,6 +1772,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1664,6 +1819,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1695,6 +1851,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1741,6 +1898,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1831,6 +1989,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1885,6 +2044,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1939,6 +2099,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -1983,6 +2144,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -2029,6 +2191,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -2063,6 +2226,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -2137,6 +2301,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -2212,6 +2377,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -2262,6 +2428,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -2313,6 +2480,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -2332,6 +2500,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok((table, source))
@@ -2394,9 +2563,14 @@ mod tests {
         scan: &ProjectedDeltaScan,
         table_uri: &str,
     ) -> Result<KernelStatsMetadataBoundary, Box<dyn std::error::Error>> {
+        let storage_options = DeltaStorageOptions::default();
         let table_url = super::kernel::try_parse_uri(table_uri)?;
-        let store =
-            super::kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
+        let store = super::kernel::store_from_url_opts(
+            &table_url,
+            storage_options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )?;
         let engine = super::kernel::DefaultEngineBuilder::new(store).build();
         let mut boundary = KernelStatsMetadataBoundary::default();
 
@@ -2787,6 +2961,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("region").eq(lit("us-west")))?;
@@ -4181,6 +4356,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(int32_lit(100)))?;
         let stats_scan = build_projected_predicated_stats_delta_scan(&source, Some(predicate))?;
@@ -4254,6 +4430,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("region").eq(lit("us-west")))?;
@@ -4785,6 +4962,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: invalid_text_table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&invalid_text_source, None)?;
 
@@ -4809,6 +4987,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: scale_mismatch_table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         assert_invalid_decimal_partition_error(kernel_predicated_file_paths(
@@ -5647,6 +5826,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
@@ -5684,6 +5864,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: invalid_text_table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&invalid_text_source, None)?;
 
@@ -5715,6 +5896,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: t_separator_table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&t_separator_source, None)?;
 
@@ -5746,6 +5928,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: zone_table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&zone_source, None)?;
 
@@ -5782,6 +5965,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: invalid_text_table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&invalid_text_source, None)?;
 
@@ -5826,6 +6010,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
@@ -5879,6 +6064,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
@@ -5912,6 +6098,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
@@ -6084,6 +6271,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         assert_eq!(
@@ -6124,6 +6312,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
@@ -6148,6 +6337,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: requested_table_uri.clone(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         assert_eq!(source.name(), "orders");
@@ -6160,6 +6350,117 @@ mod tests {
     }
 
     #[test]
+    fn planned_delta_source_owns_and_isolates_storage_options()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("storage-options-owned")?;
+        let mut caller_options = storage_options(&[
+            ("authorization", "caller-original"),
+            ("region", "us-west-2"),
+        ]);
+        let source = load_delta_source(
+            DeltaSourceConfig::new("orders", table.path.to_string_lossy())
+                .with_storage_options(caller_options.clone()),
+        )?;
+
+        caller_options.insert("authorization".to_owned(), "caller-mutated".to_owned());
+        caller_options.insert("new-secret".to_owned(), "caller-added".to_owned());
+
+        assert_eq!(
+            source
+                .storage_options()
+                .get("authorization")
+                .map(String::as_str),
+            Some("caller-original")
+        );
+        assert_eq!(
+            source.storage_options().get("region").map(String::as_str),
+            Some("us-west-2")
+        );
+        assert!(!source.storage_options().contains_key("new-secret"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn source_loading_passes_storage_options_to_kernel_store_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = unique_storage_scheme("sourceoptions")?;
+        let captured = CapturedStorageOptions::default();
+        register_capturing_storage_handler(&scheme, Arc::clone(&captured))?;
+        let options =
+            storage_options(&[("authorization", "source-token"), ("region", "us-east-1")]);
+
+        let result = load_delta_source(
+            DeltaSourceConfig::new("orders", format!("{scheme}://table/root"))
+                .with_storage_options(options.clone()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaSnapshotLoad { .. })
+        ));
+        assert_eq!(captured_storage_options(&captured), vec![options]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn reader_construction_passes_storage_options_to_each_store_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = unique_storage_scheme("readeroptions")?;
+        let captured = CapturedStorageOptions::default();
+        register_capturing_storage_handler(&scheme, Arc::clone(&captured))?;
+        let table_uri = format!("{scheme}://table/root/");
+        let options = storage_options(&[
+            ("authorization", "reader-token"),
+            ("endpoint", "http://storage.example"),
+        ]);
+
+        let _data_reader = KernelDataFileReader::try_new(KernelDataFileReaderConfig {
+            source_name: "orders",
+            table_uri: &table_uri,
+            snapshot_version: 42,
+            storage_options: &options,
+        })?;
+        let _dv_reader = KernelDeletionVectorReader::try_new(KernelDeletionVectorReaderConfig {
+            source_name: "orders",
+            table_uri: &table_uri,
+            snapshot_version: 42,
+            storage_options: &options,
+        })?;
+        let captured_options = captured_storage_options(&captured);
+        assert_eq!(captured_options.len(), 2);
+        assert!(captured_options.iter().all(|captured| captured == &options));
+
+        Ok(())
+    }
+
+    #[test]
+    fn storage_option_values_are_not_exposed_when_store_construction_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = unique_storage_scheme("redactedoptions")?;
+        let captured = CapturedStorageOptions::default();
+        let secret_value = "super-secret-token-value";
+        register_failing_storage_handler(&scheme, Arc::clone(&captured), secret_value)?;
+        let options = storage_options(&[("authorization", secret_value), ("region", "us-west-2")]);
+
+        let result = load_delta_source(
+            DeltaSourceConfig::new("orders", format!("{scheme}://table/root"))
+                .with_storage_options(options.clone()),
+        );
+        let error = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+
+        assert_eq!(captured_storage_options(&captured), vec![options]);
+        assert!(!error.contains(secret_value));
+        assert!(!error.contains("authorization"));
+
+        Ok(())
+    }
+
+    #[test]
     fn loads_named_delta_source_at_fixed_version() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("fixed")?;
 
@@ -6167,6 +6468,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: Some(0),
+            storage_options: Default::default(),
         })?;
 
         assert_eq!(source.version(), 0);
@@ -6180,6 +6482,7 @@ mod tests {
             name: "orders.latest".to_owned(),
             table_uri: "missing/path".to_owned(),
             version: None,
+            storage_options: Default::default(),
         });
 
         assert!(matches!(
@@ -6194,6 +6497,7 @@ mod tests {
             name: "select".to_owned(),
             table_uri: "missing/path".to_owned(),
             version: None,
+            storage_options: Default::default(),
         });
 
         assert!(matches!(
@@ -6209,6 +6513,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: " \t\n".to_owned(),
             version: None,
+            storage_options: Default::default(),
         });
 
         assert!(matches!(
@@ -6228,11 +6533,13 @@ mod tests {
                 name: "orders".to_owned(),
                 table_uri: orders.path.to_string_lossy().to_string(),
                 version: None,
+                storage_options: Default::default(),
             },
             DeltaSourceConfig {
                 name: "customers".to_owned(),
                 table_uri: customers.path.to_string_lossy().to_string(),
                 version: Some(0),
+                storage_options: Default::default(),
             },
         ])?;
 
@@ -6252,11 +6559,13 @@ mod tests {
                 name: "orders".to_owned(),
                 table_uri: "missing/orders".to_owned(),
                 version: None,
+                storage_options: Default::default(),
             },
             DeltaSourceConfig {
                 name: "Orders".to_owned(),
                 table_uri: "missing/customers".to_owned(),
                 version: None,
+                storage_options: Default::default(),
             },
         ]);
 
@@ -6273,11 +6582,13 @@ mod tests {
                 name: "orders".to_owned(),
                 table_uri: "missing/orders".to_owned(),
                 version: None,
+                storage_options: Default::default(),
             },
             DeltaSourceConfig {
                 name: "customers.latest".to_owned(),
                 table_uri: "missing/customers".to_owned(),
                 version: None,
+                storage_options: Default::default(),
             },
         ]);
 
@@ -6293,6 +6604,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: "ftp://user:password@example.com/table".to_owned(),
             version: None,
+            storage_options: Default::default(),
         });
 
         let error = result

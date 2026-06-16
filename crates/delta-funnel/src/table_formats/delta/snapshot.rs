@@ -5,6 +5,7 @@ use crate::{
     error::{DeltaSnapshotLoadSnafu, DeltaSourceEngineSnafu, InvalidSourceUriSnafu},
 };
 
+use super::DeltaStorageOptions;
 use super::kernel::{
     DefaultEngineBuilder, Snapshot, SnapshotRef, Version, store_from_url_opts, try_parse_uri,
 };
@@ -46,7 +47,10 @@ struct DeltaKernelEngine {
 }
 
 impl DeltaKernelEngine {
-    fn build(table_uri: &str) -> Result<Self, DeltaFunnelError> {
+    fn build(
+        table_uri: &str,
+        storage_options: &DeltaStorageOptions,
+    ) -> Result<Self, DeltaFunnelError> {
         let table_url = match try_parse_uri(table_uri) {
             Ok(table_url) => table_url,
             Err(_) => {
@@ -56,7 +60,12 @@ impl DeltaKernelEngine {
                 .fail();
             }
         };
-        let store = match store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>()) {
+        let store = match store_from_url_opts(
+            &table_url,
+            storage_options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        ) {
             Ok(store) => store,
             Err(_) => {
                 return DeltaSourceEngineSnafu {
@@ -91,9 +100,10 @@ impl DeltaKernelEngine {
 pub(crate) fn load_delta_table_snapshot(
     table_uri: impl AsRef<str>,
     version: Option<Version>,
+    storage_options: &DeltaStorageOptions,
 ) -> Result<LoadedDeltaTableSnapshot, DeltaFunnelError> {
     let table_uri = normalize_delta_table_uri(table_uri)?;
-    let engine = DeltaKernelEngine::build(&table_uri)?;
+    let engine = DeltaKernelEngine::build(&table_uri, storage_options)?;
 
     let mut builder = Snapshot::builder_for(&table_uri);
     if let Some(version) = version {
@@ -122,7 +132,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::load_delta_table_snapshot;
+    use super::{DeltaStorageOptions, load_delta_table_snapshot};
     use crate::DeltaFunnelError;
 
     struct DeltaLogTable {
@@ -191,10 +201,18 @@ mod tests {
         Ok(format!("{}-{}-{nanos}", std::process::id(), name))
     }
 
+    fn empty_storage_options() -> DeltaStorageOptions {
+        DeltaStorageOptions::default()
+    }
+
     #[test]
     fn loads_latest_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("latest")?;
-        let loaded = load_delta_table_snapshot(table.path.to_string_lossy(), None)?;
+        let loaded = load_delta_table_snapshot(
+            table.path.to_string_lossy(),
+            None,
+            &empty_storage_options(),
+        )?;
 
         assert_eq!(loaded.version(), 1);
         assert!(loaded.table_uri().starts_with("file://"));
@@ -206,7 +224,11 @@ mod tests {
     #[test]
     fn loads_fixed_snapshot_version() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("fixed")?;
-        let loaded = load_delta_table_snapshot(table.path.to_string_lossy(), Some(0))?;
+        let loaded = load_delta_table_snapshot(
+            table.path.to_string_lossy(),
+            Some(0),
+            &empty_storage_options(),
+        )?;
 
         assert_eq!(loaded.version(), 0);
 
@@ -216,7 +238,11 @@ mod tests {
     #[test]
     fn rejects_missing_fixed_snapshot_version() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("missing-version")?;
-        let result = load_delta_table_snapshot(table.path.to_string_lossy(), Some(2));
+        let result = load_delta_table_snapshot(
+            table.path.to_string_lossy(),
+            Some(2),
+            &empty_storage_options(),
+        );
 
         assert!(matches!(
             result,
@@ -228,7 +254,8 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_object_store_scheme() {
-        let result = load_delta_table_snapshot("ftp://example.com/table", None);
+        let result =
+            load_delta_table_snapshot("ftp://example.com/table", None, &empty_storage_options());
 
         assert!(matches!(
             result,
@@ -240,7 +267,8 @@ mod tests {
     fn rejects_existing_empty_directory_as_snapshot_load_error()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = TestDir::new("empty-table")?;
-        let result = load_delta_table_snapshot(dir.path.to_string_lossy(), None);
+        let result =
+            load_delta_table_snapshot(dir.path.to_string_lossy(), None, &empty_storage_options());
 
         assert!(matches!(
             result,
@@ -258,7 +286,8 @@ mod tests {
         fs::create_dir_all(&log_path)?;
         fs::write(log_path.join("00000000000000000000.json"), "{not json\n")?;
 
-        let result = load_delta_table_snapshot(dir.path.to_string_lossy(), None);
+        let result =
+            load_delta_table_snapshot(dir.path.to_string_lossy(), None, &empty_storage_options());
 
         assert!(matches!(
             result,
@@ -279,7 +308,8 @@ mod tests {
             format!("{}\n", add_json("part-00000.parquet")),
         )?;
 
-        let result = load_delta_table_snapshot(dir.path.to_string_lossy(), None);
+        let result =
+            load_delta_table_snapshot(dir.path.to_string_lossy(), None, &empty_storage_options());
 
         assert!(matches!(
             result,
@@ -295,7 +325,8 @@ mod tests {
         let file_path = dir.path.join("not-a-directory");
         fs::write(&file_path, "not a table")?;
 
-        let result = load_delta_table_snapshot(file_path.to_string_lossy(), None);
+        let result =
+            load_delta_table_snapshot(file_path.to_string_lossy(), None, &empty_storage_options());
 
         assert!(matches!(
             result,
@@ -307,7 +338,11 @@ mod tests {
 
     #[test]
     fn snapshot_errors_do_not_expose_secret_bearing_uri() {
-        let result = load_delta_table_snapshot("ftp://user:password@example.com/table", None);
+        let result = load_delta_table_snapshot(
+            "ftp://user:password@example.com/table",
+            None,
+            &empty_storage_options(),
+        );
         let error = result
             .err()
             .map(|error| error.to_string())

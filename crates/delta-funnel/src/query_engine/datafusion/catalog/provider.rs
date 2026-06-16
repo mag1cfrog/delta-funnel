@@ -168,6 +168,7 @@ impl DeltaTableProvider {
         Ok(ProviderScanPlan::from_parts(ProviderScanPlanParts {
             source_name: self.source_name().to_owned(),
             table_uri: self.source.table_uri().to_owned(),
+            storage_options: self.source.storage_options().clone(),
             snapshot_version: self.snapshot_version(),
             projected_schema,
             protocol: self.protocol.clone(),
@@ -412,6 +413,7 @@ fn reject_unsupported_reader_backend_source(
                 source_name: source.name(),
                 table_uri: source.table_uri(),
                 snapshot_version: source.version(),
+                storage_options: source.storage_options(),
             })
         }
     }
