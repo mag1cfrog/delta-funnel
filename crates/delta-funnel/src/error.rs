@@ -27,9 +27,9 @@ pub enum DeltaScanFileReadPhase {
     ArrowConversion,
     /// Applying a physical-to-logical transform failed.
     TransformApplication,
-    /// The selected backend cannot yet read this file task equivalently.
+    /// The selected backend cannot read this file task equivalently.
     UnsupportedReadMode,
-    /// A deletion-vector read was rejected because the requested read mode is not safe yet.
+    /// A deletion-vector read was rejected because the requested read mode is not safe.
     DeletionVectorPredicateRejection,
     /// Applying a deletion-vector mask failed.
     DeletionVectorMasking,

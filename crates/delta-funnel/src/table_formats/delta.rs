@@ -113,8 +113,8 @@ pub(crate) enum KernelScanDeletionVectorMetadata {
 /// Opaque handle for kernel-owned deletion-vector metadata.
 ///
 /// The wrapped `DvInfo` is kept private so metadata expansion cannot
-/// accidentally load the deletion-vector payload. Execution code can add a
-/// narrow accessor when deletion-vector reads are implemented.
+/// accidentally load the deletion-vector payload. Execution code must load
+/// payloads through the private deletion-vector reader boundary.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct KernelScanDeletionVectorHandle {
