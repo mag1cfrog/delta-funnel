@@ -1092,7 +1092,7 @@ fn build_matched_map_field_plan(
     let key_path = format!("{path}.key");
     let parquet_key = parquet_map_key_field(parquet_field, path)?;
     let key_plan = match (provider_key.data_type(), file_key.data_type()) {
-        (DataType::Struct(_), DataType::Struct(_)) => {
+        (DataType::Struct(_) | DataType::List(_), DataType::Struct(_) | DataType::List(_)) => {
             build_matched_field_plan(provider_key, file_key, parquet_key, &key_path)?
         }
         _ if file_key
@@ -1620,26 +1620,23 @@ fn unsupported_native_async_field_reason(
         ));
     }
     if matches!(map_context, NativeAsyncMapContext::Key)
-        && matches!(
-            field.data_type(),
-            KernelDataType::Array(_) | KernelDataType::Map(_)
-        )
+        && matches!(field.data_type(), KernelDataType::Map(_))
         && (has_field_matching_metadata(field, false)
             || data_type_has_field_matching_metadata(field.data_type()))
     {
         return Some(format!(
-            "native async reader does not support map key list/map field-id or physical-name matching at '{path}' yet"
+            "native async reader does not support nested map key field-id or physical-name matching at '{path}' yet"
         ));
     }
     // Delta stores synthetic map key/value field ids on the map field itself.
     // A primitive key only needs that synthetic key id preserved by the
-    // provider transform. Struct keys can now be reshaped recursively, while
-    // list and nested-map keys are handled by later implementation slices.
+    // provider transform. Struct and list keys can now be reshaped recursively,
+    // while nested-map keys are handled by a later implementation slice.
     if has_nested_field_id_map_metadata(field)
-        && matches!(field.data_type(), KernelDataType::Map(map) if matches!(map.key_type(), KernelDataType::Array(_) | KernelDataType::Map(_)))
+        && matches!(field.data_type(), KernelDataType::Map(map) if matches!(map.key_type(), KernelDataType::Map(_)))
     {
         return Some(format!(
-            "native async reader does not support list or nested-map key field-id or physical-name matching at '{path}' yet"
+            "native async reader does not support nested-map key field-id or physical-name matching at '{path}' yet"
         ));
     }
 
@@ -1659,13 +1656,6 @@ fn unsupported_native_async_data_type_reason(
             })
         }
         KernelDataType::Array(array) => {
-            if matches!(map_context, NativeAsyncMapContext::Key)
-                && data_type_has_field_matching_metadata(data_type)
-            {
-                return Some(format!(
-                    "native async reader does not support map key list/array field-id or physical-name matching at '{path}' yet"
-                ));
-            }
             let child_path = format!("{path}.element");
             unsupported_native_async_data_type_reason(
                 array.element_type(),
@@ -2294,7 +2284,7 @@ mod tests {
     }
 
     #[test]
-    fn native_async_schema_gate_rejects_complex_map_key_nested_ids()
+    fn native_async_schema_gate_allows_array_map_key_nested_ids()
     -> Result<(), Box<dyn std::error::Error>> {
         let schema = kernel_schema([KernelStructField::new(
             "attributes",
@@ -2311,10 +2301,41 @@ mod tests {
                 .to_owned(),
             KernelMetadataValue::String(r#"{"attributes.key":2}"#.to_owned()),
         )])])?;
+
+        assert_eq!(
+            unsupported_native_async_physical_schema_reason(&schema),
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_gate_rejects_nested_map_key_nested_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = kernel_schema([KernelStructField::new(
+            "attributes",
+            delta_kernel::schema::MapType::new(
+                delta_kernel::schema::MapType::new(
+                    KernelDataType::STRING,
+                    KernelDataType::INTEGER,
+                    true,
+                ),
+                KernelDataType::INTEGER,
+                true,
+            ),
+            true,
+        )
+        .add_metadata([(
+            KernelColumnMetadataKey::ColumnMappingNestedIds
+                .as_ref()
+                .to_owned(),
+            KernelMetadataValue::String(r#"{"attributes.key":2}"#.to_owned()),
+        )])])?;
         let reason =
             unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
 
-        assert!(reason.contains("list or nested-map key field-id"));
+        assert!(reason.contains("nested-map key field-id"));
         assert!(reason.contains("attributes"));
 
         Ok(())
@@ -3093,6 +3114,138 @@ mod tests {
             error.contains("is missing from the Parquet file"),
             "{error}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_reshapes_map_list_key_struct_by_field_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_element_fields = vec![
+            Field::new("city", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+            Field::new("zip", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+        ];
+        let provider_element = Field::new(
+            "item",
+            DataType::Struct(provider_element_fields.into()),
+            true,
+        );
+        let provider_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new("keys", DataType::List(Arc::new(provider_element)), false),
+            Field::new("values", DataType::Utf8, true),
+            true,
+        )]));
+        let file_element_fields = vec![
+            Field::new("stale_zip", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+            Field::new("stale_city", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+        ];
+        let file_element = Field::new(
+            "item",
+            DataType::Struct(file_element_fields.clone().into()),
+            true,
+        );
+        let file_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new(
+                "keys",
+                DataType::List(Arc::new(file_element.clone())),
+                false,
+            ),
+            Field::new("values", DataType::Utf8, true),
+            true,
+        )]));
+        let key_elements = struct_array(
+            file_element_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![94110, 10001, 60601])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("san francisco"),
+                    Some("new york"),
+                    Some("chicago"),
+                ])) as ArrayRef,
+            ],
+        );
+        let keys = list_array(file_element, vec![0, 2, 2, 3], key_elements, None)?;
+        let attributes = map_array(
+            Field::new(
+                "keys",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(
+                        vec![
+                            Field::new("stale_zip", DataType::Int32, true)
+                                .with_metadata(field_id_metadata(10)),
+                            Field::new("stale_city", DataType::Utf8, true)
+                                .with_metadata(field_id_metadata(11)),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ))),
+                false,
+            ),
+            Field::new("values", DataType::Utf8, true),
+            vec![0, 2, 2, 3],
+            keys,
+            Arc::new(StringArray::from(vec![
+                Some("home"),
+                Some("work"),
+                Some("other"),
+            ])) as ArrayRef,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "map-list-key-struct-field-id-schema-match",
+            file_schema,
+            vec![attributes],
+            provider_schema,
+        )?;
+        let attributes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or("expected attributes MapArray")?;
+        let keys = attributes
+            .keys()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or("expected map key ListArray")?;
+        let key_elements = keys
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected key element StructArray")?;
+        let values = attributes
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected map value StringArray")?;
+        let cities = key_elements
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected city StringArray")?;
+        let zips = key_elements
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected zip Int32Array")?;
+
+        assert_eq!(attributes.value_offsets(), &[0, 2, 2, 3]);
+        assert!(attributes.is_valid(0));
+        assert!(attributes.is_null(1));
+        assert!(attributes.is_valid(2));
+        assert_eq!(keys.value_offsets(), &[0, 2, 2, 3]);
+        assert_eq!(key_elements.fields()[0].name(), "city");
+        assert_eq!(key_elements.fields()[1].name(), "zip");
+        assert_eq!(cities.value(0), "san francisco");
+        assert_eq!(cities.value(2), "chicago");
+        assert_eq!(zips.value(0), 94110);
+        assert_eq!(zips.value(2), 60601);
+        assert_eq!(values.value(0), "home");
+        assert_eq!(values.value(2), "other");
 
         Ok(())
     }
