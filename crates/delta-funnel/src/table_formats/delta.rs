@@ -40,7 +40,7 @@ use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
 /// Metadata-only expansion of one kernel scan.
 ///
 /// This is the direct output of `delta_kernel` scan metadata expansion. It is
-/// not yet the provider execution task model; later provider planning converts
+/// not the provider execution task model; provider planning converts
 /// these file metadata records into Delta-aware file tasks and grouped scan
 /// partitions.
 #[allow(dead_code)]
@@ -82,7 +82,7 @@ pub(crate) struct KernelScanFileMetadata {
     ///
     /// Delta Kernel uses this for features where physical Parquet columns do
     /// not directly match the logical scan schema. The expression is preserved
-    /// for the later execution path and is not evaluated here.
+    /// for provider execution and is not evaluated here.
     pub(crate) physical_to_logical_transform: KernelPhysicalToLogicalTransform,
     /// Partition values from the Delta add action keyed by partition column.
     ///
@@ -99,7 +99,7 @@ pub(crate) struct KernelScanFileStats {
 
 /// Opaque metadata for a deletion vector selected by kernel scan planning.
 ///
-/// This preserves the kernel-owned deletion-vector descriptor for later
+/// This preserves the kernel-owned deletion-vector descriptor for provider
 /// execution without loading the deletion-vector payload.
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -113,8 +113,8 @@ pub(crate) enum KernelScanDeletionVectorMetadata {
 /// Opaque handle for kernel-owned deletion-vector metadata.
 ///
 /// The wrapped `DvInfo` is kept private so metadata expansion cannot
-/// accidentally load the deletion-vector payload. Execution code can add a
-/// narrow accessor when deletion-vector reads are implemented.
+/// accidentally load the deletion-vector payload. Execution code must load
+/// payloads through the private deletion-vector reader boundary.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct KernelScanDeletionVectorHandle {
@@ -161,7 +161,7 @@ pub(crate) enum KernelPhysicalToLogicalTransform {
 
 /// Opaque handle for a kernel physical-to-logical transform expression.
 ///
-/// The expression is metadata for later execution. It is not evaluated while
+/// The expression is metadata for provider execution. It is not evaluated while
 /// expanding scan metadata.
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -235,14 +235,14 @@ impl ProjectedDeltaScan {
         &self.kernel_schema
     }
 
-    /// Returns the kernel scan handle that later metadata planning will consume.
+    /// Returns the kernel scan handle that metadata planning consumes.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn kernel_scan(&self) -> &kernel::Scan {
         &self.scan
     }
 
-    /// Returns the kernel scan schema state needed by later data-file reads.
+    /// Returns the kernel scan schema state needed by data-file reads.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn read_schema(&self) -> KernelScanReadSchema {

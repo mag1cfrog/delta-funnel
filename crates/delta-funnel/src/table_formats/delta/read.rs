@@ -1,9 +1,8 @@
 //! Private Delta Kernel data-file read adapter.
 //!
 //! This module is the official-kernel synchronous reader baseline for #4. It
-//! must not be called directly from a DataFusion stream polling loop; later
-//! provider execution work is responsible for placing this boundary behind
-//! bounded scheduling and backpressure.
+//! must not be called directly from a DataFusion stream polling loop. Provider
+//! execution places this boundary behind bounded scheduling and backpressure.
 
 use crate::{
     DeltaFunnelError,
@@ -52,7 +51,7 @@ impl KernelScanReadSchema {
         &self.logical_schema
     }
 
-    /// Optional kernel physical predicate for later read execution.
+    /// Optional kernel physical predicate for read execution.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn physical_predicate(&self) -> Option<&kernel::PredicateRef> {

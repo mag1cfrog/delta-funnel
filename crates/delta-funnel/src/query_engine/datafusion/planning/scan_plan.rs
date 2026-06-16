@@ -111,7 +111,7 @@ impl ProviderScanPlan {
         }
     }
 
-    /// Returns the private kernel scan state for later provider scan phases.
+    /// Returns the private kernel scan state for downstream provider scan phases.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn kernel_scan(&self) -> &ProjectedDeltaScan {
@@ -121,7 +121,7 @@ impl ProviderScanPlan {
     /// Expands this provider scan plan into metadata-only file records.
     ///
     /// This is the provider-facing boundary for scan metadata expansion. It
-    /// preserves provider context for later task planning and maps kernel
+    /// preserves provider context for task planning and maps kernel
     /// expansion failures into a phase-specific DeltaFunnel error.
     #[allow(dead_code)]
     pub(crate) fn expand_scan_metadata(
@@ -153,8 +153,8 @@ impl ProviderScanPlan {
     /// Partition options are validated before Delta Kernel metadata expansion so
     /// invalid caller options fail before any scan metadata work is consumed.
     /// The returned plan is the provider execution handoff: it carries scan
-    /// context plus grouped file tasks, so later read execution should consume it
-    /// directly instead of reloading the snapshot or re-expanding scan metadata.
+    /// context plus grouped file tasks, so read execution consumes it directly
+    /// instead of reloading the snapshot or re-expanding scan metadata.
     #[allow(dead_code)]
     pub(crate) fn plan_file_task_partitions(
         &self,

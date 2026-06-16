@@ -35,11 +35,10 @@ impl DeltaProviderReaderBackend {
 /// Bounded scheduling options for one Delta DataFusion provider scan.
 ///
 /// These limits apply to provider-scheduled physical Delta file reads. The
-/// current official-kernel sync fallback limits a conservative file-level
+/// official-kernel sync fallback limits a conservative file-level
 /// handoff: reading one file and sending its batches into the bounded
-/// DataFusion output channel. A native async reader should preserve these
-/// active-read semantics while enforcing them with an async semaphore-style
-/// limiter.
+/// DataFusion output channel. The native async reader preserves the same
+/// active-read semantics with async semaphore-style permits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaProviderScanExecutionOptions {
     /// File-reader backend used by normal provider scan execution.
@@ -76,9 +75,8 @@ pub struct DeltaProviderScanExecutionOptions {
 /// Sync fallback limiter for provider-scheduled file work in one Delta scan.
 ///
 /// This limiter exists for the official-kernel synchronous iterator bridge.
-/// A native async reader should replace this implementation at the same
-/// scheduling boundary with an async permit implementation such as a
-/// `tokio::sync::Semaphore`-backed limiter.
+/// Native async execution uses `DeltaProviderAsyncReadLimiter` at the same
+/// scheduling boundary.
 pub(crate) struct DeltaProviderSyncReadLimiter {
     options: DeltaProviderScanExecutionOptions,
     state: Mutex<DeltaProviderSyncReadLimiterState>,

@@ -17,7 +17,7 @@ use super::scheduling::{DeltaProviderAsyncFileReadPermit, DeltaProviderAsyncPart
 /// Native async scheduler output buffer capacity.
 ///
 /// The internal scheduler is demand-driven and has no completed-output buffer.
-/// A later DataFusion stream adapter must document its own handoff capacity.
+/// The DataFusion stream adapter documents its own handoff capacity.
 #[allow(dead_code)]
 pub(crate) const DELTA_PROVIDER_ASYNC_SCHEDULER_OUTPUT_CAPACITY: usize = 0;
 

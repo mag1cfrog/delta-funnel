@@ -187,7 +187,7 @@ impl ProviderDeletionVectorSelection {
         Self::from_deleted_row_indexes(deleted_row_indexes)
     }
 
-    /// Creates an all-live keep mask for tests and future no-DV normalization.
+    /// Creates an all-live keep mask for tests and no-DV normalization.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn all_live(_row_count: usize) -> Self {

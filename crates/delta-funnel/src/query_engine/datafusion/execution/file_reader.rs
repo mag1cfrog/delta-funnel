@@ -1,7 +1,7 @@
 //! File-level Delta reader for one provider scan task.
 //!
 //! This module owns the internal correctness boundary between file-task
-//! planning and later DataFusion stream execution. It wires the official kernel
+//! planning and DataFusion stream execution. It wires the official kernel
 //! reader baseline through transform application and deletion-vector masking
 //! before any batch is handed to provider execution.
 
