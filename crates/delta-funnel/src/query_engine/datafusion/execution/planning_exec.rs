@@ -1155,6 +1155,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_matches_official_kernel_for_nested_struct_name_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_reordered_nested_struct_fields(
+            "native-async-nested-struct-name-fallback",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select profile, id from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let (native, native_stats) = collect_sql_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(
+            native_stats.reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+        assert_eq!(native, official);
+        assert!(native.contains("profile"), "{native}");
+        assert!(native.contains("first_name"), "{native}");
+        assert!(native.contains("age"), "{native}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_matches_official_kernel_for_nested_column_mapping_transform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_nested_column_mapping(
+            "native-async-nested-column-mapping-equivalence",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select profile, customer_name, id from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let (native, native_stats) = collect_sql_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(
+            native_stats.reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+        assert_eq!(native, official);
+        assert!(native.contains("first_name"), "{native}");
+        assert!(native.contains("age"), "{native}");
+        assert!(!native.contains("phys_profile"), "{native}");
+        assert!(!native.contains("phys_first_name"), "{native}");
+        assert!(!native.contains("phys_age"), "{native}");
+        assert!(!native.contains("stale_first_name"), "{native}");
+        assert!(!native.contains("stale_age"), "{native}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_matches_official_kernel_for_missing_nullable_columns()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_missing_nullable_column(
