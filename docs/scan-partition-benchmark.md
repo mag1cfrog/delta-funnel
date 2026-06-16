@@ -57,13 +57,13 @@ DataFusion provider registration, selects the requested provider backend through
 `DeltaProviderScanExecutionOptions`, runs DataFusion SQL, and collects real
 provider execution output. It does not use a benchmark-only reader path.
 
-The initial provider-exec matrix compares the official kernel backend against
-the native async backend with lazy scheduling on non-DV workloads. It covers a
-many-small-files shape and a fewer-larger-files shape, each with a projection
-query and a count-style query. Later #161 slices should extend this same mode
-with DV-backed workloads, DV physical predicate workloads, and any bounded
-prefetch or admission scheduling variant that exists in the production native
-execution path.
+The provider-exec matrix compares the official kernel backend against the
+native async backend with lazy scheduling. It covers non-DV and sparse-DV
+versions of a many-small-files shape and a fewer-larger-files shape. Each
+workload runs a projection query, a count-style query, and a predicate query
+that exercises provider predicate handling. Later #161 slices should extend
+this same mode with any bounded prefetch or admission scheduling variant that
+exists in the production native execution path.
 
 Run the opt-in local IO read probe:
 
@@ -231,6 +231,9 @@ important field groups are:
   - `file_count`
   - `row_count`
   - `data_file_bytes`
+  - `deletion_vector_file_count`
+  - `deletion_vector_deleted_rows`
+  - `deletion_vector_deleted_rows_per_file`
 - Output shape:
   - `produced_rows`
   - `produced_batches`
@@ -297,7 +300,6 @@ does not run network or stress probes.
 Provider-exec mode is the production read benchmark path. It measures real
 temporary local Delta tables, Parquet decoding, Arrow batch production, provider
 backend selection, DataFusion SQL planning, and DataFusion collection. The
-initial provider-exec mode is local-file based and does not yet inject
-object-store latency, expose bounded prefetch/admission, or cover DV workloads.
-Those belong to later #161 slices and must still use production provider
-execution paths.
+provider-exec mode is local-file based and does not yet inject object-store
+latency or expose bounded prefetch/admission. Those belong to later #161 slices
+and must still use production provider execution paths.

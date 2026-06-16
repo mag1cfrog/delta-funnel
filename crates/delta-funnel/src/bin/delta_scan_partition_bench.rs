@@ -25,6 +25,10 @@ use delta_funnel::{
     derive_delta_scan_partition_target_diagnostic, load_delta_source, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options,
 };
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+use delta_kernel::actions::deletion_vector_writer::{
+    KernelDeletionVector, StreamingDeletionVectorWriter,
+};
 use futures_util::StreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -42,14 +46,18 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 10;
+const BENCHMARK_SCHEMA_VERSION: u32 = 11;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
 const PROVIDER_EXEC_MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const PROVIDER_EXEC_PROTOCOL_JSON: &str =
     r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+const PROVIDER_EXEC_DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
 const PROVIDER_EXEC_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-provider-exec-benchmark","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+const PROVIDER_EXEC_RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
+const PROVIDER_EXEC_RELATIVE_DV_FILE: &str =
+    "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
 const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "benchmark_schema_version",
     "benchmark_mode",
@@ -132,7 +140,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 34] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 37] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -148,6 +156,9 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 34] = [
     "file_count",
     "row_count",
     "data_file_bytes",
+    "deletion_vector_file_count",
+    "deletion_vector_deleted_rows",
+    "deletion_vector_deleted_rows_per_file",
     "produced_rows",
     "produced_batches",
     "planning_micros_p50",
@@ -408,6 +419,7 @@ struct ProviderExecWorkloadCase {
     name: &'static str,
     file_count: usize,
     rows_per_file: usize,
+    deleted_row_indexes_per_file: &'static [u64],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -421,6 +433,14 @@ struct ProviderExecDeltaTable {
     file_count: usize,
     row_count: usize,
     data_file_bytes: u64,
+    deletion_vector_file_count: usize,
+    deletion_vector_deleted_rows: usize,
+    deletion_vector_deleted_rows_per_file: usize,
+}
+
+struct ProviderExecDeletionVector {
+    descriptor: DeletionVectorDescriptor,
+    bytes: Vec<u8>,
 }
 
 impl Drop for ProviderExecDeltaTable {
@@ -673,11 +693,25 @@ impl ProviderExecWorkloadCase {
                 name: "provider_many_small_files",
                 file_count: 64,
                 rows_per_file: 128,
+                deleted_row_indexes_per_file: &[],
             },
             Self {
                 name: "provider_few_larger_files",
                 file_count: 4,
                 rows_per_file: 8_192,
+                deleted_row_indexes_per_file: &[],
+            },
+            Self {
+                name: "provider_many_small_files_sparse_dv",
+                file_count: 64,
+                rows_per_file: 128,
+                deleted_row_indexes_per_file: &[1],
+            },
+            Self {
+                name: "provider_few_larger_files_sparse_dv",
+                file_count: 4,
+                rows_per_file: 8_192,
+                deleted_row_indexes_per_file: &[1, 4_096, 8_191],
             },
         ]
     }
@@ -685,10 +719,19 @@ impl ProviderExecWorkloadCase {
     fn row_count(self) -> usize {
         self.file_count.saturating_mul(self.rows_per_file)
     }
+
+    fn has_deletion_vectors(self) -> bool {
+        !self.deleted_row_indexes_per_file.is_empty()
+    }
+
+    fn deletion_vector_deleted_rows(self) -> usize {
+        self.file_count
+            .saturating_mul(self.deleted_row_indexes_per_file.len())
+    }
 }
 
 impl ProviderExecQueryCase {
-    fn standard_cases() -> [Self; 2] {
+    fn standard_cases() -> [Self; 3] {
         [
             Self {
                 name: "project_id",
@@ -697,6 +740,10 @@ impl ProviderExecQueryCase {
             Self {
                 name: "count_rows",
                 sql: "select count(id) from orders",
+            },
+            Self {
+                name: "filter_tail_ids",
+                sql: "select id from orders where id > 4096",
             },
         ]
     }
@@ -715,6 +762,13 @@ impl ProviderExecDeltaTable {
         let mut add_actions = Vec::with_capacity(workload.file_count);
         let mut data_file_bytes = 0_u64;
         let mut next_id = 1_usize;
+        let deletion_vector = if workload.has_deletion_vectors() {
+            Some(provider_exec_deletion_vector_fixture(
+                workload.deleted_row_indexes_per_file,
+            )?)
+        } else {
+            None
+        };
 
         for file_index in 0..workload.file_count {
             let file_path = format!("part-{file_index:05}.parquet");
@@ -740,12 +794,26 @@ impl ProviderExecDeltaTable {
                 file_size,
                 first_id,
                 workload.rows_per_file,
+                deletion_vector.as_ref(),
             )?);
         }
 
+        if let Some(deletion_vector) = &deletion_vector {
+            fs::write(
+                path.join(PROVIDER_EXEC_RELATIVE_DV_FILE),
+                &deletion_vector.bytes,
+            )?;
+        }
+
+        let protocol = if workload.has_deletion_vectors() {
+            PROVIDER_EXEC_DELETION_VECTOR_PROTOCOL_JSON
+        } else {
+            PROVIDER_EXEC_PROTOCOL_JSON
+        };
+
         fs::write(
             log_path.join("00000000000000000000.json"),
-            format!("{PROVIDER_EXEC_PROTOCOL_JSON}\n{PROVIDER_EXEC_METADATA_JSON}\n"),
+            format!("{protocol}\n{PROVIDER_EXEC_METADATA_JSON}\n"),
         )?;
         fs::write(
             log_path.join("00000000000000000001.json"),
@@ -757,6 +825,13 @@ impl ProviderExecDeltaTable {
             file_count: workload.file_count,
             row_count: workload.row_count(),
             data_file_bytes,
+            deletion_vector_file_count: if workload.has_deletion_vectors() {
+                workload.file_count
+            } else {
+                0
+            },
+            deletion_vector_deleted_rows: workload.deletion_vector_deleted_rows(),
+            deletion_vector_deleted_rows_per_file: workload.deleted_row_indexes_per_file.len(),
         })
     }
 }
@@ -911,6 +986,12 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         input.table.file_count.to_string(),
         input.table.row_count.to_string(),
         input.table.data_file_bytes.to_string(),
+        input.table.deletion_vector_file_count.to_string(),
+        input.table.deletion_vector_deleted_rows.to_string(),
+        input
+            .table
+            .deletion_vector_deleted_rows_per_file
+            .to_string(),
         summary.produced_rows.to_string(),
         summary.produced_batches.to_string(),
         summary.planning_micros.p50.to_string(),
@@ -971,15 +1052,52 @@ fn provider_exec_add_json(
     size: u64,
     first_id: usize,
     rows: usize,
+    deletion_vector: Option<&ProviderExecDeletionVector>,
 ) -> Result<String, Box<dyn Error>> {
     let max_id = first_id.saturating_add(rows).saturating_sub(1);
     let min_id = i32::try_from(first_id)?;
     let max_id = i32::try_from(max_id)?;
     let min_customer = format!("customer-{first_id}");
     let max_customer = format!("customer-{max_id}");
+    let deletion_vector_json = deletion_vector
+        .map(|deletion_vector| {
+            let descriptor = &deletion_vector.descriptor;
+            let storage_type = descriptor.storage_type;
+            let path_or_inline_dv = &descriptor.path_or_inline_dv;
+            let offset = descriptor.offset.unwrap_or(0);
+            let size_in_bytes = descriptor.size_in_bytes;
+            let cardinality = descriptor.cardinality;
+            format!(
+                r#","deletionVector":{{"storageType":"{storage_type}","pathOrInlineDv":"{path_or_inline_dv}","offset":{offset},"sizeInBytes":{size_in_bytes},"cardinality":{cardinality}}}"#
+            )
+        })
+        .unwrap_or_default();
+
     Ok(format!(
-        r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":{PROVIDER_EXEC_MODIFICATION_TIME_MS},"dataChange":true,"stats":"{{\"numRecords\":{rows},\"minValues\":{{\"id\":{min_id},\"customer_name\":\"{min_customer}\"}},\"maxValues\":{{\"id\":{max_id},\"customer_name\":\"{max_customer}\"}},\"nullCount\":{{\"id\":0,\"customer_name\":0}}}}"}}}}"#
+        r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":{PROVIDER_EXEC_MODIFICATION_TIME_MS},"dataChange":true,"stats":"{{\"numRecords\":{rows},\"minValues\":{{\"id\":{min_id},\"customer_name\":\"{min_customer}\"}},\"maxValues\":{{\"id\":{max_id},\"customer_name\":\"{max_customer}\"}},\"nullCount\":{{\"id\":0,\"customer_name\":0}}}}"{deletion_vector_json}}}}}"#
     ))
+}
+
+fn provider_exec_deletion_vector_fixture(
+    deleted_rows: &[u64],
+) -> Result<ProviderExecDeletionVector, Box<dyn Error>> {
+    let mut buffer = Vec::new();
+    let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
+    let mut deletion_vector = KernelDeletionVector::new();
+    deletion_vector.add_deleted_row_indexes(deleted_rows.iter().copied());
+    let write_result = writer.write_deletion_vector(deletion_vector)?;
+    writer.finalize()?;
+
+    Ok(ProviderExecDeletionVector {
+        descriptor: DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: PROVIDER_EXEC_RELATIVE_DV_ID.to_owned(),
+            offset: Some(write_result.offset),
+            size_in_bytes: write_result.size_in_bytes,
+            cardinality: write_result.cardinality,
+        },
+        bytes: buffer,
+    })
 }
 
 fn unique_benchmark_name(name: &str) -> Result<String, Box<dyn Error>> {
@@ -3678,7 +3796,7 @@ mod tests {
 
         assert_eq!(lines.len(), 1111);
         assert!(lines[0].starts_with("benchmark_schema_version,benchmark_mode,host_os,host_arch"));
-        assert!(csv.contains("\n10,synthetic,"));
+        assert!(csv.contains("\n11,synthetic,"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
@@ -3714,7 +3832,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "10");
+        assert_eq!(row[0], "11");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[5], "42");
         assert_eq!(row[6], "0");
@@ -3794,7 +3912,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "10");
+        assert_eq!(row[0], "11");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
@@ -4721,11 +4839,122 @@ mod tests {
     fn provider_exec_csv_header_contains_latency_signals() {
         assert_eq!(PROVIDER_EXEC_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(PROVIDER_EXEC_CSV_HEADER[1], "benchmark_mode");
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_file_count"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_deleted_rows"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_deleted_rows_per_file"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"planning_micros_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"time_to_first_batch_micros_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"total_micros_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"source_rows_per_second_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"batch_latency_micros_p99"));
+    }
+
+    #[test]
+    fn provider_exec_cases_cover_non_dv_sparse_dv_and_predicate_queries() {
+        let workloads = ProviderExecWorkloadCase::standard_cases();
+        let workload_names = workloads
+            .iter()
+            .map(|workload| workload.name)
+            .collect::<Vec<_>>();
+        let query_cases = ProviderExecQueryCase::standard_cases();
+        let query_names = query_cases
+            .iter()
+            .map(|query| query.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            workload_names,
+            [
+                "provider_many_small_files",
+                "provider_few_larger_files",
+                "provider_many_small_files_sparse_dv",
+                "provider_few_larger_files_sparse_dv"
+            ]
+        );
+        assert_eq!(workloads[0].deletion_vector_deleted_rows(), 0);
+        assert_eq!(workloads[2].deletion_vector_deleted_rows(), 64);
+        assert_eq!(workloads[3].deletion_vector_deleted_rows(), 12);
+        assert!(query_names.contains(&"project_id"));
+        assert!(query_names.contains(&"count_rows"));
+        assert!(query_names.contains(&"filter_tail_ids"));
+    }
+
+    #[test]
+    fn provider_exec_csv_row_matches_header_width_and_dv_fields() {
+        let workload = ProviderExecWorkloadCase {
+            name: "test_sparse_dv",
+            file_count: 2,
+            rows_per_file: 8,
+            deleted_row_indexes_per_file: &[1, 7],
+        };
+        let table = ProviderExecDeltaTable {
+            path: PathBuf::from("target/nonexistent-provider-exec-test"),
+            file_count: 2,
+            row_count: 16,
+            data_file_bytes: 1024,
+            deletion_vector_file_count: 2,
+            deletion_vector_deleted_rows: 4,
+            deletion_vector_deleted_rows_per_file: 2,
+        };
+        let summary = ProviderExecSummary {
+            repetitions: 3,
+            produced_rows: 12,
+            produced_batches: 2,
+            planning_micros: PercentileSummary {
+                p50: 10,
+                p95: 11,
+                p99: 12,
+            },
+            time_to_first_batch_micros: PercentileSummary {
+                p50: 20,
+                p95: 21,
+                p99: 22,
+            },
+            total_micros: PercentileSummary {
+                p50: 30,
+                p95: 31,
+                p99: 32,
+            },
+            source_rows_per_second: PercentileSummary {
+                p50: 40,
+                p95: 41,
+                p99: 42,
+            },
+            batch_latency_micros: PercentileSummary {
+                p50: 50,
+                p95: 51,
+                p99: 52,
+            },
+            min_total_micros: 29,
+            max_total_micros: 33,
+        };
+        let row = provider_exec_csv_row(ProviderExecCsvRowInput {
+            run_environment: BenchmarkRunEnvironment {
+                schema_version: BENCHMARK_SCHEMA_VERSION,
+                host_os: "test-os",
+                host_arch: "test-arch",
+                available_parallelism: Some(8),
+            },
+            seed: 7,
+            workload_case_count: 4,
+            table: &table,
+            workload: &workload,
+            query: ProviderExecQueryCase {
+                name: "project_id",
+                sql: "select id from orders",
+            },
+            backend: DeltaProviderReaderBackend::NativeAsync,
+            summary: &summary,
+        });
+
+        assert_eq!(row.len(), PROVIDER_EXEC_CSV_HEADER.len());
+        assert_eq!(row[0], "11");
+        assert_eq!(row[7], "test_sparse_dv");
+        assert_eq!(row[9], "native_async");
+        assert_eq!(row[15], "2");
+        assert_eq!(row[16], "4");
+        assert_eq!(row[17], "2");
+        assert_eq!(row[18], "12");
     }
 
     #[test]
@@ -4848,7 +5077,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "10");
+        assert_eq!(row[0], "11");
         assert_eq!(row[1], "synthetic");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
