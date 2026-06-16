@@ -1132,7 +1132,7 @@ fn map_entry_fields<'a>(
         )));
     }
 
-    let key = fields.get(0).ok_or_else(|| {
+    let key = fields.first().ok_or_else(|| {
         delta_kernel::Error::generic(format!(
             "provider field '{path}' is missing map key metadata"
         ))
