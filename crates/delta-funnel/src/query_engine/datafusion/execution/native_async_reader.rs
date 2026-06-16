@@ -1089,24 +1089,35 @@ fn build_matched_map_field_plan(
     let (provider_key, provider_value) = map_entry_fields(provider_entries, path)?;
     let (file_key, file_value) = map_entry_fields(file_entries, path)?;
 
-    if !file_key
-        .data_type()
-        .equals_datatype(provider_key.data_type())
-    {
-        return Err(delta_kernel::Error::generic(format!(
-            "provider field '{path}.key' expected Parquet type {} but found {}",
-            provider_key.data_type(),
-            file_key.data_type()
-        )));
-    }
+    let key_path = format!("{path}.key");
+    let parquet_key = parquet_map_key_field(parquet_field, path)?;
+    let key_plan = match (provider_key.data_type(), file_key.data_type()) {
+        (DataType::Struct(_), DataType::Struct(_)) => {
+            build_matched_field_plan(provider_key, file_key, parquet_key, &key_path)?
+        }
+        _ if file_key
+            .data_type()
+            .equals_datatype(provider_key.data_type()) =>
+        {
+            NativeAsyncFieldPlan::Identity
+        }
+        _ => {
+            return Err(delta_kernel::Error::generic(format!(
+                "provider field '{key_path}' expected Parquet type {} but found {}",
+                provider_key.data_type(),
+                file_key.data_type()
+            )));
+        }
+    };
 
     let value_path = format!("{path}.value");
     let parquet_value = parquet_map_value_field(parquet_field, path)?;
     let value_plan =
         build_matched_field_plan(provider_value, file_value, parquet_value, &value_path)?;
     let provider_map_type = DataType::Map(Arc::clone(provider_entries), provider_ordered);
-    let key_plan = NativeAsyncFieldPlan::Identity;
-    let needs_reshape = file_field.data_type() != &provider_map_type || !value_plan.is_identity();
+    let needs_reshape = file_field.data_type() != &provider_map_type
+        || !key_plan.is_identity()
+        || !value_plan.is_identity();
 
     if needs_reshape {
         Ok(NativeAsyncFieldPlan::Map {
@@ -1149,9 +1160,24 @@ fn map_entry_fields<'a>(
     Ok((key.as_ref(), value.as_ref()))
 }
 
+fn parquet_map_key_field<'a>(
+    parquet_field: &'a parquet::schema::types::Type,
+    path: &str,
+) -> Result<&'a parquet::schema::types::Type, delta_kernel::Error> {
+    parquet_map_entry_field(parquet_field, path, 0)
+}
+
 fn parquet_map_value_field<'a>(
     parquet_field: &'a parquet::schema::types::Type,
     path: &str,
+) -> Result<&'a parquet::schema::types::Type, delta_kernel::Error> {
+    parquet_map_entry_field(parquet_field, path, 1)
+}
+
+fn parquet_map_entry_field<'a>(
+    parquet_field: &'a parquet::schema::types::Type,
+    path: &str,
+    entry_index: usize,
 ) -> Result<&'a parquet::schema::types::Type, delta_kernel::Error> {
     let parquet_children = parquet_field.get_fields();
     let Some(repeated_child) = parquet_children.first() else {
@@ -1167,19 +1193,19 @@ fn parquet_map_value_field<'a>(
     }
 
     let entry_children = repeated_child.get_fields();
-    let Some(value) = entry_children.get(1) else {
-        return Err(delta_kernel::Error::generic(format!(
-            "provider field '{path}' expected Parquet map entry key and value fields"
-        )));
-    };
     if entry_children.len() != 2 {
         return Err(delta_kernel::Error::generic(format!(
             "provider field '{path}' expected Parquet map entry to contain two fields but found {}",
             entry_children.len()
         )));
     }
+    let Some(entry_field) = entry_children.get(entry_index) else {
+        return Err(delta_kernel::Error::generic(format!(
+            "provider field '{path}' expected Parquet map entry key and value fields"
+        )));
+    };
 
-    Ok(value.as_ref())
+    Ok(entry_field.as_ref())
 }
 
 fn build_matched_list_field_plan(
@@ -1557,12 +1583,7 @@ fn unsupported_native_async_physical_schema_reason(
     physical_schema: &KernelSchemaRef,
 ) -> Option<String> {
     physical_schema.fields().find_map(|field| {
-        unsupported_native_async_field_reason(
-            field,
-            field.name(),
-            true,
-            NativeAsyncMapContext::Outside,
-        )
+        unsupported_native_async_field_reason(field, field.name(), NativeAsyncMapContext::Outside)
     })
 }
 
@@ -1570,18 +1591,17 @@ fn unsupported_native_async_physical_schema_reason(
 enum NativeAsyncMapContext {
     /// The field is not under a map key or map value subtree.
     Outside,
-    /// The field is under a map key subtree. Native async does not reshape keys
-    /// because that could change key equality or key/value association.
+    /// The field is under a map key subtree. Key reshaping must preserve map
+    /// offsets, entry ordering, and key/value association exactly.
     Key,
     /// The field is under a map value subtree. Value fields can be reshaped the
-    /// same way as nested struct/list fields while preserving map keys.
+    /// same way as nested struct/list fields while preserving map structure.
     Value,
 }
 
 fn unsupported_native_async_field_reason(
     field: &KernelStructField,
     path: &str,
-    top_level: bool,
     map_context: NativeAsyncMapContext,
 ) -> Option<String> {
     if field.is_metadata_column() {
@@ -1599,25 +1619,27 @@ fn unsupported_native_async_field_reason(
             "native async reader does not support file path metadata column '{path}' yet"
         ));
     }
-    // Map values can be reshaped independently, but map keys define entry
-    // identity. Reject any key-side field matching until key reshaping is
-    // explicitly supported.
     if matches!(map_context, NativeAsyncMapContext::Key)
-        && has_field_matching_metadata(field, top_level)
+        && matches!(
+            field.data_type(),
+            KernelDataType::Array(_) | KernelDataType::Map(_)
+        )
+        && (has_field_matching_metadata(field, false)
+            || data_type_has_field_matching_metadata(field.data_type()))
     {
         return Some(format!(
-            "native async reader does not support map key field-id or physical-name matching at '{path}' yet"
+            "native async reader does not support map key list/map field-id or physical-name matching at '{path}' yet"
         ));
     }
     // Delta stores synthetic map key/value field ids on the map field itself.
     // A primitive key only needs that synthetic key id preserved by the
-    // provider transform. A complex key can also need recursive key-side
-    // matching, which native async intentionally rejects above.
+    // provider transform. Struct keys can now be reshaped recursively, while
+    // list and nested-map keys are handled by later implementation slices.
     if has_nested_field_id_map_metadata(field)
-        && matches!(field.data_type(), KernelDataType::Map(map) if !matches!(map.key_type(), KernelDataType::Primitive(_)))
+        && matches!(field.data_type(), KernelDataType::Map(map) if matches!(map.key_type(), KernelDataType::Array(_) | KernelDataType::Map(_)))
     {
         return Some(format!(
-            "native async reader does not support complex map key field-id or physical-name matching at '{path}' yet"
+            "native async reader does not support list or nested-map key field-id or physical-name matching at '{path}' yet"
         ));
     }
 
@@ -1633,10 +1655,17 @@ fn unsupported_native_async_data_type_reason(
         KernelDataType::Struct(fields) | KernelDataType::Variant(fields) => {
             fields.fields().find_map(|field| {
                 let child_path = format!("{path}.{}", field.name());
-                unsupported_native_async_field_reason(field, &child_path, false, map_context)
+                unsupported_native_async_field_reason(field, &child_path, map_context)
             })
         }
         KernelDataType::Array(array) => {
+            if matches!(map_context, NativeAsyncMapContext::Key)
+                && data_type_has_field_matching_metadata(data_type)
+            {
+                return Some(format!(
+                    "native async reader does not support map key list/array field-id or physical-name matching at '{path}' yet"
+                ));
+            }
             let child_path = format!("{path}.element");
             unsupported_native_async_data_type_reason(
                 array.element_type(),
@@ -1645,6 +1674,13 @@ fn unsupported_native_async_data_type_reason(
             )
         }
         KernelDataType::Map(map) => {
+            if matches!(map_context, NativeAsyncMapContext::Key)
+                && data_type_has_field_matching_metadata(data_type)
+            {
+                return Some(format!(
+                    "native async reader does not support nested map key field-id or physical-name matching at '{path}' yet"
+                ));
+            }
             let key_path = format!("{path}.key");
             unsupported_native_async_data_type_reason(
                 map.key_type(),
@@ -1661,6 +1697,23 @@ fn unsupported_native_async_data_type_reason(
             })
         }
         KernelDataType::Primitive(_) => None,
+    }
+}
+
+fn data_type_has_field_matching_metadata(data_type: &KernelDataType) -> bool {
+    match data_type {
+        KernelDataType::Struct(fields) | KernelDataType::Variant(fields) => {
+            fields.fields().any(|field| {
+                has_field_matching_metadata(field, false)
+                    || data_type_has_field_matching_metadata(field.data_type())
+            })
+        }
+        KernelDataType::Array(array) => data_type_has_field_matching_metadata(array.element_type()),
+        KernelDataType::Map(map) => {
+            data_type_has_field_matching_metadata(map.key_type())
+                || data_type_has_field_matching_metadata(map.value_type())
+        }
+        KernelDataType::Primitive(_) => false,
     }
 }
 
@@ -2214,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn native_async_schema_gate_rejects_map_key_field_id_matching()
+    fn native_async_schema_gate_allows_map_struct_key_field_id_matching()
     -> Result<(), Box<dyn std::error::Error>> {
         let key_type = KernelStructType::try_new([KernelStructField::new(
             "name",
@@ -2231,11 +2284,11 @@ mod tests {
             ),
             true,
         )])?;
-        let reason =
-            unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
 
-        assert!(reason.contains("map key field-id"));
-        assert!(reason.contains("attributes.key.name"));
+        assert_eq!(
+            unsupported_native_async_physical_schema_reason(&schema),
+            None
+        );
 
         Ok(())
     }
@@ -2261,7 +2314,7 @@ mod tests {
         let reason =
             unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
 
-        assert!(reason.contains("complex map key field-id"));
+        assert!(reason.contains("list or nested-map key field-id"));
         assert!(reason.contains("attributes"));
 
         Ok(())
@@ -2786,6 +2839,256 @@ mod tests {
             error.contains("addresses.element.required_country"),
             "{error}"
         );
+        assert!(
+            error.contains("is missing from the Parquet file"),
+            "{error}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_reshapes_map_key_struct_by_field_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_key_fields = vec![
+            Field::new("city", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+            Field::new("zip", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+        ];
+        let provider_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new("keys", DataType::Struct(provider_key_fields.into()), false),
+            Field::new("values", DataType::Utf8, true),
+            true,
+        )]));
+        let file_key_fields = vec![
+            Field::new("stale_zip", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+            Field::new("stale_city", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+        ];
+        let file_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new(
+                "keys",
+                DataType::Struct(file_key_fields.clone().into()),
+                false,
+            ),
+            Field::new("values", DataType::Utf8, true),
+            true,
+        )]));
+        let keys = struct_array(
+            file_key_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![94110, 10001, 60601])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("san francisco"),
+                    Some("new york"),
+                    Some("chicago"),
+                ])) as ArrayRef,
+            ],
+        );
+        let values = Arc::new(StringArray::from(vec![
+            Some("home"),
+            Some("work"),
+            Some("other"),
+        ])) as ArrayRef;
+        let attributes = map_array(
+            Field::new(
+                "keys",
+                DataType::Struct(
+                    vec![
+                        Field::new("stale_zip", DataType::Int32, true)
+                            .with_metadata(field_id_metadata(10)),
+                        Field::new("stale_city", DataType::Utf8, true)
+                            .with_metadata(field_id_metadata(11)),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+            Field::new("values", DataType::Utf8, true),
+            vec![0, 2, 2, 3],
+            keys,
+            values,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "map-key-struct-field-id-schema-match",
+            file_schema,
+            vec![attributes],
+            provider_schema,
+        )?;
+        let attributes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or("expected attributes MapArray")?;
+        let keys = attributes
+            .keys()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected map key StructArray")?;
+        let values = attributes
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected map value StringArray")?;
+        let cities = keys
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected city StringArray")?;
+        let zips = keys
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected zip Int32Array")?;
+
+        assert_eq!(attributes.value_offsets(), &[0, 2, 2, 3]);
+        assert!(attributes.is_valid(0));
+        assert!(attributes.is_null(1));
+        assert!(attributes.is_valid(2));
+        assert_eq!(keys.fields()[0].name(), "city");
+        assert_eq!(keys.fields()[1].name(), "zip");
+        assert_eq!(cities.value(0), "san francisco");
+        assert_eq!(cities.value(2), "chicago");
+        assert_eq!(zips.value(0), 94110);
+        assert_eq!(zips.value(2), 60601);
+        assert_eq!(values.value(0), "home");
+        assert_eq!(values.value(2), "other");
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_null_fills_missing_nullable_map_key_struct_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_key_fields = vec![
+            Field::new("zip", DataType::Int32, true),
+            Field::new("country", DataType::Utf8, true),
+        ];
+        let provider_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new("keys", DataType::Struct(provider_key_fields.into()), false),
+            Field::new("values", DataType::Utf8, true),
+            true,
+        )]));
+        let file_key_fields = vec![Field::new("zip", DataType::Int32, true)];
+        let file_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new(
+                "keys",
+                DataType::Struct(file_key_fields.clone().into()),
+                false,
+            ),
+            Field::new("values", DataType::Utf8, true),
+            true,
+        )]));
+        let keys = struct_array(
+            file_key_fields,
+            vec![Arc::new(Int32Array::from(vec![94110, 10001, 60601, 85001, 73301])) as ArrayRef],
+        );
+        let attributes = map_array(
+            Field::new(
+                "keys",
+                DataType::Struct(vec![Field::new("zip", DataType::Int32, true)].into()),
+                false,
+            ),
+            Field::new("values", DataType::Utf8, true),
+            vec![0, 2, 2, 5],
+            keys,
+            Arc::new(StringArray::from(vec![
+                Some("home"),
+                Some("work"),
+                Some("other"),
+                Some("billing"),
+                Some("shipping"),
+            ])) as ArrayRef,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "map-key-struct-missing-nullable-schema-match",
+            file_schema,
+            vec![attributes],
+            provider_schema,
+        )?;
+        let attributes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or("expected attributes MapArray")?;
+        let keys = attributes
+            .keys()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected map key StructArray")?;
+        let countries = keys
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected country StringArray")?;
+
+        assert_eq!(attributes.value_offsets(), &[0, 2, 2, 5]);
+        assert!(attributes.is_null(1));
+        assert_eq!(keys.fields()[1].name(), "country");
+        assert_eq!(countries.len(), 5);
+        assert_eq!(countries.null_count(), 5);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_rejects_missing_non_nullable_map_key_struct_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_key_fields = vec![
+            Field::new("zip", DataType::Int32, true),
+            Field::new("required_country", DataType::Utf8, false),
+        ];
+        let provider_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new("keys", DataType::Struct(provider_key_fields.into()), false),
+            Field::new("values", DataType::Utf8, true),
+            true,
+        )]));
+        let file_key_fields = vec![Field::new("zip", DataType::Int32, true)];
+        let file_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new(
+                "keys",
+                DataType::Struct(file_key_fields.clone().into()),
+                false,
+            ),
+            Field::new("values", DataType::Utf8, true),
+            true,
+        )]));
+        let keys = struct_array(
+            file_key_fields,
+            vec![Arc::new(Int32Array::from(vec![94110, 10001])) as ArrayRef],
+        );
+        let attributes = map_array(
+            Field::new(
+                "keys",
+                DataType::Struct(vec![Field::new("zip", DataType::Int32, true)].into()),
+                false,
+            ),
+            Field::new("values", DataType::Utf8, true),
+            vec![0, 2],
+            keys,
+            Arc::new(StringArray::from(vec![Some("home"), Some("work")])) as ArrayRef,
+            None,
+        )?;
+        let error = match project_parquet_batch_to_provider_schema(
+            "map-key-struct-missing-required-schema-match",
+            file_schema,
+            vec![attributes],
+            provider_schema,
+        ) {
+            Ok(_) => return Err("missing non-nullable map key struct child must fail".into()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("non-nullable provider field"), "{error}");
+        assert!(error.contains("attributes.key.required_country"), "{error}");
         assert!(
             error.contains("is missing from the Parquet file"),
             "{error}"
