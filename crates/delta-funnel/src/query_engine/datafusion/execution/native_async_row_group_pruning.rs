@@ -306,11 +306,11 @@ fn decimal_scalar_from_bytes(
     // Parquet fixed-length decimal stats are stored as big-endian two's
     // complement bytes. Convert to little-endian i128 bytes and preserve the
     // sign when the encoded value is narrower than 16 bytes.
-    let pad = bytes
-        .first()
-        .is_some_and(|byte| byte & 0x80 != 0)
-        .then_some(0xff)
-        .unwrap_or(0x00);
+    let pad = if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
+        0xff
+    } else {
+        0x00
+    };
     let mut bytes = Vec::from(bytes);
     bytes.reverse();
     bytes.resize(16, pad);
