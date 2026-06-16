@@ -48,7 +48,12 @@ pub(crate) struct KernelDeletionVectorReadRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderDeletionVectorSelection {
     deleted_row_indexes: Box<[u64]>,
+    /// Original row count consumed by the ordered full-file batch path.
     consumed_row_count: u64,
+    /// Cursor into `deleted_row_indexes` for globally ascending row-index lookups.
+    original_row_index_deleted_cursor: Option<usize>,
+    /// Last original row index seen while the cursor optimization is valid.
+    last_original_row_index: Option<u64>,
     closed: bool,
     /// Tracks which row-coordinate contract this selection is using.
     ///
@@ -162,6 +167,8 @@ impl ProviderDeletionVectorSelection {
         Self {
             deleted_row_indexes: deleted_row_indexes.into_boxed_slice(),
             consumed_row_count: 0,
+            original_row_index_deleted_cursor: Some(0),
+            last_original_row_index: None,
             closed: false,
             access_mode: ProviderDeletionVectorSelectionAccessMode::Unused,
         }
@@ -350,10 +357,47 @@ impl ProviderDeletionVectorSelection {
             }
         }
 
-        Ok(row_indexes
-            .into_iter()
-            .map(|row_index| self.deleted_row_indexes.binary_search(&row_index).is_err())
-            .collect())
+        let mut keep_mask = Vec::new();
+        let mut cursor = self.original_row_index_deleted_cursor.unwrap_or(0);
+        let mut last_row_index = self.last_original_row_index;
+        let mut cursor_is_valid = self.original_row_index_deleted_cursor.is_some();
+
+        for row_index in row_indexes {
+            if cursor_is_valid
+                && last_row_index
+                    .map(|last_row_index| row_index < last_row_index)
+                    .unwrap_or(false)
+            {
+                cursor_is_valid = false;
+            }
+
+            let keep = if cursor_is_valid {
+                while cursor < self.deleted_row_indexes.len()
+                    && self.deleted_row_indexes[cursor] < row_index
+                {
+                    cursor += 1;
+                }
+
+                self.deleted_row_indexes
+                    .get(cursor)
+                    .map(|deleted_row_index| *deleted_row_index != row_index)
+                    .unwrap_or(true)
+            } else {
+                self.deleted_row_indexes.binary_search(&row_index).is_err()
+            };
+            keep_mask.push(keep);
+            last_row_index = Some(row_index);
+        }
+
+        if cursor_is_valid {
+            self.original_row_index_deleted_cursor = Some(cursor);
+            self.last_original_row_index = last_row_index;
+        } else {
+            self.original_row_index_deleted_cursor = None;
+            self.last_original_row_index = None;
+        }
+
+        Ok(keep_mask)
     }
 
     /// Closes consumption after the physical file reader reaches EOF.
@@ -549,6 +593,50 @@ mod tests {
         assert_eq!(
             selection.select_original_row_indexes([0, 2, 4, 5, 9], context)?,
             vec![true, true, false, true, true]
+        );
+        selection.finish(context)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_original_row_indexes_advances_cursor_for_monotonic_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = test_context();
+        let mut selection =
+            ProviderDeletionVectorSelection::from_deleted_row_indexes(vec![1, 3, 5]);
+
+        assert_eq!(
+            selection.select_original_row_indexes([0, 1, 2], context)?,
+            vec![true, false, true]
+        );
+        assert_eq!(selection.original_row_index_deleted_cursor, Some(1));
+
+        assert_eq!(
+            selection.select_original_row_indexes([3, 4, 5], context)?,
+            vec![false, true, false]
+        );
+        assert_eq!(selection.original_row_index_deleted_cursor, Some(2));
+        selection.finish(context)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_original_row_indexes_falls_back_for_unsorted_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = test_context();
+        let mut selection = ProviderDeletionVectorSelection::from_deleted_row_indexes(vec![1, 3]);
+
+        assert_eq!(
+            selection.select_original_row_indexes([3, 1, 4], context)?,
+            vec![false, false, true]
+        );
+        assert_eq!(selection.original_row_index_deleted_cursor, None);
+
+        assert_eq!(
+            selection.select_original_row_indexes([1, 2], context)?,
+            vec![false, true]
         );
         selection.finish(context)?;
 
