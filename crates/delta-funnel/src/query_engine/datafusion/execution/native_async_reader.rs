@@ -1838,11 +1838,8 @@ mod tests {
                     .lock()
                     .map_err(|_| delta_kernel::object_store::Error::Generic {
                         store: "capture",
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "captured storage options lock poisoned",
-                        )
-                        .into(),
+                        source: std::io::Error::other("captured storage options lock poisoned")
+                            .into(),
                     })?
                     .push(options);
 
