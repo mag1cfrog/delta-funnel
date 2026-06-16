@@ -42,6 +42,9 @@ const MAP_ATTRIBUTES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-re
 const MISSING_NULLABLE_MAP_ATTRIBUTES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"country\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const MISSING_NON_NULLABLE_MAP_ATTRIBUTES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"required_country\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]},\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const MAP_COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":6,\"delta.columnMapping.physicalName\":\"phys_city\"}},{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":7,\"delta.columnMapping.physicalName\":\"phys_zip\"}}]},\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"phys_attributes\",\"delta.columnMapping.nested.ids\":{\"phys_attributes.key\":4,\"phys_attributes.value\":5}}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"7"},"createdTime":1587968585495}}"#;
+const MAP_KEY_VALUE_COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":6,\"delta.columnMapping.physicalName\":\"phys_key_city\"}},{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":7,\"delta.columnMapping.physicalName\":\"phys_key_zip\"}}]},\"valueType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":8,\"delta.columnMapping.physicalName\":\"phys_value_label\"}},{\"name\":\"score\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":9,\"delta.columnMapping.physicalName\":\"phys_value_score\"}}]},\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"phys_attributes\",\"delta.columnMapping.nested.ids\":{\"phys_attributes.key\":4,\"phys_attributes.value\":5}}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"9"},"createdTime":1587968585495}}"#;
+const MAP_LIST_KEY_ATTRIBUTES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":{\"type\":\"array\",\"elementType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"containsNull\":true},\"valueType\":\"string\",\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+const NESTED_MAP_KEY_ATTRIBUTES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":{\"type\":\"map\",\"keyType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"zip\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"city\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"valueType\":\"integer\",\"valueContainsNull\":true},\"valueType\":\"string\",\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const DATA_FILE: &str = "part-00000.parquet";
 const MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
@@ -619,6 +622,82 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local Delta table whose map key and value structs both use
+    /// column mapping metadata and whose Parquet child names intentionally
+    /// differ from Delta physical names.
+    pub(crate) fn new_with_map_key_value_column_mapping(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            COLUMN_MAPPING_PROTOCOL_JSON,
+            MAP_KEY_VALUE_COLUMN_MAPPING_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![map_key_value_column_mapping_batch()?],
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
+    /// Creates a local Delta table whose map key list element struct children
+    /// are stored in a different order from the Delta schema.
+    pub(crate) fn new_with_reordered_map_list_key_struct_fields(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            MAP_LIST_KEY_ATTRIBUTES_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![map_list_key_attributes_batch()?],
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
+    /// Creates a local Delta table whose nested map key struct children are
+    /// stored in a different order from the Delta schema.
+    pub(crate) fn new_with_reordered_nested_map_key_struct_fields(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            NESTED_MAP_KEY_ATTRIBUTES_METADATA_JSON,
+            vec![RealParquetDataFile {
+                path: DATA_FILE.to_owned(),
+                batches: vec![nested_map_key_attributes_batch()?],
+                stats: AddStats {
+                    rows: 3,
+                    max_id: 3,
+                    min_customer: "alice".to_owned(),
+                    max_customer: "bob".to_owned(),
+                    customer_null_count: 1,
+                },
+                partition_values_json: "{}".to_owned(),
+                deletion_vector: None,
+            }],
+        )
+    }
+
     /// Creates a local Delta table whose log schema has a nullable column that
     /// is absent from the older Parquet data file.
     pub(crate) fn new_with_missing_nullable_column(
@@ -1026,6 +1105,157 @@ fn map_column_mapping_schema() -> Arc<Schema> {
     ]))
 }
 
+fn map_key_value_column_mapping_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("phys_id", DataType::Int32, false).with_metadata(field_id_metadata(1)),
+        Field::new("phys_customer_name", DataType::Utf8, true).with_metadata(field_id_metadata(2)),
+        Field::new(
+            "phys_attributes",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(
+                        vec![
+                            Field::new(
+                                "key",
+                                DataType::Struct(
+                                    vec![
+                                        Field::new("stale_key_zip", DataType::Int32, true)
+                                            .with_metadata(field_id_metadata(7)),
+                                        Field::new("stale_key_city", DataType::Utf8, true)
+                                            .with_metadata(field_id_metadata(6)),
+                                    ]
+                                    .into(),
+                                ),
+                                false,
+                            )
+                            .with_metadata(field_id_metadata(4)),
+                            Field::new(
+                                "value",
+                                DataType::Struct(
+                                    vec![
+                                        Field::new("stale_value_score", DataType::Int32, true)
+                                            .with_metadata(field_id_metadata(9)),
+                                        Field::new("stale_value_label", DataType::Utf8, true)
+                                            .with_metadata(field_id_metadata(8)),
+                                    ]
+                                    .into(),
+                                ),
+                                true,
+                            )
+                            .with_metadata(field_id_metadata(5)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        )
+        .with_metadata(field_id_metadata(3)),
+    ]))
+}
+
+fn map_list_key_attributes_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("customer_name", DataType::Utf8, true),
+        Field::new(
+            "attributes",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(
+                        vec![
+                            Field::new(
+                                "key",
+                                DataType::List(Arc::new(Field::new(
+                                    "element",
+                                    DataType::Struct(
+                                        vec![
+                                            Field::new("city", DataType::Utf8, true),
+                                            Field::new("zip", DataType::Int32, true),
+                                        ]
+                                        .into(),
+                                    ),
+                                    true,
+                                ))),
+                                false,
+                            ),
+                            Field::new("value", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        ),
+    ]))
+}
+
+fn nested_map_key_attributes_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("customer_name", DataType::Utf8, true),
+        Field::new(
+            "attributes",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(
+                        vec![
+                            Field::new(
+                                "key",
+                                DataType::Map(
+                                    Arc::new(Field::new(
+                                        "key_value",
+                                        DataType::Struct(
+                                            vec![
+                                                Field::new(
+                                                    "key",
+                                                    DataType::Struct(
+                                                        vec![
+                                                            Field::new(
+                                                                "city",
+                                                                DataType::Utf8,
+                                                                true,
+                                                            ),
+                                                            Field::new(
+                                                                "zip",
+                                                                DataType::Int32,
+                                                                true,
+                                                            ),
+                                                        ]
+                                                        .into(),
+                                                    ),
+                                                    false,
+                                                ),
+                                                Field::new("value", DataType::Int32, true),
+                                            ]
+                                            .into(),
+                                        ),
+                                        false,
+                                    )),
+                                    false,
+                                ),
+                                false,
+                            ),
+                            Field::new("value", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        ),
+    ]))
+}
+
 fn reordered_physical_columns_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("customer_name", DataType::Utf8, true),
@@ -1349,6 +1579,278 @@ fn map_column_mapping_batch() -> Result<kernel::RecordBatch, Box<dyn std::error:
 
     Ok(kernel::RecordBatch::try_new(
         map_column_mapping_schema(),
+        columns,
+    )?)
+}
+
+fn map_key_value_column_mapping_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let key_field = Field::new(
+        "key",
+        DataType::Struct(
+            vec![
+                Field::new("stale_key_zip", DataType::Int32, true)
+                    .with_metadata(field_id_metadata(7)),
+                Field::new("stale_key_city", DataType::Utf8, true)
+                    .with_metadata(field_id_metadata(6)),
+            ]
+            .into(),
+        ),
+        false,
+    )
+    .with_metadata(field_id_metadata(4));
+    let value_field = Field::new(
+        "value",
+        DataType::Struct(
+            vec![
+                Field::new("stale_value_score", DataType::Int32, true)
+                    .with_metadata(field_id_metadata(9)),
+                Field::new("stale_value_label", DataType::Utf8, true)
+                    .with_metadata(field_id_metadata(8)),
+            ]
+            .into(),
+        ),
+        true,
+    )
+    .with_metadata(field_id_metadata(5));
+    let key_array = Arc::new(StructArray::from(vec![
+        (
+            Arc::new(
+                Field::new("stale_key_zip", DataType::Int32, true)
+                    .with_metadata(field_id_metadata(7)),
+            ),
+            Arc::new(Int32Array::from(vec![Some(94110), Some(10001), None])) as ArrayRef,
+        ),
+        (
+            Arc::new(
+                Field::new("stale_key_city", DataType::Utf8, true)
+                    .with_metadata(field_id_metadata(6)),
+            ),
+            Arc::new(StringArray::from(vec![
+                Some("san francisco"),
+                Some("new york"),
+                Some("phoenix"),
+            ])) as ArrayRef,
+        ),
+    ])) as ArrayRef;
+    let value_array = Arc::new(StructArray::from(vec![
+        (
+            Arc::new(
+                Field::new("stale_value_score", DataType::Int32, true)
+                    .with_metadata(field_id_metadata(9)),
+            ),
+            Arc::new(Int32Array::from(vec![Some(7), Some(8), Some(9)])) as ArrayRef,
+        ),
+        (
+            Arc::new(
+                Field::new("stale_value_label", DataType::Utf8, true)
+                    .with_metadata(field_id_metadata(8)),
+            ),
+            Arc::new(StringArray::from(vec![
+                Some("home"),
+                Some("work"),
+                Some("mailing"),
+            ])) as ArrayRef,
+        ),
+    ])) as ArrayRef;
+    let entries = StructArray::new(
+        vec![Arc::new(key_field.clone()), Arc::new(value_field.clone())].into(),
+        vec![key_array, value_array],
+        None,
+    );
+    let attributes = MapArray::try_new(
+        Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(vec![key_field, value_field].into()),
+            false,
+        )),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 3])),
+        entries,
+        None,
+        false,
+    )?;
+    let columns = vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
+        Arc::new(attributes) as Arc<dyn Array>,
+    ];
+
+    Ok(kernel::RecordBatch::try_new(
+        map_key_value_column_mapping_schema(),
+        columns,
+    )?)
+}
+
+fn map_list_key_attributes_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let element_field = Field::new(
+        "element",
+        DataType::Struct(
+            vec![
+                Field::new("city", DataType::Utf8, true),
+                Field::new("zip", DataType::Int32, true),
+            ]
+            .into(),
+        ),
+        true,
+    );
+    let key_field = Field::new(
+        "key",
+        DataType::List(Arc::new(element_field.clone())),
+        false,
+    );
+    let value_field = Field::new("value", DataType::Utf8, true);
+    let key_element_array = Arc::new(StructArray::from(vec![
+        (
+            Arc::new(Field::new("city", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![
+                Some("san francisco"),
+                Some("new york"),
+                Some("phoenix"),
+            ])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("zip", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![Some(94110), Some(10001), None])) as ArrayRef,
+        ),
+    ])) as ArrayRef;
+    let key_array = Arc::new(ListArray::try_new(
+        Arc::new(element_field),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 3])),
+        key_element_array,
+        None,
+    )?) as ArrayRef;
+    let entries = StructArray::new(
+        vec![Arc::new(key_field.clone()), Arc::new(value_field.clone())].into(),
+        vec![
+            key_array,
+            Arc::new(StringArray::from(vec![
+                Some("home"),
+                Some("work"),
+                Some("mailing"),
+            ])) as ArrayRef,
+        ],
+        None,
+    );
+    let attributes = MapArray::try_new(
+        Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(vec![key_field, value_field].into()),
+            false,
+        )),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 3])),
+        entries,
+        None,
+        false,
+    )?;
+    let columns = vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
+        Arc::new(attributes) as Arc<dyn Array>,
+    ];
+
+    Ok(kernel::RecordBatch::try_new(
+        map_list_key_attributes_schema(),
+        columns,
+    )?)
+}
+
+fn nested_map_key_attributes_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let inner_key_field = Field::new(
+        "key",
+        DataType::Struct(
+            vec![
+                Field::new("city", DataType::Utf8, true),
+                Field::new("zip", DataType::Int32, true),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    let inner_value_field = Field::new("value", DataType::Int32, true);
+    let outer_key_field = Field::new(
+        "key",
+        DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(vec![inner_key_field.clone(), inner_value_field.clone()].into()),
+                false,
+            )),
+            false,
+        ),
+        false,
+    );
+    let outer_value_field = Field::new("value", DataType::Utf8, true);
+    let inner_key_array = Arc::new(StructArray::from(vec![
+        (
+            Arc::new(Field::new("city", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![
+                Some("san francisco"),
+                Some("new york"),
+                Some("phoenix"),
+            ])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("zip", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![Some(94110), Some(10001), None])) as ArrayRef,
+        ),
+    ])) as ArrayRef;
+    let inner_entries = StructArray::new(
+        vec![
+            Arc::new(inner_key_field.clone()),
+            Arc::new(inner_value_field.clone()),
+        ]
+        .into(),
+        vec![
+            inner_key_array,
+            Arc::new(Int32Array::from(vec![Some(7), Some(8), Some(9)])) as ArrayRef,
+        ],
+        None,
+    );
+    let outer_key_array = Arc::new(MapArray::try_new(
+        Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(vec![inner_key_field, inner_value_field].into()),
+            false,
+        )),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 3])),
+        inner_entries,
+        None,
+        false,
+    )?) as ArrayRef;
+    let outer_entries = StructArray::new(
+        vec![
+            Arc::new(outer_key_field.clone()),
+            Arc::new(outer_value_field.clone()),
+        ]
+        .into(),
+        vec![
+            outer_key_array,
+            Arc::new(StringArray::from(vec![
+                Some("home"),
+                Some("work"),
+                Some("mailing"),
+            ])) as ArrayRef,
+        ],
+        None,
+    );
+    let attributes = MapArray::try_new(
+        Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(vec![outer_key_field, outer_value_field].into()),
+            false,
+        )),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 3])),
+        outer_entries,
+        None,
+        false,
+    )?;
+    let columns = vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
+        Arc::new(attributes) as Arc<dyn Array>,
+    ];
+
+    Ok(kernel::RecordBatch::try_new(
+        nested_map_key_attributes_schema(),
         columns,
     )?)
 }
