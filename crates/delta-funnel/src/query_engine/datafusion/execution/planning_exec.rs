@@ -2245,6 +2245,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_deletion_vector_handles_sparse_deleted_row_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_rows_and_deletion_vector(
+            "native-async-dv-sparse-deleted-row-indexes",
+            40_000,
+            &[0, 19_999, 39_999],
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select id from orders order by id";
+        let (official, _official_stats) = collect_batches_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let (native, native_stats) = collect_batches_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+        let official_ids = collect_batch_ids(&official)?;
+        let native_ids = collect_batch_ids(&native)?;
+
+        assert_eq!(native_ids, official_ids);
+        assert_eq!(native_ids.len(), 39_997);
+        assert!(!native_ids.contains(&1));
+        assert!(!native_ids.contains(&20_000));
+        assert!(!native_ids.contains(&40_000));
+        assert!(native.iter().all(|batch| {
+            let schema = batch.schema();
+            schema.fields().len() == 1 && schema.field(0).name() == "id"
+        }));
+        assert_eq!(native_stats.rows_produced, 39_997);
+        assert_eq!(native_stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(native_stats.deletion_vectors_applied, 1);
+        assert_eq!(native_stats.deletion_vector_rows_deleted, 3);
+        assert_eq!(native_stats.deletion_vector_failures, 0);
+        assert_eq!(native_stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_deletion_vector_preserves_all_live_rows()
     -> Result<(), Box<dyn std::error::Error>> {
         let table =
