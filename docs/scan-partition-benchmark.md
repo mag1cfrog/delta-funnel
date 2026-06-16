@@ -1,7 +1,7 @@
 # Scan Partition Benchmark
 
-`delta_scan_partition_bench` is a portable benchmark runner for the Delta
-DataFusion scan partition target policy. Its default mode is the deterministic
+`delta_scan_partition_bench` is a portable benchmark runner for DeltaFunnel
+scan planning and provider execution. Its default mode is the deterministic
 synthetic matrix.
 
 The production policy is documented in
@@ -42,6 +42,29 @@ in-process scheduler probe before feeding the host profile through the same
 production diagnostic target policy. It does not run local IO probes unless
 explicitly requested.
 
+Run the real provider execution benchmark:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode provider-exec \
+  --provider-exec-repetitions 3 \
+  --output target/delta-provider-exec-bench.csv
+```
+
+Provider-exec mode creates temporary local Delta tables with Parquet data,
+loads them through `load_delta_source`, registers them through production
+DataFusion provider registration, selects the requested provider backend through
+`DeltaProviderScanExecutionOptions`, runs DataFusion SQL, and collects real
+provider execution output. It does not use a benchmark-only reader path.
+
+The initial provider-exec matrix compares the official kernel backend against
+the native async backend with lazy scheduling on non-DV workloads. It covers a
+many-small-files shape and a fewer-larger-files shape, each with a projection
+query and a count-style query. Later #161 slices should extend this same mode
+with DV-backed workloads, DV physical predicate workloads, and any bounded
+prefetch or admission scheduling variant that exists in the production native
+execution path.
+
 Run the opt-in local IO read probe:
 
 ```bash
@@ -68,9 +91,11 @@ cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
 ```
 
 The default seed is `0`. The seed affects deterministic simulated work jitter.
-It does not change workload file shapes or policy target derivation.
+It does not change workload file shapes or policy target derivation. In
+provider-exec mode the seed is recorded for run metadata, but the initial local
+Delta workload shapes are deterministic.
 
-## Matrix
+## Synthetic Matrix
 
 The default matrix currently covers:
 
@@ -187,6 +212,40 @@ Important field groups:
   - `host_local_io_probe_latency_micros`
   - `host_local_io_probe_throughput_bytes_per_second`
 
+Provider-exec mode writes a provider execution CSV with a separate header. Its
+important field groups are:
+
+- Run metadata:
+  - `benchmark_schema_version`
+  - `benchmark_mode`
+  - `host_os`
+  - `host_arch`
+  - `host_available_parallelism`
+  - `seed`
+- Workload and execution shape:
+  - `workload_case`
+  - `query_case`
+  - `reader_backend`
+  - `scheduling_mode`
+  - `repetitions`
+  - `file_count`
+  - `row_count`
+  - `data_file_bytes`
+- Output shape:
+  - `produced_rows`
+  - `produced_batches`
+- Latency and throughput:
+  - `planning_micros_p50`, `planning_micros_p95`, `planning_micros_p99`
+  - `time_to_first_batch_micros_p50`, `time_to_first_batch_micros_p95`,
+    `time_to_first_batch_micros_p99`
+  - `total_micros_p50`, `total_micros_p95`, `total_micros_p99`
+  - `source_rows_per_second_p50`, `source_rows_per_second_p95`,
+    `source_rows_per_second_p99`
+  - `batch_latency_micros_p50`, `batch_latency_micros_p95`,
+    `batch_latency_micros_p99`
+  - `min_total_micros`
+  - `max_total_micros`
+
 `partition_work_imbalance_basis_points` is:
 
 ```text
@@ -235,6 +294,10 @@ parallelism, memory hints, Unix fd limit status when available, and a bounded
 local scheduler probe. Local IO probing is opt-in and bounded. Host-probe mode
 does not run network or stress probes.
 
-It is still not a production read benchmark. It does not measure real Parquet
-decoding, Arrow batch memory, object-store request behavior, or DataFusion
-runtime scheduling. Those belong to later read execution work.
+Provider-exec mode is the production read benchmark path. It measures real
+temporary local Delta tables, Parquet decoding, Arrow batch production, provider
+backend selection, DataFusion SQL planning, and DataFusion collection. The
+initial provider-exec mode is local-file based and does not yet inject
+object-store latency, expose bounded prefetch/admission, or cover DV workloads.
+Those belong to later #161 slices and must still use production provider
+execution paths.

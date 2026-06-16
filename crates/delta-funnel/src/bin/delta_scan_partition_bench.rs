@@ -6,18 +6,28 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Days, NaiveDate};
+use datafusion::arrow::array::{ArrayRef, Int32Array, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::prelude::SessionContext;
 use delta_funnel::{
+    DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
-    DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
-    delta_scan_partition_target_local_environment_diagnostic,
-    derive_delta_scan_partition_target_diagnostic,
+    DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaSourceConfig,
+    DeltaTableProviderConfig, delta_scan_partition_target_local_environment_diagnostic,
+    derive_delta_scan_partition_target_diagnostic, load_delta_source, preflight_delta_protocol,
+    register_delta_sources_with_scan_execution_options,
 };
+use futures_util::StreamExt;
+use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
 
 const MIB: u64 = 1024 * 1024;
 const BENCHMARK_FD_PER_PARTITION_CANDIDATES: [usize; 4] = [4, 8, 16, 32];
@@ -32,8 +42,14 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 9;
+const BENCHMARK_SCHEMA_VERSION: u32 = 10;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
+const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
+const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
+const PROVIDER_EXEC_MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
+const PROVIDER_EXEC_PROTOCOL_JSON: &str =
+    r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+const PROVIDER_EXEC_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-provider-exec-benchmark","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "benchmark_schema_version",
     "benchmark_mode",
@@ -116,6 +132,42 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
+const PROVIDER_EXEC_CSV_HEADER: [&str; 34] = [
+    "benchmark_schema_version",
+    "benchmark_mode",
+    "host_os",
+    "host_arch",
+    "host_available_parallelism",
+    "seed",
+    "workload_case_count",
+    "workload_case",
+    "query_case",
+    "reader_backend",
+    "scheduling_mode",
+    "repetitions",
+    "file_count",
+    "row_count",
+    "data_file_bytes",
+    "produced_rows",
+    "produced_batches",
+    "planning_micros_p50",
+    "planning_micros_p95",
+    "planning_micros_p99",
+    "time_to_first_batch_micros_p50",
+    "time_to_first_batch_micros_p95",
+    "time_to_first_batch_micros_p99",
+    "total_micros_p50",
+    "total_micros_p95",
+    "total_micros_p99",
+    "source_rows_per_second_p50",
+    "source_rows_per_second_p95",
+    "source_rows_per_second_p99",
+    "batch_latency_micros_p50",
+    "batch_latency_micros_p95",
+    "batch_latency_micros_p99",
+    "min_total_micros",
+    "max_total_micros",
+];
 
 fn main() -> Result<(), Box<dyn Error>> {
     let config = BenchmarkRunnerConfig::parse(env::args_os().skip(1))?;
@@ -145,6 +197,9 @@ fn write_benchmark_csv(
         BenchmarkMode::Synthetic => write_synthetic_benchmark_csv(output, config.seed),
         BenchmarkMode::HostProbe => {
             write_host_probe_benchmark_csv(output, config.seed, &config.host_probe_local_io)
+        }
+        BenchmarkMode::ProviderExec => {
+            write_provider_exec_benchmark_csv(output, config.seed, &config.provider_exec)
         }
     }
 }
@@ -224,10 +279,68 @@ fn write_host_probe_benchmark_csv(
     Ok(())
 }
 
+fn write_provider_exec_benchmark_csv(
+    output: &mut impl Write,
+    seed: u64,
+    config: &ProviderExecConfig,
+) -> Result<(), Box<dyn Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(write_provider_exec_benchmark_csv_async(
+        output, seed, config,
+    ))
+}
+
+async fn write_provider_exec_benchmark_csv_async(
+    output: &mut impl Write,
+    seed: u64,
+    config: &ProviderExecConfig,
+) -> Result<(), Box<dyn Error>> {
+    let run_environment = BenchmarkRunEnvironment::local();
+    let workloads = ProviderExecWorkloadCase::standard_cases();
+    let query_cases = ProviderExecQueryCase::standard_cases();
+    let backends = [
+        DeltaProviderReaderBackend::OfficialKernel,
+        DeltaProviderReaderBackend::NativeAsync,
+    ];
+    let temp_root = config.temp_dir.clone().unwrap_or_else(env::temp_dir);
+
+    writeln!(output, "{}", PROVIDER_EXEC_CSV_HEADER.join(","))?;
+    for workload in &workloads {
+        let table = ProviderExecDeltaTable::create(&temp_root, workload)?;
+        for query in query_cases {
+            for backend in backends {
+                let summary =
+                    run_provider_exec_benchmark_case(&table, workload, query, backend, config)
+                        .await?;
+                writeln!(
+                    output,
+                    "{}",
+                    provider_exec_csv_row(ProviderExecCsvRowInput {
+                        run_environment,
+                        seed,
+                        workload_case_count: workloads.len(),
+                        table: &table,
+                        workload,
+                        query,
+                        backend,
+                        summary: &summary,
+                    })
+                    .join(",")
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn print_usage(mut output: impl Write) -> io::Result<()> {
     writeln!(
         output,
-        "Usage: delta_scan_partition_bench [--mode <synthetic|host-probe>] [--output <path>] [--seed <u64>]"
+        "Usage: delta_scan_partition_bench [--mode <synthetic|host-probe|provider-exec>] [--output <path>] [--seed <u64>]"
     )?;
     writeln!(output)?;
     writeln!(
@@ -243,6 +356,10 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
         output,
         "Use --host-probe-local-io with host-probe mode to run the opt-in local IO read probe."
     )?;
+    writeln!(
+        output,
+        "Use --provider-exec-repetitions <n> with provider-exec mode to choose repeated runs."
+    )?;
     writeln!(output, "The default seed is {DEFAULT_BENCHMARK_SEED}.")?;
     Ok(())
 }
@@ -252,6 +369,7 @@ struct BenchmarkRunnerConfig {
     output_path: Option<PathBuf>,
     mode: BenchmarkMode,
     host_probe_local_io: HostProbeLocalIoConfig,
+    provider_exec: ProviderExecConfig,
     seed: u64,
     show_help: bool,
 }
@@ -264,10 +382,17 @@ struct HostProbeLocalIoConfig {
     repetitions: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderExecConfig {
+    repetitions: usize,
+    temp_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkMode {
     Synthetic,
     HostProbe,
+    ProviderExec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +401,73 @@ struct BenchmarkRunEnvironment {
     host_os: &'static str,
     host_arch: &'static str,
     available_parallelism: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderExecWorkloadCase {
+    name: &'static str,
+    file_count: usize,
+    rows_per_file: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderExecQueryCase {
+    name: &'static str,
+    sql: &'static str,
+}
+
+struct ProviderExecDeltaTable {
+    path: PathBuf,
+    file_count: usize,
+    row_count: usize,
+    data_file_bytes: u64,
+}
+
+impl Drop for ProviderExecDeltaTable {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+struct ProviderExecRunMeasurement {
+    planning_micros: u64,
+    time_to_first_batch_micros: u64,
+    total_micros: u64,
+    source_rows_per_second: u64,
+    produced_rows: usize,
+    produced_batches: usize,
+    batch_latency_micros: Vec<u64>,
+}
+
+struct ProviderExecSummary {
+    repetitions: usize,
+    produced_rows: usize,
+    produced_batches: usize,
+    planning_micros: PercentileSummary,
+    time_to_first_batch_micros: PercentileSummary,
+    total_micros: PercentileSummary,
+    source_rows_per_second: PercentileSummary,
+    batch_latency_micros: PercentileSummary,
+    min_total_micros: u64,
+    max_total_micros: u64,
+}
+
+struct ProviderExecCsvRowInput<'a> {
+    run_environment: BenchmarkRunEnvironment,
+    seed: u64,
+    workload_case_count: usize,
+    table: &'a ProviderExecDeltaTable,
+    workload: &'a ProviderExecWorkloadCase,
+    query: ProviderExecQueryCase,
+    backend: DeltaProviderReaderBackend,
+    summary: &'a ProviderExecSummary,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PercentileSummary {
+    p50: u64,
+    p95: u64,
+    p99: u64,
 }
 
 impl BenchmarkRunnerConfig {
@@ -287,6 +479,7 @@ impl BenchmarkRunnerConfig {
         let mut output_path = None;
         let mut mode = BenchmarkMode::Synthetic;
         let mut host_probe_local_io = HostProbeLocalIoConfig::default();
+        let mut provider_exec = ProviderExecConfig::default();
         let mut mode_seen = false;
         let mut seed = DEFAULT_BENCHMARK_SEED;
         let mut show_help = false;
@@ -348,6 +541,28 @@ impl BenchmarkRunnerConfig {
                 })?;
                 validate_host_probe_io_repetitions(repetitions)?;
                 host_probe_local_io.repetitions = repetitions;
+            } else if arg == "--provider-exec-temp-dir" {
+                let path = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingProviderExecTempDir)?;
+                if provider_exec
+                    .temp_dir
+                    .replace(PathBuf::from(path))
+                    .is_some()
+                {
+                    return Err(BenchmarkRunnerConfigError::DuplicateProviderExecTempDir);
+                }
+            } else if arg == "--provider-exec-repetitions" {
+                let value = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingProviderExecRepetitions)?;
+                let repetitions = value.to_string_lossy().parse::<usize>().map_err(|_| {
+                    BenchmarkRunnerConfigError::InvalidProviderExecRepetitions(
+                        value.to_string_lossy().into(),
+                    )
+                })?;
+                validate_provider_exec_repetitions(repetitions)?;
+                provider_exec.repetitions = repetitions;
             } else if arg == "--seed" {
                 let value = args.next().ok_or(BenchmarkRunnerConfigError::MissingSeed)?;
                 seed = value.to_string_lossy().parse().map_err(|_| {
@@ -364,6 +579,7 @@ impl BenchmarkRunnerConfig {
             output_path,
             mode,
             host_probe_local_io,
+            provider_exec,
             seed,
             show_help,
         })
@@ -377,6 +593,15 @@ impl Default for HostProbeLocalIoConfig {
             temp_dir: None,
             bytes_per_repetition: HOST_PROBE_DEFAULT_LOCAL_IO_BYTES,
             repetitions: HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS,
+        }
+    }
+}
+
+impl Default for ProviderExecConfig {
+    fn default() -> Self {
+        Self {
+            repetitions: DEFAULT_PROVIDER_EXEC_REPETITIONS,
+            temp_dir: None,
         }
     }
 }
@@ -401,11 +626,22 @@ fn validate_host_probe_io_repetitions(
     Ok(())
 }
 
+fn validate_provider_exec_repetitions(
+    repetitions: usize,
+) -> Result<(), BenchmarkRunnerConfigError> {
+    if repetitions == 0 || repetitions > MAX_PROVIDER_EXEC_REPETITIONS {
+        return Err(BenchmarkRunnerConfigError::ProviderExecRepetitionsOutOfRange(repetitions));
+    }
+
+    Ok(())
+}
+
 impl BenchmarkMode {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "synthetic" => Some(Self::Synthetic),
             "host-probe" | "host_probe" => Some(Self::HostProbe),
+            "provider-exec" | "provider_exec" => Some(Self::ProviderExec),
             _ => None,
         }
     }
@@ -414,6 +650,7 @@ impl BenchmarkMode {
         match self {
             Self::Synthetic => "synthetic",
             Self::HostProbe => "host_probe",
+            Self::ProviderExec => "provider_exec",
         }
     }
 }
@@ -427,6 +664,354 @@ impl BenchmarkRunEnvironment {
             available_parallelism: local_available_parallelism(),
         }
     }
+}
+
+impl ProviderExecWorkloadCase {
+    fn standard_cases() -> Vec<Self> {
+        vec![
+            Self {
+                name: "provider_many_small_files",
+                file_count: 64,
+                rows_per_file: 128,
+            },
+            Self {
+                name: "provider_few_larger_files",
+                file_count: 4,
+                rows_per_file: 8_192,
+            },
+        ]
+    }
+
+    fn row_count(self) -> usize {
+        self.file_count.saturating_mul(self.rows_per_file)
+    }
+}
+
+impl ProviderExecQueryCase {
+    fn standard_cases() -> [Self; 2] {
+        [
+            Self {
+                name: "project_id",
+                sql: "select id from orders",
+            },
+            Self {
+                name: "count_rows",
+                sql: "select count(id) from orders",
+            },
+        ]
+    }
+}
+
+impl ProviderExecDeltaTable {
+    fn create(
+        temp_root: &std::path::Path,
+        workload: &ProviderExecWorkloadCase,
+    ) -> Result<Self, Box<dyn Error>> {
+        let path = temp_root.join(unique_benchmark_name(workload.name)?);
+        let log_path = path.join("_delta_log");
+        fs::create_dir_all(&log_path)?;
+
+        let schema = provider_exec_arrow_schema();
+        let mut add_actions = Vec::with_capacity(workload.file_count);
+        let mut data_file_bytes = 0_u64;
+        let mut next_id = 1_usize;
+
+        for file_index in 0..workload.file_count {
+            let file_path = format!("part-{file_index:05}.parquet");
+            let first_id = next_id;
+            let batch =
+                provider_exec_record_batch(Arc::clone(&schema), first_id, workload.rows_per_file)?;
+            next_id = next_id.saturating_add(workload.rows_per_file);
+            let writer_properties = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(workload.rows_per_file))
+                .build();
+            let mut writer = ArrowWriter::try_new(
+                File::create(path.join(&file_path))?,
+                Arc::clone(&schema),
+                Some(writer_properties),
+            )?;
+            writer.write(&batch)?;
+            writer.close()?;
+
+            let file_size = fs::metadata(path.join(&file_path))?.len();
+            data_file_bytes = data_file_bytes.saturating_add(file_size);
+            add_actions.push(provider_exec_add_json(
+                &file_path,
+                file_size,
+                first_id,
+                workload.rows_per_file,
+            )?);
+        }
+
+        fs::write(
+            log_path.join("00000000000000000000.json"),
+            format!("{PROVIDER_EXEC_PROTOCOL_JSON}\n{PROVIDER_EXEC_METADATA_JSON}\n"),
+        )?;
+        fs::write(
+            log_path.join("00000000000000000001.json"),
+            format!("{}\n", add_actions.join("\n")),
+        )?;
+
+        Ok(Self {
+            path,
+            file_count: workload.file_count,
+            row_count: workload.row_count(),
+            data_file_bytes,
+        })
+    }
+}
+
+async fn run_provider_exec_benchmark_case(
+    table: &ProviderExecDeltaTable,
+    _workload: &ProviderExecWorkloadCase,
+    query: ProviderExecQueryCase,
+    backend: DeltaProviderReaderBackend,
+    config: &ProviderExecConfig,
+) -> Result<ProviderExecSummary, Box<dyn Error>> {
+    let mut measurements = Vec::with_capacity(config.repetitions);
+    for _ in 0..config.repetitions {
+        measurements.push(run_provider_exec_once(table, query, backend).await?);
+    }
+
+    Ok(provider_exec_summary(&measurements))
+}
+
+async fn run_provider_exec_once(
+    table: &ProviderExecDeltaTable,
+    query: ProviderExecQueryCase,
+    backend: DeltaProviderReaderBackend,
+) -> Result<ProviderExecRunMeasurement, Box<dyn Error>> {
+    let ctx = SessionContext::new();
+    let source = load_delta_source(DeltaSourceConfig::new(
+        "orders",
+        table.path.to_string_lossy().to_string(),
+    ))?;
+    let protocol = preflight_delta_protocol(&source)?;
+    let execution_options =
+        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(backend, 1, 1)?;
+    register_delta_sources_with_scan_execution_options(
+        &ctx,
+        vec![DeltaTableProviderConfig {
+            source,
+            protocol,
+            scan_target_partitions: Some(1),
+        }],
+        execution_options,
+    )?;
+
+    let query_started = Instant::now();
+    let planning_started = Instant::now();
+    let dataframe = ctx.sql(query.sql).await?;
+    let physical_plan = dataframe.create_physical_plan().await?;
+    let planning_micros = u128_to_u64_saturating(planning_started.elapsed().as_micros());
+    let execution_started = Instant::now();
+    let mut stream = datafusion::physical_plan::execute_stream(physical_plan, ctx.task_ctx())?;
+    let mut produced_rows = 0_usize;
+    let mut produced_batches = 0_usize;
+    let mut first_batch_micros = None;
+    let mut batch_latency_micros = Vec::new();
+    let mut previous_batch_at = execution_started;
+
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let now = Instant::now();
+        if first_batch_micros.is_none() {
+            first_batch_micros = Some(u128_to_u64_saturating(
+                now.duration_since(execution_started).as_micros(),
+            ));
+        }
+        batch_latency_micros.push(u128_to_u64_saturating(
+            now.duration_since(previous_batch_at).as_micros(),
+        ));
+        previous_batch_at = now;
+        produced_rows = produced_rows.saturating_add(batch.num_rows());
+        produced_batches = produced_batches.saturating_add(1);
+    }
+
+    let total_micros = u128_to_u64_saturating(query_started.elapsed().as_micros()).max(1);
+    let source_rows_per_second = u128_to_u64_saturating(
+        (table.row_count as u128).saturating_mul(1_000_000) / u128::from(total_micros),
+    );
+
+    Ok(ProviderExecRunMeasurement {
+        planning_micros,
+        time_to_first_batch_micros: first_batch_micros.unwrap_or(0),
+        total_micros,
+        source_rows_per_second,
+        produced_rows,
+        produced_batches,
+        batch_latency_micros,
+    })
+}
+
+fn provider_exec_summary(measurements: &[ProviderExecRunMeasurement]) -> ProviderExecSummary {
+    let produced_rows = measurements
+        .iter()
+        .map(|measurement| measurement.produced_rows)
+        .max()
+        .unwrap_or(0);
+    let produced_batches = measurements
+        .iter()
+        .map(|measurement| measurement.produced_batches)
+        .max()
+        .unwrap_or(0);
+    let total_micros = measurements
+        .iter()
+        .map(|measurement| measurement.total_micros)
+        .collect::<Vec<_>>();
+    let batch_latency_micros = measurements
+        .iter()
+        .flat_map(|measurement| measurement.batch_latency_micros.iter().copied())
+        .collect::<Vec<_>>();
+
+    ProviderExecSummary {
+        repetitions: measurements.len(),
+        produced_rows,
+        produced_batches,
+        planning_micros: percentile_summary(
+            &measurements
+                .iter()
+                .map(|measurement| measurement.planning_micros)
+                .collect::<Vec<_>>(),
+        ),
+        time_to_first_batch_micros: percentile_summary(
+            &measurements
+                .iter()
+                .map(|measurement| measurement.time_to_first_batch_micros)
+                .collect::<Vec<_>>(),
+        ),
+        total_micros: percentile_summary(&total_micros),
+        source_rows_per_second: percentile_summary(
+            &measurements
+                .iter()
+                .map(|measurement| measurement.source_rows_per_second)
+                .collect::<Vec<_>>(),
+        ),
+        batch_latency_micros: percentile_summary(&batch_latency_micros),
+        min_total_micros: total_micros.iter().copied().min().unwrap_or(0),
+        max_total_micros: total_micros.iter().copied().max().unwrap_or(0),
+    }
+}
+
+fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
+    let summary = input.summary;
+    vec![
+        input.run_environment.schema_version.to_string(),
+        BenchmarkMode::ProviderExec.as_csv_value().to_owned(),
+        input.run_environment.host_os.to_owned(),
+        input.run_environment.host_arch.to_owned(),
+        optional_usize(input.run_environment.available_parallelism),
+        input.seed.to_string(),
+        input.workload_case_count.to_string(),
+        input.workload.name.to_owned(),
+        input.query.name.to_owned(),
+        provider_exec_backend_name(input.backend).to_owned(),
+        "lazy".to_owned(),
+        summary.repetitions.to_string(),
+        input.table.file_count.to_string(),
+        input.table.row_count.to_string(),
+        input.table.data_file_bytes.to_string(),
+        summary.produced_rows.to_string(),
+        summary.produced_batches.to_string(),
+        summary.planning_micros.p50.to_string(),
+        summary.planning_micros.p95.to_string(),
+        summary.planning_micros.p99.to_string(),
+        summary.time_to_first_batch_micros.p50.to_string(),
+        summary.time_to_first_batch_micros.p95.to_string(),
+        summary.time_to_first_batch_micros.p99.to_string(),
+        summary.total_micros.p50.to_string(),
+        summary.total_micros.p95.to_string(),
+        summary.total_micros.p99.to_string(),
+        summary.source_rows_per_second.p50.to_string(),
+        summary.source_rows_per_second.p95.to_string(),
+        summary.source_rows_per_second.p99.to_string(),
+        summary.batch_latency_micros.p50.to_string(),
+        summary.batch_latency_micros.p95.to_string(),
+        summary.batch_latency_micros.p99.to_string(),
+        summary.min_total_micros.to_string(),
+        summary.max_total_micros.to_string(),
+    ]
+}
+
+fn provider_exec_backend_name(backend: DeltaProviderReaderBackend) -> &'static str {
+    match backend {
+        DeltaProviderReaderBackend::OfficialKernel => "official_kernel",
+        DeltaProviderReaderBackend::NativeAsync => "native_async",
+    }
+}
+
+fn provider_exec_arrow_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("customer_name", DataType::Utf8, true),
+    ]))
+}
+
+fn provider_exec_record_batch(
+    schema: SchemaRef,
+    first_id: usize,
+    rows: usize,
+) -> Result<RecordBatch, Box<dyn Error>> {
+    let first_id_i32 = i32::try_from(first_id)?;
+    let row_count = i32::try_from(rows)?;
+    let ids = (first_id_i32..first_id_i32 + row_count).collect::<Vec<_>>();
+    let names = (0..rows)
+        .map(|offset| Some(format!("customer-{}", first_id.saturating_add(offset))))
+        .collect::<Vec<_>>();
+    let columns = vec![
+        Arc::new(Int32Array::from(ids)) as ArrayRef,
+        Arc::new(StringArray::from(names)) as ArrayRef,
+    ];
+
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+fn provider_exec_add_json(
+    path: &str,
+    size: u64,
+    first_id: usize,
+    rows: usize,
+) -> Result<String, Box<dyn Error>> {
+    let max_id = first_id.saturating_add(rows).saturating_sub(1);
+    let min_id = i32::try_from(first_id)?;
+    let max_id = i32::try_from(max_id)?;
+    let min_customer = format!("customer-{first_id}");
+    let max_customer = format!("customer-{max_id}");
+    Ok(format!(
+        r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":{PROVIDER_EXEC_MODIFICATION_TIME_MS},"dataChange":true,"stats":"{{\"numRecords\":{rows},\"minValues\":{{\"id\":{min_id},\"customer_name\":\"{min_customer}\"}},\"maxValues\":{{\"id\":{max_id},\"customer_name\":\"{max_customer}\"}},\"nullCount\":{{\"id\":0,\"customer_name\":0}}}}"}}}}"#
+    ))
+}
+
+fn unique_benchmark_name(name: &str) -> Result<String, Box<dyn Error>> {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+
+    Ok(format!(
+        "{}-delta-provider-exec-{name}-{nanos}",
+        std::process::id()
+    ))
+}
+
+fn percentile_summary(values: &[u64]) -> PercentileSummary {
+    PercentileSummary {
+        p50: percentile(values, 50),
+        p95: percentile(values, 95),
+        p99: percentile(values, 99),
+    }
+}
+
+fn percentile(values: &[u64], percentile: u64) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let numerator = percentile.saturating_mul(sorted.len() as u64);
+    let rank = numerator.div_ceil(100).saturating_sub(1);
+    let index = usize::try_from(rank)
+        .unwrap_or(usize::MAX)
+        .min(sorted.len().saturating_sub(1));
+
+    sorted[index]
 }
 
 impl SyntheticWorkloadCase {
@@ -587,6 +1172,11 @@ enum BenchmarkRunnerConfigError {
     MissingHostProbeIoRepetitions,
     InvalidHostProbeIoRepetitions(String),
     HostProbeIoRepetitionsOutOfRange(usize),
+    MissingProviderExecTempDir,
+    DuplicateProviderExecTempDir,
+    MissingProviderExecRepetitions,
+    InvalidProviderExecRepetitions(String),
+    ProviderExecRepetitionsOutOfRange(usize),
     MissingSeed,
     InvalidSeed(String),
     UnknownArgument(String),
@@ -601,7 +1191,7 @@ impl fmt::Display for BenchmarkRunnerConfigError {
             Self::DuplicateMode => write!(formatter, "--mode may be provided only once"),
             Self::InvalidMode(value) => write!(
                 formatter,
-                "invalid --mode value `{value}`; expected `synthetic` or `host-probe`"
+                "invalid --mode value `{value}`; expected `synthetic`, `host-probe`, or `provider-exec`"
             ),
             Self::MissingHostProbeTempDir => {
                 write!(formatter, "--host-probe-temp-dir requires a path")
@@ -630,6 +1220,27 @@ impl fmt::Display for BenchmarkRunnerConfigError {
             Self::HostProbeIoRepetitionsOutOfRange(value) => write!(
                 formatter,
                 "--host-probe-io-repetitions value `{value}` must be between 1 and {HOST_PROBE_MAX_LOCAL_IO_REPETITIONS}"
+            ),
+            Self::MissingProviderExecTempDir => {
+                write!(formatter, "--provider-exec-temp-dir requires a path")
+            }
+            Self::DuplicateProviderExecTempDir => {
+                write!(
+                    formatter,
+                    "--provider-exec-temp-dir may be provided only once"
+                )
+            }
+            Self::MissingProviderExecRepetitions => write!(
+                formatter,
+                "--provider-exec-repetitions requires a repetition count"
+            ),
+            Self::InvalidProviderExecRepetitions(value) => write!(
+                formatter,
+                "invalid --provider-exec-repetitions value `{value}`"
+            ),
+            Self::ProviderExecRepetitionsOutOfRange(value) => write!(
+                formatter,
+                "--provider-exec-repetitions value `{value}` must be between 1 and {MAX_PROVIDER_EXEC_REPETITIONS}"
             ),
             Self::MissingSeed => write!(formatter, "--seed requires a u64 value"),
             Self::InvalidSeed(value) => write!(formatter, "invalid --seed value `{value}`"),
@@ -2797,6 +3408,7 @@ mod tests {
                 output_path: None,
                 mode: BenchmarkMode::Synthetic,
                 host_probe_local_io: HostProbeLocalIoConfig::default(),
+                provider_exec: ProviderExecConfig::default(),
                 seed: DEFAULT_BENCHMARK_SEED,
                 show_help: false
             }
@@ -2854,10 +3466,37 @@ mod tests {
         let synthetic = BenchmarkRunnerConfig::parse(["--mode", "synthetic"])?;
         let host_probe = BenchmarkRunnerConfig::parse(["--mode", "host-probe"])?;
         let host_probe_alias = BenchmarkRunnerConfig::parse(["--mode", "host_probe"])?;
+        let provider_exec = BenchmarkRunnerConfig::parse(["--mode", "provider-exec"])?;
+        let provider_exec_alias = BenchmarkRunnerConfig::parse(["--mode", "provider_exec"])?;
 
         assert_eq!(synthetic.mode, BenchmarkMode::Synthetic);
         assert_eq!(host_probe.mode, BenchmarkMode::HostProbe);
         assert_eq!(host_probe_alias.mode, BenchmarkMode::HostProbe);
+        assert_eq!(provider_exec.mode, BenchmarkMode::ProviderExec);
+        assert_eq!(provider_exec_alias.mode, BenchmarkMode::ProviderExec);
+
+        Ok(())
+    }
+
+    #[test]
+    fn runner_config_accepts_provider_exec_options() -> Result<(), Box<dyn Error>> {
+        let config = BenchmarkRunnerConfig::parse([
+            "--mode",
+            "provider-exec",
+            "--provider-exec-temp-dir",
+            "target",
+            "--provider-exec-repetitions",
+            "5",
+        ])?;
+
+        assert_eq!(config.mode, BenchmarkMode::ProviderExec);
+        assert_eq!(
+            config.provider_exec,
+            ProviderExecConfig {
+                repetitions: 5,
+                temp_dir: Some(PathBuf::from("target")),
+            }
+        );
 
         Ok(())
     }
@@ -2971,6 +3610,33 @@ mod tests {
             BenchmarkRunnerConfig::parse(["--host-probe-io-repetitions", "0"]),
             Err(BenchmarkRunnerConfigError::HostProbeIoRepetitionsOutOfRange(0))
         );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-temp-dir"]),
+            Err(BenchmarkRunnerConfigError::MissingProviderExecTempDir)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--provider-exec-temp-dir",
+                "a",
+                "--provider-exec-temp-dir",
+                "b"
+            ]),
+            Err(BenchmarkRunnerConfigError::DuplicateProviderExecTempDir)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-repetitions"]),
+            Err(BenchmarkRunnerConfigError::MissingProviderExecRepetitions)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-repetitions", "nope"]),
+            Err(BenchmarkRunnerConfigError::InvalidProviderExecRepetitions(
+                "nope".to_owned()
+            ))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-repetitions", "0"]),
+            Err(BenchmarkRunnerConfigError::ProviderExecRepetitionsOutOfRange(0))
+        );
     }
 
     #[test]
@@ -2982,12 +3648,13 @@ mod tests {
 
         assert!(
             usage.contains(
-                "Usage: delta_scan_partition_bench [--mode <synthetic|host-probe>] [--output <path>] [--seed <u64>]"
+                "Usage: delta_scan_partition_bench [--mode <synthetic|host-probe|provider-exec>] [--output <path>] [--seed <u64>]"
             )
         );
         assert!(usage.contains("CSV is written to stdout"));
         assert!(usage.contains("The default mode is synthetic."));
         assert!(usage.contains("Use --host-probe-local-io"));
+        assert!(usage.contains("Use --provider-exec-repetitions"));
         assert!(usage.contains("The default seed is 0."));
 
         Ok(())
@@ -3000,6 +3667,7 @@ mod tests {
             output_path: None,
             mode: BenchmarkMode::Synthetic,
             host_probe_local_io: HostProbeLocalIoConfig::default(),
+            provider_exec: ProviderExecConfig::default(),
             seed: 42,
             show_help: false,
         };
@@ -3010,7 +3678,7 @@ mod tests {
 
         assert_eq!(lines.len(), 1111);
         assert!(lines[0].starts_with("benchmark_schema_version,benchmark_mode,host_os,host_arch"));
-        assert!(csv.contains("\n9,synthetic,"));
+        assert!(csv.contains("\n10,synthetic,"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
@@ -3034,6 +3702,7 @@ mod tests {
             output_path: None,
             mode: BenchmarkMode::HostProbe,
             host_probe_local_io: HostProbeLocalIoConfig::default(),
+            provider_exec: ProviderExecConfig::default(),
             seed: 42,
             show_help: false,
         };
@@ -3045,7 +3714,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "9");
+        assert_eq!(row[0], "10");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[5], "42");
         assert_eq!(row[6], "0");
@@ -3125,7 +3794,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "9");
+        assert_eq!(row[0], "10");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
@@ -4045,6 +4714,18 @@ mod tests {
     fn benchmark_mode_renders_csv_fields() {
         assert_eq!(BenchmarkMode::Synthetic.as_csv_value(), "synthetic");
         assert_eq!(BenchmarkMode::HostProbe.as_csv_value(), "host_probe");
+        assert_eq!(BenchmarkMode::ProviderExec.as_csv_value(), "provider_exec");
+    }
+
+    #[test]
+    fn provider_exec_csv_header_contains_latency_signals() {
+        assert_eq!(PROVIDER_EXEC_CSV_HEADER[0], "benchmark_schema_version");
+        assert_eq!(PROVIDER_EXEC_CSV_HEADER[1], "benchmark_mode");
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"planning_micros_p99"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"time_to_first_batch_micros_p99"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"total_micros_p99"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"source_rows_per_second_p99"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"batch_latency_micros_p99"));
     }
 
     #[test]
@@ -4167,7 +4848,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "9");
+        assert_eq!(row[0], "10");
         assert_eq!(row[1], "synthetic");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
