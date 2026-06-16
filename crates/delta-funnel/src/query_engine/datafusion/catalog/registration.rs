@@ -59,7 +59,12 @@ pub fn register_delta_sources(
     ctx: &SessionContext,
     configs: Vec<DeltaTableProviderConfig>,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
-    register_delta_sources_with_options(ctx, configs, DeltaProviderScanExecutionOptions::default())
+    register_delta_sources_with_options(
+        ctx,
+        configs,
+        DeltaProviderScanExecutionOptions::default(),
+        true,
+    )
 }
 
 /// Registers preflighted Delta sources with explicit provider execution bounds.
@@ -76,23 +81,25 @@ pub fn register_delta_sources_with_scan_execution_options(
     execution_options: DeltaProviderScanExecutionOptions,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
     execution_options.validate()?;
-    register_delta_sources_with_options(ctx, configs, execution_options)
+    register_delta_sources_with_options(ctx, configs, execution_options, false)
 }
 
 fn register_delta_sources_with_options(
     ctx: &SessionContext,
     configs: Vec<DeltaTableProviderConfig>,
     execution_options: DeltaProviderScanExecutionOptions,
+    resolve_default_scan_wide_capacity: bool,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
     reject_duplicate_registration_names(&configs)?;
     let providers = configs
         .into_iter()
         .map(|config| {
-            DeltaTableProvider::try_new_with_execution_options(
+            DeltaTableProvider::try_new_with_execution_options_and_default_capacity_resolution(
                 config.source,
                 config.protocol,
                 config.scan_target_partitions,
                 execution_options,
+                resolve_default_scan_wide_capacity,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -289,6 +296,8 @@ mod tests {
                 reader_backend: DeltaProviderReaderBackend::OfficialKernel,
                 max_concurrent_file_reads_per_scan: 0,
                 max_concurrent_file_reads_per_partition: 1,
+                output_buffer_capacity_per_partition: 1,
+                native_async_prefetch_file_count_per_partition: 0,
             },
         );
 
@@ -326,6 +335,8 @@ mod tests {
                 reader_backend: DeltaProviderReaderBackend::NativeAsync,
                 max_concurrent_file_reads_per_scan: 1,
                 max_concurrent_file_reads_per_partition: 1,
+                output_buffer_capacity_per_partition: 1,
+                native_async_prefetch_file_count_per_partition: 0,
             },
         )?;
 

@@ -3,11 +3,11 @@
 pub(crate) mod datafusion;
 
 pub use datafusion::{
-    DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
+    DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaTableProviderConfig,
-    RegisteredDeltaSource, RegisteredDeltaSources,
+    RegisteredDeltaSource, RegisteredDeltaSources, collect_delta_provider_read_stats,
     delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic, register_delta_sources,
     register_delta_sources_with_scan_execution_options,

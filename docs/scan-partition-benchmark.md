@@ -1,7 +1,7 @@
 # Scan Partition Benchmark
 
-`delta_scan_partition_bench` is a portable benchmark runner for the Delta
-DataFusion scan partition target policy. Its default mode is the deterministic
+`delta_scan_partition_bench` is a portable benchmark runner for DeltaFunnel
+scan planning and provider execution. Its default mode is the deterministic
 synthetic matrix.
 
 The production policy is documented in
@@ -42,6 +42,92 @@ in-process scheduler probe before feeding the host profile through the same
 production diagnostic target policy. It does not run local IO probes unless
 explicitly requested.
 
+Run the real provider execution benchmark:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode provider-exec \
+  --provider-exec-repetitions 3 \
+  --output target/delta-provider-exec-bench.csv
+```
+
+Provider-exec mode creates temporary local Delta tables with Parquet data,
+loads them through `load_delta_source`, registers them through production
+DataFusion provider registration, selects the requested provider backend through
+`DeltaProviderScanExecutionOptions`, runs DataFusion SQL, and collects real
+provider execution output. It does not use a benchmark-only reader path.
+
+The provider-exec matrix compares the official kernel backend against the
+native async backend with lazy and bounded-prefetch scheduling profiles. It
+covers non-DV and sparse-DV versions of a many-small-files shape, a
+fewer-larger-files shape, and a 12,808,140-row
+`provider_partitioned_event_log_12m` shape based on the synthetic partitioned
+event log model. Each workload runs a projection query, a count-style query,
+and a predicate query that exercises provider predicate handling. Each case runs
+production scheduling profiles for serial lazy reads,
+parallel lazy reads, and parallel lazy reads with a larger bounded output
+handoff buffer. It also includes native async prefetch profiles that open up to
+one or two additional file streams per execution partition while the current
+file is producing batches. Prefetch depth is bounded by
+`native_async_prefetch_file_count_per_partition` plus the existing scan-wide and
+per-partition file-read limits. The provider-exec matrix also includes
+available-parallelism sweep profiles named
+`prefetch_2_ap_target_scan_1x` through `prefetch_2_ap_target_scan_4x`.
+These profiles set scan partitions to the detected host available parallelism,
+keep per-partition file-read capacity at 3, and vary scan-wide file-read
+capacity as 1x through 4x available parallelism without applying a fixed
+absolute cap.
+
+Production provider registration defaults to the native async backend with
+per-partition file-read capacity 3, prefetch depth 2, output buffer capacity 1,
+and scan-wide capacity resolved as `target_partitions * 3` after scan partition
+planning. Provider-exec benchmark filters can still select the official backend
+or lazy native async profiles explicitly.
+
+Provider-exec mode defaults to local filesystem reads. To compare production
+provider execution under remote-like storage latency, use an opt-in delayed
+HTTP storage facade:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode provider-exec \
+  --provider-exec-storage-profile s3-normal \
+  --provider-exec-workload provider_partitioned_event_log_12m \
+  --provider-exec-query project_event_keys \
+  --provider-exec-backend native_async \
+  --provider-exec-scheduling-profile lazy_parallel_buffer_4 \
+  --provider-exec-repetitions 1 \
+  --output target/delta-provider-exec-s3-normal-project.csv
+```
+
+Run one available-parallelism multiplier sweep case:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode provider-exec \
+  --provider-exec-storage-profile s3-normal \
+  --provider-exec-workload provider_partitioned_event_log_12m \
+  --provider-exec-query project_event_keys \
+  --provider-exec-backend native_async \
+  --provider-exec-scheduling-profile prefetch_2_ap_target_scan_3x \
+  --provider-exec-repetitions 3 \
+  --output target/delta-provider-exec-ap-sweep-project.csv
+```
+
+Supported provider-exec storage profiles are:
+
+- `local`: default local filesystem reads.
+- `s3-normal`: delayed HTTP reads with moderate request latency and about 1
+  Gbps per-request transfer bandwidth.
+- `s3-high-latency`: delayed HTTP reads with higher request latency.
+- `s3-throttled`: delayed HTTP reads with remote-like latency and lower
+  per-request transfer bandwidth.
+
+The delayed HTTP facade is benchmark-only and read-only. It serves the generated
+temporary Delta table through generic HTTP/WebDAV-style object-store requests,
+including `PROPFIND`, `HEAD`, `GET`, and byte ranges. Both provider backends use
+the same delayed HTTP table URI and `allow_http=true` storage option.
+
 Run the opt-in local IO read probe:
 
 ```bash
@@ -68,9 +154,11 @@ cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
 ```
 
 The default seed is `0`. The seed affects deterministic simulated work jitter.
-It does not change workload file shapes or policy target derivation.
+It does not change workload file shapes or policy target derivation. In
+provider-exec mode the seed is recorded for run metadata, but the initial local
+Delta workload shapes are deterministic.
 
-## Matrix
+## Synthetic Matrix
 
 The default matrix currently covers:
 
@@ -187,6 +275,69 @@ Important field groups:
   - `host_local_io_probe_latency_micros`
   - `host_local_io_probe_throughput_bytes_per_second`
 
+Provider-exec mode writes a provider execution CSV with a separate header. Its
+important field groups are:
+
+- Run metadata:
+  - `benchmark_schema_version`
+  - `benchmark_mode`
+  - `host_os`
+  - `host_arch`
+  - `host_available_parallelism`
+  - `seed`
+- Workload and execution shape:
+  - `workload_case`
+  - `provider_exec_storage_profile`
+  - `query_case`
+  - `reader_backend`
+  - `scheduling_mode`
+  - `scan_target_partitions`
+  - `max_concurrent_file_reads_per_scan`
+  - `max_concurrent_file_reads_per_partition`
+  - `output_buffer_capacity_per_partition`
+  - `native_async_prefetch_file_count_per_partition`
+  - `repetitions`
+  - `file_count`
+  - `row_count`
+  - `data_file_bytes`
+  - `process_peak_rss_bytes`
+  - `process_peak_rss_delta_bytes`
+  - `deletion_vector_file_count`
+  - `deletion_vector_deleted_rows`
+  - `deletion_vector_deleted_rows_per_file`
+- Provider read stats:
+  - `provider_stats_scan_count`
+  - `provider_stats_scan_metadata_exhausted`
+  - `provider_stats_scan_partitions_planned`
+  - `provider_stats_files_planned`
+  - `provider_stats_estimated_rows`
+  - `provider_stats_estimated_bytes`
+  - `provider_stats_scan_partitions_started_p50`
+  - `provider_stats_scan_partitions_completed_p50`
+  - `provider_stats_files_started_p50`
+  - `provider_stats_files_completed_p50`
+  - `provider_stats_batches_produced_p50`
+  - `provider_stats_rows_produced_p50`
+  - `provider_stats_deletion_vector_payloads_loaded_p50`
+  - `provider_stats_deletion_vectors_applied_p50`
+  - `provider_stats_deletion_vector_rows_deleted_p50`
+  - `provider_stats_deletion_vector_failures_p50`
+  - `provider_stats_deletion_vector_rejections_p50`
+- Output shape:
+  - `produced_rows`
+  - `produced_batches`
+- Latency and throughput:
+  - `planning_micros_p50`, `planning_micros_p95`, `planning_micros_p99`
+  - `time_to_first_batch_micros_p50`, `time_to_first_batch_micros_p95`,
+    `time_to_first_batch_micros_p99`
+  - `total_micros_p50`, `total_micros_p95`, `total_micros_p99`
+  - `source_rows_per_second_p50`, `source_rows_per_second_p95`,
+    `source_rows_per_second_p99`
+  - `batch_latency_micros_p50`, `batch_latency_micros_p95`,
+    `batch_latency_micros_p99`
+  - `min_total_micros`
+  - `max_total_micros`
+
 `partition_work_imbalance_basis_points` is:
 
 ```text
@@ -235,6 +386,16 @@ parallelism, memory hints, Unix fd limit status when available, and a bounded
 local scheduler probe. Local IO probing is opt-in and bounded. Host-probe mode
 does not run network or stress probes.
 
-It is still not a production read benchmark. It does not measure real Parquet
-decoding, Arrow batch memory, object-store request behavior, or DataFusion
-runtime scheduling. Those belong to later read execution work.
+Provider-exec mode is the production read benchmark path. It measures real
+temporary Delta tables, Parquet decoding, Arrow batch production, provider
+backend selection, DataFusion SQL planning, and DataFusion collection. The
+default provider-exec mode is local-file based. Opt-in delayed HTTP storage
+profiles add controlled object-store-like latency and byte-range reads without
+changing the production provider reader path. Provider-exec mode compares
+production read-admission, output-buffer, and bounded native async prefetch
+settings, and it records provider owned read stats from the physical Delta scan
+plan.
+
+Representative native async backend benchmark notes and the current scheduling
+decision are recorded in
+[`native-async-backend-benchmark-notes.md`](native-async-backend-benchmark-notes.md).
