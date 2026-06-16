@@ -1092,9 +1092,10 @@ fn build_matched_map_field_plan(
     let key_path = format!("{path}.key");
     let parquet_key = parquet_map_key_field(parquet_field, path)?;
     let key_plan = match (provider_key.data_type(), file_key.data_type()) {
-        (DataType::Struct(_) | DataType::List(_), DataType::Struct(_) | DataType::List(_)) => {
-            build_matched_field_plan(provider_key, file_key, parquet_key, &key_path)?
-        }
+        (
+            DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _),
+            DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _),
+        ) => build_matched_field_plan(provider_key, file_key, parquet_key, &key_path)?,
         _ if file_key
             .data_type()
             .equals_datatype(provider_key.data_type()) =>
@@ -1619,27 +1620,6 @@ fn unsupported_native_async_field_reason(
             "native async reader does not support file path metadata column '{path}' yet"
         ));
     }
-    if matches!(map_context, NativeAsyncMapContext::Key)
-        && matches!(field.data_type(), KernelDataType::Map(_))
-        && (has_field_matching_metadata(field, false)
-            || data_type_has_field_matching_metadata(field.data_type()))
-    {
-        return Some(format!(
-            "native async reader does not support nested map key field-id or physical-name matching at '{path}' yet"
-        ));
-    }
-    // Delta stores synthetic map key/value field ids on the map field itself.
-    // A primitive key only needs that synthetic key id preserved by the
-    // provider transform. Struct and list keys can now be reshaped recursively,
-    // while nested-map keys are handled by a later implementation slice.
-    if has_nested_field_id_map_metadata(field)
-        && matches!(field.data_type(), KernelDataType::Map(map) if matches!(map.key_type(), KernelDataType::Map(_)))
-    {
-        return Some(format!(
-            "native async reader does not support nested-map key field-id or physical-name matching at '{path}' yet"
-        ));
-    }
-
     unsupported_native_async_data_type_reason(field.data_type(), path, map_context)
 }
 
@@ -1664,13 +1644,6 @@ fn unsupported_native_async_data_type_reason(
             )
         }
         KernelDataType::Map(map) => {
-            if matches!(map_context, NativeAsyncMapContext::Key)
-                && data_type_has_field_matching_metadata(data_type)
-            {
-                return Some(format!(
-                    "native async reader does not support nested map key field-id or physical-name matching at '{path}' yet"
-                ));
-            }
             let key_path = format!("{path}.key");
             unsupported_native_async_data_type_reason(
                 map.key_type(),
@@ -1690,23 +1663,6 @@ fn unsupported_native_async_data_type_reason(
     }
 }
 
-fn data_type_has_field_matching_metadata(data_type: &KernelDataType) -> bool {
-    match data_type {
-        KernelDataType::Struct(fields) | KernelDataType::Variant(fields) => {
-            fields.fields().any(|field| {
-                has_field_matching_metadata(field, false)
-                    || data_type_has_field_matching_metadata(field.data_type())
-            })
-        }
-        KernelDataType::Array(array) => data_type_has_field_matching_metadata(array.element_type()),
-        KernelDataType::Map(map) => {
-            data_type_has_field_matching_metadata(map.key_type())
-                || data_type_has_field_matching_metadata(map.value_type())
-        }
-        KernelDataType::Primitive(_) => false,
-    }
-}
-
 fn is_file_path_metadata_field(field: &KernelStructField) -> bool {
     let Some(KernelMetadataValue::Number(field_id)) =
         field.get_config_value(&KernelColumnMetadataKey::ParquetFieldId)
@@ -1715,33 +1671,6 @@ fn is_file_path_metadata_field(field: &KernelStructField) -> bool {
     };
 
     Some(*field_id) == KernelMetadataColumnSpec::FilePath.reserved_field_id()
-}
-
-fn has_field_matching_metadata(field: &KernelStructField, top_level: bool) -> bool {
-    if has_nested_field_id_map_metadata(field) {
-        return true;
-    }
-    if top_level {
-        return false;
-    }
-
-    [
-        KernelColumnMetadataKey::ColumnMappingId,
-        KernelColumnMetadataKey::ColumnMappingPhysicalName,
-        KernelColumnMetadataKey::ParquetFieldId,
-    ]
-    .iter()
-    .any(|key| field.get_config_value(key).is_some())
-}
-
-fn has_nested_field_id_map_metadata(field: &KernelStructField) -> bool {
-    let nested_metadata_keys = [
-        KernelColumnMetadataKey::ColumnMappingNestedIds,
-        KernelColumnMetadataKey::ParquetFieldNestedIds,
-    ];
-    nested_metadata_keys
-        .iter()
-        .any(|key| field.get_config_value(key).is_some())
 }
 
 impl DeltaNativeAsyncPartitionFileReader {
@@ -2311,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn native_async_schema_gate_rejects_nested_map_key_nested_ids()
+    fn native_async_schema_gate_allows_nested_map_key_nested_ids()
     -> Result<(), Box<dyn std::error::Error>> {
         let schema = kernel_schema([KernelStructField::new(
             "attributes",
@@ -2332,11 +2261,11 @@ mod tests {
                 .to_owned(),
             KernelMetadataValue::String(r#"{"attributes.key":2}"#.to_owned()),
         )])])?;
-        let reason =
-            unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
 
-        assert!(reason.contains("nested-map key field-id"));
-        assert!(reason.contains("attributes"));
+        assert_eq!(
+            unsupported_native_async_physical_schema_reason(&schema),
+            None
+        );
 
         Ok(())
     }
@@ -3246,6 +3175,300 @@ mod tests {
         assert_eq!(zips.value(2), 60601);
         assert_eq!(values.value(0), "home");
         assert_eq!(values.value(2), "other");
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_reshapes_nested_map_key_struct_by_field_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_inner_key_fields = vec![
+            Field::new("city", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+            Field::new("zip", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+        ];
+        let provider_inner_key = Field::new(
+            "keys",
+            DataType::Struct(provider_inner_key_fields.into()),
+            false,
+        );
+        let provider_outer_key = map_field(
+            "keys",
+            provider_inner_key,
+            Field::new("values", DataType::Int32, true),
+            false,
+        );
+        let provider_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            provider_outer_key,
+            Field::new("values", DataType::Utf8, true),
+            true,
+        )]));
+        let file_inner_key_fields = vec![
+            Field::new("stale_zip", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+            Field::new("stale_city", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+        ];
+        let file_inner_key = Field::new(
+            "keys",
+            DataType::Struct(file_inner_key_fields.clone().into()),
+            false,
+        );
+        let file_outer_key = map_field(
+            "keys",
+            file_inner_key.clone(),
+            Field::new("values", DataType::Int32, true),
+            false,
+        );
+        let file_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            file_outer_key.clone(),
+            Field::new("values", DataType::Utf8, true),
+            true,
+        )]));
+        let inner_keys = struct_array(
+            file_inner_key_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![94110, 10001, 60601])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("san francisco"),
+                    Some("new york"),
+                    Some("chicago"),
+                ])) as ArrayRef,
+            ],
+        );
+        let outer_keys = map_array(
+            file_inner_key,
+            Field::new("values", DataType::Int32, true),
+            vec![0, 2, 2, 3],
+            inner_keys,
+            Arc::new(Int32Array::from(vec![7, 8, 9])) as ArrayRef,
+            None,
+        )?;
+        let attributes = map_array(
+            file_outer_key,
+            Field::new("values", DataType::Utf8, true),
+            vec![0, 2, 2, 3],
+            outer_keys,
+            Arc::new(StringArray::from(vec![
+                Some("home"),
+                Some("work"),
+                Some("other"),
+            ])) as ArrayRef,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "nested-map-key-struct-field-id-schema-match",
+            file_schema,
+            vec![attributes],
+            provider_schema,
+        )?;
+        let attributes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or("expected attributes MapArray")?;
+        let outer_keys = attributes
+            .keys()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or("expected outer key MapArray")?;
+        let inner_keys = outer_keys
+            .keys()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected inner key StructArray")?;
+        let outer_values = attributes
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected outer value StringArray")?;
+        let inner_values = outer_keys
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected inner value Int32Array")?;
+        let cities = inner_keys
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected city StringArray")?;
+        let zips = inner_keys
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected zip Int32Array")?;
+
+        assert_eq!(attributes.value_offsets(), &[0, 2, 2, 3]);
+        assert_eq!(outer_keys.value_offsets(), &[0, 2, 2, 3]);
+        assert!(attributes.is_null(1));
+        assert_eq!(inner_keys.fields()[0].name(), "city");
+        assert_eq!(inner_keys.fields()[1].name(), "zip");
+        assert_eq!(cities.value(0), "san francisco");
+        assert_eq!(cities.value(2), "chicago");
+        assert_eq!(zips.value(0), 94110);
+        assert_eq!(zips.value(2), 60601);
+        assert_eq!(inner_values.value(0), 7);
+        assert_eq!(inner_values.value(2), 9);
+        assert_eq!(outer_values.value(0), "home");
+        assert_eq!(outer_values.value(2), "other");
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_reshapes_map_key_and_value_structs_by_field_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_key_fields = vec![
+            Field::new("city", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+            Field::new("zip", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+        ];
+        let provider_value_fields = vec![
+            Field::new("label", DataType::Utf8, true).with_metadata(field_id_metadata(21)),
+            Field::new("score", DataType::Int32, true).with_metadata(field_id_metadata(20)),
+        ];
+        let provider_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new("keys", DataType::Struct(provider_key_fields.into()), false),
+            Field::new(
+                "values",
+                DataType::Struct(provider_value_fields.into()),
+                true,
+            ),
+            true,
+        )]));
+        let file_key_fields = vec![
+            Field::new("stale_zip", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+            Field::new("stale_city", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+        ];
+        let file_value_fields = vec![
+            Field::new("stale_score", DataType::Int32, true).with_metadata(field_id_metadata(20)),
+            Field::new("stale_label", DataType::Utf8, true).with_metadata(field_id_metadata(21)),
+        ];
+        let file_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new(
+                "keys",
+                DataType::Struct(file_key_fields.clone().into()),
+                false,
+            ),
+            Field::new(
+                "values",
+                DataType::Struct(file_value_fields.clone().into()),
+                true,
+            ),
+            true,
+        )]));
+        let keys = struct_array(
+            file_key_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![94110, 10001, 60601])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("san francisco"),
+                    Some("new york"),
+                    Some("chicago"),
+                ])) as ArrayRef,
+            ],
+        );
+        let values = struct_array(
+            file_value_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![7, 8, 9])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("home"),
+                    Some("work"),
+                    Some("other"),
+                ])) as ArrayRef,
+            ],
+        );
+        let attributes = map_array(
+            Field::new(
+                "keys",
+                DataType::Struct(
+                    vec![
+                        Field::new("stale_zip", DataType::Int32, true)
+                            .with_metadata(field_id_metadata(10)),
+                        Field::new("stale_city", DataType::Utf8, true)
+                            .with_metadata(field_id_metadata(11)),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+            Field::new(
+                "values",
+                DataType::Struct(
+                    vec![
+                        Field::new("stale_score", DataType::Int32, true)
+                            .with_metadata(field_id_metadata(20)),
+                        Field::new("stale_label", DataType::Utf8, true)
+                            .with_metadata(field_id_metadata(21)),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            vec![0, 2, 2, 3],
+            keys,
+            values,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "map-key-and-value-struct-field-id-schema-match",
+            file_schema,
+            vec![attributes],
+            provider_schema,
+        )?;
+        let attributes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or("expected attributes MapArray")?;
+        let keys = attributes
+            .keys()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected map key StructArray")?;
+        let values = attributes
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected map value StructArray")?;
+        let cities = keys
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected city StringArray")?;
+        let zips = keys
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected zip Int32Array")?;
+        let labels = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected label StringArray")?;
+        let scores = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected score Int32Array")?;
+
+        assert_eq!(attributes.value_offsets(), &[0, 2, 2, 3]);
+        assert!(attributes.is_null(1));
+        assert_eq!(keys.fields()[0].name(), "city");
+        assert_eq!(keys.fields()[1].name(), "zip");
+        assert_eq!(values.fields()[0].name(), "label");
+        assert_eq!(values.fields()[1].name(), "score");
+        assert_eq!(cities.value(0), "san francisco");
+        assert_eq!(zips.value(0), 94110);
+        assert_eq!(labels.value(0), "home");
+        assert_eq!(scores.value(0), 7);
+        assert_eq!(cities.value(2), "chicago");
+        assert_eq!(zips.value(2), 60601);
+        assert_eq!(labels.value(2), "other");
+        assert_eq!(scores.value(2), 9);
 
         Ok(())
     }
