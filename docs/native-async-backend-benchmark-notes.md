@@ -3,7 +3,7 @@
 These notes record representative local evidence for issue #161. They are not
 golden performance assertions. They document the command, workload shape, and
 current scheduling decision so future reviewers can audit why bounded prefetch
-is benchmark-only and not the default.
+is the recommended native-async scheduling profile under remote-like latency.
 
 ## Command
 
@@ -189,22 +189,162 @@ about 54% on `project_event_keys` and about 64% on `count_events`. Peak RSS
 rose by about 14.7 MiB for `project_event_keys` and about 7.2 MiB for
 `count_events` compared with `lazy_parallel_buffer_1`.
 
+## Repeated Default-Decision Count Matrix
+
+A later default-decision run used the 12M `count_events` query, native async
+only, one scheduling profile per process, and repetitions set to 3:
+
+```bash
+target/release/delta_scan_partition_bench \
+  --mode provider-exec \
+  --provider-exec-repetitions 3 \
+  --provider-exec-workload provider_partitioned_event_log_12m \
+  --provider-exec-query count_events \
+  --provider-exec-backend native_async \
+  --provider-exec-storage-profile s3-normal \
+  --provider-exec-scheduling-profile prefetch_2_parallel_buffer_1 \
+  --output /tmp/delta-provider-default-count-s3-normal-prefetch_2_parallel_buffer_1-rep3.csv
+```
+
+The same command shape was run for `local`, `s3-normal`,
+`s3-high-latency`, and `s3-throttled`, and for
+`lazy_parallel_buffer_1`, `prefetch_1_parallel_buffer_1`, and
+`prefetch_2_parallel_buffer_1`.
+
+| Storage | Scheduling profile | Prefetch depth | Total p50 | Total p99 | Time to first batch p50 | Rows/sec p50 | Peak RSS | Peak RSS delta |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| local | lazy_parallel_buffer_1 | 0 | 0.115 s | 0.115 s | 0.111 s | 111,517,679 | 107.6 MiB | 24.8 MiB |
+| local | prefetch_1_parallel_buffer_1 | 1 | 0.104 s | 0.107 s | 0.101 s | 123,046,343 | 109.4 MiB | 29.7 MiB |
+| local | prefetch_2_parallel_buffer_1 | 2 | 0.107 s | 0.113 s | 0.103 s | 120,225,843 | 118.9 MiB | 42.0 MiB |
+| s3-normal | lazy_parallel_buffer_1 | 0 | 14.290 s | 14.307 s | 14.256 s | 896,306 | 113.1 MiB | 26.1 MiB |
+| s3-normal | prefetch_1_parallel_buffer_1 | 1 | 8.716 s | 8.749 s | 8.682 s | 1,469,497 | 111.7 MiB | 26.8 MiB |
+| s3-normal | prefetch_2_parallel_buffer_1 | 2 | 5.257 s | 5.273 s | 5.222 s | 2,436,275 | 115.3 MiB | 29.6 MiB |
+| s3-high-latency | lazy_parallel_buffer_1 | 0 | 50.786 s | 50.787 s | 50.709 s | 252,196 | 113.9 MiB | 24.7 MiB |
+| s3-high-latency | prefetch_1_parallel_buffer_1 | 1 | 33.346 s | 33.363 s | 33.268 s | 384,093 | 114.6 MiB | 28.7 MiB |
+| s3-high-latency | prefetch_2_parallel_buffer_1 | 2 | 18.283 s | 18.728 s | 18.207 s | 700,542 | 111.8 MiB | 29.9 MiB |
+| s3-throttled | lazy_parallel_buffer_1 | 0 | 24.369 s | 24.383 s | 24.319 s | 525,581 | 106.6 MiB | 23.9 MiB |
+| s3-throttled | prefetch_1_parallel_buffer_1 | 1 | 14.401 s | 14.460 s | 14.347 s | 889,398 | 114.9 MiB | 27.2 MiB |
+| s3-throttled | prefetch_2_parallel_buffer_1 | 2 | 10.196 s | 10.427 s | 10.145 s | 1,256,174 | 107.0 MiB | 29.0 MiB |
+
+On this repeated count matrix, `prefetch_2_parallel_buffer_1` was neutral to
+slightly faster on local filesystem reads and substantially faster across every
+delayed-storage profile. Compared with `lazy_parallel_buffer_1`, prefetch depth
+2 improved total p50 by 2.72x on `s3-normal`, 2.78x on `s3-high-latency`, and
+2.39x on `s3-throttled`. Peak RSS movement stayed modest in delayed profiles,
+but local peak RSS increased by about 11.3 MiB.
+
+## Repeated Default-Decision Projection Matrix
+
+The same default-decision matrix was then run for the 12M
+`project_event_keys` query. This query emits projected batches throughout the
+scan, so it exercises the bounded output handoff path rather than waiting for a
+single aggregate result:
+
+```bash
+target/release/delta_scan_partition_bench \
+  --mode provider-exec \
+  --provider-exec-repetitions 3 \
+  --provider-exec-workload provider_partitioned_event_log_12m \
+  --provider-exec-query project_event_keys \
+  --provider-exec-backend native_async \
+  --provider-exec-storage-profile s3-normal \
+  --provider-exec-scheduling-profile prefetch_2_parallel_buffer_1 \
+  --output /tmp/delta-provider-default-project-s3-normal-prefetch_2_parallel_buffer_1-rep3.csv
+```
+
+The same command shape was run for `local`, `s3-normal`,
+`s3-high-latency`, and `s3-throttled`, and for
+`lazy_parallel_buffer_1`, `prefetch_1_parallel_buffer_1`, and
+`prefetch_2_parallel_buffer_1`.
+
+| Storage | Scheduling profile | Prefetch depth | Total p50 | Total p99 | Time to first batch p50 | Rows/sec p50 | Batch latency p99 | Peak RSS | Peak RSS delta |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| local | lazy_parallel_buffer_1 | 0 | 0.177 s | 0.178 s | 0.001 s | 72,484,818 | 0.117 ms | 84.5 MiB | 22.4 MiB |
+| local | prefetch_1_parallel_buffer_1 | 1 | 0.162 s | 0.170 s | 0.001 s | 78,942,230 | 0.079 ms | 100.2 MiB | 36.6 MiB |
+| local | prefetch_2_parallel_buffer_1 | 2 | 0.159 s | 0.161 s | 0.001 s | 80,512,817 | 0.075 ms | 96.3 MiB | 33.0 MiB |
+| s3-normal | lazy_parallel_buffer_1 | 0 | 15.668 s | 15.735 s | 0.086 s | 817,452 | 38.737 ms | 119.3 MiB | 44.5 MiB |
+| s3-normal | prefetch_1_parallel_buffer_1 | 1 | 8.649 s | 8.662 s | 0.087 s | 1,480,962 | 24.340 ms | 138.2 MiB | 60.7 MiB |
+| s3-normal | prefetch_2_parallel_buffer_1 | 2 | 7.352 s | 7.420 s | 0.085 s | 1,742,056 | 15.139 ms | 145.7 MiB | 64.3 MiB |
+| s3-high-latency | lazy_parallel_buffer_1 | 0 | 53.252 s | 53.272 s | 0.218 s | 240,519 | 139.387 ms | 114.5 MiB | 38.1 MiB |
+| s3-high-latency | prefetch_1_parallel_buffer_1 | 1 | 33.432 s | 33.485 s | 0.224 s | 383,108 | 114.093 ms | 132.8 MiB | 57.0 MiB |
+| s3-high-latency | prefetch_2_parallel_buffer_1 | 2 | 20.453 s | 21.570 s | 0.225 s | 626,228 | 47.410 ms | 138.1 MiB | 57.4 MiB |
+| s3-throttled | lazy_parallel_buffer_1 | 0 | 31.450 s | 31.499 s | 0.148 s | 407,256 | 68.151 ms | 115.7 MiB | 39.3 MiB |
+| s3-throttled | prefetch_1_parallel_buffer_1 | 1 | 17.273 s | 17.274 s | 0.147 s | 741,524 | 33.827 ms | 127.8 MiB | 46.2 MiB |
+| s3-throttled | prefetch_2_parallel_buffer_1 | 2 | 17.174 s | 17.176 s | 0.144 s | 745,801 | 34.715 ms | 148.2 MiB | 65.3 MiB |
+
+On this repeated projection matrix, `prefetch_2_parallel_buffer_1` was again
+neutral to slightly faster on local filesystem reads and substantially faster
+on `s3-normal` and `s3-high-latency`. Compared with
+`lazy_parallel_buffer_1`, prefetch depth 2 improved total p50 by 2.13x on
+`s3-normal`, 2.60x on `s3-high-latency`, and 1.83x on `s3-throttled`. On the
+throttled projection case, prefetch depth 1 and 2 were effectively tied on
+total p50, while prefetch depth 2 used about 20.4 MiB more peak RSS than
+prefetch depth 1.
+
+## Sparse-DV Prefetch Sanity Matrix
+
+A sparse-DV sanity run used `s3-normal`, native async only, repetitions set to
+3, the two existing sparse-DV provider-exec workloads, projection and count
+queries, and the lazy, prefetch depth 1, and prefetch depth 2 scheduling
+profiles:
+
+```bash
+target/release/delta_scan_partition_bench \
+  --mode provider-exec \
+  --provider-exec-repetitions 3 \
+  --provider-exec-workload provider_many_small_files_sparse_dv \
+  --provider-exec-query project_id \
+  --provider-exec-backend native_async \
+  --provider-exec-storage-profile s3-normal \
+  --provider-exec-scheduling-profile prefetch_2_parallel_buffer_1 \
+  --output /tmp/delta-provider-sparse-dv-many-small-project-prefetch_2_parallel_buffer_1-rep3.csv
+```
+
+| Workload | Query | Scheduling profile | Total p50 | Total p99 | Time to first batch p50 | Rows/sec p50 | Peak RSS | DV payloads loaded p50 | DV rows deleted p50 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| provider_many_small_files_sparse_dv | project_id | lazy_parallel_buffer_1 | 1.175 s | 1.197 s | 0.090 s | 6,970 | 68.6 MiB | 64 | 64 |
+| provider_many_small_files_sparse_dv | project_id | prefetch_1_parallel_buffer_1 | 0.901 s | 0.903 s | 0.106 s | 9,089 | 71.1 MiB | 64 | 64 |
+| provider_many_small_files_sparse_dv | project_id | prefetch_2_parallel_buffer_1 | 0.775 s | 0.779 s | 0.108 s | 10,565 | 73.8 MiB | 64 | 64 |
+| provider_many_small_files_sparse_dv | count_rows | lazy_parallel_buffer_1 | 1.253 s | 1.272 s | 1.225 s | 6,538 | 72.2 MiB | 64 | 64 |
+| provider_many_small_files_sparse_dv | count_rows | prefetch_1_parallel_buffer_1 | 0.965 s | 0.975 s | 0.937 s | 8,490 | 73.1 MiB | 64 | 64 |
+| provider_many_small_files_sparse_dv | count_rows | prefetch_2_parallel_buffer_1 | 0.847 s | 0.858 s | 0.817 s | 9,673 | 74.0 MiB | 64 | 64 |
+| provider_few_larger_files_sparse_dv | project_id | lazy_parallel_buffer_1 | 0.133 s | 0.135 s | 0.091 s | 245,534 | 65.9 MiB | 4 | 12 |
+| provider_few_larger_files_sparse_dv | project_id | prefetch_1_parallel_buffer_1 | 0.124 s | 0.133 s | 0.091 s | 264,398 | 68.3 MiB | 4 | 12 |
+| provider_few_larger_files_sparse_dv | project_id | prefetch_2_parallel_buffer_1 | 0.122 s | 0.135 s | 0.092 s | 267,885 | 66.6 MiB | 4 | 12 |
+| provider_few_larger_files_sparse_dv | count_rows | lazy_parallel_buffer_1 | 0.197 s | 0.204 s | 0.171 s | 166,605 | 68.8 MiB | 4 | 12 |
+| provider_few_larger_files_sparse_dv | count_rows | prefetch_1_parallel_buffer_1 | 0.202 s | 0.202 s | 0.175 s | 162,607 | 69.3 MiB | 4 | 12 |
+| provider_few_larger_files_sparse_dv | count_rows | prefetch_2_parallel_buffer_1 | 0.200 s | 0.220 s | 0.173 s | 163,994 | 72.3 MiB | 4 | 12 |
+
+The sparse-DV metrics confirm that prefetch did not bypass DV loading or
+masking. Every sparse case loaded and applied the expected DV payload count,
+and deleted the expected number of rows. Prefetch depth 2 helped the
+many-small-files sparse-DV workload by 1.52x for projection and 1.48x for
+count. On the few-larger-files sparse-DV workload, prefetch was neutral for
+projection and slightly slower for count, where only 4 files are available and
+there is little file-open latency to hide.
+
 ## Decision
 
-Keep lazy scheduling as the default.
+Keep the public provider default unchanged, and keep the official-kernel backend
+as the `DeltaProviderScanExecutionOptions::default()` backend for this slice.
 
-This evidence supports retaining the existing production lazy scheduler with
-bounded read admission and a bounded DataFusion output handoff buffer. Parallel
-lazy profiles were materially faster than serial lazy profiles on this local
+For the native async backend specifically, the benchmark evidence supports a
+bounded prefetch profile under remote-object-store-like latency. Parallel lazy
+profiles were materially faster than serial lazy profiles on the local
 small-file matrix. Increasing the output handoff buffer from 1 to 4 was a small
-improvement in this run, but it is not enough evidence to expose a new public
-prefetch scheduler.
+improvement in that run, but file-level prefetch produced the dominant delayed
+storage gains.
 
-Bounded prefetch is available as an internal execution option and benchmark
-profile, but this branch does not make it the default. The delayed HTTP evidence
-shows a clearer native async advantage under object-store-like latency, and the
-focused prefetch runs show that a small bounded prefetch window can hide file
-open and Parquet setup latency on the 12M mimic workload. Keep the default lazy
-until the prefetch path has broader review and at least one repeated benchmark
-run, but this is now a strong candidate for the native async default under
-remote-object-store-like latency.
+The repeated 12M count and projection matrices make
+`prefetch_2_parallel_buffer_1` the best native-async default candidate for
+remote-object-store-like latency. It wins or ties on local reads, wins strongly
+on `s3-normal` and `s3-high-latency`, and wins the count workload on
+`s3-throttled`. The main caution is the throttled projection case, where depth 1
+and depth 2 are effectively tied but depth 2 uses about 20.4 MiB more peak RSS.
+The sparse-DV sanity matrix does not show a correctness or memory blocker for
+depth 2.
+
+The next code slice should make the native-async selected-backend defaults
+match `prefetch_2_parallel_buffer_1`: prefetch depth 2, per-partition file-read
+capacity 3, and scan-wide file-read capacity sized for the scan partition count.
+That change should leave depth 0 available as an explicit lazy override.
