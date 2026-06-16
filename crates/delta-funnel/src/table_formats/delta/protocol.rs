@@ -240,6 +240,7 @@ mod tests {
             name: name.to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
 
         Ok(source)
@@ -250,6 +251,7 @@ mod tests {
             name: name.to_owned(),
             table_uri: table.path.to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         }
     }
 

@@ -728,6 +728,7 @@ mod tests {
             name: source_name.to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?)
     }
 

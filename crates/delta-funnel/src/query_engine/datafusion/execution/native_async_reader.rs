@@ -1269,6 +1269,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
 
@@ -1531,6 +1532,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let read_schema = scan.read_schema();
@@ -1684,6 +1686,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let read_schema = scan.read_schema();
@@ -1748,6 +1751,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let read_schema = scan.read_schema();
@@ -1802,6 +1806,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
@@ -1867,6 +1872,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
@@ -1939,6 +1945,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(3_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
@@ -1983,6 +1990,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let negative = Expr::Literal(ScalarValue::Decimal128(Some(0), 10, 2), None);
         let predicate = datafusion_expr_to_kernel_predicate(&col("amount").lt(negative))?;
@@ -2031,6 +2039,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(3_i32)))?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
@@ -2088,6 +2097,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let projected_columns = vec!["customer_name".to_owned()];
         let scan = build_projected_delta_scan(&source, Some(&projected_columns))?;

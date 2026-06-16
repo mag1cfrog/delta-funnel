@@ -248,6 +248,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let expansion = scan.expand_kernel_scan_metadata(source.table_uri())?;

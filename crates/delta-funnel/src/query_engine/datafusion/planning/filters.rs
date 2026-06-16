@@ -301,6 +301,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let mut provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -645,6 +646,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let mut provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -701,6 +703,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -731,6 +734,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -757,6 +761,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -795,6 +800,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -834,6 +840,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -871,6 +878,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -913,6 +921,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -960,6 +969,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let mut provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1014,6 +1024,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let mut provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1071,6 +1082,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1123,6 +1135,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1176,6 +1189,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let mut provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1235,6 +1249,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1283,6 +1298,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1340,6 +1356,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1400,6 +1417,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1472,6 +1490,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1518,6 +1537,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1554,6 +1574,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1603,6 +1624,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
@@ -1670,6 +1692,7 @@ mod tests {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
             version: None,
+            storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
         let provider = DeltaTableProvider::try_new(source, preflight)?;
