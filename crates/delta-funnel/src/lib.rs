@@ -27,8 +27,9 @@ pub use query_engine::{
     register_delta_sources_with_scan_execution_options,
 };
 pub use table_formats::{
-    DeltaProtocolReport, DeltaSourceConfig, PlannedDeltaSource, ProtocolPreflight,
-    load_delta_source, load_delta_sources, preflight_delta_protocol, preflight_delta_sources,
+    DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,
+    ProtocolPreflight, load_delta_source, load_delta_sources, preflight_delta_protocol,
+    preflight_delta_sources,
 };
 
 /// Current crate version.

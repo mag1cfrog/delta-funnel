@@ -1537,7 +1537,7 @@ mod tests {
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1691,7 +1691,7 @@ mod tests {
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1756,7 +1756,7 @@ mod tests {
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1814,7 +1814,7 @@ mod tests {
             .read_schema()
             .with_provider_enforced_physical_predicate_rows();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1880,7 +1880,7 @@ mod tests {
             .read_schema()
             .with_provider_enforced_physical_predicate_rows();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -1951,7 +1951,7 @@ mod tests {
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -2045,7 +2045,7 @@ mod tests {
         let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -2103,7 +2103,7 @@ mod tests {
         let scan = build_projected_delta_scan(&source, Some(&projected_columns))?;
         let read_schema = scan.read_schema();
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()

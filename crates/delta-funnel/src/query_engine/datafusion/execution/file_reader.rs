@@ -644,7 +644,7 @@ mod tests {
         scan: &crate::table_formats::ProjectedDeltaScan,
     ) -> Result<DeltaScanFileTask, Box<dyn std::error::Error>> {
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()

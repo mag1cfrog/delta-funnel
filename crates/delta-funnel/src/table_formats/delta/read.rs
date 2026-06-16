@@ -480,7 +480,7 @@ mod tests {
         let read_schema = scan.read_schema();
         let reader = test_reader(&source)?;
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()
@@ -534,7 +534,7 @@ mod tests {
         let read_schema = scan.read_schema();
         let reader = test_reader(&source)?;
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri())?
+            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
             .files
             .into_iter()
             .next()

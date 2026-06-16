@@ -262,13 +262,19 @@ impl ProjectedDeltaScan {
     pub(crate) fn expand_kernel_scan_metadata(
         &self,
         table_uri: &str,
+        storage_options: &DeltaStorageOptions,
     ) -> Result<KernelScanMetadataExpansion, delta_kernel::Error> {
         fn collect_scan_file(files: &mut Vec<KernelScanFileMetadata>, file: kernel::ScanFile) {
             files.push(KernelScanFileMetadata::from_kernel_scan_file(file));
         }
 
         let table_url = kernel::try_parse_uri(table_uri)?;
-        let store = kernel::store_from_url_opts(&table_url, std::iter::empty::<(&str, &str)>())?;
+        let store = kernel::store_from_url_opts(
+            &table_url,
+            storage_options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )?;
         let engine = kernel::DefaultEngineBuilder::new(store).build();
         let mut files = Vec::new();
 
@@ -287,9 +293,10 @@ impl ProjectedDeltaScan {
     pub(crate) fn scan_file_paths(
         &self,
         table_uri: &str,
+        storage_options: &DeltaStorageOptions,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let mut paths = self
-            .expand_kernel_scan_metadata(table_uri)?
+            .expand_kernel_scan_metadata(table_uri, storage_options)?
             .files
             .into_iter()
             .map(|file| file.path)
@@ -529,7 +536,7 @@ fn load_delta_source_after_name_validation(
         storage_options,
     } = config;
 
-    let snapshot = load_delta_table_snapshot(&table_uri, version)?;
+    let snapshot = load_delta_table_snapshot(&table_uri, version, &storage_options)?;
 
     Ok(PlannedDeltaSource {
         name,
@@ -554,9 +561,9 @@ mod tests {
 
     use super::kernel::{ColumnName, Expression, Predicate, Scalar};
     use super::{
-        DeltaKernelPredicate, DeltaSourceConfig, ProjectedDeltaScan, build_projected_delta_scan,
-        build_projected_predicated_delta_scan, datafusion_expr_to_kernel_predicate,
-        load_delta_source, load_delta_sources,
+        DeltaKernelPredicate, DeltaSourceConfig, DeltaStorageOptions, ProjectedDeltaScan,
+        build_projected_delta_scan, build_projected_predicated_delta_scan,
+        datafusion_expr_to_kernel_predicate, load_delta_source, load_delta_sources,
     };
     use crate::DeltaFunnelError;
 
@@ -961,8 +968,9 @@ mod tests {
         scan: &ProjectedDeltaScan,
         table_uri: &str,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let storage_options = DeltaStorageOptions::default();
         let mut paths = scan
-            .expand_kernel_scan_metadata(table_uri)?
+            .expand_kernel_scan_metadata(table_uri, &storage_options)?
             .files
             .into_iter()
             .map(|file| file.path)
@@ -981,8 +989,9 @@ mod tests {
         scan: &ProjectedDeltaScan,
         table_uri: &str,
     ) -> Result<Vec<KernelScanFileBoundary>, Box<dyn std::error::Error>> {
+        let storage_options = DeltaStorageOptions::default();
         let mut boundaries = scan
-            .expand_kernel_scan_metadata(table_uri)?
+            .expand_kernel_scan_metadata(table_uri, &storage_options)?
             .files
             .into_iter()
             .map(|file| KernelScanFileBoundary {
@@ -1019,7 +1028,8 @@ mod tests {
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None)?;
 
-        let expansion = scan.expand_kernel_scan_metadata(source.table_uri())?;
+        let expansion =
+            scan.expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?;
 
         assert!(expansion.scan_metadata_exhausted);
         assert_eq!(expansion.files.len(), 1);
@@ -1053,7 +1063,8 @@ mod tests {
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None)?;
 
-        let expansion = scan.expand_kernel_scan_metadata(source.table_uri())?;
+        let expansion =
+            scan.expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?;
 
         assert!(expansion.scan_metadata_exhausted);
         assert!(expansion.files.is_empty());

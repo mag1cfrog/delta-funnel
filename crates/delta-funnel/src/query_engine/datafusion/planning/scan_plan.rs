@@ -17,8 +17,8 @@ use crate::{
     DeltaFunnelError, DeltaProtocolReport,
     error::DeltaScanMetadataExpansionSnafu,
     table_formats::{
-        DeltaKernelPredicate, KernelScanFileMetadata, KernelScanMetadataExpansion,
-        ProjectedDeltaScan,
+        DeltaKernelPredicate, DeltaStorageOptions, KernelScanFileMetadata,
+        KernelScanMetadataExpansion, ProjectedDeltaScan,
     },
 };
 
@@ -45,6 +45,8 @@ pub(crate) struct ProviderScanPlan {
     pub(crate) source_name: String,
     /// Normalized Delta table URI for this source.
     pub(crate) table_uri: String,
+    /// Source-local options forwarded to Delta Kernel object-store construction.
+    pub(crate) storage_options: DeltaStorageOptions,
     /// Resolved Delta snapshot version.
     pub(crate) snapshot_version: u64,
     /// Arrow schema expected from this provider scan.
@@ -83,6 +85,7 @@ pub(crate) struct ProviderScanMetadataExpansion {
 pub(crate) struct ProviderScanPlanParts {
     pub(crate) source_name: String,
     pub(crate) table_uri: String,
+    pub(crate) storage_options: DeltaStorageOptions,
     pub(crate) snapshot_version: u64,
     pub(crate) projected_schema: SchemaRef,
     pub(crate) protocol: DeltaProtocolReport,
@@ -97,6 +100,7 @@ impl ProviderScanPlan {
         Self {
             source_name: parts.source_name,
             table_uri: parts.table_uri,
+            storage_options: parts.storage_options,
             snapshot_version: parts.snapshot_version,
             projected_schema: parts.projected_schema,
             protocol: parts.protocol,
@@ -128,7 +132,7 @@ impl ProviderScanPlan {
             scan_metadata_exhausted,
         } = self
             .kernel_scan
-            .expand_kernel_scan_metadata(&self.table_uri)
+            .expand_kernel_scan_metadata(&self.table_uri, &self.storage_options)
             .context(DeltaScanMetadataExpansionSnafu {
                 source_name: self.source_name.clone(),
                 table_uri: self.table_uri.clone(),
@@ -653,7 +657,8 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
         assert!(plan.kernel_partition_predicate.is_some());
         assert_eq!(
-            plan.kernel_scan().scan_file_paths(&plan.table_uri)?,
+            plan.kernel_scan()
+                .scan_file_paths(&plan.table_uri, &plan.storage_options)?,
             vec!["part-00000.parquet"]
         );
         assert_eq!(plan.projected_schema.field(0).name(), "id");
@@ -707,7 +712,8 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
         assert!(plan.kernel_partition_predicate.is_some());
         assert_eq!(
-            plan.kernel_scan().scan_file_paths(&plan.table_uri)?,
+            plan.kernel_scan()
+                .scan_file_paths(&plan.table_uri, &plan.storage_options)?,
             vec!["part-00000.parquet"]
         );
 
@@ -752,7 +758,7 @@ mod tests {
         assert!(plan.kernel_partition_predicate.is_some());
         assert!(
             plan.kernel_scan()
-                .scan_file_paths(&plan.table_uri)?
+                .scan_file_paths(&plan.table_uri, &plan.storage_options)?
                 .is_empty()
         );
 
@@ -837,7 +843,8 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
         assert!(plan.kernel_partition_predicate.is_some());
         assert_eq!(
-            plan.kernel_scan().scan_file_paths(&plan.table_uri)?,
+            plan.kernel_scan()
+                .scan_file_paths(&plan.table_uri, &plan.storage_options)?,
             vec!["part-00000.parquet", "part-00001.parquet"]
         );
 
