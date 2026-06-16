@@ -6,6 +6,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::DeltaFunnelError;
 
+/// Native async bounded file prefetch depth selected by benchmark evidence.
+pub const NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION: usize = 2;
+
 /// Provider file-reader backend selected for Delta scan execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaProviderReaderBackend {
@@ -417,12 +420,17 @@ impl DeltaProviderScanExecutionOptions {
         max_concurrent_file_reads_per_scan: usize,
         max_concurrent_file_reads_per_partition: usize,
     ) -> Result<Self, DeltaFunnelError> {
+        let native_async_prefetch_file_count_per_partition =
+            default_native_async_prefetch_file_count_per_partition(
+                reader_backend,
+                max_concurrent_file_reads_per_partition,
+            );
         let options = Self {
             reader_backend,
             max_concurrent_file_reads_per_scan,
             max_concurrent_file_reads_per_partition,
             output_buffer_capacity_per_partition: 1,
-            native_async_prefetch_file_count_per_partition: 0,
+            native_async_prefetch_file_count_per_partition,
         };
         options.validate()?;
         Ok(options)
@@ -488,11 +496,25 @@ fn validate_positive(name: &'static str, value: usize) -> Result<(), DeltaFunnel
     Ok(())
 }
 
+fn default_native_async_prefetch_file_count_per_partition(
+    reader_backend: DeltaProviderReaderBackend,
+    max_concurrent_file_reads_per_partition: usize,
+) -> usize {
+    if reader_backend != DeltaProviderReaderBackend::NativeAsync {
+        return 0;
+    }
+
+    max_concurrent_file_reads_per_partition
+        .saturating_sub(1)
+        .min(NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DeltaProviderAsyncReadLimiter, DeltaProviderReaderBackend,
         DeltaProviderScanExecutionOptions, DeltaProviderSyncReadLimiter,
+        NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION,
     };
 
     #[test]
@@ -555,6 +577,52 @@ mod tests {
         assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
         assert_eq!(options.output_buffer_capacity_per_partition, 1);
+        assert_eq!(options.native_async_prefetch_file_count_per_partition, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_backend_defaults_to_bounded_prefetch_when_capacity_allows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            12,
+            3,
+        )?;
+
+        assert_eq!(
+            options.native_async_prefetch_file_count_per_partition,
+            NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_backend_default_prefetch_respects_partition_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            2,
+            2,
+        )?;
+
+        assert_eq!(options.native_async_prefetch_file_count_per_partition, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_backend_can_force_lazy_after_default_prefetch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            12,
+            3,
+        )?
+        .with_native_async_prefetch_file_count_per_partition(0)?;
+
         assert_eq!(options.native_async_prefetch_file_count_per_partition, 0);
 
         Ok(())

@@ -344,7 +344,9 @@ and depth 2 are effectively tied but depth 2 uses about 20.4 MiB more peak RSS.
 The sparse-DV sanity matrix does not show a correctness or memory blocker for
 depth 2.
 
-The next code slice should make the native-async selected-backend defaults
-match `prefetch_2_parallel_buffer_1`: prefetch depth 2, per-partition file-read
-capacity 3, and scan-wide file-read capacity sized for the scan partition count.
-That change should leave depth 0 available as an explicit lazy override.
+The native-async selected-backend defaults now apply a capacity-aware bounded
+prefetch depth. Per-partition file-read capacity 1 stays lazy, capacity 2
+defaults to prefetch depth 1, and capacity 3 or greater defaults to prefetch
+depth 2. This lets callers use the benchmark-backed profile by selecting
+capacity 3 per partition and scan-wide capacity sized for the scan partition
+count, while still allowing depth 0 as an explicit lazy override.
