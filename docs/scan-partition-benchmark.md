@@ -59,13 +59,45 @@ provider execution output. It does not use a benchmark-only reader path.
 
 The provider-exec matrix compares the official kernel backend against the
 native async backend with lazy scheduling. It covers non-DV and sparse-DV
-versions of a many-small-files shape and a fewer-larger-files shape. Each
-workload runs a projection query, a count-style query, and a predicate query
-that exercises provider predicate handling. Each case runs production
-scheduling profiles for serial lazy reads, parallel lazy reads, and parallel
-lazy reads with a larger bounded output handoff buffer. Later #161 slices
-should extend this same mode with a bounded prefetch scheduler only if that
-variant exists in the production native execution path.
+versions of a many-small-files shape, a fewer-larger-files shape, and a
+12,808,140-row `provider_partitioned_event_log_12m` shape based on the
+synthetic partitioned event log model. Each workload runs a projection query, a
+count-style query, and a predicate query that exercises provider predicate
+handling. Each case runs production scheduling profiles for serial lazy reads,
+parallel lazy reads, and parallel lazy reads with a larger bounded output
+handoff buffer. Later #161 slices should extend this same mode with a bounded
+prefetch scheduler only if that variant exists in the production native
+execution path.
+
+Provider-exec mode defaults to local filesystem reads. To compare production
+provider execution under remote-like storage latency, use an opt-in delayed
+HTTP storage facade:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode provider-exec \
+  --provider-exec-storage-profile s3-normal \
+  --provider-exec-workload provider_partitioned_event_log_12m \
+  --provider-exec-query project_event_keys \
+  --provider-exec-backend native_async \
+  --provider-exec-scheduling-profile lazy_parallel_buffer_4 \
+  --provider-exec-repetitions 1 \
+  --output target/delta-provider-exec-s3-normal-project.csv
+```
+
+Supported provider-exec storage profiles are:
+
+- `local`: default local filesystem reads.
+- `s3-normal`: delayed HTTP reads with moderate request latency and about 1
+  Gbps per-request transfer bandwidth.
+- `s3-high-latency`: delayed HTTP reads with higher request latency.
+- `s3-throttled`: delayed HTTP reads with remote-like latency and lower
+  per-request transfer bandwidth.
+
+The delayed HTTP facade is benchmark-only and read-only. It serves the generated
+temporary Delta table through generic HTTP/WebDAV-style object-store requests,
+including `PROPFIND`, `HEAD`, `GET`, and byte ranges. Both provider backends use
+the same delayed HTTP table URI and `allow_http=true` storage option.
 
 Run the opt-in local IO read probe:
 
@@ -226,6 +258,7 @@ important field groups are:
   - `seed`
 - Workload and execution shape:
   - `workload_case`
+  - `provider_exec_storage_profile`
   - `query_case`
   - `reader_backend`
   - `scheduling_mode`
@@ -322,10 +355,16 @@ local scheduler probe. Local IO probing is opt-in and bounded. Host-probe mode
 does not run network or stress probes.
 
 Provider-exec mode is the production read benchmark path. It measures real
-temporary local Delta tables, Parquet decoding, Arrow batch production, provider
+temporary Delta tables, Parquet decoding, Arrow batch production, provider
 backend selection, DataFusion SQL planning, and DataFusion collection. The
-provider-exec mode is local-file based and does not yet inject object-store
-latency or expose a bounded prefetch scheduler. It does compare existing
-production read-admission and output-buffer settings, and it records provider
-owned read stats from the physical Delta scan plan. Any later prefetch work must
-still use production provider execution paths.
+default provider-exec mode is local-file based. Opt-in delayed HTTP storage
+profiles add controlled object-store-like latency and byte-range reads without
+changing the production provider reader path. Provider-exec mode does not expose
+a bounded prefetch scheduler. It does compare existing production
+read-admission and output-buffer settings, and it records provider owned read
+stats from the physical Delta scan plan. Any later prefetch work must still use
+production provider execution paths.
+
+Representative native async backend benchmark notes and the current scheduling
+decision are recorded in
+[`native-async-backend-benchmark-notes.md`](native-async-backend-benchmark-notes.md).

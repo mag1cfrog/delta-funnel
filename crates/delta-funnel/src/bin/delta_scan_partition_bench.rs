@@ -1,19 +1,24 @@
 //! Portable synthetic Delta scan partition benchmark runner.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Days, NaiveDate};
-use datafusion::arrow::array::{ArrayRef, Int32Array, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+    TimestampMicrosecondArray,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use delta_funnel::{
@@ -21,7 +26,7 @@ use delta_funnel::{
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaSourceConfig,
-    DeltaTableProviderConfig, collect_delta_provider_read_stats,
+    DeltaStorageOptions, DeltaTableProviderConfig, collect_delta_provider_read_stats,
     delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic, load_delta_source, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options,
@@ -47,7 +52,7 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 13;
+const BENCHMARK_SCHEMA_VERSION: u32 = 14;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
@@ -55,7 +60,6 @@ const PROVIDER_EXEC_MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const PROVIDER_EXEC_PROTOCOL_JSON: &str =
     r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
 const PROVIDER_EXEC_DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
-const PROVIDER_EXEC_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-provider-exec-benchmark","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const PROVIDER_EXEC_RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
 const PROVIDER_EXEC_RELATIVE_DV_FILE: &str =
     "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
@@ -141,7 +145,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 58] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 59] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -150,6 +154,7 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 58] = [
     "seed",
     "workload_case_count",
     "workload_case",
+    "provider_exec_storage_profile",
     "query_case",
     "reader_backend",
     "scheduling_mode",
@@ -332,27 +337,53 @@ async fn write_provider_exec_benchmark_csv_async(
     config: &ProviderExecConfig,
 ) -> Result<(), Box<dyn Error>> {
     let run_environment = BenchmarkRunEnvironment::local();
-    let workloads = ProviderExecWorkloadCase::standard_cases();
-    let query_cases = ProviderExecQueryCase::standard_cases();
+    let workloads = ProviderExecWorkloadCase::standard_cases()?
+        .into_iter()
+        .filter(|workload| provider_exec_filter_matches(&config.workload_filter, workload.name))
+        .collect::<Vec<_>>();
+    validate_provider_exec_filter_result("workload", &config.workload_filter, workloads.len())?;
     let scheduling_profiles = ProviderExecSchedulingProfile::standard_cases();
+    let scheduling_profiles = scheduling_profiles
+        .into_iter()
+        .filter(|profile| {
+            provider_exec_filter_matches(&config.scheduling_profile_filter, profile.name)
+        })
+        .collect::<Vec<_>>();
+    validate_provider_exec_filter_result(
+        "scheduling profile",
+        &config.scheduling_profile_filter,
+        scheduling_profiles.len(),
+    )?;
     let backends = [
         DeltaProviderReaderBackend::OfficialKernel,
         DeltaProviderReaderBackend::NativeAsync,
-    ];
+    ]
+    .into_iter()
+    .filter(|backend| {
+        provider_exec_filter_matches(&config.backend_filter, provider_exec_backend_name(*backend))
+    })
+    .collect::<Vec<_>>();
+    validate_provider_exec_filter_result("backend", &config.backend_filter, backends.len())?;
     let temp_root = config.temp_dir.clone().unwrap_or_else(env::temp_dir);
 
     writeln!(output, "{}", PROVIDER_EXEC_CSV_HEADER.join(","))?;
     for workload in &workloads {
-        let table = ProviderExecDeltaTable::create(&temp_root, workload)?;
+        let table = ProviderExecDeltaTable::create(&temp_root, workload, config.storage_profile)?;
+        let query_cases = workload
+            .query_cases()
+            .into_iter()
+            .filter(|query| provider_exec_filter_matches(&config.query_filter, query.name))
+            .collect::<Vec<_>>();
+        validate_provider_exec_filter_result("query", &config.query_filter, query_cases.len())?;
         for query in query_cases {
-            for backend in backends {
-                for scheduling_profile in scheduling_profiles {
+            for backend in &backends {
+                for scheduling_profile in &scheduling_profiles {
                     let summary = run_provider_exec_benchmark_case(
                         &table,
                         workload,
                         query,
-                        backend,
-                        scheduling_profile,
+                        *backend,
+                        *scheduling_profile,
                         config,
                     )
                     .await?;
@@ -366,8 +397,8 @@ async fn write_provider_exec_benchmark_csv_async(
                             table: &table,
                             workload,
                             query,
-                            backend,
-                            scheduling_profile,
+                            backend: *backend,
+                            scheduling_profile: *scheduling_profile,
                             summary: &summary,
                         })
                         .join(",")
@@ -403,6 +434,14 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
         output,
         "Use --provider-exec-repetitions <n> with provider-exec mode to choose repeated runs."
     )?;
+    writeln!(
+        output,
+        "Use --provider-exec-storage-profile <local|s3-normal|s3-high-latency|s3-throttled> to add provider-exec storage latency."
+    )?;
+    writeln!(
+        output,
+        "Use --provider-exec-workload, --provider-exec-query, --provider-exec-backend, and --provider-exec-scheduling-profile to run a focused provider-exec case."
+    )?;
     writeln!(output, "The default seed is {DEFAULT_BENCHMARK_SEED}.")?;
     Ok(())
 }
@@ -429,6 +468,19 @@ struct HostProbeLocalIoConfig {
 struct ProviderExecConfig {
     repetitions: usize,
     temp_dir: Option<PathBuf>,
+    storage_profile: ProviderExecStorageProfile,
+    workload_filter: Option<String>,
+    query_filter: Option<String>,
+    backend_filter: Option<String>,
+    scheduling_profile_filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderExecStorageProfile {
+    name: &'static str,
+    open_latency_micros: u64,
+    read_latency_micros: u64,
+    bandwidth_bytes_per_second: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,12 +498,25 @@ struct BenchmarkRunEnvironment {
     available_parallelism: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ProviderExecWorkloadCase {
     name: &'static str,
-    file_count: usize,
-    rows_per_file: usize,
+    schema_kind: ProviderExecSchemaKind,
+    file_specs: Vec<ProviderExecFileSpec>,
     deleted_row_indexes_per_file: &'static [u64],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderExecSchemaKind {
+    SimpleOrders,
+    SyntheticPartitionedEventLog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderExecFileSpec {
+    path: String,
+    rows: usize,
+    partition_date: Option<SyntheticDate>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -471,6 +536,10 @@ struct ProviderExecSchedulingProfile {
 
 struct ProviderExecDeltaTable {
     path: PathBuf,
+    table_uri: String,
+    storage_options: DeltaStorageOptions,
+    storage_profile: ProviderExecStorageProfile,
+    delayed_http_server: Option<ProviderExecDelayedHttpServer>,
     file_count: usize,
     row_count: usize,
     data_file_bytes: u64,
@@ -484,9 +553,27 @@ struct ProviderExecDeletionVector {
     bytes: Vec<u8>,
 }
 
+struct ProviderExecDelayedHttpServer {
+    shutdown: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    url: String,
+}
+
 impl Drop for ProviderExecDeltaTable {
     fn drop(&mut self) {
+        if let Some(server) = &self.delayed_http_server {
+            server.shutdown();
+        }
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+impl Drop for ProviderExecDelayedHttpServer {
+    fn drop(&mut self) {
+        self.shutdown();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -593,6 +680,7 @@ impl BenchmarkRunnerConfig {
         let mut host_probe_local_io = HostProbeLocalIoConfig::default();
         let mut provider_exec = ProviderExecConfig::default();
         let mut mode_seen = false;
+        let mut provider_exec_storage_profile_seen = false;
         let mut seed = DEFAULT_BENCHMARK_SEED;
         let mut show_help = false;
         let mut args = args.into_iter().map(Into::into);
@@ -675,6 +763,68 @@ impl BenchmarkRunnerConfig {
                 })?;
                 validate_provider_exec_repetitions(repetitions)?;
                 provider_exec.repetitions = repetitions;
+            } else if arg == "--provider-exec-storage-profile" {
+                let value = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingProviderExecStorageProfile)?;
+                if provider_exec_storage_profile_seen {
+                    return Err(BenchmarkRunnerConfigError::DuplicateProviderExecStorageProfile);
+                }
+                provider_exec_storage_profile_seen = true;
+                provider_exec.storage_profile = ProviderExecStorageProfile::parse(
+                    &value.to_string_lossy(),
+                )
+                .ok_or_else(|| {
+                    BenchmarkRunnerConfigError::InvalidProviderExecStorageProfile(
+                        value.to_string_lossy().into_owned(),
+                    )
+                })?;
+            } else if arg == "--provider-exec-workload" {
+                let value = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingProviderExecWorkloadFilter)?;
+                if provider_exec
+                    .workload_filter
+                    .replace(value.to_string_lossy().into_owned())
+                    .is_some()
+                {
+                    return Err(BenchmarkRunnerConfigError::DuplicateProviderExecWorkloadFilter);
+                }
+            } else if arg == "--provider-exec-query" {
+                let value = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingProviderExecQueryFilter)?;
+                if provider_exec
+                    .query_filter
+                    .replace(value.to_string_lossy().into_owned())
+                    .is_some()
+                {
+                    return Err(BenchmarkRunnerConfigError::DuplicateProviderExecQueryFilter);
+                }
+            } else if arg == "--provider-exec-backend" {
+                let value = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingProviderExecBackendFilter)?;
+                if provider_exec
+                    .backend_filter
+                    .replace(value.to_string_lossy().into_owned())
+                    .is_some()
+                {
+                    return Err(BenchmarkRunnerConfigError::DuplicateProviderExecBackendFilter);
+                }
+            } else if arg == "--provider-exec-scheduling-profile" {
+                let value = args.next().ok_or(
+                    BenchmarkRunnerConfigError::MissingProviderExecSchedulingProfileFilter,
+                )?;
+                if provider_exec
+                    .scheduling_profile_filter
+                    .replace(value.to_string_lossy().into_owned())
+                    .is_some()
+                {
+                    return Err(
+                        BenchmarkRunnerConfigError::DuplicateProviderExecSchedulingProfileFilter,
+                    );
+                }
             } else if arg == "--seed" {
                 let value = args.next().ok_or(BenchmarkRunnerConfigError::MissingSeed)?;
                 seed = value.to_string_lossy().parse().map_err(|_| {
@@ -714,6 +864,11 @@ impl Default for ProviderExecConfig {
         Self {
             repetitions: DEFAULT_PROVIDER_EXEC_REPETITIONS,
             temp_dir: None,
+            storage_profile: ProviderExecStorageProfile::local(),
+            workload_filter: None,
+            query_filter: None,
+            backend_filter: None,
+            scheduling_profile_filter: None,
         }
     }
 }
@@ -778,66 +933,179 @@ impl BenchmarkRunEnvironment {
     }
 }
 
+impl ProviderExecStorageProfile {
+    fn local() -> Self {
+        Self {
+            name: "local",
+            open_latency_micros: 0,
+            read_latency_micros: 0,
+            bandwidth_bytes_per_second: None,
+        }
+    }
+
+    fn s3_normal() -> Self {
+        Self {
+            name: "s3_normal",
+            open_latency_micros: 8_000,
+            read_latency_micros: 4_000,
+            bandwidth_bytes_per_second: Some(125 * MIB),
+        }
+    }
+
+    fn s3_high_latency() -> Self {
+        Self {
+            name: "s3_high_latency",
+            open_latency_micros: 35_000,
+            read_latency_micros: 20_000,
+            bandwidth_bytes_per_second: Some(100 * MIB),
+        }
+    }
+
+    fn s3_throttled() -> Self {
+        Self {
+            name: "s3_throttled",
+            open_latency_micros: 15_000,
+            read_latency_micros: 8_000,
+            bandwidth_bytes_per_second: Some(32 * MIB),
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "local" => Some(Self::local()),
+            "s3-normal" | "s3_normal" => Some(Self::s3_normal()),
+            "s3-high-latency" | "s3_high_latency" => Some(Self::s3_high_latency()),
+            "s3-throttled" | "s3_throttled" => Some(Self::s3_throttled()),
+            _ => None,
+        }
+    }
+
+    fn uses_delayed_http(self) -> bool {
+        self.open_latency_micros != 0
+            || self.read_latency_micros != 0
+            || self.bandwidth_bytes_per_second.is_some()
+    }
+}
+
 impl ProviderExecWorkloadCase {
-    fn standard_cases() -> Vec<Self> {
-        vec![
-            Self {
-                name: "provider_many_small_files",
-                file_count: 64,
-                rows_per_file: 128,
-                deleted_row_indexes_per_file: &[],
-            },
-            Self {
-                name: "provider_few_larger_files",
-                file_count: 4,
-                rows_per_file: 8_192,
-                deleted_row_indexes_per_file: &[],
-            },
-            Self {
-                name: "provider_many_small_files_sparse_dv",
-                file_count: 64,
-                rows_per_file: 128,
-                deleted_row_indexes_per_file: &[1],
-            },
-            Self {
-                name: "provider_few_larger_files_sparse_dv",
-                file_count: 4,
-                rows_per_file: 8_192,
-                deleted_row_indexes_per_file: &[1, 4_096, 8_191],
-            },
-        ]
+    fn standard_cases() -> Result<Vec<Self>, Box<dyn Error>> {
+        Ok(vec![
+            Self::simple_orders("provider_many_small_files", 64, 128, &[]),
+            Self::simple_orders("provider_few_larger_files", 4, 8_192, &[]),
+            Self::simple_orders("provider_many_small_files_sparse_dv", 64, 128, &[1]),
+            Self::simple_orders(
+                "provider_few_larger_files_sparse_dv",
+                4,
+                8_192,
+                &[1, 4_096, 8_191],
+            ),
+            Self::synthetic_partitioned_event_log()?,
+        ])
     }
 
-    fn row_count(self) -> usize {
-        self.file_count.saturating_mul(self.rows_per_file)
+    fn simple_orders(
+        name: &'static str,
+        file_count: usize,
+        rows_per_file: usize,
+        deleted_row_indexes_per_file: &'static [u64],
+    ) -> Self {
+        let file_specs = (0..file_count)
+            .map(|file_index| ProviderExecFileSpec {
+                path: format!("part-{file_index:05}.parquet"),
+                rows: rows_per_file,
+                partition_date: None,
+            })
+            .collect();
+
+        Self {
+            name,
+            schema_kind: ProviderExecSchemaKind::SimpleOrders,
+            file_specs,
+            deleted_row_indexes_per_file,
+        }
     }
 
-    fn has_deletion_vectors(self) -> bool {
+    fn synthetic_partitioned_event_log() -> Result<Self, Box<dyn Error>> {
+        let workload = SyntheticWorkloadCase::partitioned_event_log_target_shape()?;
+        let file_specs = workload
+            .file_set
+            .files
+            .iter()
+            .map(|file| {
+                let rows = usize::try_from(file.rows)?;
+                Ok(ProviderExecFileSpec {
+                    path: file.path.clone(),
+                    rows,
+                    partition_date: Some(file.partition_date),
+                })
+            })
+            .collect::<Result<Vec<_>, std::num::TryFromIntError>>()?;
+
+        Ok(Self {
+            name: "provider_partitioned_event_log_12m",
+            schema_kind: ProviderExecSchemaKind::SyntheticPartitionedEventLog,
+            file_specs,
+            deleted_row_indexes_per_file: &[],
+        })
+    }
+
+    fn file_count(&self) -> usize {
+        self.file_specs.len()
+    }
+
+    fn row_count(&self) -> usize {
+        self.file_specs
+            .iter()
+            .map(|file| file.rows)
+            .fold(0_usize, usize::saturating_add)
+    }
+
+    fn has_deletion_vectors(&self) -> bool {
         !self.deleted_row_indexes_per_file.is_empty()
     }
 
-    fn deletion_vector_deleted_rows(self) -> usize {
-        self.file_count
+    fn deletion_vector_deleted_rows(&self) -> usize {
+        self.file_count()
             .saturating_mul(self.deleted_row_indexes_per_file.len())
+    }
+
+    fn query_cases(&self) -> [ProviderExecQueryCase; 3] {
+        ProviderExecQueryCase::standard_cases_for_schema(self.schema_kind)
     }
 }
 
 impl ProviderExecQueryCase {
-    fn standard_cases() -> [Self; 3] {
-        [
-            Self {
-                name: "project_id",
-                sql: "select id from orders",
-            },
-            Self {
-                name: "count_rows",
-                sql: "select count(id) from orders",
-            },
-            Self {
-                name: "filter_tail_ids",
-                sql: "select id from orders where id > 4096",
-            },
-        ]
+    fn standard_cases_for_schema(schema_kind: ProviderExecSchemaKind) -> [Self; 3] {
+        match schema_kind {
+            ProviderExecSchemaKind::SimpleOrders => [
+                Self {
+                    name: "project_id",
+                    sql: "select id from orders",
+                },
+                Self {
+                    name: "count_rows",
+                    sql: "select count(id) from orders",
+                },
+                Self {
+                    name: "filter_tail_ids",
+                    sql: "select id from orders where id > 4096",
+                },
+            ],
+            ProviderExecSchemaKind::SyntheticPartitionedEventLog => [
+                Self {
+                    name: "project_event_keys",
+                    sql: "select primary_event_id, group_id, metric_x from orders",
+                },
+                Self {
+                    name: "count_events",
+                    sql: "select count(primary_event_id) from orders",
+                },
+                Self {
+                    name: "filter_recent_events",
+                    sql: "select primary_event_id, category_num from orders where event_year >= 2025",
+                },
+            ],
+        }
     }
 }
 
@@ -873,15 +1141,16 @@ impl ProviderExecDeltaTable {
     fn create(
         temp_root: &std::path::Path,
         workload: &ProviderExecWorkloadCase,
+        storage_profile: ProviderExecStorageProfile,
     ) -> Result<Self, Box<dyn Error>> {
         let path = temp_root.join(unique_benchmark_name(workload.name)?);
         let log_path = path.join("_delta_log");
         fs::create_dir_all(&log_path)?;
 
-        let schema = provider_exec_arrow_schema();
-        let mut add_actions = Vec::with_capacity(workload.file_count);
+        let schema = provider_exec_arrow_schema(workload.schema_kind);
+        let mut add_actions = Vec::with_capacity(workload.file_count());
         let mut data_file_bytes = 0_u64;
-        let mut next_id = 1_usize;
+        let mut next_row_id = 1_usize;
         let deletion_vector = if workload.has_deletion_vectors() {
             Some(provider_exec_deletion_vector_fixture(
                 workload.deleted_row_indexes_per_file,
@@ -890,30 +1159,38 @@ impl ProviderExecDeltaTable {
             None
         };
 
-        for file_index in 0..workload.file_count {
-            let file_path = format!("part-{file_index:05}.parquet");
-            let first_id = next_id;
-            let batch =
-                provider_exec_record_batch(Arc::clone(&schema), first_id, workload.rows_per_file)?;
-            next_id = next_id.saturating_add(workload.rows_per_file);
+        for file in &workload.file_specs {
+            validate_provider_exec_deletion_vector(workload, file)?;
+            let first_row_id = next_row_id;
+            let batch = provider_exec_record_batch(
+                workload.schema_kind,
+                Arc::clone(&schema),
+                file,
+                first_row_id,
+            )?;
+            next_row_id = next_row_id.saturating_add(file.rows);
             let writer_properties = WriterProperties::builder()
-                .set_max_row_group_row_count(Some(workload.rows_per_file))
+                .set_max_row_group_row_count(Some(file.rows))
                 .build();
+            let data_path = path.join(&file.path);
+            if let Some(parent) = data_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             let mut writer = ArrowWriter::try_new(
-                File::create(path.join(&file_path))?,
+                File::create(&data_path)?,
                 Arc::clone(&schema),
                 Some(writer_properties),
             )?;
             writer.write(&batch)?;
             writer.close()?;
 
-            let file_size = fs::metadata(path.join(&file_path))?.len();
+            let file_size = fs::metadata(&data_path)?.len();
             data_file_bytes = data_file_bytes.saturating_add(file_size);
             add_actions.push(provider_exec_add_json(
-                &file_path,
+                workload.schema_kind,
+                file,
                 file_size,
-                first_id,
-                workload.rows_per_file,
+                first_row_id,
                 deletion_vector.as_ref(),
             )?);
         }
@@ -933,20 +1210,44 @@ impl ProviderExecDeltaTable {
 
         fs::write(
             log_path.join("00000000000000000000.json"),
-            format!("{protocol}\n{PROVIDER_EXEC_METADATA_JSON}\n"),
+            format!(
+                "{protocol}\n{}\n",
+                provider_exec_metadata_json(workload.schema_kind)
+            ),
         )?;
         fs::write(
             log_path.join("00000000000000000001.json"),
             format!("{}\n", add_actions.join("\n")),
         )?;
+        let delayed_http_server = if storage_profile.uses_delayed_http() {
+            Some(ProviderExecDelayedHttpServer::start(
+                path.clone(),
+                storage_profile,
+            )?)
+        } else {
+            None
+        };
+        let table_uri = delayed_http_server
+            .as_ref()
+            .map(ProviderExecDelayedHttpServer::url)
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let storage_options = if delayed_http_server.is_some() {
+            provider_exec_delayed_http_storage_options()
+        } else {
+            DeltaStorageOptions::default()
+        };
 
         Ok(Self {
             path,
-            file_count: workload.file_count,
+            table_uri,
+            storage_options,
+            storage_profile,
+            delayed_http_server,
+            file_count: workload.file_count(),
             row_count: workload.row_count(),
             data_file_bytes,
             deletion_vector_file_count: if workload.has_deletion_vectors() {
-                workload.file_count
+                workload.file_count()
             } else {
                 0
             },
@@ -954,6 +1255,510 @@ impl ProviderExecDeltaTable {
             deletion_vector_deleted_rows_per_file: workload.deleted_row_indexes_per_file.len(),
         })
     }
+
+    fn storage_profile_name(&self) -> &'static str {
+        self.storage_profile.name
+    }
+}
+
+fn provider_exec_delayed_http_storage_options() -> DeltaStorageOptions {
+    BTreeMap::from([("allow_http".to_owned(), "true".to_owned())])
+}
+
+impl ProviderExecDelayedHttpServer {
+    fn start(
+        root: PathBuf,
+        storage_profile: ProviderExecStorageProfile,
+    ) -> Result<Self, Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let url = format!("http://{}/", listener.local_addr()?);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            provider_exec_delayed_http_accept_loop(
+                listener,
+                root,
+                storage_profile,
+                worker_shutdown,
+            );
+        });
+
+        Ok(Self {
+            shutdown,
+            handle: Some(handle),
+            url,
+        })
+    }
+
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
+fn provider_exec_delayed_http_accept_loop(
+    listener: TcpListener,
+    root: PathBuf,
+    storage_profile: ProviderExecStorageProfile,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let root = root.clone();
+                let shutdown = Arc::clone(&shutdown);
+                let _ = thread::Builder::new()
+                    .name("delta-provider-exec-http".to_owned())
+                    .spawn(move || {
+                        let _ = provider_exec_delayed_http_handle_connection(
+                            stream,
+                            &root,
+                            storage_profile,
+                            &shutdown,
+                        );
+                    });
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_error) => break,
+        }
+    }
+}
+
+fn provider_exec_delayed_http_handle_connection(
+    mut stream: TcpStream,
+    root: &Path,
+    storage_profile: ProviderExecStorageProfile,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    let request = match provider_exec_delayed_http_read_request(&stream)? {
+        Some(request) => request,
+        None => return Ok(()),
+    };
+    if shutdown.load(Ordering::Relaxed) {
+        let _ = stream.shutdown(Shutdown::Both);
+        return Ok(());
+    }
+
+    provider_exec_delayed_http_sleep(storage_profile.open_latency_micros);
+    match request.method.as_str() {
+        "PROPFIND" => provider_exec_delayed_http_propfind(&mut stream, root, &request),
+        "HEAD" => provider_exec_delayed_http_file_response(
+            &mut stream,
+            root,
+            &request.path,
+            request.headers.get("range").map(String::as_str),
+            true,
+            storage_profile,
+        ),
+        "GET" => provider_exec_delayed_http_file_response(
+            &mut stream,
+            root,
+            &request.path,
+            request.headers.get("range").map(String::as_str),
+            false,
+            storage_profile,
+        ),
+        _ => provider_exec_delayed_http_write_response(
+            stream,
+            405,
+            "Method Not Allowed",
+            &[("Content-Length", "0".to_owned())],
+            &[],
+        ),
+    }
+}
+
+struct ProviderExecDelayedHttpRequest {
+    method: String,
+    path: String,
+    headers: BTreeMap<String, String>,
+}
+
+fn provider_exec_delayed_http_read_request(
+    stream: &TcpStream,
+) -> io::Result<Option<ProviderExecDelayedHttpRequest>> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line)? == 0 {
+        return Ok(None);
+    }
+    let mut parts = request_line.split_whitespace();
+    let Some(method) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(target) = parts.next() else {
+        return Ok(None);
+    };
+    let mut headers = BTreeMap::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_owned());
+        }
+    }
+
+    Ok(Some(ProviderExecDelayedHttpRequest {
+        method: method.to_owned(),
+        path: provider_exec_delayed_http_request_path(target)?,
+        headers,
+    }))
+}
+
+fn provider_exec_delayed_http_request_path(target: &str) -> io::Result<String> {
+    let path = target.split('?').next().unwrap_or_default();
+    let path = path.trim_start_matches('/');
+    let decoded = percent_decode_ascii(path)?;
+    if decoded
+        .split('/')
+        .any(|component| component == ".." || component.contains('\\'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid delayed HTTP path",
+        ));
+    }
+
+    Ok(decoded)
+}
+
+fn provider_exec_delayed_http_propfind(
+    stream: &mut TcpStream,
+    root: &Path,
+    request: &ProviderExecDelayedHttpRequest,
+) -> io::Result<()> {
+    let requested = root.join(&request.path);
+    if !requested.exists() {
+        return provider_exec_delayed_http_write_response(
+            stream,
+            404,
+            "Not Found",
+            &[("Content-Length", "0".to_owned())],
+            &[],
+        );
+    }
+    let depth = request
+        .headers
+        .get("depth")
+        .map(String::as_str)
+        .unwrap_or("infinity");
+    let mut entries = Vec::new();
+    provider_exec_delayed_http_collect_propfind_entries(
+        root,
+        &request.path,
+        &requested,
+        depth != "0",
+        &mut entries,
+    )?;
+    let body = provider_exec_delayed_http_multistatus_xml(&entries)?;
+
+    provider_exec_delayed_http_write_response(
+        stream,
+        207,
+        "Multi-Status",
+        &[
+            ("Content-Type", "application/xml; charset=utf-8".to_owned()),
+            ("Content-Length", body.len().to_string()),
+        ],
+        body.as_bytes(),
+    )
+}
+
+struct ProviderExecDelayedHttpPropfindEntry {
+    href: String,
+    size: u64,
+    is_dir: bool,
+    modified: SystemTime,
+}
+
+fn provider_exec_delayed_http_collect_propfind_entries(
+    root: &Path,
+    relative_path: &str,
+    path: &Path,
+    recursive: bool,
+    entries: &mut Vec<ProviderExecDelayedHttpPropfindEntry>,
+) -> io::Result<()> {
+    let metadata = fs::metadata(path)?;
+    entries.push(ProviderExecDelayedHttpPropfindEntry {
+        href: format!("/{}", relative_path.trim_start_matches('/')),
+        size: if metadata.is_file() {
+            metadata.len()
+        } else {
+            0
+        },
+        is_dir: metadata.is_dir(),
+        modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+    });
+
+    if metadata.is_dir() && recursive {
+        let mut children = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        children.sort_by_key(|entry| entry.path());
+        for child in children {
+            let child_path = child.path();
+            let child_relative_path = child_path
+                .strip_prefix(root)
+                .map_err(|_| io::Error::other("delayed HTTP path escaped root"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            provider_exec_delayed_http_collect_propfind_entries(
+                root,
+                &child_relative_path,
+                &child_path,
+                recursive,
+                entries,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn provider_exec_delayed_http_multistatus_xml(
+    entries: &[ProviderExecDelayedHttpPropfindEntry],
+) -> io::Result<String> {
+    let mut xml = String::from(r#"<?xml version="1.0" encoding="utf-8"?><multistatus>"#);
+    for entry in entries {
+        let href = xml_escape(&entry.href);
+        let modified = provider_exec_http_date(entry.modified);
+        let resource_type = if entry.is_dir {
+            "<resourcetype><collection/></resourcetype>"
+        } else {
+            "<resourcetype/>"
+        };
+        xml.push_str(&format!(
+            "<response><href>{href}</href><propstat><prop><getlastmodified>{modified}</getlastmodified><getcontentlength>{}</getcontentlength>{resource_type}<getetag>\"{}\"</getetag></prop><status>HTTP/1.1 200 OK</status></propstat></response>",
+            entry.size,
+            provider_exec_etag(entry.size, entry.modified)?
+        ));
+    }
+    xml.push_str("</multistatus>");
+    Ok(xml)
+}
+
+fn provider_exec_delayed_http_file_response(
+    stream: &mut TcpStream,
+    root: &Path,
+    request_path: &str,
+    range_header: Option<&str>,
+    head_only: bool,
+    storage_profile: ProviderExecStorageProfile,
+) -> io::Result<()> {
+    let path = root.join(request_path);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => {
+            return provider_exec_delayed_http_write_response(
+                stream,
+                404,
+                "Not Found",
+                &[("Content-Length", "0".to_owned())],
+                &[],
+            );
+        }
+    };
+    let size = metadata.len();
+    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+    let range = provider_exec_delayed_http_parse_range(range_header, size)?;
+    let (status_code, status_text, start, end) = match range {
+        Some((start, end)) => (206, "Partial Content", start, end),
+        None => (200, "OK", 0, size),
+    };
+    let content_len = end.saturating_sub(start);
+    let mut headers = vec![
+        ("Accept-Ranges", "bytes".to_owned()),
+        ("Content-Length", content_len.to_string()),
+        ("Last-Modified", provider_exec_http_date(modified)),
+        (
+            "ETag",
+            format!("\"{}\"", provider_exec_etag(size, modified)?),
+        ),
+    ];
+    if status_code == 206 {
+        headers.push((
+            "Content-Range",
+            format!("bytes {start}-{}/{}", end.saturating_sub(1), size),
+        ));
+    }
+
+    provider_exec_delayed_http_sleep(storage_profile.read_latency_micros);
+    provider_exec_delayed_http_sleep(provider_exec_transfer_delay_micros(
+        content_len,
+        storage_profile.bandwidth_bytes_per_second,
+    ));
+
+    if head_only {
+        return provider_exec_delayed_http_write_response(
+            stream,
+            status_code,
+            status_text,
+            &headers,
+            &[],
+        );
+    }
+
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut body = Vec::new();
+    file.take(content_len).read_to_end(&mut body)?;
+    provider_exec_delayed_http_write_response(stream, status_code, status_text, &headers, &body)
+}
+
+fn provider_exec_delayed_http_parse_range(
+    range_header: Option<&str>,
+    size: u64,
+) -> io::Result<Option<(u64, u64)>> {
+    let Some(range_header) = range_header else {
+        return Ok(None);
+    };
+    let Some(range) = range_header.strip_prefix("bytes=") else {
+        return Ok(None);
+    };
+    if let Some(suffix) = range.strip_prefix('-') {
+        let suffix_len = suffix.parse::<u64>().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP suffix range")
+        })?;
+        let start = size.saturating_sub(suffix_len);
+        return Ok(Some((start, size)));
+    }
+    let (start, end) = range.split_once('-').unwrap_or((range, ""));
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP range start"))?;
+    let end = if end.is_empty() {
+        size
+    } else {
+        end.parse::<u64>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP range end"))?
+            .saturating_add(1)
+            .min(size)
+    };
+    if start > end || end > size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid HTTP range bounds",
+        ));
+    }
+
+    Ok(Some((start, end)))
+}
+
+fn provider_exec_delayed_http_write_response(
+    mut stream: impl Write,
+    status_code: u16,
+    status_text: &str,
+    headers: &[(&str, String)],
+    body: &[u8],
+) -> io::Result<()> {
+    write!(stream, "HTTP/1.1 {status_code} {status_text}\r\n")?;
+    write!(stream, "Connection: close\r\n")?;
+    for (key, value) in headers {
+        write!(stream, "{key}: {value}\r\n")?;
+    }
+    write!(stream, "\r\n")?;
+    stream.write_all(body)
+}
+
+fn provider_exec_delayed_http_sleep(micros: u64) {
+    if micros != 0 {
+        thread::sleep(Duration::from_micros(micros));
+    }
+}
+
+fn provider_exec_transfer_delay_micros(bytes: u64, bandwidth_bytes_per_second: Option<u64>) -> u64 {
+    let Some(bandwidth) = bandwidth_bytes_per_second else {
+        return 0;
+    };
+    if bandwidth == 0 {
+        return 0;
+    }
+
+    u128_to_u64_saturating(u128::from(bytes) * 1_000_000 / u128::from(bandwidth))
+}
+
+fn provider_exec_http_date(time: SystemTime) -> String {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let Some(datetime) = chrono::DateTime::from_timestamp(i64::try_from(seconds).unwrap_or(0), 0)
+    else {
+        return "Thu, 01 Jan 1970 00:00:00 GMT".to_owned();
+    };
+
+    datetime.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+fn provider_exec_etag(size: u64, modified: SystemTime) -> io::Result<String> {
+    let modified_nanos = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    Ok(format!("{size:x}-{modified_nanos:x}"))
+}
+
+fn percent_decode_ascii(value: &str) -> io::Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid percent encoding",
+                ));
+            }
+            let high = hex_value(bytes[index + 1])?;
+            let low = hex_value(bytes[index + 2])?;
+            decoded.push(high * 16 + low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    String::from_utf8(decoded).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn hex_value(byte: u8) -> io::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid hex digit",
+        )),
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            character => escaped.push(character),
+        }
+    }
+
+    escaped
 }
 
 async fn run_provider_exec_benchmark_case(
@@ -979,10 +1784,10 @@ async fn run_provider_exec_once(
     scheduling_profile: ProviderExecSchedulingProfile,
 ) -> Result<ProviderExecRunMeasurement, Box<dyn Error>> {
     let ctx = SessionContext::new();
-    let source = load_delta_source(DeltaSourceConfig::new(
-        "orders",
-        table.path.to_string_lossy().to_string(),
-    ))?;
+    let source = load_delta_source(
+        DeltaSourceConfig::new("orders", table.table_uri.clone())
+            .with_storage_options(table.storage_options.clone()),
+    )?;
     let protocol = preflight_delta_protocol(&source)?;
     let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
         backend,
@@ -1340,6 +2145,7 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         input.seed.to_string(),
         input.workload_case_count.to_string(),
         input.workload.name.to_owned(),
+        input.table.storage_profile_name().to_owned(),
         input.query.name.to_owned(),
         provider_exec_backend_name(input.backend).to_owned(),
         input.scheduling_profile.name.to_owned(),
@@ -1412,14 +2218,77 @@ fn provider_exec_backend_name(backend: DeltaProviderReaderBackend) -> &'static s
     }
 }
 
-fn provider_exec_arrow_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("customer_name", DataType::Utf8, true),
-    ]))
+fn provider_exec_filter_matches(filter: &Option<String>, candidate: &str) -> bool {
+    filter.as_deref().is_none_or(|filter| filter == candidate)
+}
+
+fn validate_provider_exec_filter_result(
+    filter_name: &str,
+    filter: &Option<String>,
+    match_count: usize,
+) -> Result<(), Box<dyn Error>> {
+    if match_count == 0
+        && let Some(filter) = filter
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("provider-exec {filter_name} filter `{filter}` did not match any case"),
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn provider_exec_arrow_schema(schema_kind: ProviderExecSchemaKind) -> SchemaRef {
+    match schema_kind {
+        ProviderExecSchemaKind::SimpleOrders => Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("customer_name", DataType::Utf8, true),
+        ])),
+        ProviderExecSchemaKind::SyntheticPartitionedEventLog => Arc::new(Schema::new(
+            synthetic_columns()
+                .into_iter()
+                .map(|column| {
+                    Field::new(
+                        column.name,
+                        provider_exec_arrow_data_type(column.data_type),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )),
+    }
+}
+
+fn provider_exec_arrow_data_type(data_type: SyntheticDataType) -> DataType {
+    match data_type {
+        SyntheticDataType::String => DataType::Utf8,
+        SyntheticDataType::Int => DataType::Int32,
+        SyntheticDataType::Double => DataType::Float64,
+        SyntheticDataType::Bigint => DataType::Int64,
+        SyntheticDataType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+        SyntheticDataType::Boolean => DataType::Boolean,
+    }
 }
 
 fn provider_exec_record_batch(
+    schema_kind: ProviderExecSchemaKind,
+    schema: SchemaRef,
+    file: &ProviderExecFileSpec,
+    first_row_id: usize,
+) -> Result<RecordBatch, Box<dyn Error>> {
+    match schema_kind {
+        ProviderExecSchemaKind::SimpleOrders => {
+            provider_exec_simple_orders_record_batch(schema, first_row_id, file.rows)
+        }
+        ProviderExecSchemaKind::SyntheticPartitionedEventLog => {
+            provider_exec_synthetic_record_batch(schema, file, first_row_id)
+        }
+    }
+}
+
+fn provider_exec_simple_orders_record_batch(
     schema: SchemaRef,
     first_id: usize,
     rows: usize,
@@ -1438,18 +2307,165 @@ fn provider_exec_record_batch(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn provider_exec_add_json(
-    path: &str,
-    size: u64,
-    first_id: usize,
+fn provider_exec_synthetic_record_batch(
+    schema: SchemaRef,
+    file: &ProviderExecFileSpec,
+    first_row_id: usize,
+) -> Result<RecordBatch, Box<dyn Error>> {
+    let partition_date = file.partition_date.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "synthetic provider-exec file is missing its partition date",
+        )
+    })?;
+    let columns = synthetic_columns()
+        .into_iter()
+        .map(|column| {
+            provider_exec_synthetic_column_array(column, partition_date, first_row_id, file.rows)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+fn provider_exec_synthetic_column_array(
+    column: ColumnShape,
+    partition_date: SyntheticDate,
+    first_row_id: usize,
     rows: usize,
+) -> Result<ArrayRef, Box<dyn Error>> {
+    let row_ids = first_row_id..first_row_id.saturating_add(rows);
+    let array = match column.data_type {
+        SyntheticDataType::String => Arc::new(StringArray::from(
+            row_ids
+                .map(|row_id| provider_exec_synthetic_string_value(column.name, row_id))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
+        SyntheticDataType::Int => Arc::new(Int32Array::from(
+            row_ids
+                .map(|row_id| {
+                    provider_exec_synthetic_int_value(column.name, partition_date, row_id)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )) as ArrayRef,
+        SyntheticDataType::Double => Arc::new(Float64Array::from(
+            row_ids
+                .map(|row_id| provider_exec_synthetic_double_value(column.name, row_id))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
+        SyntheticDataType::Bigint => Arc::new(Int64Array::from(
+            row_ids
+                .map(|row_id| provider_exec_synthetic_bigint_value(column.name, row_id))
+                .collect::<Result<Vec<_>, _>>()?,
+        )) as ArrayRef,
+        SyntheticDataType::Timestamp => Arc::new(TimestampMicrosecondArray::from(
+            row_ids
+                .map(|row_id| provider_exec_synthetic_timestamp_value(partition_date, row_id))
+                .collect::<Result<Vec<_>, _>>()?,
+        )) as ArrayRef,
+        SyntheticDataType::Boolean => Arc::new(BooleanArray::from(
+            row_ids
+                .map(|row_id| Some(!row_id.is_multiple_of(7)))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
+    };
+
+    Ok(array)
+}
+
+fn provider_exec_synthetic_string_value(column_name: &str, row_id: usize) -> Option<String> {
+    match column_name {
+        "primary_event_id" => Some(format!("event-{row_id:012}")),
+        "group_id" => Some(format!("group-{:05}", row_id % 34_500)),
+        "secondary_event_id" => Some(format!("secondary-{row_id:012}")),
+        "source_kind" => Some(["web", "mobile", "api", "batch"][row_id % 4].to_owned()),
+        "category_code" => Some(format!("category-{:04}", row_id % 4_096)),
+        "optional_group_key" if row_id.is_multiple_of(11) => None,
+        "optional_group_key" => Some(format!("optional-{:05}", row_id % 12_000)),
+        "quality_tier" => Some(["bronze", "silver", "gold", "platinum"][row_id % 4].to_owned()),
+        "group_code" => Some(format!("group-code-{:02}", row_id % 50)),
+        _ => Some(format!("{column_name}-{}", row_id % 10_000)),
+    }
+}
+
+fn provider_exec_synthetic_int_value(
+    column_name: &str,
+    partition_date: SyntheticDate,
+    row_id: usize,
+) -> Result<Option<i32>, Box<dyn Error>> {
+    let value = match column_name {
+        "event_year" => partition_date.year,
+        "event_month" => i32::from(partition_date.month),
+        "event_day" => i32::from(partition_date.day),
+        "event_processed_year" | "category_processed_year" | "record_processed_year" => {
+            partition_date.year
+        }
+        "event_processed_month" | "category_processed_month" | "record_processed_month" => {
+            i32::from(partition_date.month)
+        }
+        "event_processed_day" | "category_processed_day" | "record_processed_day" => {
+            i32::from(partition_date.day)
+        }
+        _ => i32::try_from(row_id % 10_000)?,
+    };
+
+    Ok(Some(value))
+}
+
+fn provider_exec_synthetic_double_value(column_name: &str, row_id: usize) -> Option<f64> {
+    let scale = match column_name {
+        "metric_x" => 0.25,
+        "metric_y" => 0.5,
+        "metric_z" => 0.75,
+        _ => 1.0,
+    };
+
+    Some((row_id % 1_000_000) as f64 * scale)
+}
+
+fn provider_exec_synthetic_bigint_value(
+    column_name: &str,
+    row_id: usize,
+) -> Result<Option<i64>, Box<dyn Error>> {
+    let value = match column_name {
+        "actor_numeric_id" => row_id % 11_900,
+        "category_num" => row_id % 4_096,
+        _ => row_id,
+    };
+
+    Ok(Some(i64::try_from(value)?))
+}
+
+fn provider_exec_synthetic_timestamp_value(
+    partition_date: SyntheticDate,
+    row_id: usize,
+) -> Result<Option<i64>, Box<dyn Error>> {
+    let days = i64::from(partition_date.year.saturating_sub(1970))
+        .saturating_mul(365)
+        .saturating_add(
+            i64::from(partition_date.month)
+                .saturating_sub(1)
+                .saturating_mul(31),
+        )
+        .saturating_add(i64::from(partition_date.day).saturating_sub(1));
+    let micros_per_day = 86_400_000_000_i64;
+    let micros_within_day = i64::try_from(row_id % 86_400)?.saturating_mul(1_000_000);
+
+    Ok(Some(
+        days.saturating_mul(micros_per_day)
+            .saturating_add(micros_within_day),
+    ))
+}
+
+fn provider_exec_add_json(
+    schema_kind: ProviderExecSchemaKind,
+    file: &ProviderExecFileSpec,
+    size: u64,
+    first_row_id: usize,
     deletion_vector: Option<&ProviderExecDeletionVector>,
 ) -> Result<String, Box<dyn Error>> {
-    let max_id = first_id.saturating_add(rows).saturating_sub(1);
-    let min_id = i32::try_from(first_id)?;
-    let max_id = i32::try_from(max_id)?;
-    let min_customer = format!("customer-{first_id}");
-    let max_customer = format!("customer-{max_id}");
+    let stats = provider_exec_stats_json(schema_kind, file, first_row_id)?;
+    let escaped_stats = json_string_escape(&stats);
     let deletion_vector_json = deletion_vector
         .map(|deletion_vector| {
             let descriptor = &deletion_vector.descriptor;
@@ -1465,8 +2481,136 @@ fn provider_exec_add_json(
         .unwrap_or_default();
 
     Ok(format!(
-        r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":{PROVIDER_EXEC_MODIFICATION_TIME_MS},"dataChange":true,"stats":"{{\"numRecords\":{rows},\"minValues\":{{\"id\":{min_id},\"customer_name\":\"{min_customer}\"}},\"maxValues\":{{\"id\":{max_id},\"customer_name\":\"{max_customer}\"}},\"nullCount\":{{\"id\":0,\"customer_name\":0}}}}"{deletion_vector_json}}}}}"#
+        r#"{{"add":{{"path":"{}","partitionValues":{{}},"size":{size},"modificationTime":{PROVIDER_EXEC_MODIFICATION_TIME_MS},"dataChange":true,"stats":"{escaped_stats}"{deletion_vector_json}}}}}"#,
+        json_string_escape(&file.path)
     ))
+}
+
+fn provider_exec_stats_json(
+    schema_kind: ProviderExecSchemaKind,
+    file: &ProviderExecFileSpec,
+    first_row_id: usize,
+) -> Result<String, Box<dyn Error>> {
+    match schema_kind {
+        ProviderExecSchemaKind::SimpleOrders => {
+            let max_id = first_row_id.saturating_add(file.rows).saturating_sub(1);
+            let min_id = i32::try_from(first_row_id)?;
+            let max_id = i32::try_from(max_id)?;
+            let min_customer = format!("customer-{first_row_id}");
+            let max_customer = format!("customer-{max_id}");
+
+            Ok(format!(
+                r#"{{"numRecords":{},"minValues":{{"id":{min_id},"customer_name":"{min_customer}"}},"maxValues":{{"id":{max_id},"customer_name":"{max_customer}"}},"nullCount":{{"id":0,"customer_name":0}}}}"#,
+                file.rows
+            ))
+        }
+        ProviderExecSchemaKind::SyntheticPartitionedEventLog => {
+            let partition_date = file.partition_date.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "synthetic provider-exec file is missing its partition date",
+                )
+            })?;
+
+            Ok(format!(
+                r#"{{"numRecords":{},"minValues":{{"event_year":{},"event_month":{},"event_day":{}}},"maxValues":{{"event_year":{},"event_month":{},"event_day":{}}},"nullCount":{{"event_year":0,"event_month":0,"event_day":0}}}}"#,
+                file.rows,
+                partition_date.year,
+                partition_date.month,
+                partition_date.day,
+                partition_date.year,
+                partition_date.month,
+                partition_date.day
+            ))
+        }
+    }
+}
+
+fn provider_exec_metadata_json(schema_kind: ProviderExecSchemaKind) -> String {
+    let schema_string = provider_exec_delta_schema_json(schema_kind);
+    let escaped_schema = json_string_escape(&schema_string);
+
+    format!(
+        r#"{{"metaData":{{"id":"delta-funnel-provider-exec-benchmark","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{escaped_schema}","partitionColumns":[],"configuration":{{}},"createdTime":1587968585495}}}}"#
+    )
+}
+
+fn provider_exec_delta_schema_json(schema_kind: ProviderExecSchemaKind) -> String {
+    let fields = match schema_kind {
+        ProviderExecSchemaKind::SimpleOrders => vec![
+            provider_exec_delta_field_json("id", "integer", false),
+            provider_exec_delta_field_json("customer_name", "string", true),
+        ],
+        ProviderExecSchemaKind::SyntheticPartitionedEventLog => synthetic_columns()
+            .into_iter()
+            .map(|column| {
+                provider_exec_delta_field_json(
+                    column.name,
+                    provider_exec_delta_data_type(column.data_type),
+                    true,
+                )
+            })
+            .collect(),
+    };
+
+    format!(r#"{{"type":"struct","fields":[{}]}}"#, fields.join(","))
+}
+
+fn provider_exec_delta_field_json(name: &str, data_type: &str, nullable: bool) -> String {
+    format!(
+        r#"{{"name":"{}","type":"{data_type}","nullable":{nullable},"metadata":{{}}}}"#,
+        json_string_escape(name)
+    )
+}
+
+fn provider_exec_delta_data_type(data_type: SyntheticDataType) -> &'static str {
+    match data_type {
+        SyntheticDataType::String => "string",
+        SyntheticDataType::Int => "integer",
+        SyntheticDataType::Double => "double",
+        SyntheticDataType::Bigint => "long",
+        SyntheticDataType::Timestamp => "timestamp",
+        SyntheticDataType::Boolean => "boolean",
+    }
+}
+
+fn validate_provider_exec_deletion_vector(
+    workload: &ProviderExecWorkloadCase,
+    file: &ProviderExecFileSpec,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(max_deleted_row_index) = workload.deleted_row_indexes_per_file.iter().max()
+        && *max_deleted_row_index >= u64::try_from(file.rows)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "provider-exec deletion vector row index {max_deleted_row_index} exceeds file row count {}",
+                file.rows
+            ),
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn json_string_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => escaped.push(character),
+        }
+    }
+
+    escaped
 }
 
 fn provider_exec_deletion_vector_fixture(
@@ -1686,6 +2830,17 @@ enum BenchmarkRunnerConfigError {
     MissingProviderExecRepetitions,
     InvalidProviderExecRepetitions(String),
     ProviderExecRepetitionsOutOfRange(usize),
+    MissingProviderExecStorageProfile,
+    InvalidProviderExecStorageProfile(String),
+    DuplicateProviderExecStorageProfile,
+    MissingProviderExecWorkloadFilter,
+    DuplicateProviderExecWorkloadFilter,
+    MissingProviderExecQueryFilter,
+    DuplicateProviderExecQueryFilter,
+    MissingProviderExecBackendFilter,
+    DuplicateProviderExecBackendFilter,
+    MissingProviderExecSchedulingProfileFilter,
+    DuplicateProviderExecSchedulingProfileFilter,
     MissingSeed,
     InvalidSeed(String),
     UnknownArgument(String),
@@ -1750,6 +2905,53 @@ impl fmt::Display for BenchmarkRunnerConfigError {
             Self::ProviderExecRepetitionsOutOfRange(value) => write!(
                 formatter,
                 "--provider-exec-repetitions value `{value}` must be between 1 and {MAX_PROVIDER_EXEC_REPETITIONS}"
+            ),
+            Self::MissingProviderExecStorageProfile => write!(
+                formatter,
+                "--provider-exec-storage-profile requires a profile name"
+            ),
+            Self::InvalidProviderExecStorageProfile(value) => write!(
+                formatter,
+                "invalid --provider-exec-storage-profile value `{value}`; expected `local`, `s3-normal`, `s3-high-latency`, or `s3-throttled`"
+            ),
+            Self::DuplicateProviderExecStorageProfile => write!(
+                formatter,
+                "--provider-exec-storage-profile may be provided only once"
+            ),
+            Self::MissingProviderExecWorkloadFilter => {
+                write!(
+                    formatter,
+                    "--provider-exec-workload requires a workload name"
+                )
+            }
+            Self::DuplicateProviderExecWorkloadFilter => {
+                write!(
+                    formatter,
+                    "--provider-exec-workload may be provided only once"
+                )
+            }
+            Self::MissingProviderExecQueryFilter => {
+                write!(formatter, "--provider-exec-query requires a query name")
+            }
+            Self::DuplicateProviderExecQueryFilter => {
+                write!(formatter, "--provider-exec-query may be provided only once")
+            }
+            Self::MissingProviderExecBackendFilter => {
+                write!(formatter, "--provider-exec-backend requires a backend name")
+            }
+            Self::DuplicateProviderExecBackendFilter => {
+                write!(
+                    formatter,
+                    "--provider-exec-backend may be provided only once"
+                )
+            }
+            Self::MissingProviderExecSchedulingProfileFilter => write!(
+                formatter,
+                "--provider-exec-scheduling-profile requires a scheduling profile name"
+            ),
+            Self::DuplicateProviderExecSchedulingProfileFilter => write!(
+                formatter,
+                "--provider-exec-scheduling-profile may be provided only once"
             ),
             Self::MissingSeed => write!(formatter, "--seed requires a u64 value"),
             Self::InvalidSeed(value) => write!(formatter, "invalid --seed value `{value}`"),
@@ -3996,6 +5198,16 @@ mod tests {
             "target",
             "--provider-exec-repetitions",
             "5",
+            "--provider-exec-storage-profile",
+            "s3-normal",
+            "--provider-exec-workload",
+            "provider_partitioned_event_log_12m",
+            "--provider-exec-query",
+            "count_events",
+            "--provider-exec-backend",
+            "native_async",
+            "--provider-exec-scheduling-profile",
+            "lazy_parallel_buffer_4",
         ])?;
 
         assert_eq!(config.mode, BenchmarkMode::ProviderExec);
@@ -4004,6 +5216,11 @@ mod tests {
             ProviderExecConfig {
                 repetitions: 5,
                 temp_dir: Some(PathBuf::from("target")),
+                storage_profile: ProviderExecStorageProfile::s3_normal(),
+                workload_filter: Some("provider_partitioned_event_log_12m".to_owned()),
+                query_filter: Some("count_events".to_owned()),
+                backend_filter: Some("native_async".to_owned()),
+                scheduling_profile_filter: Some("lazy_parallel_buffer_4".to_owned()),
             }
         );
 
@@ -4146,6 +5363,75 @@ mod tests {
             BenchmarkRunnerConfig::parse(["--provider-exec-repetitions", "0"]),
             Err(BenchmarkRunnerConfigError::ProviderExecRepetitionsOutOfRange(0))
         );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-storage-profile"]),
+            Err(BenchmarkRunnerConfigError::MissingProviderExecStorageProfile)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-storage-profile", "mars"]),
+            Err(BenchmarkRunnerConfigError::InvalidProviderExecStorageProfile("mars".to_owned()))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--provider-exec-storage-profile",
+                "local",
+                "--provider-exec-storage-profile",
+                "s3-normal"
+            ]),
+            Err(BenchmarkRunnerConfigError::DuplicateProviderExecStorageProfile)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-workload"]),
+            Err(BenchmarkRunnerConfigError::MissingProviderExecWorkloadFilter)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--provider-exec-workload",
+                "a",
+                "--provider-exec-workload",
+                "b"
+            ]),
+            Err(BenchmarkRunnerConfigError::DuplicateProviderExecWorkloadFilter)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-query"]),
+            Err(BenchmarkRunnerConfigError::MissingProviderExecQueryFilter)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--provider-exec-query",
+                "a",
+                "--provider-exec-query",
+                "b"
+            ]),
+            Err(BenchmarkRunnerConfigError::DuplicateProviderExecQueryFilter)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-backend"]),
+            Err(BenchmarkRunnerConfigError::MissingProviderExecBackendFilter)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--provider-exec-backend",
+                "a",
+                "--provider-exec-backend",
+                "b"
+            ]),
+            Err(BenchmarkRunnerConfigError::DuplicateProviderExecBackendFilter)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-scheduling-profile"]),
+            Err(BenchmarkRunnerConfigError::MissingProviderExecSchedulingProfileFilter)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--provider-exec-scheduling-profile",
+                "a",
+                "--provider-exec-scheduling-profile",
+                "b"
+            ]),
+            Err(BenchmarkRunnerConfigError::DuplicateProviderExecSchedulingProfileFilter)
+        );
     }
 
     #[test]
@@ -4164,6 +5450,8 @@ mod tests {
         assert!(usage.contains("The default mode is synthetic."));
         assert!(usage.contains("Use --host-probe-local-io"));
         assert!(usage.contains("Use --provider-exec-repetitions"));
+        assert!(usage.contains("Use --provider-exec-storage-profile"));
+        assert!(usage.contains("Use --provider-exec-workload"));
         assert!(usage.contains("The default seed is 0."));
 
         Ok(())
@@ -4187,7 +5475,7 @@ mod tests {
 
         assert_eq!(lines.len(), 1111);
         assert!(lines[0].starts_with("benchmark_schema_version,benchmark_mode,host_os,host_arch"));
-        assert!(csv.contains("\n13,synthetic,"));
+        assert!(csv.contains("\n14,synthetic,"));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
@@ -4223,7 +5511,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "13");
+        assert_eq!(row[0], "14");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[5], "42");
         assert_eq!(row[6], "0");
@@ -4303,7 +5591,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "13");
+        assert_eq!(row[0], "14");
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
@@ -5230,6 +6518,7 @@ mod tests {
     fn provider_exec_csv_header_contains_latency_signals() {
         assert_eq!(PROVIDER_EXEC_CSV_HEADER[0], "benchmark_schema_version");
         assert_eq!(PROVIDER_EXEC_CSV_HEADER[1], "benchmark_mode");
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_exec_storage_profile"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"scan_target_partitions"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"max_concurrent_file_reads_per_scan"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"max_concurrent_file_reads_per_partition"));
@@ -5248,14 +6537,20 @@ mod tests {
     }
 
     #[test]
-    fn provider_exec_cases_cover_non_dv_sparse_dv_and_predicate_queries() {
-        let workloads = ProviderExecWorkloadCase::standard_cases();
+    fn provider_exec_cases_cover_non_dv_sparse_dv_mimic_and_predicate_queries()
+    -> Result<(), Box<dyn Error>> {
+        let workloads = ProviderExecWorkloadCase::standard_cases()?;
         let workload_names = workloads
             .iter()
             .map(|workload| workload.name)
             .collect::<Vec<_>>();
-        let query_cases = ProviderExecQueryCase::standard_cases();
-        let query_names = query_cases
+        let simple_query_cases = workloads[0].query_cases();
+        let simple_query_names = simple_query_cases
+            .iter()
+            .map(|query| query.name)
+            .collect::<Vec<_>>();
+        let synthetic_query_cases = workloads[4].query_cases();
+        let synthetic_query_names = synthetic_query_cases
             .iter()
             .map(|query| query.name)
             .collect::<Vec<_>>();
@@ -5271,15 +6566,25 @@ mod tests {
                 "provider_many_small_files",
                 "provider_few_larger_files",
                 "provider_many_small_files_sparse_dv",
-                "provider_few_larger_files_sparse_dv"
+                "provider_few_larger_files_sparse_dv",
+                "provider_partitioned_event_log_12m"
             ]
         );
         assert_eq!(workloads[0].deletion_vector_deleted_rows(), 0);
         assert_eq!(workloads[2].deletion_vector_deleted_rows(), 64);
         assert_eq!(workloads[3].deletion_vector_deleted_rows(), 12);
-        assert!(query_names.contains(&"project_id"));
-        assert!(query_names.contains(&"count_rows"));
-        assert!(query_names.contains(&"filter_tail_ids"));
+        assert_eq!(
+            workloads[4].schema_kind,
+            ProviderExecSchemaKind::SyntheticPartitionedEventLog
+        );
+        assert_eq!(workloads[4].file_count(), 956);
+        assert_eq!(workloads[4].row_count(), 12_808_140);
+        assert!(simple_query_names.contains(&"project_id"));
+        assert!(simple_query_names.contains(&"count_rows"));
+        assert!(simple_query_names.contains(&"filter_tail_ids"));
+        assert!(synthetic_query_names.contains(&"project_event_keys"));
+        assert!(synthetic_query_names.contains(&"count_events"));
+        assert!(synthetic_query_names.contains(&"filter_recent_events"));
         assert_eq!(
             scheduling_profile_names,
             [
@@ -5292,18 +6597,216 @@ mod tests {
             scheduling_profiles[2].output_buffer_capacity_per_partition,
             4
         );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_exec_synthetic_schema_matches_target_mimic_columns() {
+        let schema =
+            provider_exec_arrow_schema(ProviderExecSchemaKind::SyntheticPartitionedEventLog);
+        let field_names = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(schema.fields().len(), synthetic_columns().len());
+        assert!(field_names.contains(&"primary_event_id"));
+        assert!(field_names.contains(&"metric_x"));
+        assert!(field_names.contains(&"event_year"));
+        assert!(field_names.contains(&"validation_flag"));
+        let event_time = match schema.field_with_name("event_time") {
+            Ok(field) => field,
+            Err(error) => panic!("event_time field missing: {error}"),
+        };
+        assert_eq!(
+            event_time.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+    }
+
+    #[test]
+    fn provider_exec_creates_synthetic_mimic_delta_table() -> Result<(), Box<dyn Error>> {
+        let partition_date = SyntheticDate {
+            year: 2026,
+            month: 6,
+            day: 12,
+        };
+        let workload = ProviderExecWorkloadCase {
+            name: "test_provider_synthetic_mimic",
+            schema_kind: ProviderExecSchemaKind::SyntheticPartitionedEventLog,
+            file_specs: vec![ProviderExecFileSpec {
+                path: synthetic_file_path(partition_date, 0),
+                rows: 16,
+                partition_date: Some(partition_date),
+            }],
+            deleted_row_indexes_per_file: &[],
+        };
+
+        let table = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile::local(),
+        )?;
+        let source = load_delta_source(
+            DeltaSourceConfig::new("orders", table.table_uri.clone())
+                .with_storage_options(table.storage_options.clone()),
+        )?;
+        let _protocol = preflight_delta_protocol(&source)?;
+        let metadata_log =
+            fs::read_to_string(table.path.join("_delta_log/00000000000000000000.json"))?;
+
+        assert_eq!(table.file_count, 1);
+        assert_eq!(table.row_count, 16);
+        assert!(metadata_log.contains("primary_event_id"));
+        assert!(metadata_log.contains("validation_flag"));
+        assert!(
+            table
+                .path
+                .join(synthetic_file_path(partition_date, 0))
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_exec_reads_synthetic_mimic_table_with_both_backends() -> Result<(), Box<dyn Error>>
+    {
+        let partition_date = SyntheticDate {
+            year: 2026,
+            month: 6,
+            day: 12,
+        };
+        let workload = ProviderExecWorkloadCase {
+            name: "test_provider_synthetic_mimic_read",
+            schema_kind: ProviderExecSchemaKind::SyntheticPartitionedEventLog,
+            file_specs: vec![ProviderExecFileSpec {
+                path: synthetic_file_path(partition_date, 0),
+                rows: 16,
+                partition_date: Some(partition_date),
+            }],
+            deleted_row_indexes_per_file: &[],
+        };
+        let table = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile::local(),
+        )?;
+        let query = workload.query_cases()[0];
+        let scheduling_profile = ProviderExecSchedulingProfile {
+            name: "test_lazy_serial",
+            scan_target_partitions: 1,
+            max_concurrent_file_reads_per_scan: 1,
+            max_concurrent_file_reads_per_partition: 1,
+            output_buffer_capacity_per_partition: 1,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        for backend in [
+            DeltaProviderReaderBackend::OfficialKernel,
+            DeltaProviderReaderBackend::NativeAsync,
+        ] {
+            let measurement = runtime.block_on(run_provider_exec_once(
+                &table,
+                query,
+                backend,
+                scheduling_profile,
+            ))?;
+            assert_eq!(measurement.produced_rows, 16);
+            assert!(measurement.produced_batches > 0);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_exec_reads_synthetic_mimic_table_over_delayed_http() -> Result<(), Box<dyn Error>> {
+        let partition_date = SyntheticDate {
+            year: 2026,
+            month: 6,
+            day: 12,
+        };
+        let workload = ProviderExecWorkloadCase {
+            name: "test_provider_synthetic_mimic_delayed_http",
+            schema_kind: ProviderExecSchemaKind::SyntheticPartitionedEventLog,
+            file_specs: vec![ProviderExecFileSpec {
+                path: synthetic_file_path(partition_date, 0),
+                rows: 16,
+                partition_date: Some(partition_date),
+            }],
+            deleted_row_indexes_per_file: &[],
+        };
+        let table = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile {
+                name: "test_delayed_http",
+                open_latency_micros: 1_000,
+                read_latency_micros: 1_000,
+                bandwidth_bytes_per_second: None,
+            },
+        )?;
+        let query = workload.query_cases()[1];
+        let scheduling_profile = ProviderExecSchedulingProfile {
+            name: "test_lazy_serial",
+            scan_target_partitions: 1,
+            max_concurrent_file_reads_per_scan: 1,
+            max_concurrent_file_reads_per_partition: 1,
+            output_buffer_capacity_per_partition: 1,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        assert!(table.table_uri.starts_with("http://127.0.0.1:"));
+        assert_eq!(
+            table.storage_options.get("allow_http").map(String::as_str),
+            Some("true")
+        );
+        for backend in [
+            DeltaProviderReaderBackend::OfficialKernel,
+            DeltaProviderReaderBackend::NativeAsync,
+        ] {
+            let measurement = runtime.block_on(run_provider_exec_once(
+                &table,
+                query,
+                backend,
+                scheduling_profile,
+            ))?;
+            assert_eq!(measurement.produced_rows, 1);
+            assert_eq!(measurement.produced_batches, 1);
+        }
+
+        Ok(())
     }
 
     #[test]
     fn provider_exec_csv_row_matches_header_width_and_dv_fields() {
         let workload = ProviderExecWorkloadCase {
             name: "test_sparse_dv",
-            file_count: 2,
-            rows_per_file: 8,
+            schema_kind: ProviderExecSchemaKind::SimpleOrders,
+            file_specs: vec![
+                ProviderExecFileSpec {
+                    path: "part-00000.parquet".to_owned(),
+                    rows: 8,
+                    partition_date: None,
+                },
+                ProviderExecFileSpec {
+                    path: "part-00001.parquet".to_owned(),
+                    rows: 8,
+                    partition_date: None,
+                },
+            ],
             deleted_row_indexes_per_file: &[1, 7],
         };
         let table = ProviderExecDeltaTable {
             path: PathBuf::from("target/nonexistent-provider-exec-test"),
+            table_uri: "target/nonexistent-provider-exec-test".to_owned(),
+            storage_options: DeltaStorageOptions::default(),
+            storage_profile: ProviderExecStorageProfile::local(),
+            delayed_http_server: None,
             file_count: 2,
             row_count: 16,
             data_file_bytes: 1024,
@@ -5370,7 +6873,7 @@ mod tests {
                 available_parallelism: Some(8),
             },
             seed: 7,
-            workload_case_count: 4,
+            workload_case_count: 5,
             table: &table,
             workload: &workload,
             query: ProviderExecQueryCase {
@@ -5389,23 +6892,24 @@ mod tests {
         });
 
         assert_eq!(row.len(), PROVIDER_EXEC_CSV_HEADER.len());
-        assert_eq!(row[0], "13");
+        assert_eq!(row[0], "14");
         assert_eq!(row[7], "test_sparse_dv");
-        assert_eq!(row[9], "native_async");
-        assert_eq!(row[10], "lazy_parallel_buffer_4");
-        assert_eq!(row[11], "4");
+        assert_eq!(row[8], "local");
+        assert_eq!(row[10], "native_async");
+        assert_eq!(row[11], "lazy_parallel_buffer_4");
         assert_eq!(row[12], "4");
-        assert_eq!(row[13], "1");
-        assert_eq!(row[14], "4");
-        assert_eq!(row[19], "2");
-        assert_eq!(row[20], "4");
-        assert_eq!(row[21], "2");
-        assert_eq!(row[22], "1");
-        assert_eq!(row[23], "true");
-        assert_eq!(row[26], "16");
-        assert_eq!(row[30], "2");
-        assert_eq!(row[33], "12");
-        assert_eq!(row[39], "12");
+        assert_eq!(row[13], "4");
+        assert_eq!(row[14], "1");
+        assert_eq!(row[15], "4");
+        assert_eq!(row[20], "2");
+        assert_eq!(row[21], "4");
+        assert_eq!(row[22], "2");
+        assert_eq!(row[23], "1");
+        assert_eq!(row[24], "true");
+        assert_eq!(row[27], "16");
+        assert_eq!(row[31], "2");
+        assert_eq!(row[34], "12");
+        assert_eq!(row[40], "12");
     }
 
     #[test]
@@ -5528,7 +7032,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "13");
+        assert_eq!(row[0], "14");
         assert_eq!(row[1], "synthetic");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
