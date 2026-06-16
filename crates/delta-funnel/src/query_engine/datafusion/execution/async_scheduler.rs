@@ -129,13 +129,14 @@ where
         Some(self.reader.start_file_read(task, permit).await)
     }
 
-    /// Starts opening one future file without borrowing the scheduler.
+    /// Schedules one future file for bounded prefetch without borrowing the scheduler.
     ///
-    /// This is used only by the bounded prefetch stream adapter. Creating the
-    /// future admits the task to the prefetch window, but permits are still
-    /// acquired inside the future before reader work starts. Dropping the
+    /// This is used only by the bounded prefetch stream adapter. Calling this
+    /// method removes one task from the pending queue and returns a future. The
+    /// returned future starts opening that file only when it is polled: permits
+    /// are acquired inside the future before reader work starts. Dropping the
     /// future cancels setup and releases any permit already acquired.
-    pub(crate) fn start_prefetch_file(
+    pub(crate) fn schedule_prefetch_file(
         &mut self,
     ) -> Option<DeltaProviderAsyncFileReadFuture<Output>> {
         let task = self.file_tasks.pop_front()?;
@@ -521,7 +522,7 @@ mod tests {
         );
 
         let prefetched = scheduler
-            .start_prefetch_file()
+            .schedule_prefetch_file()
             .ok_or("expected prefetched file future")?;
 
         assert_eq!(scheduler.admitted_file_tasks(), 1);
@@ -554,7 +555,7 @@ mod tests {
             ),
         );
         let mut prefetched = scheduler
-            .start_prefetch_file()
+            .schedule_prefetch_file()
             .ok_or("expected prefetched file future")?;
 
         tokio::select! {

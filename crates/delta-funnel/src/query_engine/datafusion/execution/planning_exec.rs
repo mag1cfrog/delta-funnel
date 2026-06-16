@@ -590,7 +590,7 @@ fn refill_native_async_prefetch_queue(
     target_in_flight: usize,
 ) {
     while in_flight.len() < target_in_flight {
-        let Some(file) = scheduler.start_prefetch_file() else {
+        let Some(file) = scheduler.schedule_prefetch_file() else {
             return;
         };
         in_flight.push_back(file);
