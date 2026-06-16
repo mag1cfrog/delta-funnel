@@ -416,7 +416,7 @@ fn native_async_scan_partition_stream(
             ),
         );
         if prefetch_file_count > 0 {
-            return native_async_prefetch_scan_partition(
+            return native_async_scan_partition_with_file_prefetch(
                 output,
                 scheduler,
                 prefetch_file_count,
@@ -474,25 +474,41 @@ fn native_async_scan_partition_stream(
     builder.build()
 }
 
-/// Executes one native async scan partition with bounded file-stream prefetch.
+type NativeAsyncPartitionScheduler = DeltaProviderAsyncPartitionReadScheduler<
+    DeltaScanFileTask,
+    DeltaNativeAsyncFileReadStream,
+    DeltaNativeAsyncPartitionFileReader,
+>;
+type NativeAsyncPrefetchQueue =
+    FuturesOrdered<DeltaProviderAsyncFileReadFuture<DeltaNativeAsyncFileReadStream>>;
+type NativeAsyncFileSetupResult = Result<DeltaNativeAsyncFileReadStream, DeltaFunnelError>;
+type NativeAsyncReadyFileSetups = VecDeque<NativeAsyncFileSetupResult>;
+
+enum NativeAsyncFileDrainResult {
+    FileCompleted,
+    OutputClosed,
+}
+
+enum NativeAsyncPrefetchPollResult {
+    CurrentBatch(Result<Option<RecordBatch>, DeltaFunnelError>),
+    PrefetchedFileSetupCompleted,
+}
+
+/// Executes one native async scan partition with bounded file-stream setup prefetch.
 ///
 /// The active file still drives output ordering: batches are emitted only from
 /// the current file stream. Prefetch only overlaps opening later file streams
 /// and Parquet setup while the current stream is producing batches. The bound
 /// is one current file plus `prefetch_file_count` additional ready or in-flight
 /// file streams for this execution partition.
-async fn native_async_prefetch_scan_partition(
+async fn native_async_scan_partition_with_file_prefetch(
     output: Sender<DataFusionResult<RecordBatch>>,
-    mut scheduler: DeltaProviderAsyncPartitionReadScheduler<
-        DeltaScanFileTask,
-        DeltaNativeAsyncFileReadStream,
-        DeltaNativeAsyncPartitionFileReader,
-    >,
+    mut scheduler: NativeAsyncPartitionScheduler,
     prefetch_file_count: usize,
     read_stats: Arc<DeltaProviderReadStats>,
 ) -> DataFusionResult<()> {
     let mut in_flight = FuturesOrdered::new();
-    let mut ready_file_streams = VecDeque::new();
+    let mut ready_file_setups = VecDeque::new();
     // Before there is a current file, fill the queue with the first file plus
     // the configured prefetch window.
     refill_native_async_prefetch_queue(
@@ -501,75 +517,149 @@ async fn native_async_prefetch_scan_partition(
         prefetch_file_count.saturating_add(1),
     );
 
+    // `is_closed` is an early cancellation hint. The send result below is the
+    // authoritative close check because the receiver can close after this
+    // snapshot.
     while !output.is_closed() {
-        let file_stream = match ready_file_streams.pop_front() {
-            Some(file_stream) => file_stream,
-            None => {
-                let Some(file_stream) = in_flight.next().await else {
-                    read_stats.record_scan_partition_completed();
-                    return Ok(());
-                };
-                file_stream
-            }
+        let Some(file_stream) =
+            take_next_native_async_file_setup(&mut ready_file_setups, &mut in_flight).await
+        else {
+            read_stats.record_scan_partition_completed();
+            return Ok(());
         };
         refill_native_async_prefetch_queue(
             &mut scheduler,
             &mut in_flight,
-            // A ready prefetched stream already holds a file permit and counts
-            // against the prefetch window even though it is not producing
-            // output yet.
-            prefetch_file_count.saturating_sub(ready_file_streams.len()),
+            remaining_native_async_prefetch_capacity(prefetch_file_count, &ready_file_setups),
         );
         let mut file_stream = native_async_file_stream_from_result(file_stream, &read_stats)?;
 
-        while !output.is_closed() {
-            let next_batch = if ready_file_streams.is_empty() && !in_flight.is_empty() {
-                let next_prefetched_file = in_flight.next();
-                tokio::pin!(next_prefetched_file);
-                tokio::select! {
-                    next_batch = file_stream.next_batch() => next_batch,
-                    next_prefetched_file = &mut next_prefetched_file => {
-                        if let Some(next_prefetched_file) = next_prefetched_file {
-                            ready_file_streams.push_back(next_prefetched_file);
-                        }
-                        refill_native_async_prefetch_queue(
-                            &mut scheduler,
-                            &mut in_flight,
-                            // Keep ready streams and in-flight setup together
-                            // within the configured prefetch window.
-                            prefetch_file_count.saturating_sub(ready_file_streams.len()),
-                        );
-                        continue;
-                    }
-                }
-            } else {
-                file_stream.next_batch().await
-            };
-            record_deletion_vector_read_stats(
-                read_stats.as_ref(),
-                file_stream.take_deletion_vector_stats(),
-            );
-            let batch = match next_batch {
-                Ok(Some(batch)) => batch,
-                Ok(None) => break,
-                Err(error) => {
-                    record_deletion_vector_read_error(read_stats.as_ref(), &error);
-                    return Err(DataFusionError::from(error));
-                }
-            };
-            let rows = batch.num_rows();
-            if output.send(Ok(batch)).await.is_err() {
-                return Ok(());
-            }
-            read_stats.record_batch_produced(rows);
+        match drain_native_async_current_file_with_prefetch(
+            &output,
+            &mut file_stream,
+            &mut scheduler,
+            &mut in_flight,
+            &mut ready_file_setups,
+            prefetch_file_count,
+            read_stats.as_ref(),
+        )
+        .await?
+        {
+            NativeAsyncFileDrainResult::FileCompleted => read_stats.record_file_completed(),
+            NativeAsyncFileDrainResult::OutputClosed => return Ok(()),
         }
-        if output.is_closed() {
-            return Ok(());
-        }
-        read_stats.record_file_completed();
     }
 
     Ok(())
+}
+
+async fn take_next_native_async_file_setup(
+    ready_file_setups: &mut NativeAsyncReadyFileSetups,
+    in_flight: &mut NativeAsyncPrefetchQueue,
+) -> Option<NativeAsyncFileSetupResult> {
+    match ready_file_setups.pop_front() {
+        Some(file_setup) => Some(file_setup),
+        None => in_flight.next().await,
+    }
+}
+
+async fn drain_native_async_current_file_with_prefetch(
+    output: &Sender<DataFusionResult<RecordBatch>>,
+    file_stream: &mut DeltaNativeAsyncFileReadStream,
+    scheduler: &mut NativeAsyncPartitionScheduler,
+    in_flight: &mut NativeAsyncPrefetchQueue,
+    ready_file_setups: &mut NativeAsyncReadyFileSetups,
+    prefetch_file_count: usize,
+    read_stats: &DeltaProviderReadStats,
+) -> DataFusionResult<NativeAsyncFileDrainResult> {
+    // `is_closed` is an early cancellation hint. The send result below is the
+    // authoritative close check because the receiver can close after this
+    // snapshot.
+    while !output.is_closed() {
+        let next_batch = match poll_native_async_current_batch_or_prefetch_setup(
+            file_stream,
+            scheduler,
+            in_flight,
+            ready_file_setups,
+            prefetch_file_count,
+        )
+        .await
+        {
+            NativeAsyncPrefetchPollResult::CurrentBatch(next_batch) => next_batch,
+            NativeAsyncPrefetchPollResult::PrefetchedFileSetupCompleted => continue,
+        };
+        record_deletion_vector_read_stats(read_stats, file_stream.take_deletion_vector_stats());
+        let batch = match next_batch {
+            Ok(Some(batch)) => batch,
+            Ok(None) => return Ok(NativeAsyncFileDrainResult::FileCompleted),
+            Err(error) => {
+                record_deletion_vector_read_error(read_stats, &error);
+                return Err(DataFusionError::from(error));
+            }
+        };
+        let rows = batch.num_rows();
+        if output.send(Ok(batch)).await.is_err() {
+            return Ok(NativeAsyncFileDrainResult::OutputClosed);
+        }
+        read_stats.record_batch_produced(rows);
+    }
+
+    Ok(NativeAsyncFileDrainResult::OutputClosed)
+}
+
+/// Polls either the current file for one batch or one future-file setup.
+///
+/// When there is already a ready prefetched file, the prefetch window is full
+/// enough and the current file gets polled directly. Otherwise this races the
+/// current batch against the oldest in-flight file setup. If setup completes
+/// first, it is saved in `ready_file_setups` and the caller should poll again
+/// without emitting a batch.
+async fn poll_native_async_current_batch_or_prefetch_setup(
+    file_stream: &mut DeltaNativeAsyncFileReadStream,
+    scheduler: &mut NativeAsyncPartitionScheduler,
+    in_flight: &mut NativeAsyncPrefetchQueue,
+    ready_file_setups: &mut NativeAsyncReadyFileSetups,
+    prefetch_file_count: usize,
+) -> NativeAsyncPrefetchPollResult {
+    if !ready_file_setups.is_empty() || in_flight.is_empty() {
+        return NativeAsyncPrefetchPollResult::CurrentBatch(file_stream.next_batch().await);
+    }
+
+    let next_file_setup = in_flight.next();
+    tokio::pin!(next_file_setup);
+    // This select is the prefetch overlap point. It polls the current file for
+    // the next record batch and, at the same time, polls the oldest scheduled
+    // future-file setup. If file setup wins, the resulting stream is held in
+    // `ready_file_setups` until the current file finishes; no batches are read
+    // from that prefetched stream yet.
+    tokio::select! {
+        next_batch = file_stream.next_batch() => {
+            NativeAsyncPrefetchPollResult::CurrentBatch(next_batch)
+        }
+        completed_file_setup = &mut next_file_setup => {
+            if let Some(completed_file_setup) = completed_file_setup {
+                ready_file_setups.push_back(completed_file_setup);
+            }
+            refill_native_async_prefetch_queue(
+                scheduler,
+                in_flight,
+                remaining_native_async_prefetch_capacity(
+                    prefetch_file_count,
+                    ready_file_setups,
+                ),
+            );
+            NativeAsyncPrefetchPollResult::PrefetchedFileSetupCompleted
+        }
+    }
+}
+
+fn remaining_native_async_prefetch_capacity(
+    prefetch_file_count: usize,
+    ready_file_setups: &NativeAsyncReadyFileSetups,
+) -> usize {
+    // A ready prefetched stream already holds a file permit and counts against
+    // the prefetch window even though it is not producing output yet.
+    prefetch_file_count.saturating_sub(ready_file_setups.len())
 }
 
 /// Refills ordered native async file setup up to the requested in-flight target.
@@ -579,14 +669,8 @@ async fn native_async_prefetch_scan_partition(
 /// so file streams are consumed in planned file order even when later setup
 /// could complete first.
 fn refill_native_async_prefetch_queue(
-    scheduler: &mut DeltaProviderAsyncPartitionReadScheduler<
-        DeltaScanFileTask,
-        DeltaNativeAsyncFileReadStream,
-        DeltaNativeAsyncPartitionFileReader,
-    >,
-    in_flight: &mut FuturesOrdered<
-        DeltaProviderAsyncFileReadFuture<DeltaNativeAsyncFileReadStream>,
-    >,
+    scheduler: &mut NativeAsyncPartitionScheduler,
+    in_flight: &mut NativeAsyncPrefetchQueue,
     target_in_flight: usize,
 ) {
     while in_flight.len() < target_in_flight {
