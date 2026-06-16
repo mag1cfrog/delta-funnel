@@ -419,7 +419,7 @@ impl ProviderDeletionVectorSelection {
             .partition_point(|row_index| *row_index < self.consumed_row_count);
         if consumed_deleted < self.deleted_row_indexes.len() {
             return Err(kernel::DeltaKernelError::generic(format!(
-                "selection vector has {} unconsumed deleted row indexes after file completion",
+                "selection vector has {} unconsumed entries after file completion (deleted row indexes)",
                 self.deleted_row_indexes.len() - consumed_deleted
             )))
             .context(DeltaScanDeletionVectorSnafu {
@@ -695,10 +695,8 @@ mod tests {
             display.contains("selection-vector length mismatch"),
             "{display}"
         );
-        assert!(
-            display.contains("unconsumed deleted row indexes"),
-            "{display}"
-        );
+        assert!(display.contains("unconsumed entries"), "{display}");
+        assert!(display.contains("deleted row indexes"), "{display}");
 
         Ok(())
     }
