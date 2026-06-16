@@ -5579,7 +5579,7 @@ mod tests {
 
         assert_eq!(lines.len(), 1111);
         assert!(lines[0].starts_with("benchmark_schema_version,benchmark_mode,host_os,host_arch"));
-        assert!(csv.contains("\n14,synthetic,"));
+        assert!(csv.contains(&format!("\n{BENCHMARK_SCHEMA_VERSION},synthetic,")));
         assert!(csv.contains(",partitioned_event_log_target_shape,"));
         assert!(csv.contains(",many_tiny_files,"));
         assert!(csv.contains(",mixed_tiny_large_files,"));
@@ -5615,7 +5615,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "14");
+        assert_eq!(row[0], BENCHMARK_SCHEMA_VERSION.to_string());
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[5], "42");
         assert_eq!(row[6], "0");
@@ -5695,7 +5695,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "14");
+        assert_eq!(row[0], BENCHMARK_SCHEMA_VERSION.to_string());
         assert_eq!(row[1], "host_probe");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
@@ -6767,7 +6767,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_exec_synthetic_schema_matches_target_mimic_columns() {
+    fn provider_exec_synthetic_schema_matches_target_mimic_columns() -> Result<(), Box<dyn Error>> {
         let schema =
             provider_exec_arrow_schema(ProviderExecSchemaKind::SyntheticPartitionedEventLog);
         let field_names = schema
@@ -6781,14 +6781,13 @@ mod tests {
         assert!(field_names.contains(&"metric_x"));
         assert!(field_names.contains(&"event_year"));
         assert!(field_names.contains(&"validation_flag"));
-        let event_time = match schema.field_with_name("event_time") {
-            Ok(field) => field,
-            Err(error) => panic!("event_time field missing: {error}"),
-        };
+        let event_time = schema.field_with_name("event_time")?;
         assert_eq!(
             event_time.data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
+
+        Ok(())
     }
 
     #[test]
@@ -7206,7 +7205,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), BENCHMARK_CSV_HEADER.len());
-        assert_eq!(row[0], "14");
+        assert_eq!(row[0], BENCHMARK_SCHEMA_VERSION.to_string());
         assert_eq!(row[1], "synthetic");
         assert_eq!(row[2], "test-os");
         assert_eq!(row[3], "test-arch");
