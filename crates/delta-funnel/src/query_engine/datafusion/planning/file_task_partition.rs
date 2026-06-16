@@ -4,7 +4,7 @@
 //! partitions without touching file contents. The plan keeps all selected file
 //! tasks in memory because this MVP needs a complete metadata view to balance
 //! tasks by bytes or file count. Each task remains whole, preserving per-file
-//! Delta correctness metadata for later read execution.
+//! Delta correctness metadata for read execution.
 
 use crate::{DeltaFunnelError, error::DeltaScanFileTaskPartitionPlanningSnafu};
 
@@ -180,7 +180,7 @@ fn validate_partition_options(
 /// Verifies that all file tasks belong to the same provider scan context.
 ///
 /// Partition planning consumes tasks as one scan unit, so mixed sources,
-/// tables, or snapshot versions would make later execution diagnostics and
+/// tables, or snapshot versions would make execution diagnostics and
 /// recovery ambiguous.
 fn validate_file_task_context(
     source_name: &str,
