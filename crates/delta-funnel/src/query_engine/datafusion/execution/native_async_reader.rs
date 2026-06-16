@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Array, StructArray, new_null_array,
+    Array, ArrayRef, BooleanArray, Int64Array, ListArray, StructArray, new_null_array,
 };
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, SchemaRef};
@@ -741,6 +741,9 @@ enum NativeAsyncFieldPlan {
     Struct {
         children: Vec<NativeAsyncStructChild>,
     },
+    List {
+        element_plan: Box<NativeAsyncFieldPlan>,
+    },
 }
 
 impl NativeAsyncFieldPlan {
@@ -1037,6 +1040,16 @@ fn build_matched_field_plan(
                 path,
             )
         }
+        (DataType::List(provider_element), DataType::List(file_element)) => {
+            build_matched_list_field_plan(
+                provider_field,
+                provider_element,
+                file_field,
+                file_element,
+                parquet_field,
+                path,
+            )
+        }
         _ if file_field
             .data_type()
             .equals_datatype(provider_field.data_type()) =>
@@ -1048,6 +1061,60 @@ fn build_matched_field_plan(
             provider_field.data_type(),
             file_field.data_type()
         ))),
+    }
+}
+
+fn build_matched_list_field_plan(
+    provider_field: &Field,
+    provider_element: &Arc<Field>,
+    file_field: &Field,
+    file_element: &Arc<Field>,
+    parquet_field: &parquet::schema::types::Type,
+    path: &str,
+) -> Result<NativeAsyncFieldPlan, delta_kernel::Error> {
+    let element_path = format!("{path}.element");
+    let parquet_element = parquet_list_element_field(parquet_field, path)?;
+    let element_plan = build_matched_field_plan(
+        provider_element.as_ref(),
+        file_element.as_ref(),
+        parquet_element,
+        &element_path,
+    )?;
+
+    let needs_reshape =
+        file_field.data_type() != provider_field.data_type() || !element_plan.is_identity();
+
+    if needs_reshape {
+        Ok(NativeAsyncFieldPlan::List {
+            element_plan: Box::new(element_plan),
+        })
+    } else {
+        Ok(NativeAsyncFieldPlan::Identity)
+    }
+}
+
+fn parquet_list_element_field<'a>(
+    parquet_field: &'a parquet::schema::types::Type,
+    path: &str,
+) -> Result<&'a parquet::schema::types::Type, delta_kernel::Error> {
+    let parquet_children = parquet_field.get_fields();
+    let Some(repeated_child) = parquet_children.first() else {
+        return Err(delta_kernel::Error::generic(format!(
+            "provider field '{path}' expected Parquet list element metadata"
+        )));
+    };
+    if parquet_children.len() != 1 {
+        return Err(delta_kernel::Error::generic(format!(
+            "provider field '{path}' expected one Parquet list child but found {}",
+            parquet_children.len()
+        )));
+    }
+
+    let repeated_child_fields = repeated_child.get_fields();
+    if repeated_child_fields.len() == 1 {
+        Ok(repeated_child_fields[0].as_ref())
+    } else {
+        Ok(repeated_child.as_ref())
     }
 }
 
@@ -1241,6 +1308,36 @@ fn reshape_array_to_provider_field(
                 struct_array.nulls().cloned(),
             )))
         }
+        NativeAsyncFieldPlan::List { element_plan } => {
+            let DataType::List(provider_element) = provider_field.data_type() else {
+                return Err(delta_kernel::Error::generic(format!(
+                    "provider field '{}' expected list reshape plan but has type {}",
+                    provider_field.name(),
+                    provider_field.data_type()
+                )));
+            };
+            let list_array = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                delta_kernel::Error::generic(format!(
+                    "provider field '{}' expected Parquet list array but found {}",
+                    provider_field.name(),
+                    array.data_type()
+                ))
+            })?;
+            let values = reshape_array_to_provider_field(
+                Arc::clone(list_array.values()),
+                provider_element,
+                element_plan,
+            )?;
+
+            ListArray::try_new(
+                Arc::clone(provider_element),
+                list_array.offsets().clone(),
+                values,
+                list_array.nulls().cloned(),
+            )
+            .map(|array| Arc::new(array) as ArrayRef)
+            .map_err(delta_kernel::Error::from)
+        }
     }
 }
 
@@ -1299,7 +1396,7 @@ fn unsupported_native_async_field_reason(
     field: &KernelStructField,
     path: &str,
     top_level: bool,
-    inside_repeated: bool,
+    inside_map: bool,
 ) -> Option<String> {
     if field.is_metadata_column() {
         return Some(format!(
@@ -1317,39 +1414,36 @@ fn unsupported_native_async_field_reason(
         ));
     }
     if has_nested_field_id_map_metadata(field)
-        && matches!(
-            field.data_type(),
-            KernelDataType::Array(_) | KernelDataType::Map(_)
-        )
+        && matches!(field.data_type(), KernelDataType::Map(_))
     {
         return Some(format!(
-            "native async reader does not support list or map nested field-id or physical-name matching at '{path}' yet"
+            "native async reader does not support map nested field-id or physical-name matching at '{path}' yet"
         ));
     }
-    if inside_repeated && has_field_matching_metadata(field, top_level) {
+    if inside_map && has_field_matching_metadata(field, top_level) {
         return Some(format!(
-            "native async reader does not support list or map nested field-id or physical-name matching at '{path}' yet"
+            "native async reader does not support map nested field-id or physical-name matching at '{path}' yet"
         ));
     }
 
-    unsupported_native_async_data_type_reason(field.data_type(), path, inside_repeated)
+    unsupported_native_async_data_type_reason(field.data_type(), path, inside_map)
 }
 
 fn unsupported_native_async_data_type_reason(
     data_type: &KernelDataType,
     path: &str,
-    inside_repeated: bool,
+    inside_map: bool,
 ) -> Option<String> {
     match data_type {
         KernelDataType::Struct(fields) | KernelDataType::Variant(fields) => {
             fields.fields().find_map(|field| {
                 let child_path = format!("{path}.{}", field.name());
-                unsupported_native_async_field_reason(field, &child_path, false, inside_repeated)
+                unsupported_native_async_field_reason(field, &child_path, false, inside_map)
             })
         }
         KernelDataType::Array(array) => {
             let child_path = format!("{path}.element");
-            unsupported_native_async_data_type_reason(array.element_type(), &child_path, true)
+            unsupported_native_async_data_type_reason(array.element_type(), &child_path, inside_map)
         }
         KernelDataType::Map(map) => {
             let key_path = format!("{path}.key");
@@ -1452,9 +1546,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::arrow::array::{
-        Array, ArrayRef, Decimal128Array, Int32Array, StringArray, StructArray,
+        Array, ArrayRef, Decimal128Array, Int32Array, ListArray, StringArray, StructArray,
     };
     use datafusion::arrow::buffer::NullBuffer;
+    use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue;
@@ -1682,6 +1777,20 @@ mod tests {
         Arc::new(StructArray::new(fields, columns, nulls))
     }
 
+    fn list_array(
+        element: Field,
+        offsets: Vec<i32>,
+        values: ArrayRef,
+        nulls: Option<NullBuffer>,
+    ) -> Result<ArrayRef, Box<dyn std::error::Error>> {
+        Ok(Arc::new(ListArray::try_new(
+            Arc::new(element),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            values,
+            nulls,
+        )?))
+    }
+
     fn project_parquet_batch_to_provider_schema(
         name: &str,
         file_schema: Arc<Schema>,
@@ -1818,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn native_async_schema_gate_rejects_list_nested_field_id_matching()
+    fn native_async_schema_gate_allows_array_nested_field_id_matching()
     -> Result<(), Box<dyn std::error::Error>> {
         let schema = kernel_schema([KernelStructField::new(
             "tags",
@@ -1831,11 +1940,38 @@ mod tests {
                 .to_owned(),
             KernelMetadataValue::String(r#"{"tags.element":2}"#.to_owned()),
         )])])?;
+
+        assert_eq!(
+            unsupported_native_async_physical_schema_reason(&schema),
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_gate_rejects_map_nested_field_id_matching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = kernel_schema([KernelStructField::new(
+            "attributes",
+            delta_kernel::schema::MapType::new(
+                KernelDataType::STRING,
+                KernelDataType::INTEGER,
+                true,
+            ),
+            true,
+        )
+        .add_metadata([(
+            KernelColumnMetadataKey::ColumnMappingNestedIds
+                .as_ref()
+                .to_owned(),
+            KernelMetadataValue::String(r#"{"attributes.value":2}"#.to_owned()),
+        )])])?;
         let reason =
             unsupported_native_async_physical_schema_reason(&schema).ok_or("expected rejection")?;
 
-        assert!(reason.contains("list or map nested field-id"));
-        assert!(reason.contains("tags"));
+        assert!(reason.contains("map nested field-id"));
+        assert!(reason.contains("attributes"));
 
         Ok(())
     }
@@ -2045,6 +2181,96 @@ mod tests {
     }
 
     #[test]
+    fn native_async_schema_match_reshapes_list_struct_elements_by_field_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_address_fields = vec![
+            Field::new("city", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+            Field::new("zip", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+        ];
+        let provider_element = Field::new(
+            "item",
+            DataType::Struct(provider_address_fields.into()),
+            true,
+        );
+        let provider_schema = Arc::new(Schema::new(vec![Field::new(
+            "addresses",
+            DataType::List(Arc::new(provider_element)),
+            true,
+        )]));
+        let file_address_fields = vec![
+            Field::new("stale_zip", DataType::Int32, true).with_metadata(field_id_metadata(10)),
+            Field::new("stale_city", DataType::Utf8, true).with_metadata(field_id_metadata(11)),
+        ];
+        let file_element = Field::new(
+            "item",
+            DataType::Struct(file_address_fields.clone().into()),
+            true,
+        );
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "addresses",
+            DataType::List(Arc::new(file_element.clone())),
+            true,
+        )]));
+        let values = struct_array(
+            file_address_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![94110, 10001, 60601])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("san francisco"),
+                    Some("new york"),
+                    Some("chicago"),
+                ])) as ArrayRef,
+            ],
+        );
+        let addresses = list_array(
+            file_element,
+            vec![0, 2, 2, 3],
+            values,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "list-struct-field-id-schema-match",
+            file_schema,
+            vec![addresses],
+            provider_schema,
+        )?;
+        let addresses = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or("expected addresses ListArray")?;
+        let values = addresses
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected address element StructArray")?;
+        let cities = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected city StringArray")?;
+        let zips = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected zip Int32Array")?;
+
+        assert_eq!(addresses.value_offsets(), &[0, 2, 2, 3]);
+        assert!(addresses.is_valid(0));
+        assert!(addresses.is_null(1));
+        assert!(addresses.is_valid(2));
+        assert_eq!(values.fields()[0].name(), "city");
+        assert_eq!(values.fields()[1].name(), "zip");
+        assert_eq!(cities.value(0), "san francisco");
+        assert_eq!(cities.value(2), "chicago");
+        assert_eq!(zips.value(0), 94110);
+        assert_eq!(zips.value(2), 60601);
+
+        Ok(())
+    }
+
+    #[test]
     fn native_async_schema_match_recurses_by_local_nested_name_fallback()
     -> Result<(), Box<dyn std::error::Error>> {
         let provider_profile_fields = vec![
@@ -2147,6 +2373,132 @@ mod tests {
         assert_eq!(profile.fields()[1].name(), "loyalty_tier");
         assert_eq!(loyalty_tiers.len(), 2);
         assert_eq!(loyalty_tiers.null_count(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_null_fills_missing_nullable_list_struct_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_address_fields = vec![
+            Field::new("zip", DataType::Int32, true),
+            Field::new("country", DataType::Utf8, true),
+        ];
+        let provider_element = Field::new(
+            "item",
+            DataType::Struct(provider_address_fields.into()),
+            true,
+        );
+        let provider_schema = Arc::new(Schema::new(vec![Field::new(
+            "addresses",
+            DataType::List(Arc::new(provider_element)),
+            true,
+        )]));
+        let file_address_fields = vec![Field::new("zip", DataType::Int32, true)];
+        let file_element = Field::new(
+            "item",
+            DataType::Struct(file_address_fields.clone().into()),
+            true,
+        );
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "addresses",
+            DataType::List(Arc::new(file_element.clone())),
+            true,
+        )]));
+        let values = struct_array(
+            file_address_fields,
+            vec![Arc::new(Int32Array::from(vec![94110, 10001, 60601, 85001, 73301])) as ArrayRef],
+        );
+        let addresses = list_array(
+            file_element,
+            vec![0, 2, 2, 5],
+            values,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "list-struct-missing-nullable-schema-match",
+            file_schema,
+            vec![addresses],
+            provider_schema,
+        )?;
+        let addresses = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or("expected addresses ListArray")?;
+        let values = addresses
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected address element StructArray")?;
+        let countries = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected country StringArray")?;
+
+        assert_eq!(addresses.value_offsets(), &[0, 2, 2, 5]);
+        assert!(addresses.is_null(1));
+        assert_eq!(values.fields()[1].name(), "country");
+        assert_eq!(countries.len(), 5);
+        assert_eq!(countries.null_count(), 5);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_rejects_missing_non_nullable_list_struct_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_address_fields = vec![
+            Field::new("zip", DataType::Int32, true),
+            Field::new("required_country", DataType::Utf8, false),
+        ];
+        let provider_element = Field::new(
+            "item",
+            DataType::Struct(provider_address_fields.into()),
+            true,
+        );
+        let provider_schema = Arc::new(Schema::new(vec![Field::new(
+            "addresses",
+            DataType::List(Arc::new(provider_element)),
+            true,
+        )]));
+        let file_address_fields = vec![Field::new("zip", DataType::Int32, true)];
+        let file_element = Field::new(
+            "item",
+            DataType::Struct(file_address_fields.clone().into()),
+            true,
+        );
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "addresses",
+            DataType::List(Arc::new(file_element.clone())),
+            true,
+        )]));
+        let values = struct_array(
+            file_address_fields,
+            vec![Arc::new(Int32Array::from(vec![94110, 10001])) as ArrayRef],
+        );
+        let addresses = list_array(file_element, vec![0, 2], values, None)?;
+        let error = match project_parquet_batch_to_provider_schema(
+            "list-struct-missing-required-schema-match",
+            file_schema,
+            vec![addresses],
+            provider_schema,
+        ) {
+            Ok(_) => return Err("missing non-nullable list struct child must fail".into()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("non-nullable provider field"), "{error}");
+        assert!(
+            error.contains("addresses.element.required_country"),
+            "{error}"
+        );
+        assert!(
+            error.contains("is missing from the Parquet file"),
+            "{error}"
+        );
 
         Ok(())
     }
