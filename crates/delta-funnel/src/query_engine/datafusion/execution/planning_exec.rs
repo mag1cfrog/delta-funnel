@@ -1225,6 +1225,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_matches_official_kernel_for_projected_nested_column_mapping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_nested_column_mapping(
+            "native-async-projected-nested-column-mapping",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select profile from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let (native, native_stats) = collect_sql_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(
+            native_stats.reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+        assert_eq!(native, official);
+        assert!(native.contains("profile"), "{native}");
+        assert!(native.contains("first_name"), "{native}");
+        assert!(native.contains("age"), "{native}");
+        assert!(!native.contains("phys_profile"), "{native}");
+        assert!(!native.contains("stale_first_name"), "{native}");
+        assert!(!native.contains("stale_age"), "{native}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_matches_official_kernel_for_missing_nullable_nested_struct_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_missing_nullable_nested_struct_field(
+            "native-async-missing-nullable-nested-struct",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select profile, id from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let (native, native_stats) = collect_sql_with_reader_backend_and_stats(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(
+            native_stats.reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+        assert_eq!(native, official);
+        assert!(native.contains("loyalty_tier"), "{native}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_rejects_missing_non_nullable_nested_struct_field_before_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_missing_non_nullable_nested_struct_field(
+            "native-async-missing-required-nested-struct",
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+            storage_options: Default::default(),
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select profile, id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].read_stats_snapshot().reader_backend,
+            DeltaProviderReaderBackend::NativeAsync
+        );
+
+        let error =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await;
+        let error = match error {
+            Ok(_) => return Err("missing native async nested non-nullable field must fail".into()),
+            Err(error) => error,
+        };
+        let display = error.to_string();
+
+        assert!(display.contains("Arrow conversion"), "{display}");
+        assert!(display.contains("non-nullable provider field"), "{display}");
+        assert!(display.contains("profile.required_code"), "{display}");
+        assert!(
+            display.contains("is missing from the Parquet file"),
+            "{display}"
+        );
+        let read_stats = scans[0].read_stats_snapshot();
+        assert_eq!(read_stats.files_started, 1);
+        assert_eq!(read_stats.files_completed, 0);
+        assert_eq!(read_stats.batches_produced, 0);
+        assert_eq!(read_stats.rows_produced, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_matches_official_kernel_for_missing_nullable_columns()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_missing_nullable_column(
