@@ -57,6 +57,8 @@ pub(crate) struct ProviderScanPlan {
     pub(crate) scan_projection: Option<Vec<usize>>,
     /// Structured report for filters pushed into this scan.
     pub(crate) pushed_filter_plan: DeltaFilterPushdownPlan,
+    /// Delta table partition columns retained for scan-local filter planning.
+    pub(crate) partition_columns: Vec<String>,
     /// Kernel predicate passed to delta_kernel scan planning for partition pruning.
     pub(crate) kernel_partition_predicate: Option<DeltaKernelPredicate>,
     kernel_scan: ProjectedDeltaScan,
@@ -91,6 +93,7 @@ pub(crate) struct ProviderScanPlanParts {
     pub(crate) protocol: DeltaProtocolReport,
     pub(crate) scan_projection: Option<Vec<usize>>,
     pub(crate) pushed_filter_plan: DeltaFilterPushdownPlan,
+    pub(crate) partition_columns: Vec<String>,
     pub(crate) kernel_partition_predicate: Option<DeltaKernelPredicate>,
     pub(crate) kernel_scan: ProjectedDeltaScan,
 }
@@ -106,9 +109,16 @@ impl ProviderScanPlan {
             protocol: parts.protocol,
             scan_projection: parts.scan_projection,
             pushed_filter_plan: parts.pushed_filter_plan,
+            partition_columns: parts.partition_columns,
             kernel_partition_predicate: parts.kernel_partition_predicate,
             kernel_scan: parts.kernel_scan,
         }
+    }
+
+    /// Returns the scan-local Delta table partition columns.
+    #[cfg(test)]
+    pub(crate) fn partition_columns(&self) -> &[String] {
+        &self.partition_columns
     }
 
     /// Returns the private kernel scan state for downstream provider scan phases.

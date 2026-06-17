@@ -175,6 +175,8 @@ impl DeltaTableProvider {
         } = self.plan_projection(requested_projection)?;
         let normalized_pushed_filters = self.normalize_provider_filters(pushed_filters);
         let pushed_filter_plan = self.plan_normalized_provider_filters(&normalized_pushed_filters);
+        let mut partition_columns = self.partition_columns().into_iter().collect::<Vec<_>>();
+        partition_columns.sort();
         self.reject_unaccepted_pushed_filters(&pushed_filter_plan)?;
         self.reject_projected_inexact_pushed_filters_without_residual_columns(
             &scan_projection,
@@ -199,6 +201,7 @@ impl DeltaTableProvider {
             protocol: self.protocol.clone(),
             scan_projection,
             pushed_filter_plan,
+            partition_columns,
             kernel_partition_predicate,
             kernel_scan,
         }))

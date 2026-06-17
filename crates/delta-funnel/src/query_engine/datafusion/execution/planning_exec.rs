@@ -7,10 +7,13 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::{DataFusionError, Result as DataFusionResult};
+use datafusion::common::{DataFusionError, Result as DataFusionResult, config::ConfigOptions};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, Partitioning,
@@ -23,6 +26,9 @@ use crate::DeltaFunnelError;
 use crate::error::DeltaScanFileReadPhase;
 use crate::table_formats::KernelScanReadSchema;
 
+use super::super::planning::dynamic_filters::{
+    DeltaDynamicFilterOutcome, DeltaDynamicFilterPlan, DeltaRetainedDynamicFilter,
+};
 use super::super::planning::file_task::DeltaScanFileTask;
 use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
 use super::super::planning::partition_target::DeltaScanPartitionTargetDecision;
@@ -47,14 +53,15 @@ use super::scheduling::{
 };
 
 pub(crate) struct DeltaScanPlanningExec {
-    scan_plan: ProviderScanPlan,
-    partition_plan: DeltaScanFileTaskPartitionPlan,
+    scan_plan: Arc<ProviderScanPlan>,
+    partition_plan: Arc<DeltaScanFileTaskPartitionPlan>,
     partition_target_decision: DeltaScanPartitionTargetDecision,
     execution_options: DeltaProviderScanExecutionOptions,
     sync_read_limiter: Arc<DeltaProviderSyncReadLimiter>,
     async_read_limiter: Arc<DeltaProviderAsyncReadLimiter>,
     read_stats: Arc<DeltaProviderReadStats>,
     properties: Arc<PlanProperties>,
+    dynamic_filters: Arc<[DeltaRetainedDynamicFilter]>,
 }
 
 impl DeltaScanPlanningExec {
@@ -68,6 +75,8 @@ impl DeltaScanPlanningExec {
         // accepts this at physical planning time, and it avoids inventing empty
         // read work for a source with no selected files.
         let partition_count = partition_plan.partitions.len();
+        let scan_plan = Arc::new(scan_plan);
+        let partition_plan = Arc::new(partition_plan);
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&scan_plan.projected_schema)),
             Partitioning::UnknownPartitioning(partition_count),
@@ -104,17 +113,38 @@ impl DeltaScanPlanningExec {
             async_read_limiter,
             read_stats,
             properties: Arc::new(properties),
+            dynamic_filters: Arc::from([]),
         }
+    }
+
+    fn with_dynamic_filters(
+        &self,
+        dynamic_filters: Vec<DeltaRetainedDynamicFilter>,
+    ) -> Arc<dyn ExecutionPlan> {
+        // DataFusion dynamic filters are runtime state shared by `Arc`.
+        // Preserve every existing scan-planning handle and only replace the
+        // retained filter set so the producer and scan consumer stay connected.
+        Arc::new(Self {
+            scan_plan: Arc::clone(&self.scan_plan),
+            partition_plan: Arc::clone(&self.partition_plan),
+            partition_target_decision: self.partition_target_decision,
+            execution_options: self.execution_options,
+            sync_read_limiter: Arc::clone(&self.sync_read_limiter),
+            async_read_limiter: Arc::clone(&self.async_read_limiter),
+            read_stats: Arc::clone(&self.read_stats),
+            properties: Arc::clone(&self.properties),
+            dynamic_filters: Arc::from(dynamic_filters),
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn scan_plan(&self) -> &ProviderScanPlan {
-        &self.scan_plan
+        self.scan_plan.as_ref()
     }
 
     #[cfg(test)]
     pub(crate) fn partition_plan(&self) -> &DeltaScanFileTaskPartitionPlan {
-        &self.partition_plan
+        self.partition_plan.as_ref()
     }
 
     #[cfg(test)]
@@ -130,6 +160,11 @@ impl DeltaScanPlanningExec {
     #[cfg(test)]
     pub(crate) fn active_async_file_reads(&self) -> usize {
         self.async_read_limiter.active_file_reads()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dynamic_filters(&self) -> &[DeltaRetainedDynamicFilter] {
+        &self.dynamic_filters
     }
 
     /// Returns a cheap point-in-time snapshot of provider-owned read progress.
@@ -165,6 +200,7 @@ impl fmt::Debug for DeltaScanPlanningExec {
                 "pushed_filter_count",
                 &self.scan_plan.pushed_filter_plan.pushed_filter_count,
             )
+            .field("dynamic_filter_count", &self.dynamic_filters.len())
             .finish_non_exhaustive()
     }
 }
@@ -303,6 +339,71 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                 ))
             }
         }
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DataFusionResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        // This scan is a leaf, so DataFusion offers filters here through the
+        // "parent filters" side of the pushdown result. We preserve their order
+        // so the returned `PushedDown` flags line up with DataFusion's inputs.
+        let parent_filters = child_pushdown_result
+            .parent_filters
+            .iter()
+            .map(|filter_result| Arc::clone(&filter_result.filter))
+            .collect::<Vec<_>>();
+        // Returning `No` keeps query correctness: DataFusion must continue to
+        // treat unsupported filters as not consumed by this scan.
+        let unsupported = || {
+            FilterPushdownPropagation::with_parent_pushdown_result(vec![
+                PushedDown::No;
+                parent_filters.len()
+            ])
+        };
+
+        // `Post` is DataFusion's late physical pushdown phase, after most
+        // shape-changing physical optimizations have already run. Dynamic
+        // filters are only safe to retain then because they carry runtime
+        // producer/consumer state between physical operators. Before `Post`,
+        // the plan may be rewritten in ways that can invalidate those links.
+        // An empty input is a no-op and should not produce an updated scan node.
+        if phase != FilterPushdownPhase::Post || parent_filters.is_empty() {
+            return Ok(unsupported());
+        }
+
+        // Classification is intentionally narrower than static logical
+        // pushdown. This hook only consumes runtime dynamic filters that
+        // reference provider output columns proven to be Delta partition
+        // columns for this scan.
+        let dynamic_filter_plan = DeltaDynamicFilterPlan::from_filters(
+            &parent_filters,
+            &self.scan_plan.projected_schema,
+            &self.scan_plan.partition_columns,
+        );
+        // If nothing is accepted, leave the scan unchanged so later execution
+        // cannot observe any new pruning state.
+        if !dynamic_filter_plan.has_accepted_filters() {
+            return Ok(unsupported());
+        }
+
+        // Mark only retained filters as pushed. Rejected dynamic filters and
+        // ordinary static physical filters remain unsupported.
+        let filters = dynamic_filter_plan
+            .decisions
+            .iter()
+            .map(|decision| match decision.outcome {
+                DeltaDynamicFilterOutcome::Accepted => PushedDown::Yes,
+                DeltaDynamicFilterOutcome::Rejected => PushedDown::No,
+            })
+            .collect::<Vec<_>>();
+
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(filters)
+                .with_updated_node(self.with_dynamic_filters(dynamic_filter_plan.accepted_filters)),
+        )
     }
 }
 
@@ -748,8 +849,16 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::common::config::ConfigOptions;
+    use datafusion::logical_expr::Operator;
     use datafusion::logical_expr::{col, lit};
+    use datafusion::physical_expr::expressions::{
+        BinaryExpr, Column, DynamicFilterPhysicalExpr, lit as physical_lit,
+    };
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::filter_pushdown::{
+        ChildFilterPushdownResult, ChildPushdownResult, FilterPushdownPhase, PushedDown,
+    };
     use datafusion::prelude::SessionContext;
     use delta_kernel::actions::deletion_vector::{
         DeletionVectorDescriptor, DeletionVectorStorageType,
@@ -773,13 +882,16 @@ mod tests {
     };
     use crate::query_engine::datafusion::planning::file_task::DeltaScanFileTask;
     use crate::query_engine::datafusion::test_support::{
-        DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, find_delta_scan_plans, register_fixture_source,
+        DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, PARTITIONED_SCHEMA_FIELDS_JSON,
+        find_delta_scan_plans, register_fixture_source,
     };
     use crate::table_formats::{
         KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata, RealParquetDeltaTable,
         build_projected_predicated_stats_delta_scan, datafusion_expr_to_kernel_predicate,
     };
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+
+    const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
 
     async fn collect_sql_with_reader_backend(
         table_uri: &str,
@@ -845,6 +957,327 @@ mod tests {
         let read_stats = scans[0].read_stats_snapshot();
 
         Ok((result, read_stats))
+    }
+
+    async fn partitioned_scan_physical_plan(
+        name: &str,
+    ) -> Result<(DeltaLogTable, Arc<dyn ExecutionPlan>), Box<dyn std::error::Error>> {
+        partitioned_scan_physical_plan_with_schema(
+            name,
+            PARTITIONED_SCHEMA_FIELDS_JSON,
+            r#"["region"]"#,
+            r#""partitionValues":{"region":"us-west"}"#,
+            "select id, region from orders",
+        )
+        .await
+    }
+
+    async fn partitioned_scan_physical_plan_with_schema(
+        name: &str,
+        schema_fields_json: &str,
+        partition_columns_json: &str,
+        add_partition_values_json: &str,
+        sql: &str,
+    ) -> Result<(DeltaLogTable, Arc<dyn ExecutionPlan>), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema(
+            name,
+            schema_fields_json,
+            partition_columns_json,
+            add_partition_values_json,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+            storage_options: Default::default(),
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+        )?;
+
+        let dataframe = ctx.sql(sql).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+
+        Ok((table, physical_plan))
+    }
+
+    fn physical_column(
+        name: &str,
+        index: usize,
+    ) -> Arc<dyn datafusion::physical_plan::PhysicalExpr> {
+        Arc::new(Column::new(name, index))
+    }
+
+    fn dynamic_filter(
+        children: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
+    ) -> Arc<dyn datafusion::physical_plan::PhysicalExpr> {
+        Arc::new(DynamicFilterPhysicalExpr::new(children, physical_lit(true)))
+    }
+
+    fn hook_input(
+        filters: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
+    ) -> ChildPushdownResult {
+        ChildPushdownResult {
+            parent_filters: filters
+                .into_iter()
+                .map(|filter| ChildFilterPushdownResult {
+                    filter,
+                    child_results: Vec::new(),
+                })
+                .collect(),
+            self_filters: Vec::new(),
+        }
+    }
+
+    fn pushed_down_yes(value: PushedDown) -> bool {
+        matches!(value, PushedDown::Yes)
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_retains_partition_dynamic_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) =
+            partitioned_scan_physical_plan("dynamic-filter-partition-hook").await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![dynamic_filter(vec![physical_column("region", 1)])]),
+            &ConfigOptions::new(),
+        )?;
+        let updated_node = result
+            .updated_node
+            .as_ref()
+            .ok_or("expected updated DeltaScanPlanningExec")?;
+        let updated_scan = updated_node
+            .as_any()
+            .downcast_ref::<super::DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(pushed_down_yes(result.filters[0]));
+        assert_eq!(updated_scan.dynamic_filters().len(), 1);
+        assert_eq!(
+            updated_scan.dynamic_filters()[0].partition_columns[0].name,
+            "region"
+        );
+        assert_eq!(
+            updated_scan.dynamic_filters()[0].partition_columns[0].index,
+            1
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_retains_multi_partition_dynamic_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) = partitioned_scan_physical_plan_with_schema(
+            "dynamic-filter-multi-partition-hook",
+            TWO_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["region","event_date"]"#,
+            r#""partitionValues":{"region":"us-west","event_date":"2025-01-01"}"#,
+            "select id, region, event_date from orders",
+        )
+        .await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![dynamic_filter(vec![
+                physical_column("event_date", 2),
+                physical_column("region", 1),
+            ])]),
+            &ConfigOptions::new(),
+        )?;
+        let updated_node = result
+            .updated_node
+            .as_ref()
+            .ok_or("expected updated DeltaScanPlanningExec")?;
+        let updated_scan = updated_node
+            .as_any()
+            .downcast_ref::<super::DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(pushed_down_yes(result.filters[0]));
+        assert_eq!(updated_scan.dynamic_filters().len(), 1);
+        assert_eq!(
+            updated_scan.dynamic_filters()[0]
+                .partition_columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.index))
+                .collect::<Vec<_>>(),
+            vec![("region", 1), ("event_date", 2)]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_rejects_data_dynamic_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) =
+            partitioned_scan_physical_plan("dynamic-filter-data-rejected").await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![dynamic_filter(vec![physical_column("id", 0)])]),
+            &ConfigOptions::new(),
+        )?;
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(!pushed_down_yes(result.filters[0]));
+        assert!(result.updated_node.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_rejects_unknown_dynamic_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) =
+            partitioned_scan_physical_plan("dynamic-filter-unknown-rejected").await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![dynamic_filter(vec![physical_column("ghost", 99)])]),
+            &ConfigOptions::new(),
+        )?;
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(!pushed_down_yes(result.filters[0]));
+        assert!(result.updated_node.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_rejects_mixed_partition_and_data_dynamic_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) =
+            partitioned_scan_physical_plan("dynamic-filter-mixed-rejected").await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![dynamic_filter(vec![
+                physical_column("id", 0),
+                physical_column("region", 1),
+            ])]),
+            &ConfigOptions::new(),
+        )?;
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(!pushed_down_yes(result.filters[0]));
+        assert!(result.updated_node.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_rejects_non_dynamic_filter() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_table, physical_plan) =
+            partitioned_scan_physical_plan("dynamic-filter-static-rejected").await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+        let filter = Arc::new(BinaryExpr::new(
+            physical_column("region", 1),
+            Operator::Eq,
+            physical_lit("us-west"),
+        ));
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![filter]),
+            &ConfigOptions::new(),
+        )?;
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(!pushed_down_yes(result.filters[0]));
+        assert!(result.updated_node.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_accepts_filters_only_in_post_phase()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) =
+            partitioned_scan_physical_plan("dynamic-filter-pre-rejected").await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Pre,
+            hook_input(vec![dynamic_filter(vec![physical_column("region", 1)])]),
+            &ConfigOptions::new(),
+        )?;
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(!pushed_down_yes(result.filters[0]));
+        assert!(result.updated_node.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_preserves_dynamic_filters_across_plan_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) =
+            partitioned_scan_physical_plan("dynamic-filter-plan-rebuild").await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![dynamic_filter(vec![physical_column("region", 1)])]),
+            &ConfigOptions::new(),
+        )?;
+        let updated_node = result.updated_node.ok_or("expected updated scan")?;
+        let rebuilt_node = Arc::clone(&updated_node).with_new_children(Vec::new())?;
+        let rebuilt_scan = rebuilt_node
+            .as_any()
+            .downcast_ref::<super::DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+        let reset_node = updated_node.reset_state()?;
+        let reset_scan = reset_node
+            .as_any()
+            .downcast_ref::<super::DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(rebuilt_scan.dynamic_filters().len(), 1);
+        assert_eq!(reset_scan.dynamic_filters().len(), 1);
+        assert!(
+            Arc::clone(&rebuilt_node)
+                .with_new_children(vec![Arc::clone(&rebuilt_node)])
+                .is_err()
+        );
+
+        Ok(())
     }
 
     #[tokio::test]

@@ -807,6 +807,35 @@ async fn table_provider_scan_returns_projected_non_reading_plan()
 }
 
 #[tokio::test]
+async fn table_provider_scan_retains_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
+    let table = DeltaLogTable::new_with_schema(
+        "table-provider-scan-partition-columns",
+        PARTITIONED_SCHEMA_FIELDS_JSON,
+        r#"["region"]"#,
+        r#""partitionValues":{"region":"us-west"}"#,
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+        storage_options: Default::default(),
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+
+    let plan = provider.scan(&state, None, &[], None).await?;
+    let delta_plan = plan
+        .as_any()
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+
+    assert_eq!(delta_plan.scan_plan().partition_columns(), &["region"]);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn table_provider_scan_without_projection_returns_full_non_reading_plan()
 -> Result<(), Box<dyn std::error::Error>> {
     let table = DeltaLogTable::new("table-provider-full-scan")?;
