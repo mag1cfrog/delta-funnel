@@ -36,6 +36,10 @@ pub struct DeltaProviderReadStatsSnapshot {
     pub files_started: u64,
     /// File-read handoffs that finished successfully.
     pub files_completed: u64,
+    /// File tasks skipped before read scheduling by dynamic partition pruning.
+    pub dynamic_partition_files_pruned: u64,
+    /// File tasks kept after dynamic partition pruning evaluation.
+    pub dynamic_partition_files_kept: u64,
     /// Record batches sent toward DataFusion.
     pub batches_produced: u64,
     /// Rows sent toward DataFusion after transform and DV filtering.
@@ -89,6 +93,8 @@ pub(crate) struct DeltaProviderReadStats {
     scan_partitions_completed: AtomicU64,
     files_started: AtomicU64,
     files_completed: AtomicU64,
+    dynamic_partition_files_pruned: AtomicU64,
+    dynamic_partition_files_kept: AtomicU64,
     batches_produced: AtomicU64,
     rows_produced: AtomicU64,
     deletion_vector_payloads_loaded: AtomicU64,
@@ -117,6 +123,8 @@ impl DeltaProviderReadStats {
             scan_partitions_completed: AtomicU64::new(0),
             files_started: AtomicU64::new(0),
             files_completed: AtomicU64::new(0),
+            dynamic_partition_files_pruned: AtomicU64::new(0),
+            dynamic_partition_files_kept: AtomicU64::new(0),
             batches_produced: AtomicU64::new(0),
             rows_produced: AtomicU64::new(0),
             deletion_vector_payloads_loaded: AtomicU64::new(0),
@@ -144,6 +152,10 @@ impl DeltaProviderReadStats {
             scan_partitions_completed: self.scan_partitions_completed.load(Ordering::Relaxed),
             files_started: self.files_started.load(Ordering::Relaxed),
             files_completed: self.files_completed.load(Ordering::Relaxed),
+            dynamic_partition_files_pruned: self
+                .dynamic_partition_files_pruned
+                .load(Ordering::Relaxed),
+            dynamic_partition_files_kept: self.dynamic_partition_files_kept.load(Ordering::Relaxed),
             batches_produced: self.batches_produced.load(Ordering::Relaxed),
             rows_produced: self.rows_produced.load(Ordering::Relaxed),
             deletion_vector_payloads_loaded: self
@@ -170,6 +182,14 @@ impl DeltaProviderReadStats {
 
     pub(crate) fn record_file_completed(&self) {
         saturating_fetch_add(&self.files_completed, 1);
+    }
+
+    pub(crate) fn record_dynamic_partition_file_pruned(&self) {
+        saturating_fetch_add(&self.dynamic_partition_files_pruned, 1);
+    }
+
+    pub(crate) fn record_dynamic_partition_file_kept(&self) {
+        saturating_fetch_add(&self.dynamic_partition_files_kept, 1);
     }
 
     pub(crate) fn record_batch_produced(&self, rows: usize) {
