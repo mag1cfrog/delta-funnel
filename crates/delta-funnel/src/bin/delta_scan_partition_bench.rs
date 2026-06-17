@@ -52,7 +52,7 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 16;
+const BENCHMARK_SCHEMA_VERSION: u32 = 17;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
@@ -145,7 +145,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 62] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 64] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -180,6 +180,8 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 62] = [
     "provider_stats_scan_partitions_completed_p50",
     "provider_stats_files_started_p50",
     "provider_stats_files_completed_p50",
+    "provider_stats_dynamic_partition_files_pruned_p50",
+    "provider_stats_dynamic_partition_files_kept_p50",
     "provider_stats_batches_produced_p50",
     "provider_stats_rows_produced_p50",
     "provider_stats_deletion_vector_payloads_loaded_p50",
@@ -605,6 +607,8 @@ struct ProviderExecReadStatsMeasurement {
     scan_partitions_completed: u64,
     files_started: u64,
     files_completed: u64,
+    dynamic_partition_files_pruned: u64,
+    dynamic_partition_files_kept: u64,
     batches_produced: u64,
     rows_produced: u64,
     deletion_vector_payloads_loaded: u64,
@@ -641,6 +645,8 @@ struct ProviderExecReadStatsSummary {
     scan_partitions_completed: u64,
     files_started: u64,
     files_completed: u64,
+    dynamic_partition_files_pruned: u64,
+    dynamic_partition_files_kept: u64,
     batches_produced: u64,
     rows_produced: u64,
     deletion_vector_payloads_loaded: u64,
@@ -2015,6 +2021,14 @@ fn provider_exec_read_stats_measurement(
             .iter()
             .map(|snapshot| snapshot.files_completed)
             .sum(),
+        dynamic_partition_files_pruned: snapshots
+            .iter()
+            .map(|snapshot| snapshot.dynamic_partition_files_pruned)
+            .sum(),
+        dynamic_partition_files_kept: snapshots
+            .iter()
+            .map(|snapshot| snapshot.dynamic_partition_files_kept)
+            .sum(),
         batches_produced: snapshots
             .iter()
             .map(|snapshot| snapshot.batches_produced)
@@ -2088,6 +2102,12 @@ fn provider_exec_read_stats_summary(
         files_started: provider_exec_read_stats_counter_p50(&stats, |stats| stats.files_started),
         files_completed: provider_exec_read_stats_counter_p50(&stats, |stats| {
             stats.files_completed
+        }),
+        dynamic_partition_files_pruned: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.dynamic_partition_files_pruned
+        }),
+        dynamic_partition_files_kept: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.dynamic_partition_files_kept
         }),
         batches_produced: provider_exec_read_stats_counter_p50(&stats, |stats| {
             stats.batches_produced
@@ -2254,6 +2274,8 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         read_stats.scan_partitions_completed.to_string(),
         read_stats.files_started.to_string(),
         read_stats.files_completed.to_string(),
+        read_stats.dynamic_partition_files_pruned.to_string(),
+        read_stats.dynamic_partition_files_kept.to_string(),
         read_stats.batches_produced.to_string(),
         read_stats.rows_produced.to_string(),
         read_stats.deletion_vector_payloads_loaded.to_string(),
@@ -6654,6 +6676,12 @@ mod tests {
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"deletion_vector_deleted_rows_per_file"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_scan_count"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_files_started_p50"));
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_dynamic_partition_files_pruned_p50")
+        );
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_dynamic_partition_files_kept_p50")
+        );
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_rows_produced_p50"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_bytes"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_delta_bytes"));
@@ -7025,6 +7053,8 @@ mod tests {
                 scan_partitions_completed: 4,
                 files_started: 2,
                 files_completed: 2,
+                dynamic_partition_files_pruned: 3,
+                dynamic_partition_files_kept: 5,
                 batches_produced: 2,
                 rows_produced: 12,
                 deletion_vector_payloads_loaded: 2,
@@ -7062,7 +7092,7 @@ mod tests {
         });
 
         assert_eq!(row.len(), PROVIDER_EXEC_CSV_HEADER.len());
-        assert_eq!(row[0], "16");
+        assert_eq!(row[0], BENCHMARK_SCHEMA_VERSION.to_string());
         assert_eq!(row[7], "test_sparse_dv");
         assert_eq!(row[8], "local");
         assert_eq!(row[10], "native_async");
@@ -7079,10 +7109,12 @@ mod tests {
         assert_eq!(row[25], "true");
         assert_eq!(row[28], "16");
         assert_eq!(row[32], "2");
-        assert_eq!(row[35], "12");
-        assert_eq!(row[41], "12");
-        assert_eq!(row[43], "4096");
-        assert_eq!(row[44], "1024");
+        assert_eq!(row[34], "3");
+        assert_eq!(row[35], "5");
+        assert_eq!(row[37], "12");
+        assert_eq!(row[43], "12");
+        assert_eq!(row[45], "4096");
+        assert_eq!(row[46], "1024");
     }
 
     #[test]

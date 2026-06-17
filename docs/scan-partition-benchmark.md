@@ -57,6 +57,16 @@ DataFusion provider registration, selects the requested provider backend through
 `DeltaProviderScanExecutionOptions`, runs DataFusion SQL, and collects real
 provider execution output. It does not use a benchmark-only reader path.
 
+Provider-exec CSV output includes provider read statistics collected from the
+executed Delta scan plan. The dynamic partition pruning fields are:
+
+- `provider_stats_dynamic_partition_files_pruned_p50`: p50 count of file tasks
+  skipped before provider file admission because a dynamic partition filter
+  snapshot proved the partition could not match.
+- `provider_stats_dynamic_partition_files_kept_p50`: p50 count of file tasks
+  evaluated by dynamic partition pruning and kept because the filter allowed
+  them or could not safely prove exclusion.
+
 The provider-exec matrix compares the official kernel backend against the
 native async backend with lazy and bounded-prefetch scheduling profiles. It
 covers non-DV and sparse-DV versions of a many-small-files shape, a

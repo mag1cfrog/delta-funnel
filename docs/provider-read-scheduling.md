@@ -51,6 +51,25 @@ The official-kernel backend keeps native async prefetch disabled and uses the
 same active-read option names for compatibility. It does not maintain an extra
 provider file-task queue.
 
+## Dynamic Partition Pruning
+
+Provider execution applies dynamic partition pruning at the whole-file
+admission boundary. A retained DataFusion dynamic physical filter is snapshotted
+for each not-yet-started `DeltaScanFileTask`, then evaluated against the task's
+Delta partition values. When the snapshot proves that the partition cannot
+match, the task is skipped before the provider starts file IO.
+
+Skipped tasks do not acquire file-read permits, open object-store streams, load
+deletion vectors, run physical-to-logical transforms, or emit batches. Kept
+tasks continue through the same reader backend path as before, including
+deletion-vector handling and residual DataFusion filtering.
+
+The first implementation is intentionally opportunistic. Placeholder,
+incomplete, unsupported, missing-metadata, and unparsable dynamic filter states
+degrade to reading the file task. Files that have already started are not
+cancelled, and native async prefetch only skips tasks before they are opened or
+prefetched.
+
 ## Backpressure And Cancellation
 
 Provider execution builds a DataFusion `RecordBatchReceiverStream` with bounded
