@@ -891,6 +891,8 @@ mod tests {
     };
     use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
 
+    const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
     async fn collect_sql_with_reader_backend(
         table_uri: &str,
         reader_backend: DeltaProviderReaderBackend,
@@ -960,12 +962,29 @@ mod tests {
     async fn partitioned_scan_physical_plan(
         name: &str,
     ) -> Result<(DeltaLogTable, Arc<dyn ExecutionPlan>), Box<dyn std::error::Error>> {
-        let ctx = SessionContext::new();
-        let table = DeltaLogTable::new_with_schema(
+        partitioned_scan_physical_plan_with_schema(
             name,
             PARTITIONED_SCHEMA_FIELDS_JSON,
             r#"["region"]"#,
             r#""partitionValues":{"region":"us-west"}"#,
+            "select id, region from orders",
+        )
+        .await
+    }
+
+    async fn partitioned_scan_physical_plan_with_schema(
+        name: &str,
+        schema_fields_json: &str,
+        partition_columns_json: &str,
+        add_partition_values_json: &str,
+        sql: &str,
+    ) -> Result<(DeltaLogTable, Arc<dyn ExecutionPlan>), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema(
+            name,
+            schema_fields_json,
+            partition_columns_json,
+            add_partition_values_json,
         )?;
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
@@ -983,7 +1002,7 @@ mod tests {
             }],
         )?;
 
-        let dataframe = ctx.sql("select id, region from orders").await?;
+        let dataframe = ctx.sql(sql).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
 
         Ok((table, physical_plan))
@@ -1060,6 +1079,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn physical_pushdown_retains_multi_partition_dynamic_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) = partitioned_scan_physical_plan_with_schema(
+            "dynamic-filter-multi-partition-hook",
+            TWO_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["region","event_date"]"#,
+            r#""partitionValues":{"region":"us-west","event_date":"2025-01-01"}"#,
+            "select id, region, event_date from orders",
+        )
+        .await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![dynamic_filter(vec![
+                physical_column("event_date", 2),
+                physical_column("region", 1),
+            ])]),
+            &ConfigOptions::new(),
+        )?;
+        let updated_node = result
+            .updated_node
+            .as_ref()
+            .ok_or("expected updated DeltaScanPlanningExec")?;
+        let updated_scan = updated_node
+            .as_any()
+            .downcast_ref::<super::DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(pushed_down_yes(result.filters[0]));
+        assert_eq!(updated_scan.dynamic_filters().len(), 1);
+        assert_eq!(
+            updated_scan.dynamic_filters()[0]
+                .partition_columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.index))
+                .collect::<Vec<_>>(),
+            vec![("region", 1), ("event_date", 2)]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn physical_pushdown_rejects_data_dynamic_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, physical_plan) =
@@ -1071,6 +1137,53 @@ mod tests {
         let result = scans[0].handle_child_pushdown_result(
             FilterPushdownPhase::Post,
             hook_input(vec![dynamic_filter(vec![physical_column("id", 0)])]),
+            &ConfigOptions::new(),
+        )?;
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(!pushed_down_yes(result.filters[0]));
+        assert!(result.updated_node.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_rejects_unknown_dynamic_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) =
+            partitioned_scan_physical_plan("dynamic-filter-unknown-rejected").await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![dynamic_filter(vec![physical_column("ghost", 99)])]),
+            &ConfigOptions::new(),
+        )?;
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(!pushed_down_yes(result.filters[0]));
+        assert!(result.updated_node.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_rejects_mixed_partition_and_data_dynamic_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) =
+            partitioned_scan_physical_plan("dynamic-filter-mixed-rejected").await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![dynamic_filter(vec![
+                physical_column("id", 0),
+                physical_column("region", 1),
+            ])]),
             &ConfigOptions::new(),
         )?;
 
