@@ -47,8 +47,8 @@ use super::scheduling::{
 };
 
 pub(crate) struct DeltaScanPlanningExec {
-    scan_plan: ProviderScanPlan,
-    partition_plan: DeltaScanFileTaskPartitionPlan,
+    scan_plan: Arc<ProviderScanPlan>,
+    partition_plan: Arc<DeltaScanFileTaskPartitionPlan>,
     partition_target_decision: DeltaScanPartitionTargetDecision,
     execution_options: DeltaProviderScanExecutionOptions,
     sync_read_limiter: Arc<DeltaProviderSyncReadLimiter>,
@@ -68,6 +68,8 @@ impl DeltaScanPlanningExec {
         // accepts this at physical planning time, and it avoids inventing empty
         // read work for a source with no selected files.
         let partition_count = partition_plan.partitions.len();
+        let scan_plan = Arc::new(scan_plan);
+        let partition_plan = Arc::new(partition_plan);
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&scan_plan.projected_schema)),
             Partitioning::UnknownPartitioning(partition_count),
@@ -109,12 +111,12 @@ impl DeltaScanPlanningExec {
 
     #[cfg(test)]
     pub(crate) fn scan_plan(&self) -> &ProviderScanPlan {
-        &self.scan_plan
+        self.scan_plan.as_ref()
     }
 
     #[cfg(test)]
     pub(crate) fn partition_plan(&self) -> &DeltaScanFileTaskPartitionPlan {
-        &self.partition_plan
+        self.partition_plan.as_ref()
     }
 
     #[cfg(test)]
