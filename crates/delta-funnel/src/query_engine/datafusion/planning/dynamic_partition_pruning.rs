@@ -7,10 +7,6 @@
 //! cannot satisfy the filter. Every missing, unsupported, incomplete, or failed
 //! case is a structured conservative `Keep` decision.
 
-// This slice builds and tests the evaluator before execution scheduling calls
-// it. Remove this allowance when file-task pruning is wired into the scan path.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, BooleanArray, new_null_array};
