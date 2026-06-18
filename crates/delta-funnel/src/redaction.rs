@@ -1,12 +1,18 @@
 //! Redaction helpers for user-facing display strings.
 
+/// Escapes caller-provided text before it is displayed in logs, errors, and reports.
+#[must_use]
+pub(crate) fn sanitize_text_for_display(text: &str) -> String {
+    text.chars().flat_map(char::escape_default).collect()
+}
+
 /// Sanitizes a URI for display in logs, errors, and reports.
 #[must_use]
 pub(crate) fn sanitize_uri_for_display(uri: &str) -> String {
     let uri = strip_fragment_and_query(uri);
     let uri = strip_userinfo(uri);
 
-    uri.chars().flat_map(char::escape_default).collect()
+    sanitize_text_for_display(&uri)
 }
 
 /// Removes URI query strings and fragments before a URI is displayed.
