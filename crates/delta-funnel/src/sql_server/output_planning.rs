@@ -138,6 +138,20 @@ mod tests {
         ])
     }
 
+    fn west_output_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("west_order_id", DataType::Int64, false),
+            Field::new("west_customer", DataType::Utf8, true),
+        ])
+    }
+
+    fn east_output_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("east_order_id", DataType::Int64, false),
+            Field::new("east_total", DataType::Float64, true),
+        ])
+    }
+
     #[test]
     fn high_level_api_plans_append_existing_output() -> Result<(), DeltaFunnelError> {
         let default_connection = secret_connection()?;
@@ -217,6 +231,84 @@ mod tests {
             error,
             DeltaFunnelError::MissingMssqlConnection { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn high_level_api_plans_outputs_independently() -> Result<(), DeltaFunnelError> {
+        let default_connection = secret_connection()?.with_display_label("context-default");
+        let east_connection = MssqlConnectionConfig::new(
+            "server=tcp:sql.example.com;database=east;user=admin;password=east-secret",
+        )?
+        .with_display_label("east-override");
+        let west_target = MssqlTargetConfig::new(MssqlTargetTable::new("reporting", "west")?);
+        let east_target = MssqlTargetConfig::new(MssqlTargetTable::new("warehouse", "east")?)
+            .with_load_mode(LoadMode::CreateAndLoad)
+            .with_connection(east_connection);
+
+        let west_plan = plan_mssql_target_for_output(
+            west_output_schema(),
+            "west_output",
+            &west_target,
+            Some(&default_connection),
+            PlanOptions::default(),
+        )?;
+        let east_plan = plan_mssql_target_for_output(
+            east_output_schema(),
+            "east_output",
+            &east_target,
+            Some(&default_connection),
+            PlanOptions::default(),
+        )?;
+
+        assert_eq!(west_plan.target().output_name(), "west_output");
+        assert_eq!(west_plan.target().table().schema(), Some("reporting"));
+        assert_eq!(west_plan.target().table().table(), "west");
+        assert_eq!(west_plan.target().load_mode(), LoadMode::AppendExisting);
+        assert_eq!(
+            west_plan.target().connection_source(),
+            MssqlConnectionSource::ContextDefault
+        );
+        assert_eq!(west_plan.ddl_plan().create_table_sql(), None);
+        assert_eq!(
+            west_plan.schema_plan().mappings()[0].arrow().name(),
+            "west_order_id"
+        );
+        assert_eq!(
+            west_plan.schema_plan().mappings()[1].arrow().name(),
+            "west_customer"
+        );
+
+        assert_eq!(east_plan.target().output_name(), "east_output");
+        assert_eq!(east_plan.target().table().schema(), Some("warehouse"));
+        assert_eq!(east_plan.target().table().table(), "east");
+        assert_eq!(east_plan.target().load_mode(), LoadMode::CreateAndLoad);
+        assert_eq!(
+            east_plan.target().connection_source(),
+            MssqlConnectionSource::TargetOverride
+        );
+        assert!(
+            east_plan
+                .ddl_plan()
+                .create_table_sql()
+                .unwrap_or_default()
+                .starts_with("CREATE TABLE [warehouse].[east]")
+        );
+        assert_eq!(
+            east_plan.schema_plan().mappings()[0].arrow().name(),
+            "east_order_id"
+        );
+        assert_eq!(
+            east_plan.schema_plan().mappings()[1].arrow().name(),
+            "east_total"
+        );
+
+        let debug = format!("{west_plan:?}\n{east_plan:?}");
+        assert!(debug.contains("context-default"));
+        assert!(debug.contains("east-override"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("east-secret"));
+        assert!(!debug.contains("password"));
         Ok(())
     }
 
