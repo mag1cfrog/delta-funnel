@@ -245,6 +245,23 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local partitioned Delta table with two real Parquet files.
+    pub(crate) fn new_with_two_partition_values(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut west = file_batch(1, vec![(1, Some("west-1")), (2, Some("west-2"))])?;
+        west.partition_values_json = r#"{"region":"us-west"}"#.to_owned();
+        let mut east = file_batch(2, vec![(3, Some("east-3")), (4, Some("east-4"))])?;
+        east.partition_values_json = r#"{"region":"us-east"}"#.to_owned();
+
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            PARTITIONED_METADATA_JSON,
+            vec![west, east],
+        )
+    }
+
     /// Creates a local partitioned Delta table with one data file and a real
     /// deletion vector.
     pub(crate) fn new_with_partition_value_and_deletion_vector(
