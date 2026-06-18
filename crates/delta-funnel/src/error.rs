@@ -468,6 +468,19 @@ pub enum DeltaFunnelError {
         message: String,
     },
 
+    /// SQL Server lifecycle planning failed for a DeltaFunnel-owned reason.
+    #[snafu(display(
+        "MSSQL lifecycle planning error for output `{}`: {}",
+        sanitize_text_for_display(output_name),
+        sanitize_reason_for_display(message)
+    ))]
+    MssqlLifecyclePlanning {
+        /// Selected output name associated with the target.
+        output_name: String,
+        /// Sanitized reason for the lifecycle planning failure.
+        message: String,
+    },
+
     /// SQL Server batch writing failed.
     #[snafu(display(
         "MSSQL write error: {}",
