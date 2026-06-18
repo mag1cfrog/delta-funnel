@@ -1,10 +1,19 @@
 //! Batch pipeline foundation for query-result handoff.
 //!
-//! This module intentionally does not poll DataFusion streams or rewrite
-//! Arrow batches. It only owns shared concepts that later query-output handoff
-//! and MSSQL writer integration can build on.
+//! This module owns the thin async boundary between DataFusion query output and
+//! downstream batch writers. The handoff is deliberately pull-driven: one
+//! upstream batch is polled, one downstream write is awaited, and only then is
+//! the next upstream batch polled.
 
 use std::fmt;
+
+use async_trait::async_trait;
+use datafusion::{
+    arrow::record_batch::RecordBatch,
+    error::{DataFusionError, Result as DataFusionResult},
+};
+use futures_util::{Stream, StreamExt};
+use snafu::Snafu;
 
 use crate::DeltaFunnelError;
 
@@ -24,6 +33,63 @@ impl fmt::Display for BatchPipelinePhase {
             Self::HandoffSetup => "handoff setup",
         })
     }
+}
+
+/// Successful result for one completed query-output handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchHandoffOutcome {
+    stats: BatchHandoffStats,
+}
+
+impl BatchHandoffOutcome {
+    /// Returns the final per-output handoff counters.
+    pub fn stats(&self) -> BatchHandoffStats {
+        self.stats
+    }
+}
+
+/// Terminal failure from a query-output handoff.
+///
+/// Upstream errors come from the DataFusion stream. Downstream errors come from
+/// the batch consumer, which will later be backed by `arrow-tiberius`.
+#[derive(Debug, Snafu)]
+pub enum BatchHandoffError {
+    /// The upstream DataFusion stream failed before producing the next batch.
+    #[snafu(display("upstream RecordBatch stream failed: {source}"))]
+    Upstream {
+        /// Original DataFusion error with its existing provider/query context.
+        source: DataFusionError,
+        /// Handoff counters for batches accepted before the failure.
+        stats: BatchHandoffStats,
+    },
+    /// The downstream consumer rejected the current batch.
+    #[snafu(display("downstream RecordBatch consumer failed: {source}"))]
+    Downstream {
+        /// Original downstream writer error.
+        source: DeltaFunnelError,
+        /// Handoff counters for batches accepted before the failure.
+        stats: BatchHandoffStats,
+    },
+}
+
+impl BatchHandoffError {
+    /// Returns counters for batches accepted before the terminal failure.
+    pub fn stats(&self) -> BatchHandoffStats {
+        match self {
+            Self::Upstream { stats, .. } | Self::Downstream { stats, .. } => *stats,
+        }
+    }
+}
+
+/// Downstream consumer for one query-output `RecordBatch`.
+///
+/// Implementations should return only after the batch has been accepted by the
+/// downstream system. That await point is what preserves backpressure between
+/// DataFusion and the downstream writer.
+#[async_trait]
+pub trait RecordBatchConsumer: Send {
+    /// Writes one batch without changing its schema, values, or row order.
+    async fn write_record_batch(&mut self, batch: &RecordBatch) -> Result<(), DeltaFunnelError>;
 }
 
 /// Per-output batch handoff counters.
@@ -58,6 +124,39 @@ impl BatchHandoffStats {
     }
 }
 
+/// Hands one DataFusion `RecordBatch` stream to one downstream consumer.
+///
+/// This helper intentionally contains no queue and spawns no background task.
+/// The next upstream batch is not polled until the previous downstream write
+/// has completed.
+pub async fn handoff_record_batch_stream<S, C>(
+    mut stream: S,
+    consumer: &mut C,
+) -> Result<BatchHandoffOutcome, BatchHandoffError>
+where
+    S: Stream<Item = DataFusionResult<RecordBatch>> + Unpin,
+    C: RecordBatchConsumer,
+{
+    let mut stats = BatchHandoffStats::default();
+
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(|source| BatchHandoffError::Upstream { source, stats })?;
+        let row_count = batch.num_rows();
+        let accepted_stats = stats;
+
+        stats.record_input_batch(row_count);
+        if let Err(source) = consumer.write_record_batch(&batch).await {
+            return Err(BatchHandoffError::Downstream {
+                source,
+                stats: accepted_stats,
+            });
+        }
+        stats.record_output_batch(row_count);
+    }
+
+    Ok(BatchHandoffOutcome { stats })
+}
+
 /// Validates a future batch/query/handoff `usize` option that must be nonzero.
 #[allow(dead_code)]
 pub(crate) fn validate_nonzero_usize_option(
@@ -82,8 +181,32 @@ fn rows_to_u64(row_count: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        error::Error,
+        pin::Pin,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
+    use async_trait::async_trait;
+    use datafusion::{
+        arrow::{
+            array::Int32Array,
+            datatypes::{DataType, Field, Schema, SchemaRef},
+            record_batch::RecordBatch,
+        },
+        error::DataFusionError,
+    };
+    use futures_util::{Stream, stream};
+    use tokio::sync::oneshot;
+
     use super::{
-        BatchHandoffStats, BatchPipelinePhase, rows_to_u64, validate_nonzero_usize_option,
+        BatchHandoffError, BatchHandoffStats, BatchPipelinePhase, RecordBatchConsumer,
+        handoff_record_batch_stream, rows_to_u64, validate_nonzero_usize_option,
     };
     use crate::DeltaFunnelError;
 
@@ -167,5 +290,215 @@ mod tests {
             BatchPipelinePhase::HandoffSetup.to_string(),
             "handoff setup"
         );
+    }
+
+    #[tokio::test]
+    async fn handoff_forwards_batches_in_order() -> Result<(), Box<dyn Error>> {
+        let batches = vec![Ok(int_batch(&[1, 2])?), Ok(int_batch(&[3, 4, 5])?)];
+        let mut consumer = RecordingConsumer::default();
+
+        let outcome = handoff_record_batch_stream(stream::iter(batches), &mut consumer).await?;
+
+        assert_eq!(consumer.accepted_row_counts, vec![2, 3]);
+        assert_eq!(
+            outcome.stats(),
+            BatchHandoffStats {
+                input_batches: 2,
+                input_rows: 5,
+                output_batches: 2,
+                output_rows: 5,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_preserves_upstream_error_context() -> Result<(), Box<dyn Error>> {
+        let batches = vec![
+            Ok(int_batch(&[1, 2])?),
+            Err(DataFusionError::Execution("upstream failed".to_owned())),
+            Ok(int_batch(&[3])?),
+        ];
+        let mut consumer = RecordingConsumer::default();
+
+        let error = handoff_record_batch_stream(stream::iter(batches), &mut consumer)
+            .await
+            .err()
+            .ok_or("handoff should fail on upstream error")?;
+
+        assert_eq!(consumer.accepted_row_counts, vec![2]);
+        assert_eq!(
+            error.stats(),
+            BatchHandoffStats {
+                input_batches: 1,
+                input_rows: 2,
+                output_batches: 1,
+                output_rows: 2,
+            }
+        );
+        assert!(matches!(error, BatchHandoffError::Upstream { .. }));
+        assert!(error.to_string().contains("upstream failed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_stops_after_downstream_failure() -> Result<(), Box<dyn Error>> {
+        let batches = vec![
+            Ok(int_batch(&[1, 2])?),
+            Ok(int_batch(&[3, 4, 5])?),
+            Ok(int_batch(&[6])?),
+        ];
+        let mut consumer = RecordingConsumer {
+            fail_on_call: Some(1),
+            ..RecordingConsumer::default()
+        };
+
+        let error = handoff_record_batch_stream(stream::iter(batches), &mut consumer)
+            .await
+            .err()
+            .ok_or("handoff should fail on downstream error")?;
+
+        assert_eq!(consumer.accepted_row_counts, vec![2]);
+        assert_eq!(consumer.call_count, 2);
+        assert_eq!(
+            error.stats(),
+            BatchHandoffStats {
+                input_batches: 1,
+                input_rows: 2,
+                output_batches: 1,
+                output_rows: 2,
+            }
+        );
+        assert!(matches!(error, BatchHandoffError::Downstream { .. }));
+        assert!(error.to_string().contains("consumer failed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slow_downstream_blocks_next_upstream_poll() -> Result<(), Box<dyn Error>> {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let accepted_row_counts = Arc::new(Mutex::new(Vec::new()));
+        let stream = PollCountingStream {
+            batches: VecDeque::from(vec![int_batch(&[1])?, int_batch(&[2])?]),
+            poll_count: Arc::clone(&poll_count),
+        };
+        let (release_write, wait_for_release) = oneshot::channel();
+        let consumer = GatedConsumer {
+            accepted_row_counts: Arc::clone(&accepted_row_counts),
+            first_write_gate: Some(wait_for_release),
+        };
+
+        let task = tokio::spawn(async move {
+            let mut consumer = consumer;
+            handoff_record_batch_stream(stream, &mut consumer).await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(poll_count.load(Ordering::SeqCst), 1);
+        assert!(release_write.send(()).is_ok());
+
+        let outcome = task.await??;
+
+        assert_eq!(poll_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            *accepted_row_counts.lock().map_err(|_| "mutex poisoned")?,
+            vec![1, 1]
+        );
+        assert_eq!(
+            outcome.stats(),
+            BatchHandoffStats {
+                input_batches: 2,
+                input_rows: 2,
+                output_batches: 2,
+                output_rows: 2,
+            }
+        );
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct RecordingConsumer {
+        accepted_row_counts: Vec<usize>,
+        call_count: usize,
+        fail_on_call: Option<usize>,
+    }
+
+    #[async_trait]
+    impl RecordBatchConsumer for RecordingConsumer {
+        async fn write_record_batch(
+            &mut self,
+            batch: &RecordBatch,
+        ) -> Result<(), DeltaFunnelError> {
+            if self.fail_on_call == Some(self.call_count) {
+                self.call_count += 1;
+                return Err(consumer_error("consumer failed"));
+            }
+
+            self.call_count += 1;
+            self.accepted_row_counts.push(batch.num_rows());
+            Ok(())
+        }
+    }
+
+    struct GatedConsumer {
+        accepted_row_counts: Arc<Mutex<Vec<usize>>>,
+        first_write_gate: Option<oneshot::Receiver<()>>,
+    }
+
+    #[async_trait]
+    impl RecordBatchConsumer for GatedConsumer {
+        async fn write_record_batch(
+            &mut self,
+            batch: &RecordBatch,
+        ) -> Result<(), DeltaFunnelError> {
+            self.accepted_row_counts
+                .lock()
+                .map_err(|_| consumer_error("accepted rows lock poisoned"))?
+                .push(batch.num_rows());
+
+            if let Some(gate) = self.first_write_gate.take() {
+                let _result = gate.await;
+            }
+
+            Ok(())
+        }
+    }
+
+    struct PollCountingStream {
+        batches: VecDeque<RecordBatch>,
+        poll_count: Arc<AtomicUsize>,
+    }
+
+    impl Stream for PollCountingStream {
+        type Item = Result<RecordBatch, DataFusionError>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.poll_count.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(self.batches.pop_front().map(Ok))
+        }
+    }
+
+    fn int_batch(values: &[i32]) -> Result<RecordBatch, Box<dyn Error>> {
+        RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(values.to_vec()))])
+            .map_err(Into::into)
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]))
+    }
+
+    fn consumer_error(message: impl Into<String>) -> DeltaFunnelError {
+        DeltaFunnelError::BatchPipeline {
+            phase: BatchPipelinePhase::HandoffSetup,
+            option: "record_batch_consumer",
+            message: message.into(),
+        }
     }
 }

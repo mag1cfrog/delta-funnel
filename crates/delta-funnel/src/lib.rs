@@ -16,7 +16,10 @@ pub(crate) mod query_engine;
 mod redaction;
 mod table_formats;
 
-pub use batch_pipeline::{BatchHandoffStats, BatchPipelinePhase};
+pub use batch_pipeline::{
+    BatchHandoffError, BatchHandoffOutcome, BatchHandoffStats, BatchPipelinePhase,
+    RecordBatchConsumer, handoff_record_batch_stream,
+};
 pub use error::DeltaFunnelError;
 pub use query_engine::{
     DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
