@@ -364,6 +364,16 @@ pub enum DeltaFunnelError {
         /// Sanitized message suitable for logs and Python-facing errors.
         message: String,
     },
+
+    /// SQL Server batch writing failed.
+    #[snafu(display(
+        "MSSQL write error: {}",
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    MssqlWrite {
+        /// Underlying Arrow-to-TDS or Tiberius writer failure.
+        source: arrow_tiberius::Error,
+    },
 }
 
 fn sanitize_source_name_for_display(name: &str) -> String {
@@ -431,6 +441,21 @@ mod tests {
         assert!(!display.contains('\n'));
         assert!(!display.contains('\t'));
         assert!(display.contains(r"invalid\nvalue\tprovided"));
+    }
+
+    #[test]
+    fn mssql_write_error_has_sanitized_display() {
+        let error = DeltaFunnelError::MssqlWrite {
+            source: arrow_tiberius::Error::BackendUnavailable {
+                backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                reason: "not available\nfor test".to_owned(),
+            },
+        };
+
+        let display = error.to_string();
+
+        assert!(!display.contains('\n'));
+        assert!(display.contains(r"not available\nfor test"));
     }
 
     #[test]

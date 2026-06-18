@@ -1,7 +1,10 @@
 //! DataFusion integration.
 
+use std::sync::Arc;
+
 use datafusion::common::DataFusionError;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 
 use crate::DeltaFunnelError;
 
@@ -56,6 +59,20 @@ fn collect_delta_provider_read_stats_into(
     for child in plan.children() {
         collect_delta_provider_read_stats_into(child.as_ref(), found);
     }
+}
+
+/// Executes one selected DataFusion query output as a single merged stream.
+///
+/// DataFusion physical plans can have multiple output partitions. This helper
+/// uses DataFusion's own `execute_stream` behavior, which merges those
+/// partitions into one `RecordBatch` stream while still letting partition tasks
+/// run concurrently. DeltaFunnel's downstream MSSQL writer can then stay a
+/// single awaited consumer without forcing serial partition execution.
+pub fn datafusion_query_output_stream(
+    plan: Arc<dyn ExecutionPlan>,
+    task_context: Arc<TaskContext>,
+) -> Result<SendableRecordBatchStream, DataFusionError> {
+    datafusion::physical_plan::execute_stream(plan, task_context)
 }
 
 #[cfg(test)]
@@ -351,5 +368,72 @@ mod test_support {
         fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
             (name == "public").then(|| Arc::clone(&self.schema))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, sync::Arc};
+
+    use datafusion::{
+        arrow::{
+            array::Int32Array,
+            datatypes::{DataType, Field, Schema, SchemaRef},
+            record_batch::RecordBatch,
+        },
+        execution::TaskContext,
+        physical_plan::{ExecutionPlan, test::TestMemoryExec},
+    };
+    use futures_util::StreamExt;
+
+    use super::datafusion_query_output_stream;
+
+    #[tokio::test]
+    async fn query_output_stream_merges_multi_partition_plan() -> Result<(), Box<dyn Error>> {
+        let schema = schema();
+        let plan = TestMemoryExec::try_new_exec(
+            &[
+                vec![int_batch(Arc::clone(&schema), &[1, 2])?],
+                vec![int_batch(Arc::clone(&schema), &[3, 4])?],
+            ],
+            Arc::clone(&schema),
+            None,
+        )?;
+        assert_eq!(plan.properties().output_partitioning().partition_count(), 2);
+
+        let plan: Arc<dyn ExecutionPlan> = plan;
+        let mut stream = datafusion_query_output_stream(plan, Arc::new(TaskContext::default()))?;
+        let mut values = Vec::new();
+
+        while let Some(batch) = stream.next().await {
+            values.extend(batch_values(&batch?)?);
+        }
+        values.sort_unstable();
+
+        assert_eq!(values, vec![1, 2, 3, 4]);
+        Ok(())
+    }
+
+    fn int_batch(schema: SchemaRef, values: &[i32]) -> Result<RecordBatch, Box<dyn Error>> {
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
+            .map_err(Into::into)
+    }
+
+    fn batch_values(batch: &RecordBatch) -> Result<Vec<i32>, Box<dyn Error>> {
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected Int32Array")?;
+
+        Ok((0..values.len()).map(|index| values.value(index)).collect())
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]))
     }
 }

@@ -16,7 +16,10 @@ pub(crate) mod query_engine;
 mod redaction;
 mod table_formats;
 
-pub use batch_pipeline::{BatchHandoffStats, BatchPipelinePhase};
+pub use batch_pipeline::{
+    BatchHandoffError, BatchHandoffOutcome, BatchHandoffStats, BatchPipelinePhase,
+    RecordBatchConsumer, handoff_datafusion_query_output, handoff_record_batch_stream,
+};
 pub use error::DeltaFunnelError;
 pub use query_engine::{
     DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
@@ -24,7 +27,7 @@ pub use query_engine::{
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaTableProviderConfig,
     QueryOptions, RegisteredDeltaSource, RegisteredDeltaSources, collect_delta_provider_read_stats,
-    datafusion_session_config, datafusion_session_context,
+    datafusion_query_output_stream, datafusion_session_config, datafusion_session_context,
     delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic, register_delta_sources,
     register_delta_sources_with_scan_execution_options,
