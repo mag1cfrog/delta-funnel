@@ -2701,6 +2701,20 @@ mod tests {
 
         assert_eq!(rebuilt_scan.dynamic_filters().len(), 1);
         assert_eq!(reset_scan.dynamic_filters().len(), 1);
+        let debug_display = format!("{rebuilt_scan:?}");
+        assert!(
+            debug_display.contains("dynamic_filter_count: 1"),
+            "{debug_display}"
+        );
+        let plan_display = datafusion::physical_plan::displayable(rebuilt_node.as_ref())
+            .one_line()
+            .to_string();
+        assert!(
+            plan_display.contains("DeltaScanPlanningExec:"),
+            "{plan_display}"
+        );
+        assert!(plan_display.contains("partitions="), "{plan_display}");
+        assert!(!plan_display.contains("DynamicFilter"), "{plan_display}");
         assert!(
             Arc::clone(&rebuilt_node)
                 .with_new_children(vec![Arc::clone(&rebuilt_node)])
