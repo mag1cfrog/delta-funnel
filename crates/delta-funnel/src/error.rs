@@ -442,6 +442,32 @@ pub enum DeltaFunnelError {
         source: arrow_tiberius::Error,
     },
 
+    /// SQL Server DDL planning failed because a target identifier was invalid.
+    #[snafu(display(
+        "MSSQL DDL planning error for output `{}`: {}",
+        sanitize_text_for_display(output_name),
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    MssqlDdlTargetIdentifier {
+        /// Selected output name associated with the target.
+        output_name: String,
+        /// Underlying arrow-tiberius identifier validation failure.
+        source: arrow_tiberius::Error,
+    },
+
+    /// SQL Server DDL planning failed for a DeltaFunnel-owned lifecycle reason.
+    #[snafu(display(
+        "MSSQL DDL planning error for output `{}`: {}",
+        sanitize_text_for_display(output_name),
+        sanitize_reason_for_display(message)
+    ))]
+    MssqlDdlPlanning {
+        /// Selected output name associated with the target.
+        output_name: String,
+        /// Sanitized reason for the DDL planning failure.
+        message: String,
+    },
+
     /// SQL Server batch writing failed.
     #[snafu(display(
         "MSSQL write error: {}",
