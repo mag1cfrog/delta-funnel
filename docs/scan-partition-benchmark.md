@@ -57,6 +57,30 @@ DataFusion provider registration, selects the requested provider backend through
 `DeltaProviderScanExecutionOptions`, runs DataFusion SQL, and collects real
 provider execution output. It does not use a benchmark-only reader path.
 
+Provider-exec CSV output includes provider read statistics collected from the
+executed Delta scan plan. The dynamic partition pruning fields are:
+
+- `provider_stats_dynamic_partition_files_pruned_p50`: p50 count of file tasks
+  skipped before provider file admission because a dynamic partition filter
+  snapshot proved the partition could not match.
+- `provider_stats_dynamic_partition_files_kept_p50`: p50 count of file tasks
+  evaluated by dynamic partition pruning and kept because the filter allowed
+  them or could not safely prove exclusion.
+- `provider_stats_dynamic_filters_received_p50`: p50 count of post-phase
+  physical filters offered to the Delta dynamic filter hook.
+- `provider_stats_dynamic_filters_accepted_p50`: p50 count of offered dynamic
+  filters retained for partition pruning.
+- `provider_stats_dynamic_filters_unsupported_p50`: p50 count of offered
+  filters rejected by the Delta dynamic filter hook policy.
+- `provider_stats_dynamic_filter_snapshots_p50`: p50 count of retained dynamic
+  filter snapshot attempts during file admission.
+- `provider_stats_dynamic_partition_files_not_pruned_missing_metadata_p50`:
+  p50 count of kept file tasks where missing, invalid, or unparsable partition
+  metadata prevented pruning.
+- `provider_stats_dynamic_partition_files_not_pruned_unsupported_expression_p50`:
+  p50 count of kept file tasks where unsupported or failed dynamic partition
+  evaluation prevented pruning.
+
 The provider-exec matrix compares the official kernel backend against the
 native async backend with lazy and bounded-prefetch scheduling profiles. It
 covers non-DV and sparse-DV versions of a many-small-files shape, a

@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
 use datafusion::common::{Column as DataFusionColumn, ScalarValue};
 use datafusion::logical_expr::{Expr as DataFusionExpr, Operator as DataFusionOperator};
 #[cfg(test)]
@@ -63,6 +64,16 @@ pub(crate) enum DeltaKernelPredicateAdapterError {
     UnsupportedLiteral,
     #[snafu(display("null DataFusion literal is unsupported"))]
     NullLiteral,
+}
+
+/// Typed rejection from the private Kernel-to-DataFusion partition scalar adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub(crate) enum DeltaKernelPartitionScalarAdapterError {
+    #[snafu(display("unsupported Arrow partition type"))]
+    UnsupportedArrowType,
+    #[snafu(display("unsupported Delta Kernel scalar value"))]
+    UnsupportedScalarValue,
 }
 
 /// Extracts the Delta protocol from a loaded snapshot.
@@ -379,6 +390,130 @@ fn datafusion_scalar_to_kernel_scalar(
     }
 }
 
+/// Maps provider Arrow partition types to Delta Kernel primitive parsers.
+///
+/// This is the inverse boundary of `datafusion_scalar_to_kernel_scalar` for
+/// Delta partition metadata. It intentionally admits only primitive Arrow
+/// shapes that static partition pushdown also treats as valid Delta partition
+/// representations.
+pub(crate) fn arrow_partition_type_to_kernel_primitive(
+    data_type: &ArrowDataType,
+) -> Option<KernelPrimitiveType> {
+    match data_type {
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Some(KernelPrimitiveType::String),
+        ArrowDataType::Int8 => Some(KernelPrimitiveType::Byte),
+        ArrowDataType::Int16 => Some(KernelPrimitiveType::Short),
+        ArrowDataType::Int32 => Some(KernelPrimitiveType::Integer),
+        ArrowDataType::Int64 => Some(KernelPrimitiveType::Long),
+        ArrowDataType::Float32 => Some(KernelPrimitiveType::Float),
+        ArrowDataType::Float64 => Some(KernelPrimitiveType::Double),
+        ArrowDataType::Boolean => Some(KernelPrimitiveType::Boolean),
+        ArrowDataType::Date32 => Some(KernelPrimitiveType::Date),
+        ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::FixedSizeBinary(_) => {
+            Some(KernelPrimitiveType::Binary)
+        }
+        ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, Some(timezone))
+            if !timezone.is_empty() =>
+        {
+            Some(KernelPrimitiveType::Timestamp)
+        }
+        ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, _) => {
+            Some(KernelPrimitiveType::TimestampNtz)
+        }
+        ArrowDataType::Decimal128(precision, scale) => {
+            let precision = *precision;
+            let scale = u8::try_from(*scale).ok()?;
+            KernelPrimitiveType::decimal(precision, scale).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Converts a parsed Delta Kernel partition scalar into the provider Arrow scalar type.
+///
+/// Delta Kernel owns protocol parsing for partition strings, while DataFusion
+/// physical expressions need `ScalarValue` instances that match the provider
+/// Arrow field exactly. This adapter preserves typed nulls, keeps LargeUtf8 and
+/// LargeBinary shapes, enforces FixedSizeBinary length, and rejects values that
+/// static partition pushdown does not use for exact pruning.
+pub(crate) fn kernel_partition_scalar_to_datafusion_scalar(
+    scalar: Scalar,
+    data_type: &ArrowDataType,
+) -> Result<ScalarValue, DeltaKernelPartitionScalarAdapterError> {
+    match (scalar, data_type) {
+        // Empty Delta partition strings parse to typed null for every primitive
+        // type. Preserve that typed null so DataFusion can produce SQL null
+        // results for expressions such as `partition_col = literal`.
+        (Scalar::Null(_), data_type) => ScalarValue::try_from(data_type)
+            .map_err(|_| DeltaKernelPartitionScalarAdapterError::UnsupportedArrowType),
+        (Scalar::String(value), ArrowDataType::Utf8) => Ok(ScalarValue::Utf8(Some(value))),
+        (Scalar::String(value), ArrowDataType::LargeUtf8) => {
+            Ok(ScalarValue::LargeUtf8(Some(value)))
+        }
+        (Scalar::Byte(value), ArrowDataType::Int8) => Ok(ScalarValue::Int8(Some(value))),
+        (Scalar::Short(value), ArrowDataType::Int16) => Ok(ScalarValue::Int16(Some(value))),
+        (Scalar::Integer(value), ArrowDataType::Int32) => Ok(ScalarValue::Int32(Some(value))),
+        (Scalar::Long(value), ArrowDataType::Int64) => Ok(ScalarValue::Int64(Some(value))),
+        // Static partition pushdown does not rely on signed zero or non-finite
+        // floating metadata. Keep that same boundary for dynamic pruning.
+        (Scalar::Float(value), ArrowDataType::Float32) if value.is_finite() && value != 0.0 => {
+            Ok(ScalarValue::Float32(Some(value)))
+        }
+        (Scalar::Double(value), ArrowDataType::Float64) if value.is_finite() && value != 0.0 => {
+            Ok(ScalarValue::Float64(Some(value)))
+        }
+        (Scalar::Boolean(value), ArrowDataType::Boolean) => Ok(ScalarValue::Boolean(Some(value))),
+        (Scalar::Date(value), ArrowDataType::Date32) => Ok(ScalarValue::Date32(Some(value))),
+        // Delta serializes binary partition values as UTF-8 strings. Empty
+        // binary collapses to null at the protocol boundary, so a non-null empty
+        // binary value is not accepted as proof for pruning.
+        (Scalar::Binary(value), ArrowDataType::Binary) if !value.is_empty() => {
+            Ok(ScalarValue::Binary(Some(value)))
+        }
+        (Scalar::Binary(value), ArrowDataType::LargeBinary) if !value.is_empty() => {
+            Ok(ScalarValue::LargeBinary(Some(value)))
+        }
+        (Scalar::Binary(value), ArrowDataType::FixedSizeBinary(size))
+            if usize::try_from(*size).is_ok_and(|size| value.len() == size)
+                && !value.is_empty() =>
+        {
+            Ok(ScalarValue::FixedSizeBinary(*size, Some(value)))
+        }
+        (
+            Scalar::Timestamp(value),
+            ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, timezone),
+        ) => Ok(ScalarValue::TimestampMicrosecond(
+            Some(value),
+            timezone.clone(),
+        )),
+        (
+            Scalar::TimestampNtz(value),
+            ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, None),
+        ) => Ok(ScalarValue::TimestampMicrosecond(Some(value), None)),
+        (
+            Scalar::TimestampNtz(value),
+            ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, Some(timezone)),
+        ) if timezone.is_empty() => Ok(ScalarValue::TimestampMicrosecond(
+            Some(value),
+            Some(Arc::clone(timezone)),
+        )),
+        // Decimal comparisons must stay exact across both precision and scale.
+        // A parseable decimal string with a different declared Arrow decimal
+        // shape is not safe to reinterpret for pruning.
+        (Scalar::Decimal(value), ArrowDataType::Decimal128(precision, scale))
+            if value.precision() == *precision
+                && value.scale() == u8::try_from(*scale).ok().unwrap_or_default() =>
+        {
+            Ok(ScalarValue::Decimal128(
+                Some(value.bits()),
+                *precision,
+                *scale,
+            ))
+        }
+        _ => Err(DeltaKernelPartitionScalarAdapterError::UnsupportedScalarValue),
+    }
+}
+
 #[cfg(test)]
 fn scan_builder_with_predicate_symbol(
     builder: delta_kernel::scan::ScanBuilder,
@@ -417,16 +552,16 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ArrowEngineData, ColumnName, DefaultEngineBuilder, DeltaKernelPredicate,
-        DeltaKernelPredicateAdapterError, DvInfo, EngineDataArrowExt, Expression, Predicate,
-        Scalar, Scan, ScanFile, ScanMetadata, Snapshot, SnapshotRef, Version,
-        scan_builder_with_predicate_and_stats_symbol, scan_builder_with_predicate_symbol,
+        ArrowEngineData, ColumnName, DefaultEngineBuilder, DeltaKernelPartitionScalarAdapterError,
+        DeltaKernelPredicate, DeltaKernelPredicateAdapterError, DvInfo, EngineDataArrowExt,
+        Expression, Predicate, Scalar, Scan, ScanFile, ScanMetadata, Snapshot, SnapshotRef,
+        Version, scan_builder_with_predicate_and_stats_symbol, scan_builder_with_predicate_symbol,
         store_from_url_opts, transform_to_logical, try_parse_uri,
     };
     use arrow_tiberius::{MssqlProfile, PlanOptions, plan_arrow_schema_to_mssql_mappings};
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::{Expr, cast, col, lit};
-    use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
+    use delta_kernel::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     fn convert_datafusion_predicate(
         filter: &Expr,
@@ -443,6 +578,13 @@ mod tests {
         value: &ScalarValue,
     ) -> Result<Scalar, DeltaKernelPredicateAdapterError> {
         super::datafusion_scalar_to_kernel_scalar(value)
+    }
+
+    fn convert_kernel_partition_scalar(
+        value: Scalar,
+        data_type: &DataType,
+    ) -> Result<ScalarValue, DeltaKernelPartitionScalarAdapterError> {
+        super::kernel_partition_scalar_to_datafusion_scalar(value, data_type)
     }
 
     fn collect_scan_file(files: &mut Vec<ScanFile>, file: ScanFile) {
@@ -659,6 +801,88 @@ mod tests {
                 kernel_column("event_ts_ntz"),
                 Expression::Literal(Scalar::TimestampNtz(1_767_225_600_123_456))
             ))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_scalar_adapter_preserves_provider_arrow_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let timezone = Arc::<str>::from("America/Phoenix");
+
+        assert_eq!(
+            convert_kernel_partition_scalar(
+                Scalar::String("value".to_owned()),
+                &DataType::LargeUtf8
+            ),
+            Ok(ScalarValue::LargeUtf8(Some("value".to_owned())))
+        );
+        assert_eq!(
+            convert_kernel_partition_scalar(
+                Scalar::Binary(b"abc".to_vec()),
+                &DataType::LargeBinary
+            ),
+            Ok(ScalarValue::LargeBinary(Some(b"abc".to_vec())))
+        );
+        assert_eq!(
+            convert_kernel_partition_scalar(
+                Scalar::Binary(b"abc".to_vec()),
+                &DataType::FixedSizeBinary(3)
+            ),
+            Ok(ScalarValue::FixedSizeBinary(3, Some(b"abc".to_vec())))
+        );
+        assert_eq!(
+            convert_kernel_partition_scalar(
+                Scalar::Timestamp(1_767_225_600_123_456),
+                &DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::clone(&timezone)))
+            ),
+            Ok(ScalarValue::TimestampMicrosecond(
+                Some(1_767_225_600_123_456),
+                Some(timezone)
+            ))
+        );
+        assert_eq!(
+            convert_kernel_partition_scalar(
+                Scalar::decimal(12_345, 10, 2)?,
+                &DataType::Decimal128(10, 2)
+            ),
+            Ok(ScalarValue::Decimal128(Some(12_345), 10, 2))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_partition_scalar_adapter_rejects_unproven_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let unsupported = DeltaKernelPartitionScalarAdapterError::UnsupportedScalarValue;
+
+        assert_eq!(
+            convert_kernel_partition_scalar(Scalar::Float(0.0), &DataType::Float32),
+            Err(unsupported)
+        );
+        assert_eq!(
+            convert_kernel_partition_scalar(Scalar::Float(f32::NAN), &DataType::Float32),
+            Err(unsupported)
+        );
+        assert_eq!(
+            convert_kernel_partition_scalar(Scalar::Binary(Vec::new()), &DataType::Binary),
+            Err(unsupported)
+        );
+        assert_eq!(
+            convert_kernel_partition_scalar(
+                Scalar::Binary(b"abc".to_vec()),
+                &DataType::FixedSizeBinary(4)
+            ),
+            Err(unsupported)
+        );
+        assert_eq!(
+            convert_kernel_partition_scalar(
+                Scalar::decimal(12_345, 10, 2)?,
+                &DataType::Decimal128(10, 3)
+            ),
+            Err(unsupported)
         );
 
         Ok(())

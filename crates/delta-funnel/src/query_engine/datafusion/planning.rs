@@ -1,6 +1,7 @@
 //! Delta DataFusion scan planning.
 
 pub(crate) mod dynamic_filters;
+pub(crate) mod dynamic_partition_pruning;
 pub(crate) mod file_task;
 pub(crate) mod file_task_partition;
 pub(crate) mod filters;

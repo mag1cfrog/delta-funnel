@@ -36,6 +36,22 @@ pub struct DeltaProviderReadStatsSnapshot {
     pub files_started: u64,
     /// File-read handoffs that finished successfully.
     pub files_completed: u64,
+    /// File tasks skipped before read scheduling by dynamic partition pruning.
+    pub dynamic_partition_files_pruned: u64,
+    /// File tasks kept after dynamic partition pruning evaluation.
+    pub dynamic_partition_files_kept: u64,
+    /// Post-phase physical filters offered to the Delta dynamic filter hook.
+    pub dynamic_filters_received: u64,
+    /// Offered dynamic filters retained for partition pruning.
+    pub dynamic_filters_accepted: u64,
+    /// Offered filters rejected by the dynamic filter hook policy.
+    pub dynamic_filters_unsupported: u64,
+    /// Attempts to snapshot a retained dynamic filter during file admission.
+    pub dynamic_filter_snapshots: u64,
+    /// Kept file tasks with missing, invalid, or unparsable partition metadata.
+    pub dynamic_partition_files_not_pruned_missing_metadata: u64,
+    /// Kept file tasks with unsupported or failed dynamic partition evaluation.
+    pub dynamic_partition_files_not_pruned_unsupported_expression: u64,
     /// Record batches sent toward DataFusion.
     pub batches_produced: u64,
     /// Rows sent toward DataFusion after transform and DV filtering.
@@ -89,6 +105,14 @@ pub(crate) struct DeltaProviderReadStats {
     scan_partitions_completed: AtomicU64,
     files_started: AtomicU64,
     files_completed: AtomicU64,
+    dynamic_partition_files_pruned: AtomicU64,
+    dynamic_partition_files_kept: AtomicU64,
+    dynamic_filters_received: AtomicU64,
+    dynamic_filters_accepted: AtomicU64,
+    dynamic_filters_unsupported: AtomicU64,
+    dynamic_filter_snapshots: AtomicU64,
+    dynamic_partition_files_not_pruned_missing_metadata: AtomicU64,
+    dynamic_partition_files_not_pruned_unsupported_expression: AtomicU64,
     batches_produced: AtomicU64,
     rows_produced: AtomicU64,
     deletion_vector_payloads_loaded: AtomicU64,
@@ -117,6 +141,14 @@ impl DeltaProviderReadStats {
             scan_partitions_completed: AtomicU64::new(0),
             files_started: AtomicU64::new(0),
             files_completed: AtomicU64::new(0),
+            dynamic_partition_files_pruned: AtomicU64::new(0),
+            dynamic_partition_files_kept: AtomicU64::new(0),
+            dynamic_filters_received: AtomicU64::new(0),
+            dynamic_filters_accepted: AtomicU64::new(0),
+            dynamic_filters_unsupported: AtomicU64::new(0),
+            dynamic_filter_snapshots: AtomicU64::new(0),
+            dynamic_partition_files_not_pruned_missing_metadata: AtomicU64::new(0),
+            dynamic_partition_files_not_pruned_unsupported_expression: AtomicU64::new(0),
             batches_produced: AtomicU64::new(0),
             rows_produced: AtomicU64::new(0),
             deletion_vector_payloads_loaded: AtomicU64::new(0),
@@ -144,6 +176,20 @@ impl DeltaProviderReadStats {
             scan_partitions_completed: self.scan_partitions_completed.load(Ordering::Relaxed),
             files_started: self.files_started.load(Ordering::Relaxed),
             files_completed: self.files_completed.load(Ordering::Relaxed),
+            dynamic_partition_files_pruned: self
+                .dynamic_partition_files_pruned
+                .load(Ordering::Relaxed),
+            dynamic_partition_files_kept: self.dynamic_partition_files_kept.load(Ordering::Relaxed),
+            dynamic_filters_received: self.dynamic_filters_received.load(Ordering::Relaxed),
+            dynamic_filters_accepted: self.dynamic_filters_accepted.load(Ordering::Relaxed),
+            dynamic_filters_unsupported: self.dynamic_filters_unsupported.load(Ordering::Relaxed),
+            dynamic_filter_snapshots: self.dynamic_filter_snapshots.load(Ordering::Relaxed),
+            dynamic_partition_files_not_pruned_missing_metadata: self
+                .dynamic_partition_files_not_pruned_missing_metadata
+                .load(Ordering::Relaxed),
+            dynamic_partition_files_not_pruned_unsupported_expression: self
+                .dynamic_partition_files_not_pruned_unsupported_expression
+                .load(Ordering::Relaxed),
             batches_produced: self.batches_produced.load(Ordering::Relaxed),
             rows_produced: self.rows_produced.load(Ordering::Relaxed),
             deletion_vector_payloads_loaded: self
@@ -170,6 +216,50 @@ impl DeltaProviderReadStats {
 
     pub(crate) fn record_file_completed(&self) {
         saturating_fetch_add(&self.files_completed, 1);
+    }
+
+    pub(crate) fn record_dynamic_partition_file_pruned(&self) {
+        saturating_fetch_add(&self.dynamic_partition_files_pruned, 1);
+    }
+
+    pub(crate) fn record_dynamic_partition_file_kept(&self) {
+        saturating_fetch_add(&self.dynamic_partition_files_kept, 1);
+    }
+
+    pub(crate) fn record_dynamic_filters_received(&self, count: usize) {
+        saturating_fetch_add(
+            &self.dynamic_filters_received,
+            usize_to_u64_saturating(count),
+        );
+    }
+
+    pub(crate) fn record_dynamic_filters_accepted(&self, count: usize) {
+        saturating_fetch_add(
+            &self.dynamic_filters_accepted,
+            usize_to_u64_saturating(count),
+        );
+    }
+
+    pub(crate) fn record_dynamic_filters_unsupported(&self, count: usize) {
+        saturating_fetch_add(
+            &self.dynamic_filters_unsupported,
+            usize_to_u64_saturating(count),
+        );
+    }
+
+    pub(crate) fn record_dynamic_filter_snapshot(&self) {
+        saturating_fetch_add(&self.dynamic_filter_snapshots, 1);
+    }
+
+    pub(crate) fn record_dynamic_partition_file_not_pruned_missing_metadata(&self) {
+        saturating_fetch_add(&self.dynamic_partition_files_not_pruned_missing_metadata, 1);
+    }
+
+    pub(crate) fn record_dynamic_partition_file_not_pruned_unsupported_expression(&self) {
+        saturating_fetch_add(
+            &self.dynamic_partition_files_not_pruned_unsupported_expression,
+            1,
+        );
     }
 
     pub(crate) fn record_batch_produced(&self, rows: usize) {
@@ -256,6 +346,20 @@ mod tests {
         assert_eq!(snapshot.scan_partitions_completed, 0);
         assert_eq!(snapshot.files_started, 0);
         assert_eq!(snapshot.files_completed, 0);
+        assert_eq!(snapshot.dynamic_partition_files_pruned, 0);
+        assert_eq!(snapshot.dynamic_partition_files_kept, 0);
+        assert_eq!(snapshot.dynamic_filters_received, 0);
+        assert_eq!(snapshot.dynamic_filters_accepted, 0);
+        assert_eq!(snapshot.dynamic_filters_unsupported, 0);
+        assert_eq!(snapshot.dynamic_filter_snapshots, 0);
+        assert_eq!(
+            snapshot.dynamic_partition_files_not_pruned_missing_metadata,
+            0
+        );
+        assert_eq!(
+            snapshot.dynamic_partition_files_not_pruned_unsupported_expression,
+            0
+        );
         assert_eq!(snapshot.batches_produced, 0);
         assert_eq!(snapshot.rows_produced, 0);
         assert_eq!(snapshot.deletion_vector_payloads_loaded, 0);
@@ -280,6 +384,14 @@ mod tests {
 
         stats.record_scan_partition_started();
         stats.record_file_started();
+        stats.record_dynamic_partition_file_pruned();
+        stats.record_dynamic_partition_file_kept();
+        stats.record_dynamic_filters_received(3);
+        stats.record_dynamic_filters_accepted(1);
+        stats.record_dynamic_filters_unsupported(2);
+        stats.record_dynamic_filter_snapshot();
+        stats.record_dynamic_partition_file_not_pruned_missing_metadata();
+        stats.record_dynamic_partition_file_not_pruned_unsupported_expression();
         stats.record_batch_produced(3);
         stats.record_deletion_vector_payload_loaded();
         stats.record_deletion_vector_applied(1);
@@ -291,6 +403,20 @@ mod tests {
         assert_eq!(snapshot.scan_partitions_completed, 0);
         assert_eq!(snapshot.files_started, 1);
         assert_eq!(snapshot.files_completed, 0);
+        assert_eq!(snapshot.dynamic_partition_files_pruned, 1);
+        assert_eq!(snapshot.dynamic_partition_files_kept, 1);
+        assert_eq!(snapshot.dynamic_filters_received, 3);
+        assert_eq!(snapshot.dynamic_filters_accepted, 1);
+        assert_eq!(snapshot.dynamic_filters_unsupported, 2);
+        assert_eq!(snapshot.dynamic_filter_snapshots, 1);
+        assert_eq!(
+            snapshot.dynamic_partition_files_not_pruned_missing_metadata,
+            1
+        );
+        assert_eq!(
+            snapshot.dynamic_partition_files_not_pruned_unsupported_expression,
+            1
+        );
         assert_eq!(snapshot.batches_produced, 1);
         assert_eq!(snapshot.rows_produced, 3);
         assert_eq!(snapshot.deletion_vector_payloads_loaded, 1);
@@ -325,6 +451,14 @@ mod tests {
                     stats.record_scan_partition_completed();
                     stats.record_file_started();
                     stats.record_file_completed();
+                    stats.record_dynamic_partition_file_pruned();
+                    stats.record_dynamic_partition_file_kept();
+                    stats.record_dynamic_filters_received(3);
+                    stats.record_dynamic_filters_accepted(1);
+                    stats.record_dynamic_filters_unsupported(2);
+                    stats.record_dynamic_filter_snapshot();
+                    stats.record_dynamic_partition_file_not_pruned_missing_metadata();
+                    stats.record_dynamic_partition_file_not_pruned_unsupported_expression();
                     stats.record_batch_produced(2);
                     stats.record_deletion_vector_payload_loaded();
                     stats.record_deletion_vector_applied(1);
@@ -345,6 +479,20 @@ mod tests {
         assert_eq!(snapshot.scan_partitions_completed, expected);
         assert_eq!(snapshot.files_started, expected);
         assert_eq!(snapshot.files_completed, expected);
+        assert_eq!(snapshot.dynamic_partition_files_pruned, expected);
+        assert_eq!(snapshot.dynamic_partition_files_kept, expected);
+        assert_eq!(snapshot.dynamic_filters_received, expected * 3);
+        assert_eq!(snapshot.dynamic_filters_accepted, expected);
+        assert_eq!(snapshot.dynamic_filters_unsupported, expected * 2);
+        assert_eq!(snapshot.dynamic_filter_snapshots, expected);
+        assert_eq!(
+            snapshot.dynamic_partition_files_not_pruned_missing_metadata,
+            expected
+        );
+        assert_eq!(
+            snapshot.dynamic_partition_files_not_pruned_unsupported_expression,
+            expected
+        );
         assert_eq!(snapshot.batches_produced, expected);
         assert_eq!(snapshot.rows_produced, expected * 2);
         assert_eq!(snapshot.deletion_vector_payloads_loaded, expected);

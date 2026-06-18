@@ -28,6 +28,7 @@ const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test
 const MISSING_NULLABLE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"loyalty_tier\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const MISSING_NON_NULLABLE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"required_code\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
+const TWO_PARTITION_COLUMN_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region","event_date"],"configuration":{},"createdTime":1587968585495}}"#;
 const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"},"createdTime":1587968585495}}"#;
 const SUPPORTED_TYPES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"active\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}},{\"name\":\"score_f32\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"score_f64\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"level\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const NESTED_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
@@ -242,6 +243,70 @@ impl RealParquetDeltaTable {
                 partition_values_json: format!(r#"{{"region":"{region}"}}"#),
                 deletion_vector: None,
             }],
+        )
+    }
+
+    /// Creates a local partitioned Delta table with two real Parquet files.
+    pub(crate) fn new_with_two_partition_values(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut west = file_batch(1, vec![(1, Some("west-1")), (2, Some("west-2"))])?;
+        west.partition_values_json = r#"{"region":"us-west"}"#.to_owned();
+        let mut east = file_batch(2, vec![(3, Some("east-3")), (4, Some("east-4"))])?;
+        east.partition_values_json = r#"{"region":"us-east"}"#.to_owned();
+
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            PARTITIONED_METADATA_JSON,
+            vec![west, east],
+        )
+    }
+
+    /// Creates a local partitioned Delta table with null and non-null region
+    /// partition values.
+    pub(crate) fn new_with_null_partition_value(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut null_region = file_batch(1, vec![(1, Some("null-region-1"))])?;
+        null_region.partition_values_json = r#"{"region":null}"#.to_owned();
+        let mut west = file_batch(2, vec![(2, Some("west-2"))])?;
+        west.partition_values_json = r#"{"region":"us-west"}"#.to_owned();
+        let mut east = file_batch(3, vec![(3, Some("east-3"))])?;
+        east.partition_values_json = r#"{"region":"us-east"}"#.to_owned();
+
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            PARTITIONED_METADATA_JSON,
+            vec![null_region, west, east],
+        )
+    }
+
+    /// Creates a local Delta table with two partition columns and four real
+    /// Parquet files. One file matches both partition values, two files match
+    /// only one value each, and one file matches neither value.
+    pub(crate) fn new_with_two_partition_columns(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut west_2026 = file_batch(1, vec![(1, Some("west-2026-1"))])?;
+        west_2026.partition_values_json =
+            r#"{"region":"us-west","event_date":"2026-01-01"}"#.to_owned();
+        let mut west_2025 = file_batch(2, vec![(2, Some("west-2025-2"))])?;
+        west_2025.partition_values_json =
+            r#"{"region":"us-west","event_date":"2025-01-01"}"#.to_owned();
+        let mut east_2026 = file_batch(3, vec![(3, Some("east-2026-3"))])?;
+        east_2026.partition_values_json =
+            r#"{"region":"us-east","event_date":"2026-01-01"}"#.to_owned();
+        let mut east_2025 = file_batch(4, vec![(4, Some("east-2025-4"))])?;
+        east_2025.partition_values_json =
+            r#"{"region":"us-east","event_date":"2025-01-01"}"#.to_owned();
+
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            TWO_PARTITION_COLUMN_METADATA_JSON,
+            vec![west_2026, west_2025, east_2026, east_2025],
         )
     }
 

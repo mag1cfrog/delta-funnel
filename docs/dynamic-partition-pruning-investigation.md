@@ -209,7 +209,7 @@ snapshot at that point.
 | What about incomplete filters? | Treat them as opportunistic. If no safe snapshot is available, read the file task. |
 | What about empty or contradictory filters? | Skip not-yet-started file tasks only when the current snapshot proves exclusion from file metadata. Otherwise read and preserve residual filtering. |
 | What about updated filters after scheduling starts? | Use the newest snapshot for future file admissions only. Do not invalidate emitted rows or cancel already started reads in the first implementation. |
-| How should metrics and dry-run reports work? | Metrics should distinguish received, accepted, unsupported, snapshotted, skipped, already-started, missing-metadata, and too-late dynamic filters. Dry-run or benchmark reporting can consume the same counters once implementation exists. |
+| How should metrics and dry-run reports work? | Metrics distinguish received, accepted, unsupported, snapshotted, skipped, missing-metadata, and unsupported-expression outcomes. Provider-exec benchmark reporting consumes the same counters. Already-started and too-late counters are intentionally omitted until they can be observed without coupling the scan to dynamic filter producers. |
 
 ## Scheduling Behavior
 
@@ -232,22 +232,36 @@ often outrun useful dynamic filters.
 
 ## Metrics
 
-Add provider-owned metrics that distinguish dynamic pruning from existing scan
+Provider-owned read stats distinguish dynamic pruning from existing scan
 planning counters:
 
-- `dynamic_filters_received`
-- `dynamic_filters_accepted`
-- `dynamic_filters_unsupported`
-- `dynamic_filter_snapshots`
-- `dynamic_files_skipped_before_scheduling`
-- `dynamic_files_started_before_filter`
-- `dynamic_files_not_pruned_missing_metadata`
-- `dynamic_files_not_pruned_unsupported_expression`
-- `dynamic_filters_completed`
-- `dynamic_filters_too_late`
+- `dynamic_filters_received`: post-phase physical filters offered to the Delta
+  dynamic filter hook.
+- `dynamic_filters_accepted`: offered dynamic filters retained for partition
+  pruning.
+- `dynamic_filters_unsupported`: offered filters rejected by provider policy.
+- `dynamic_filter_snapshots`: attempts to snapshot a retained dynamic filter
+  during file admission.
+- `dynamic_partition_files_pruned`: file tasks skipped before provider file
+  admission.
+- `dynamic_partition_files_kept`: file tasks evaluated by dynamic pruning and
+  kept.
+- `dynamic_partition_files_not_pruned_missing_metadata`: kept file tasks where
+  missing, invalid, or unparsable partition metadata prevented pruning.
+- `dynamic_partition_files_not_pruned_unsupported_expression`: kept file tasks
+  where unsupported or failed dynamic partition evaluation prevented pruning.
 
-Existing read stats should continue to report planned partitions, started
-partitions, files read, batches, rows, deletion-vector counts, and backend.
+Existing read stats continue to report planned partitions, started partitions,
+files planned, files started, files completed, batches, rows, deletion-vector
+counts, and backend. Dynamic pruning must not rewrite `files_planned`; skipped
+files instead show up as fewer `files_started` and `files_completed`.
+
+The first implementation does not expose `dynamic_filters_completed` or
+`dynamic_filters_too_late`. A completion counter would require observing
+producer internals without blocking file admission. A precise too-late counter
+would require knowing that a filter became newly useful after a specific file
+task was already opened or prefetched. Those are intentionally left out until
+there is a producer-side signal or a separate design for bounded waiting.
 
 ## Follow-Up Issues
 
