@@ -28,6 +28,11 @@ pub struct DeltaProviderReadStatsSnapshot {
     pub estimated_rows: Option<u64>,
     /// Estimated bytes from planning when every selected file had a byte size.
     pub estimated_bytes: Option<u64>,
+    /// Effective DataFusion task batch size observed when execution starts.
+    ///
+    /// This records the upstream query-engine setting. It does not claim every
+    /// produced or final query-output batch has exactly this many rows.
+    pub datafusion_output_batch_size: Option<u64>,
     /// Execution partitions whose stream was started by DataFusion.
     pub scan_partitions_started: u64,
     /// Execution partitions whose stream reached normal completion.
@@ -101,6 +106,7 @@ pub(crate) struct DeltaProviderReadStats {
     files_planned: u64,
     estimated_rows: Option<u64>,
     estimated_bytes: Option<u64>,
+    datafusion_output_batch_size: AtomicU64,
     scan_partitions_started: AtomicU64,
     scan_partitions_completed: AtomicU64,
     files_started: AtomicU64,
@@ -137,6 +143,7 @@ impl DeltaProviderReadStats {
             files_planned: usize_to_u64_saturating(config.files_planned),
             estimated_rows: config.estimated_rows,
             estimated_bytes: config.estimated_bytes,
+            datafusion_output_batch_size: AtomicU64::new(0),
             scan_partitions_started: AtomicU64::new(0),
             scan_partitions_completed: AtomicU64::new(0),
             files_started: AtomicU64::new(0),
@@ -172,6 +179,9 @@ impl DeltaProviderReadStats {
             files_planned: self.files_planned,
             estimated_rows: self.estimated_rows,
             estimated_bytes: self.estimated_bytes,
+            datafusion_output_batch_size: nonzero_atomic_snapshot(
+                &self.datafusion_output_batch_size,
+            ),
             scan_partitions_started: self.scan_partitions_started.load(Ordering::Relaxed),
             scan_partitions_completed: self.scan_partitions_completed.load(Ordering::Relaxed),
             files_started: self.files_started.load(Ordering::Relaxed),
@@ -204,6 +214,11 @@ impl DeltaProviderReadStats {
 
     pub(crate) fn record_scan_partition_started(&self) {
         saturating_fetch_add(&self.scan_partitions_started, 1);
+    }
+
+    pub(crate) fn record_datafusion_output_batch_size(&self, batch_size: usize) {
+        self.datafusion_output_batch_size
+            .store(usize_to_u64_saturating(batch_size), Ordering::Relaxed);
     }
 
     pub(crate) fn record_scan_partition_completed(&self) {
@@ -309,6 +324,14 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+#[allow(dead_code)]
+fn nonzero_atomic_snapshot(counter: &AtomicU64) -> Option<u64> {
+    match counter.load(Ordering::Relaxed) {
+        0 => None,
+        value => Some(value),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -342,6 +365,7 @@ mod tests {
         assert_eq!(snapshot.files_planned, 5);
         assert_eq!(snapshot.estimated_rows, Some(99));
         assert_eq!(snapshot.estimated_bytes, Some(42));
+        assert_eq!(snapshot.datafusion_output_batch_size, None);
         assert_eq!(snapshot.scan_partitions_started, 0);
         assert_eq!(snapshot.scan_partitions_completed, 0);
         assert_eq!(snapshot.files_started, 0);
@@ -383,6 +407,7 @@ mod tests {
         });
 
         stats.record_scan_partition_started();
+        stats.record_datafusion_output_batch_size(8192);
         stats.record_file_started();
         stats.record_dynamic_partition_file_pruned();
         stats.record_dynamic_partition_file_kept();
@@ -399,6 +424,7 @@ mod tests {
 
         let snapshot = stats.snapshot();
 
+        assert_eq!(snapshot.datafusion_output_batch_size, Some(8192));
         assert_eq!(snapshot.scan_partitions_started, 1);
         assert_eq!(snapshot.scan_partitions_completed, 0);
         assert_eq!(snapshot.files_started, 1);

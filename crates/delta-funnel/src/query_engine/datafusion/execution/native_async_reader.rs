@@ -96,6 +96,8 @@ pub(crate) struct DeltaNativeAsyncFileReadRequest<'a> {
     pub(crate) task: &'a DeltaScanFileTask,
     /// Kernel scan schema state selected for this provider scan.
     pub(crate) read_schema: &'a KernelScanReadSchema,
+    /// Optional DataFusion task batch size for provider-owned Parquet decoding.
+    pub(crate) output_batch_size: Option<usize>,
 }
 
 /// Native async scheduler adapter for one execution partition.
@@ -104,6 +106,7 @@ pub(crate) struct DeltaNativeAsyncPartitionFileReader {
     reader: Arc<DeltaNativeAsyncFileReader>,
     read_schema: KernelScanReadSchema,
     read_stats: Arc<DeltaProviderReadStats>,
+    output_batch_size: usize,
 }
 
 /// Native async batches for one provider file task.
@@ -352,6 +355,11 @@ impl DeltaNativeAsyncFileReader {
         )?;
         let builder = if let Some(row_filter) = row_filter {
             builder.with_row_filter(row_filter)
+        } else {
+            builder
+        };
+        let builder = if let Some(output_batch_size) = request.output_batch_size {
+            builder.with_batch_size(output_batch_size)
         } else {
             builder
         };
@@ -1680,11 +1688,13 @@ impl DeltaNativeAsyncPartitionFileReader {
         reader: Arc<DeltaNativeAsyncFileReader>,
         read_schema: KernelScanReadSchema,
         read_stats: Arc<DeltaProviderReadStats>,
+        output_batch_size: usize,
     ) -> Self {
         Self {
             reader,
             read_schema,
             read_stats,
+            output_batch_size,
         }
     }
 }
@@ -1699,6 +1709,7 @@ impl DeltaProviderAsyncFileReader<DeltaScanFileTask, DeltaNativeAsyncFileReadStr
     ) -> DeltaProviderAsyncFileReadFuture<DeltaNativeAsyncFileReadStream> {
         let reader = Arc::clone(&self.reader);
         let read_schema = self.read_schema.clone();
+        let output_batch_size = self.output_batch_size;
         self.read_stats.record_file_started();
 
         Box::pin(async move {
@@ -1707,6 +1718,7 @@ impl DeltaProviderAsyncFileReader<DeltaScanFileTask, DeltaNativeAsyncFileReadStr
                     DeltaNativeAsyncFileReadRequest {
                         task: &task,
                         read_schema: &read_schema,
+                        output_batch_size: Some(output_batch_size),
                     },
                     Some(permit),
                 )
@@ -2345,6 +2357,7 @@ mod tests {
             .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
+                output_batch_size: None,
             })
             .await?;
         let batches = collect_file_stream(stream).await?;
@@ -2366,6 +2379,37 @@ mod tests {
         assert_eq!(names.value(0), "alice");
         assert_eq!(names.value(1), "bob");
         assert!(names.is_null(2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_reader_uses_configured_output_batch_size()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table_uri = "memory:///table/root/";
+        let reader = reader(table_uri)?;
+        let read_schema = default_read_schema("native-async-configured-batch-size")?;
+        let parquet_bytes = default_parquet_bytes()?;
+        let mut task = task(table_uri, "part-00000.parquet");
+
+        task.estimated_bytes = Some(u64::try_from(parquet_bytes.len())?);
+        let object = reader.parquet_object_for_task(&task)?;
+        reader.store.put(&object.path, parquet_bytes.into()).await?;
+
+        let stream = reader
+            .open_file_stream(DeltaNativeAsyncFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+                output_batch_size: Some(2),
+            })
+            .await?;
+        let batches = collect_file_stream(stream).await?;
+        let batch_rows = batches
+            .iter()
+            .map(datafusion::arrow::record_batch::RecordBatch::num_rows)
+            .collect::<Vec<_>>();
+
+        assert_eq!(batch_rows, vec![2, 1]);
 
         Ok(())
     }
@@ -3829,6 +3873,7 @@ mod tests {
             .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
+                output_batch_size: None,
             })
             .await?;
         let batches = collect_file_stream(stream).await?;
@@ -3874,6 +3919,7 @@ mod tests {
             .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
+                output_batch_size: None,
             })
             .await?;
         let batches = collect_file_stream(stream).await?;
@@ -3917,6 +3963,7 @@ mod tests {
             .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
+                output_batch_size: None,
             })
             .await
         {
@@ -3970,6 +4017,7 @@ mod tests {
             .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
+                output_batch_size: None,
             })
             .await?;
         assert_eq!(
@@ -4036,6 +4084,7 @@ mod tests {
             .open_file_stream_with_original_row_index(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
+                output_batch_size: None,
             })
             .await?;
         let (batch, row_indexes) = stream
@@ -4097,6 +4146,7 @@ mod tests {
             .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
+                output_batch_size: None,
             })
             .await?;
         let batches = collect_file_stream(stream).await?;
@@ -4165,6 +4215,7 @@ mod tests {
             .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
+                output_batch_size: None,
             })
             .await?;
         let batches = collect_file_stream(stream).await?;
@@ -4329,6 +4380,7 @@ mod tests {
             .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
+                output_batch_size: None,
             })
             .await?;
         let batches = collect_file_stream(stream).await?;
@@ -4388,6 +4440,7 @@ mod tests {
             .open_file_stream(DeltaNativeAsyncFileReadRequest {
                 task: &task,
                 read_schema: &read_schema,
+                output_batch_size: None,
             })
             .await?;
         let batches = collect_file_stream(stream).await?;

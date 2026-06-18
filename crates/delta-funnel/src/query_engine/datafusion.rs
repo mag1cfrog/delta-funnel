@@ -8,6 +8,7 @@ use crate::DeltaFunnelError;
 mod catalog;
 mod execution;
 mod planning;
+mod session;
 
 pub use catalog::registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources,
@@ -23,6 +24,7 @@ pub use planning::partition_target::{
     delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic,
 };
+pub use session::{QueryOptions, datafusion_session_config, datafusion_session_context};
 
 impl From<DeltaFunnelError> for DataFusionError {
     fn from(error: DeltaFunnelError) -> Self {
