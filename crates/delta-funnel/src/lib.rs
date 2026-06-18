@@ -34,9 +34,13 @@ pub use query_engine::{
     register_delta_sources_with_scan_execution_options,
 };
 pub use sql_server::{
-    LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary,
-    MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,
-    ResolvedMssqlTarget,
+    LoadMode, MssqlBinaryPolicy, MssqlConnectionConfig, MssqlConnectionSource,
+    MssqlConnectionSummary, MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy,
+    MssqlFloatPolicy, MssqlNanosecondPolicy, MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField,
+    MssqlSchemaPlan, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTargetConfig,
+    MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable, MssqlTimezonePolicy,
+    MssqlUInt64Policy, ResolvedMssqlTarget, mssql_schema_diagnostic_reports,
+    plan_mssql_output_schema,
 };
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,
