@@ -1661,6 +1661,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_join_dynamic_filter_kept_file_still_applies_deletion_vector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = SessionConfig::new()
+            .with_target_partitions(1)
+            .set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", true)
+            .set_bool(
+                "datafusion.optimizer.enable_join_dynamic_filter_pushdown",
+                true,
+            );
+        let ctx = SessionContext::new_with_config(config);
+        register_allowed_regions(&ctx, vec!["us-west"])?;
+        let table = RealParquetDeltaTable::new_with_partition_value_and_deletion_vector(
+            "dynamic-pruning-kept-dv-file",
+            "us-west",
+            &[1],
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+            storage_options: Default::default(),
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql(
+                "select o.region, o.id \
+                 from allowed_regions r \
+                 join orders o on r.region = o.region \
+                 order by o.id",
+            )
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1, "{plan_display}");
+        assert_eq!(scans[0].dynamic_filters().len(), 1, "{plan_display}");
+        assert_eq!(scans[0].read_stats_snapshot().files_planned, 1);
+
+        let batches =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let formatted = pretty_format_batches(&batches)?.to_string();
+        let stats = scans[0].read_stats_snapshot();
+
+        assert_eq!(
+            formatted,
+            [
+                "+---------+----+",
+                "| region  | id |",
+                "+---------+----+",
+                "| us-west | 1  |",
+                "| us-west | 3  |",
+                "+---------+----+",
+            ]
+            .join("\n")
+        );
+        assert_eq!(stats.files_planned, 1);
+        assert_eq!(stats.files_started, 1);
+        assert_eq!(stats.files_completed, 1);
+        assert_eq!(stats.dynamic_filters_received, 1);
+        assert_eq!(stats.dynamic_filters_accepted, 1);
+        assert_eq!(stats.dynamic_filters_unsupported, 0);
+        assert_eq!(stats.dynamic_filter_snapshots, 1);
+        assert_eq!(stats.dynamic_partition_files_pruned, 0);
+        assert_eq!(stats.dynamic_partition_files_kept, 1);
+        assert_eq!(stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(stats.deletion_vectors_applied, 1);
+        assert_eq!(stats.deletion_vector_rows_deleted, 1);
+        assert_eq!(stats.deletion_vector_failures, 0);
+        assert_eq!(stats.deletion_vector_rejections, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn physical_pushdown_retains_multi_partition_dynamic_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, physical_plan) = partitioned_scan_physical_plan_with_schema(
