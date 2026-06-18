@@ -1259,6 +1259,7 @@ dependencies = [
 name = "delta-funnel"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema",
  "arrow-tiberius",
  "async-trait",
  "chrono",

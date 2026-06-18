@@ -387,6 +387,61 @@ pub enum DeltaFunnelError {
         output_name: String,
     },
 
+    /// A selected output identity is missing or invalid for SQL Server schema planning.
+    #[snafu(display(
+        "MSSQL schema planning error for output `{}`: {reason}",
+        sanitize_text_for_display(output_name)
+    ))]
+    InvalidMssqlOutputIdentity {
+        /// Selected output name associated with the schema.
+        output_name: String,
+        /// Stable reason for the validation failure.
+        reason: &'static str,
+    },
+
+    /// A selected output has duplicate field names before SQL Server planning.
+    #[snafu(display(
+        "MSSQL schema planning error for output `{}`: duplicate field name `{}` at indexes {first_index} and {duplicate_index}",
+        sanitize_text_for_display(output_name),
+        sanitize_text_for_display(field_name)
+    ))]
+    DuplicateMssqlOutputField {
+        /// Selected output name associated with the schema.
+        output_name: String,
+        /// Duplicate output field name.
+        field_name: String,
+        /// First index where the field name was seen.
+        first_index: usize,
+        /// Duplicate index where the field name was seen again.
+        duplicate_index: usize,
+    },
+
+    /// SQL Server schema planning failed with structured arrow-tiberius diagnostics.
+    #[snafu(display(
+        "MSSQL schema planning error for output `{}`: arrow-tiberius returned {} diagnostic(s)",
+        sanitize_text_for_display(output_name),
+        diagnostics.len()
+    ))]
+    MssqlSchemaPlanning {
+        /// Selected output name associated with the schema.
+        output_name: String,
+        /// Structured diagnostics returned by arrow-tiberius.
+        diagnostics: arrow_tiberius::DiagnosticSet,
+    },
+
+    /// SQL Server schema planning failed before producing diagnostics.
+    #[snafu(display(
+        "MSSQL schema planning error for output `{}`: {}",
+        sanitize_text_for_display(output_name),
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    MssqlSchemaPlanningFailed {
+        /// Selected output name associated with the schema.
+        output_name: String,
+        /// Underlying arrow-tiberius planning failure.
+        source: arrow_tiberius::Error,
+    },
+
     /// SQL Server batch writing failed.
     #[snafu(display(
         "MSSQL write error: {}",

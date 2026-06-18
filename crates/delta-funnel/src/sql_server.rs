@@ -4,8 +4,10 @@
 //! SQL Server targets. Schema mapping, identifier quoting, DDL rendering, and
 //! Arrow-to-TDS writing remain owned by `arrow-tiberius`.
 
+mod schema_planning;
 mod target;
 
+pub use schema_planning::{MssqlSchemaPlan, MssqlSchemaPlanOptions, plan_mssql_output_schema};
 pub use target::{
     LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,

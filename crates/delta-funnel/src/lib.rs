@@ -35,8 +35,8 @@ pub use query_engine::{
 };
 pub use sql_server::{
     LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary,
-    MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,
-    ResolvedMssqlTarget,
+    MssqlSchemaPlan, MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetResolutionContext,
+    MssqlTargetSummary, MssqlTargetTable, ResolvedMssqlTarget, plan_mssql_output_schema,
 };
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,
