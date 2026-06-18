@@ -396,6 +396,15 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             &self.scan_plan.projected_schema,
             &self.scan_plan.partition_columns,
         );
+        let accepted_count = dynamic_filter_plan.accepted_filters.len();
+        self.read_stats
+            .record_dynamic_filters_received(parent_filters.len());
+        self.read_stats
+            .record_dynamic_filters_accepted(accepted_count);
+        self.read_stats.record_dynamic_filters_unsupported(
+            parent_filters.len().saturating_sub(accepted_count),
+        );
+
         // If nothing is accepted, leave the scan unchanged so later execution
         // cannot observe any new pruning state.
         if !dynamic_filter_plan.has_accepted_filters() {
@@ -1154,6 +1163,48 @@ mod tests {
             updated_scan.dynamic_filters()[0].partition_columns[0].index,
             1
         );
+        let stats = updated_scan.read_stats_snapshot();
+        assert_eq!(stats.dynamic_filters_received, 1);
+        assert_eq!(stats.dynamic_filters_accepted, 1);
+        assert_eq!(stats.dynamic_filters_unsupported, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_pushdown_records_mixed_dynamic_filter_hook_stats()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, physical_plan) =
+            partitioned_scan_physical_plan("dynamic-filter-hook-stats-mixed").await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![
+                dynamic_filter(vec![physical_column("region", 1)]),
+                dynamic_filter(vec![physical_column("id", 0)]),
+            ]),
+            &ConfigOptions::new(),
+        )?;
+        let updated_node = result
+            .updated_node
+            .as_ref()
+            .ok_or("expected updated DeltaScanPlanningExec")?;
+        let updated_scan = updated_node
+            .as_any()
+            .downcast_ref::<super::DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+        let stats = updated_scan.read_stats_snapshot();
+
+        assert_eq!(result.filters.len(), 2);
+        assert!(pushed_down_yes(result.filters[0]));
+        assert!(!pushed_down_yes(result.filters[1]));
+        assert_eq!(updated_scan.dynamic_filters().len(), 1);
+        assert_eq!(stats.dynamic_filters_received, 2);
+        assert_eq!(stats.dynamic_filters_accepted, 1);
+        assert_eq!(stats.dynamic_filters_unsupported, 1);
 
         Ok(())
     }
@@ -1343,6 +1394,10 @@ mod tests {
         assert_eq!(result.filters.len(), 1);
         assert!(!pushed_down_yes(result.filters[0]));
         assert!(result.updated_node.is_none());
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.dynamic_filters_received, 1);
+        assert_eq!(stats.dynamic_filters_accepted, 0);
+        assert_eq!(stats.dynamic_filters_unsupported, 1);
 
         Ok(())
     }
@@ -1365,6 +1420,10 @@ mod tests {
         assert_eq!(result.filters.len(), 1);
         assert!(!pushed_down_yes(result.filters[0]));
         assert!(result.updated_node.is_none());
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.dynamic_filters_received, 1);
+        assert_eq!(stats.dynamic_filters_accepted, 0);
+        assert_eq!(stats.dynamic_filters_unsupported, 1);
 
         Ok(())
     }
@@ -1390,6 +1449,10 @@ mod tests {
         assert_eq!(result.filters.len(), 1);
         assert!(!pushed_down_yes(result.filters[0]));
         assert!(result.updated_node.is_none());
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.dynamic_filters_received, 1);
+        assert_eq!(stats.dynamic_filters_accepted, 0);
+        assert_eq!(stats.dynamic_filters_unsupported, 1);
 
         Ok(())
     }
@@ -1417,6 +1480,10 @@ mod tests {
         assert_eq!(result.filters.len(), 1);
         assert!(!pushed_down_yes(result.filters[0]));
         assert!(result.updated_node.is_none());
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.dynamic_filters_received, 1);
+        assert_eq!(stats.dynamic_filters_accepted, 0);
+        assert_eq!(stats.dynamic_filters_unsupported, 1);
 
         Ok(())
     }
@@ -1439,6 +1506,10 @@ mod tests {
         assert_eq!(result.filters.len(), 1);
         assert!(!pushed_down_yes(result.filters[0]));
         assert!(result.updated_node.is_none());
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.dynamic_filters_received, 0);
+        assert_eq!(stats.dynamic_filters_accepted, 0);
+        assert_eq!(stats.dynamic_filters_unsupported, 0);
 
         Ok(())
     }
