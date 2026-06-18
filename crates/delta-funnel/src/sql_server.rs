@@ -5,10 +5,14 @@
 //! Arrow-to-TDS writing remain owned by `arrow-tiberius`.
 
 mod ddl_planning;
+mod lifecycle_planning;
 mod schema_planning;
 mod target;
 
 pub use ddl_planning::{MssqlDdlPlan, plan_mssql_create_table_ddl};
+pub use lifecycle_planning::{
+    MssqlLifecyclePlan, MssqlLifecycleSideEffectPolicy, MssqlTargetTableState, plan_mssql_lifecycle,
+};
 pub use schema_planning::{
     MssqlBinaryPolicy, MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy,
     MssqlFloatPolicy, MssqlNanosecondPolicy, MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField,
