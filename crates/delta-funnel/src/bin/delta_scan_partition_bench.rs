@@ -52,7 +52,7 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 18;
+const BENCHMARK_SCHEMA_VERSION: u32 = 19;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
@@ -145,7 +145,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 67] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 70] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -185,6 +185,9 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 67] = [
     "provider_stats_dynamic_filters_received_p50",
     "provider_stats_dynamic_filters_accepted_p50",
     "provider_stats_dynamic_filters_unsupported_p50",
+    "provider_stats_dynamic_filter_snapshots_p50",
+    "provider_stats_dynamic_partition_files_not_pruned_missing_metadata_p50",
+    "provider_stats_dynamic_partition_files_not_pruned_unsupported_expression_p50",
     "provider_stats_batches_produced_p50",
     "provider_stats_rows_produced_p50",
     "provider_stats_deletion_vector_payloads_loaded_p50",
@@ -615,6 +618,9 @@ struct ProviderExecReadStatsMeasurement {
     dynamic_filters_received: u64,
     dynamic_filters_accepted: u64,
     dynamic_filters_unsupported: u64,
+    dynamic_filter_snapshots: u64,
+    dynamic_partition_files_not_pruned_missing_metadata: u64,
+    dynamic_partition_files_not_pruned_unsupported_expression: u64,
     batches_produced: u64,
     rows_produced: u64,
     deletion_vector_payloads_loaded: u64,
@@ -656,6 +662,9 @@ struct ProviderExecReadStatsSummary {
     dynamic_filters_received: u64,
     dynamic_filters_accepted: u64,
     dynamic_filters_unsupported: u64,
+    dynamic_filter_snapshots: u64,
+    dynamic_partition_files_not_pruned_missing_metadata: u64,
+    dynamic_partition_files_not_pruned_unsupported_expression: u64,
     batches_produced: u64,
     rows_produced: u64,
     deletion_vector_payloads_loaded: u64,
@@ -2050,6 +2059,18 @@ fn provider_exec_read_stats_measurement(
             .iter()
             .map(|snapshot| snapshot.dynamic_filters_unsupported)
             .sum(),
+        dynamic_filter_snapshots: snapshots
+            .iter()
+            .map(|snapshot| snapshot.dynamic_filter_snapshots)
+            .sum(),
+        dynamic_partition_files_not_pruned_missing_metadata: snapshots
+            .iter()
+            .map(|snapshot| snapshot.dynamic_partition_files_not_pruned_missing_metadata)
+            .sum(),
+        dynamic_partition_files_not_pruned_unsupported_expression: snapshots
+            .iter()
+            .map(|snapshot| snapshot.dynamic_partition_files_not_pruned_unsupported_expression)
+            .sum(),
         batches_produced: snapshots
             .iter()
             .map(|snapshot| snapshot.batches_produced)
@@ -2139,6 +2160,17 @@ fn provider_exec_read_stats_summary(
         dynamic_filters_unsupported: provider_exec_read_stats_counter_p50(&stats, |stats| {
             stats.dynamic_filters_unsupported
         }),
+        dynamic_filter_snapshots: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.dynamic_filter_snapshots
+        }),
+        dynamic_partition_files_not_pruned_missing_metadata: provider_exec_read_stats_counter_p50(
+            &stats,
+            |stats| stats.dynamic_partition_files_not_pruned_missing_metadata,
+        ),
+        dynamic_partition_files_not_pruned_unsupported_expression:
+            provider_exec_read_stats_counter_p50(&stats, |stats| {
+                stats.dynamic_partition_files_not_pruned_unsupported_expression
+            }),
         batches_produced: provider_exec_read_stats_counter_p50(&stats, |stats| {
             stats.batches_produced
         }),
@@ -2309,6 +2341,13 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         read_stats.dynamic_filters_received.to_string(),
         read_stats.dynamic_filters_accepted.to_string(),
         read_stats.dynamic_filters_unsupported.to_string(),
+        read_stats.dynamic_filter_snapshots.to_string(),
+        read_stats
+            .dynamic_partition_files_not_pruned_missing_metadata
+            .to_string(),
+        read_stats
+            .dynamic_partition_files_not_pruned_unsupported_expression
+            .to_string(),
         read_stats.batches_produced.to_string(),
         read_stats.rows_produced.to_string(),
         read_stats.deletion_vector_payloads_loaded.to_string(),
@@ -6720,6 +6759,15 @@ mod tests {
         assert!(
             PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_dynamic_filters_unsupported_p50")
         );
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_dynamic_filter_snapshots_p50"));
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER.contains(
+                &"provider_stats_dynamic_partition_files_not_pruned_missing_metadata_p50"
+            )
+        );
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(
+            &"provider_stats_dynamic_partition_files_not_pruned_unsupported_expression_p50"
+        ));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_rows_produced_p50"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_bytes"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_delta_bytes"));
@@ -7096,6 +7144,9 @@ mod tests {
                 dynamic_filters_received: 7,
                 dynamic_filters_accepted: 4,
                 dynamic_filters_unsupported: 3,
+                dynamic_filter_snapshots: 9,
+                dynamic_partition_files_not_pruned_missing_metadata: 2,
+                dynamic_partition_files_not_pruned_unsupported_expression: 1,
                 batches_produced: 2,
                 rows_produced: 12,
                 deletion_vector_payloads_loaded: 2,
@@ -7155,10 +7206,13 @@ mod tests {
         assert_eq!(row[36], "7");
         assert_eq!(row[37], "4");
         assert_eq!(row[38], "3");
-        assert_eq!(row[40], "12");
-        assert_eq!(row[46], "12");
-        assert_eq!(row[48], "4096");
-        assert_eq!(row[49], "1024");
+        assert_eq!(row[39], "9");
+        assert_eq!(row[40], "2");
+        assert_eq!(row[41], "1");
+        assert_eq!(row[43], "12");
+        assert_eq!(row[49], "12");
+        assert_eq!(row[51], "4096");
+        assert_eq!(row[52], "1024");
     }
 
     #[test]
