@@ -262,7 +262,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let Some(scan_partition) = self.partition_plan.partitions.get(partition) else {
             return Err(DataFusionError::Execution(format!(
@@ -270,6 +270,8 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                 self.partition_plan.partitions.len()
             )));
         };
+        self.read_stats
+            .record_datafusion_output_batch_size(context.session_config().batch_size());
 
         if scan_partition.file_tasks.is_empty() {
             return Ok(Box::pin(EmptyRecordBatchStream::new(Arc::clone(
@@ -1021,7 +1023,10 @@ mod tests {
         KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata, RealParquetDeltaTable,
         build_projected_predicated_stats_delta_scan, datafusion_expr_to_kernel_predicate,
     };
-    use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+    use crate::{
+        DeltaSourceConfig, QueryOptions, datafusion_session_context, load_delta_source,
+        preflight_delta_protocol,
+    };
 
     const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
 
@@ -2924,6 +2929,36 @@ mod tests {
             ]
             .join("\n")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_execution_records_configured_datafusion_batch_size()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = datafusion_session_context(QueryOptions {
+            target_partitions: Some(1),
+            output_batch_size: Some(13),
+        })?;
+        let _table = register_real_parquet_source(&ctx, "orders", "execution-records-batch-size")?;
+
+        let dataframe = ctx.sql("select id from orders order by id").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].read_stats_snapshot().datafusion_output_batch_size,
+            None
+        );
+
+        let _result =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let read_stats = scans[0].read_stats_snapshot();
+
+        assert_eq!(read_stats.datafusion_output_batch_size, Some(13));
+        assert_eq!(read_stats.scan_partitions_started, 1);
 
         Ok(())
     }
