@@ -263,9 +263,9 @@ impl RealParquetDeltaTable {
         )
     }
 
-    /// Creates a local Delta table with two partition columns and three real
-    /// Parquet files. One file matches both partition values, while the other
-    /// files match only one value each.
+    /// Creates a local Delta table with two partition columns and four real
+    /// Parquet files. One file matches both partition values, two files match
+    /// only one value each, and one file matches neither value.
     pub(crate) fn new_with_two_partition_columns(
         name: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -278,12 +278,15 @@ impl RealParquetDeltaTable {
         let mut east_2026 = file_batch(3, vec![(3, Some("east-2026-3"))])?;
         east_2026.partition_values_json =
             r#"{"region":"us-east","event_date":"2026-01-01"}"#.to_owned();
+        let mut east_2025 = file_batch(4, vec![(4, Some("east-2025-4"))])?;
+        east_2025.partition_values_json =
+            r#"{"region":"us-east","event_date":"2025-01-01"}"#.to_owned();
 
         Self::new_with_protocol_metadata_file_batches(
             name,
             PROTOCOL_JSON,
             TWO_PARTITION_COLUMN_METADATA_JSON,
-            vec![west_2026, west_2025, east_2026],
+            vec![west_2026, west_2025, east_2026, east_2025],
         )
     }
 
