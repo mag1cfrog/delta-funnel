@@ -4,8 +4,16 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use arrow_schema::Schema;
 use arrow_tiberius::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, MssqlProfile, PlanOptions,
-    SchemaMapping, plan_arrow_schema_to_mssql_mappings,
+    Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, MssqlProfile, SchemaMapping,
+    plan_arrow_schema_to_mssql_mappings,
+};
+
+pub use arrow_tiberius::{
+    BinaryPolicy as MssqlBinaryPolicy, Date64Policy as MssqlDate64Policy,
+    Decimal256Policy as MssqlDecimal256Policy, DecimalPolicy as MssqlDecimalPolicy,
+    FloatPolicy as MssqlFloatPolicy, NanosecondPolicy as MssqlNanosecondPolicy,
+    PlanOptions as MssqlSchemaPlanOptions, StringPolicy as MssqlStringPolicy,
+    TimezonePolicy as MssqlTimezonePolicy, UInt64Policy as MssqlUInt64Policy,
 };
 
 use crate::{
@@ -16,9 +24,6 @@ use crate::{
 };
 
 use super::{MssqlTargetSummary, ResolvedMssqlTarget};
-
-/// DeltaFunnel schema planning options passed directly to arrow-tiberius.
-pub type MssqlSchemaPlanOptions = PlanOptions;
 
 /// Planned SQL Server schema mapping for one selected output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,7 +248,7 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use arrow_tiberius::{
-        DiagnosticCode, DiagnosticSeverity, MssqlType, MssqlTypeLength, PlanOptions, StringPolicy,
+        DiagnosticCode, DiagnosticSeverity, MssqlType, MssqlTypeLength, PlanOptions,
     };
 
     use super::*;
@@ -450,7 +455,7 @@ mod tests {
         let schema = Schema::new(vec![Field::new("customer", DataType::Utf8, true)]);
         let target = resolved_target()?;
         let options = MssqlSchemaPlanOptions {
-            string_policy: StringPolicy::NVarChar(128),
+            string_policy: MssqlStringPolicy::NVarChar(128),
             ..PlanOptions::default()
         };
 
@@ -461,6 +466,37 @@ mod tests {
             &MssqlType::NVarChar(MssqlTypeLength::Bounded(128))
         );
         Ok(())
+    }
+
+    #[test]
+    fn policy_option_types_are_available_through_delta_funnel_names() {
+        let options = MssqlSchemaPlanOptions {
+            string_policy: MssqlStringPolicy::NVarChar(64),
+            binary_policy: MssqlBinaryPolicy::VarBinary(128),
+            timezone_policy: MssqlTimezonePolicy::DateTimeOffset,
+            nanosecond_policy: MssqlNanosecondPolicy::RoundTo100ns,
+            uint64_policy: MssqlUInt64Policy::Decimal20_0,
+            decimal_policy: MssqlDecimalPolicy::NormalizeNegativeScale,
+            decimal256_policy: MssqlDecimal256Policy::Reject,
+            float_policy: MssqlFloatPolicy::RejectNonFinite,
+            date64_policy: MssqlDate64Policy::TimestampDateTime2,
+        };
+
+        assert_eq!(options.string_policy, MssqlStringPolicy::NVarChar(64));
+        assert_eq!(options.binary_policy, MssqlBinaryPolicy::VarBinary(128));
+        assert_eq!(options.timezone_policy, MssqlTimezonePolicy::DateTimeOffset);
+        assert_eq!(
+            options.nanosecond_policy,
+            MssqlNanosecondPolicy::RoundTo100ns
+        );
+        assert_eq!(options.uint64_policy, MssqlUInt64Policy::Decimal20_0);
+        assert_eq!(
+            options.decimal_policy,
+            MssqlDecimalPolicy::NormalizeNegativeScale
+        );
+        assert_eq!(options.decimal256_policy, MssqlDecimal256Policy::Reject);
+        assert_eq!(options.float_policy, MssqlFloatPolicy::RejectNonFinite);
+        assert_eq!(options.date64_policy, MssqlDate64Policy::TimestampDateTime2);
     }
 
     #[test]

@@ -8,8 +8,10 @@ mod schema_planning;
 mod target;
 
 pub use schema_planning::{
-    MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField, MssqlSchemaPlan, MssqlSchemaPlanOptions,
-    mssql_schema_diagnostic_reports, plan_mssql_output_schema,
+    MssqlBinaryPolicy, MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy,
+    MssqlFloatPolicy, MssqlNanosecondPolicy, MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField,
+    MssqlSchemaPlan, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTimezonePolicy,
+    MssqlUInt64Policy, mssql_schema_diagnostic_reports, plan_mssql_output_schema,
 };
 pub use target::{
     LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary,
