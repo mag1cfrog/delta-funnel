@@ -169,7 +169,11 @@ where
         self.file_tasks.len()
     }
 
-    /// File tasks admitted after permits were acquired.
+    /// File tasks admitted to a read future.
+    ///
+    /// Lazy reads acquire a permit before admission. Prefetch reads admit the
+    /// task first and acquire the permit later when the returned future is
+    /// polled.
     pub(crate) fn admitted_file_tasks(&self) -> usize {
         self.admitted_file_tasks
     }
