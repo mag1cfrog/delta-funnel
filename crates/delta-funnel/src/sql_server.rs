@@ -7,7 +7,10 @@
 mod schema_planning;
 mod target;
 
-pub use schema_planning::{MssqlSchemaPlan, MssqlSchemaPlanOptions, plan_mssql_output_schema};
+pub use schema_planning::{
+    MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField, MssqlSchemaPlan, MssqlSchemaPlanOptions,
+    mssql_schema_diagnostic_reports, plan_mssql_output_schema,
+};
 pub use target::{
     LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,

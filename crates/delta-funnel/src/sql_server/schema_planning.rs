@@ -4,7 +4,8 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use arrow_schema::Schema;
 use arrow_tiberius::{
-    DiagnosticSet, MssqlProfile, PlanOptions, SchemaMapping, plan_arrow_schema_to_mssql_mappings,
+    Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, MssqlProfile, PlanOptions,
+    SchemaMapping, plan_arrow_schema_to_mssql_mappings,
 };
 
 use crate::{
@@ -25,6 +26,7 @@ pub struct MssqlSchemaPlan {
     target: MssqlTargetSummary,
     mappings: Vec<SchemaMapping>,
     diagnostics: DiagnosticSet,
+    diagnostic_reports: Vec<MssqlSchemaDiagnostic>,
 }
 
 impl MssqlSchemaPlan {
@@ -44,6 +46,102 @@ impl MssqlSchemaPlan {
     #[must_use]
     pub fn diagnostics(&self) -> &DiagnosticSet {
         &self.diagnostics
+    }
+
+    /// Returns DeltaFunnel-owned diagnostic report entries.
+    #[must_use]
+    pub fn diagnostic_reports(&self) -> &[MssqlSchemaDiagnostic] {
+        &self.diagnostic_reports
+    }
+}
+
+/// DeltaFunnel-owned schema planning diagnostic entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MssqlSchemaDiagnostic {
+    output_name: String,
+    severity: DiagnosticSeverity,
+    code: DiagnosticCode,
+    message: String,
+    field: Option<MssqlSchemaDiagnosticField>,
+    row: Option<usize>,
+}
+
+impl MssqlSchemaDiagnostic {
+    fn from_arrow_tiberius(output_name: &str, diagnostic: &Diagnostic) -> Self {
+        Self {
+            output_name: output_name.to_owned(),
+            severity: diagnostic.severity(),
+            code: diagnostic.code(),
+            message: diagnostic.message().to_owned(),
+            field: diagnostic.field().map(MssqlSchemaDiagnosticField::from),
+            row: diagnostic.row(),
+        }
+    }
+
+    /// Returns the selected output name associated with this diagnostic.
+    #[must_use]
+    pub fn output_name(&self) -> &str {
+        &self.output_name
+    }
+
+    /// Returns diagnostic severity.
+    #[must_use]
+    pub const fn severity(&self) -> DiagnosticSeverity {
+        self.severity
+    }
+
+    /// Returns machine-readable diagnostic code.
+    #[must_use]
+    pub const fn code(&self) -> DiagnosticCode {
+        self.code
+    }
+
+    /// Returns the diagnostic message from arrow-tiberius.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Returns optional field context.
+    #[must_use]
+    pub fn field(&self) -> Option<&MssqlSchemaDiagnosticField> {
+        self.field.as_ref()
+    }
+
+    /// Returns optional row context.
+    #[must_use]
+    pub const fn row(&self) -> Option<usize> {
+        self.row
+    }
+}
+
+/// Field context for a DeltaFunnel-owned schema planning diagnostic entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MssqlSchemaDiagnosticField {
+    index: usize,
+    name: String,
+}
+
+impl MssqlSchemaDiagnosticField {
+    /// Returns the output field index.
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Returns the output field name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl From<&arrow_tiberius::FieldRef> for MssqlSchemaDiagnosticField {
+    fn from(field: &arrow_tiberius::FieldRef) -> Self {
+        Self {
+            index: field.index(),
+            name: field.name().to_owned(),
+        }
     }
 }
 
@@ -78,12 +176,27 @@ pub fn plan_mssql_output_schema(
     })?;
 
     let (mappings, diagnostics) = outcome.into_parts();
+    let diagnostic_reports = mssql_schema_diagnostic_reports(target.output_name(), &diagnostics);
 
     Ok(MssqlSchemaPlan {
         target: target.summary(),
         mappings,
         diagnostics,
+        diagnostic_reports,
     })
+}
+
+/// Converts arrow-tiberius diagnostics into DeltaFunnel-owned report entries.
+#[must_use]
+pub fn mssql_schema_diagnostic_reports(
+    output_name: &str,
+    diagnostics: &DiagnosticSet,
+) -> Vec<MssqlSchemaDiagnostic> {
+    diagnostics
+        .all()
+        .iter()
+        .map(|diagnostic| MssqlSchemaDiagnostic::from_arrow_tiberius(output_name, diagnostic))
+        .collect()
 }
 
 fn validate_output_identity(output_name: &str) -> Result<(), DeltaFunnelError> {
@@ -183,6 +296,7 @@ mod tests {
             &MssqlType::NVarChar(MssqlTypeLength::Max)
         );
         assert!(plan.diagnostics().is_empty());
+        assert!(plan.diagnostic_reports().is_empty());
         Ok(())
     }
 
@@ -315,6 +429,19 @@ mod tests {
         assert_eq!(field.index(), 0);
         assert_eq!(field.name(), "items");
         assert!(diagnostic.message().contains("nested"));
+
+        let reports = mssql_schema_diagnostic_reports(&output_name, &diagnostics);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].output_name(), "orders_output");
+        assert_eq!(reports[0].severity(), DiagnosticSeverity::Error);
+        assert_eq!(reports[0].code(), DiagnosticCode::UnsupportedArrowType);
+        assert_eq!(reports[0].message(), diagnostic.message());
+        let report_field = reports[0].field().ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected field report context".to_owned(),
+        })?;
+        assert_eq!(report_field.index(), 0);
+        assert_eq!(report_field.name(), "items");
+        assert_eq!(reports[0].row(), None);
         Ok(())
     }
 
