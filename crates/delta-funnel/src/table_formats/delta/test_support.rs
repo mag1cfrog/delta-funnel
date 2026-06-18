@@ -263,6 +263,26 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local partitioned Delta table with null and non-null region
+    /// partition values.
+    pub(crate) fn new_with_null_partition_value(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut null_region = file_batch(1, vec![(1, Some("null-region-1"))])?;
+        null_region.partition_values_json = r#"{"region":null}"#.to_owned();
+        let mut west = file_batch(2, vec![(2, Some("west-2"))])?;
+        west.partition_values_json = r#"{"region":"us-west"}"#.to_owned();
+        let mut east = file_batch(3, vec![(3, Some("east-3"))])?;
+        east.partition_values_json = r#"{"region":"us-east"}"#.to_owned();
+
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            PARTITIONED_METADATA_JSON,
+            vec![null_region, west, east],
+        )
+    }
+
     /// Creates a local Delta table with two partition columns and four real
     /// Parquet files. One file matches both partition values, two files match
     /// only one value each, and one file matches neither value.
