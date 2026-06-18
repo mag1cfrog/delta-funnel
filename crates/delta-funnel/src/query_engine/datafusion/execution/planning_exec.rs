@@ -1748,6 +1748,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_join_dynamic_pruning_preserves_residual_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = SessionConfig::new()
+            .with_target_partitions(1)
+            .set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", true)
+            .set_bool(
+                "datafusion.optimizer.enable_join_dynamic_filter_pushdown",
+                true,
+            );
+        let ctx = SessionContext::new_with_config(config);
+        register_allowed_regions(&ctx, vec!["us-west"])?;
+        let table = RealParquetDeltaTable::new_with_two_partition_values(
+            "dynamic-pruning-residual-filter",
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+            storage_options: Default::default(),
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+        )?;
+
+        let dataframe = ctx
+            .sql(
+                "select o.id, o.customer_name, o.region \
+                 from allowed_regions r \
+                 join orders o on r.region = o.region \
+                 where o.customer_name like 'west-1%' \
+                 order by o.id",
+            )
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1, "{plan_display}");
+        assert!(
+            plan_display.contains("FilterExec"),
+            "expected residual filter above the Delta provider scan:\n{plan_display}"
+        );
+        assert_eq!(scans[0].dynamic_filters().len(), 1, "{plan_display}");
+        assert_eq!(
+            scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
+            0
+        );
+        assert_eq!(scans[0].read_stats_snapshot().files_planned, 2);
+
+        let batches =
+            datafusion::physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+        let formatted = pretty_format_batches(&batches)?.to_string();
+        let stats = scans[0].read_stats_snapshot();
+
+        assert_eq!(
+            formatted,
+            [
+                "+----+---------------+---------+",
+                "| id | customer_name | region  |",
+                "+----+---------------+---------+",
+                "| 1  | west-1        | us-west |",
+                "+----+---------------+---------+",
+            ]
+            .join("\n")
+        );
+        assert_eq!(stats.files_planned, 2);
+        assert_eq!(stats.files_started, 1);
+        assert_eq!(stats.files_completed, 1);
+        assert_eq!(stats.dynamic_filters_received, 1);
+        assert_eq!(stats.dynamic_filters_accepted, 1);
+        assert_eq!(stats.dynamic_filters_unsupported, 0);
+        assert_eq!(stats.dynamic_partition_files_pruned, 1);
+        assert_eq!(stats.dynamic_partition_files_kept, 1);
+        assert_eq!(stats.rows_produced, 2);
+        assert_eq!(
+            stats.files_planned,
+            stats
+                .files_started
+                .saturating_add(stats.dynamic_partition_files_pruned)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dynamic_partition_false_snapshot_prunes_all_real_files()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
