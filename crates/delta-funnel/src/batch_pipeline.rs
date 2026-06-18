@@ -5,12 +5,14 @@
 //! upstream batch is polled, one downstream write is awaited, and only then is
 //! the next upstream batch polled.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
     arrow::record_batch::RecordBatch,
     error::{DataFusionError, Result as DataFusionResult},
+    execution::TaskContext,
+    physical_plan::ExecutionPlan,
 };
 use futures_util::{
     Stream, StreamExt,
@@ -18,7 +20,7 @@ use futures_util::{
 };
 use snafu::Snafu;
 
-use crate::DeltaFunnelError;
+use crate::{DeltaFunnelError, query_engine::datafusion_query_output_stream};
 
 /// Phase for batch pipeline setup and configuration failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,14 @@ impl BatchHandoffOutcome {
 /// the batch consumer, which will later be backed by `arrow-tiberius`.
 #[derive(Debug, Snafu)]
 pub enum BatchHandoffError {
+    /// The selected DataFusion query output could not be exposed as a stream.
+    #[snafu(display("DataFusion query output handoff setup failed: {source}"))]
+    QueryOutputSetup {
+        /// Original DataFusion setup error.
+        source: DataFusionError,
+        /// Handoff counters for batches accepted before the failure.
+        stats: BatchHandoffStats,
+    },
     /// The upstream DataFusion stream failed before producing the next batch.
     #[snafu(display("upstream RecordBatch stream failed: {source}"))]
     Upstream {
@@ -79,7 +89,9 @@ impl BatchHandoffError {
     /// Returns counters for batches accepted before the terminal failure.
     pub fn stats(&self) -> BatchHandoffStats {
         match self {
-            Self::Upstream { stats, .. } | Self::Downstream { stats, .. } => *stats,
+            Self::QueryOutputSetup { stats, .. }
+            | Self::Upstream { stats, .. }
+            | Self::Downstream { stats, .. } => *stats,
         }
     }
 }
@@ -173,6 +185,30 @@ where
     Ok(BatchHandoffOutcome { stats })
 }
 
+/// Executes one selected DataFusion query output and hands it to a consumer.
+///
+/// This composes DataFusion's merged output stream execution with the
+/// pull-driven batch handoff. Multi-partition query outputs are merged by
+/// DataFusion before the handoff, preserving scan parallelism while keeping the
+/// downstream writer serial.
+pub async fn handoff_datafusion_query_output<C>(
+    plan: Arc<dyn ExecutionPlan>,
+    task_context: Arc<TaskContext>,
+    consumer: &mut C,
+) -> Result<BatchHandoffOutcome, BatchHandoffError>
+where
+    C: RecordBatchConsumer,
+{
+    let stream = datafusion_query_output_stream(plan, task_context).map_err(|source| {
+        BatchHandoffError::QueryOutputSetup {
+            source,
+            stats: BatchHandoffStats::default(),
+        }
+    })?;
+
+    handoff_record_batch_stream(stream, consumer).await
+}
+
 /// Validates a future batch/query/handoff `usize` option that must be nonzero.
 #[allow(dead_code)]
 pub(crate) fn validate_nonzero_usize_option(
@@ -217,13 +253,16 @@ mod tests {
             record_batch::RecordBatch,
         },
         error::DataFusionError,
+        execution::TaskContext,
+        physical_plan::{ExecutionPlan, test::TestMemoryExec},
     };
     use futures_util::{Stream, io::AllowStdIo, stream};
     use tokio::sync::oneshot;
 
     use super::{
         BatchHandoffError, BatchHandoffStats, BatchPipelinePhase, RecordBatchConsumer,
-        handoff_record_batch_stream, rows_to_u64, validate_nonzero_usize_option,
+        handoff_datafusion_query_output, handoff_record_batch_stream, rows_to_u64,
+        validate_nonzero_usize_option,
     };
     use crate::DeltaFunnelError;
 
@@ -331,6 +370,40 @@ mod tests {
                 input_rows: 5,
                 output_batches: 2,
                 output_rows: 5,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_datafusion_query_output_merges_partitions() -> Result<(), Box<dyn Error>> {
+        let schema = schema();
+        let plan = TestMemoryExec::try_new_exec(
+            &[
+                vec![int_batch_with_schema(Arc::clone(&schema), &[1])?],
+                vec![int_batch_with_schema(Arc::clone(&schema), &[2, 3])?],
+            ],
+            schema,
+            None,
+        )?;
+        assert_eq!(plan.properties().output_partitioning().partition_count(), 2);
+
+        let plan: Arc<dyn ExecutionPlan> = plan;
+        let mut consumer = RecordingConsumer::default();
+
+        let outcome =
+            handoff_datafusion_query_output(plan, Arc::new(TaskContext::default()), &mut consumer)
+                .await?;
+
+        consumer.accepted_row_counts.sort_unstable();
+        assert_eq!(consumer.accepted_row_counts, vec![1, 2]);
+        assert_eq!(
+            outcome.stats(),
+            BatchHandoffStats {
+                input_batches: 2,
+                input_rows: 3,
+                output_batches: 2,
+                output_rows: 3,
             }
         );
         Ok(())
@@ -506,7 +579,14 @@ mod tests {
     }
 
     fn int_batch(values: &[i32]) -> Result<RecordBatch, Box<dyn Error>> {
-        RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(values.to_vec()))])
+        int_batch_with_schema(schema(), values)
+    }
+
+    fn int_batch_with_schema(
+        schema: SchemaRef,
+        values: &[i32],
+    ) -> Result<RecordBatch, Box<dyn Error>> {
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
             .map_err(Into::into)
     }
 
