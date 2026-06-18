@@ -154,6 +154,7 @@ impl From<&arrow_tiberius::FieldRef> for MssqlSchemaDiagnosticField {
 ///
 /// This function owns DeltaFunnel orchestration concerns only. Arrow-to-MSSQL
 /// type mapping and identifier validation are delegated to arrow-tiberius.
+/// Callers may pass an Arrow `Schema`, `SchemaRef`, or borrowed schema.
 pub fn plan_mssql_output_schema(
     schema: impl AsRef<Schema>,
     target: &ResolvedMssqlTarget,
@@ -246,7 +247,7 @@ fn validate_unique_output_field_names(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
     use arrow_tiberius::{
         DiagnosticCode, DiagnosticSeverity, MssqlType, MssqlTypeLength, PlanOptions,
     };
@@ -324,6 +325,22 @@ mod tests {
         assert_eq!(columns, vec!["gross_total", "order_id"]);
         assert_eq!(plan.mappings()[0].arrow().index(), 0);
         assert_eq!(plan.mappings()[1].arrow().index(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_datafusion_output_schema_ref() -> Result<(), DeltaFunnelError> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let target = resolved_target()?;
+
+        let plan = plan_mssql_output_schema(schema, &target, PlanOptions::default())?;
+
+        assert_eq!(plan.mappings().len(), 2);
+        assert_eq!(plan.mappings()[0].arrow().name(), "order_id");
+        assert_eq!(plan.mappings()[1].arrow().name(), "status");
         Ok(())
     }
 
