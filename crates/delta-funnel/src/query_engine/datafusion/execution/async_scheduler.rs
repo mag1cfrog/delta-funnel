@@ -26,6 +26,8 @@ pub(crate) const DELTA_PROVIDER_ASYNC_SCHEDULER_OUTPUT_CAPACITY: usize = 0;
 pub(crate) type DeltaProviderAsyncFileReadFuture<Output> =
     Pin<Box<dyn Future<Output = Result<Output, DeltaFunnelError>> + Send>>;
 
+type DeltaProviderAsyncTaskAdmissionFilter<Task> = Arc<dyn Fn(&Task) -> bool + Send + Sync>;
+
 /// Native async file reader used by the lazy scheduler.
 #[allow(dead_code)]
 pub(crate) trait DeltaProviderAsyncFileReader<Task, Output>: Send + Sync {
@@ -53,6 +55,7 @@ where
     pub(crate) reader: Arc<Reader>,
     /// Partition-local limiter view for this execution partition.
     pub(crate) partition_limiter: DeltaProviderAsyncPartitionReadLimiter,
+    task_admission_filter: DeltaProviderAsyncTaskAdmissionFilter<Task>,
     _output: PhantomData<Output>,
 }
 
@@ -71,8 +74,18 @@ where
             file_tasks,
             reader,
             partition_limiter,
+            task_admission_filter: Arc::new(|_| true),
             _output: PhantomData,
         }
+    }
+
+    /// Adds a file-task admission predicate evaluated before a task starts.
+    pub(crate) fn with_task_admission_filter(
+        mut self,
+        task_admission_filter: DeltaProviderAsyncTaskAdmissionFilter<Task>,
+    ) -> Self {
+        self.task_admission_filter = task_admission_filter;
+        self
     }
 }
 
@@ -85,6 +98,7 @@ where
     file_tasks: VecDeque<Task>,
     reader: Arc<Reader>,
     partition_limiter: DeltaProviderAsyncPartitionReadLimiter,
+    task_admission_filter: DeltaProviderAsyncTaskAdmissionFilter<Task>,
     admitted_file_tasks: usize,
     _output: PhantomData<Output>,
 }
@@ -104,6 +118,7 @@ where
             file_tasks: VecDeque::from(config.file_tasks),
             reader: config.reader,
             partition_limiter: config.partition_limiter,
+            task_admission_filter: config.task_admission_filter,
             admitted_file_tasks: 0,
             _output: PhantomData,
         }
@@ -115,9 +130,8 @@ where
     /// read future. Dropping this future cancels the current admission attempt
     /// or in-flight file read and releases any acquired permits.
     pub(crate) async fn next_file(&mut self) -> Option<Result<Output, DeltaFunnelError>> {
-        if self.file_tasks.is_empty() {
-            return None;
-        }
+        self.discard_rejected_front_tasks();
+        self.file_tasks.front()?;
 
         let permit = match self.partition_limiter.acquire_file_permit().await {
             Ok(permit) => permit,
@@ -139,10 +153,9 @@ where
     pub(crate) fn schedule_prefetch_file(
         &mut self,
     ) -> Option<DeltaProviderAsyncFileReadFuture<Output>> {
-        let task = self.file_tasks.pop_front()?;
+        let task = self.pop_next_admitted_task()?;
         let reader = Arc::clone(&self.reader);
         let partition_limiter = self.partition_limiter.clone();
-        self.admitted_file_tasks = self.admitted_file_tasks.saturating_add(1);
 
         Some(Box::pin(async move {
             let permit = partition_limiter.acquire_file_permit().await?;
@@ -164,6 +177,26 @@ where
     /// Internal completed-output buffer capacity for this scheduler.
     pub(crate) fn output_capacity(&self) -> usize {
         DELTA_PROVIDER_ASYNC_SCHEDULER_OUTPUT_CAPACITY
+    }
+
+    fn pop_next_admitted_task(&mut self) -> Option<Task> {
+        loop {
+            let task = self.file_tasks.pop_front()?;
+            if (self.task_admission_filter)(&task) {
+                self.admitted_file_tasks = self.admitted_file_tasks.saturating_add(1);
+                return Some(task);
+            }
+        }
+    }
+
+    fn discard_rejected_front_tasks(&mut self) {
+        while self
+            .file_tasks
+            .front()
+            .is_some_and(|task| !(self.task_admission_filter)(task))
+        {
+            self.file_tasks.pop_front();
+        }
     }
 }
 
@@ -432,6 +465,45 @@ mod tests {
 
         assert_eq!(scheduler.admitted_file_tasks(), 0);
         assert_eq!(scheduler.remaining_file_tasks(), 1);
+        assert_eq!(limiter.active_file_reads(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_admission_filter_skips_rejected_tasks_before_permits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = DeltaProviderAsyncReadLimiter::new(
+            DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+                DeltaProviderReaderBackend::NativeAsync,
+                1,
+                1,
+            )?,
+            1,
+        );
+        let partition = limiter.partition_limiter(0)?;
+        let held_permit = partition.acquire_file_permit().await?;
+        let reader = Arc::new(CountingAsyncFileReader::new());
+        let mut scheduler = DeltaProviderAsyncPartitionReadScheduler::new(
+            DeltaProviderAsyncPartitionReadSchedulerConfig::new(
+                vec![FakeFileTask { id: 1 }],
+                Arc::clone(&reader),
+                partition,
+            )
+            .with_task_admission_filter(Arc::new(|task: &FakeFileTask| task.id != 1)),
+        );
+
+        let next = scheduler.next_file().await;
+
+        assert!(next.is_none());
+        assert_eq!(reader.futures_created(), 0);
+        assert_eq!(reader.reads_started(), 0);
+        assert_eq!(scheduler.admitted_file_tasks(), 0);
+        assert_eq!(scheduler.remaining_file_tasks(), 0);
+        assert_eq!(limiter.active_file_reads(), 1);
+
+        drop(held_permit);
+
         assert_eq!(limiter.active_file_reads(), 0);
 
         Ok(())
