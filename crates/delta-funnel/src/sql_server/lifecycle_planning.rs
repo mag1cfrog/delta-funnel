@@ -13,13 +13,32 @@ pub enum MssqlTargetTableState {
     Absent,
 }
 
-/// Whether SQL Server side effects may proceed after planning.
+/// Whether guarded execution may proceed after lifecycle planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MssqlLifecycleSideEffectPolicy {
+pub enum MssqlLifecycleGuardrailPolicy {
     /// Planning succeeded and later execution phases may perform their work.
     AllowedAfterPlanning,
-    /// Planning failed, so later execution phases must not perform side effects.
+    /// Planning failed, so later execution phases must not run.
     ForbiddenAfterPlanningFailure,
+}
+
+/// An execution operation guarded by successful lifecycle planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MssqlLifecycleExecutionGuardrail {
+    /// Delta source scan execution must wait for lifecycle planning.
+    DeltaSourceScanExecution,
+    /// DataFusion physical plan execution must wait for lifecycle planning.
+    DataFusionPhysicalPlanExecution,
+    /// SQL Server connection attempts must wait for lifecycle planning.
+    SqlServerConnectionAttempt,
+    /// Target table existence probes must wait for lifecycle planning.
+    TargetTableExistenceProbe,
+    /// Create-table DDL execution must wait for lifecycle planning.
+    CreateTableDdlExecution,
+    /// Bulk writer construction must wait for lifecycle planning.
+    BulkWriterConstruction,
+    /// RecordBatch handoff polling must wait for lifecycle planning.
+    RecordBatchHandoffPolling,
 }
 
 /// Planned SQL Server table lifecycle behavior for one selected output.
@@ -30,7 +49,8 @@ pub struct MssqlLifecyclePlan {
     create_table_sql_required: bool,
     create_table_sql_present: bool,
     executable_in_mvp: bool,
-    side_effect_policy: MssqlLifecycleSideEffectPolicy,
+    guardrail_policy: MssqlLifecycleGuardrailPolicy,
+    execution_guardrails: &'static [MssqlLifecycleExecutionGuardrail],
 }
 
 impl MssqlLifecyclePlan {
@@ -64,16 +84,41 @@ impl MssqlLifecyclePlan {
         self.executable_in_mvp
     }
 
-    /// Returns whether later side-effect phases may proceed.
+    /// Returns whether later execution phases may proceed.
     #[must_use]
-    pub const fn side_effect_policy(&self) -> MssqlLifecycleSideEffectPolicy {
-        self.side_effect_policy
+    pub const fn guardrail_policy(&self) -> MssqlLifecycleGuardrailPolicy {
+        self.guardrail_policy
+    }
+
+    /// Returns guarded execution operations in the order they should run.
+    #[must_use]
+    pub const fn execution_guardrails(&self) -> &[MssqlLifecycleExecutionGuardrail] {
+        self.execution_guardrails
     }
 }
 
+const APPEND_EXISTING_EXECUTION_GUARDRAILS: &[MssqlLifecycleExecutionGuardrail] = &[
+    MssqlLifecycleExecutionGuardrail::SqlServerConnectionAttempt,
+    MssqlLifecycleExecutionGuardrail::TargetTableExistenceProbe,
+    MssqlLifecycleExecutionGuardrail::BulkWriterConstruction,
+    MssqlLifecycleExecutionGuardrail::DeltaSourceScanExecution,
+    MssqlLifecycleExecutionGuardrail::DataFusionPhysicalPlanExecution,
+    MssqlLifecycleExecutionGuardrail::RecordBatchHandoffPolling,
+];
+
+const CREATE_AND_LOAD_EXECUTION_GUARDRAILS: &[MssqlLifecycleExecutionGuardrail] = &[
+    MssqlLifecycleExecutionGuardrail::SqlServerConnectionAttempt,
+    MssqlLifecycleExecutionGuardrail::TargetTableExistenceProbe,
+    MssqlLifecycleExecutionGuardrail::CreateTableDdlExecution,
+    MssqlLifecycleExecutionGuardrail::BulkWriterConstruction,
+    MssqlLifecycleExecutionGuardrail::DeltaSourceScanExecution,
+    MssqlLifecycleExecutionGuardrail::DataFusionPhysicalPlanExecution,
+    MssqlLifecycleExecutionGuardrail::RecordBatchHandoffPolling,
+];
+
 /// Plans lifecycle behavior for one selected output.
 ///
-/// This function is deterministic and side-effect free. Errors return no
+/// This function is deterministic and performs no I/O or execution. Errors return no
 /// partial lifecycle plan, which keeps later execution code from accidentally
 /// acting on a failed lifecycle decision.
 pub fn plan_mssql_lifecycle(
@@ -113,7 +158,8 @@ fn plan_append_existing_lifecycle(
         create_table_sql_required: false,
         create_table_sql_present: false,
         executable_in_mvp: true,
-        side_effect_policy: MssqlLifecycleSideEffectPolicy::AllowedAfterPlanning,
+        guardrail_policy: MssqlLifecycleGuardrailPolicy::AllowedAfterPlanning,
+        execution_guardrails: APPEND_EXISTING_EXECUTION_GUARDRAILS,
     })
 }
 
@@ -135,7 +181,8 @@ fn plan_create_and_load_lifecycle(
         create_table_sql_required: true,
         create_table_sql_present,
         executable_in_mvp: true,
-        side_effect_policy: MssqlLifecycleSideEffectPolicy::AllowedAfterPlanning,
+        guardrail_policy: MssqlLifecycleGuardrailPolicy::AllowedAfterPlanning,
+        execution_guardrails: CREATE_AND_LOAD_EXECUTION_GUARDRAILS,
     })
 }
 
@@ -222,8 +269,12 @@ mod tests {
         assert!(!lifecycle.create_table_sql_present());
         assert!(lifecycle.executable_in_mvp());
         assert_eq!(
-            lifecycle.side_effect_policy(),
-            MssqlLifecycleSideEffectPolicy::AllowedAfterPlanning
+            lifecycle.guardrail_policy(),
+            MssqlLifecycleGuardrailPolicy::AllowedAfterPlanning
+        );
+        assert_eq!(
+            lifecycle.execution_guardrails(),
+            APPEND_EXISTING_EXECUTION_GUARDRAILS
         );
         Ok(())
     }
@@ -247,8 +298,57 @@ mod tests {
         assert!(lifecycle.create_table_sql_present());
         assert!(lifecycle.executable_in_mvp());
         assert_eq!(
-            lifecycle.side_effect_policy(),
-            MssqlLifecycleSideEffectPolicy::AllowedAfterPlanning
+            lifecycle.guardrail_policy(),
+            MssqlLifecycleGuardrailPolicy::AllowedAfterPlanning
+        );
+        assert_eq!(
+            lifecycle.execution_guardrails(),
+            CREATE_AND_LOAD_EXECUTION_GUARDRAILS
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_reports_guarded_execution_by_load_mode() -> Result<(), DeltaFunnelError> {
+        let append_schema_plan = schema_plan(
+            "append_output",
+            LoadMode::AppendExisting,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let append_ddl_plan = plan_mssql_create_table_ddl(&append_schema_plan)?;
+        let append_lifecycle = plan_mssql_lifecycle(&append_schema_plan, Some(&append_ddl_plan))?;
+
+        assert_eq!(
+            append_lifecycle.execution_guardrails(),
+            &[
+                MssqlLifecycleExecutionGuardrail::SqlServerConnectionAttempt,
+                MssqlLifecycleExecutionGuardrail::TargetTableExistenceProbe,
+                MssqlLifecycleExecutionGuardrail::BulkWriterConstruction,
+                MssqlLifecycleExecutionGuardrail::DeltaSourceScanExecution,
+                MssqlLifecycleExecutionGuardrail::DataFusionPhysicalPlanExecution,
+                MssqlLifecycleExecutionGuardrail::RecordBatchHandoffPolling,
+            ]
+        );
+
+        let create_schema_plan = schema_plan(
+            "create_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders_archive")?,
+        )?;
+        let create_ddl_plan = plan_mssql_create_table_ddl(&create_schema_plan)?;
+        let create_lifecycle = plan_mssql_lifecycle(&create_schema_plan, Some(&create_ddl_plan))?;
+
+        assert_eq!(
+            create_lifecycle.execution_guardrails(),
+            &[
+                MssqlLifecycleExecutionGuardrail::SqlServerConnectionAttempt,
+                MssqlLifecycleExecutionGuardrail::TargetTableExistenceProbe,
+                MssqlLifecycleExecutionGuardrail::CreateTableDdlExecution,
+                MssqlLifecycleExecutionGuardrail::BulkWriterConstruction,
+                MssqlLifecycleExecutionGuardrail::DeltaSourceScanExecution,
+                MssqlLifecycleExecutionGuardrail::DataFusionPhysicalPlanExecution,
+                MssqlLifecycleExecutionGuardrail::RecordBatchHandoffPolling,
+            ]
         );
         Ok(())
     }
@@ -298,6 +398,64 @@ mod tests {
             DeltaFunnelError::MssqlLifecyclePlanning { .. }
         ));
         assert!(error.to_string().contains("replace load mode is reserved"));
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_failures_block_guarded_execution() -> Result<(), DeltaFunnelError> {
+        let replace_plan = schema_plan(
+            "orders_output",
+            LoadMode::Replace,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let missing_create_sql_plan = schema_plan(
+            "create_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders_archive")?,
+        )?;
+        let append_plan = schema_plan(
+            "append_output",
+            LoadMode::AppendExisting,
+            MssqlTargetTable::new("dbo", "orders_existing")?,
+        )?;
+        let create_plan = schema_plan(
+            "append_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders_existing")?,
+        )?;
+        let contradictory_ddl_plan = plan_mssql_create_table_ddl(&create_plan)?;
+
+        let cases = [
+            ("replace mode", plan_mssql_lifecycle(&replace_plan, None)),
+            (
+                "missing create-table SQL",
+                plan_mssql_lifecycle(&missing_create_sql_plan, None),
+            ),
+            (
+                "append-existing create-table SQL contradiction",
+                plan_mssql_lifecycle(&append_plan, Some(&contradictory_ddl_plan)),
+            ),
+        ];
+
+        for (case_name, result) in cases {
+            let mut attempted_execution = Vec::new();
+            let error = match result {
+                Ok(_lifecycle) => {
+                    fake_guarded_execution(ALL_GUARDED_EXECUTION, &mut attempted_execution);
+                    return Err(DeltaFunnelError::Config {
+                        message: format!("expected {case_name} lifecycle error"),
+                    });
+                }
+                Err(error) => error,
+            };
+
+            assert!(matches!(
+                error,
+                DeltaFunnelError::MssqlLifecyclePlanning { .. }
+            ));
+            assert!(attempted_execution.is_empty());
+        }
+
         Ok(())
     }
 
@@ -379,5 +537,22 @@ mod tests {
         assert!(!combined.contains("server=tcp"));
         assert!(combined.contains("warehouse-primary"));
         Ok(())
+    }
+
+    const ALL_GUARDED_EXECUTION: &[MssqlLifecycleExecutionGuardrail] = &[
+        MssqlLifecycleExecutionGuardrail::DeltaSourceScanExecution,
+        MssqlLifecycleExecutionGuardrail::DataFusionPhysicalPlanExecution,
+        MssqlLifecycleExecutionGuardrail::SqlServerConnectionAttempt,
+        MssqlLifecycleExecutionGuardrail::TargetTableExistenceProbe,
+        MssqlLifecycleExecutionGuardrail::CreateTableDdlExecution,
+        MssqlLifecycleExecutionGuardrail::BulkWriterConstruction,
+        MssqlLifecycleExecutionGuardrail::RecordBatchHandoffPolling,
+    ];
+
+    fn fake_guarded_execution(
+        guardrails: &[MssqlLifecycleExecutionGuardrail],
+        attempted_execution: &mut Vec<MssqlLifecycleExecutionGuardrail>,
+    ) {
+        attempted_execution.extend(guardrails.iter().copied());
     }
 }

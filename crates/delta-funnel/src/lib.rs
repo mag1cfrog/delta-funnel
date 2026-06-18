@@ -36,12 +36,13 @@ pub use query_engine::{
 pub use sql_server::{
     LoadMode, MssqlBinaryPolicy, MssqlConnectionConfig, MssqlConnectionSource,
     MssqlConnectionSummary, MssqlDate64Policy, MssqlDdlPlan, MssqlDecimal256Policy,
-    MssqlDecimalPolicy, MssqlFloatPolicy, MssqlLifecyclePlan, MssqlLifecycleSideEffectPolicy,
-    MssqlNanosecondPolicy, MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField, MssqlSchemaPlan,
-    MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTargetConfig, MssqlTargetResolutionContext,
-    MssqlTargetSummary, MssqlTargetTable, MssqlTargetTableState, MssqlTimezonePolicy,
-    MssqlUInt64Policy, ResolvedMssqlTarget, mssql_schema_diagnostic_reports,
-    plan_mssql_create_table_ddl, plan_mssql_lifecycle, plan_mssql_output_schema,
+    MssqlDecimalPolicy, MssqlFloatPolicy, MssqlLifecycleExecutionGuardrail,
+    MssqlLifecycleGuardrailPolicy, MssqlLifecyclePlan, MssqlNanosecondPolicy,
+    MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField, MssqlSchemaPlan, MssqlSchemaPlanOptions,
+    MssqlStringPolicy, MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary,
+    MssqlTargetTable, MssqlTargetTableState, MssqlTimezonePolicy, MssqlUInt64Policy,
+    ResolvedMssqlTarget, mssql_schema_diagnostic_reports, plan_mssql_create_table_ddl,
+    plan_mssql_lifecycle, plan_mssql_output_schema,
 };
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,

@@ -11,7 +11,8 @@ mod target;
 
 pub use ddl_planning::{MssqlDdlPlan, plan_mssql_create_table_ddl};
 pub use lifecycle_planning::{
-    MssqlLifecyclePlan, MssqlLifecycleSideEffectPolicy, MssqlTargetTableState, plan_mssql_lifecycle,
+    MssqlLifecycleExecutionGuardrail, MssqlLifecycleGuardrailPolicy, MssqlLifecyclePlan,
+    MssqlTargetTableState, plan_mssql_lifecycle,
 };
 pub use schema_planning::{
     MssqlBinaryPolicy, MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy,
