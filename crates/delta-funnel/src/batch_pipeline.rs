@@ -101,6 +101,11 @@ impl BatchHandoffError {
 /// Implementations should return only after the batch has been accepted by the
 /// downstream system. That await point is what preserves backpressure between
 /// DataFusion and the downstream writer.
+///
+/// Consumers that need a separate finalization step, such as
+/// `arrow_tiberius::BulkWriter::finish`, keep owning that step. The handoff only
+/// drives per-batch writes so callers can decide whether and when finalization
+/// is appropriate after success or failure.
 #[async_trait]
 pub trait RecordBatchConsumer: Send {
     /// Writes one batch without changing its schema, values, or row order.
@@ -156,7 +161,8 @@ impl BatchHandoffStats {
 ///
 /// This helper intentionally contains no queue and spawns no background task.
 /// The next upstream batch is not polled until the previous downstream write
-/// has completed.
+/// has completed. Empty batches are forwarded and counted when the downstream
+/// consumer accepts them, matching DataFusion's stream semantics.
 pub async fn handoff_record_batch_stream<S, C>(
     mut stream: S,
     consumer: &mut C,
@@ -372,6 +378,61 @@ mod tests {
                 output_rows: 5,
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_counts_empty_batches_when_accepted() -> Result<(), Box<dyn Error>> {
+        let batches = vec![Ok(int_batch(&[])?), Ok(int_batch(&[1, 2])?)];
+        let mut consumer = RecordingConsumer::default();
+
+        let outcome = handoff_record_batch_stream(stream::iter(batches), &mut consumer).await?;
+
+        assert_eq!(consumer.accepted_row_counts, vec![0, 2]);
+        assert_eq!(
+            outcome.stats(),
+            BatchHandoffStats {
+                input_batches: 2,
+                input_rows: 2,
+                output_batches: 2,
+                output_rows: 2,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_keeps_selected_output_stats_independent() -> Result<(), Box<dyn Error>> {
+        let first_batches = vec![Ok(int_batch(&[1])?)];
+        let second_batches = vec![Ok(int_batch(&[10, 20])?), Ok(int_batch(&[30])?)];
+        let mut first_consumer = RecordingConsumer::default();
+        let mut second_consumer = RecordingConsumer::default();
+
+        let first =
+            handoff_record_batch_stream(stream::iter(first_batches), &mut first_consumer).await?;
+        let second =
+            handoff_record_batch_stream(stream::iter(second_batches), &mut second_consumer).await?;
+
+        assert_eq!(
+            first.stats(),
+            BatchHandoffStats {
+                input_batches: 1,
+                input_rows: 1,
+                output_batches: 1,
+                output_rows: 1,
+            }
+        );
+        assert_eq!(
+            second.stats(),
+            BatchHandoffStats {
+                input_batches: 2,
+                input_rows: 3,
+                output_batches: 2,
+                output_rows: 3,
+            }
+        );
+        assert_eq!(first_consumer.accepted_row_counts, vec![1]);
+        assert_eq!(second_consumer.accepted_row_counts, vec![2, 1]);
         Ok(())
     }
 
