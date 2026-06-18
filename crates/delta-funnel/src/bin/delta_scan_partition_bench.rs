@@ -52,7 +52,7 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 17;
+const BENCHMARK_SCHEMA_VERSION: u32 = 18;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
@@ -145,7 +145,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 64] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 67] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -182,6 +182,9 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 64] = [
     "provider_stats_files_completed_p50",
     "provider_stats_dynamic_partition_files_pruned_p50",
     "provider_stats_dynamic_partition_files_kept_p50",
+    "provider_stats_dynamic_filters_received_p50",
+    "provider_stats_dynamic_filters_accepted_p50",
+    "provider_stats_dynamic_filters_unsupported_p50",
     "provider_stats_batches_produced_p50",
     "provider_stats_rows_produced_p50",
     "provider_stats_deletion_vector_payloads_loaded_p50",
@@ -609,6 +612,9 @@ struct ProviderExecReadStatsMeasurement {
     files_completed: u64,
     dynamic_partition_files_pruned: u64,
     dynamic_partition_files_kept: u64,
+    dynamic_filters_received: u64,
+    dynamic_filters_accepted: u64,
+    dynamic_filters_unsupported: u64,
     batches_produced: u64,
     rows_produced: u64,
     deletion_vector_payloads_loaded: u64,
@@ -647,6 +653,9 @@ struct ProviderExecReadStatsSummary {
     files_completed: u64,
     dynamic_partition_files_pruned: u64,
     dynamic_partition_files_kept: u64,
+    dynamic_filters_received: u64,
+    dynamic_filters_accepted: u64,
+    dynamic_filters_unsupported: u64,
     batches_produced: u64,
     rows_produced: u64,
     deletion_vector_payloads_loaded: u64,
@@ -2029,6 +2038,18 @@ fn provider_exec_read_stats_measurement(
             .iter()
             .map(|snapshot| snapshot.dynamic_partition_files_kept)
             .sum(),
+        dynamic_filters_received: snapshots
+            .iter()
+            .map(|snapshot| snapshot.dynamic_filters_received)
+            .sum(),
+        dynamic_filters_accepted: snapshots
+            .iter()
+            .map(|snapshot| snapshot.dynamic_filters_accepted)
+            .sum(),
+        dynamic_filters_unsupported: snapshots
+            .iter()
+            .map(|snapshot| snapshot.dynamic_filters_unsupported)
+            .sum(),
         batches_produced: snapshots
             .iter()
             .map(|snapshot| snapshot.batches_produced)
@@ -2108,6 +2129,15 @@ fn provider_exec_read_stats_summary(
         }),
         dynamic_partition_files_kept: provider_exec_read_stats_counter_p50(&stats, |stats| {
             stats.dynamic_partition_files_kept
+        }),
+        dynamic_filters_received: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.dynamic_filters_received
+        }),
+        dynamic_filters_accepted: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.dynamic_filters_accepted
+        }),
+        dynamic_filters_unsupported: provider_exec_read_stats_counter_p50(&stats, |stats| {
+            stats.dynamic_filters_unsupported
         }),
         batches_produced: provider_exec_read_stats_counter_p50(&stats, |stats| {
             stats.batches_produced
@@ -2276,6 +2306,9 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         read_stats.files_completed.to_string(),
         read_stats.dynamic_partition_files_pruned.to_string(),
         read_stats.dynamic_partition_files_kept.to_string(),
+        read_stats.dynamic_filters_received.to_string(),
+        read_stats.dynamic_filters_accepted.to_string(),
+        read_stats.dynamic_filters_unsupported.to_string(),
         read_stats.batches_produced.to_string(),
         read_stats.rows_produced.to_string(),
         read_stats.deletion_vector_payloads_loaded.to_string(),
@@ -6682,6 +6715,11 @@ mod tests {
         assert!(
             PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_dynamic_partition_files_kept_p50")
         );
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_dynamic_filters_received_p50"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_dynamic_filters_accepted_p50"));
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_dynamic_filters_unsupported_p50")
+        );
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_rows_produced_p50"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_bytes"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_delta_bytes"));
@@ -7055,6 +7093,9 @@ mod tests {
                 files_completed: 2,
                 dynamic_partition_files_pruned: 3,
                 dynamic_partition_files_kept: 5,
+                dynamic_filters_received: 7,
+                dynamic_filters_accepted: 4,
+                dynamic_filters_unsupported: 3,
                 batches_produced: 2,
                 rows_produced: 12,
                 deletion_vector_payloads_loaded: 2,
@@ -7111,10 +7152,13 @@ mod tests {
         assert_eq!(row[32], "2");
         assert_eq!(row[34], "3");
         assert_eq!(row[35], "5");
-        assert_eq!(row[37], "12");
-        assert_eq!(row[43], "12");
-        assert_eq!(row[45], "4096");
-        assert_eq!(row[46], "1024");
+        assert_eq!(row[36], "7");
+        assert_eq!(row[37], "4");
+        assert_eq!(row[38], "3");
+        assert_eq!(row[40], "12");
+        assert_eq!(row[46], "12");
+        assert_eq!(row[48], "4096");
+        assert_eq!(row[49], "1024");
     }
 
     #[test]

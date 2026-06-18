@@ -66,6 +66,12 @@ executed Delta scan plan. The dynamic partition pruning fields are:
 - `provider_stats_dynamic_partition_files_kept_p50`: p50 count of file tasks
   evaluated by dynamic partition pruning and kept because the filter allowed
   them or could not safely prove exclusion.
+- `provider_stats_dynamic_filters_received_p50`: p50 count of post-phase
+  physical filters offered to the Delta dynamic filter hook.
+- `provider_stats_dynamic_filters_accepted_p50`: p50 count of offered dynamic
+  filters retained for partition pruning.
+- `provider_stats_dynamic_filters_unsupported_p50`: p50 count of offered
+  filters rejected by the Delta dynamic filter hook policy.
 
 The provider-exec matrix compares the official kernel backend against the
 native async backend with lazy and bounded-prefetch scheduling profiles. It
