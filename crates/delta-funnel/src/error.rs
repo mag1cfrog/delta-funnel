@@ -1,7 +1,7 @@
 //! Shared error pattern for DeltaFunnel.
 
 use crate::BatchPipelinePhase;
-use crate::redaction::sanitize_uri_for_display;
+use crate::redaction::{sanitize_text_for_display, sanitize_uri_for_display};
 
 use snafu::Snafu;
 
@@ -365,6 +365,28 @@ pub enum DeltaFunnelError {
         message: String,
     },
 
+    /// SQL Server target configuration is invalid.
+    #[snafu(display(
+        "MSSQL target configuration error for option `{option}`: {}",
+        sanitize_reason_for_display(message)
+    ))]
+    MssqlTargetConfig {
+        /// Stable option name associated with the failure.
+        option: &'static str,
+        /// Sanitized message suitable for logs and Python-facing errors.
+        message: String,
+    },
+
+    /// A SQL Server target could not resolve a connection.
+    #[snafu(display(
+        "MSSQL target for output `{}` has no effective connection",
+        sanitize_text_for_display(output_name)
+    ))]
+    MissingMssqlConnection {
+        /// Selected output name associated with the target.
+        output_name: String,
+    },
+
     /// SQL Server batch writing failed.
     #[snafu(display(
         "MSSQL write error: {}",
@@ -377,11 +399,11 @@ pub enum DeltaFunnelError {
 }
 
 fn sanitize_source_name_for_display(name: &str) -> String {
-    name.chars().flat_map(char::escape_default).collect()
+    sanitize_text_for_display(name)
 }
 
 fn sanitize_reason_for_display(reason: &str) -> String {
-    reason.chars().flat_map(char::escape_default).collect()
+    sanitize_text_for_display(reason)
 }
 
 #[cfg(test)]

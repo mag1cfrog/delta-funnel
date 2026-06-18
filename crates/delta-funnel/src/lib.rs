@@ -14,6 +14,7 @@ mod batch_pipeline;
 pub mod error;
 pub(crate) mod query_engine;
 mod redaction;
+mod sql_server;
 mod table_formats;
 
 pub use batch_pipeline::{
@@ -31,6 +32,11 @@ pub use query_engine::{
     delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic, register_delta_sources,
     register_delta_sources_with_scan_execution_options,
+};
+pub use sql_server::{
+    LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary,
+    MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,
+    ResolvedMssqlTarget,
 };
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,
