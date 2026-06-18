@@ -1573,6 +1573,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_partition_unsupported_snapshot_reads_all_real_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = SessionContext::new();
+        let table = RealParquetDeltaTable::new_with_two_partition_values(
+            "dynamic-pruning-unsupported-snapshot",
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+            storage_options: Default::default(),
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        register_delta_sources(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(1),
+            }],
+        )?;
+        let dataframe = ctx
+            .sql("select id, customer_name, region from orders order by id")
+            .await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].read_stats_snapshot().files_planned, 2);
+
+        let dynamic = dynamic_filter_state(vec![physical_column("region", 2)]);
+        let result = scans[0].handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            hook_input(vec![
+                Arc::clone(&dynamic) as Arc<dyn datafusion::physical_plan::PhysicalExpr>
+            ]),
+            &ConfigOptions::new(),
+        )?;
+        dynamic.update(physical_lit("not a boolean result"))?;
+        let updated_node = result.updated_node.ok_or("expected updated scan")?;
+        let updated_scan = updated_node
+            .as_any()
+            .downcast_ref::<super::DeltaScanPlanningExec>()
+            .ok_or("expected DeltaScanPlanningExec")?;
+
+        let mut stream = updated_scan.execute(0, ctx.task_ctx())?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+        let formatted = pretty_format_batches(&batches)?.to_string();
+        let stats = updated_scan.read_stats_snapshot();
+
+        assert_eq!(
+            formatted,
+            [
+                "+----+---------------+---------+",
+                "| id | customer_name | region  |",
+                "+----+---------------+---------+",
+                "| 1  | west-1        | us-west |",
+                "| 2  | west-2        | us-west |",
+                "| 3  | east-3        | us-east |",
+                "| 4  | east-4        | us-east |",
+                "+----+---------------+---------+",
+            ]
+            .join("\n")
+        );
+        assert_eq!(stats.files_planned, 2);
+        assert_eq!(stats.files_started, 2);
+        assert_eq!(stats.files_completed, 2);
+        assert_eq!(stats.dynamic_filters_received, 1);
+        assert_eq!(stats.dynamic_filters_accepted, 1);
+        assert_eq!(stats.dynamic_filters_unsupported, 0);
+        assert_eq!(stats.dynamic_filter_snapshots, 2);
+        assert_eq!(stats.dynamic_partition_files_pruned, 0);
+        assert_eq!(stats.dynamic_partition_files_kept, 2);
+        assert_eq!(stats.dynamic_partition_files_not_pruned_missing_metadata, 0);
+        assert_eq!(
+            stats.dynamic_partition_files_not_pruned_unsupported_expression,
+            2
+        );
+        assert_eq!(stats.rows_produced, 4);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sql_join_dynamic_filter_prunes_delta_scan_partition_file()
     -> Result<(), Box<dyn std::error::Error>> {
         let config = SessionConfig::new()
