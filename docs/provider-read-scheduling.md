@@ -70,6 +70,38 @@ degrade to reading the file task. Files that have already started are not
 cancelled, and native async prefetch only skips tasks before they are opened or
 prefetched.
 
+Dynamic pruning extends provider read stats without changing the meaning of
+existing counters:
+
+- `dynamic_filters_received`: post-phase physical filters offered to the Delta
+  dynamic filter hook.
+- `dynamic_filters_accepted`: offered dynamic filters retained because they
+  reference only partition columns.
+- `dynamic_filters_unsupported`: offered filters rejected by the dynamic filter
+  hook policy.
+- `dynamic_filter_snapshots`: retained dynamic filter snapshot attempts during
+  file admission.
+- `dynamic_partition_files_pruned`: file tasks skipped before provider file
+  admission.
+- `dynamic_partition_files_kept`: file tasks evaluated by dynamic pruning and
+  kept.
+- `dynamic_partition_files_not_pruned_missing_metadata`: kept file tasks where
+  missing, invalid, or unparsable partition metadata prevented pruning.
+- `dynamic_partition_files_not_pruned_unsupported_expression`: kept file tasks
+  where unsupported or failed dynamic partition evaluation prevented pruning.
+
+`files_planned` still reports the statically planned file-task count. Dynamically
+skipped tasks reduce `files_started` and `files_completed`, because skipped
+tasks never enter a reader backend.
+
+The provider does not currently expose `dynamic_filters_completed` or
+`dynamic_filters_too_late`. DataFusion does not provide a completion signal
+that this scan can observe without coupling to producer internals or blocking
+file admission. A precise too-late counter would also need to observe that a
+dynamic filter became newly useful only after a task had already been opened or
+prefetched; the first implementation intentionally avoids that producer-state
+coupling.
+
 ## Backpressure And Cancellation
 
 Provider execution builds a DataFusion `RecordBatchReceiverStream` with bounded
