@@ -12,7 +12,10 @@ use datafusion::{
     arrow::record_batch::RecordBatch,
     error::{DataFusionError, Result as DataFusionResult},
 };
-use futures_util::{Stream, StreamExt};
+use futures_util::{
+    Stream, StreamExt,
+    io::{AsyncRead, AsyncWrite},
+};
 use snafu::Snafu;
 
 use crate::DeltaFunnelError;
@@ -90,6 +93,19 @@ impl BatchHandoffError {
 pub trait RecordBatchConsumer: Send {
     /// Writes one batch without changing its schema, values, or row order.
     async fn write_record_batch(&mut self, batch: &RecordBatch) -> Result<(), DeltaFunnelError>;
+}
+
+#[async_trait]
+impl<'client, S> RecordBatchConsumer for arrow_tiberius::BulkWriter<'client, S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    async fn write_record_batch(&mut self, batch: &RecordBatch) -> Result<(), DeltaFunnelError> {
+        self.write_batch(batch)
+            .await
+            .map(|_stats| ())
+            .map_err(|source| DeltaFunnelError::MssqlWrite { source })
+    }
 }
 
 /// Per-output batch handoff counters.
@@ -184,6 +200,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         error::Error,
+        io::Cursor,
         pin::Pin,
         sync::{
             Arc, Mutex,
@@ -201,7 +218,7 @@ mod tests {
         },
         error::DataFusionError,
     };
-    use futures_util::{Stream, stream};
+    use futures_util::{Stream, io::AllowStdIo, stream};
     use tokio::sync::oneshot;
 
     use super::{
@@ -290,6 +307,13 @@ mod tests {
             BatchPipelinePhase::HandoffSetup.to_string(),
             "handoff setup"
         );
+    }
+
+    #[test]
+    fn arrow_tiberius_bulk_writer_is_a_record_batch_consumer() {
+        fn assert_consumer<C: RecordBatchConsumer>() {}
+
+        assert_consumer::<arrow_tiberius::BulkWriter<'static, AllowStdIo<Cursor<Vec<u8>>>>>();
     }
 
     #[tokio::test]
