@@ -30,7 +30,8 @@ use super::super::planning::dynamic_filters::{
     DeltaDynamicFilterOutcome, DeltaDynamicFilterPlan, DeltaRetainedDynamicFilter,
 };
 use super::super::planning::dynamic_partition_pruning::{
-    DeltaDynamicPartitionPruningDecision, evaluate_dynamic_partition_filter,
+    DeltaDynamicPartitionKeepReason, DeltaDynamicPartitionPruningDecision,
+    evaluate_dynamic_partition_filter,
 };
 use super::super::planning::file_task::DeltaScanFileTask;
 use super::super::planning::file_task_partition::DeltaScanFileTaskPartitionPlan;
@@ -441,22 +442,66 @@ fn prune_dynamic_partition_file_tasks(
     file_tasks
         .into_iter()
         .filter(|task| {
-            let pruned = dynamic_filters.iter().any(|filter| {
-                matches!(
-                    evaluate_dynamic_partition_filter(filter, task),
-                    DeltaDynamicPartitionPruningDecision::Prune(_)
-                )
-            });
+            let mut pruned = false;
+            let mut not_pruned_missing_metadata = false;
+            let mut not_pruned_unsupported_expression = false;
+
+            for filter in dynamic_filters {
+                read_stats.record_dynamic_filter_snapshot();
+                match evaluate_dynamic_partition_filter(filter, task) {
+                    DeltaDynamicPartitionPruningDecision::Prune(_) => {
+                        pruned = true;
+                        break;
+                    }
+                    DeltaDynamicPartitionPruningDecision::Keep(reason) => {
+                        if dynamic_partition_keep_reason_is_missing_metadata(reason) {
+                            not_pruned_missing_metadata = true;
+                        }
+                        if dynamic_partition_keep_reason_is_unsupported_expression(reason) {
+                            not_pruned_unsupported_expression = true;
+                        }
+                    }
+                }
+            }
 
             if pruned {
                 read_stats.record_dynamic_partition_file_pruned();
                 false
             } else {
+                if not_pruned_missing_metadata {
+                    read_stats.record_dynamic_partition_file_not_pruned_missing_metadata();
+                }
+                if not_pruned_unsupported_expression {
+                    read_stats.record_dynamic_partition_file_not_pruned_unsupported_expression();
+                }
                 read_stats.record_dynamic_partition_file_kept();
                 true
             }
         })
         .collect()
+}
+
+fn dynamic_partition_keep_reason_is_missing_metadata(
+    reason: DeltaDynamicPartitionKeepReason,
+) -> bool {
+    matches!(
+        reason,
+        DeltaDynamicPartitionKeepReason::PartitionMetadataInvalid
+            | DeltaDynamicPartitionKeepReason::PartitionValueMissing
+            | DeltaDynamicPartitionKeepReason::PartitionValueUnparseable
+    )
+}
+
+fn dynamic_partition_keep_reason_is_unsupported_expression(
+    reason: DeltaDynamicPartitionKeepReason,
+) -> bool {
+    matches!(
+        reason,
+        DeltaDynamicPartitionKeepReason::SnapshotUnavailable
+            | DeltaDynamicPartitionKeepReason::UnsupportedPartitionType
+            | DeltaDynamicPartitionKeepReason::EvaluationFailed
+            | DeltaDynamicPartitionKeepReason::NonBooleanResult
+    )
 }
 
 fn partition_read_schema(
@@ -1223,6 +1268,12 @@ mod tests {
         assert_eq!(surviving.len(), 2);
         assert_eq!(stats.dynamic_partition_files_pruned, 0);
         assert_eq!(stats.dynamic_partition_files_kept, 0);
+        assert_eq!(stats.dynamic_filter_snapshots, 0);
+        assert_eq!(stats.dynamic_partition_files_not_pruned_missing_metadata, 0);
+        assert_eq!(
+            stats.dynamic_partition_files_not_pruned_unsupported_expression,
+            0
+        );
     }
 
     #[test]
@@ -1258,6 +1309,48 @@ mod tests {
         );
         assert_eq!(stats.dynamic_partition_files_pruned, 1);
         assert_eq!(stats.dynamic_partition_files_kept, 2);
+        assert_eq!(stats.dynamic_filter_snapshots, 3);
+        assert_eq!(stats.dynamic_partition_files_not_pruned_missing_metadata, 1);
+        assert_eq!(
+            stats.dynamic_partition_files_not_pruned_unsupported_expression,
+            0
+        );
+        assert_eq!(stats.files_started, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_partition_pruning_counts_unsupported_keep_reasons_once_per_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let read_stats = test_read_stats();
+        let dynamic = dynamic_filter_state(vec![physical_column("region", 1)]);
+        dynamic.update(physical_lit("not a boolean result"))?;
+        let retained = retained_partition_dynamic_filter(dynamic)?;
+        let tasks = vec![fake_task_with_region("part-00000.parquet", "us-west")];
+
+        let surviving = super::prune_dynamic_partition_file_tasks(
+            tasks,
+            std::slice::from_ref(&retained),
+            read_stats.as_ref(),
+        );
+
+        let stats = read_stats.snapshot();
+        assert_eq!(
+            surviving
+                .iter()
+                .map(|task| task.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["part-00000.parquet"]
+        );
+        assert_eq!(stats.dynamic_partition_files_pruned, 0);
+        assert_eq!(stats.dynamic_partition_files_kept, 1);
+        assert_eq!(stats.dynamic_filter_snapshots, 1);
+        assert_eq!(stats.dynamic_partition_files_not_pruned_missing_metadata, 0);
+        assert_eq!(
+            stats.dynamic_partition_files_not_pruned_unsupported_expression,
+            1
+        );
         assert_eq!(stats.files_started, 0);
 
         Ok(())
@@ -1323,6 +1416,7 @@ mod tests {
         assert!(batches.is_empty());
         assert_eq!(stats.dynamic_partition_files_pruned, 1);
         assert_eq!(stats.dynamic_partition_files_kept, 0);
+        assert_eq!(stats.dynamic_filter_snapshots, 1);
         assert_eq!(stats.files_started, 0);
         assert_eq!(stats.files_completed, 0);
 
