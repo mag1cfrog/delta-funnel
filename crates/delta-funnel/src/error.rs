@@ -1,5 +1,6 @@
 //! Shared error pattern for DeltaFunnel.
 
+use crate::BatchPipelinePhase;
 use crate::redaction::sanitize_uri_for_display;
 
 use snafu::Snafu;
@@ -349,6 +350,20 @@ pub enum DeltaFunnelError {
         /// Sanitized message suitable for logs and Python-facing errors.
         message: String,
     },
+
+    /// Batch pipeline setup or configuration is invalid.
+    #[snafu(display(
+        "batch pipeline {phase} error for option `{option}`: {}",
+        sanitize_reason_for_display(message)
+    ))]
+    BatchPipeline {
+        /// Batch pipeline phase associated with the failure.
+        phase: BatchPipelinePhase,
+        /// Stable option name associated with the failure.
+        option: &'static str,
+        /// Sanitized message suitable for logs and Python-facing errors.
+        message: String,
+    },
 }
 
 fn sanitize_source_name_for_display(name: &str) -> String {
@@ -387,6 +402,35 @@ mod tests {
             error.to_string(),
             "dependency compatibility error: delta_kernel API smoke test failed"
         );
+    }
+
+    #[test]
+    fn batch_pipeline_error_has_sanitized_display() {
+        let error = DeltaFunnelError::BatchPipeline {
+            phase: super::BatchPipelinePhase::Configuration,
+            option: "output_batch_size",
+            message: "must be greater than zero".to_owned(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "batch pipeline configuration error for option `output_batch_size`: must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn batch_pipeline_error_display_escapes_control_characters() {
+        let error = DeltaFunnelError::BatchPipeline {
+            phase: super::BatchPipelinePhase::HandoffSetup,
+            option: "consumer_capacity",
+            message: "invalid\nvalue\tprovided".to_owned(),
+        };
+
+        let display = error.to_string();
+
+        assert!(!display.contains('\n'));
+        assert!(!display.contains('\t'));
+        assert!(display.contains(r"invalid\nvalue\tprovided"));
     }
 
     #[test]

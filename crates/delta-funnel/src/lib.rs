@@ -10,11 +10,13 @@
 //! sink, and orchestration work should land in their own modules when the first
 //! real implementation slice needs them.
 
+mod batch_pipeline;
 pub mod error;
 pub(crate) mod query_engine;
 mod redaction;
 mod table_formats;
 
+pub use batch_pipeline::{BatchHandoffStats, BatchPipelinePhase};
 pub use error::DeltaFunnelError;
 pub use query_engine::{
     DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
