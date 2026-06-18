@@ -263,6 +263,48 @@ would require knowing that a filter became newly useful after a specific file
 task was already opened or prefetched. Those are intentionally left out until
 there is a producer-side signal or a separate design for bounded waiting.
 
+## Spark V2 Runtime Filtering Parity
+
+Delta Spark V2 implements runtime partition filtering through
+`SupportsRuntimeV2Filtering`. It exposes only partition attributes to Spark,
+converts accepted runtime filters against the partition schema, filters the
+materialized `PartitionedFile` list, and recomputes scan-level byte and row
+statistics after runtime filtering.
+
+DeltaFunnel keeps the same safety boundary, but uses DataFusion's physical
+runtime filter model instead of Spark's connector API. Retained filters are
+partition-only `DynamicFilterPhysicalExpr` trees, and each available snapshot is
+evaluated against a synthetic one-row Arrow batch built from Delta file
+partition metadata. Unsupported, incomplete, missing-metadata, unparsable, null,
+non-boolean, or failed evaluations remain no-prune decisions.
+
+Spark has explicit runtime predicate conversion for `STARTS_WITH`, `ENDS_WITH`,
+and `CONTAINS`. DeltaFunnel does not need a provider-specific string predicate
+converter because it evaluates DataFusion physical expression snapshots
+directly. The provider evaluator has focused coverage for DataFusion physical
+snapshots lowered from `starts_with`, `ends_with`, and `contains`, proving that
+these shapes prune and keep correctly when DataFusion supplies them as dynamic
+filter snapshots. Whether a SQL plan produces a particular string dynamic
+filter remains a DataFusion optimizer decision, not a DeltaFunnel provider
+contract.
+
+DeltaFunnel intentionally does not recompute optimizer-visible scan statistics
+after dynamic pruning. The pruning decision happens during physical execution at
+file admission time, after the static scan and optimizer statistics have already
+been planned. Rewriting those statistics at that point would make the planned
+file count ambiguous. Provider read stats are the execution-time observability
+surface: `files_planned` remains the static count, while `files_started`,
+`files_completed`, `dynamic_filter_snapshots`,
+`dynamic_partition_files_pruned`, and `dynamic_partition_files_kept` show the
+runtime outcome.
+
+Spark equality and hashCode tests do not map directly to DeltaFunnel's
+DataFusion plan model. The retained runtime filter is stateful DataFusion
+physical expression state held by `DeltaScanPlanningExec`. DeltaFunnel tests the
+relevant lifecycle behavior instead: accepted dynamic filters are retained
+across physical plan rebuild and `reset_state`, and plan diagnostics include the
+retained dynamic filter count without rendering noisy expression internals.
+
 ## Follow-Up Issues
 
 Recommended implementation slices:

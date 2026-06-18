@@ -289,11 +289,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::logical_expr::Operator;
+    use datafusion::common::DFSchema;
+    use datafusion::logical_expr::{Expr, Operator};
     use datafusion::physical_expr::expressions::{
         BinaryExpr, Column, DynamicFilterPhysicalExpr, in_list, lit,
     };
+    use datafusion::physical_expr::{create_physical_expr, execution_props::ExecutionProps};
     use datafusion::physical_plan::PhysicalExpr;
+    use datafusion::prelude::{
+        col as logical_col, contains, ends_with, lit as logical_lit, starts_with,
+    };
 
     use super::*;
     use crate::query_engine::datafusion::planning::dynamic_filters::DeltaDynamicFilterPlan;
@@ -335,6 +340,27 @@ mod tests {
             .ok_or_else(|| "dynamic filter was not retained".to_owned())?;
 
         Ok((dynamic, retained))
+    }
+
+    fn lower_logical_snapshot(expr: Expr) -> Result<Arc<dyn PhysicalExpr>, String> {
+        let df_schema = DFSchema::try_from(test_schema()).map_err(|err| err.to_string())?;
+        create_physical_expr(&expr, &df_schema, &ExecutionProps::new())
+            .map_err(|err| err.to_string())
+    }
+
+    fn string_function_snapshot_decision(
+        snapshot: Expr,
+        region: &str,
+    ) -> Result<DeltaDynamicPartitionPruningDecision, String> {
+        let (dynamic, retained) = retained_filter(vec![column("region", 1)])?;
+        dynamic
+            .update(lower_logical_snapshot(snapshot)?)
+            .map_err(|err| err.to_string())?;
+
+        Ok(evaluate_dynamic_partition_filter(
+            &retained,
+            &file_task(&[("region", region)]),
+        ))
     }
 
     fn file_task(partition_values: &[(&str, &str)]) -> DeltaScanFileTask {
@@ -399,6 +425,67 @@ mod tests {
                 DeltaDynamicPartitionKeepReason::FilterAllowedPartition
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn string_function_snapshots_evaluate_partition_values() -> Result<(), String> {
+        for (label, snapshot, region, expected) in [
+            (
+                "starts_with match",
+                starts_with(logical_col("region"), logical_lit("us-")),
+                "us-west",
+                DeltaDynamicPartitionPruningDecision::Keep(
+                    DeltaDynamicPartitionKeepReason::FilterAllowedPartition,
+                ),
+            ),
+            (
+                "starts_with miss",
+                starts_with(logical_col("region"), logical_lit("us-")),
+                "eu-west",
+                DeltaDynamicPartitionPruningDecision::Prune(
+                    DeltaDynamicPartitionPruneReason::FilterRejectedPartition,
+                ),
+            ),
+            (
+                "ends_with match",
+                ends_with(logical_col("region"), logical_lit("-west")),
+                "us-west",
+                DeltaDynamicPartitionPruningDecision::Keep(
+                    DeltaDynamicPartitionKeepReason::FilterAllowedPartition,
+                ),
+            ),
+            (
+                "ends_with miss",
+                ends_with(logical_col("region"), logical_lit("-west")),
+                "us-east",
+                DeltaDynamicPartitionPruningDecision::Prune(
+                    DeltaDynamicPartitionPruneReason::FilterRejectedPartition,
+                ),
+            ),
+            (
+                "contains match",
+                contains(logical_col("region"), logical_lit("west")),
+                "us-west",
+                DeltaDynamicPartitionPruningDecision::Keep(
+                    DeltaDynamicPartitionKeepReason::FilterAllowedPartition,
+                ),
+            ),
+            (
+                "contains miss",
+                contains(logical_col("region"), logical_lit("west")),
+                "us-east",
+                DeltaDynamicPartitionPruningDecision::Prune(
+                    DeltaDynamicPartitionPruneReason::FilterRejectedPartition,
+                ),
+            ),
+        ] {
+            assert_eq!(
+                string_function_snapshot_decision(snapshot, region)?,
+                expected,
+                "{label}"
+            );
+        }
         Ok(())
     }
 
