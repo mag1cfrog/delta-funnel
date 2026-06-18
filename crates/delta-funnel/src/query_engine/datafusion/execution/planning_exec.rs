@@ -329,6 +329,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                     file_reader,
                     read_schema,
                     Arc::clone(&self.read_stats),
+                    context.session_config().batch_size(),
                 ));
                 let partition_limiter = self
                     .async_read_limiter
