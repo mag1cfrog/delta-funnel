@@ -5705,6 +5705,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequential_stream_drop_preserves_dynamic_pruning_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = RealParquetDeltaTable::new_default("stream-drop-dynamic-pruning")?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+            storage_options: Default::default(),
+        })?;
+        let scan = crate::table_formats::build_projected_delta_scan(&source, None)?;
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let sync_read_limiter =
+            DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
+        let reader = Arc::new(FakePartitionFileReader {
+            read_count: Arc::clone(&read_count),
+            schema: Arc::clone(&schema),
+            fail_path: None,
+        });
+        let read_stats = Arc::new(DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
+            source_name: "orders".to_owned(),
+            snapshot_version: 1,
+            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 1,
+            files_planned: 3,
+            estimated_rows: Some(4),
+            estimated_bytes: Some(3),
+        }));
+        let dynamic = dynamic_filter_state(vec![physical_column("region", 1)]);
+        dynamic.update(Arc::new(BinaryExpr::new(
+            physical_column("region", 1),
+            Operator::Eq,
+            physical_lit("us-west"),
+        )))?;
+        let retained = retained_partition_dynamic_filter(dynamic)?;
+        let admission = super::DeltaDynamicPartitionFileAdmission::new(
+            Arc::clone(&read_stats),
+            Arc::from([retained]),
+        );
+        let mut stream = super::sequential_scan_partition_stream(
+            schema,
+            reader,
+            scan.read_schema(),
+            vec![
+                fake_task_with_region("part-00000.parquet", "us-east"),
+                fake_task_with_region("part-many-batches.parquet", "us-west"),
+                fake_task_with_region("part-00001.parquet", "us-west"),
+            ],
+            sync_read_limiter.partition_limiter(0)?,
+            1,
+            admission,
+        );
+
+        let first = stream.next().await.ok_or("expected first batch")??;
+
+        assert_eq!(batch_ids(&first)?, vec![1]);
+        assert_eq!(read_count.load(Ordering::SeqCst), 1);
+
+        drop(stream);
+
+        for _ in 0..1000 {
+            if sync_read_limiter.active_file_reads() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        assert_eq!(read_count.load(Ordering::SeqCst), 1);
+        assert_eq!(sync_read_limiter.active_file_reads(), 0);
+        let stats = read_stats.snapshot();
+        assert_eq!(stats.files_planned, 3);
+        assert_eq!(stats.scan_partitions_started, 1);
+        assert_eq!(stats.scan_partitions_completed, 0);
+        assert_eq!(stats.files_started, 1);
+        assert_eq!(stats.files_completed, 0);
+        assert_eq!(stats.dynamic_filter_snapshots, 2);
+        assert_eq!(stats.dynamic_partition_files_pruned, 1);
+        assert_eq!(stats.dynamic_partition_files_kept, 1);
+        assert_eq!(stats.dynamic_partition_files_not_pruned_missing_metadata, 0);
+        assert_eq!(
+            stats.dynamic_partition_files_not_pruned_unsupported_expression,
+            0
+        );
+        assert!((1..=2).contains(&stats.batches_produced));
+        assert!((1..=2).contains(&stats.rows_produced));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sequential_stream_releases_file_permit_after_failure()
     -> Result<(), Box<dyn std::error::Error>> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
