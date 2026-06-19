@@ -6,7 +6,9 @@ use std::fmt;
 
 use arrow_schema::Schema;
 pub use arrow_tiberius::WriteOptions as MssqlWriteOptions;
+use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
+use futures_util::io::{AsyncRead, AsyncWrite};
 
 use crate::DeltaFunnelError;
 
@@ -14,6 +16,37 @@ use super::{
     LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan,
     MssqlTargetTable,
 };
+
+/// Fakeable bulk-load writer boundary for one planned SQL Server output.
+#[async_trait]
+pub(crate) trait MssqlBulkLoadWriter: Sized + Send {
+    /// Writes one already-shaped record batch.
+    async fn write_batch(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error>;
+
+    /// Finalizes the writer and consumes it, matching `arrow-tiberius`.
+    #[allow(dead_code)]
+    async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error>;
+}
+
+#[async_trait]
+impl<'client, S> MssqlBulkLoadWriter for arrow_tiberius::BulkWriter<'client, S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    async fn write_batch(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
+        arrow_tiberius::BulkWriter::write_batch(self, batch).await
+    }
+
+    async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
+        arrow_tiberius::BulkWriter::finish(self).await
+    }
+}
 
 /// Per-output SQL Server write statistics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,6 +499,54 @@ mod tests {
         ])
     }
 
+    #[derive(Debug, Default)]
+    struct FakeBulkLoadWriter {
+        accepted_rows: u64,
+        accepted_batches: u64,
+        batch_rows: Vec<usize>,
+    }
+
+    #[async_trait]
+    impl MssqlBulkLoadWriter for FakeBulkLoadWriter {
+        async fn write_batch(
+            &mut self,
+            batch: &RecordBatch,
+        ) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
+            let row_count = batch.num_rows();
+            self.batch_rows.push(row_count);
+            self.accepted_rows = self.accepted_rows.saturating_add(row_count as u64);
+            self.accepted_batches = self.accepted_batches.saturating_add(1);
+
+            Ok(arrow_tiberius::WriteStats {
+                rows_written: self.accepted_rows,
+                batches_written: self.accepted_batches,
+            })
+        }
+
+        async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
+            Ok(arrow_tiberius::WriteStats {
+                rows_written: self.accepted_rows,
+                batches_written: self.accepted_batches,
+            })
+        }
+    }
+
+    fn orders_batch(
+        order_ids: Vec<i64>,
+        statuses: Vec<Option<&str>>,
+    ) -> Result<RecordBatch, DeltaFunnelError> {
+        RecordBatch::try_new(
+            Arc::new(orders_schema()),
+            vec![
+                Arc::new(Int64Array::from(order_ids)),
+                Arc::new(StringArray::from(statuses)),
+            ],
+        )
+        .map_err(|error| DeltaFunnelError::Config {
+            message: error.to_string(),
+        })
+    }
+
     fn output_plan_for_orders_schema() -> Result<MssqlTargetOutputPlan, DeltaFunnelError> {
         let connection = secret_connection()?;
         let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
@@ -521,6 +602,33 @@ mod tests {
         assert_eq!(stats.rows_written(), 42);
         assert_eq!(stats.batches_written(), 3);
         assert_eq!(stats.elapsed_ms(), 125);
+    }
+
+    #[tokio::test]
+    async fn bulk_load_writer_trait_consumes_writer_on_finish() -> Result<(), DeltaFunnelError> {
+        let mut writer = FakeBulkLoadWriter::default();
+        let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
+        let second = orders_batch(vec![3], vec![None])?;
+
+        let first_stats = MssqlBulkLoadWriter::write_batch(&mut writer, &first)
+            .await
+            .map_err(|source| DeltaFunnelError::MssqlWrite { source })?;
+        let second_stats = MssqlBulkLoadWriter::write_batch(&mut writer, &second)
+            .await
+            .map_err(|source| DeltaFunnelError::MssqlWrite { source })?;
+        assert_eq!(writer.batch_rows, vec![2, 1]);
+
+        let final_stats = MssqlBulkLoadWriter::finish(writer)
+            .await
+            .map_err(|source| DeltaFunnelError::MssqlWrite { source })?;
+
+        assert_eq!(first_stats.rows_written, 2);
+        assert_eq!(first_stats.batches_written, 1);
+        assert_eq!(second_stats.rows_written, 3);
+        assert_eq!(second_stats.batches_written, 2);
+        assert_eq!(final_stats.rows_written, 3);
+        assert_eq!(final_stats.batches_written, 2);
+        Ok(())
     }
 
     #[test]

@@ -20,7 +20,9 @@ use futures_util::{
 };
 use snafu::Snafu;
 
-use crate::{DeltaFunnelError, query_engine::datafusion_query_output_stream};
+use crate::{
+    DeltaFunnelError, query_engine::datafusion_query_output_stream, sql_server::MssqlBulkLoadWriter,
+};
 
 /// Phase for batch pipeline setup and configuration failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +120,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     async fn write_record_batch(&mut self, batch: &RecordBatch) -> Result<(), DeltaFunnelError> {
-        self.write_batch(batch)
+        MssqlBulkLoadWriter::write_batch(self, batch)
             .await
             .map(|_stats| ())
             .map_err(|source| DeltaFunnelError::MssqlWrite { source })

@@ -30,6 +30,7 @@ pub use target::{
     MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,
     ResolvedMssqlTarget,
 };
+pub(crate) use write::MssqlBulkLoadWriter;
 pub use write::{
     MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus, MssqlWriteFailureContext,
     MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport, MssqlWriteStats,
