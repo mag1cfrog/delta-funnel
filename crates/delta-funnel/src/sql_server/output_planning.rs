@@ -145,7 +145,7 @@ pub fn plan_mssql_target_output(
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
-    use arrow_tiberius::PlanOptions;
+    use arrow_tiberius::{DiagnosticCode, DiagnosticSeverity, PlanOptions};
 
     use super::*;
     use crate::{
@@ -200,6 +200,21 @@ mod tests {
             Field::new("east_order_id", DataType::Int64, false),
             Field::new("east_total", DataType::Float64, true),
         ])
+    }
+
+    fn duplicate_field_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("id", DataType::Utf8, true),
+        ])
+    }
+
+    fn unsupported_field_schema() -> Schema {
+        Schema::new(vec![Field::new(
+            "items",
+            DataType::new_list(DataType::Int64, true),
+            true,
+        )])
     }
 
     #[test]
@@ -323,6 +338,75 @@ mod tests {
             error,
             DeltaFunnelError::MissingMssqlConnection { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn high_level_api_preserves_duplicate_field_error() -> Result<(), DeltaFunnelError> {
+        let default_connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+
+        let error = plan_mssql_target_for_output(
+            duplicate_field_schema(),
+            "orders_output",
+            &target_config,
+            Some(&default_connection),
+            PlanOptions::default(),
+        )
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected duplicate field error".to_owned(),
+        })?;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::DuplicateMssqlOutputField {
+                output_name,
+                field_name,
+                first_index: 0,
+                duplicate_index: 1,
+            } if output_name == "orders_output" && field_name == "id"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn high_level_api_preserves_structured_schema_diagnostics() -> Result<(), DeltaFunnelError> {
+        let default_connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+
+        let error = plan_mssql_target_for_output(
+            unsupported_field_schema(),
+            "orders_output",
+            &target_config,
+            Some(&default_connection),
+            PlanOptions::default(),
+        )
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected schema planning error".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlSchemaPlanning {
+            output_name,
+            diagnostics,
+        } = error
+        else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlSchemaPlanning error".to_owned(),
+            });
+        };
+
+        assert_eq!(output_name, "orders_output");
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(diagnostic.severity(), DiagnosticSeverity::Error);
+        assert_eq!(diagnostic.code(), DiagnosticCode::UnsupportedArrowType);
+        let field = diagnostic.field().ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected field diagnostic context".to_owned(),
+        })?;
+        assert_eq!(field.index(), 0);
+        assert_eq!(field.name(), "items");
         Ok(())
     }
 
