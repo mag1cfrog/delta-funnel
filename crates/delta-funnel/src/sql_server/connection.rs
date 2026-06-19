@@ -188,6 +188,32 @@ mod tests {
     }
 
     #[test]
+    fn mssql_connection_uses_arrow_tiberius_without_direct_transport_dependencies() {
+        let dependencies = direct_manifest_dependency_names(include_str!("../../Cargo.toml"));
+
+        assert!(dependencies.contains(&"arrow-tiberius"));
+        assert!(!dependencies.contains(&"tiberius"));
+        assert!(!dependencies.contains(&"tiberius-raw-bulk"));
+        assert!(!dependencies.contains(&"tokio-util"));
+    }
+
+    #[test]
+    fn connection_module_stays_before_execution_boundaries() {
+        let source = include_str!("connection.rs");
+        let forbidden_patterns = [
+            concat!("Bulk", "Writer"),
+            concat!("execute", "_statement"),
+            concat!("table", "_exists"),
+            concat!("Record", "Batch"),
+            concat!("data", "fusion"),
+        ];
+
+        for pattern in forbidden_patterns {
+            assert!(!source.contains(pattern), "unexpected `{pattern}`");
+        }
+    }
+
+    #[test]
     fn connection_request_pairs_raw_connection_with_redacted_output_plan()
     -> Result<(), DeltaFunnelError> {
         let connection = secret_connection("warehouse-primary", "secret-token")?;
@@ -349,5 +375,30 @@ mod tests {
         assert!(message.contains("TCP connection to SQL Server failed"));
         assert!(!message.contains("secret-token"));
         Ok(())
+    }
+
+    fn direct_manifest_dependency_names(manifest: &str) -> Vec<&str> {
+        let mut dependency_names = Vec::new();
+        let mut in_dependency_section = false;
+
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                in_dependency_section = matches!(
+                    line,
+                    "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]"
+                );
+                continue;
+            }
+            if !in_dependency_section || line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((dependency_name, _value)) = line.split_once('=') else {
+                continue;
+            };
+            dependency_names.push(dependency_name.trim().trim_matches('"'));
+        }
+
+        dependency_names
     }
 }
