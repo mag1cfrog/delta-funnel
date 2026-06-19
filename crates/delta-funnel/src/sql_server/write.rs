@@ -923,6 +923,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_loop_empty_stream_finishes_with_zero_stats() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let log = Arc::new(Mutex::new(FakeBulkLoadWriterLog::default()));
+        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log));
+        let batches = stream::empty::<Result<RecordBatch, DeltaFunnelError>>();
+
+        let report = write_mssql_batches_with_writer(
+            &output_plan,
+            batches,
+            writer,
+            default_mssql_write_options(),
+        )
+        .await?;
+
+        assert_eq!(report.output_name(), "orders_output");
+        assert_eq!(report.stats().rows_written(), 0);
+        assert_eq!(report.stats().batches_written(), 0);
+        assert!(!report.partial_write_possible());
+        let log = lock_fake_writer_log(&log)?;
+        assert!(log.batch_rows.is_empty());
+        assert_eq!(log.finish_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn write_loop_stream_error_preserves_stats_and_skips_finish()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_for_orders_schema()?;
