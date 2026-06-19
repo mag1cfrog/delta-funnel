@@ -504,6 +504,20 @@ pub enum DeltaFunnelError {
         /// Sanitized reason for the write failure.
         message: String,
     },
+
+    /// SQL Server output batch schema validation failed.
+    #[snafu(display(
+        "MSSQL write error for output `{}` during {}: {}",
+        sanitize_text_for_display(context.output_name()),
+        context.phase(),
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    MssqlBatchSchemaValidation {
+        /// Structured, redacted failure context.
+        context: Box<crate::MssqlWriteFailureContext>,
+        /// Underlying arrow-tiberius schema validation failure.
+        source: arrow_tiberius::Error,
+    },
 }
 
 fn sanitize_source_name_for_display(name: &str) -> String {
@@ -640,6 +654,69 @@ mod tests {
         assert_eq!(context.output_name(), "orders_output");
         assert_eq!(context.stats().rows_written(), 42);
         assert!(context.partial_write_possible());
+        Ok(())
+    }
+
+    #[test]
+    fn mssql_batch_schema_validation_error_has_sanitized_display_and_context()
+    -> Result<(), DeltaFunnelError> {
+        let connection = crate::MssqlConnectionConfig::new(
+            "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+        )?
+        .with_display_label("warehouse-primary");
+        let target_config =
+            crate::MssqlTargetConfig::new(crate::MssqlTargetTable::new("dbo", "orders")?);
+        let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "order_id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let output_plan = crate::plan_mssql_target_for_output(
+            schema,
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            arrow_tiberius::PlanOptions::default(),
+        )?;
+        let context = crate::MssqlWriteFailureContext::from_output_plan(
+            &output_plan,
+            crate::MssqlWritePhase::ValidateBatchSchema,
+            0,
+            0,
+            0,
+            false,
+            crate::MssqlTargetCleanupStatus::NotApplicable,
+        );
+
+        let error = DeltaFunnelError::MssqlBatchSchemaValidation {
+            context: Box::new(context),
+            source: arrow_tiberius::Error::BackendUnavailable {
+                backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                reason: "schema mismatch\nfor test".to_owned(),
+            },
+        };
+
+        let display = error.to_string();
+
+        assert!(display.contains("orders_output"));
+        assert!(display.contains("validate batch schema"));
+        assert!(!display.contains('\n'));
+        assert!(display.contains(r"schema mismatch\nfor test"));
+        assert!(!display.contains("secret-token"));
+        assert!(!display.contains("server=tcp"));
+        let DeltaFunnelError::MssqlBatchSchemaValidation { context, source } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlBatchSchemaValidation error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), crate::MssqlWritePhase::ValidateBatchSchema);
+        assert_eq!(context.output_name(), "orders_output");
+        assert_eq!(context.stats().rows_written(), 0);
+        assert!(!context.partial_write_possible());
+        assert!(matches!(
+            source,
+            arrow_tiberius::Error::BackendUnavailable { .. }
+        ));
         Ok(())
     }
 

@@ -31,7 +31,8 @@ pub use target::{
     ResolvedMssqlTarget,
 };
 pub use write::{
-    MssqlTargetCleanupStatus, MssqlWriteFailureContext, MssqlWriteOptions, MssqlWritePhase,
-    MssqlWriteReport, MssqlWriteStats, default_mssql_write_options,
-    mssql_write_options_for_output_plan,
+    MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus, MssqlWriteFailureContext,
+    MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport, MssqlWriteStats,
+    default_mssql_write_options, mssql_write_options_for_output_plan,
+    validate_mssql_output_record_batch, validate_mssql_output_schema,
 };
