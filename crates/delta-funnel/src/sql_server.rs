@@ -30,4 +30,7 @@ pub use target::{
     MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,
     ResolvedMssqlTarget,
 };
-pub use write::{MssqlWriteOptions, default_mssql_write_options};
+pub use write::{
+    MssqlTargetCleanupStatus, MssqlWriteOptions, MssqlWritePhase, MssqlWriteStats,
+    default_mssql_write_options,
+};
