@@ -653,6 +653,7 @@ mod tests {
         batch_rows: Vec<usize>,
         log: Option<Arc<Mutex<FakeBulkLoadWriterLog>>>,
         fail_on_write_batch: Option<u64>,
+        fail_on_finish: bool,
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -671,6 +672,11 @@ mod tests {
 
         fn fail_on_write_batch(mut self, write_batch_call: u64) -> Self {
             self.fail_on_write_batch = Some(write_batch_call);
+            self
+        }
+
+        fn fail_on_finish(mut self) -> Self {
+            self.fail_on_finish = true;
             self
         }
     }
@@ -717,6 +723,12 @@ mod tests {
                     });
                 };
                 log.finish_count = log.finish_count.saturating_add(1);
+            }
+            if self.fail_on_finish {
+                return Err(arrow_tiberius::Error::BackendUnavailable {
+                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                    reason: "fake writer failed on finish".to_owned(),
+                });
             }
 
             Ok(arrow_tiberius::WriteStats {
@@ -1007,6 +1019,38 @@ mod tests {
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_loop_finalize_failure_preserves_stats() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let log = Arc::new(Mutex::new(FakeBulkLoadWriterLog::default()));
+        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log)).fail_on_finish();
+        let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
+        let second = orders_batch(vec![3], vec![None])?;
+        let batches = stream::iter(vec![Ok(first), Ok(second)]);
+
+        let error = match write_mssql_batches_with_writer(
+            &output_plan,
+            batches,
+            writer,
+            default_mssql_write_options(),
+        )
+        .await
+        {
+            Ok(_) => {
+                return Err(DeltaFunnelError::Config {
+                    message: "expected finalize error".to_owned(),
+                });
+            }
+            Err(error) => error,
+        };
+
+        assert_write_phase_error(error, MssqlWritePhase::Finalize, 3, 2, true)?;
+        let log = lock_fake_writer_log(&log)?;
+        assert_eq!(log.batch_rows, vec![2, 1]);
+        assert_eq!(log.finish_count, 1);
         Ok(())
     }
 
