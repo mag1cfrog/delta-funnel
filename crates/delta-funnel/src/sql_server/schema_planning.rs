@@ -29,6 +29,7 @@ use super::{MssqlTargetSummary, ResolvedMssqlTarget};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlSchemaPlan {
     target: MssqlTargetSummary,
+    plan_options: MssqlSchemaPlanOptions,
     mappings: Vec<SchemaMapping>,
     diagnostics: DiagnosticSet,
     diagnostic_reports: Vec<MssqlSchemaDiagnostic>,
@@ -39,6 +40,12 @@ impl MssqlSchemaPlan {
     #[must_use]
     pub fn target(&self) -> &MssqlTargetSummary {
         &self.target
+    }
+
+    /// Returns the Arrow-to-MSSQL planning options used for this plan.
+    #[must_use]
+    pub const fn plan_options(&self) -> MssqlSchemaPlanOptions {
+        self.plan_options
     }
 
     /// Returns planned Arrow-to-MSSQL column mappings in output field order.
@@ -186,6 +193,7 @@ pub fn plan_mssql_output_schema(
 
     Ok(MssqlSchemaPlan {
         target: target.summary(),
+        plan_options: options,
         mappings,
         diagnostics,
         diagnostic_reports,
@@ -482,6 +490,7 @@ mod tests {
             plan.mappings()[0].mssql().ty(),
             &MssqlType::NVarChar(MssqlTypeLength::Bounded(128))
         );
+        assert_eq!(plan.plan_options(), options);
         Ok(())
     }
 

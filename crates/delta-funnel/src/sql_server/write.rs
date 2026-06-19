@@ -218,10 +218,21 @@ pub fn default_mssql_write_options() -> MssqlWriteOptions {
     }
 }
 
+/// Builds write options from a planned SQL Server output target.
+#[must_use]
+pub fn mssql_write_options_for_output_plan(
+    output_plan: &MssqlTargetOutputPlan,
+) -> MssqlWriteOptions {
+    MssqlWriteOptions {
+        plan_options: output_plan.schema_plan_options(),
+        ..default_mssql_write_options()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
-    use arrow_tiberius::{PlanOptions, SchemaCheck, WriteBackend, WriteOptions};
+    use arrow_tiberius::{PlanOptions, SchemaCheck, StringPolicy, WriteBackend, WriteOptions};
 
     use super::*;
     use crate::{
@@ -385,5 +396,30 @@ mod tests {
 
         assert_eq!(options.plan_options, WriteOptions::default().plan_options);
         assert_eq!(options.plan_options, PlanOptions::default());
+    }
+
+    #[test]
+    fn write_options_for_output_plan_preserve_schema_plan_options() -> Result<(), DeltaFunnelError>
+    {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let plan_options = PlanOptions {
+            string_policy: StringPolicy::NVarChar(128),
+            ..PlanOptions::default()
+        };
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            plan_options,
+        )?;
+
+        let write_options = mssql_write_options_for_output_plan(&output_plan);
+
+        assert_eq!(write_options.backend, WriteBackend::DirectRawBulk);
+        assert_eq!(write_options.schema_check, SchemaCheck::Strict);
+        assert_eq!(write_options.plan_options, plan_options);
+        Ok(())
     }
 }
