@@ -791,6 +791,36 @@ mod tests {
     }
 
     #[test]
+    fn output_schema_validation_accepts_aliased_output_field_names() -> Result<(), DeltaFunnelError>
+    {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let schema = Schema::new(vec![
+            Field::new("gross_total", DataType::Float64, true),
+            Field::new("order_id", DataType::Int32, false),
+        ]);
+        let output_plan = plan_mssql_target_for_output(
+            schema.clone(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+
+        let report = validate_mssql_output_schema(&output_plan, &schema)?;
+
+        assert_eq!(
+            output_plan.schema_mappings()[0].arrow().name(),
+            "gross_total"
+        );
+        assert_eq!(output_plan.schema_mappings()[1].arrow().name(), "order_id");
+        assert_eq!(report.output_name(), "orders_output");
+        assert_eq!(report.target_table().schema(), Some("dbo"));
+        assert_eq!(report.target_table().table(), "orders");
+        Ok(())
+    }
+
+    #[test]
     fn output_schema_validation_rejects_reordered_fields() -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_for_orders_schema()?;
         let schema = Schema::new(vec![
