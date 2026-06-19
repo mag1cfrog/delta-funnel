@@ -781,8 +781,15 @@ mod tests {
     }
 
     fn output_plan_for_orders_schema() -> Result<MssqlTargetOutputPlan, DeltaFunnelError> {
+        output_plan_for_orders_schema_with_load_mode(LoadMode::AppendExisting)
+    }
+
+    fn output_plan_for_orders_schema_with_load_mode(
+        load_mode: LoadMode,
+    ) -> Result<MssqlTargetOutputPlan, DeltaFunnelError> {
         let connection = secret_connection()?;
-        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?)
+            .with_load_mode(load_mode);
 
         plan_mssql_target_for_output(
             orders_schema(),
@@ -1041,6 +1048,48 @@ mod tests {
         };
 
         assert_write_phase_error(error, MssqlWritePhase::WriteBatch, 2, 1, true)?;
+        let log = lock_fake_writer_log(&log)?;
+        assert_eq!(log.batch_rows, vec![2, 1]);
+        assert_eq!(log.finish_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_loop_create_and_load_write_failure_does_not_report_partial_write()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema_with_load_mode(LoadMode::CreateAndLoad)?;
+        let log = Arc::new(Mutex::new(FakeBulkLoadWriterLog::default()));
+        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log)).fail_on_write_batch(2);
+        let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
+        let second = orders_batch(vec![3], vec![None])?;
+        let batches = stream::iter(vec![Ok(first), Ok(second)]);
+
+        let error = match write_mssql_batches_with_writer(
+            &output_plan,
+            batches,
+            writer,
+            default_mssql_write_options(),
+        )
+        .await
+        {
+            Ok(_) => {
+                return Err(DeltaFunnelError::Config {
+                    message: "expected create-and-load write batch error".to_owned(),
+                });
+            }
+            Err(error) => error,
+        };
+
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MSSQL write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::WriteBatch);
+        assert_eq!(context.load_mode(), LoadMode::CreateAndLoad);
+        assert_eq!(context.stats().rows_written(), 2);
+        assert_eq!(context.stats().batches_written(), 1);
+        assert!(!context.partial_write_possible());
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 0);
