@@ -652,6 +652,7 @@ mod tests {
         accepted_batches: u64,
         batch_rows: Vec<usize>,
         log: Option<Arc<Mutex<FakeBulkLoadWriterLog>>>,
+        fail_on_write_batch: Option<u64>,
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -666,6 +667,11 @@ mod tests {
                 log: Some(log),
                 ..Self::default()
             }
+        }
+
+        fn fail_on_write_batch(mut self, write_batch_call: u64) -> Self {
+            self.fail_on_write_batch = Some(write_batch_call);
+            self
         }
     }
 
@@ -685,6 +691,13 @@ mod tests {
                     });
                 };
                 log.batch_rows.push(row_count);
+            }
+            let write_batch_call = self.accepted_batches.saturating_add(1);
+            if self.fail_on_write_batch == Some(write_batch_call) {
+                return Err(arrow_tiberius::Error::BackendUnavailable {
+                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                    reason: format!("fake writer failed on batch {write_batch_call}"),
+                });
             }
             self.accepted_rows = self.accepted_rows.saturating_add(row_count as u64);
             self.accepted_batches = self.accepted_batches.saturating_add(1);
@@ -960,6 +973,39 @@ mod tests {
         assert_batch_schema_validation_error(error, Some((0, "order_id")))?;
         let log = lock_fake_writer_log(&log)?;
         assert!(log.batch_rows.is_empty());
+        assert_eq!(log.finish_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_loop_write_failure_preserves_stats_and_skips_finish()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let log = Arc::new(Mutex::new(FakeBulkLoadWriterLog::default()));
+        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log)).fail_on_write_batch(2);
+        let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
+        let second = orders_batch(vec![3], vec![None])?;
+        let batches = stream::iter(vec![Ok(first), Ok(second)]);
+
+        let error = match write_mssql_batches_with_writer(
+            &output_plan,
+            batches,
+            writer,
+            default_mssql_write_options(),
+        )
+        .await
+        {
+            Ok(_) => {
+                return Err(DeltaFunnelError::Config {
+                    message: "expected write batch error".to_owned(),
+                });
+            }
+            Err(error) => error,
+        };
+
+        assert_write_phase_error(error, MssqlWritePhase::WriteBatch, 2, 1, true)?;
+        let log = lock_fake_writer_log(&log)?;
+        assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 0);
         Ok(())
     }
