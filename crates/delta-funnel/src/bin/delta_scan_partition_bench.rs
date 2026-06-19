@@ -4036,8 +4036,8 @@ impl BenchmarkPolicyCase {
 
     fn derive_target(
         &self,
-    ) -> Result<DeltaScanPartitionTargetDiagnosticOutput, delta_funnel::DeltaFunnelError> {
-        derive_delta_scan_partition_target_diagnostic(self.input)
+    ) -> Result<DeltaScanPartitionTargetDiagnosticOutput, Box<delta_funnel::DeltaFunnelError>> {
+        derive_delta_scan_partition_target_diagnostic(self.input).map_err(Box::new)
     }
 
     #[cfg(test)]
