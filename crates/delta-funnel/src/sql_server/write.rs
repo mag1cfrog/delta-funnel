@@ -784,6 +784,34 @@ mod tests {
         Ok(())
     }
 
+    fn assert_write_phase_error(
+        error: DeltaFunnelError,
+        expected_phase: MssqlWritePhase,
+        expected_rows_written: u64,
+        expected_batches_written: u64,
+        expected_partial_write_possible: bool,
+    ) -> Result<(), DeltaFunnelError> {
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MSSQL write phase error".to_owned(),
+            });
+        };
+
+        assert_eq!(context.phase(), expected_phase);
+        assert_eq!(context.output_name(), "orders_output");
+        assert_eq!(context.target_table().schema(), Some("dbo"));
+        assert_eq!(context.target_table().table(), "orders");
+        assert_eq!(context.load_mode(), LoadMode::AppendExisting);
+        assert_eq!(context.stats().rows_written(), expected_rows_written);
+        assert_eq!(context.stats().batches_written(), expected_batches_written);
+        assert_eq!(
+            context.partial_write_possible(),
+            expected_partial_write_possible
+        );
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        Ok(())
+    }
+
     #[test]
     fn write_stats_preserve_output_counts_and_elapsed_time() {
         let stats = MssqlWriteStats::new("orders", 42, 3, 125);
@@ -848,6 +876,43 @@ mod tests {
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_loop_stream_error_preserves_stats_and_skips_finish()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let log = Arc::new(Mutex::new(FakeBulkLoadWriterLog::default()));
+        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log));
+        let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
+        let batches = stream::iter(vec![
+            Ok(first),
+            Err(DeltaFunnelError::Config {
+                message: "stream failed after first batch".to_owned(),
+            }),
+        ]);
+
+        let error = match write_mssql_batches_with_writer(
+            &output_plan,
+            batches,
+            writer,
+            default_mssql_write_options(),
+        )
+        .await
+        {
+            Ok(_) => {
+                return Err(DeltaFunnelError::Config {
+                    message: "expected stream error".to_owned(),
+                });
+            }
+            Err(error) => error,
+        };
+
+        assert_write_phase_error(error, MssqlWritePhase::PollBatchStream, 2, 1, true)?;
+        let log = lock_fake_writer_log(&log)?;
+        assert_eq!(log.batch_rows, vec![2]);
+        assert_eq!(log.finish_count, 0);
         Ok(())
     }
 
