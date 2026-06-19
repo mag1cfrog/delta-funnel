@@ -438,7 +438,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema};
-    use arrow_tiberius::{PlanOptions, SchemaCheck, StringPolicy, WriteBackend, WriteOptions};
+    use arrow_tiberius::{
+        DiagnosticCode, PlanOptions, SchemaCheck, StringPolicy, WriteBackend, WriteOptions,
+    };
     use datafusion::arrow::{
         array::{Int64Array, StringArray},
         record_batch::RecordBatch,
@@ -462,6 +464,53 @@ mod tests {
             Field::new("order_id", DataType::Int64, false),
             Field::new("status", DataType::Utf8, true),
         ])
+    }
+
+    fn output_plan_for_orders_schema() -> Result<MssqlTargetOutputPlan, DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+
+        plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )
+    }
+
+    fn assert_batch_schema_validation_error(
+        error: DeltaFunnelError,
+        expected_field: Option<(usize, &str)>,
+    ) -> Result<(), DeltaFunnelError> {
+        let DeltaFunnelError::MssqlBatchSchemaValidation { context, source } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MSSQL batch schema validation error".to_owned(),
+            });
+        };
+
+        assert_eq!(context.phase(), MssqlWritePhase::ValidateBatchSchema);
+        assert_eq!(context.output_name(), "orders_output");
+        assert_eq!(context.target_table().schema(), Some("dbo"));
+        assert_eq!(context.target_table().table(), "orders");
+        assert_eq!(context.load_mode(), LoadMode::AppendExisting);
+        assert!(!context.partial_write_possible());
+
+        let arrow_tiberius::Error::ValueConversion { diagnostics } = source else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected arrow-tiberius value conversion error".to_owned(),
+            });
+        };
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(diagnostic.code(), DiagnosticCode::SchemaMismatch);
+        assert_eq!(
+            diagnostic
+                .field()
+                .map(|field| (field.index(), field.name())),
+            expected_field
+        );
+        Ok(())
     }
 
     #[test]
@@ -710,16 +759,8 @@ mod tests {
     #[test]
     fn output_record_batch_validation_accepts_matching_planned_schema()
     -> Result<(), DeltaFunnelError> {
-        let connection = secret_connection()?;
-        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
         let schema = Arc::new(orders_schema());
-        let output_plan = plan_mssql_target_for_output(
-            schema.as_ref().clone(),
-            "orders_output",
-            &target_config,
-            Some(&connection),
-            PlanOptions::default(),
-        )?;
+        let output_plan = output_plan_for_orders_schema()?;
         let batch = RecordBatch::try_new(
             schema,
             vec![
@@ -746,6 +787,74 @@ mod tests {
             Some("warehouse-primary")
         );
         assert!(!format!("{report:?}").contains("secret-token"));
+        Ok(())
+    }
+
+    #[test]
+    fn output_schema_validation_rejects_reordered_fields() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let schema = Schema::new(vec![
+            Field::new("status", DataType::Utf8, true),
+            Field::new("order_id", DataType::Int64, false),
+        ]);
+
+        let error = validate_mssql_output_schema(&output_plan, &schema).unwrap_err();
+
+        assert_batch_schema_validation_error(error, Some((0, "order_id")))?;
+        Ok(())
+    }
+
+    #[test]
+    fn output_schema_validation_rejects_type_mismatch() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let schema = Schema::new(vec![
+            Field::new("order_id", DataType::Int32, false),
+            Field::new("status", DataType::Utf8, true),
+        ]);
+
+        let error = validate_mssql_output_schema(&output_plan, &schema).unwrap_err();
+
+        assert_batch_schema_validation_error(error, Some((0, "order_id")))?;
+        Ok(())
+    }
+
+    #[test]
+    fn output_schema_validation_rejects_missing_field() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let schema = Schema::new(vec![Field::new("order_id", DataType::Int64, false)]);
+
+        let error = validate_mssql_output_schema(&output_plan, &schema).unwrap_err();
+
+        assert_batch_schema_validation_error(error, Some((1, "status")))?;
+        Ok(())
+    }
+
+    #[test]
+    fn output_schema_validation_rejects_extra_field() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let schema = Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]);
+
+        let error = validate_mssql_output_schema(&output_plan, &schema).unwrap_err();
+
+        assert_batch_schema_validation_error(error, None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn output_schema_validation_rejects_nullability_mismatch() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let schema = Schema::new(vec![
+            Field::new("order_id", DataType::Int64, true),
+            Field::new("status", DataType::Utf8, true),
+        ]);
+
+        let error = validate_mssql_output_schema(&output_plan, &schema).unwrap_err();
+
+        assert_batch_schema_validation_error(error, Some((0, "order_id")))?;
         Ok(())
     }
 }
