@@ -6,6 +6,11 @@ use std::fmt;
 
 pub use arrow_tiberius::WriteOptions as MssqlWriteOptions;
 
+use super::{
+    LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan,
+    MssqlTargetTable,
+};
+
 /// Per-output SQL Server write statistics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlWriteStats {
@@ -117,6 +122,93 @@ impl fmt::Display for MssqlTargetCleanupStatus {
     }
 }
 
+/// Redacted per-output SQL Server write report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MssqlWriteReport {
+    output_name: String,
+    target_table: MssqlTargetTable,
+    load_mode: LoadMode,
+    connection_source: MssqlConnectionSource,
+    connection: MssqlConnectionSummary,
+    stats: MssqlWriteStats,
+    partial_write_possible: bool,
+    cleanup: MssqlTargetCleanupStatus,
+}
+
+impl MssqlWriteReport {
+    /// Builds a write report from the already planned SQL Server output target.
+    #[must_use]
+    pub fn from_output_plan(
+        output_plan: &MssqlTargetOutputPlan,
+        rows_written: u64,
+        batches_written: u64,
+        elapsed_ms: u64,
+        partial_write_possible: bool,
+        cleanup: MssqlTargetCleanupStatus,
+    ) -> Self {
+        let output_name = output_plan.output_name().to_owned();
+
+        Self {
+            output_name: output_name.clone(),
+            target_table: output_plan.target_table().clone(),
+            load_mode: output_plan.load_mode(),
+            connection_source: output_plan.connection_source(),
+            connection: output_plan.connection().clone(),
+            stats: MssqlWriteStats::new(output_name, rows_written, batches_written, elapsed_ms),
+            partial_write_possible,
+            cleanup,
+        }
+    }
+
+    /// Returns the selected output name.
+    #[must_use]
+    pub fn output_name(&self) -> &str {
+        &self.output_name
+    }
+
+    /// Returns the effective target table.
+    #[must_use]
+    pub fn target_table(&self) -> &MssqlTargetTable {
+        &self.target_table
+    }
+
+    /// Returns the requested target lifecycle mode.
+    #[must_use]
+    pub const fn load_mode(&self) -> LoadMode {
+        self.load_mode
+    }
+
+    /// Returns where the effective connection came from.
+    #[must_use]
+    pub const fn connection_source(&self) -> MssqlConnectionSource {
+        self.connection_source
+    }
+
+    /// Returns the redacted effective connection summary.
+    #[must_use]
+    pub const fn connection(&self) -> &MssqlConnectionSummary {
+        &self.connection
+    }
+
+    /// Returns per-output write statistics.
+    #[must_use]
+    pub const fn stats(&self) -> &MssqlWriteStats {
+        &self.stats
+    }
+
+    /// Returns whether the target may contain a partial write after failure.
+    #[must_use]
+    pub const fn partial_write_possible(&self) -> bool {
+        self.partial_write_possible
+    }
+
+    /// Returns cleanup reporting state for DeltaFunnel-owned target cleanup.
+    #[must_use]
+    pub const fn cleanup(&self) -> MssqlTargetCleanupStatus {
+        self.cleanup
+    }
+}
+
 /// Returns DeltaFunnel's default SQL Server write options.
 #[must_use]
 pub fn default_mssql_write_options() -> MssqlWriteOptions {
@@ -128,9 +220,28 @@ pub fn default_mssql_write_options() -> MssqlWriteOptions {
 
 #[cfg(test)]
 mod tests {
+    use arrow_schema::{DataType, Field, Schema};
     use arrow_tiberius::{PlanOptions, SchemaCheck, WriteBackend, WriteOptions};
 
     use super::*;
+    use crate::{
+        DeltaFunnelError, MssqlConnectionConfig, MssqlTargetConfig, MssqlTargetTable,
+        plan_mssql_target_for_output,
+    };
+
+    fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
+        Ok(MssqlConnectionConfig::new(
+            "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+        )?
+        .with_display_label("warehouse-primary"))
+    }
+
+    fn orders_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+        ])
+    }
 
     #[test]
     fn write_stats_preserve_output_counts_and_elapsed_time() {
@@ -180,6 +291,77 @@ mod tests {
             assert_eq!(status.to_string(), expected);
             assert!(!format!("{status:?}").contains("password"));
         }
+    }
+
+    #[test]
+    fn write_report_preserves_plan_context_stats_and_cleanup() -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+
+        let report = MssqlWriteReport::from_output_plan(
+            &output_plan,
+            42,
+            3,
+            125,
+            true,
+            MssqlTargetCleanupStatus::NotApplicable,
+        );
+
+        assert_eq!(report.output_name(), "orders_output");
+        assert_eq!(report.target_table().schema(), Some("dbo"));
+        assert_eq!(report.target_table().table(), "orders");
+        assert_eq!(report.load_mode(), LoadMode::AppendExisting);
+        assert_eq!(
+            report.connection_source(),
+            MssqlConnectionSource::ContextDefault
+        );
+        assert_eq!(
+            report.connection().display_label(),
+            Some("warehouse-primary")
+        );
+        assert_eq!(report.stats().output_name(), "orders_output");
+        assert_eq!(report.stats().rows_written(), 42);
+        assert_eq!(report.stats().batches_written(), 3);
+        assert_eq!(report.stats().elapsed_ms(), 125);
+        assert!(report.partial_write_possible());
+        assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        Ok(())
+    }
+
+    #[test]
+    fn write_report_debug_redacts_connection_secret() -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+
+        let report = MssqlWriteReport::from_output_plan(
+            &output_plan,
+            0,
+            0,
+            0,
+            false,
+            MssqlTargetCleanupStatus::NotApplicable,
+        );
+        let debug = format!("{report:?}");
+
+        assert!(debug.contains("warehouse-primary"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("server=tcp"));
+        Ok(())
     }
 
     #[test]

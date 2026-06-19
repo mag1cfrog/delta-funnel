@@ -31,6 +31,6 @@ pub use target::{
     ResolvedMssqlTarget,
 };
 pub use write::{
-    MssqlTargetCleanupStatus, MssqlWriteOptions, MssqlWritePhase, MssqlWriteStats,
-    default_mssql_write_options,
+    MssqlTargetCleanupStatus, MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport,
+    MssqlWriteStats, default_mssql_write_options,
 };

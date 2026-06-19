@@ -41,10 +41,10 @@ pub use sql_server::{
     MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField, MssqlSchemaPlan, MssqlSchemaPlanOptions,
     MssqlStringPolicy, MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetOutputPlan,
     MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable, MssqlTargetTableState,
-    MssqlTimezonePolicy, MssqlUInt64Policy, MssqlWriteOptions, MssqlWritePhase, MssqlWriteStats,
-    ResolvedMssqlTarget, default_mssql_write_options, mssql_schema_diagnostic_reports,
-    plan_mssql_create_table_ddl, plan_mssql_lifecycle, plan_mssql_output_schema,
-    plan_mssql_target_for_output, plan_mssql_target_output,
+    MssqlTimezonePolicy, MssqlUInt64Policy, MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport,
+    MssqlWriteStats, ResolvedMssqlTarget, default_mssql_write_options,
+    mssql_schema_diagnostic_reports, plan_mssql_create_table_ddl, plan_mssql_lifecycle,
+    plan_mssql_output_schema, plan_mssql_target_for_output, plan_mssql_target_output,
 };
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,
