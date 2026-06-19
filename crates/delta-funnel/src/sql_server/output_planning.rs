@@ -63,6 +63,12 @@ impl MssqlTargetOutputPlan {
         &self.schema_plan
     }
 
+    /// Returns the Arrow-to-MSSQL planning options used for this output.
+    #[must_use]
+    pub fn schema_plan_options(&self) -> MssqlSchemaPlanOptions {
+        self.schema_plan.plan_options()
+    }
+
     /// Returns planned Arrow-to-MSSQL column mappings in output field order.
     #[must_use]
     pub fn schema_mappings(&self) -> &[SchemaMapping] {
@@ -303,6 +309,7 @@ mod tests {
         );
         assert_eq!(output_plan.schema_mappings()[0].arrow().name(), "order_id");
         assert_eq!(output_plan.schema_mappings()[1].arrow().name(), "status");
+        assert_eq!(output_plan.schema_plan_options(), PlanOptions::default());
         assert!(output_plan.schema_diagnostics().is_empty());
         assert!(
             output_plan
@@ -314,6 +321,27 @@ mod tests {
             output_plan.lifecycle_plan().expected_target_state(),
             MssqlTargetTableState::Absent
         );
+        Ok(())
+    }
+
+    #[test]
+    fn output_plan_exposes_schema_plan_options() -> Result<(), DeltaFunnelError> {
+        let default_connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let options = PlanOptions {
+            string_policy: arrow_tiberius::StringPolicy::NVarChar(128),
+            ..PlanOptions::default()
+        };
+
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&default_connection),
+            options,
+        )?;
+
+        assert_eq!(output_plan.schema_plan_options(), options);
         Ok(())
     }
 

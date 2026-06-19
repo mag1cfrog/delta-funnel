@@ -39,11 +39,13 @@ pub use sql_server::{
     MssqlDecimalPolicy, MssqlFloatPolicy, MssqlLifecycleExecutionGuardrail,
     MssqlLifecycleGuardrailPolicy, MssqlLifecyclePlan, MssqlNanosecondPolicy,
     MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField, MssqlSchemaPlan, MssqlSchemaPlanOptions,
-    MssqlStringPolicy, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetResolutionContext,
-    MssqlTargetSummary, MssqlTargetTable, MssqlTargetTableState, MssqlTimezonePolicy,
-    MssqlUInt64Policy, ResolvedMssqlTarget, mssql_schema_diagnostic_reports,
-    plan_mssql_create_table_ddl, plan_mssql_lifecycle, plan_mssql_output_schema,
-    plan_mssql_target_for_output, plan_mssql_target_output,
+    MssqlStringPolicy, MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetOutputPlan,
+    MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable, MssqlTargetTableState,
+    MssqlTimezonePolicy, MssqlUInt64Policy, MssqlWriteFailureContext, MssqlWriteOptions,
+    MssqlWritePhase, MssqlWriteReport, MssqlWriteStats, ResolvedMssqlTarget,
+    default_mssql_write_options, mssql_schema_diagnostic_reports,
+    mssql_write_options_for_output_plan, plan_mssql_create_table_ddl, plan_mssql_lifecycle,
+    plan_mssql_output_schema, plan_mssql_target_for_output, plan_mssql_target_output,
 };
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,

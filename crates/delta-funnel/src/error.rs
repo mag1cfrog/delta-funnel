@@ -490,6 +490,20 @@ pub enum DeltaFunnelError {
         /// Underlying Arrow-to-TDS or Tiberius writer failure.
         source: arrow_tiberius::Error,
     },
+
+    /// SQL Server write execution failed during a known phase.
+    #[snafu(display(
+        "MSSQL write error for output `{}` during {}: {}",
+        sanitize_text_for_display(context.output_name()),
+        context.phase(),
+        sanitize_reason_for_display(message)
+    ))]
+    MssqlWritePhase {
+        /// Structured, redacted failure context.
+        context: Box<crate::MssqlWriteFailureContext>,
+        /// Sanitized reason for the write failure.
+        message: String,
+    },
 }
 
 fn sanitize_source_name_for_display(name: &str) -> String {
@@ -572,6 +586,61 @@ mod tests {
 
         assert!(!display.contains('\n'));
         assert!(display.contains(r"not available\nfor test"));
+    }
+
+    #[test]
+    fn mssql_write_phase_error_has_sanitized_display_and_context() -> Result<(), DeltaFunnelError> {
+        let connection = crate::MssqlConnectionConfig::new(
+            "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+        )?
+        .with_display_label("warehouse-primary");
+        let target_config =
+            crate::MssqlTargetConfig::new(crate::MssqlTargetTable::new("dbo", "orders")?);
+        let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "order_id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let output_plan = crate::plan_mssql_target_for_output(
+            schema,
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            arrow_tiberius::PlanOptions::default(),
+        )?;
+        let context = crate::MssqlWriteFailureContext::from_output_plan(
+            &output_plan,
+            crate::MssqlWritePhase::WriteBatch,
+            42,
+            3,
+            125,
+            true,
+            crate::MssqlTargetCleanupStatus::NotApplicable,
+        );
+
+        let error = DeltaFunnelError::MssqlWritePhase {
+            context: Box::new(context),
+            message: "batch failed\nwhile writing".to_owned(),
+        };
+
+        let display = error.to_string();
+
+        assert!(display.contains("orders_output"));
+        assert!(display.contains("write batch"));
+        assert!(!display.contains('\n'));
+        assert!(display.contains(r"batch failed\nwhile writing"));
+        assert!(!display.contains("secret-token"));
+        assert!(!display.contains("server=tcp"));
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlWritePhase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), crate::MssqlWritePhase::WriteBatch);
+        assert_eq!(context.output_name(), "orders_output");
+        assert_eq!(context.stats().rows_written(), 42);
+        assert!(context.partial_write_possible());
+        Ok(())
     }
 
     #[test]

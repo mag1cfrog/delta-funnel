@@ -9,6 +9,7 @@ mod lifecycle_planning;
 mod output_planning;
 mod schema_planning;
 mod target;
+mod write;
 
 pub use ddl_planning::{MssqlDdlPlan, plan_mssql_create_table_ddl};
 pub use lifecycle_planning::{
@@ -28,4 +29,9 @@ pub use target::{
     LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,
     ResolvedMssqlTarget,
+};
+pub use write::{
+    MssqlTargetCleanupStatus, MssqlWriteFailureContext, MssqlWriteOptions, MssqlWritePhase,
+    MssqlWriteReport, MssqlWriteStats, default_mssql_write_options,
+    mssql_write_options_for_output_plan,
 };
