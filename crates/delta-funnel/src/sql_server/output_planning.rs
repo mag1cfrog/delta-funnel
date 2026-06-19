@@ -1,12 +1,14 @@
 //! SQL Server target output planning.
 
 use arrow_schema::Schema;
+use arrow_tiberius::SchemaMapping;
 
 use crate::DeltaFunnelError;
 
 use super::{
-    LoadMode, MssqlConnectionConfig, MssqlDdlPlan, MssqlLifecyclePlan, MssqlSchemaPlan,
-    MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary,
+    LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary, MssqlDdlPlan,
+    MssqlLifecyclePlan, MssqlSchemaDiagnostic, MssqlSchemaPlan, MssqlSchemaPlanOptions,
+    MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,
     plan_mssql_create_table_ddl, plan_mssql_lifecycle, plan_mssql_output_schema,
 };
 
@@ -25,16 +27,64 @@ impl MssqlTargetOutputPlan {
         self.schema_plan.target()
     }
 
+    /// Returns the selected output name.
+    #[must_use]
+    pub fn output_name(&self) -> &str {
+        self.target().output_name()
+    }
+
+    /// Returns the effective target table.
+    #[must_use]
+    pub fn target_table(&self) -> &MssqlTargetTable {
+        self.target().table()
+    }
+
+    /// Returns the requested target lifecycle mode.
+    #[must_use]
+    pub fn load_mode(&self) -> LoadMode {
+        self.target().load_mode()
+    }
+
+    /// Returns where the effective connection came from.
+    #[must_use]
+    pub fn connection_source(&self) -> MssqlConnectionSource {
+        self.target().connection_source()
+    }
+
+    /// Returns the redacted effective connection summary.
+    #[must_use]
+    pub fn connection(&self) -> &MssqlConnectionSummary {
+        self.target().connection()
+    }
+
     /// Returns the planned Arrow-to-MSSQL schema mapping.
     #[must_use]
     pub fn schema_plan(&self) -> &MssqlSchemaPlan {
         &self.schema_plan
     }
 
+    /// Returns planned Arrow-to-MSSQL column mappings in output field order.
+    #[must_use]
+    pub fn schema_mappings(&self) -> &[SchemaMapping] {
+        self.schema_plan.mappings()
+    }
+
+    /// Returns structured schema diagnostic report entries.
+    #[must_use]
+    pub fn schema_diagnostics(&self) -> &[MssqlSchemaDiagnostic] {
+        self.schema_plan.diagnostic_reports()
+    }
+
     /// Returns the planned SQL Server DDL artifact.
     #[must_use]
     pub fn ddl_plan(&self) -> &MssqlDdlPlan {
         &self.ddl_plan
+    }
+
+    /// Returns planned `CREATE TABLE` SQL when required by the lifecycle mode.
+    #[must_use]
+    pub fn create_table_sql(&self) -> Option<&str> {
+        self.ddl_plan.create_table_sql()
     }
 
     /// Returns the planned SQL Server lifecycle report.
@@ -211,6 +261,48 @@ mod tests {
     }
 
     #[test]
+    fn composed_report_exposes_structured_python_ready_fields() -> Result<(), DeltaFunnelError> {
+        let default_connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?)
+            .with_load_mode(LoadMode::CreateAndLoad);
+
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&default_connection),
+            PlanOptions::default(),
+        )?;
+
+        assert_eq!(output_plan.output_name(), "orders_output");
+        assert_eq!(output_plan.target_table().schema(), Some("dbo"));
+        assert_eq!(output_plan.target_table().table(), "orders");
+        assert_eq!(output_plan.load_mode(), LoadMode::CreateAndLoad);
+        assert_eq!(
+            output_plan.connection_source(),
+            MssqlConnectionSource::ContextDefault
+        );
+        assert_eq!(
+            output_plan.connection().display_label(),
+            Some("warehouse-primary")
+        );
+        assert_eq!(output_plan.schema_mappings()[0].arrow().name(), "order_id");
+        assert_eq!(output_plan.schema_mappings()[1].arrow().name(), "status");
+        assert!(output_plan.schema_diagnostics().is_empty());
+        assert!(
+            output_plan
+                .create_table_sql()
+                .unwrap_or_default()
+                .starts_with("CREATE TABLE [dbo].[orders]")
+        );
+        assert_eq!(
+            output_plan.lifecycle_plan().expected_target_state(),
+            MssqlTargetTableState::Absent
+        );
+        Ok(())
+    }
+
+    #[test]
     fn high_level_api_returns_structured_missing_connection_error() -> Result<(), DeltaFunnelError>
     {
         let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
@@ -271,11 +363,11 @@ mod tests {
         );
         assert_eq!(west_plan.ddl_plan().create_table_sql(), None);
         assert_eq!(
-            west_plan.schema_plan().mappings()[0].arrow().name(),
+            west_plan.schema_mappings()[0].arrow().name(),
             "west_order_id"
         );
         assert_eq!(
-            west_plan.schema_plan().mappings()[1].arrow().name(),
+            west_plan.schema_mappings()[1].arrow().name(),
             "west_customer"
         );
 
@@ -289,19 +381,15 @@ mod tests {
         );
         assert!(
             east_plan
-                .ddl_plan()
                 .create_table_sql()
                 .unwrap_or_default()
                 .starts_with("CREATE TABLE [warehouse].[east]")
         );
         assert_eq!(
-            east_plan.schema_plan().mappings()[0].arrow().name(),
+            east_plan.schema_mappings()[0].arrow().name(),
             "east_order_id"
         );
-        assert_eq!(
-            east_plan.schema_plan().mappings()[1].arrow().name(),
-            "east_total"
-        );
+        assert_eq!(east_plan.schema_mappings()[1].arrow().name(), "east_total");
 
         let debug = format!("{west_plan:?}\n{east_plan:?}");
         assert!(debug.contains("context-default"));
