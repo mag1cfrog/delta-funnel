@@ -125,7 +125,7 @@ mod tests {
     use super::*;
     use crate::{
         MssqlConnectionConfig, MssqlConnectionSource, MssqlTargetConfig,
-        MssqlTargetResolutionContext, MssqlTargetTable,
+        MssqlTargetResolutionContext, MssqlTargetTable, MssqlWriteReport,
     };
 
     fn secret_connection(
@@ -158,6 +158,35 @@ mod tests {
             })
     }
 
+    fn assert_connect_phase_error(
+        error: DeltaFunnelError,
+        expected_cleanup: MssqlTargetCleanupStatus,
+    ) -> Result<String, DeltaFunnelError> {
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlWritePhase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Connect);
+        assert_eq!(context.stats().rows_written(), 0);
+        assert_eq!(context.stats().batches_written(), 0);
+        assert!(!context.partial_write_possible());
+        assert_eq!(context.cleanup(), expected_cleanup);
+        assert_eq!(
+            context.connection().display_label(),
+            Some("warehouse-primary")
+        );
+        Ok(message)
+    }
+
+    #[test]
+    fn compatible_arrow_tiberius_connection_api_is_available() {
+        let _connect = arrow_tiberius::connect_mssql_client_from_ado_string;
+        let client_type = std::any::type_name::<arrow_tiberius::ConnectedMssqlClient>();
+
+        assert!(client_type.contains("ConnectedMssqlClient"));
+    }
+
     #[test]
     fn connection_request_pairs_raw_connection_with_redacted_output_plan()
     -> Result<(), DeltaFunnelError> {
@@ -185,6 +214,38 @@ mod tests {
     }
 
     #[test]
+    fn matching_redacted_summaries_do_not_drive_request_pairing() -> Result<(), DeltaFunnelError> {
+        let west_connection = secret_connection("warehouse-primary", "west-secret")?;
+        let east_connection = secret_connection("warehouse-primary", "east-secret")?;
+        let west_request = plan_mssql_output_connection_request(
+            orders_schema(),
+            resolved_target("west", LoadMode::AppendExisting, &west_connection)?,
+            PlanOptions::default(),
+        )?;
+        let east_request = plan_mssql_output_connection_request(
+            orders_schema(),
+            resolved_target("east", LoadMode::AppendExisting, &east_connection)?,
+            PlanOptions::default(),
+        )?;
+
+        assert_eq!(
+            west_request.output_plan().connection(),
+            east_request.output_plan().connection()
+        );
+        assert_eq!(
+            west_request.connection.connection_string(),
+            "server=tcp:sql.example.com;database=warehouse;user=admin;password=west-secret"
+        );
+        assert_eq!(
+            east_request.connection.connection_string(),
+            "server=tcp:sql.example.com;database=warehouse;user=admin;password=east-secret"
+        );
+        assert_eq!(west_request.output_plan().output_name(), "west");
+        assert_eq!(east_request.output_plan().output_name(), "east");
+        Ok(())
+    }
+
+    #[test]
     fn create_and_load_connection_request_reports_cleanup_not_attempted()
     -> Result<(), DeltaFunnelError> {
         let connection = secret_connection("warehouse-primary", "secret-token")?;
@@ -202,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_request_debug_does_not_leak_raw_connection_string() -> Result<(), DeltaFunnelError>
+    fn redacted_connection_shapes_do_not_leak_raw_connection_string() -> Result<(), DeltaFunnelError>
     {
         let connection = secret_connection("warehouse-primary", "secret-token")?;
         let request = plan_mssql_output_connection_request(
@@ -210,11 +271,35 @@ mod tests {
             resolved_target("orders", LoadMode::AppendExisting, &connection)?,
             PlanOptions::default(),
         )?;
+        let report = MssqlWriteReport::from_output_plan(
+            request.output_plan(),
+            0,
+            0,
+            0,
+            false,
+            MssqlTargetCleanupStatus::NotApplicable,
+        );
+        let context = MssqlWriteFailureContext::from_output_plan(
+            request.output_plan(),
+            MssqlWritePhase::Connect,
+            0,
+            0,
+            0,
+            false,
+            MssqlTargetCleanupStatus::NotApplicable,
+        );
 
-        let debug = format!("{request:?}");
-        assert!(!debug.contains("secret-token"));
-        assert!(!debug.contains("server=tcp:sql.example.com"));
-        assert!(debug.contains("warehouse-primary"));
+        for debug in [
+            format!("{request:?}"),
+            format!("{:?}", request.output_plan()),
+            format!("{:?}", request.output_plan().target()),
+            format!("{report:?}"),
+            format!("{context:?}"),
+        ] {
+            assert!(!debug.contains("secret-token"));
+            assert!(!debug.contains("server=tcp:sql.example.com"));
+            assert!(debug.contains("warehouse-primary"));
+        }
         Ok(())
     }
 
@@ -236,21 +321,33 @@ mod tests {
                 message: "expected invalid connection string to fail".to_owned(),
             })?;
 
-        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
-            return Err(DeltaFunnelError::Config {
-                message: "expected MssqlWritePhase error".to_owned(),
-            });
-        };
-        assert_eq!(context.phase(), MssqlWritePhase::Connect);
-        assert_eq!(context.stats().rows_written(), 0);
-        assert_eq!(context.stats().batches_written(), 0);
-        assert!(!context.partial_write_possible());
-        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
-        assert_eq!(
-            context.connection().display_label(),
-            Some("warehouse-primary")
-        );
+        let message = assert_connect_phase_error(error, MssqlTargetCleanupStatus::NotApplicable)?;
         assert!(!message.contains("not an ado string"));
+        Ok(())
+    }
+
+    #[test]
+    fn tcp_connect_failure_is_mapped_to_connect_phase() -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection("warehouse-primary", "secret-token")?;
+        let request = plan_mssql_output_connection_request(
+            orders_schema(),
+            resolved_target("orders", LoadMode::CreateAndLoad, &connection)?,
+            PlanOptions::default(),
+        )?;
+        let error = connect_error(
+            &request,
+            request.cleanup_before_target_creation(),
+            arrow_tiberius::Error::ConnectionTcpConnect {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "connection refused",
+                ),
+            },
+        );
+
+        let message = assert_connect_phase_error(error, MssqlTargetCleanupStatus::NotAttempted)?;
+        assert!(message.contains("TCP connection to SQL Server failed"));
+        assert!(!message.contains("secret-token"));
         Ok(())
     }
 }
