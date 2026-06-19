@@ -729,6 +729,24 @@ mod tests {
         })
     }
 
+    fn orders_batch_with_int32_order_id() -> Result<RecordBatch, DeltaFunnelError> {
+        let schema = Schema::new(vec![
+            Field::new("order_id", DataType::Int32, false),
+            Field::new("status", DataType::Utf8, true),
+        ]);
+
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![1_i32])),
+                Arc::new(StringArray::from(vec![Some("open")])),
+            ],
+        )
+        .map_err(|error| DeltaFunnelError::Config {
+            message: error.to_string(),
+        })
+    }
+
     fn lock_fake_writer_log(
         log: &Arc<Mutex<FakeBulkLoadWriterLog>>,
     ) -> Result<MutexGuard<'_, FakeBulkLoadWriterLog>, DeltaFunnelError> {
@@ -912,6 +930,36 @@ mod tests {
         assert_write_phase_error(error, MssqlWritePhase::PollBatchStream, 2, 1, true)?;
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2]);
+        assert_eq!(log.finish_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_loop_schema_mismatch_skips_writer_and_finish() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let log = Arc::new(Mutex::new(FakeBulkLoadWriterLog::default()));
+        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log));
+        let batches = stream::iter(vec![Ok(orders_batch_with_int32_order_id()?)]);
+
+        let error = match write_mssql_batches_with_writer(
+            &output_plan,
+            batches,
+            writer,
+            default_mssql_write_options(),
+        )
+        .await
+        {
+            Ok(_) => {
+                return Err(DeltaFunnelError::Config {
+                    message: "expected batch schema validation error".to_owned(),
+                });
+            }
+            Err(error) => error,
+        };
+
+        assert_batch_schema_validation_error(error, Some((0, "order_id")))?;
+        let log = lock_fake_writer_log(&log)?;
+        assert!(log.batch_rows.is_empty());
         assert_eq!(log.finish_count, 0);
         Ok(())
     }
