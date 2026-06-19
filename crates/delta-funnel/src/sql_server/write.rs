@@ -209,6 +209,99 @@ impl MssqlWriteReport {
     }
 }
 
+/// Structured context for a one-output SQL Server write failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MssqlWriteFailureContext {
+    phase: MssqlWritePhase,
+    report: MssqlWriteReport,
+}
+
+impl MssqlWriteFailureContext {
+    /// Builds failure context from the already planned SQL Server output target.
+    #[must_use]
+    pub fn from_output_plan(
+        output_plan: &MssqlTargetOutputPlan,
+        phase: MssqlWritePhase,
+        rows_written: u64,
+        batches_written: u64,
+        elapsed_ms: u64,
+        partial_write_possible: bool,
+        cleanup: MssqlTargetCleanupStatus,
+    ) -> Self {
+        Self {
+            phase,
+            report: MssqlWriteReport::from_output_plan(
+                output_plan,
+                rows_written,
+                batches_written,
+                elapsed_ms,
+                partial_write_possible,
+                cleanup,
+            ),
+        }
+    }
+
+    /// Returns the write phase associated with the failure.
+    #[must_use]
+    pub const fn phase(&self) -> MssqlWritePhase {
+        self.phase
+    }
+
+    /// Returns the selected output name.
+    #[must_use]
+    pub fn output_name(&self) -> &str {
+        self.report.output_name()
+    }
+
+    /// Returns the effective target table.
+    #[must_use]
+    pub fn target_table(&self) -> &MssqlTargetTable {
+        self.report.target_table()
+    }
+
+    /// Returns the requested target lifecycle mode.
+    #[must_use]
+    pub const fn load_mode(&self) -> LoadMode {
+        self.report.load_mode()
+    }
+
+    /// Returns where the effective connection came from.
+    #[must_use]
+    pub const fn connection_source(&self) -> MssqlConnectionSource {
+        self.report.connection_source()
+    }
+
+    /// Returns the redacted effective connection summary.
+    #[must_use]
+    pub const fn connection(&self) -> &MssqlConnectionSummary {
+        self.report.connection()
+    }
+
+    /// Returns accepted write statistics known at failure time.
+    #[must_use]
+    pub const fn stats(&self) -> &MssqlWriteStats {
+        self.report.stats()
+    }
+
+    /// Returns whether the target may contain a partial write after failure.
+    #[must_use]
+    pub const fn partial_write_possible(&self) -> bool {
+        self.report.partial_write_possible()
+    }
+
+    /// Returns cleanup reporting state for DeltaFunnel-owned target cleanup.
+    #[must_use]
+    pub const fn cleanup(&self) -> MssqlTargetCleanupStatus {
+        self.report.cleanup()
+    }
+
+    /// Returns the redacted write report associated with the failure.
+    #[must_use]
+    pub const fn report(&self) -> &MssqlWriteReport {
+        &self.report
+    }
+}
+
 /// Returns DeltaFunnel's default SQL Server write options.
 #[must_use]
 pub fn default_mssql_write_options() -> MssqlWriteOptions {
@@ -367,6 +460,80 @@ mod tests {
             MssqlTargetCleanupStatus::NotApplicable,
         );
         let debug = format!("{report:?}");
+
+        assert!(debug.contains("warehouse-primary"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("server=tcp"));
+        Ok(())
+    }
+
+    #[test]
+    fn write_failure_context_preserves_phase_report_and_accepted_stats()
+    -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+
+        let context = MssqlWriteFailureContext::from_output_plan(
+            &output_plan,
+            MssqlWritePhase::WriteBatch,
+            42,
+            3,
+            125,
+            true,
+            MssqlTargetCleanupStatus::NotApplicable,
+        );
+
+        assert_eq!(context.phase(), MssqlWritePhase::WriteBatch);
+        assert_eq!(context.output_name(), "orders_output");
+        assert_eq!(context.target_table().table(), "orders");
+        assert_eq!(context.load_mode(), LoadMode::AppendExisting);
+        assert_eq!(
+            context.connection_source(),
+            MssqlConnectionSource::ContextDefault
+        );
+        assert_eq!(
+            context.connection().display_label(),
+            Some("warehouse-primary")
+        );
+        assert_eq!(context.stats().rows_written(), 42);
+        assert_eq!(context.stats().batches_written(), 3);
+        assert_eq!(context.stats().elapsed_ms(), 125);
+        assert!(context.partial_write_possible());
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert_eq!(context.report().output_name(), "orders_output");
+        Ok(())
+    }
+
+    #[test]
+    fn write_failure_context_debug_redacts_connection_secret() -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+
+        let context = MssqlWriteFailureContext::from_output_plan(
+            &output_plan,
+            MssqlWritePhase::InitializeWriter,
+            0,
+            0,
+            0,
+            false,
+            MssqlTargetCleanupStatus::NotAttempted,
+        );
+        let debug = format!("{context:?}");
 
         assert!(debug.contains("warehouse-primary"));
         assert!(!debug.contains("secret-token"));
