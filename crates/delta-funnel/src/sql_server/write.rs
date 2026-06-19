@@ -4,7 +4,11 @@
 
 use std::fmt;
 
+use arrow_schema::Schema;
 pub use arrow_tiberius::WriteOptions as MssqlWriteOptions;
+use datafusion::arrow::record_batch::RecordBatch;
+
+use crate::DeltaFunnelError;
 
 use super::{
     LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan,
@@ -133,6 +137,60 @@ pub struct MssqlWriteReport {
     stats: MssqlWriteStats,
     partial_write_possible: bool,
     cleanup: MssqlTargetCleanupStatus,
+}
+
+/// Redacted report for a successful planned-output schema validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MssqlOutputBatchValidationReport {
+    output_name: String,
+    target_table: MssqlTargetTable,
+    load_mode: LoadMode,
+    connection_source: MssqlConnectionSource,
+    connection: MssqlConnectionSummary,
+}
+
+impl MssqlOutputBatchValidationReport {
+    /// Builds a validation report from the already planned SQL Server output target.
+    #[must_use]
+    pub fn from_output_plan(output_plan: &MssqlTargetOutputPlan) -> Self {
+        Self {
+            output_name: output_plan.output_name().to_owned(),
+            target_table: output_plan.target_table().clone(),
+            load_mode: output_plan.load_mode(),
+            connection_source: output_plan.connection_source(),
+            connection: output_plan.connection().clone(),
+        }
+    }
+
+    /// Returns the selected output name.
+    #[must_use]
+    pub fn output_name(&self) -> &str {
+        &self.output_name
+    }
+
+    /// Returns the effective target table.
+    #[must_use]
+    pub const fn target_table(&self) -> &MssqlTargetTable {
+        &self.target_table
+    }
+
+    /// Returns the requested target lifecycle mode.
+    #[must_use]
+    pub const fn load_mode(&self) -> LoadMode {
+        self.load_mode
+    }
+
+    /// Returns where the effective connection came from.
+    #[must_use]
+    pub const fn connection_source(&self) -> MssqlConnectionSource {
+        self.connection_source
+    }
+
+    /// Returns the redacted effective connection summary.
+    #[must_use]
+    pub const fn connection(&self) -> &MssqlConnectionSummary {
+        &self.connection
+    }
 }
 
 impl MssqlWriteReport {
@@ -322,10 +380,69 @@ pub fn mssql_write_options_for_output_plan(
     }
 }
 
+/// Validates a runtime Arrow schema against a planned SQL Server output.
+///
+/// DeltaFunnel owns the output context and redacted report shape, while the
+/// schema contract comparison is delegated to `arrow-tiberius`.
+pub fn validate_mssql_output_schema(
+    output_plan: &MssqlTargetOutputPlan,
+    schema: &Schema,
+) -> Result<MssqlOutputBatchValidationReport, DeltaFunnelError> {
+    arrow_tiberius::validate_arrow_schema_against_mappings(schema, output_plan.schema_mappings())
+        .map_err(|source| mssql_batch_schema_validation_error(output_plan, source))?;
+
+    Ok(MssqlOutputBatchValidationReport::from_output_plan(
+        output_plan,
+    ))
+}
+
+/// Validates a runtime `RecordBatch` schema against a planned SQL Server output.
+///
+/// This helper validates `batch.schema()` before row writes and does not inspect
+/// row values, connect to SQL Server, or construct a writer.
+pub fn validate_mssql_output_record_batch(
+    output_plan: &MssqlTargetOutputPlan,
+    batch: &RecordBatch,
+) -> Result<MssqlOutputBatchValidationReport, DeltaFunnelError> {
+    arrow_tiberius::validate_record_batch_schema_against_mappings(
+        batch,
+        output_plan.schema_mappings(),
+    )
+    .map_err(|source| mssql_batch_schema_validation_error(output_plan, source))?;
+
+    Ok(MssqlOutputBatchValidationReport::from_output_plan(
+        output_plan,
+    ))
+}
+
+fn mssql_batch_schema_validation_error(
+    output_plan: &MssqlTargetOutputPlan,
+    source: arrow_tiberius::Error,
+) -> DeltaFunnelError {
+    DeltaFunnelError::MssqlBatchSchemaValidation {
+        context: Box::new(MssqlWriteFailureContext::from_output_plan(
+            output_plan,
+            MssqlWritePhase::ValidateBatchSchema,
+            0,
+            0,
+            0,
+            false,
+            MssqlTargetCleanupStatus::NotApplicable,
+        )),
+        source,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow_schema::{DataType, Field, Schema};
     use arrow_tiberius::{PlanOptions, SchemaCheck, StringPolicy, WriteBackend, WriteOptions};
+    use datafusion::arrow::{
+        array::{Int64Array, StringArray},
+        record_batch::RecordBatch,
+    };
 
     use super::*;
     use crate::{
@@ -587,6 +704,48 @@ mod tests {
         assert_eq!(write_options.backend, WriteBackend::DirectRawBulk);
         assert_eq!(write_options.schema_check, SchemaCheck::Strict);
         assert_eq!(write_options.plan_options, plan_options);
+        Ok(())
+    }
+
+    #[test]
+    fn output_record_batch_validation_accepts_matching_planned_schema()
+    -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let schema = Arc::new(orders_schema());
+        let output_plan = plan_mssql_target_for_output(
+            schema.as_ref().clone(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(StringArray::from(vec![Some("open"), None])),
+            ],
+        )
+        .map_err(|error| DeltaFunnelError::Config {
+            message: error.to_string(),
+        })?;
+
+        let report = validate_mssql_output_record_batch(&output_plan, &batch)?;
+
+        assert_eq!(report.output_name(), "orders_output");
+        assert_eq!(report.target_table().schema(), Some("dbo"));
+        assert_eq!(report.target_table().table(), "orders");
+        assert_eq!(report.load_mode(), LoadMode::AppendExisting);
+        assert_eq!(
+            report.connection_source(),
+            MssqlConnectionSource::ContextDefault
+        );
+        assert_eq!(
+            report.connection().display_label(),
+            Some("warehouse-primary")
+        );
+        assert!(!format!("{report:?}").contains("secret-token"));
         Ok(())
     }
 }

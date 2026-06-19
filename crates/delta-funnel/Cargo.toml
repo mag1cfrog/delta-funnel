@@ -16,7 +16,7 @@ workspace = true
 [dependencies]
 async-trait = "0.1"
 arrow-schema = "58.3.0"
-arrow-tiberius = "0.1.0"
+arrow-tiberius = "0.1.1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 datafusion = { version = "53.1.0", default-features = false, features = [
     "sql",

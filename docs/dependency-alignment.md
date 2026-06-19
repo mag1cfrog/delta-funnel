@@ -7,7 +7,7 @@ owning feature work needs them.
 ## Selected Dependencies
 
 - `snafu = "0.9"` is the Rust error-handling framework.
-- `arrow-tiberius = "0.1.0"` is the Arrow to SQL Server planning and write
+- `arrow-tiberius = "0.1.1"` is the Arrow to SQL Server planning and write
   path.
 - `arrow-tiberius` brings in `tiberius-raw-bulk =0.12.3-raw-bulk.13`
   transitively. DeltaFunnel should add a direct `tiberius` dependency only when
