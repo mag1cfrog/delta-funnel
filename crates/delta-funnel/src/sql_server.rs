@@ -15,7 +15,7 @@ mod target;
 mod write;
 
 pub use ddl_planning::{MssqlDdlPlan, plan_mssql_create_table_ddl};
-pub(crate) use lifecycle_execution::table_name_from_target;
+pub(crate) use lifecycle_execution::{MssqlConnectedLifecycleClient, table_name_from_target};
 pub use lifecycle_execution::{
     MssqlPreparedTarget, MssqlPreparedTargetAction, MssqlPreparedTargetReport,
 };

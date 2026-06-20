@@ -4,7 +4,8 @@
 //! target before writer construction. Actual SQL Server probes and DDL
 //! execution land in later slices.
 
-use arrow_tiberius::TableName;
+use arrow_tiberius::{SqlExecutionOutcome, TableName};
+use async_trait::async_trait;
 
 use crate::DeltaFunnelError;
 
@@ -12,6 +13,74 @@ use super::{
     LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetCleanupStatus,
     MssqlTargetOutputPlan, MssqlTargetTable, MssqlTargetTableState,
 };
+
+/// Fakeable SQL Server target lifecycle operation boundary.
+#[allow(dead_code)]
+#[async_trait]
+pub(crate) trait MssqlTargetLifecycleClient: Send {
+    /// Returns whether the target table exists in SQL Server metadata.
+    async fn table_exists(&mut self, table: &TableName) -> arrow_tiberius::Result<bool>;
+
+    /// Executes one prepared lifecycle SQL statement.
+    async fn execute_statement(&mut self, sql: &str)
+    -> arrow_tiberius::Result<SqlExecutionOutcome>;
+}
+
+#[async_trait]
+impl MssqlTargetLifecycleClient for arrow_tiberius::ConnectedMssqlClient {
+    async fn table_exists(&mut self, table: &TableName) -> arrow_tiberius::Result<bool> {
+        arrow_tiberius::ConnectedMssqlClient::table_exists(self, table).await
+    }
+
+    async fn execute_statement(
+        &mut self,
+        sql: &str,
+    ) -> arrow_tiberius::Result<SqlExecutionOutcome> {
+        arrow_tiberius::ConnectedMssqlClient::execute_statement(self, sql).await
+    }
+}
+
+/// Connected lifecycle client paired with the planned output it prepares.
+#[allow(dead_code)]
+pub(crate) struct MssqlConnectedLifecycleClient<'client> {
+    output_plan: &'client MssqlTargetOutputPlan,
+    client: &'client mut arrow_tiberius::ConnectedMssqlClient,
+}
+
+impl<'client> MssqlConnectedLifecycleClient<'client> {
+    /// Pairs a connected arrow-tiberius client with its redacted output plan.
+    #[must_use]
+    pub(crate) fn new(
+        output_plan: &'client MssqlTargetOutputPlan,
+        client: &'client mut arrow_tiberius::ConnectedMssqlClient,
+    ) -> Self {
+        Self {
+            output_plan,
+            client,
+        }
+    }
+
+    /// Returns the redacted target output plan paired with this connection.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) const fn output_plan(&self) -> &MssqlTargetOutputPlan {
+        self.output_plan
+    }
+}
+
+#[async_trait]
+impl MssqlTargetLifecycleClient for MssqlConnectedLifecycleClient<'_> {
+    async fn table_exists(&mut self, table: &TableName) -> arrow_tiberius::Result<bool> {
+        MssqlTargetLifecycleClient::table_exists(self.client, table).await
+    }
+
+    async fn execute_statement(
+        &mut self,
+        sql: &str,
+    ) -> arrow_tiberius::Result<SqlExecutionOutcome> {
+        MssqlTargetLifecycleClient::execute_statement(self.client, sql).await
+    }
+}
 
 /// Side effect completed while preparing a SQL Server target for loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -195,6 +264,7 @@ fn ensure_action_matches_load_mode(
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use arrow_tiberius::PlanOptions;
+    use async_trait::async_trait;
 
     use super::*;
     use crate::{
@@ -228,6 +298,66 @@ mod tests {
         let schema_plan = plan_mssql_output_schema(&schema, &target, PlanOptions::default())?;
 
         plan_mssql_target_output(schema_plan)
+    }
+
+    #[derive(Default)]
+    struct RecordingLifecycleClient {
+        calls: Vec<String>,
+        exists: bool,
+        rows_affected: Vec<u64>,
+    }
+
+    #[async_trait]
+    impl MssqlTargetLifecycleClient for RecordingLifecycleClient {
+        async fn table_exists(&mut self, table: &TableName) -> arrow_tiberius::Result<bool> {
+            self.calls.push(format!("probe {}", table.quoted_sql()));
+            Ok(self.exists)
+        }
+
+        async fn execute_statement(
+            &mut self,
+            sql: &str,
+        ) -> arrow_tiberius::Result<SqlExecutionOutcome> {
+            self.calls.push(format!("execute {sql}"));
+            Ok(SqlExecutionOutcome {
+                rows_affected: self.rows_affected.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn connected_arrow_tiberius_client_implements_lifecycle_client_boundary() {
+        fn assert_lifecycle_client<C: MssqlTargetLifecycleClient>() {}
+
+        assert_lifecycle_client::<arrow_tiberius::ConnectedMssqlClient>();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_client_boundary_is_fakeable() -> arrow_tiberius::Result<()> {
+        let table = TableName::new("dbo", "orders")?;
+        let mut client = RecordingLifecycleClient {
+            exists: true,
+            rows_affected: vec![1],
+            ..RecordingLifecycleClient::default()
+        };
+
+        let exists = MssqlTargetLifecycleClient::table_exists(&mut client, &table).await?;
+        let outcome = MssqlTargetLifecycleClient::execute_statement(
+            &mut client,
+            "CREATE TABLE [dbo].[orders] ([id] bigint)",
+        )
+        .await?;
+
+        assert!(exists);
+        assert_eq!(outcome.rows_affected, vec![1]);
+        assert_eq!(
+            client.calls,
+            vec![
+                "probe [dbo].[orders]".to_owned(),
+                "execute CREATE TABLE [dbo].[orders] ([id] bigint)".to_owned(),
+            ]
+        );
+        Ok(())
     }
 
     #[test]
