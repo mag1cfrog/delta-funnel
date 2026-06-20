@@ -11,7 +11,8 @@ use crate::DeltaFunnelError;
 
 use super::{
     LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetCleanupStatus,
-    MssqlTargetOutputPlan, MssqlTargetTable, MssqlTargetTableState,
+    MssqlTargetOutputPlan, MssqlTargetTable, MssqlTargetTableState, MssqlWriteFailureContext,
+    MssqlWritePhase,
 };
 
 /// Fakeable SQL Server target lifecycle operation boundary.
@@ -80,6 +81,35 @@ impl MssqlTargetLifecycleClient for MssqlConnectedLifecycleClient<'_> {
     ) -> arrow_tiberius::Result<SqlExecutionOutcome> {
         MssqlTargetLifecycleClient::execute_statement(self.client, sql).await
     }
+}
+
+/// Prepares an append-existing SQL Server target before writer construction.
+#[allow(dead_code)]
+pub(crate) async fn prepare_mssql_append_existing_target<C>(
+    output_plan: &MssqlTargetOutputPlan,
+    client: &mut C,
+) -> Result<MssqlPreparedTarget, DeltaFunnelError>
+where
+    C: MssqlTargetLifecycleClient + ?Sized,
+{
+    ensure_append_existing_output(output_plan)?;
+    let table_name = table_name_from_target(output_plan.output_name(), output_plan.target_table())?;
+    let exists = client
+        .table_exists(&table_name)
+        .await
+        .map_err(|source| prepare_target_lifecycle_error(output_plan, source.to_string()))?;
+
+    if !exists {
+        return Err(prepare_target_lifecycle_error(
+            output_plan,
+            format!(
+                "append-existing target table {} does not exist",
+                table_name.quoted_sql()
+            ),
+        ));
+    }
+
+    MssqlPreparedTarget::from_output_plan(output_plan, MssqlPreparedTargetAction::VerifiedExisting)
 }
 
 /// Side effect completed while preparing a SQL Server target for loading.
@@ -260,6 +290,47 @@ fn ensure_action_matches_load_mode(
     })
 }
 
+#[allow(dead_code)]
+fn ensure_append_existing_output(
+    output_plan: &MssqlTargetOutputPlan,
+) -> Result<(), DeltaFunnelError> {
+    if output_plan.load_mode() == LoadMode::AppendExisting {
+        return Ok(());
+    }
+
+    Err(DeltaFunnelError::MssqlLifecyclePlanning {
+        output_name: output_plan.output_name().to_owned(),
+        message: "append-existing target preparation requires append-existing load mode".to_owned(),
+    })
+}
+
+#[allow(dead_code)]
+fn prepare_target_lifecycle_error(
+    output_plan: &MssqlTargetOutputPlan,
+    message: impl Into<String>,
+) -> DeltaFunnelError {
+    DeltaFunnelError::MssqlWritePhase {
+        context: Box::new(MssqlWriteFailureContext::from_output_plan(
+            output_plan,
+            MssqlWritePhase::PrepareTargetLifecycle,
+            0,
+            0,
+            0,
+            false,
+            cleanup_before_target_creation(output_plan),
+        )),
+        message: message.into(),
+    }
+}
+
+#[allow(dead_code)]
+fn cleanup_before_target_creation(output_plan: &MssqlTargetOutputPlan) -> MssqlTargetCleanupStatus {
+    match output_plan.load_mode() {
+        LoadMode::AppendExisting => MssqlTargetCleanupStatus::NotApplicable,
+        LoadMode::CreateAndLoad | LoadMode::Replace => MssqlTargetCleanupStatus::NotAttempted,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
@@ -305,12 +376,17 @@ mod tests {
         calls: Vec<String>,
         exists: bool,
         rows_affected: Vec<u64>,
+        table_exists_error: Option<String>,
     }
 
     #[async_trait]
     impl MssqlTargetLifecycleClient for RecordingLifecycleClient {
         async fn table_exists(&mut self, table: &TableName) -> arrow_tiberius::Result<bool> {
             self.calls.push(format!("probe {}", table.quoted_sql()));
+            if let Some(reason) = self.table_exists_error.take() {
+                return Err(arrow_tiberius::Error::TableExistsUnexpectedResult { reason });
+            }
+
             Ok(self.exists)
         }
 
@@ -357,6 +433,116 @@ mod tests {
                 "execute CREATE TABLE [dbo].[orders] ([id] bigint)".to_owned(),
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_preparation_verifies_existing_target() -> Result<(), DeltaFunnelError>
+    {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::AppendExisting,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            exists: true,
+            ..RecordingLifecycleClient::default()
+        };
+
+        let prepared = prepare_mssql_append_existing_target(&output_plan, &mut client).await?;
+
+        assert_eq!(prepared.quoted_table_sql(), "[dbo].[orders]");
+        assert_eq!(
+            prepared.report().action(),
+            MssqlPreparedTargetAction::VerifiedExisting
+        );
+        assert_eq!(
+            prepared.report().cleanup(),
+            MssqlTargetCleanupStatus::NotApplicable
+        );
+        assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_preparation_fails_when_target_is_absent()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::AppendExisting,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            exists: false,
+            ..RecordingLifecycleClient::default()
+        };
+
+        let error = prepare_mssql_append_existing_target(&output_plan, &mut client)
+            .await
+            .err()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected absent append-existing target error".to_owned(),
+            })?;
+
+        assert_prepare_target_lifecycle_error(
+            error,
+            "append-existing target table [dbo].[orders] does not exist",
+        )?;
+        assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_preparation_maps_probe_errors_to_lifecycle_phase()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::AppendExisting,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            table_exists_error: Some("metadata query failed\nfor test".to_owned()),
+            ..RecordingLifecycleClient::default()
+        };
+
+        let error = prepare_mssql_append_existing_target(&output_plan, &mut client)
+            .await
+            .err()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected probe error".to_owned(),
+            })?;
+
+        assert_prepare_target_lifecycle_error(error, r"metadata query failed\nfor test")?;
+        assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_preparation_rejects_create_and_load_before_probe()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            exists: true,
+            ..RecordingLifecycleClient::default()
+        };
+
+        let error = prepare_mssql_append_existing_target(&output_plan, &mut client)
+            .await
+            .err()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected append-only preparation error".to_owned(),
+            })?;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::MssqlLifecyclePlanning { .. }
+        ));
+        assert!(error.to_string().contains("requires append-existing"));
+        assert!(client.calls.is_empty());
         Ok(())
     }
 
@@ -495,6 +681,31 @@ mod tests {
         assert!(!combined.contains("password"));
         assert!(!combined.contains("server=tcp"));
         assert!(combined.contains("warehouse-primary"));
+        Ok(())
+    }
+
+    fn assert_prepare_target_lifecycle_error(
+        error: DeltaFunnelError,
+        expected_message: &str,
+    ) -> Result<(), DeltaFunnelError> {
+        let display = error.to_string();
+        assert!(display.contains("orders_output"));
+        assert!(display.contains("prepare target lifecycle"));
+        assert!(display.contains(expected_message));
+        assert!(!display.contains("secret-token"));
+        assert!(!display.contains("server=tcp"));
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlWritePhase error".to_owned(),
+            });
+        };
+
+        assert_eq!(context.phase(), MssqlWritePhase::PrepareTargetLifecycle);
+        assert_eq!(context.output_name(), "orders_output");
+        assert_eq!(context.stats().rows_written(), 0);
+        assert_eq!(context.stats().batches_written(), 0);
+        assert!(!context.partial_write_possible());
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
         Ok(())
     }
 }
