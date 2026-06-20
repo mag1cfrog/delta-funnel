@@ -152,6 +152,34 @@ where
     MssqlPreparedTarget::from_output_plan(output_plan, MssqlPreparedTargetAction::CreatedTable)
 }
 
+/// Cleans up a DeltaFunnel-created SQL Server target after a later failure.
+#[allow(dead_code)]
+pub(crate) async fn cleanup_mssql_prepared_target<C>(
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_target: Option<&MssqlPreparedTarget>,
+    client: &mut C,
+) -> Result<MssqlTargetCleanupStatus, DeltaFunnelError>
+where
+    C: MssqlTargetLifecycleClient + ?Sized,
+{
+    let Some(prepared_target) = prepared_target else {
+        return Ok(cleanup_before_target_creation(output_plan));
+    };
+
+    match prepared_target.report().action() {
+        MssqlPreparedTargetAction::VerifiedExisting => Ok(MssqlTargetCleanupStatus::NotApplicable),
+        MssqlPreparedTargetAction::CreatedTable => {
+            let drop_table_sql = format!("DROP TABLE {}", prepared_target.quoted_table_sql());
+            client
+                .execute_statement(&drop_table_sql)
+                .await
+                .map_err(|source| cleanup_error(output_plan, source.to_string()))?;
+
+            Ok(MssqlTargetCleanupStatus::Succeeded)
+        }
+    }
+}
+
 /// Side effect completed while preparing a SQL Server target for loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MssqlPreparedTargetAction {
@@ -372,6 +400,25 @@ fn prepare_target_lifecycle_error(
             0,
             false,
             cleanup_before_target_creation(output_plan),
+        )),
+        message: message.into(),
+    }
+}
+
+#[allow(dead_code)]
+fn cleanup_error(
+    output_plan: &MssqlTargetOutputPlan,
+    message: impl Into<String>,
+) -> DeltaFunnelError {
+    DeltaFunnelError::MssqlWritePhase {
+        context: Box::new(MssqlWriteFailureContext::from_output_plan(
+            output_plan,
+            MssqlWritePhase::Cleanup,
+            0,
+            0,
+            0,
+            false,
+            MssqlTargetCleanupStatus::Failed,
         )),
         message: message.into(),
     }
@@ -773,6 +820,101 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn cleanup_returns_not_applicable_without_append_existing_target_creation()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::AppendExisting,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let prepared = MssqlPreparedTarget::from_output_plan(
+            &output_plan,
+            MssqlPreparedTargetAction::VerifiedExisting,
+        )?;
+        let mut client = RecordingLifecycleClient::default();
+
+        let cleanup =
+            cleanup_mssql_prepared_target(&output_plan, Some(&prepared), &mut client).await?;
+
+        assert_eq!(cleanup, MssqlTargetCleanupStatus::NotApplicable);
+        assert!(client.calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_returns_not_attempted_before_create_and_load_target_creation()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient::default();
+
+        let cleanup = cleanup_mssql_prepared_target(&output_plan, None, &mut client).await?;
+
+        assert_eq!(cleanup, MssqlTargetCleanupStatus::NotAttempted);
+        assert!(client.calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_drops_deltafunnel_created_target_with_quoted_table_name()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo.part", "target]part")?,
+        )?;
+        let prepared = MssqlPreparedTarget::from_output_plan(
+            &output_plan,
+            MssqlPreparedTargetAction::CreatedTable,
+        )?;
+        let mut client = RecordingLifecycleClient::default();
+
+        let cleanup =
+            cleanup_mssql_prepared_target(&output_plan, Some(&prepared), &mut client).await?;
+
+        assert_eq!(cleanup, MssqlTargetCleanupStatus::Succeeded);
+        assert_eq!(
+            client.calls,
+            vec!["execute DROP TABLE [dbo.part].[target]]part]".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_errors_map_to_cleanup_phase() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let prepared = MssqlPreparedTarget::from_output_plan(
+            &output_plan,
+            MssqlPreparedTargetAction::CreatedTable,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            execute_statement_error: Some("DROP failed\nfor test".to_owned()),
+            ..RecordingLifecycleClient::default()
+        };
+
+        let error = cleanup_mssql_prepared_target(&output_plan, Some(&prepared), &mut client)
+            .await
+            .err()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected cleanup error".to_owned(),
+            })?;
+
+        assert_cleanup_error(error, r"DROP failed\nfor test")?;
+        assert_eq!(
+            client.calls,
+            vec!["execute DROP TABLE [dbo].[orders]".to_owned()]
+        );
+        Ok(())
+    }
+
     #[test]
     fn qualified_target_table_converts_to_arrow_tiberius_table_name() -> Result<(), DeltaFunnelError>
     {
@@ -934,6 +1076,31 @@ mod tests {
         assert_eq!(context.stats().batches_written(), 0);
         assert!(!context.partial_write_possible());
         assert_eq!(context.cleanup(), expected_cleanup);
+        Ok(())
+    }
+
+    fn assert_cleanup_error(
+        error: DeltaFunnelError,
+        expected_message: &str,
+    ) -> Result<(), DeltaFunnelError> {
+        let display = error.to_string();
+        assert!(display.contains("orders_output"));
+        assert!(display.contains("cleanup"));
+        assert!(display.contains(expected_message));
+        assert!(!display.contains("secret-token"));
+        assert!(!display.contains("server=tcp"));
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlWritePhase error".to_owned(),
+            });
+        };
+
+        assert_eq!(context.phase(), MssqlWritePhase::Cleanup);
+        assert_eq!(context.output_name(), "orders_output");
+        assert_eq!(context.stats().rows_written(), 0);
+        assert_eq!(context.stats().batches_written(), 0);
+        assert!(!context.partial_write_possible());
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Failed);
         Ok(())
     }
 }
