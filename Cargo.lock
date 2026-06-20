@@ -293,9 +293,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-tiberius"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a9cc883bb36b366ad5b36931e1f27774985de5376d52f7c886113ce108863bb"
+checksum = "e79697ffcde3f60b7cf89a95c1e24ecbcc6860e99ffe39de29a81e2bfb885488"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -304,6 +304,8 @@ dependencies = [
  "futures-util",
  "snafu",
  "tiberius-raw-bulk",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -3351,6 +3353,7 @@ checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "pin-project-lite",
  "tokio",

@@ -4,6 +4,8 @@
 //! SQL Server targets. Schema mapping, identifier quoting, DDL rendering, and
 //! Arrow-to-TDS writing remain owned by `arrow-tiberius`.
 
+#[allow(dead_code)]
+mod connection;
 mod ddl_planning;
 mod lifecycle_planning;
 mod output_planning;
