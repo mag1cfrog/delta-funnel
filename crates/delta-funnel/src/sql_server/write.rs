@@ -16,8 +16,8 @@ use futures_util::{
 use crate::DeltaFunnelError;
 
 use super::{
-    LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan,
-    MssqlTargetTable,
+    LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlLifecycleExecutionGuardrail,
+    MssqlPreparedTarget, MssqlPreparedTargetAction, MssqlTargetOutputPlan, MssqlTargetTable,
 };
 
 /// Fakeable bulk-load writer boundary for one planned SQL Server output.
@@ -47,6 +47,135 @@ where
 
     async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
         arrow_tiberius::BulkWriter::finish(self).await
+    }
+}
+
+#[async_trait]
+impl MssqlBulkLoadWriter for arrow_tiberius::ConnectedBulkWriter<'_> {
+    async fn write_batch(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
+        arrow_tiberius::ConnectedBulkWriter::write_batch(self, batch).await
+    }
+
+    async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
+        arrow_tiberius::ConnectedBulkWriter::finish(self).await
+    }
+}
+
+/// Fakeable boundary for constructing one SQL Server bulk writer.
+#[allow(dead_code)]
+#[async_trait]
+pub(crate) trait MssqlBulkWriterFactory: Send {
+    /// Writer type returned by this factory.
+    type Writer: MssqlBulkLoadWriter;
+
+    /// Constructs a bulk writer from an already prepared target request.
+    async fn initialize(
+        self,
+        request: MssqlBulkWriterInitializationRequest,
+    ) -> Result<Self::Writer, arrow_tiberius::Error>;
+}
+
+/// Production bulk writer factory for an already connected SQL Server client.
+#[allow(dead_code)]
+pub(crate) struct MssqlConnectedBulkWriterFactory<'client> {
+    client: &'client mut arrow_tiberius::ConnectedMssqlClient,
+}
+
+impl<'client> MssqlConnectedBulkWriterFactory<'client> {
+    /// Wraps the already connected SQL Server client used for lifecycle work.
+    #[must_use]
+    pub(crate) const fn new(client: &'client mut arrow_tiberius::ConnectedMssqlClient) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl<'client> MssqlBulkWriterFactory for MssqlConnectedBulkWriterFactory<'client> {
+    type Writer = arrow_tiberius::ConnectedBulkWriter<'client>;
+
+    async fn initialize(
+        self,
+        request: MssqlBulkWriterInitializationRequest,
+    ) -> Result<Self::Writer, arrow_tiberius::Error> {
+        let MssqlBulkWriterInitializationRequest {
+            table,
+            mappings,
+            options,
+            ..
+        } = request;
+
+        self.client.bulk_writer(table, mappings, options).await
+    }
+}
+
+/// Planned inputs for constructing one SQL Server bulk writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MssqlBulkWriterInitializationRequest {
+    output_name: String,
+    table: arrow_tiberius::TableName,
+    mappings: Vec<arrow_tiberius::SchemaMapping>,
+    options: MssqlWriteOptions,
+    prepared_action: MssqlPreparedTargetAction,
+    cleanup: MssqlTargetCleanupStatus,
+}
+
+#[allow(dead_code)]
+impl MssqlBulkWriterInitializationRequest {
+    /// Builds writer initialization inputs from a previously prepared target.
+    pub(crate) fn from_prepared_target(
+        output_plan: &MssqlTargetOutputPlan,
+        prepared_target: &MssqlPreparedTarget,
+        options: MssqlWriteOptions,
+    ) -> Result<Self, DeltaFunnelError> {
+        ensure_prepared_target_matches_output_plan(output_plan, prepared_target)?;
+
+        Ok(Self {
+            output_name: output_plan.output_name().to_owned(),
+            table: prepared_target.table_name().clone(),
+            mappings: output_plan.schema_mappings().to_vec(),
+            options,
+            prepared_action: prepared_target.report().action(),
+            cleanup: prepared_target.report().cleanup(),
+        })
+    }
+
+    /// Returns the selected output name.
+    #[must_use]
+    pub(crate) fn output_name(&self) -> &str {
+        &self.output_name
+    }
+
+    /// Returns the prepared SQL Server table identity.
+    #[must_use]
+    pub(crate) const fn table(&self) -> &arrow_tiberius::TableName {
+        &self.table
+    }
+
+    /// Returns the planned schema mappings passed to the writer.
+    #[must_use]
+    pub(crate) fn mappings(&self) -> &[arrow_tiberius::SchemaMapping] {
+        &self.mappings
+    }
+
+    /// Returns the write options passed to the writer.
+    #[must_use]
+    pub(crate) const fn options(&self) -> MssqlWriteOptions {
+        self.options
+    }
+
+    /// Returns the prepared lifecycle action that permits writer initialization.
+    #[must_use]
+    pub(crate) const fn prepared_action(&self) -> MssqlPreparedTargetAction {
+        self.prepared_action
+    }
+
+    /// Returns cleanup state if writer initialization fails.
+    #[must_use]
+    pub(crate) const fn cleanup(&self) -> MssqlTargetCleanupStatus {
+        self.cleanup
     }
 }
 
@@ -415,6 +544,47 @@ pub fn mssql_write_options_for_output_plan(
     }
 }
 
+/// Initializes one SQL Server bulk writer after target lifecycle preparation.
+#[allow(dead_code)]
+pub(crate) async fn initialize_mssql_bulk_writer<'client>(
+    client: &'client mut arrow_tiberius::ConnectedMssqlClient,
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_target: &MssqlPreparedTarget,
+    options: MssqlWriteOptions,
+) -> Result<arrow_tiberius::ConnectedBulkWriter<'client>, DeltaFunnelError> {
+    initialize_mssql_bulk_writer_with_factory(
+        output_plan,
+        prepared_target,
+        options,
+        MssqlConnectedBulkWriterFactory::new(client),
+    )
+    .await
+}
+
+/// Initializes one SQL Server bulk writer through an injected factory.
+#[allow(dead_code)]
+pub(crate) async fn initialize_mssql_bulk_writer_with_factory<F>(
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_target: &MssqlPreparedTarget,
+    options: MssqlWriteOptions,
+    factory: F,
+) -> Result<F::Writer, DeltaFunnelError>
+where
+    F: MssqlBulkWriterFactory,
+{
+    let request = MssqlBulkWriterInitializationRequest::from_prepared_target(
+        output_plan,
+        prepared_target,
+        options,
+    )?;
+    let cleanup = request.cleanup();
+    let prepared_action = request.prepared_action();
+
+    factory.initialize(request).await.map_err(|source| {
+        mssql_writer_initialization_error(output_plan, prepared_action, cleanup, source.to_string())
+    })
+}
+
 /// Validates a runtime Arrow schema against a planned SQL Server output.
 ///
 /// DeltaFunnel owns the output context and redacted report shape, while the
@@ -600,6 +770,60 @@ fn mssql_write_phase_error(
     }
 }
 
+fn mssql_writer_initialization_error(
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_action: MssqlPreparedTargetAction,
+    cleanup: MssqlTargetCleanupStatus,
+    message: String,
+) -> DeltaFunnelError {
+    mssql_write_phase_error(
+        output_plan,
+        MssqlWritePhase::InitializeWriter,
+        0,
+        0,
+        false,
+        cleanup,
+        format!("prepared target action {prepared_action:?}: {message}"),
+    )
+}
+
+fn ensure_prepared_target_matches_output_plan(
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_target: &MssqlPreparedTarget,
+) -> Result<(), DeltaFunnelError> {
+    let report = prepared_target.report();
+    let matches_plan = report.output_name() == output_plan.output_name()
+        && report.target_table() == output_plan.target_table()
+        && report.load_mode() == output_plan.load_mode()
+        && report.connection_source() == output_plan.connection_source()
+        && report.connection() == output_plan.connection()
+        && report.expected_target_state() == output_plan.lifecycle_plan().expected_target_state();
+
+    if !matches_plan {
+        return Err(mssql_writer_initialization_error(
+            output_plan,
+            report.action(),
+            report.cleanup(),
+            "prepared target does not match output plan".to_owned(),
+        ));
+    }
+
+    if !output_plan
+        .lifecycle_plan()
+        .execution_guardrails()
+        .contains(&MssqlLifecycleExecutionGuardrail::BulkWriterConstruction)
+    {
+        return Err(mssql_writer_initialization_error(
+            output_plan,
+            report.action(),
+            report.cleanup(),
+            "target lifecycle plan does not allow BulkWriterConstruction".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn partial_write_possible(
     output_plan: &MssqlTargetOutputPlan,
     rows_written: u64,
@@ -662,6 +886,12 @@ mod tests {
         finish_count: u64,
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingBulkWriterFactory {
+        request: Arc<Mutex<Option<MssqlBulkWriterInitializationRequest>>>,
+        error: Option<String>,
+    }
+
     impl FakeBulkLoadWriter {
         fn with_log(log: Arc<Mutex<FakeBulkLoadWriterLog>>) -> Self {
             Self {
@@ -677,6 +907,22 @@ mod tests {
 
         fn fail_on_finish(mut self) -> Self {
             self.fail_on_finish = true;
+            self
+        }
+    }
+
+    impl RecordingBulkWriterFactory {
+        fn with_request_log(
+            request: Arc<Mutex<Option<MssqlBulkWriterInitializationRequest>>>,
+        ) -> Self {
+            Self {
+                request,
+                error: None,
+            }
+        }
+
+        fn fail_with(mut self, error: impl Into<String>) -> Self {
+            self.error = Some(error.into());
             self
         }
     }
@@ -738,6 +984,33 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl MssqlBulkWriterFactory for RecordingBulkWriterFactory {
+        type Writer = FakeBulkLoadWriter;
+
+        async fn initialize(
+            self,
+            request: MssqlBulkWriterInitializationRequest,
+        ) -> Result<Self::Writer, arrow_tiberius::Error> {
+            let Ok(mut request_log) = self.request.lock() else {
+                return Err(arrow_tiberius::Error::BackendUnavailable {
+                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                    reason: "fake initializer request log mutex was poisoned".to_owned(),
+                });
+            };
+            *request_log = Some(request);
+
+            if let Some(reason) = self.error {
+                return Err(arrow_tiberius::Error::BackendUnavailable {
+                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                    reason,
+                });
+            }
+
+            Ok(FakeBulkLoadWriter::default())
+        }
+    }
+
     fn orders_batch(
         order_ids: Vec<i64>,
         statuses: Vec<Option<&str>>,
@@ -777,6 +1050,18 @@ mod tests {
     ) -> Result<MutexGuard<'_, FakeBulkLoadWriterLog>, DeltaFunnelError> {
         log.lock().map_err(|_| DeltaFunnelError::Config {
             message: "fake writer log mutex was poisoned".to_owned(),
+        })
+    }
+
+    fn take_initialization_request(
+        request: &Arc<Mutex<Option<MssqlBulkWriterInitializationRequest>>>,
+    ) -> Result<MssqlBulkWriterInitializationRequest, DeltaFunnelError> {
+        let mut request = request.lock().map_err(|_| DeltaFunnelError::Config {
+            message: "fake initializer request log mutex was poisoned".to_owned(),
+        })?;
+
+        request.take().ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected fake initializer request".to_owned(),
         })
     }
 
@@ -862,6 +1147,33 @@ mod tests {
         Ok(())
     }
 
+    fn assert_initialize_writer_error(
+        error: DeltaFunnelError,
+        expected_message: &str,
+        expected_cleanup: MssqlTargetCleanupStatus,
+    ) -> Result<String, DeltaFunnelError> {
+        let display = error.to_string();
+        assert!(display.contains("orders_output"));
+        assert!(display.contains("initialize writer"));
+        assert!(display.contains(expected_message));
+        assert!(!display.contains("secret-token"));
+        assert!(!display.contains("password"));
+        assert!(!display.contains("server=tcp"));
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MSSQL write phase error".to_owned(),
+            });
+        };
+
+        assert_eq!(context.phase(), MssqlWritePhase::InitializeWriter);
+        assert_eq!(context.output_name(), "orders_output");
+        assert_eq!(context.stats().rows_written(), 0);
+        assert_eq!(context.stats().batches_written(), 0);
+        assert!(!context.partial_write_possible());
+        assert_eq!(context.cleanup(), expected_cleanup);
+        Ok(message)
+    }
+
     #[test]
     fn write_stats_preserve_output_counts_and_elapsed_time() {
         let stats = MssqlWriteStats::new("orders", 42, 3, 125);
@@ -870,6 +1182,139 @@ mod tests {
         assert_eq!(stats.rows_written(), 42);
         assert_eq!(stats.batches_written(), 3);
         assert_eq!(stats.elapsed_ms(), 125);
+    }
+
+    #[test]
+    fn connected_bulk_writer_adapts_to_bulk_load_writer_trait() {
+        fn assert_bulk_load_writer<W: MssqlBulkLoadWriter>() {}
+
+        assert_bulk_load_writer::<arrow_tiberius::ConnectedBulkWriter<'static>>();
+    }
+
+    #[tokio::test]
+    async fn bulk_writer_initialization_passes_prepared_identity_mappings_and_options()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let prepared_target = MssqlPreparedTarget::from_output_plan(
+            &output_plan,
+            MssqlPreparedTargetAction::VerifiedExisting,
+        )?;
+        let options = WriteOptions {
+            backend: WriteBackend::BaselineTokenRow,
+            schema_check: SchemaCheck::Strict,
+            plan_options: PlanOptions {
+                string_policy: StringPolicy::NVarChar(128),
+                ..PlanOptions::default()
+            },
+        };
+        let request_log = Arc::new(Mutex::new(None));
+        let factory = RecordingBulkWriterFactory::with_request_log(Arc::clone(&request_log));
+
+        let writer = initialize_mssql_bulk_writer_with_factory(
+            &output_plan,
+            &prepared_target,
+            options,
+            factory,
+        )
+        .await?;
+        let final_stats = MssqlBulkLoadWriter::finish(writer)
+            .await
+            .map_err(|source| DeltaFunnelError::MssqlWrite { source })?;
+        let request = take_initialization_request(&request_log)?;
+
+        assert_eq!(final_stats.rows_written, 0);
+        assert_eq!(final_stats.batches_written, 0);
+        assert_eq!(request.output_name(), "orders_output");
+        assert_eq!(request.table().quoted_sql(), "[dbo].[orders]");
+        assert_eq!(request.mappings(), output_plan.schema_mappings());
+        assert_eq!(request.options(), options);
+        assert_eq!(
+            request.prepared_action(),
+            MssqlPreparedTargetAction::VerifiedExisting
+        );
+        assert_eq!(request.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bulk_writer_initialization_errors_map_to_initialize_writer_phase()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema_with_load_mode(LoadMode::CreateAndLoad)?;
+        let prepared_target = MssqlPreparedTarget::from_output_plan(
+            &output_plan,
+            MssqlPreparedTargetAction::CreatedTable,
+        )?;
+        let request_log = Arc::new(Mutex::new(None));
+        let factory = RecordingBulkWriterFactory::with_request_log(Arc::clone(&request_log))
+            .fail_with("target metadata failed\nfor test");
+
+        let error = initialize_mssql_bulk_writer_with_factory(
+            &output_plan,
+            &prepared_target,
+            default_mssql_write_options(),
+            factory,
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected bulk writer initialization error".to_owned(),
+        })?;
+        let message = assert_initialize_writer_error(
+            error,
+            r"target metadata failed\nfor test",
+            MssqlTargetCleanupStatus::NotAttempted,
+        )?;
+        let request = take_initialization_request(&request_log)?;
+
+        assert!(message.contains("CreatedTable"));
+        assert_eq!(request.cleanup(), MssqlTargetCleanupStatus::NotAttempted);
+        assert_eq!(
+            request.prepared_action(),
+            MssqlPreparedTargetAction::CreatedTable
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bulk_writer_initialization_rejects_mismatched_prepared_target_before_factory()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let connection = secret_connection()?;
+        let other_target_config =
+            MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "other_orders")?);
+        let other_output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "other_output",
+            &other_target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+        let prepared_target = MssqlPreparedTarget::from_output_plan(
+            &other_output_plan,
+            MssqlPreparedTargetAction::VerifiedExisting,
+        )?;
+        let request_log = Arc::new(Mutex::new(None));
+        let factory = RecordingBulkWriterFactory::with_request_log(Arc::clone(&request_log));
+
+        let error = initialize_mssql_bulk_writer_with_factory(
+            &output_plan,
+            &prepared_target,
+            default_mssql_write_options(),
+            factory,
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected mismatched prepared target error".to_owned(),
+        })?;
+
+        assert_initialize_writer_error(
+            error,
+            "prepared target does not match output plan",
+            MssqlTargetCleanupStatus::NotApplicable,
+        )?;
+        assert!(take_initialization_request(&request_log).is_err());
+        Ok(())
     }
 
     #[tokio::test]

@@ -8,9 +8,10 @@ use crate::DeltaFunnelError;
 
 use super::{
     LoadMode, MssqlConnectedLifecycleClient, MssqlConnectionConfig, MssqlSchemaPlanOptions,
-    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteFailureContext, MssqlWritePhase,
-    ResolvedMssqlTarget, plan_mssql_output_schema, plan_mssql_target_output,
+    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteFailureContext, MssqlWriteOptions,
+    MssqlWritePhase, ResolvedMssqlTarget, plan_mssql_output_schema, plan_mssql_target_output,
 };
+use super::{MssqlPreparedTarget, write::initialize_mssql_bulk_writer};
 
 /// Private execution request for connecting one planned SQL Server output.
 pub(crate) struct MssqlOutputConnectionRequest {
@@ -67,6 +68,21 @@ impl MssqlConnectedOutputClient {
     /// Returns the lifecycle operation adapter for this output connection.
     pub(crate) fn lifecycle_client(&mut self) -> MssqlConnectedLifecycleClient<'_> {
         MssqlConnectedLifecycleClient::new(&self.output_plan, &mut self.client)
+    }
+
+    /// Initializes the bulk writer after target lifecycle preparation.
+    pub(crate) async fn initialize_bulk_writer(
+        &mut self,
+        prepared_target: &MssqlPreparedTarget,
+        options: MssqlWriteOptions,
+    ) -> Result<arrow_tiberius::ConnectedBulkWriter<'_>, DeltaFunnelError> {
+        initialize_mssql_bulk_writer(
+            &mut self.client,
+            &self.output_plan,
+            prepared_target,
+            options,
+        )
+        .await
     }
 }
 
@@ -203,19 +219,28 @@ mod tests {
     }
 
     #[test]
-    fn connection_module_stays_before_execution_boundaries() {
+    fn connection_module_stays_before_lifecycle_sql_and_row_writing_boundaries() {
         let source = include_str!("connection.rs");
         let forbidden_patterns = [
-            concat!("Bulk", "Writer"),
             concat!("execute", "_statement"),
             concat!("table", "_exists"),
             concat!("Record", "Batch"),
             concat!("data", "fusion"),
+            concat!("write", "_batch"),
         ];
 
         for pattern in forbidden_patterns {
             assert!(!source.contains(pattern), "unexpected `{pattern}`");
         }
+    }
+
+    #[test]
+    fn connected_output_client_exposes_writer_initialization_boundary() {
+        let source = include_str!("connection.rs");
+
+        assert!(source.contains("initialize_bulk_writer"));
+        assert!(source.contains("initialize_mssql_bulk_writer"));
+        assert!(source.contains("MssqlPreparedTarget"));
     }
 
     #[test]
