@@ -11,6 +11,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::{
     Stream, StreamExt,
     io::{AsyncRead, AsyncWrite},
+    pin_mut,
 };
 
 use crate::DeltaFunnelError;
@@ -664,17 +665,18 @@ fn mssql_batch_schema_validation_error(
 #[allow(dead_code)]
 pub(crate) async fn write_mssql_batches_with_writer<W, S>(
     output_plan: &MssqlTargetOutputPlan,
-    mut batches: S,
+    batches: S,
     mut writer: W,
     _options: MssqlWriteOptions,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     W: MssqlBulkLoadWriter,
-    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Unpin,
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>>,
 {
     let mut rows_written = 0_u64;
     let mut batches_written = 0_u64;
     let cleanup = MssqlTargetCleanupStatus::NotApplicable;
+    pin_mut!(batches);
 
     while let Some(batch) = batches.next().await {
         let batch = batch.map_err(|source| {
