@@ -7,9 +7,9 @@ use arrow_schema::Schema;
 use crate::DeltaFunnelError;
 
 use super::{
-    LoadMode, MssqlConnectionConfig, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus,
-    MssqlTargetOutputPlan, MssqlWriteFailureContext, MssqlWritePhase, ResolvedMssqlTarget,
-    plan_mssql_output_schema, plan_mssql_target_output,
+    LoadMode, MssqlConnectedLifecycleClient, MssqlConnectionConfig, MssqlSchemaPlanOptions,
+    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteFailureContext, MssqlWritePhase,
+    ResolvedMssqlTarget, plan_mssql_output_schema, plan_mssql_target_output,
 };
 
 /// Private execution request for connecting one planned SQL Server output.
@@ -62,6 +62,11 @@ impl MssqlConnectedOutputClient {
     #[must_use]
     pub(crate) fn client(&mut self) -> &mut arrow_tiberius::ConnectedMssqlClient {
         &mut self.client
+    }
+
+    /// Returns the lifecycle operation adapter for this output connection.
+    pub(crate) fn lifecycle_client(&mut self) -> MssqlConnectedLifecycleClient<'_> {
+        MssqlConnectedLifecycleClient::new(&self.output_plan, &mut self.client)
     }
 }
 
