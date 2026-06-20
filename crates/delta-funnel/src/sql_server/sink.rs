@@ -614,6 +614,25 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn public_one_output_sink_stays_before_delta_reads_and_datafusion_execution() {
+        let source = include_str!("sink.rs");
+        let forbidden_patterns = [
+            concat!("load", "_delta", "_source"),
+            concat!("load", "_delta", "_sources"),
+            concat!("datafusion", "_query", "_output", "_stream"),
+            concat!("datafusion", "_session", "_context"),
+            concat!("handoff", "_datafusion", "_query", "_output"),
+            concat!("Delta", "Table", "Provider"),
+            concat!("Session", "Context"),
+            concat!("Data", "Frame"),
+        ];
+
+        for pattern in forbidden_patterns {
+            assert!(!source.contains(pattern), "unexpected `{pattern}`");
+        }
+    }
+
     #[tokio::test]
     async fn one_output_sink_stops_before_writer_initialization_when_lifecycle_fails()
     -> Result<(), DeltaFunnelError> {
