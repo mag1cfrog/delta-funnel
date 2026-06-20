@@ -11,6 +11,7 @@ mod lifecycle_execution;
 mod lifecycle_planning;
 mod output_planning;
 mod schema_planning;
+mod sink;
 mod target;
 mod write;
 
