@@ -112,6 +112,46 @@ where
     MssqlPreparedTarget::from_output_plan(output_plan, MssqlPreparedTargetAction::VerifiedExisting)
 }
 
+/// Prepares a create-and-load SQL Server target before writer construction.
+#[allow(dead_code)]
+pub(crate) async fn prepare_mssql_create_and_load_target<C>(
+    output_plan: &MssqlTargetOutputPlan,
+    client: &mut C,
+) -> Result<MssqlPreparedTarget, DeltaFunnelError>
+where
+    C: MssqlTargetLifecycleClient + ?Sized,
+{
+    ensure_create_and_load_output(output_plan)?;
+    let table_name = table_name_from_target(output_plan.output_name(), output_plan.target_table())?;
+    let exists = client
+        .table_exists(&table_name)
+        .await
+        .map_err(|source| prepare_target_lifecycle_error(output_plan, source.to_string()))?;
+
+    if exists {
+        return Err(prepare_target_lifecycle_error(
+            output_plan,
+            format!(
+                "create-and-load target table {} already exists",
+                table_name.quoted_sql()
+            ),
+        ));
+    }
+
+    let create_table_sql = output_plan.create_table_sql().ok_or_else(|| {
+        prepare_target_lifecycle_error(
+            output_plan,
+            "create-and-load target preparation requires planned create-table SQL",
+        )
+    })?;
+    client
+        .execute_statement(create_table_sql)
+        .await
+        .map_err(|source| prepare_target_lifecycle_error(output_plan, source.to_string()))?;
+
+    MssqlPreparedTarget::from_output_plan(output_plan, MssqlPreparedTargetAction::CreatedTable)
+}
+
 /// Side effect completed while preparing a SQL Server target for loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MssqlPreparedTargetAction {
@@ -305,6 +345,20 @@ fn ensure_append_existing_output(
 }
 
 #[allow(dead_code)]
+fn ensure_create_and_load_output(
+    output_plan: &MssqlTargetOutputPlan,
+) -> Result<(), DeltaFunnelError> {
+    if output_plan.load_mode() == LoadMode::CreateAndLoad {
+        return Ok(());
+    }
+
+    Err(DeltaFunnelError::MssqlLifecyclePlanning {
+        output_name: output_plan.output_name().to_owned(),
+        message: "create-and-load target preparation requires create-and-load load mode".to_owned(),
+    })
+}
+
+#[allow(dead_code)]
 fn prepare_target_lifecycle_error(
     output_plan: &MssqlTargetOutputPlan,
     message: impl Into<String>,
@@ -377,6 +431,7 @@ mod tests {
         exists: bool,
         rows_affected: Vec<u64>,
         table_exists_error: Option<String>,
+        execute_statement_error: Option<String>,
     }
 
     #[async_trait]
@@ -395,6 +450,10 @@ mod tests {
             sql: &str,
         ) -> arrow_tiberius::Result<SqlExecutionOutcome> {
             self.calls.push(format!("execute {sql}"));
+            if let Some(reason) = self.execute_statement_error.take() {
+                return Err(arrow_tiberius::Error::InvalidIdentifier { reason });
+            }
+
             Ok(SqlExecutionOutcome {
                 rows_affected: self.rows_affected.clone(),
             })
@@ -487,6 +546,7 @@ mod tests {
         assert_prepare_target_lifecycle_error(
             error,
             "append-existing target table [dbo].[orders] does not exist",
+            MssqlTargetCleanupStatus::NotApplicable,
         )?;
         assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
         Ok(())
@@ -512,7 +572,11 @@ mod tests {
                 message: "expected probe error".to_owned(),
             })?;
 
-        assert_prepare_target_lifecycle_error(error, r"metadata query failed\nfor test")?;
+        assert_prepare_target_lifecycle_error(
+            error,
+            r"metadata query failed\nfor test",
+            MssqlTargetCleanupStatus::NotApplicable,
+        )?;
         assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
         Ok(())
     }
@@ -542,6 +606,169 @@ mod tests {
             DeltaFunnelError::MssqlLifecyclePlanning { .. }
         ));
         assert!(error.to_string().contains("requires append-existing"));
+        assert!(client.calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_and_load_preparation_creates_absent_target() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let create_table_sql = output_plan
+            .create_table_sql()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected planned create-table SQL".to_owned(),
+            })?
+            .to_owned();
+        let mut client = RecordingLifecycleClient {
+            exists: false,
+            rows_affected: vec![0],
+            ..RecordingLifecycleClient::default()
+        };
+
+        let prepared = prepare_mssql_create_and_load_target(&output_plan, &mut client).await?;
+
+        assert_eq!(prepared.quoted_table_sql(), "[dbo].[orders]");
+        assert_eq!(
+            prepared.report().action(),
+            MssqlPreparedTargetAction::CreatedTable
+        );
+        assert_eq!(
+            prepared.report().cleanup(),
+            MssqlTargetCleanupStatus::NotAttempted
+        );
+        assert_eq!(
+            client.calls,
+            vec![
+                "probe [dbo].[orders]".to_owned(),
+                format!("execute {create_table_sql}"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_and_load_preparation_fails_when_target_already_exists()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            exists: true,
+            ..RecordingLifecycleClient::default()
+        };
+
+        let error = prepare_mssql_create_and_load_target(&output_plan, &mut client)
+            .await
+            .err()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected existing create-and-load target error".to_owned(),
+            })?;
+
+        assert_prepare_target_lifecycle_error(
+            error,
+            "create-and-load target table [dbo].[orders] already exists",
+            MssqlTargetCleanupStatus::NotAttempted,
+        )?;
+        assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_and_load_preparation_maps_probe_errors_to_lifecycle_phase()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            table_exists_error: Some("metadata query failed\nfor test".to_owned()),
+            ..RecordingLifecycleClient::default()
+        };
+
+        let error = prepare_mssql_create_and_load_target(&output_plan, &mut client)
+            .await
+            .err()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected create-and-load probe error".to_owned(),
+            })?;
+
+        assert_prepare_target_lifecycle_error(
+            error,
+            r"metadata query failed\nfor test",
+            MssqlTargetCleanupStatus::NotAttempted,
+        )?;
+        assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_and_load_preparation_maps_ddl_errors_to_lifecycle_phase()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            exists: false,
+            execute_statement_error: Some("DDL failed\nfor test".to_owned()),
+            ..RecordingLifecycleClient::default()
+        };
+
+        let error = prepare_mssql_create_and_load_target(&output_plan, &mut client)
+            .await
+            .err()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected create-and-load DDL error".to_owned(),
+            })?;
+
+        assert_prepare_target_lifecycle_error(
+            error,
+            r"DDL failed\nfor test",
+            MssqlTargetCleanupStatus::NotAttempted,
+        )?;
+        assert_eq!(client.calls.len(), 2);
+        assert_eq!(client.calls[0], "probe [dbo].[orders]");
+        assert!(
+            client.calls[1].starts_with("execute CREATE TABLE [dbo].[orders]"),
+            "unexpected DDL call: {}",
+            client.calls[1]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_and_load_preparation_rejects_append_existing_before_probe()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::AppendExisting,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            exists: false,
+            ..RecordingLifecycleClient::default()
+        };
+
+        let error = prepare_mssql_create_and_load_target(&output_plan, &mut client)
+            .await
+            .err()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected create-and-load mode error".to_owned(),
+            })?;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::MssqlLifecyclePlanning { .. }
+        ));
+        assert!(error.to_string().contains("requires create-and-load"));
         assert!(client.calls.is_empty());
         Ok(())
     }
@@ -687,6 +914,7 @@ mod tests {
     fn assert_prepare_target_lifecycle_error(
         error: DeltaFunnelError,
         expected_message: &str,
+        expected_cleanup: MssqlTargetCleanupStatus,
     ) -> Result<(), DeltaFunnelError> {
         let display = error.to_string();
         assert!(display.contains("orders_output"));
@@ -705,7 +933,7 @@ mod tests {
         assert_eq!(context.stats().rows_written(), 0);
         assert_eq!(context.stats().batches_written(), 0);
         assert!(!context.partial_write_possible());
-        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert_eq!(context.cleanup(), expected_cleanup);
         Ok(())
     }
 }
