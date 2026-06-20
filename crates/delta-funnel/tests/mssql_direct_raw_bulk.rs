@@ -7,6 +7,7 @@ use std::{
     env,
     error::Error,
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -28,6 +29,7 @@ const SCHEMA_ENV: &str = "DELTA_FUNNEL_MSSQL_TEST_SCHEMA";
 const APPEND_EXISTING_OUTPUT_NAME: &str = "mssql_direct_raw_bulk_append_orders";
 const CREATE_AND_LOAD_OUTPUT_NAME: &str = "mssql_direct_raw_bulk_create_orders";
 const EXPECTED_ORDER_IDS: &[i64] = &[101, 102, 103];
+static NEXT_TABLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 type TestError = Box<dyn Error + Send + Sync + 'static>;
 type TestResult<T> = Result<T, TestError>;
@@ -152,7 +154,10 @@ async fn run_append_existing_direct_raw_bulk_test(
             Ok(())
         }
         (Err(write_error), Ok(())) => Err(write_error),
-        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Ok(report), Err(cleanup_error)) => Err(test_error(format!(
+            "write succeeded with {}; cleanup failed: {cleanup_error}",
+            write_report_summary(&report)
+        ))),
         (Err(write_error), Err(cleanup_error)) => Err(test_error(format!(
             "write failed: {write_error}; cleanup failed: {cleanup_error}"
         ))),
@@ -196,7 +201,10 @@ async fn run_create_and_load_direct_raw_bulk_test(
             Ok(())
         }
         (Err(write_error), Ok(())) => Err(write_error),
-        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Ok(report), Err(cleanup_error)) => Err(test_error(format!(
+            "write succeeded with {}; cleanup failed: {cleanup_error}",
+            write_report_summary(&report)
+        ))),
         (Err(write_error), Err(cleanup_error)) => Err(test_error(format!(
             "write failed: {write_error}; cleanup failed: {cleanup_error}"
         ))),
@@ -279,7 +287,13 @@ fn unique_table_name(schema: &str) -> TestResult<TableName> {
         .duration_since(UNIX_EPOCH)
         .map_err(|source| test_error(format!("system clock is before UNIX_EPOCH: {source}")))?
         .as_nanos();
-    let table = format!("df_mssql_it_{}_{}", std::process::id(), timestamp);
+    let sequence = NEXT_TABLE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let table = format!(
+        "df_mssql_it_{}_{}_{}",
+        std::process::id(),
+        timestamp,
+        sequence
+    );
 
     Ok(TableName::new(schema.to_owned(), table)?)
 }
@@ -351,6 +365,16 @@ fn configured_or_skip() -> Option<MssqlIntegrationConfig> {
             None
         }
     }
+}
+
+fn write_report_summary(report: &delta_funnel::MssqlWriteReport) -> String {
+    format!(
+        "output `{}`, rows {}, batches {}, cleanup {}",
+        report.stats().output_name(),
+        report.stats().rows_written(),
+        report.stats().batches_written(),
+        report.cleanup()
+    )
 }
 
 fn test_error(message: impl Into<String>) -> TestError {
