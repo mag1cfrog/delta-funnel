@@ -83,8 +83,27 @@ impl MssqlTargetLifecycleClient for MssqlConnectedLifecycleClient<'_> {
     }
 }
 
-/// Prepares an append-existing SQL Server target before writer construction.
+/// Prepares one planned SQL Server target before writer construction.
 #[allow(dead_code)]
+pub(crate) async fn prepare_mssql_target_lifecycle<C>(
+    output_plan: &MssqlTargetOutputPlan,
+    client: &mut C,
+) -> Result<MssqlPreparedTarget, DeltaFunnelError>
+where
+    C: MssqlTargetLifecycleClient + ?Sized,
+{
+    match output_plan.load_mode() {
+        LoadMode::AppendExisting => prepare_mssql_append_existing_target(output_plan, client).await,
+        LoadMode::CreateAndLoad => prepare_mssql_create_and_load_target(output_plan, client).await,
+        LoadMode::Replace => Err(DeltaFunnelError::MssqlLifecyclePlanning {
+            output_name: output_plan.output_name().to_owned(),
+            message: "replace load mode is reserved and cannot prepare a target lifecycle"
+                .to_owned(),
+        }),
+    }
+}
+
+/// Prepares an append-existing SQL Server target before writer construction.
 pub(crate) async fn prepare_mssql_append_existing_target<C>(
     output_plan: &MssqlTargetOutputPlan,
     client: &mut C,
@@ -113,7 +132,6 @@ where
 }
 
 /// Prepares a create-and-load SQL Server target before writer construction.
-#[allow(dead_code)]
 pub(crate) async fn prepare_mssql_create_and_load_target<C>(
     output_plan: &MssqlTargetOutputPlan,
     client: &mut C,
@@ -539,6 +557,54 @@ mod tests {
                 "execute CREATE TABLE [dbo].[orders] ([id] bigint)".to_owned(),
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn target_lifecycle_preparation_dispatches_append_existing()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::AppendExisting,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            exists: true,
+            ..RecordingLifecycleClient::default()
+        };
+
+        let prepared = prepare_mssql_target_lifecycle(&output_plan, &mut client).await?;
+
+        assert_eq!(
+            prepared.report().action(),
+            MssqlPreparedTargetAction::VerifiedExisting
+        );
+        assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn target_lifecycle_preparation_dispatches_create_and_load()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            exists: false,
+            ..RecordingLifecycleClient::default()
+        };
+
+        let prepared = prepare_mssql_target_lifecycle(&output_plan, &mut client).await?;
+
+        assert_eq!(
+            prepared.report().action(),
+            MssqlPreparedTargetAction::CreatedTable
+        );
+        assert_eq!(client.calls.len(), 2);
+        assert_eq!(client.calls[0], "probe [dbo].[orders]");
+        assert!(client.calls[1].starts_with("execute CREATE TABLE [dbo].[orders]"));
         Ok(())
     }
 
