@@ -337,11 +337,15 @@ mod tests {
         prepare_error: Option<DeltaFunnelError>,
         initialize_error: Option<DeltaFunnelError>,
         cleanup_error: Option<DeltaFunnelError>,
+        fail_write: bool,
+        fail_finish: bool,
     }
 
     #[derive(Default)]
     struct FakeSinkWriter {
         log: Arc<Mutex<Vec<String>>>,
+        fail_write: bool,
+        fail_finish: bool,
     }
 
     impl FakeSinkConnection {
@@ -364,6 +368,16 @@ mod tests {
 
         fn fail_cleanup(mut self, error: DeltaFunnelError) -> Self {
             self.cleanup_error = Some(error);
+            self
+        }
+
+        fn fail_write(mut self) -> Self {
+            self.fail_write = true;
+            self
+        }
+
+        fn fail_finish(mut self) -> Self {
+            self.fail_finish = true;
             self
         }
 
@@ -430,6 +444,8 @@ mod tests {
 
             Ok(FakeSinkWriter {
                 log: Arc::clone(&self.log),
+                fail_write: self.fail_write,
+                fail_finish: self.fail_finish,
             })
         }
 
@@ -464,6 +480,12 @@ mod tests {
             batch: &RecordBatch,
         ) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
             self.record(format!("write {}", batch.num_rows()))?;
+            if self.fail_write {
+                return Err(arrow_tiberius::Error::BackendUnavailable {
+                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                    reason: "fake sink writer failed on write".to_owned(),
+                });
+            }
 
             Ok(arrow_tiberius::WriteStats {
                 rows_written: u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
@@ -473,6 +495,12 @@ mod tests {
 
         async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
             self.record("finish")?;
+            if self.fail_finish {
+                return Err(arrow_tiberius::Error::BackendUnavailable {
+                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                    reason: "fake sink writer failed on finish".to_owned(),
+                });
+            }
 
             Ok(arrow_tiberius::WriteStats {
                 rows_written: 0,
@@ -539,6 +567,22 @@ mod tests {
                 Arc::new(Int64Array::from(order_ids)),
                 Arc::new(StringArray::from(statuses)),
             ],
+        )
+        .map_err(|error| DeltaFunnelError::Config {
+            message: error.to_string(),
+        })
+    }
+
+    fn invalid_orders_batch(row_count: usize) -> Result<RecordBatch, DeltaFunnelError> {
+        let statuses = (0..row_count).map(|_| Some("open")).collect::<Vec<_>>();
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "status",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(statuses))],
         )
         .map_err(|error| DeltaFunnelError::Config {
             message: error.to_string(),
@@ -791,6 +835,116 @@ mod tests {
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "cleanup CreatedTable"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_output_sink_cleans_up_created_target_after_schema_validation_failure()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::CreateAndLoad)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log));
+        let batches = stream::iter(vec![Ok(invalid_orders_batch(1)?)]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected schema validation failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlBatchSchemaValidation { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlBatchSchemaValidation error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::ValidateBatchSchema);
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "initialize", "cleanup CreatedTable"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_output_sink_cleans_up_created_target_after_write_failure()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::CreateAndLoad)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_write();
+        let batches = stream::iter(vec![Ok(orders_batch(1)?)]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected write failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlWritePhase write failure".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::WriteBatch);
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert!(message.contains("fake sink writer failed on write"));
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "initialize", "write 1", "cleanup CreatedTable"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_output_sink_cleans_up_created_target_after_finalize_failure()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::CreateAndLoad)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_finish();
+        let batches = stream::iter(vec![Ok(orders_batch(1)?)]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected finalize failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlWritePhase finalize failure".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Finalize);
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert!(message.contains("fake sink writer failed on finish"));
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "initialize",
+                "write 1",
+                "finish",
+                "cleanup CreatedTable"
+            ]
         );
         Ok(())
     }
