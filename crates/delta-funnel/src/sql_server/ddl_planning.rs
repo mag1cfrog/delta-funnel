@@ -1,10 +1,10 @@
 //! SQL Server create-table DDL planning through arrow-tiberius.
 
-use arrow_tiberius::{TableName, create_table_sql_from_mappings};
+use arrow_tiberius::create_table_sql_from_mappings;
 
 use crate::DeltaFunnelError;
 
-use super::{LoadMode, MssqlSchemaPlan, MssqlTargetSummary, MssqlTargetTable};
+use super::{LoadMode, MssqlSchemaPlan, MssqlTargetSummary, table_name_from_target};
 
 /// Planned SQL Server DDL artifacts for one selected output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,20 +65,6 @@ pub fn plan_mssql_create_table_ddl(
     })
 }
 
-fn table_name_from_target(
-    output_name: &str,
-    table: &MssqlTargetTable,
-) -> Result<TableName, DeltaFunnelError> {
-    match table.schema() {
-        Some(schema) => TableName::new(schema, table.table()),
-        None => TableName::unqualified(table.table()),
-    }
-    .map_err(|source| DeltaFunnelError::MssqlDdlTargetIdentifier {
-        output_name: output_name.to_owned(),
-        source,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
@@ -86,7 +72,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        MssqlConnectionConfig, MssqlTargetConfig, MssqlTargetResolutionContext,
+        MssqlConnectionConfig, MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetTable,
         plan_mssql_output_schema,
     };
 

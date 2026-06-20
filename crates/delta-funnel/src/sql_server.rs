@@ -7,6 +7,7 @@
 #[allow(dead_code)]
 mod connection;
 mod ddl_planning;
+mod lifecycle_execution;
 mod lifecycle_planning;
 mod output_planning;
 mod schema_planning;
@@ -14,6 +15,10 @@ mod target;
 mod write;
 
 pub use ddl_planning::{MssqlDdlPlan, plan_mssql_create_table_ddl};
+pub(crate) use lifecycle_execution::table_name_from_target;
+pub use lifecycle_execution::{
+    MssqlPreparedTarget, MssqlPreparedTargetAction, MssqlPreparedTargetReport,
+};
 pub use lifecycle_planning::{
     MssqlLifecycleExecutionGuardrail, MssqlLifecycleGuardrailPolicy, MssqlLifecyclePlan,
     MssqlTargetTableState, plan_mssql_lifecycle,
