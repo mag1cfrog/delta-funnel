@@ -577,6 +577,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_schema_validation_failure_preserves_failure_context()
+    -> Result<(), DeltaFunnelError> {
+        let output = output_plan("schema_failure", LoadMode::AppendExisting)?;
+        let context = MssqlWriteFailureContext::from_output_plan(
+            &output,
+            MssqlWritePhase::ValidateBatchSchema,
+            0,
+            0,
+            0,
+            false,
+            MssqlTargetCleanupStatus::NotApplicable,
+        );
+        let failure = DeltaFunnelError::MssqlBatchSchemaValidation {
+            context: Box::new(context),
+            source: arrow_tiberius::Error::BackendUnavailable {
+                backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                reason: "schema mismatch".to_owned(),
+            },
+        };
+        let writer = FakeWorkflowWriter::new(vec![Err(failure)]);
+
+        let report = write_mssql_outputs_with_writer(
+            vec![job(output)?],
+            MssqlWorkflowWriteOptions::default(),
+            writer,
+        )
+        .await?;
+
+        let [MssqlOutputWriteStatus::Failed(failure)] = report.outputs() else {
+            return Err(test_error("expected failed output status"));
+        };
+        let context = failure
+            .context()
+            .ok_or_else(|| test_error("expected schema validation context"))?;
+        assert_eq!(failure.output_name(), "schema_failure");
+        assert_eq!(context.phase(), MssqlWritePhase::ValidateBatchSchema);
+        assert!(!context.partial_write_possible());
+        assert_eq!(context.stats().rows_written(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn first_failure_marks_later_outputs_skipped_without_attempting_them()
     -> Result<(), DeltaFunnelError> {
         let first = output_plan("first", LoadMode::AppendExisting)?;
@@ -730,6 +773,35 @@ mod tests {
         };
 
         assert!(error.to_string().contains("parallel MSSQL output writers"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_parallel_writer_configuration_is_rejected_before_attempting_outputs()
+    -> Result<(), DeltaFunnelError> {
+        let output = output_plan("first", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::new(vec![Ok(write_report(
+            &output,
+            1,
+            1,
+            false,
+            MssqlTargetCleanupStatus::NotApplicable,
+        ))]);
+        let attempted = writer.attempted_outputs();
+
+        let error = write_mssql_outputs_with_writer(
+            vec![job(output)?],
+            MssqlWorkflowWriteOptions::new().with_max_parallel_outputs(0),
+            writer,
+        )
+        .await;
+        let Err(error) = error else {
+            return Err(test_error("zero writer config should be rejected"));
+        };
+
+        assert!(error.to_string().contains("must be at least 1"));
+        assert!(locked(&attempted)?.is_empty());
 
         Ok(())
     }
