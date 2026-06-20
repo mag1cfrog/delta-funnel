@@ -44,7 +44,7 @@ pub async fn write_output_batches_to_mssql<S>(
     write_options: MssqlWriteOptions,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
-    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + Unpin,
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
     let request =
         plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
@@ -97,7 +97,7 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         options: MssqlWriteOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>
     where
-        S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + Unpin,
+        S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
     {
         let writer = self
             .initialize_writer(output_plan, prepared_target, options)
@@ -151,7 +151,7 @@ pub(crate) async fn write_mssql_output_connection_request<S>(
     options: MssqlWriteOptions,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
-    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + Unpin,
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
     let output_plan = request.output_plan().clone();
     ensure_supported_output_mode(&output_plan)?;
@@ -170,7 +170,7 @@ pub(crate) async fn write_mssql_output_batches_on_connection<C, S>(
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     C: MssqlOneOutputSinkConnection,
-    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + Unpin,
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
     ensure_supported_output_mode(&output_plan)?;
     let prepared_target = connection.prepare_target_lifecycle(&output_plan).await?;
@@ -647,7 +647,7 @@ mod tests {
     -> Result<(), DeltaFunnelError> {
         let connection = secret_connection()?;
         let resolved_target = resolved_target_with_load_mode(LoadMode::Replace, &connection)?;
-        let batches = stream::empty::<Result<RecordBatch, DeltaFunnelError>>();
+        let batches = stream::once(async { orders_batch(1) });
 
         let error = write_output_batches_to_mssql(
             orders_schema(),
