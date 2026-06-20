@@ -518,6 +518,16 @@ pub enum DeltaFunnelError {
         /// Underlying arrow-tiberius schema validation failure.
         source: arrow_tiberius::Error,
     },
+
+    /// SQL Server multi-output workflow planning failed before output writes.
+    #[snafu(display(
+        "MSSQL workflow planning error: {}",
+        sanitize_reason_for_display(message)
+    ))]
+    MssqlWorkflowPlanning {
+        /// Sanitized reason for the workflow planning failure.
+        message: String,
+    },
 }
 
 fn sanitize_source_name_for_display(name: &str) -> String {

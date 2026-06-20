@@ -13,6 +13,7 @@ mod output_planning;
 mod schema_planning;
 mod sink;
 mod target;
+mod workflow;
 mod write;
 
 pub use ddl_planning::{MssqlDdlPlan, plan_mssql_create_table_ddl};
@@ -38,6 +39,12 @@ pub use target::{
     LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,
     ResolvedMssqlTarget,
+};
+pub use workflow::{
+    MssqlOutputBatchStream, MssqlOutputBatchStreamFactory, MssqlOutputWriteJob,
+    MssqlOutputWriteStatus, MssqlWorkflowWriteOptions, MssqlWorkflowWriteReport,
+    MssqlWriteFailureReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport,
+    write_mssql_outputs_to_mssql,
 };
 pub(crate) use write::MssqlBulkLoadWriter;
 pub use write::{
