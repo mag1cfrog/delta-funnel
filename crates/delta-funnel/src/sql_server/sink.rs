@@ -10,14 +10,14 @@ use futures_util::Stream;
 use crate::DeltaFunnelError;
 
 use super::{
-    LoadMode, MssqlBulkLoadWriter, MssqlPreparedTarget, MssqlTargetOutputPlan, MssqlWriteOptions,
-    MssqlWriteReport,
+    LoadMode, MssqlBulkLoadWriter, MssqlPreparedTarget, MssqlTargetCleanupStatus,
+    MssqlTargetOutputPlan, MssqlWriteOptions, MssqlWriteReport,
 };
 use super::{
     connection::{
         MssqlConnectedOutputClient, MssqlOutputConnectionRequest, connect_mssql_output_client,
     },
-    lifecycle_execution::prepare_mssql_target_lifecycle,
+    lifecycle_execution::{cleanup_mssql_prepared_target, prepare_mssql_target_lifecycle},
     write::write_mssql_batches_with_writer,
 };
 
@@ -43,6 +43,13 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         prepared_target: &MssqlPreparedTarget,
         options: MssqlWriteOptions,
     ) -> Result<Self::Writer<'connection>, DeltaFunnelError>;
+
+    /// Cleans up a prepared target after a later failure.
+    async fn cleanup_prepared_target(
+        &mut self,
+        output_plan: &MssqlTargetOutputPlan,
+        prepared_target: Option<&MssqlPreparedTarget>,
+    ) -> Result<MssqlTargetCleanupStatus, DeltaFunnelError>;
 }
 
 #[async_trait]
@@ -68,6 +75,16 @@ impl MssqlOneOutputSinkConnection for MssqlConnectedOutputClient {
         options: MssqlWriteOptions,
     ) -> Result<Self::Writer<'connection>, DeltaFunnelError> {
         self.initialize_bulk_writer(prepared_target, options).await
+    }
+
+    async fn cleanup_prepared_target(
+        &mut self,
+        output_plan: &MssqlTargetOutputPlan,
+        prepared_target: Option<&MssqlPreparedTarget>,
+    ) -> Result<MssqlTargetCleanupStatus, DeltaFunnelError> {
+        let mut lifecycle_client = self.lifecycle_client();
+
+        cleanup_mssql_prepared_target(output_plan, prepared_target, &mut lifecycle_client).await
     }
 }
 
@@ -106,7 +123,20 @@ where
         .initialize_writer(&output_plan, &prepared_target, options)
         .await?;
 
-    write_mssql_batches_with_writer(&output_plan, batches, writer, options).await
+    match write_mssql_batches_with_writer(&output_plan, batches, writer, options).await {
+        Ok(report) => Ok(write_report_with_cleanup(
+            &output_plan,
+            &report,
+            prepared_target.report().cleanup(),
+        )),
+        Err(error) => Err(cleanup_after_prepared_target_failure(
+            &mut connection,
+            &output_plan,
+            &prepared_target,
+            error,
+        )
+        .await),
+    }
 }
 
 fn ensure_supported_output_mode(
@@ -120,6 +150,111 @@ fn ensure_supported_output_mode(
         output_name: output_plan.output_name().to_owned(),
         message: "replace load mode is reserved and cannot write one MSSQL output".to_owned(),
     })
+}
+
+async fn cleanup_after_prepared_target_failure<C>(
+    connection: &mut C,
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_target: &MssqlPreparedTarget,
+    original_error: DeltaFunnelError,
+) -> DeltaFunnelError
+where
+    C: MssqlOneOutputSinkConnection,
+{
+    match connection
+        .cleanup_prepared_target(output_plan, Some(prepared_target))
+        .await
+    {
+        Ok(cleanup) => error_with_cleanup(output_plan, original_error, cleanup),
+        Err(cleanup_error) => {
+            error_with_cleanup_failure(output_plan, original_error, cleanup_error)
+        }
+    }
+}
+
+fn write_report_with_cleanup(
+    output_plan: &MssqlTargetOutputPlan,
+    report: &MssqlWriteReport,
+    cleanup: MssqlTargetCleanupStatus,
+) -> MssqlWriteReport {
+    MssqlWriteReport::from_output_plan(
+        output_plan,
+        report.stats().rows_written(),
+        report.stats().batches_written(),
+        report.stats().elapsed_ms(),
+        report.partial_write_possible(),
+        cleanup,
+    )
+}
+
+fn error_with_cleanup(
+    output_plan: &MssqlTargetOutputPlan,
+    error: DeltaFunnelError,
+    cleanup: MssqlTargetCleanupStatus,
+) -> DeltaFunnelError {
+    match error {
+        DeltaFunnelError::MssqlWritePhase { context, message } => {
+            DeltaFunnelError::MssqlWritePhase {
+                context: Box::new(context_with_cleanup(output_plan, context.as_ref(), cleanup)),
+                message,
+            }
+        }
+        DeltaFunnelError::MssqlBatchSchemaValidation { context, source } => {
+            DeltaFunnelError::MssqlBatchSchemaValidation {
+                context: Box::new(context_with_cleanup(output_plan, context.as_ref(), cleanup)),
+                source,
+            }
+        }
+        other => other,
+    }
+}
+
+fn error_with_cleanup_failure(
+    output_plan: &MssqlTargetOutputPlan,
+    error: DeltaFunnelError,
+    cleanup_error: DeltaFunnelError,
+) -> DeltaFunnelError {
+    match error {
+        DeltaFunnelError::MssqlWritePhase { context, message } => {
+            DeltaFunnelError::MssqlWritePhase {
+                context: Box::new(context_with_cleanup(
+                    output_plan,
+                    context.as_ref(),
+                    MssqlTargetCleanupStatus::Failed,
+                )),
+                message: format!("{message}; cleanup failed: {cleanup_error}"),
+            }
+        }
+        DeltaFunnelError::MssqlBatchSchemaValidation { context, source } => {
+            DeltaFunnelError::MssqlWritePhase {
+                context: Box::new(context_with_cleanup(
+                    output_plan,
+                    context.as_ref(),
+                    MssqlTargetCleanupStatus::Failed,
+                )),
+                message: format!(
+                    "batch schema validation failed: {source}; cleanup failed: {cleanup_error}"
+                ),
+            }
+        }
+        other => other,
+    }
+}
+
+fn context_with_cleanup(
+    output_plan: &MssqlTargetOutputPlan,
+    context: &crate::MssqlWriteFailureContext,
+    cleanup: MssqlTargetCleanupStatus,
+) -> crate::MssqlWriteFailureContext {
+    crate::MssqlWriteFailureContext::from_output_plan(
+        output_plan,
+        context.phase(),
+        context.stats().rows_written(),
+        context.stats().batches_written(),
+        context.stats().elapsed_ms(),
+        context.partial_write_possible(),
+        cleanup,
+    )
 }
 
 #[cfg(test)]
@@ -145,6 +280,7 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
         prepare_error: Option<DeltaFunnelError>,
         initialize_error: Option<DeltaFunnelError>,
+        cleanup_error: Option<DeltaFunnelError>,
     }
 
     #[derive(Default)]
@@ -167,6 +303,11 @@ mod tests {
 
         fn fail_initialize(mut self, error: DeltaFunnelError) -> Self {
             self.initialize_error = Some(error);
+            self
+        }
+
+        fn fail_cleanup(mut self, error: DeltaFunnelError) -> Self {
+            self.cleanup_error = Some(error);
             self
         }
 
@@ -212,7 +353,11 @@ mod tests {
 
             MssqlPreparedTarget::from_output_plan(
                 output_plan,
-                MssqlPreparedTargetAction::VerifiedExisting,
+                match output_plan.load_mode() {
+                    LoadMode::AppendExisting => MssqlPreparedTargetAction::VerifiedExisting,
+                    LoadMode::CreateAndLoad => MssqlPreparedTargetAction::CreatedTable,
+                    LoadMode::Replace => MssqlPreparedTargetAction::VerifiedExisting,
+                },
             )
         }
 
@@ -229,6 +374,29 @@ mod tests {
 
             Ok(FakeSinkWriter {
                 log: Arc::clone(&self.log),
+            })
+        }
+
+        async fn cleanup_prepared_target(
+            &mut self,
+            _output_plan: &MssqlTargetOutputPlan,
+            prepared_target: Option<&MssqlPreparedTarget>,
+        ) -> Result<MssqlTargetCleanupStatus, DeltaFunnelError> {
+            let Some(prepared_target) = prepared_target else {
+                self.record("cleanup none")?;
+                return Ok(MssqlTargetCleanupStatus::NotAttempted);
+            };
+
+            self.record(format!("cleanup {:?}", prepared_target.report().action()))?;
+            if let Some(error) = self.cleanup_error.take() {
+                return Err(error);
+            }
+
+            Ok(match prepared_target.report().action() {
+                MssqlPreparedTargetAction::VerifiedExisting => {
+                    MssqlTargetCleanupStatus::NotApplicable
+                }
+                MssqlPreparedTargetAction::CreatedTable => MssqlTargetCleanupStatus::Succeeded,
             })
         }
     }
@@ -272,8 +440,15 @@ mod tests {
     }
 
     fn output_plan() -> Result<MssqlTargetOutputPlan, DeltaFunnelError> {
+        output_plan_with_load_mode(LoadMode::AppendExisting)
+    }
+
+    fn output_plan_with_load_mode(
+        load_mode: LoadMode,
+    ) -> Result<MssqlTargetOutputPlan, DeltaFunnelError> {
         let connection = secret_connection()?;
-        let target = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let target = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?)
+            .with_load_mode(load_mode);
 
         plan_mssql_target_for_output(
             orders_schema(),
@@ -411,6 +586,85 @@ mod tests {
 
         assert!(error.to_string().contains("initialize failed"));
         assert_eq!(logged_events(&log)?, vec!["prepare", "initialize"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_output_sink_cleans_up_created_target_after_stream_failure()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::CreateAndLoad)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log));
+        let batches = stream::iter(vec![Err(DeltaFunnelError::Config {
+            message: "stream failed".to_owned(),
+        })]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected stream failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::PollBatchStream);
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "initialize", "cleanup CreatedTable"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_output_sink_preserves_original_failure_when_cleanup_fails()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::CreateAndLoad)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_cleanup(phase_error(
+            &output_plan,
+            MssqlWritePhase::Cleanup,
+            "cleanup failed",
+        ));
+        let batches = stream::iter(vec![Err(DeltaFunnelError::Config {
+            message: "stream failed".to_owned(),
+        })]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected stream failure".to_owned(),
+        })?;
+        let display = error.to_string();
+
+        assert!(display.contains("stream failed"));
+        assert!(display.contains("cleanup failed"));
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::PollBatchStream);
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Failed);
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "initialize", "cleanup CreatedTable"]
+        );
         Ok(())
     }
 }
