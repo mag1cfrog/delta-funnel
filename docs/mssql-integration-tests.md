@@ -19,8 +19,10 @@ integration tests, and removes the container when the command exits.
 
 The `mssql_direct_raw_bulk` integration test exercises the public
 `write_output_batches_to_mssql` API with the default `WriteBackend::DirectRawBulk`
-path. When configured, it creates a unique append-existing test table, writes two
-Arrow record batches, checks the returned write stats, and drops the table.
+path. When configured, it runs append-existing and create-and-load writes against
+unique test tables, writes two Arrow record batches per table, checks the
+returned write stats, verifies the SQL Server row count and values, and drops
+the tables.
 
 ## Container runtime
 
