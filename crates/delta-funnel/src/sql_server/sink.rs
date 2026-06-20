@@ -10,16 +10,47 @@ use futures_util::Stream;
 use crate::DeltaFunnelError;
 
 use super::{
-    LoadMode, MssqlBulkLoadWriter, MssqlPreparedTarget, MssqlTargetCleanupStatus,
-    MssqlTargetOutputPlan, MssqlWriteOptions, MssqlWriteReport,
+    LoadMode, MssqlBulkLoadWriter, MssqlPreparedTarget, MssqlSchemaPlanOptions,
+    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteOptions, MssqlWriteReport,
+    ResolvedMssqlTarget,
 };
 use super::{
     connection::{
         MssqlConnectedOutputClient, MssqlOutputConnectionRequest, connect_mssql_output_client,
+        plan_mssql_output_connection_request,
     },
     lifecycle_execution::{cleanup_mssql_prepared_target, prepare_mssql_target_lifecycle},
     write::write_mssql_batches_with_writer,
 };
+
+/// Writes one resolved output to SQL Server from an Arrow record batch stream.
+///
+/// Use this when the caller has already selected one output, resolved its SQL Server target,
+/// and can provide the output schema plus a stream of `RecordBatch` values for that output.
+/// The function plans the private connection request, opens the SQL Server connection,
+/// prepares the target table lifecycle, initializes the bulk writer, writes each batch, and
+/// returns a redacted `MssqlWriteReport`.
+///
+/// The batch stream must already match the planned output schema. This API does not load Delta
+/// tables, run DataFusion queries, choose among multiple outputs, retry failed writes, or perform
+/// destructive replace behavior. `LoadMode::Replace` is rejected before connecting to SQL Server.
+/// Connection string material stays inside the resolved target and private connection request;
+/// reports and errors use the redacted connection summary.
+pub async fn write_output_batches_to_mssql<S>(
+    output_schema: impl AsRef<arrow_schema::Schema>,
+    resolved_target: ResolvedMssqlTarget,
+    schema_options: MssqlSchemaPlanOptions,
+    batches: S,
+    write_options: MssqlWriteOptions,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + Unpin,
+{
+    let request =
+        plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
+
+    write_mssql_output_connection_request(request, batches, write_options).await
+}
 
 /// Connected one-output SQL Server sink boundary.
 #[allow(dead_code)]
@@ -271,8 +302,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        MssqlConnectionConfig, MssqlPreparedTargetAction, MssqlTargetConfig, MssqlTargetTable,
-        MssqlWritePhase, default_mssql_write_options, plan_mssql_target_for_output,
+        MssqlConnectionConfig, MssqlPreparedTargetAction, MssqlTargetConfig,
+        MssqlTargetResolutionContext, MssqlTargetTable, MssqlWritePhase,
+        default_mssql_write_options, plan_mssql_target_for_output,
     };
 
     #[derive(Default)]
@@ -459,6 +491,18 @@ mod tests {
         )
     }
 
+    fn resolved_target_with_load_mode(
+        load_mode: LoadMode,
+        connection: &MssqlConnectionConfig,
+    ) -> Result<ResolvedMssqlTarget, DeltaFunnelError> {
+        MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?)
+            .with_load_mode(load_mode)
+            .resolve(MssqlTargetResolutionContext {
+                output_name: Some("orders_output"),
+                default_connection: Some(connection),
+            })
+    }
+
     fn orders_batch(row_count: usize) -> Result<RecordBatch, DeltaFunnelError> {
         let order_ids = (0..row_count)
             .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
@@ -527,6 +571,46 @@ mod tests {
         assert_eq!(report.output_name(), "orders_output");
         assert_eq!(report.stats().rows_written(), 3);
         assert_eq!(report.stats().batches_written(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_one_output_api_rejects_replace_before_connection()
+    -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let resolved_target = resolved_target_with_load_mode(LoadMode::Replace, &connection)?;
+        let batches = stream::empty::<Result<RecordBatch, DeltaFunnelError>>();
+
+        let error = write_output_batches_to_mssql(
+            orders_schema(),
+            resolved_target,
+            arrow_tiberius::PlanOptions::default(),
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected replace load mode to fail before connection".to_owned(),
+        })?;
+
+        let error_message = error.to_string();
+        let error_debug = format!("{error:?}");
+        let DeltaFunnelError::MssqlLifecyclePlanning {
+            output_name,
+            message,
+        } = &error
+        else {
+            return Err(DeltaFunnelError::Config {
+                message: format!("expected MssqlLifecyclePlanning error, got {error:?}"),
+            });
+        };
+        assert_eq!(output_name, "orders_output");
+        assert!(message.contains("replace"));
+        assert!(error_message.contains("replace"));
+        assert!(!error_message.contains("secret-token"));
+        assert!(!error_debug.contains("secret-token"));
+
         Ok(())
     }
 

@@ -33,6 +33,7 @@ pub use schema_planning::{
     MssqlSchemaPlan, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTimezonePolicy,
     MssqlUInt64Policy, mssql_schema_diagnostic_reports, plan_mssql_output_schema,
 };
+pub use sink::write_output_batches_to_mssql;
 pub use target::{
     LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,
