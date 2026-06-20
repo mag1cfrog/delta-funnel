@@ -81,6 +81,30 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         output_plan: &MssqlTargetOutputPlan,
         prepared_target: Option<&MssqlPreparedTarget>,
     ) -> Result<MssqlTargetCleanupStatus, DeltaFunnelError>;
+
+    /// Initializes the writer and writes batches after lifecycle preparation.
+    ///
+    /// The concrete production writer borrows the connected SQL Server client while it is alive.
+    /// Keeping writer initialization and the write loop inside this method prevents that borrowed
+    /// writer type from escaping into the outer orchestration scope. After this method returns,
+    /// the caller can safely borrow the same connection again to clean up a prepared target after
+    /// either writer initialization or batch writing fails.
+    async fn write_prepared_batches<S>(
+        &mut self,
+        output_plan: &MssqlTargetOutputPlan,
+        prepared_target: &MssqlPreparedTarget,
+        batches: S,
+        options: MssqlWriteOptions,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError>
+    where
+        S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + Unpin,
+    {
+        let writer = self
+            .initialize_writer(output_plan, prepared_target, options)
+            .await?;
+
+        write_mssql_batches_with_writer(output_plan, batches, writer, options).await
+    }
 }
 
 #[async_trait]
@@ -150,11 +174,11 @@ where
 {
     ensure_supported_output_mode(&output_plan)?;
     let prepared_target = connection.prepare_target_lifecycle(&output_plan).await?;
-    let writer = connection
-        .initialize_writer(&output_plan, &prepared_target, options)
-        .await?;
 
-    match write_mssql_batches_with_writer(&output_plan, batches, writer, options).await {
+    match connection
+        .write_prepared_batches(&output_plan, &prepared_target, batches, options)
+        .await
+    {
         Ok(report) => Ok(write_report_with_cleanup(
             &output_plan,
             &report,
@@ -688,7 +712,50 @@ mod tests {
         })?;
 
         assert!(error.to_string().contains("initialize failed"));
-        assert_eq!(logged_events(&log)?, vec!["prepare", "initialize"]);
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "initialize", "cleanup VerifiedExisting"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_output_sink_cleans_up_created_target_after_writer_initialization_failure()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::CreateAndLoad)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).fail_initialize(phase_error(
+                &output_plan,
+                MssqlWritePhase::InitializeWriter,
+                "initialize failed",
+            ));
+        let batches = stream::iter(vec![Ok(orders_batch(1)?)]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected initialization failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlWritePhase initialization failure".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::InitializeWriter);
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert!(message.contains("initialize failed"));
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "initialize", "cleanup CreatedTable"]
+        );
         Ok(())
     }
 
