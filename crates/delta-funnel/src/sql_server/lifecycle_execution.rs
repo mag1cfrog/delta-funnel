@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use crate::DeltaFunnelError;
 
 use super::{
-    LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetCleanupStatus,
-    MssqlTargetOutputPlan, MssqlTargetTable, MssqlTargetTableState, MssqlWriteFailureContext,
-    MssqlWritePhase,
+    LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlLifecycleExecutionGuardrail,
+    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlTargetTable, MssqlTargetTableState,
+    MssqlWriteFailureContext, MssqlWritePhase,
 };
 
 /// Fakeable SQL Server target lifecycle operation boundary.
@@ -112,6 +112,10 @@ where
     C: MssqlTargetLifecycleClient + ?Sized,
 {
     ensure_append_existing_output(output_plan)?;
+    ensure_lifecycle_guardrail(
+        output_plan,
+        MssqlLifecycleExecutionGuardrail::TargetTableExistenceProbe,
+    )?;
     let table_name = table_name_from_target(output_plan.output_name(), output_plan.target_table())?;
     let exists = client
         .table_exists(&table_name)
@@ -140,6 +144,14 @@ where
     C: MssqlTargetLifecycleClient + ?Sized,
 {
     ensure_create_and_load_output(output_plan)?;
+    ensure_lifecycle_guardrail(
+        output_plan,
+        MssqlLifecycleExecutionGuardrail::TargetTableExistenceProbe,
+    )?;
+    ensure_lifecycle_guardrail(
+        output_plan,
+        MssqlLifecycleExecutionGuardrail::CreateTableDdlExecution,
+    )?;
     let table_name = table_name_from_target(output_plan.output_name(), output_plan.target_table())?;
     let exists = client
         .table_exists(&table_name)
@@ -183,6 +195,7 @@ where
     let Some(prepared_target) = prepared_target else {
         return Ok(cleanup_before_target_creation(output_plan));
     };
+    ensure_prepared_target_matches_output_plan(output_plan, prepared_target)?;
 
     match prepared_target.report().action() {
         MssqlPreparedTargetAction::VerifiedExisting => Ok(MssqlTargetCleanupStatus::NotApplicable),
@@ -402,6 +415,48 @@ fn ensure_create_and_load_output(
         output_name: output_plan.output_name().to_owned(),
         message: "create-and-load target preparation requires create-and-load load mode".to_owned(),
     })
+}
+
+#[allow(dead_code)]
+fn ensure_lifecycle_guardrail(
+    output_plan: &MssqlTargetOutputPlan,
+    guardrail: MssqlLifecycleExecutionGuardrail,
+) -> Result<(), DeltaFunnelError> {
+    if output_plan
+        .lifecycle_plan()
+        .execution_guardrails()
+        .contains(&guardrail)
+    {
+        return Ok(());
+    }
+
+    Err(DeltaFunnelError::MssqlLifecyclePlanning {
+        output_name: output_plan.output_name().to_owned(),
+        message: format!("target lifecycle plan does not allow {guardrail:?}"),
+    })
+}
+
+#[allow(dead_code)]
+fn ensure_prepared_target_matches_output_plan(
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_target: &MssqlPreparedTarget,
+) -> Result<(), DeltaFunnelError> {
+    let report = prepared_target.report();
+    let matches_plan = report.output_name() == output_plan.output_name()
+        && report.target_table() == output_plan.target_table()
+        && report.load_mode() == output_plan.load_mode()
+        && report.connection_source() == output_plan.connection_source()
+        && report.connection() == output_plan.connection()
+        && report.expected_target_state() == output_plan.lifecycle_plan().expected_target_state();
+
+    if matches_plan {
+        return Ok(());
+    }
+
+    Err(cleanup_error(
+        output_plan,
+        "prepared target does not match output plan",
+    ))
 }
 
 #[allow(dead_code)]
@@ -978,6 +1033,38 @@ mod tests {
             client.calls,
             vec!["execute DROP TABLE [dbo].[orders]".to_owned()]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_rejects_prepared_target_from_different_output_without_drop()
+    -> Result<(), DeltaFunnelError> {
+        let current_output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let other_output_plan = output_plan(
+            "other_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "other_orders")?,
+        )?;
+        let prepared = MssqlPreparedTarget::from_output_plan(
+            &other_output_plan,
+            MssqlPreparedTargetAction::CreatedTable,
+        )?;
+        let mut client = RecordingLifecycleClient::default();
+
+        let error =
+            cleanup_mssql_prepared_target(&current_output_plan, Some(&prepared), &mut client)
+                .await
+                .err()
+                .ok_or_else(|| DeltaFunnelError::Config {
+                    message: "expected mismatched cleanup target error".to_owned(),
+                })?;
+
+        assert_cleanup_error(error, "prepared target does not match output plan")?;
+        assert!(client.calls.is_empty());
         Ok(())
     }
 
