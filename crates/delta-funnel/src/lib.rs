@@ -25,7 +25,7 @@ pub use batch_pipeline::{
 pub use error::DeltaFunnelError;
 pub use orchestrator::{
     BatchOptions, DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan,
-    RunMode, SessionOptions, ValidationOptions,
+    RegisteredSessionSource, RunMode, SessionOptions, ValidationOptions,
 };
 pub use query_engine::{
     DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,

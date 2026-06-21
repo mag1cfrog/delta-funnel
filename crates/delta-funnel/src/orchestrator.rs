@@ -6,13 +6,16 @@
 
 use std::fmt;
 
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::prelude::SessionContext;
 
 use crate::{
-    DeltaFunnelError, DeltaProviderScanExecutionOptions, MssqlConnectionConfig,
-    MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlWorkflowWriteOptions, MssqlWriteOptions,
-    QueryOptions, datafusion_session_context, default_mssql_write_options,
-    redaction::sanitize_text_for_display,
+    DeltaFunnelError, DeltaProtocolReport, DeltaProviderScanExecutionOptions, DeltaSourceConfig,
+    DeltaTableProviderConfig, MssqlConnectionConfig, MssqlSchemaPlanOptions, MssqlTargetConfig,
+    MssqlWorkflowWriteOptions, MssqlWriteOptions, QueryOptions, RegisteredDeltaSource,
+    datafusion_session_context, default_mssql_write_options, load_delta_source,
+    preflight_delta_protocol, redaction::sanitize_text_for_display,
+    register_delta_sources_with_scan_execution_options,
 };
 
 /// Query-load action mode requested by a caller.
@@ -339,16 +342,26 @@ impl fmt::Debug for SessionOptions {
 pub struct LazyTable {
     id: LazyTableId,
     kind: LazyTableKind,
+    name: String,
 }
 
 impl LazyTable {
     /// Creates a placeholder lazy table handle for future registration slices.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn placeholder(id: u64, kind: LazyTableKind) -> Self {
+    pub(crate) fn placeholder(id: u64, kind: LazyTableKind) -> Self {
         Self {
             id: LazyTableId(id),
             kind,
+            name: format!("table_{id}"),
+        }
+    }
+
+    fn delta_source(id: u64, name: String) -> Self {
+        Self {
+            id: LazyTableId(id),
+            kind: LazyTableKind::DeltaSource,
+            name,
         }
     }
 
@@ -362,6 +375,12 @@ impl LazyTable {
     #[must_use]
     pub const fn kind(&self) -> LazyTableKind {
         self.kind
+    }
+
+    /// Returns the session-owned table name for this lazy table.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -457,11 +476,74 @@ impl OutputWritePlan {
     }
 }
 
+/// Registered Delta source tracked by a query-load session.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RegisteredSessionSource {
+    table: LazyTable,
+    snapshot_version: u64,
+    schema: SchemaRef,
+    protocol: DeltaProtocolReport,
+}
+
+impl RegisteredSessionSource {
+    fn from_registered(table: LazyTable, registered: RegisteredDeltaSource) -> Self {
+        Self {
+            table,
+            snapshot_version: registered.snapshot_version,
+            schema: registered.schema,
+            protocol: registered.protocol,
+        }
+    }
+
+    /// Returns the lazy table handle for this registered source.
+    #[must_use]
+    pub const fn table(&self) -> &LazyTable {
+        &self.table
+    }
+
+    /// Returns the DataFusion table name for this source.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.table.name()
+    }
+
+    /// Returns the resolved Delta snapshot version.
+    #[must_use]
+    pub const fn snapshot_version(&self) -> u64 {
+        self.snapshot_version
+    }
+
+    /// Returns the logical Arrow schema exposed to DataFusion.
+    #[must_use]
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Returns the sanitized protocol report captured before registration.
+    #[must_use]
+    pub const fn protocol(&self) -> &DeltaProtocolReport {
+        &self.protocol
+    }
+}
+
+impl fmt::Debug for RegisteredSessionSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredSessionSource")
+            .field("table", &self.table)
+            .field("snapshot_version", &self.snapshot_version)
+            .field("schema", &self.schema)
+            .field("protocol", &self.protocol)
+            .finish()
+    }
+}
+
 /// Rust backing session for lazy query-load workflows.
 pub struct DeltaFunnelSession {
     options: SessionOptions,
     context: SessionContext,
     next_table_id: u64,
+    sources: Vec<RegisteredSessionSource>,
 }
 
 impl DeltaFunnelSession {
@@ -478,6 +560,7 @@ impl DeltaFunnelSession {
             options,
             context,
             next_table_id: 0,
+            sources: Vec::new(),
         })
     }
 
@@ -487,7 +570,12 @@ impl DeltaFunnelSession {
         &self.options
     }
 
-    /// Returns the owned DataFusion session context.
+    /// Returns the DataFusion session context owned by this orchestrator.
+    ///
+    /// The session context is exposed so later planning steps can analyze SQL
+    /// against registered session aliases. Delta source registration should
+    /// still go through [`DeltaFunnelSession::delta_lake`] so the orchestrator's
+    /// source reports stay aligned with the DataFusion catalog.
     #[must_use]
     pub const fn context(&self) -> &SessionContext {
         &self.context
@@ -498,6 +586,74 @@ impl DeltaFunnelSession {
     pub const fn next_table_id(&self) -> u64 {
         self.next_table_id
     }
+
+    /// Registers one Delta source and returns its lazy table handle.
+    ///
+    /// The method performs source setup only: Delta snapshot metadata loading,
+    /// protocol preflight, and DataFusion table registration. It does not scan
+    /// data files for row production, parse user SQL, contact SQL Server, or
+    /// execute an output action.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first Delta source loading, protocol preflight, duplicate
+    /// alias, schema conversion, or DataFusion registration error. Session
+    /// source state is updated only after the DataFusion registration succeeds.
+    pub fn delta_lake(&mut self, source: DeltaSourceConfig) -> Result<LazyTable, DeltaFunnelError> {
+        self.reject_registered_source_name(&source.name)?;
+        let planned = load_delta_source(source)?;
+        let preflight = preflight_delta_protocol(&planned)?;
+        let registered = register_delta_sources_with_scan_execution_options(
+            &self.context,
+            vec![DeltaTableProviderConfig {
+                source: planned,
+                protocol: preflight,
+                scan_target_partitions: None,
+            }],
+            self.options.provider_scan_options(),
+        )?;
+        let registered =
+            registered
+                .sources
+                .into_iter()
+                .next()
+                .ok_or_else(|| DeltaFunnelError::Config {
+                    message: "Delta source registration returned no registered source".to_owned(),
+                })?;
+        let table = self.allocate_delta_source_table(registered.name.clone());
+        let session_source = RegisteredSessionSource::from_registered(table.clone(), registered);
+        self.sources.push(session_source);
+        Ok(table)
+    }
+
+    /// Returns registered Delta source reports in registration order.
+    #[must_use]
+    pub fn sources(&self) -> &[RegisteredSessionSource] {
+        &self.sources
+    }
+
+    /// Finds a registered Delta source by alias using unquoted SQL semantics.
+    #[must_use]
+    pub fn registered_source(&self, name: &str) -> Option<&RegisteredSessionSource> {
+        self.sources
+            .iter()
+            .find(|source| source.name().eq_ignore_ascii_case(name))
+    }
+
+    fn allocate_delta_source_table(&mut self, name: String) -> LazyTable {
+        let id = self.next_table_id;
+        self.next_table_id = self.next_table_id.saturating_add(1);
+        LazyTable::delta_source(id, name)
+    }
+
+    fn reject_registered_source_name(&self, name: &str) -> Result<(), DeltaFunnelError> {
+        if self.registered_source(name).is_some() {
+            return Err(DeltaFunnelError::DuplicateSourceName {
+                name: name.to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for DeltaFunnelSession {
@@ -505,6 +661,7 @@ impl fmt::Debug for DeltaFunnelSession {
         formatter
             .debug_struct("DeltaFunnelSession")
             .field("options", &self.options)
+            .field("sources", &self.sources)
             .field("next_table_id", &self.next_table_id)
             .finish_non_exhaustive()
     }
@@ -527,8 +684,93 @@ fn validate_nonzero_batch_option(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
-    use crate::{BatchPipelinePhase, DeltaProviderReaderBackend, LoadMode, MssqlTargetTable};
+    use crate::{
+        BatchPipelinePhase, DeltaProviderReaderBackend, DeltaStorageOptions, LoadMode,
+        MssqlTargetTable,
+    };
+
+    struct DeltaLogTable {
+        path: PathBuf,
+    }
+
+    impl Drop for DeltaLogTable {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    impl DeltaLogTable {
+        fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_protocol(name, PROTOCOL_JSON)
+        }
+
+        fn new_with_protocol(
+            name: &str,
+            protocol_json: &str,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let path = Path::new("target")
+                .join("delta-funnel-orchestrator-tests")
+                .join(unique_name(name)?);
+            let log_path = path.join("_delta_log");
+            fs::create_dir_all(&log_path)?;
+            fs::write(
+                log_path.join("00000000000000000000.json"),
+                format!(
+                    "{}\n{}\n",
+                    protocol_json,
+                    metadata_json(DEFAULT_SCHEMA_FIELDS_JSON)
+                ),
+            )?;
+            fs::write(
+                log_path.join("00000000000000000001.json"),
+                format!("{}\n", add_json("part-00000.parquet")),
+            )?;
+
+            Ok(Self { path })
+        }
+
+        fn uri(&self) -> String {
+            self.path.to_string_lossy().to_string()
+        }
+
+        fn file_uri_with_secret_parts(&self) -> Result<String, Box<dyn std::error::Error>> {
+            let path = fs::canonicalize(&self.path)?;
+
+            Ok(format!(
+                "file://{}?token=super-secret#debug-secret",
+                path.to_string_lossy()
+            ))
+        }
+    }
+
+    const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    const UNSUPPORTED_PROTOCOL_JSON: &str =
+        r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":2}}"#;
+    const DEFAULT_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
+    fn metadata_json(schema_fields_json: &str) -> String {
+        format!(
+            r#"{{"metaData":{{"id":"delta-funnel-test","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":{schema_fields_json}}}","partitionColumns":[],"configuration":{{}},"createdTime":1587968585495}}}}"#
+        )
+    }
+
+    fn add_json(path: &str) -> String {
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+        )
+    }
+
+    fn unique_name(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        Ok(format!("{}-{name}-{nanos}", std::process::id()))
+    }
 
     fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
         Ok(MssqlConnectionConfig::new(
@@ -683,6 +925,207 @@ mod tests {
         assert!(!debug.contains("secret-token"));
         assert!(!debug.contains("password"));
         assert!(!debug.contains("server=tcp"));
+        Ok(())
+    }
+
+    #[test]
+    fn delta_lake_registers_source_and_returns_lazy_table() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let lazy = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        assert_eq!(lazy.id(), 0);
+        assert_eq!(lazy.kind(), LazyTableKind::DeltaSource);
+        assert_eq!(lazy.name(), "orders");
+        assert_eq!(session.next_table_id(), 1);
+        assert_eq!(session.sources().len(), 1);
+        let registered = session
+            .registered_source("ORDERS")
+            .ok_or("expected registered source")?;
+        assert_eq!(registered.table(), &lazy);
+        assert_eq!(registered.name(), "orders");
+        assert_eq!(registered.snapshot_version(), 1);
+        assert_eq!(registered.protocol().source_name, "orders");
+        assert_eq!(registered.schema().fields().len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn delta_lake_registers_multiple_distinct_sources() -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("orders")?;
+        let customers = DeltaLogTable::new("customers")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let orders = session.delta_lake(DeltaSourceConfig::new("orders", orders.uri()))?;
+        let customers = session.delta_lake(DeltaSourceConfig::new("customers", customers.uri()))?;
+
+        assert_eq!(orders.id(), 0);
+        assert_eq!(customers.id(), 1);
+        assert_eq!(session.sources().len(), 2);
+        assert!(session.registered_source("orders").is_some());
+        assert!(session.registered_source("customers").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_source_alias_fails_before_loading_second_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let error = session.delta_lake(DeltaSourceConfig::new("ORDERS", ""));
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::DuplicateSourceName { name }) if name == "ORDERS"
+        ));
+        assert_eq!(session.sources().len(), 1);
+        assert_eq!(session.next_table_id(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_source_alias_fails_before_registration() -> Result<(), DeltaFunnelError> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session.delta_lake(DeltaSourceConfig::new("select", ""));
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::InvalidSourceName { name, .. }) if name == "select"
+        ));
+        assert!(session.sources().is_empty());
+        assert_eq!(session.next_table_id(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_preflight_failure_does_not_register_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session.delta_lake(DeltaSourceConfig::new("unsupported", table.uri()));
+
+        let display = format!("{}", error.as_ref().err().ok_or("expected error")?);
+        assert!(display.contains("unsupported"));
+        assert!(display.contains("unsupported Delta minReaderVersion"));
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::DeltaProtocolCompatibility { .. })
+        ));
+        assert!(session.sources().is_empty());
+        assert_eq!(session.next_table_id(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_preflight_failure_redacts_secret_uri_parts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session
+            .delta_lake(DeltaSourceConfig::new(
+                "unsupported",
+                table.file_uri_with_secret_parts()?,
+            ))
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+
+        assert!(
+            matches!(error, Err(display) if display.contains("unsupported")
+            && display.contains("unsupported Delta minReaderVersion")
+            && !display.contains("super-secret")
+            && !display.contains("debug-secret")
+            && !display.contains("token"))
+        );
+        assert!(session.sources().is_empty());
+        assert_eq!(session.next_table_id(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protocol_preflight_failure_does_not_leak_datafusion_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session.delta_lake(DeltaSourceConfig::new("unsupported", table.uri()));
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::DeltaProtocolCompatibility { .. })
+        ));
+        assert!(session.context().table("unsupported").await.is_err());
+        assert!(session.sources().is_empty());
+        assert_eq!(session.next_table_id(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registered_source_sql_analysis_does_not_read_data_files_for_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let dataframe = session
+            .context()
+            .sql("select id, customer_name from orders")
+            .await?;
+        let schema = dataframe.schema();
+
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "customer_name");
+        assert_eq!(session.sources().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn source_debug_does_not_expose_storage_option_values() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table = DeltaLogTable::new("storage-options")?;
+        let mut storage_options = DeltaStorageOptions::new();
+        storage_options.insert(
+            "AWS_SECRET_ACCESS_KEY".to_owned(),
+            "super-secret".to_owned(),
+        );
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        session.delta_lake(
+            DeltaSourceConfig::new("orders", table.uri()).with_storage_options(storage_options),
+        )?;
+
+        let debug = format!("{session:?}");
+        assert!(debug.contains("orders"));
+        assert!(!debug.contains("super-secret"));
+        assert!(!debug.contains("AWS_SECRET_ACCESS_KEY"));
+        Ok(())
+    }
+
+    #[test]
+    fn source_registration_honors_configured_provider_options()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("configured-provider")?;
+        let mut session =
+            DeltaFunnelSession::new(SessionOptions::new().with_provider_scan_options(
+                DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+                    DeltaProviderReaderBackend::OfficialKernel,
+                    2,
+                    1,
+                )?,
+            ))?;
+
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        assert_eq!(session.sources().len(), 1);
+        assert!(session.registered_source("orders").is_some());
         Ok(())
     }
 }
