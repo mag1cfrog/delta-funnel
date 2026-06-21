@@ -739,6 +739,15 @@ mod tests {
         fn uri(&self) -> String {
             self.path.to_string_lossy().to_string()
         }
+
+        fn file_uri_with_secret_parts(&self) -> Result<String, Box<dyn std::error::Error>> {
+            let path = fs::canonicalize(&self.path)?;
+
+            Ok(format!(
+                "file://{}?token=super-secret#debug-secret",
+                path.to_string_lossy()
+            ))
+        }
     }
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
@@ -1009,6 +1018,32 @@ mod tests {
             error,
             Err(DeltaFunnelError::DeltaProtocolCompatibility { .. })
         ));
+        assert!(session.sources().is_empty());
+        assert_eq!(session.next_table_id(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_preflight_failure_redacts_secret_uri_parts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session
+            .delta_lake(DeltaSourceConfig::new(
+                "unsupported",
+                table.file_uri_with_secret_parts()?,
+            ))
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+
+        assert!(
+            matches!(error, Err(display) if display.contains("unsupported")
+            && display.contains("unsupported Delta minReaderVersion")
+            && !display.contains("super-secret")
+            && !display.contains("debug-secret")
+            && !display.contains("token"))
+        );
         assert!(session.sources().is_empty());
         assert_eq!(session.next_table_id(), 0);
         Ok(())
