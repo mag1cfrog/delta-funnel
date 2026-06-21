@@ -169,6 +169,18 @@ impl MssqlWorkflowWriteReport {
         Self { outputs }
     }
 
+    /// Returns the number of selected outputs represented by this report.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Returns whether this report contains no selected outputs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
     /// Returns per-output statuses in caller-provided order.
     #[must_use]
     pub fn outputs(&self) -> &[MssqlOutputWriteStatus] {
@@ -182,25 +194,40 @@ impl MssqlWorkflowWriteReport {
             .iter()
             .all(MssqlOutputWriteStatus::is_succeeded)
     }
+
+    /// Returns the number of outputs that completed successfully.
+    #[must_use]
+    pub fn succeeded_count(&self) -> usize {
+        self.outputs
+            .iter()
+            .filter(|status| status.is_succeeded())
+            .count()
+    }
+
+    /// Returns the number of outputs that failed.
+    #[must_use]
+    pub fn failed_count(&self) -> usize {
+        self.outputs
+            .iter()
+            .filter(|status| status.is_failed())
+            .count()
+    }
+
+    /// Returns the number of outputs skipped after a previous output failed.
+    #[must_use]
+    pub fn skipped_count(&self) -> usize {
+        self.outputs
+            .iter()
+            .filter(|status| status.is_skipped())
+            .count()
+    }
 }
 
 impl fmt::Display for MssqlWorkflowWriteReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let succeeded = self
-            .outputs
-            .iter()
-            .filter(|status| status.is_succeeded())
-            .count();
-        let failed = self
-            .outputs
-            .iter()
-            .filter(|status| status.is_failed())
-            .count();
-        let skipped = self
-            .outputs
-            .iter()
-            .filter(|status| status.is_skipped())
-            .count();
+        let succeeded = self.succeeded_count();
+        let failed = self.failed_count();
+        let skipped = self.skipped_count();
 
         write!(
             formatter,
@@ -549,6 +576,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_workflow_report_has_zero_counts() -> Result<(), DeltaFunnelError> {
+        let writer = FakeWorkflowWriter::default();
+
+        let report = write_mssql_outputs_with_writer(
+            Vec::new(),
+            MssqlWorkflowWriteOptions::default(),
+            writer,
+        )
+        .await?;
+
+        assert!(report.is_empty());
+        assert_eq!(report.len(), 0);
+        assert_eq!(report.outputs(), []);
+        assert!(report.all_succeeded());
+        assert_eq!(report.succeeded_count(), 0);
+        assert_eq!(report.failed_count(), 0);
+        assert_eq!(report.skipped_count(), 0);
+        assert_eq!(
+            report.to_string(),
+            "MSSQL workflow write report: 0 succeeded, 0 failed, 0 skipped"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn two_successful_outputs_produce_two_success_statuses() -> Result<(), DeltaFunnelError> {
         let first = output_plan("first", LoadMode::AppendExisting)?;
         let second = output_plan("second", LoadMode::AppendExisting)?;
@@ -699,6 +752,10 @@ mod tests {
         let [failed, skipped_second, skipped_third] = report.outputs() else {
             return Err(test_error("expected three output statuses"));
         };
+        assert_eq!(report.len(), 3);
+        assert_eq!(report.succeeded_count(), 0);
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(report.skipped_count(), 2);
         assert!(matches!(failed, MssqlOutputWriteStatus::Failed(_)));
         assert_skipped_after(skipped_second, "second", "first")?;
         assert_skipped_after(skipped_third, "third", "first")?;
