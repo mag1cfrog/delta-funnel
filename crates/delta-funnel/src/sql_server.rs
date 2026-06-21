@@ -26,7 +26,8 @@ pub use lifecycle_planning::{
     MssqlTargetTableState, plan_mssql_lifecycle,
 };
 pub use output_planning::{
-    MssqlTargetOutputPlan, plan_mssql_target_for_output, plan_mssql_target_output,
+    MssqlTargetOutputPlan, plan_mssql_target_for_output, plan_mssql_target_for_resolved_output,
+    plan_mssql_target_output,
 };
 pub use schema_planning::{
     MssqlBinaryPolicy, MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy,

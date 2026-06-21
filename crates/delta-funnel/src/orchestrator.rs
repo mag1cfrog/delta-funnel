@@ -9,15 +9,18 @@ use std::{fmt, sync::Arc};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::prelude::{SQLOptions, SessionContext};
 use datafusion::{datasource::TableProvider, prelude::DataFrame};
+use futures_util::StreamExt;
 
 use crate::{
-    DeltaFunnelError, DeltaProtocolReport, DeltaProviderScanExecutionOptions, DeltaSourceConfig,
-    DeltaTableProviderConfig, MssqlConnectionConfig, MssqlSchemaPlanOptions, MssqlTargetConfig,
-    MssqlTargetOutputPlan, MssqlWorkflowWriteOptions, MssqlWriteOptions, QueryOptions,
-    RegisteredDeltaSource, SqlTablePhase, datafusion_session_context, default_mssql_write_options,
-    load_delta_source, plan_mssql_target_for_output, preflight_delta_protocol,
-    redaction::sanitize_text_for_display, register_delta_sources_with_scan_execution_options,
-    table_formats::validate_table_source_names,
+    BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaProviderScanExecutionOptions,
+    DeltaSourceConfig, DeltaTableProviderConfig, MssqlConnectionConfig, MssqlOutputBatchStream,
+    MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlWorkflowWriteOptions,
+    MssqlWriteOptions, MssqlWriteReport, QueryOptions, RegisteredDeltaSource, ResolvedMssqlTarget,
+    SqlTablePhase, datafusion_query_output_stream, datafusion_session_context,
+    default_mssql_write_options, load_delta_source, plan_mssql_target_for_resolved_output,
+    preflight_delta_protocol, redaction::sanitize_text_for_display,
+    register_delta_sources_with_scan_execution_options, table_formats::validate_table_source_names,
+    write_output_batches_to_mssql,
 };
 
 /// Query-load action mode requested by a caller.
@@ -408,13 +411,19 @@ impl OutputWritePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedMssqlOutput {
     request: OutputWritePlan,
+    resolved_target: ResolvedMssqlTarget,
     output_plan: MssqlTargetOutputPlan,
 }
 
 impl PlannedMssqlOutput {
-    fn new(request: OutputWritePlan, output_plan: MssqlTargetOutputPlan) -> Self {
+    fn new(
+        request: OutputWritePlan,
+        resolved_target: ResolvedMssqlTarget,
+        output_plan: MssqlTargetOutputPlan,
+    ) -> Self {
         Self {
             request,
+            resolved_target,
             output_plan,
         }
     }
@@ -435,6 +444,12 @@ impl PlannedMssqlOutput {
     #[must_use]
     pub const fn target(&self) -> &MssqlOutputTarget {
         self.request.target()
+    }
+
+    /// Returns the resolved SQL Server target, including the private connection config.
+    #[must_use]
+    pub const fn resolved_target(&self) -> &ResolvedMssqlTarget {
+        &self.resolved_target
     }
 
     /// Returns the complete SQL Server target output plan.
@@ -741,15 +756,55 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
     ) -> Result<PlannedMssqlOutput, DeltaFunnelError> {
         let schema = self.schema_for_lazy_table(request.table())?;
-        let output_plan = plan_mssql_target_for_output(
+        let resolved_target =
+            request
+                .target()
+                .target()
+                .resolve(crate::MssqlTargetResolutionContext {
+                    output_name: Some(request.target().output_name()),
+                    default_connection: self.options.default_mssql_connection(),
+                })?;
+        let output_plan = plan_mssql_target_for_resolved_output(
             schema.as_ref(),
-            request.target().output_name(),
-            request.target().target(),
-            self.options.default_mssql_connection(),
+            &resolved_target,
             self.options.mssql_schema_options(),
         )?;
 
-        Ok(PlannedMssqlOutput::new(request.clone(), output_plan))
+        Ok(PlannedMssqlOutput::new(
+            request.clone(),
+            resolved_target,
+            output_plan,
+        ))
+    }
+
+    /// Writes one selected lazy table to SQL Server.
+    ///
+    /// The method reuses the session output planner, builds a DataFusion physical
+    /// plan for the selected lazy table, exposes DataFusion's merged
+    /// `RecordBatch` stream, and hands that stream directly to the existing
+    /// one-output MSSQL sink. It does not implement SQL Server lifecycle,
+    /// writer, cleanup, retry, or stream buffering behavior itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first planning, DataFusion stream setup, upstream stream, SQL
+    /// Server connection, lifecycle, schema validation, write, or cleanup error.
+    pub async fn write_to_mssql(
+        &self,
+        request: &OutputWritePlan,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        let planned = self.plan_mssql_output(request)?;
+        let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
+        let batches = self.batch_stream_for_lazy_table(planned.table()).await?;
+
+        write_output_batches_to_mssql(
+            output_schema.as_ref(),
+            planned.resolved_target().clone(),
+            planned.output_plan().schema_plan_options(),
+            batches,
+            self.options.mssql_write_options(),
+        )
+        .await
     }
 
     /// Returns registered Delta source reports in registration order.
@@ -821,6 +876,64 @@ impl DeltaFunnelSession {
             .position(|pending| pending.table.id == table.id)
     }
 
+    pub(crate) async fn batch_stream_for_lazy_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
+        let dataframe = self.dataframe_for_lazy_table(table).await?;
+        let physical_plan = dataframe
+            .create_physical_plan()
+            .await
+            .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
+        let stream = datafusion_query_output_stream(physical_plan, self.context.task_ctx())
+            .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
+
+        Ok(Box::pin(stream.map(|batch| {
+            batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
+        })))
+    }
+
+    async fn dataframe_for_lazy_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<DataFrame, DeltaFunnelError> {
+        match table.kind() {
+            LazyTableKind::DeltaSource => {
+                let source = self
+                    .sources
+                    .iter()
+                    .find(|source| source.table.id == table.id)
+                    .ok_or_else(|| unknown_lazy_table_error(table))?;
+
+                self.context
+                    .table(source.name())
+                    .await
+                    .map_err(|error| datafusion_handoff_setup_error("registered_table", error))
+            }
+            LazyTableKind::DerivedSql => {
+                if let Some(derived) = self
+                    .derived_tables
+                    .iter()
+                    .find(|derived| derived.table.id == table.id)
+                {
+                    return self.context.table(derived.name()).await.map_err(|error| {
+                        datafusion_handoff_setup_error("registered_table", error)
+                    });
+                }
+
+                let pending = self
+                    .pending_derived_tables
+                    .iter()
+                    .find(|pending| pending.table.id == table.id)
+                    .ok_or_else(|| unknown_lazy_table_error(table))?;
+
+                self.context
+                    .read_table(Arc::clone(&pending.provider))
+                    .map_err(|error| datafusion_handoff_setup_error("pending_table", error))
+            }
+        }
+    }
+
     fn schema_for_lazy_table(&self, table: &LazyTable) -> Result<&SchemaRef, DeltaFunnelError> {
         match table.kind() {
             LazyTableKind::DeltaSource => self
@@ -840,12 +953,7 @@ impl DeltaFunnelSession {
                         .map(|pending| &pending.schema)
                 }),
         }
-        .ok_or_else(|| DeltaFunnelError::MssqlWorkflowPlanning {
-            message: format!(
-                "lazy table `{}` is not registered in this session",
-                sanitize_text_for_display(table.name())
-            ),
-        })
+        .ok_or_else(|| unknown_lazy_table_error(table))
     }
 }
 
@@ -890,6 +998,26 @@ fn sql_table_error<T>(
     })
 }
 
+fn unknown_lazy_table_error(table: &LazyTable) -> DeltaFunnelError {
+    DeltaFunnelError::MssqlWorkflowPlanning {
+        message: format!(
+            "lazy table `{}` is not registered in this session",
+            sanitize_text_for_display(table.name())
+        ),
+    }
+}
+
+fn datafusion_handoff_setup_error(
+    option: &'static str,
+    error: impl fmt::Display,
+) -> DeltaFunnelError {
+    DeltaFunnelError::BatchPipeline {
+        phase: BatchPipelinePhase::HandoffSetup,
+        option,
+        message: error.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -901,7 +1029,7 @@ mod tests {
     use super::*;
     use crate::{
         BatchPipelinePhase, DeltaProviderReaderBackend, DeltaStorageOptions, LoadMode,
-        MssqlConnectionSource, MssqlTargetTable,
+        MssqlConnectionSource, MssqlTargetTable, table_formats::RealParquetDeltaTable,
     };
 
     struct DeltaLogTable {
@@ -1018,6 +1146,18 @@ mod tests {
             table,
             MssqlOutputTarget::new(output_name, target_config, RunMode::DryRun),
         ))
+    }
+
+    async fn collect_stream_row_count(
+        mut stream: MssqlOutputBatchStream,
+    ) -> Result<usize, DeltaFunnelError> {
+        let mut rows = 0_usize;
+
+        while let Some(batch) = stream.next().await {
+            rows = rows.saturating_add(batch?.num_rows());
+        }
+
+        Ok(rows)
     }
 
     #[test]
@@ -1460,6 +1600,98 @@ mod tests {
         assert!(!debug.contains("override-secret"));
         assert!(!debug.contains("password"));
         assert!(!debug.contains("server=tcp"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_stream_for_lazy_table_reads_registered_delta_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+
+        let stream = session.batch_stream_for_lazy_table(&source).await?;
+        let rows = collect_stream_row_count(stream).await?;
+
+        assert_eq!(rows, table.rows());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_stream_for_lazy_table_reads_pending_derived_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session_options = SessionOptions::new().with_query_options(QueryOptions {
+            target_partitions: None,
+            output_batch_size: Some(1),
+        });
+        let mut session = DeltaFunnelSession::new(session_options)?;
+        let derived = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+
+        let stream = session.batch_stream_for_lazy_table(&derived).await?;
+        let rows = collect_stream_row_count(stream).await?;
+
+        assert_eq!(rows, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_stream_for_lazy_table_reads_registered_derived_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let derived = session
+            .table_from_sql("select 'alice' as customer_name")
+            .await?;
+        let alias = session.register_alias("customer_names", &derived)?;
+
+        let stream = session.batch_stream_for_lazy_table(&alias).await?;
+        let rows = collect_stream_row_count(stream).await?;
+
+        assert_eq!(rows, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_stream_for_lazy_table_rejects_unknown_table_before_execution()
+    -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session
+            .batch_stream_for_lazy_table(&LazyTable::placeholder(42, LazyTableKind::DeltaSource))
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("not registered in this session")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_to_mssql_requires_effective_connection_before_stream_setup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(
+            source,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.write_to_mssql(&request).await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MissingMssqlConnection { output_name })
+                if output_name == "orders_output"
+        ));
         Ok(())
     }
 
