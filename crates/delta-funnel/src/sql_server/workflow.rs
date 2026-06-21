@@ -156,6 +156,28 @@ impl MssqlWorkflowWriteOptions {
     pub const fn max_parallel_outputs(&self) -> usize {
         self.max_parallel_outputs
     }
+
+    /// Validates workflow write options before any output write side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeltaFunnelError::MssqlWorkflowPlanning`] when no output
+    /// writer is allowed or when parallel output writers are requested. The
+    /// current MVP is intentionally single-writer so callers cannot mistake
+    /// this workflow for a parallel writer pool or cross-output transaction.
+    pub fn validate(&self) -> Result<(), DeltaFunnelError> {
+        match self.max_parallel_outputs() {
+            1 => Ok(()),
+            0 => Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                message: "max_parallel_outputs must be at least 1".to_owned(),
+            }),
+            max_parallel_outputs => Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                message: format!(
+                    "parallel MSSQL output writers are not supported; requested {max_parallel_outputs}"
+                ),
+            }),
+        }
+    }
 }
 
 /// Structured report for a multi-output SQL Server write workflow.
@@ -486,17 +508,7 @@ where
 }
 
 fn ensure_sequential_options(options: MssqlWorkflowWriteOptions) -> Result<(), DeltaFunnelError> {
-    match options.max_parallel_outputs() {
-        1 => Ok(()),
-        0 => Err(DeltaFunnelError::MssqlWorkflowPlanning {
-            message: "max_parallel_outputs must be at least 1".to_owned(),
-        }),
-        max_parallel_outputs => Err(DeltaFunnelError::MssqlWorkflowPlanning {
-            message: format!(
-                "parallel MSSQL output writers are not supported; requested {max_parallel_outputs}"
-            ),
-        }),
-    }
+    options.validate()
 }
 
 fn failure_context(error: &DeltaFunnelError) -> Option<&MssqlWriteFailureContext> {

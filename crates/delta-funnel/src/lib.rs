@@ -12,6 +12,7 @@
 
 mod batch_pipeline;
 pub mod error;
+mod orchestrator;
 pub(crate) mod query_engine;
 mod redaction;
 mod sql_server;
@@ -22,6 +23,10 @@ pub use batch_pipeline::{
     RecordBatchConsumer, handoff_datafusion_query_output, handoff_record_batch_stream,
 };
 pub use error::DeltaFunnelError;
+pub use orchestrator::{
+    BatchOptions, DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan,
+    RunMode, SessionOptions, ValidationOptions,
+};
 pub use query_engine::{
     DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
