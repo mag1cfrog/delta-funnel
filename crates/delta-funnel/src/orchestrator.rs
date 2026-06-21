@@ -1469,6 +1469,51 @@ mod tests {
         ));
         assert!(session.derived_tables().is_empty());
         assert!(session.context().table("ORDERS").await.is_ok());
+        let alias = session.register_alias("recent_orders", &derived)?;
+        assert_eq!(alias.name(), "recent_orders");
+        assert_eq!(session.derived_tables().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_derived_alias_fails_without_consuming_pending_table()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let derived = session.table_from_sql("select id from orders").await?;
+
+        let error = session.register_alias("select", &derived);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::InvalidSourceName { name, .. }) if name == "select"
+        ));
+        assert!(session.derived_tables().is_empty());
+        let alias = session.register_alias("recent_orders", &derived)?;
+        assert_eq!(alias.name(), "recent_orders");
+        assert_eq!(session.derived_tables().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn register_alias_rejects_non_pending_table_handle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let error = session.register_alias("recent_orders", &source);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::SqlTable {
+                phase: SqlTablePhase::RegisterDerivedAlias,
+                message,
+            }) if message.contains("pending SQL-derived table")
+        ));
+        assert!(session.derived_tables().is_empty());
+        assert!(session.context().table("recent_orders").await.is_err());
         Ok(())
     }
 
