@@ -25,7 +25,7 @@ use super::{
 pub type MssqlOutputBatchStream =
     Pin<Box<dyn Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send>>;
 
-/// Factory that constructs a shaped batch stream for one attempted output.
+/// Factory that constructs a direct batch stream for one attempted output.
 pub type MssqlOutputBatchStreamFactory = Box<dyn FnOnce() -> MssqlOutputBatchStream + Send>;
 
 /// One deferred SQL Server output write job.

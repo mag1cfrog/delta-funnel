@@ -30,79 +30,6 @@ pub enum RunMode {
     DryRun,
 }
 
-/// Batch-shaping options reserved for the orchestrator output stream.
-///
-/// Issue #237 owns the stream adapter that will enforce these bounds. This
-/// early data shape validates local values so session construction can fail
-/// before any source reads or target side effects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BatchOptions {
-    max_rows_per_batch: usize,
-    max_buffered_batches: usize,
-    max_buffered_rows: usize,
-}
-
-impl Default for BatchOptions {
-    fn default() -> Self {
-        Self {
-            max_rows_per_batch: 100_000,
-            max_buffered_batches: 1,
-            max_buffered_rows: 100_000,
-        }
-    }
-}
-
-impl BatchOptions {
-    /// Builds validated batch-shaping options.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DeltaFunnelError::BatchPipeline`] when any bound is zero.
-    pub fn try_new(
-        max_rows_per_batch: usize,
-        max_buffered_batches: usize,
-        max_buffered_rows: usize,
-    ) -> Result<Self, DeltaFunnelError> {
-        let options = Self {
-            max_rows_per_batch,
-            max_buffered_batches,
-            max_buffered_rows,
-        };
-        options.validate()?;
-        Ok(options)
-    }
-
-    /// Returns the maximum rows allowed in one shaped output batch.
-    #[must_use]
-    pub const fn max_rows_per_batch(&self) -> usize {
-        self.max_rows_per_batch
-    }
-
-    /// Returns the maximum shaped batches buffered by the orchestrator.
-    #[must_use]
-    pub const fn max_buffered_batches(&self) -> usize {
-        self.max_buffered_batches
-    }
-
-    /// Returns the maximum shaped rows buffered by the orchestrator.
-    #[must_use]
-    pub const fn max_buffered_rows(&self) -> usize {
-        self.max_buffered_rows
-    }
-
-    /// Validates batch-shaping bounds before execution side effects.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DeltaFunnelError::BatchPipeline`] when any bound is zero.
-    pub fn validate(&self) -> Result<(), DeltaFunnelError> {
-        validate_nonzero_batch_option("max_rows_per_batch", self.max_rows_per_batch)?;
-        validate_nonzero_batch_option("max_buffered_batches", self.max_buffered_batches)?;
-        validate_nonzero_batch_option("max_buffered_rows", self.max_buffered_rows)?;
-        Ok(())
-    }
-}
-
 /// Validation options that can be checked before workflow side effects.
 ///
 /// Rich row-count and target-side validation belongs to issue #10. This type
@@ -152,7 +79,6 @@ impl ValidationOptions {
 pub struct SessionOptions {
     query_options: QueryOptions,
     provider_scan_options: DeltaProviderScanExecutionOptions,
-    batch_options: BatchOptions,
     mssql_schema_options: MssqlSchemaPlanOptions,
     mssql_write_options: MssqlWriteOptions,
     mssql_workflow_options: MssqlWorkflowWriteOptions,
@@ -165,7 +91,6 @@ impl Default for SessionOptions {
         Self {
             query_options: QueryOptions::default(),
             provider_scan_options: DeltaProviderScanExecutionOptions::default(),
-            batch_options: BatchOptions::default(),
             mssql_schema_options: MssqlSchemaPlanOptions::default(),
             mssql_write_options: default_mssql_write_options(),
             mssql_workflow_options: MssqlWorkflowWriteOptions::default(),
@@ -196,13 +121,6 @@ impl SessionOptions {
         provider_scan_options: DeltaProviderScanExecutionOptions,
     ) -> Self {
         self.provider_scan_options = provider_scan_options;
-        self
-    }
-
-    /// Sets orchestrator batch-shaping options.
-    #[must_use]
-    pub const fn with_batch_options(mut self, batch_options: BatchOptions) -> Self {
-        self.batch_options = batch_options;
         self
     }
 
@@ -265,12 +183,6 @@ impl SessionOptions {
         self.provider_scan_options
     }
 
-    /// Returns orchestrator batch-shaping options.
-    #[must_use]
-    pub const fn batch_options(&self) -> BatchOptions {
-        self.batch_options
-    }
-
     /// Returns SQL Server schema planning options.
     #[must_use]
     pub const fn mssql_schema_options(&self) -> MssqlSchemaPlanOptions {
@@ -305,12 +217,11 @@ impl SessionOptions {
     ///
     /// # Errors
     ///
-    /// Returns the first validation error from query, provider, batch,
-    /// workflow, or local validation options.
+    /// Returns the first validation error from query, provider, workflow, or
+    /// local validation options.
     pub fn validate(&self) -> Result<(), DeltaFunnelError> {
         self.query_options.validate()?;
         self.provider_scan_options.validate()?;
-        self.batch_options.validate()?;
         self.mssql_workflow_options.validate()?;
         self.validation_options.validate()?;
         Ok(())
@@ -323,7 +234,6 @@ impl fmt::Debug for SessionOptions {
             .debug_struct("SessionOptions")
             .field("query_options", &self.query_options)
             .field("provider_scan_options", &self.provider_scan_options)
-            .field("batch_options", &self.batch_options)
             .field("mssql_schema_options", &self.mssql_schema_options)
             .field("mssql_write_options", &self.mssql_write_options)
             .field("mssql_workflow_options", &self.mssql_workflow_options)
@@ -980,21 +890,6 @@ fn sql_table_error<T>(
     })
 }
 
-fn validate_nonzero_batch_option(
-    option: &'static str,
-    value: usize,
-) -> Result<(), DeltaFunnelError> {
-    if value == 0 {
-        return Err(DeltaFunnelError::BatchPipeline {
-            phase: crate::BatchPipelinePhase::Configuration,
-            option,
-            message: "must be greater than zero".to_owned(),
-        });
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1188,25 +1083,6 @@ mod tests {
         ));
 
         assert!(matches!(error, Err(DeltaFunnelError::Config { .. })));
-    }
-
-    #[test]
-    fn batch_option_validation_failure_reaches_session_construction() {
-        let error =
-            DeltaFunnelSession::new(SessionOptions::new().with_batch_options(BatchOptions {
-                max_rows_per_batch: 0,
-                max_buffered_batches: 1,
-                max_buffered_rows: 1,
-            }));
-
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::BatchPipeline {
-                phase: BatchPipelinePhase::Configuration,
-                option: "max_rows_per_batch",
-                ..
-            })
-        ));
     }
 
     #[test]
