@@ -1504,6 +1504,34 @@ mod tests {
     }
 
     #[test]
+    fn plan_mssql_output_rejects_invalid_target_identifier_before_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(
+            source,
+            "orders_output",
+            "orders\narchive",
+            LoadMode::CreateAndLoad,
+        )?;
+
+        let error = session.plan_mssql_output(&request);
+
+        assert!(matches!(
+            &error,
+            Err(DeltaFunnelError::MssqlDdlTargetIdentifier { output_name, .. })
+                if output_name == "orders_output"
+        ));
+        let display = error.err().ok_or("expected error")?.to_string();
+        assert!(!display.contains('\n'));
+        assert!(display.contains("control characters"));
+        Ok(())
+    }
+
+    #[test]
     fn plan_mssql_output_reports_unsupported_source_schema()
     -> Result<(), Box<dyn std::error::Error>> {
         let table =
