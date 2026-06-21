@@ -15,7 +15,8 @@ use futures_util::Stream;
 use crate::{DeltaFunnelError, redaction::sanitize_text_for_display};
 
 use super::{
-    MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlWriteFailureContext, MssqlWriteOptions,
+    LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlSchemaPlanOptions,
+    MssqlTargetSummary, MssqlTargetTable, MssqlWriteFailureContext, MssqlWriteOptions,
     MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_options,
     write_output_batches_to_mssql,
 };
@@ -220,6 +221,56 @@ pub enum MssqlOutputWriteStatus {
 }
 
 impl MssqlOutputWriteStatus {
+    /// Returns the selected output name for this status.
+    #[must_use]
+    pub fn output_name(&self) -> &str {
+        match self {
+            Self::Succeeded(report) => report.output_name(),
+            Self::Failed(report) => report.output_name(),
+            Self::Skipped(report) => report.output_name(),
+        }
+    }
+
+    /// Returns the effective SQL Server target table for this status.
+    #[must_use]
+    pub fn target_table(&self) -> &MssqlTargetTable {
+        match self {
+            Self::Succeeded(report) => report.target_table(),
+            Self::Failed(report) => report.target().table(),
+            Self::Skipped(report) => report.target().table(),
+        }
+    }
+
+    /// Returns the requested lifecycle mode for this output.
+    #[must_use]
+    pub fn load_mode(&self) -> LoadMode {
+        match self {
+            Self::Succeeded(report) => report.load_mode(),
+            Self::Failed(report) => report.target().load_mode(),
+            Self::Skipped(report) => report.target().load_mode(),
+        }
+    }
+
+    /// Returns where the effective connection came from.
+    #[must_use]
+    pub fn connection_source(&self) -> MssqlConnectionSource {
+        match self {
+            Self::Succeeded(report) => report.connection_source(),
+            Self::Failed(report) => report.target().connection_source(),
+            Self::Skipped(report) => report.target().connection_source(),
+        }
+    }
+
+    /// Returns the redacted effective connection summary.
+    #[must_use]
+    pub fn connection(&self) -> &MssqlConnectionSummary {
+        match self {
+            Self::Succeeded(report) => report.connection(),
+            Self::Failed(report) => report.target().connection(),
+            Self::Skipped(report) => report.target().connection(),
+        }
+    }
+
     /// Returns whether this output succeeded.
     #[must_use]
     pub const fn is_succeeded(&self) -> bool {
@@ -651,6 +702,62 @@ mod tests {
         assert!(matches!(failed, MssqlOutputWriteStatus::Failed(_)));
         assert_skipped_after(skipped_second, "second", "first")?;
         assert_skipped_after(skipped_third, "third", "first")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_status_accessors_cover_success_failure_and_skipped_variants()
+    -> Result<(), DeltaFunnelError> {
+        let first = output_plan("first", LoadMode::AppendExisting)?;
+        let second = output_plan("second", LoadMode::CreateAndLoad)?;
+        let third = output_plan("third", LoadMode::AppendExisting)?;
+        let first_report =
+            write_report(&first, 2, 1, false, MssqlTargetCleanupStatus::NotApplicable);
+        let failure = phase_error(
+            &second,
+            MssqlWritePhase::InitializeWriter,
+            0,
+            0,
+            false,
+            MssqlTargetCleanupStatus::NotAttempted,
+            "writer init failed",
+        );
+        let writer = FakeWorkflowWriter::new(vec![Ok(first_report), Err(failure)]);
+
+        let report = write_mssql_outputs_with_writer(
+            vec![job(first)?, job(second)?, job(third)?],
+            MssqlWorkflowWriteOptions::default(),
+            writer,
+        )
+        .await?;
+
+        let [success, failed, skipped] = report.outputs() else {
+            return Err(test_error("expected three output statuses"));
+        };
+        assert!(success.is_succeeded());
+        assert_eq!(success.output_name(), "first");
+        assert_eq!(success.target_table().table(), "first_orders");
+        assert_eq!(success.load_mode(), LoadMode::AppendExisting);
+        assert_eq!(
+            success.connection().display_label(),
+            Some("test connection")
+        );
+
+        assert!(failed.is_failed());
+        assert_eq!(failed.output_name(), "second");
+        assert_eq!(failed.target_table().table(), "second_orders");
+        assert_eq!(failed.load_mode(), LoadMode::CreateAndLoad);
+        assert_eq!(failed.connection().display_label(), Some("test connection"));
+
+        assert!(skipped.is_skipped());
+        assert_eq!(skipped.output_name(), "third");
+        assert_eq!(skipped.target_table().table(), "third_orders");
+        assert_eq!(skipped.load_mode(), LoadMode::AppendExisting);
+        assert_eq!(
+            skipped.connection().display_label(),
+            Some("test connection")
+        );
 
         Ok(())
     }
