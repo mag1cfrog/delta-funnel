@@ -189,6 +189,18 @@ pub enum DeltaFunnelError {
         reason: String,
     },
 
+    /// Lazy SQL-derived table planning or alias registration failed.
+    #[snafu(display(
+        "SQL table error during {phase}: {}",
+        sanitize_reason_for_display(message)
+    ))]
+    SqlTable {
+        /// Session SQL table phase that failed.
+        phase: SqlTablePhase,
+        /// Sanitized reason for the failure.
+        message: String,
+    },
+
     /// A Delta provider scan projection could not be planned.
     #[snafu(display(
         "Delta scan projection error for source `{}` ({}): {}",
@@ -528,6 +540,27 @@ pub enum DeltaFunnelError {
         /// Sanitized reason for the workflow planning failure.
         message: String,
     },
+}
+
+/// Phase associated with lazy SQL table construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlTablePhase {
+    /// Caller SQL text failed local validation.
+    ValidateSql,
+    /// DataFusion could not produce a lazy logical table.
+    PlanSql,
+    /// A derived table alias could not be registered in the session catalog.
+    RegisterDerivedAlias,
+}
+
+impl std::fmt::Display for SqlTablePhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ValidateSql => "SQL validation",
+            Self::PlanSql => "SQL planning",
+            Self::RegisterDerivedAlias => "derived alias registration",
+        })
+    }
 }
 
 fn sanitize_source_name_for_display(name: &str) -> String {

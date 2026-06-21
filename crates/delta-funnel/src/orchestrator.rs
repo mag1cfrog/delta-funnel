@@ -2,20 +2,21 @@
 //!
 //! This module owns the high-level session and request data shapes that will
 //! later back the Python `Session` and `Table` API. It intentionally does not
-//! load Delta sources, parse SQL, contact SQL Server, or execute rows.
+//! contact SQL Server, produce physical query plans, or execute rows.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SQLOptions, SessionContext};
+use datafusion::{datasource::TableProvider, prelude::DataFrame};
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, DeltaProviderScanExecutionOptions, DeltaSourceConfig,
     DeltaTableProviderConfig, MssqlConnectionConfig, MssqlSchemaPlanOptions, MssqlTargetConfig,
     MssqlWorkflowWriteOptions, MssqlWriteOptions, QueryOptions, RegisteredDeltaSource,
-    datafusion_session_context, default_mssql_write_options, load_delta_source,
+    SqlTablePhase, datafusion_session_context, default_mssql_write_options, load_delta_source,
     preflight_delta_protocol, redaction::sanitize_text_for_display,
-    register_delta_sources_with_scan_execution_options,
+    register_delta_sources_with_scan_execution_options, table_formats::validate_table_source_names,
 };
 
 /// Query-load action mode requested by a caller.
@@ -365,6 +366,22 @@ impl LazyTable {
         }
     }
 
+    fn derived_sql(id: u64) -> Self {
+        Self {
+            id: LazyTableId(id),
+            kind: LazyTableKind::DerivedSql,
+            name: format!("table_{id}"),
+        }
+    }
+
+    fn with_name(&self, name: String) -> Self {
+        Self {
+            id: self.id,
+            kind: self.kind,
+            name,
+        }
+    }
+
     /// Returns the stable session-local table id.
     #[must_use]
     pub const fn id(&self) -> u64 {
@@ -538,12 +555,61 @@ impl fmt::Debug for RegisteredSessionSource {
     }
 }
 
+/// Registered SQL-derived table alias tracked by a query-load session.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RegisteredDerivedTable {
+    table: LazyTable,
+    schema: SchemaRef,
+}
+
+impl RegisteredDerivedTable {
+    fn new(table: LazyTable, schema: SchemaRef) -> Self {
+        Self { table, schema }
+    }
+
+    /// Returns the lazy table handle for this registered derived alias.
+    #[must_use]
+    pub const fn table(&self) -> &LazyTable {
+        &self.table
+    }
+
+    /// Returns the DataFusion table name for this derived alias.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.table.name()
+    }
+
+    /// Returns the logical Arrow schema exposed to DataFusion.
+    #[must_use]
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+}
+
+impl fmt::Debug for RegisteredDerivedTable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredDerivedTable")
+            .field("table", &self.table)
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+struct PendingDerivedTable {
+    table: LazyTable,
+    provider: Arc<dyn TableProvider>,
+    schema: SchemaRef,
+}
+
 /// Rust backing session for lazy query-load workflows.
 pub struct DeltaFunnelSession {
     options: SessionOptions,
     context: SessionContext,
     next_table_id: u64,
     sources: Vec<RegisteredSessionSource>,
+    derived_tables: Vec<RegisteredDerivedTable>,
+    pending_derived_tables: Vec<PendingDerivedTable>,
 }
 
 impl DeltaFunnelSession {
@@ -561,6 +627,8 @@ impl DeltaFunnelSession {
             context,
             next_table_id: 0,
             sources: Vec::new(),
+            derived_tables: Vec::new(),
+            pending_derived_tables: Vec::new(),
         })
     }
 
@@ -587,6 +655,82 @@ impl DeltaFunnelSession {
         self.next_table_id
     }
 
+    /// Builds a lazy SQL-derived table without registering a query alias.
+    ///
+    /// The SQL must be one read-only tabular query. Planning uses DataFusion to
+    /// produce a lazy table provider and does not execute rows, contact SQL
+    /// Server, or create an output target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeltaFunnelError::SqlTable`] when the SQL is empty, contains
+    /// an unsupported or non-read-only statement, or cannot be planned against
+    /// the session's registered aliases.
+    pub async fn table_from_sql(&mut self, sql: &str) -> Result<LazyTable, DeltaFunnelError> {
+        let sql = sql.trim();
+        if sql.is_empty() {
+            return sql_table_error(SqlTablePhase::ValidateSql, "SQL text must not be empty");
+        }
+
+        let dataframe = self.plan_read_only_sql(sql).await?;
+        let schema = Arc::new(dataframe.schema().as_arrow().clone());
+        let provider = dataframe.into_view();
+        let table = self.allocate_derived_sql_table();
+        self.pending_derived_tables.push(PendingDerivedTable {
+            table: table.clone(),
+            provider,
+            schema,
+        });
+        Ok(table)
+    }
+
+    /// Registers a session-owned alias for a lazy SQL-derived table.
+    ///
+    /// Alias names use the same unquoted identifier rules as Delta source
+    /// aliases. The alias is registered into the session's DataFusion catalog
+    /// only after all local validation succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeltaFunnelError::InvalidSourceName`] or
+    /// [`DeltaFunnelError::DuplicateSourceName`] for invalid or ambiguous
+    /// aliases, and [`DeltaFunnelError::SqlTable`] when the table handle is not
+    /// a pending SQL-derived table owned by this session or DataFusion rejects
+    /// the alias registration.
+    pub fn register_alias(
+        &mut self,
+        name: impl Into<String>,
+        table: &LazyTable,
+    ) -> Result<LazyTable, DeltaFunnelError> {
+        let name = name.into();
+        validate_table_source_names([name.as_str()])?;
+        self.reject_registered_alias_name(&name)?;
+
+        let Some(index) = self.find_pending_derived_table(table) else {
+            return sql_table_error(
+                SqlTablePhase::RegisterDerivedAlias,
+                "lazy table is not a pending SQL-derived table owned by this session",
+            );
+        };
+        let pending = self.pending_derived_tables.remove(index);
+
+        if let Err(error) = self
+            .context
+            .register_table(name.as_str(), Arc::clone(&pending.provider))
+        {
+            let message = error.to_string();
+            self.pending_derived_tables.push(pending);
+            return sql_table_error(SqlTablePhase::RegisterDerivedAlias, message);
+        }
+
+        let alias_table = pending.table.with_name(name);
+        self.derived_tables.push(RegisteredDerivedTable::new(
+            alias_table.clone(),
+            pending.schema,
+        ));
+        Ok(alias_table)
+    }
+
     /// Registers one Delta source and returns its lazy table handle.
     ///
     /// The method performs source setup only: Delta snapshot metadata loading,
@@ -600,7 +744,7 @@ impl DeltaFunnelSession {
     /// alias, schema conversion, or DataFusion registration error. Session
     /// source state is updated only after the DataFusion registration succeeds.
     pub fn delta_lake(&mut self, source: DeltaSourceConfig) -> Result<LazyTable, DeltaFunnelError> {
-        self.reject_registered_source_name(&source.name)?;
+        self.reject_registered_alias_name(&source.name)?;
         let planned = load_delta_source(source)?;
         let preflight = preflight_delta_protocol(&planned)?;
         let registered = register_delta_sources_with_scan_execution_options(
@@ -640,19 +784,59 @@ impl DeltaFunnelSession {
             .find(|source| source.name().eq_ignore_ascii_case(name))
     }
 
+    /// Returns registered SQL-derived aliases in registration order.
+    #[must_use]
+    pub fn derived_tables(&self) -> &[RegisteredDerivedTable] {
+        &self.derived_tables
+    }
+
+    /// Finds a registered SQL-derived alias by name using unquoted SQL semantics.
+    #[must_use]
+    pub fn registered_derived_table(&self, name: &str) -> Option<&RegisteredDerivedTable> {
+        self.derived_tables
+            .iter()
+            .find(|table| table.name().eq_ignore_ascii_case(name))
+    }
+
+    async fn plan_read_only_sql(&self, sql: &str) -> Result<DataFrame, DeltaFunnelError> {
+        self.context
+            .sql_with_options(sql, read_only_sql_options())
+            .await
+            .map_err(|error| DeltaFunnelError::SqlTable {
+                phase: classify_sql_error_phase(&error.to_string()),
+                message: error.to_string(),
+            })
+    }
+
     fn allocate_delta_source_table(&mut self, name: String) -> LazyTable {
         let id = self.next_table_id;
         self.next_table_id = self.next_table_id.saturating_add(1);
         LazyTable::delta_source(id, name)
     }
 
-    fn reject_registered_source_name(&self, name: &str) -> Result<(), DeltaFunnelError> {
-        if self.registered_source(name).is_some() {
+    fn allocate_derived_sql_table(&mut self) -> LazyTable {
+        let id = self.next_table_id;
+        self.next_table_id = self.next_table_id.saturating_add(1);
+        LazyTable::derived_sql(id)
+    }
+
+    fn reject_registered_alias_name(&self, name: &str) -> Result<(), DeltaFunnelError> {
+        if self.registered_source(name).is_some() || self.registered_derived_table(name).is_some() {
             return Err(DeltaFunnelError::DuplicateSourceName {
                 name: name.to_owned(),
             });
         }
         Ok(())
+    }
+
+    fn find_pending_derived_table(&self, table: &LazyTable) -> Option<usize> {
+        if table.kind() != LazyTableKind::DerivedSql {
+            return None;
+        }
+
+        self.pending_derived_tables
+            .iter()
+            .position(|pending| pending.table.id == table.id)
     }
 }
 
@@ -662,9 +846,39 @@ impl fmt::Debug for DeltaFunnelSession {
             .debug_struct("DeltaFunnelSession")
             .field("options", &self.options)
             .field("sources", &self.sources)
+            .field("derived_tables", &self.derived_tables)
             .field("next_table_id", &self.next_table_id)
             .finish_non_exhaustive()
     }
+}
+
+fn read_only_sql_options() -> SQLOptions {
+    SQLOptions::new()
+        .with_allow_ddl(false)
+        .with_allow_dml(false)
+        .with_allow_statements(false)
+}
+
+fn classify_sql_error_phase(error: &str) -> SqlTablePhase {
+    if error.contains("DDL not supported")
+        || error.contains("DML not supported")
+        || error.contains("Statement not supported")
+        || error.contains("only supports a single SQL statement")
+    {
+        SqlTablePhase::ValidateSql
+    } else {
+        SqlTablePhase::PlanSql
+    }
+}
+
+fn sql_table_error<T>(
+    phase: SqlTablePhase,
+    message: impl Into<String>,
+) -> Result<T, DeltaFunnelError> {
+    Err(DeltaFunnelError::SqlTable {
+        phase,
+        message: message.into(),
+    })
 }
 
 fn validate_nonzero_batch_option(
@@ -1084,6 +1298,218 @@ mod tests {
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(1).name(), "customer_name");
         assert_eq!(session.sources().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_from_sql_builds_lazy_derived_table_without_row_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let derived = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+
+        assert_eq!(derived.id(), 1);
+        assert_eq!(derived.kind(), LazyTableKind::DerivedSql);
+        assert_eq!(derived.name(), "table_1");
+        assert_eq!(session.next_table_id(), 2);
+        assert!(session.derived_tables().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registered_derived_alias_can_be_referenced_by_later_sql()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let derived = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+
+        let alias = session.register_alias("recent_orders", &derived)?;
+        let second = session
+            .table_from_sql("select id from recent_orders")
+            .await?;
+
+        assert_eq!(alias.id(), derived.id());
+        assert_eq!(alias.name(), "recent_orders");
+        assert_eq!(second.id(), 2);
+        assert_eq!(second.kind(), LazyTableKind::DerivedSql);
+        assert_eq!(session.derived_tables().len(), 1);
+        let registered = session
+            .registered_derived_table("RECENT_ORDERS")
+            .ok_or("registered derived alias missing")?;
+        assert_eq!(registered.table(), &alias);
+        assert_eq!(registered.schema().fields().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_sql_fails_before_lazy_table_allocation() -> Result<(), DeltaFunnelError> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session.table_from_sql(" \n\t ").await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::SqlTable {
+                phase: SqlTablePhase::ValidateSql,
+                message,
+            }) if message.contains("must not be empty")
+        ));
+        assert_eq!(session.next_table_id(), 0);
+        assert!(session.derived_tables().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiple_sql_statements_fail_before_lazy_table_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let error = session
+            .table_from_sql("select id from orders; select id from orders")
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::SqlTable {
+                phase: SqlTablePhase::ValidateSql,
+                ..
+            })
+        ));
+        assert_eq!(session.next_table_id(), 1);
+        assert!(session.derived_tables().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ddl_sql_fails_before_alias_registration() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let error = session
+            .table_from_sql("create table created_orders as select id from orders")
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::SqlTable {
+                phase: SqlTablePhase::ValidateSql,
+                ..
+            })
+        ));
+        assert_eq!(session.next_table_id(), 1);
+        assert!(session.derived_tables().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dml_sql_fails_before_alias_registration() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let error = session
+            .table_from_sql("insert into orders select id, customer_name from orders")
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::SqlTable {
+                phase: SqlTablePhase::ValidateSql,
+                ..
+            })
+        ));
+        assert_eq!(session.next_table_id(), 1);
+        assert!(session.derived_tables().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_table_sql_fails_with_planning_context() -> Result<(), DeltaFunnelError> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session
+            .table_from_sql("select id from missing_orders")
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::SqlTable {
+                phase: SqlTablePhase::PlanSql,
+                message,
+            }) if message.contains("missing_orders")
+        ));
+        assert_eq!(session.next_table_id(), 0);
+        assert!(session.derived_tables().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_alias_duplicate_with_source_fails_before_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let derived = session.table_from_sql("select id from orders").await?;
+
+        let error = session.register_alias("ORDERS", &derived);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::DuplicateSourceName { name }) if name == "ORDERS"
+        ));
+        assert!(session.derived_tables().is_empty());
+        assert!(session.context().table("ORDERS").await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_alias_duplicate_with_derived_alias_fails_before_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let first = session.table_from_sql("select id from orders").await?;
+        session.register_alias("recent_orders", &first)?;
+        let second = session.table_from_sql("select id from orders").await?;
+
+        let error = session.register_alias("RECENT_ORDERS", &second);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::DuplicateSourceName { name }) if name == "RECENT_ORDERS"
+        ));
+        assert_eq!(session.derived_tables().len(), 1);
+        assert!(session.context().table("RECENT_ORDERS").await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_alias_duplicate_with_derived_alias_fails_before_loading_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let derived = session.table_from_sql("select id from orders").await?;
+        session.register_alias("recent_orders", &derived)?;
+
+        let error = session.delta_lake(DeltaSourceConfig::new("RECENT_ORDERS", ""));
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::DuplicateSourceName { name }) if name == "RECENT_ORDERS"
+        ));
+        assert_eq!(session.sources().len(), 1);
+        assert_eq!(session.derived_tables().len(), 1);
         Ok(())
     }
 

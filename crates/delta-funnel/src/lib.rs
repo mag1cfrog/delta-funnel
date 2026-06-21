@@ -22,10 +22,10 @@ pub use batch_pipeline::{
     BatchHandoffError, BatchHandoffOutcome, BatchHandoffStats, BatchPipelinePhase,
     RecordBatchConsumer, handoff_datafusion_query_output, handoff_record_batch_stream,
 };
-pub use error::DeltaFunnelError;
+pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
     BatchOptions, DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan,
-    RegisteredSessionSource, RunMode, SessionOptions, ValidationOptions,
+    RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions, ValidationOptions,
 };
 pub use query_engine::{
     DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
