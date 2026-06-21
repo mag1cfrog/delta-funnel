@@ -13,10 +13,11 @@ use datafusion::{datasource::TableProvider, prelude::DataFrame};
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, DeltaProviderScanExecutionOptions, DeltaSourceConfig,
     DeltaTableProviderConfig, MssqlConnectionConfig, MssqlSchemaPlanOptions, MssqlTargetConfig,
-    MssqlWorkflowWriteOptions, MssqlWriteOptions, QueryOptions, RegisteredDeltaSource,
-    SqlTablePhase, datafusion_session_context, default_mssql_write_options, load_delta_source,
-    preflight_delta_protocol, redaction::sanitize_text_for_display,
-    register_delta_sources_with_scan_execution_options, table_formats::validate_table_source_names,
+    MssqlTargetOutputPlan, MssqlWorkflowWriteOptions, MssqlWriteOptions, QueryOptions,
+    RegisteredDeltaSource, SqlTablePhase, datafusion_session_context, default_mssql_write_options,
+    load_delta_source, plan_mssql_target_for_output, preflight_delta_protocol,
+    redaction::sanitize_text_for_display, register_delta_sources_with_scan_execution_options,
+    table_formats::validate_table_source_names,
 };
 
 /// Query-load action mode requested by a caller.
@@ -493,6 +494,46 @@ impl OutputWritePlan {
     }
 }
 
+/// Planned MSSQL output request for one selected lazy table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedMssqlOutput {
+    request: OutputWritePlan,
+    output_plan: MssqlTargetOutputPlan,
+}
+
+impl PlannedMssqlOutput {
+    fn new(request: OutputWritePlan, output_plan: MssqlTargetOutputPlan) -> Self {
+        Self {
+            request,
+            output_plan,
+        }
+    }
+
+    /// Returns the original lazy-table output request.
+    #[must_use]
+    pub const fn request(&self) -> &OutputWritePlan {
+        &self.request
+    }
+
+    /// Returns the selected lazy table.
+    #[must_use]
+    pub const fn table(&self) -> &LazyTable {
+        self.request.table()
+    }
+
+    /// Returns the selected MSSQL target request.
+    #[must_use]
+    pub const fn target(&self) -> &MssqlOutputTarget {
+        self.request.target()
+    }
+
+    /// Returns the complete SQL Server target output plan.
+    #[must_use]
+    pub const fn output_plan(&self) -> &MssqlTargetOutputPlan {
+        &self.output_plan
+    }
+}
+
 /// Registered Delta source tracked by a query-load session.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RegisteredSessionSource {
@@ -770,6 +811,37 @@ impl DeltaFunnelSession {
         Ok(table)
     }
 
+    /// Plans one lazy table as an MSSQL output without executing the table.
+    ///
+    /// The selected table must be owned by this session. The method uses the
+    /// table's logical Arrow schema, resolves the effective SQL Server
+    /// connection from the output override or session default, and reuses the
+    /// SQL Server schema, DDL, and lifecycle planning rules. It intentionally
+    /// performs no SQL Server I/O, physical DataFusion planning, row reads,
+    /// batch streaming, or writer construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an MSSQL planning error when the selected table is not known to
+    /// this session, the target has no effective connection, the output or
+    /// target config is invalid, the schema cannot be mapped to SQL Server, or
+    /// the requested load mode is not supported by the current target planner.
+    pub fn plan_mssql_output(
+        &self,
+        request: &OutputWritePlan,
+    ) -> Result<PlannedMssqlOutput, DeltaFunnelError> {
+        let schema = self.schema_for_lazy_table(request.table())?;
+        let output_plan = plan_mssql_target_for_output(
+            schema.as_ref(),
+            request.target().output_name(),
+            request.target().target(),
+            self.options.default_mssql_connection(),
+            self.options.mssql_schema_options(),
+        )?;
+
+        Ok(PlannedMssqlOutput::new(request.clone(), output_plan))
+    }
+
     /// Returns registered Delta source reports in registration order.
     #[must_use]
     pub fn sources(&self) -> &[RegisteredSessionSource] {
@@ -837,6 +909,33 @@ impl DeltaFunnelSession {
         self.pending_derived_tables
             .iter()
             .position(|pending| pending.table.id == table.id)
+    }
+
+    fn schema_for_lazy_table(&self, table: &LazyTable) -> Result<&SchemaRef, DeltaFunnelError> {
+        match table.kind() {
+            LazyTableKind::DeltaSource => self
+                .sources
+                .iter()
+                .find(|source| source.table.id == table.id)
+                .map(RegisteredSessionSource::schema),
+            LazyTableKind::DerivedSql => self
+                .derived_tables
+                .iter()
+                .find(|derived| derived.table.id == table.id)
+                .map(RegisteredDerivedTable::schema)
+                .or_else(|| {
+                    self.pending_derived_tables
+                        .iter()
+                        .find(|pending| pending.table.id == table.id)
+                        .map(|pending| &pending.schema)
+                }),
+        }
+        .ok_or_else(|| DeltaFunnelError::MssqlWorkflowPlanning {
+            message: format!(
+                "lazy table `{}` is not registered in this session",
+                sanitize_text_for_display(table.name())
+            ),
+        })
     }
 }
 
@@ -907,7 +1006,7 @@ mod tests {
     use super::*;
     use crate::{
         BatchPipelinePhase, DeltaProviderReaderBackend, DeltaStorageOptions, LoadMode,
-        MssqlTargetTable,
+        MssqlConnectionSource, MssqlTargetTable,
     };
 
     struct DeltaLogTable {
@@ -922,12 +1021,27 @@ mod tests {
 
     impl DeltaLogTable {
         fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
-            Self::new_with_protocol(name, PROTOCOL_JSON)
+            Self::new_with_protocol_and_schema(name, PROTOCOL_JSON, DEFAULT_SCHEMA_FIELDS_JSON)
         }
 
         fn new_with_protocol(
             name: &str,
             protocol_json: &str,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_protocol_and_schema(name, protocol_json, DEFAULT_SCHEMA_FIELDS_JSON)
+        }
+
+        fn new_with_schema(
+            name: &str,
+            schema_fields_json: &str,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_protocol_and_schema(name, PROTOCOL_JSON, schema_fields_json)
+        }
+
+        fn new_with_protocol_and_schema(
+            name: &str,
+            protocol_json: &str,
+            schema_fields_json: &str,
         ) -> Result<Self, Box<dyn std::error::Error>> {
             let path = Path::new("target")
                 .join("delta-funnel-orchestrator-tests")
@@ -936,11 +1050,7 @@ mod tests {
             fs::create_dir_all(&log_path)?;
             fs::write(
                 log_path.join("00000000000000000000.json"),
-                format!(
-                    "{}\n{}\n",
-                    protocol_json,
-                    metadata_json(DEFAULT_SCHEMA_FIELDS_JSON)
-                ),
+                format!("{}\n{}\n", protocol_json, metadata_json(schema_fields_json)),
             )?;
             fs::write(
                 log_path.join("00000000000000000001.json"),
@@ -968,6 +1078,7 @@ mod tests {
     const UNSUPPORTED_PROTOCOL_JSON: &str =
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":2}}"#;
     const DEFAULT_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+    const UNSUPPORTED_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]"#;
 
     fn metadata_json(schema_fields_json: &str) -> String {
         format!(
@@ -991,6 +1102,27 @@ mod tests {
             "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
         )?
         .with_display_label("warehouse-primary"))
+    }
+
+    fn override_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
+        Ok(MssqlConnectionConfig::new(
+            "server=tcp:override.example.com;database=warehouse;user=writer;password=override-secret",
+        )?
+        .with_display_label("warehouse-override"))
+    }
+
+    fn output_request(
+        table: LazyTable,
+        output_name: &str,
+        target_table: &str,
+        load_mode: LoadMode,
+    ) -> Result<OutputWritePlan, DeltaFunnelError> {
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", target_table)?)
+            .with_load_mode(load_mode);
+        Ok(OutputWritePlan::new(
+            table,
+            MssqlOutputTarget::new(output_name, target_config, RunMode::DryRun),
+        ))
     }
 
     #[test]
@@ -1137,6 +1269,291 @@ mod tests {
         let debug = format!("{target:?}");
         assert!(debug.contains("orders_output"));
         assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("server=tcp"));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mssql_output_uses_source_schema_and_session_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(
+            source.clone(),
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+
+        let planned = session.plan_mssql_output(&request)?;
+
+        assert_eq!(planned.request(), &request);
+        assert_eq!(planned.table(), &source);
+        assert_eq!(planned.target().run_mode(), RunMode::DryRun);
+        assert_eq!(planned.output_plan().output_name(), "orders_output");
+        assert_eq!(planned.output_plan().target_table().schema(), Some("dbo"));
+        assert_eq!(planned.output_plan().target_table().table(), "orders_sink");
+        assert_eq!(
+            planned.output_plan().connection_source(),
+            MssqlConnectionSource::ContextDefault
+        );
+        assert_eq!(
+            planned.output_plan().connection().display_label(),
+            Some("warehouse-primary")
+        );
+        assert_eq!(planned.output_plan().schema_mappings().len(), 2);
+        assert_eq!(
+            planned.output_plan().schema_mappings()[0].arrow().name(),
+            "id"
+        );
+        assert_eq!(
+            planned.output_plan().schema_mappings()[1].arrow().name(),
+            "customer_name"
+        );
+        assert_eq!(planned.output_plan().create_table_sql(), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_mssql_output_uses_pending_derived_schema_without_row_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let derived = session.table_from_sql("select id from orders").await?;
+        let request = output_request(
+            derived.clone(),
+            "derived_orders_output",
+            "derived_orders",
+            LoadMode::CreateAndLoad,
+        )?;
+
+        let planned = session.plan_mssql_output(&request)?;
+
+        assert_eq!(planned.table(), &derived);
+        assert_eq!(planned.output_plan().load_mode(), LoadMode::CreateAndLoad);
+        assert_eq!(planned.output_plan().schema_mappings().len(), 1);
+        assert_eq!(
+            planned.output_plan().schema_mappings()[0].arrow().name(),
+            "id"
+        );
+        let create_table_sql = planned
+            .output_plan()
+            .create_table_sql()
+            .ok_or("expected create table SQL")?;
+        assert!(create_table_sql.contains("[dbo].[derived_orders]"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_mssql_output_accepts_registered_derived_alias_handle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let derived = session
+            .table_from_sql("select customer_name from orders")
+            .await?;
+        let alias = session.register_alias("customer_names", &derived)?;
+        let request = output_request(
+            alias.clone(),
+            "customer_names_output",
+            "customer_names_sink",
+            LoadMode::AppendExisting,
+        )?;
+
+        let planned = session.plan_mssql_output(&request)?;
+
+        assert_eq!(planned.table(), &alias);
+        assert_eq!(planned.output_plan().schema_mappings().len(), 1);
+        assert_eq!(
+            planned.output_plan().schema_mappings()[0].arrow().name(),
+            "customer_name"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mssql_output_connection_override_wins_without_mutating_session_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders_sink")?)
+            .with_connection(override_connection()?);
+        let request = OutputWritePlan::new(
+            source,
+            MssqlOutputTarget::new("orders_output", target_config, RunMode::DryRun),
+        );
+
+        let planned = session.plan_mssql_output(&request)?;
+
+        assert_eq!(
+            planned.output_plan().connection_source(),
+            MssqlConnectionSource::TargetOverride
+        );
+        assert_eq!(
+            planned.output_plan().connection().display_label(),
+            Some("warehouse-override")
+        );
+        assert_eq!(
+            session
+                .options()
+                .default_mssql_connection()
+                .ok_or("expected default connection")?
+                .summary()
+                .display_label(),
+            Some("warehouse-primary")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mssql_output_missing_effective_connection_fails_before_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(
+            source,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.plan_mssql_output(&request);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MissingMssqlConnection { output_name })
+                if output_name == "orders_output"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mssql_output_rejects_replace_before_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(source, "orders_output", "orders_sink", LoadMode::Replace)?;
+
+        let error = session.plan_mssql_output(&request);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlLifecyclePlanning { output_name, message })
+                if output_name == "orders_output" && message.contains("replace load mode")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mssql_output_rejects_unknown_lazy_table_before_target_planning()
+    -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let request = output_request(
+            LazyTable::placeholder(42, LazyTableKind::DeltaSource),
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.plan_mssql_output(&request);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("not registered in this session")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mssql_output_rejects_invalid_output_name() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(source, "  ", "orders_sink", LoadMode::AppendExisting)?;
+
+        let error = session.plan_mssql_output(&request);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::InvalidMssqlOutputIdentity { output_name, .. })
+                if output_name == "  "
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mssql_output_reports_unsupported_source_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table =
+            DeltaLogTable::new_with_schema("unsupported-schema", UNSUPPORTED_SCHEMA_FIELDS_JSON)?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source =
+            session.delta_lake(DeltaSourceConfig::new("unsupported_schema", table.uri()))?;
+        let request = output_request(
+            source,
+            "unsupported_output",
+            "unsupported_sink",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.plan_mssql_output(&request);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlSchemaPlanning {
+                output_name,
+                diagnostics,
+            }) if output_name == "unsupported_output" && !diagnostics.is_empty()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn planned_mssql_output_debug_redacts_connection_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders_sink")?)
+            .with_connection(override_connection()?);
+        let request = OutputWritePlan::new(
+            source,
+            MssqlOutputTarget::new("orders_output", target_config, RunMode::DryRun),
+        );
+
+        let planned = session.plan_mssql_output(&request)?;
+        let debug = format!("{planned:?}");
+
+        assert!(debug.contains("orders_output"));
+        assert!(debug.contains("warehouse-override"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("override-secret"));
         assert!(!debug.contains("password"));
         assert!(!debug.contains("server=tcp"));
         Ok(())
