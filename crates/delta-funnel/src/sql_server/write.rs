@@ -2,7 +2,7 @@
 //!
 //! This module owns DeltaFunnel-side write defaults around `arrow-tiberius`.
 
-use std::fmt;
+use std::{fmt, time::Instant};
 
 use arrow_schema::Schema;
 pub use arrow_tiberius::WriteOptions as MssqlWriteOptions;
@@ -599,8 +599,7 @@ pub fn validate_mssql_output_schema(
         mssql_batch_schema_validation_error(
             output_plan,
             source,
-            0,
-            0,
+            MssqlWriteProgress::zero(),
             false,
             MssqlTargetCleanupStatus::NotApplicable,
         )
@@ -627,8 +626,7 @@ pub fn validate_mssql_output_record_batch(
         mssql_batch_schema_validation_error(
             output_plan,
             source,
-            0,
-            0,
+            MssqlWriteProgress::zero(),
             false,
             MssqlTargetCleanupStatus::NotApplicable,
         )
@@ -642,8 +640,7 @@ pub fn validate_mssql_output_record_batch(
 fn mssql_batch_schema_validation_error(
     output_plan: &MssqlTargetOutputPlan,
     source: arrow_tiberius::Error,
-    rows_written: u64,
-    batches_written: u64,
+    progress: MssqlWriteProgress,
     partial_write_possible: bool,
     cleanup: MssqlTargetCleanupStatus,
 ) -> DeltaFunnelError {
@@ -651,9 +648,9 @@ fn mssql_batch_schema_validation_error(
         context: Box::new(MssqlWriteFailureContext::from_output_plan(
             output_plan,
             MssqlWritePhase::ValidateBatchSchema,
-            rows_written,
-            batches_written,
-            0,
+            progress.rows_written,
+            progress.batches_written,
+            progress.elapsed_ms,
             partial_write_possible,
             cleanup,
         )),
@@ -676,15 +673,16 @@ where
     let mut rows_written = 0_u64;
     let mut batches_written = 0_u64;
     let cleanup = MssqlTargetCleanupStatus::NotApplicable;
+    let started_at = Instant::now();
     pin_mut!(batches);
 
     while let Some(batch) = batches.next().await {
         let batch = batch.map_err(|source| {
+            let elapsed_ms = elapsed_ms_since(started_at);
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::PollBatchStream,
-                rows_written,
-                batches_written,
+                MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                 partial_write_possible(output_plan, rows_written, batches_written),
                 cleanup,
                 source.to_string(),
@@ -696,11 +694,11 @@ where
             output_plan.schema_mappings(),
         )
         .map_err(|source| {
+            let elapsed_ms = elapsed_ms_since(started_at);
             mssql_batch_schema_validation_error(
                 output_plan,
                 source,
-                rows_written,
-                batches_written,
+                MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                 partial_write_possible(output_plan, rows_written, batches_written),
                 cleanup,
             )
@@ -710,11 +708,11 @@ where
         MssqlBulkLoadWriter::write_batch(&mut writer, &batch)
             .await
             .map_err(|source| {
+                let elapsed_ms = elapsed_ms_since(started_at);
                 mssql_write_phase_error(
                     output_plan,
                     MssqlWritePhase::WriteBatch,
-                    rows_written,
-                    batches_written,
+                    MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                     partial_write_possible(output_plan, rows_written, batches_written),
                     cleanup,
                     source.to_string(),
@@ -728,11 +726,11 @@ where
     MssqlBulkLoadWriter::finish(writer)
         .await
         .map_err(|source| {
+            let elapsed_ms = elapsed_ms_since(started_at);
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::Finalize,
-                rows_written,
-                batches_written,
+                MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                 partial_write_possible(output_plan, rows_written, batches_written),
                 cleanup,
                 source.to_string(),
@@ -743,7 +741,7 @@ where
         output_plan,
         rows_written,
         batches_written,
-        0,
+        elapsed_ms_since(started_at),
         false,
         cleanup,
     ))
@@ -752,8 +750,7 @@ where
 fn mssql_write_phase_error(
     output_plan: &MssqlTargetOutputPlan,
     phase: MssqlWritePhase,
-    rows_written: u64,
-    batches_written: u64,
+    progress: MssqlWriteProgress,
     partial_write_possible: bool,
     cleanup: MssqlTargetCleanupStatus,
     message: String,
@@ -762,9 +759,9 @@ fn mssql_write_phase_error(
         context: Box::new(MssqlWriteFailureContext::from_output_plan(
             output_plan,
             phase,
-            rows_written,
-            batches_written,
-            0,
+            progress.rows_written,
+            progress.batches_written,
+            progress.elapsed_ms,
             partial_write_possible,
             cleanup,
         )),
@@ -781,8 +778,7 @@ fn mssql_writer_initialization_error(
     mssql_write_phase_error(
         output_plan,
         MssqlWritePhase::InitializeWriter,
-        0,
-        0,
+        MssqlWriteProgress::zero(),
         false,
         cleanup,
         format!("prepared target action {prepared_action:?}: {message}"),
@@ -834,13 +830,41 @@ fn partial_write_possible(
     output_plan.load_mode() == LoadMode::AppendExisting && (rows_written > 0 || batches_written > 0)
 }
 
+#[derive(Clone, Copy)]
+struct MssqlWriteProgress {
+    rows_written: u64,
+    batches_written: u64,
+    elapsed_ms: u64,
+}
+
+impl MssqlWriteProgress {
+    const fn new(rows_written: u64, batches_written: u64, elapsed_ms: u64) -> Self {
+        Self {
+            rows_written,
+            batches_written,
+            elapsed_ms,
+        }
+    }
+
+    const fn zero() -> Self {
+        Self::new(0, 0, 0)
+    }
+}
+
+fn elapsed_ms_since(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn batch_row_count(row_count: usize) -> u64 {
     u64::try_from(row_count).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::{
+        sync::{Arc, Mutex, MutexGuard},
+        time::Duration,
+    };
 
     use arrow_schema::{DataType, Field, Schema};
     use arrow_tiberius::{
@@ -880,6 +904,7 @@ mod tests {
         log: Option<Arc<Mutex<FakeBulkLoadWriterLog>>>,
         fail_on_write_batch: Option<u64>,
         fail_on_finish: bool,
+        write_delay: Option<Duration>,
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -904,6 +929,11 @@ mod tests {
 
         fn fail_on_write_batch(mut self, write_batch_call: u64) -> Self {
             self.fail_on_write_batch = Some(write_batch_call);
+            self
+        }
+
+        fn delay_writes_by(mut self, delay: Duration) -> Self {
+            self.write_delay = Some(delay);
             self
         }
 
@@ -945,6 +975,9 @@ mod tests {
                     });
                 };
                 log.batch_rows.push(row_count);
+            }
+            if let Some(delay) = self.write_delay {
+                tokio::time::sleep(delay).await;
             }
             let write_batch_call = self.accepted_batches.saturating_add(1);
             if self.fail_on_write_batch == Some(write_batch_call) {
@@ -1351,7 +1384,8 @@ mod tests {
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_for_orders_schema()?;
         let log = Arc::new(Mutex::new(FakeBulkLoadWriterLog::default()));
-        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log));
+        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log))
+            .delay_writes_by(Duration::from_millis(2));
         let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
         let second = orders_batch(vec![3], vec![None])?;
         let batches = stream::iter(vec![Ok(first), Ok(second)]);
@@ -1367,6 +1401,7 @@ mod tests {
         assert_eq!(report.output_name(), "orders_output");
         assert_eq!(report.stats().rows_written(), 3);
         assert_eq!(report.stats().batches_written(), 2);
+        assert!(report.stats().elapsed_ms() > 0);
         assert!(!report.partial_write_possible());
         assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
 
@@ -1473,7 +1508,9 @@ mod tests {
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_for_orders_schema()?;
         let log = Arc::new(Mutex::new(FakeBulkLoadWriterLog::default()));
-        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log)).fail_on_write_batch(2);
+        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log))
+            .fail_on_write_batch(2)
+            .delay_writes_by(Duration::from_millis(2));
         let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
         let second = orders_batch(vec![3], vec![None])?;
         let batches = stream::iter(vec![Ok(first), Ok(second)]);
@@ -1494,7 +1531,18 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_write_phase_error(error, MssqlWritePhase::WriteBatch, 2, 1, true)?;
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MSSQL write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::WriteBatch);
+        assert_eq!(context.output_name(), "orders_output");
+        assert_eq!(context.stats().rows_written(), 2);
+        assert_eq!(context.stats().batches_written(), 1);
+        assert!(context.stats().elapsed_ms() > 0);
+        assert!(context.partial_write_possible());
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 0);
