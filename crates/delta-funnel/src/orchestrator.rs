@@ -570,7 +570,12 @@ impl DeltaFunnelSession {
         &self.options
     }
 
-    /// Returns the owned DataFusion session context.
+    /// Returns the DataFusion session context owned by this orchestrator.
+    ///
+    /// The session context is exposed so later planning steps can analyze SQL
+    /// against registered session aliases. Delta source registration should
+    /// still go through [`DeltaFunnelSession::delta_lake`] so the orchestrator's
+    /// source reports stay aligned with the DataFusion catalog.
     #[must_use]
     pub const fn context(&self) -> &SessionContext {
         &self.context
@@ -1006,6 +1011,44 @@ mod tests {
         ));
         assert!(session.sources().is_empty());
         assert_eq!(session.next_table_id(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protocol_preflight_failure_does_not_leak_datafusion_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session.delta_lake(DeltaSourceConfig::new("unsupported", table.uri()));
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::DeltaProtocolCompatibility { .. })
+        ));
+        assert!(session.context().table("unsupported").await.is_err());
+        assert!(session.sources().is_empty());
+        assert_eq!(session.next_table_id(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registered_source_sql_analysis_does_not_read_data_files_for_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let dataframe = session
+            .context()
+            .sql("select id, customer_name from orders")
+            .await?;
+        let schema = dataframe.schema();
+
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "customer_name");
+        assert_eq!(session.sources().len(), 1);
         Ok(())
     }
 
