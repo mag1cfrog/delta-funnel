@@ -24,7 +24,7 @@ use super::{
 /// Fakeable bulk-load writer boundary for one planned SQL Server output.
 #[async_trait]
 pub(crate) trait MssqlBulkLoadWriter: Sized + Send {
-    /// Writes one already-shaped record batch.
+    /// Writes one record batch.
     async fn write_batch(
         &mut self,
         batch: &RecordBatch,
