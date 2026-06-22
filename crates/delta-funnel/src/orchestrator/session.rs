@@ -2804,6 +2804,50 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn cache_plan_skips_registered_derived_alias_with_missing_sql_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let registered = session
+            .derived_tables
+            .iter_mut()
+            .find(|derived| derived.table().id() == big.id())
+            .ok_or("registered derived alias missing")?;
+        registered.sql_text.clear();
+        let west = session
+            .table_from_sql("select id from big where customer_name = 'alice'")
+            .await?;
+        let east = session
+            .table_from_sql("select id from big where customer_name = 'bob'")
+            .await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+
+        let plan = session.plan_mssql_output_cache(&[west, east]);
+
+        assert_eq!(
+            plan.decision(),
+            &MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::NoSharedRegisteredDerivedAlias,
+            }
+        );
+        assert_eq!(plan.skipped_candidates().len(), 1);
+        let skipped = &plan.skipped_candidates()[0];
+        assert_eq!(skipped.table_id(), big.id());
+        assert_eq!(skipped.alias(), "big");
+        assert_eq!(
+            skipped.reason(),
+            &MssqlCacheCandidateSkipReason::MissingSqlText
+        );
+        Ok(())
+    }
+
     #[test]
     fn plan_mssql_output_uses_source_schema_and_session_connection()
     -> Result<(), Box<dyn std::error::Error>> {
