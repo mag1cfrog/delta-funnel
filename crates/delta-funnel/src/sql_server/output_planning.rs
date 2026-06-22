@@ -9,7 +9,8 @@ use super::{
     LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary, MssqlDdlPlan,
     MssqlLifecyclePlan, MssqlSchemaDiagnostic, MssqlSchemaPlan, MssqlSchemaPlanOptions,
     MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetSummary, MssqlTargetTable,
-    plan_mssql_create_table_ddl, plan_mssql_lifecycle, plan_mssql_output_schema,
+    ResolvedMssqlTarget, plan_mssql_create_table_ddl, plan_mssql_lifecycle,
+    plan_mssql_output_schema,
 };
 
 /// Complete SQL Server target planning artifact for one selected output.
@@ -117,7 +118,21 @@ pub fn plan_mssql_target_for_output(
         output_name: Some(output_name),
         default_connection,
     })?;
-    let schema_plan = plan_mssql_output_schema(output_schema, &target, options)?;
+
+    plan_mssql_target_for_resolved_output(output_schema, &target, options)
+}
+
+/// Plans one selected output schema for an already resolved SQL Server target.
+///
+/// Use this when an orchestrator needs to retain the resolved target for later
+/// SQL Server connection setup while still reusing the lower-level schema, DDL,
+/// and lifecycle planning path.
+pub fn plan_mssql_target_for_resolved_output(
+    output_schema: impl AsRef<Schema>,
+    target: &ResolvedMssqlTarget,
+    options: MssqlSchemaPlanOptions,
+) -> Result<MssqlTargetOutputPlan, DeltaFunnelError> {
+    let schema_plan = plan_mssql_output_schema(output_schema, target, options)?;
 
     plan_mssql_target_output(schema_plan)
 }

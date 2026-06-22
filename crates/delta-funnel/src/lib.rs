@@ -55,8 +55,9 @@ pub use sql_server::{
     MssqlWriteStats, ResolvedMssqlTarget, default_mssql_write_options,
     mssql_schema_diagnostic_reports, mssql_write_options_for_output_plan,
     plan_mssql_create_table_ddl, plan_mssql_lifecycle, plan_mssql_output_schema,
-    plan_mssql_target_for_output, plan_mssql_target_output, validate_mssql_output_record_batch,
-    validate_mssql_output_schema, write_mssql_outputs_to_mssql, write_output_batches_to_mssql,
+    plan_mssql_target_for_output, plan_mssql_target_for_resolved_output, plan_mssql_target_output,
+    validate_mssql_output_record_batch, validate_mssql_output_schema, write_mssql_outputs_to_mssql,
+    write_output_batches_to_mssql,
 };
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,
