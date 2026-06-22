@@ -1,4 +1,4 @@
-//! Environment-gated SQL Server DirectRawBulk integration tests.
+//! Environment-gated SQL Server integration tests.
 //!
 //! These tests skip when the SQL Server test connection environment variables
 //! are absent, so default workspace test runs do not require SQL Server.
@@ -18,8 +18,9 @@ use datafusion::arrow::{
     record_batch::RecordBatch,
 };
 use delta_funnel::{
-    DeltaFunnelError, LoadMode, MssqlConnectionConfig, MssqlSchemaPlanOptions,
-    MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetResolutionContext, MssqlTargetTable,
+    DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession, LoadMode, MssqlConnectionConfig,
+    MssqlOutputTarget, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus, MssqlTargetConfig,
+    MssqlTargetResolutionContext, MssqlTargetTable, OutputWritePlan, RunMode, SessionOptions,
     default_mssql_write_options, write_output_batches_to_mssql,
 };
 use futures_util::stream;
@@ -28,6 +29,7 @@ const CONNECTION_STRING_ENV: &str = "DELTA_FUNNEL_MSSQL_TEST_CONNECTION_STRING";
 const SCHEMA_ENV: &str = "DELTA_FUNNEL_MSSQL_TEST_SCHEMA";
 const APPEND_EXISTING_OUTPUT_NAME: &str = "mssql_direct_raw_bulk_append_orders";
 const CREATE_AND_LOAD_OUTPUT_NAME: &str = "mssql_direct_raw_bulk_create_orders";
+const ORCHESTRATOR_OUTPUT_NAME: &str = "mssql_orchestrator_runtime_orders";
 const EXPECTED_ORDER_IDS: &[i64] = &[101, 102, 103];
 static NEXT_TABLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -113,6 +115,16 @@ async fn mssql_direct_raw_bulk_create_and_load_writes_two_batches_when_configure
     };
 
     run_create_and_load_direct_raw_bulk_test(config).await
+}
+
+#[test]
+fn mssql_orchestrator_runtime_create_and_load_writes_query_output_when_configured() -> TestResult<()>
+{
+    let Some(config) = configured_or_skip() else {
+        return Ok(());
+    };
+
+    run_create_and_load_orchestrator_runtime_test(config)
 }
 
 async fn run_append_existing_direct_raw_bulk_test(
@@ -211,6 +223,62 @@ async fn run_create_and_load_direct_raw_bulk_test(
     }
 }
 
+fn run_create_and_load_orchestrator_runtime_test(config: MssqlIntegrationConfig) -> TestResult<()> {
+    let table = unique_table_name(&config.schema)?;
+    let admin_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    admin_runtime.block_on(async {
+        let mut admin = connect_mssql_client_from_ado_string(&config.connection_string).await?;
+        drop_table_if_exists(&mut admin, &table).await
+    })?;
+
+    let write_result = write_orchestrator_runtime_order_ids(&config, table.table().as_str());
+
+    let cleanup_result = admin_runtime.block_on(async {
+        let mut admin = connect_mssql_client_from_ado_string(&config.connection_string).await?;
+        let assertion_result = async {
+            if !admin.table_exists(&table).await? {
+                return Err(test_error(format!(
+                    "created MSSQL test table is not visible: {}",
+                    table.quoted_sql()
+                )));
+            }
+            assert_order_ids_persisted(&mut admin, &table, EXPECTED_ORDER_IDS).await
+        }
+        .await;
+        let cleanup_result = drop_table_if_exists(&mut admin, &table).await;
+
+        match (assertion_result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(assertion_error), Ok(())) => Err(assertion_error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(assertion_error), Err(cleanup_error)) => Err(test_error(format!(
+                "assertion failed: {assertion_error}; cleanup failed: {cleanup_error}"
+            ))),
+        }
+    });
+
+    match (write_result, cleanup_result) {
+        (Ok(report), Ok(())) => {
+            assert_eq!(report.stats().output_name(), ORCHESTRATOR_OUTPUT_NAME);
+            assert_eq!(report.stats().rows_written(), 3);
+            assert!(report.stats().batches_written() >= 1);
+            assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotAttempted);
+            Ok(())
+        }
+        (Err(write_error), Ok(())) => Err(write_error),
+        (Ok(report), Err(cleanup_error)) => Err(test_error(format!(
+            "write succeeded with {}; cleanup failed: {cleanup_error}",
+            write_report_summary(&report)
+        ))),
+        (Err(write_error), Err(cleanup_error)) => Err(test_error(format!(
+            "write failed: {write_error}; cleanup failed: {cleanup_error}"
+        ))),
+    }
+}
+
 async fn write_order_id_batches(
     config: &MssqlIntegrationConfig,
     table_name: &str,
@@ -243,6 +311,35 @@ async fn write_order_id_batches(
         default_mssql_write_options(),
     )
     .await?)
+}
+
+fn write_orchestrator_runtime_order_ids(
+    config: &MssqlIntegrationConfig,
+    table_name: &str,
+) -> TestResult<delta_funnel::MssqlWriteReport> {
+    let connection = MssqlConnectionConfig::new(config.connection_string.clone())?
+        .with_display_label("mssql-orchestrator-runtime-integration");
+    let runtime = DeltaFunnelRuntime::new()?;
+    let mut session =
+        DeltaFunnelSession::new(SessionOptions::new().with_default_mssql_connection(connection))?;
+    let orders = runtime.table_from_sql(
+        &mut session,
+        "\
+select cast(101 as bigint) as order_id
+union all select cast(102 as bigint) as order_id
+union all select cast(103 as bigint) as order_id",
+    )?;
+    let target = MssqlTargetConfig::new(MssqlTargetTable::new(
+        config.schema.clone(),
+        table_name.to_owned(),
+    )?)
+    .with_load_mode(LoadMode::CreateAndLoad);
+    let request = OutputWritePlan::new(
+        orders,
+        MssqlOutputTarget::new(ORCHESTRATOR_OUTPUT_NAME, target, RunMode::Execute),
+    );
+
+    Ok(runtime.write_to_mssql(&session, &request)?)
 }
 
 async fn create_append_existing_table(

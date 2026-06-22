@@ -15,14 +15,14 @@ The xtask runner starts a local SQL Server container, waits for readiness,
 creates the test database, sets compatibility level 100, runs the SQL Server
 integration tests, and removes the container when the command exits.
 
-## DirectRawBulk sink test
+## SQL Server test target
 
-The `mssql_direct_raw_bulk` integration test exercises the public
+The `mssql_direct_raw_bulk` integration test target exercises SQL Server writes
+through the public APIs used by the crate. When configured, it runs the public
 `write_output_batches_to_mssql` API with the default `WriteBackend::DirectRawBulk`
-path. When configured, it runs append-existing and create-and-load writes against
-unique test tables, writes two Arrow record batches per table, checks the
-returned write stats, verifies the SQL Server row count and values, and drops
-the tables.
+path and the high-level orchestrator runtime `write_to_mssql` path against
+unique test tables. The tests check returned write stats, verify SQL Server row
+counts and values, and drop the tables.
 
 ## Container runtime
 
