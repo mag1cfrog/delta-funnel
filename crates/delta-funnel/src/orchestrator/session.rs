@@ -2778,7 +2778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_plan_selects_independent_shared_registered_derived_aliases()
+    async fn cache_plan_selects_independent_shared_aliases_with_same_output_indexes()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -2806,6 +2806,8 @@ mod tests {
 
         let plan = session.plan_mssql_output_cache(&[west, east]);
 
+        // Sharing the same selected output indexes is not ambiguity when the
+        // aliases are independent in the derived lineage graph.
         let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
             return Err("expected cache aliases decision".into());
         };
