@@ -1724,8 +1724,9 @@ impl DeltaFunnelSession {
     ///
     /// The returned factory performs DataFusion stream setup when the workflow
     /// attempts this output. Direct cached aliases and unrelated outputs reuse
-    /// the normal lazy-table stream path; dependent outputs will be replanned in
-    /// the next slice.
+    /// the normal lazy-table stream path. Dependent outputs replan from the
+    /// retained SQL text so active scoped cache aliases can replace the
+    /// registered providers referenced by that SQL.
     #[allow(dead_code)]
     fn cached_output_batch_stream_factory(
         &self,
@@ -1740,12 +1741,13 @@ impl DeltaFunnelSession {
             }
             MssqlCachedOutputStreamRoute::ReplannedCachedDependency(_) => {
                 let output_name = request.target().output_name().to_owned();
+                let sql_text = self.sql_text_for_derived_table(request.table())?.to_owned();
+                let expected_schema = Arc::clone(self.schema_for_lazy_table(request.table())?);
+                let context = self.context.clone();
                 Ok(Box::new(move || {
                     Box::pin(async move {
-                        Err(cached_output_stream_setup_error(
-                            &output_name,
-                            "replanned cached dependency stream setup is not implemented yet",
-                        ))
+                        replanned_sql_batch_stream(context, output_name, sql_text, expected_schema)
+                            .await
                     })
                 }))
             }
@@ -2282,6 +2284,48 @@ async fn batch_stream_for_lazy_table_from_session_parts(
     Ok(Box::pin(stream.map(|batch| {
         batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
     })))
+}
+
+async fn replanned_sql_batch_stream(
+    context: SessionContext,
+    output_name: String,
+    sql_text: String,
+    expected_schema: SchemaRef,
+) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
+    let dataframe = context
+        .sql_with_options(sql_text.as_str(), read_only_sql_options())
+        .await
+        .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
+    validate_replanned_output_schema(
+        &output_name,
+        dataframe.schema().as_arrow(),
+        &expected_schema,
+    )?;
+    let physical_plan = dataframe
+        .create_physical_plan()
+        .await
+        .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
+    let stream = datafusion_query_output_stream(physical_plan, context.task_ctx())
+        .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
+
+    Ok(Box::pin(stream.map(move |batch| {
+        batch.map_err(|error| cached_output_stream_setup_error(&output_name, error))
+    })))
+}
+
+fn validate_replanned_output_schema(
+    output_name: &str,
+    replanned_schema: &datafusion::arrow::datatypes::Schema,
+    expected_schema: &SchemaRef,
+) -> Result<(), DeltaFunnelError> {
+    if replanned_schema == expected_schema.as_ref() {
+        return Ok(());
+    }
+
+    Err(cached_output_stream_setup_error(
+        output_name,
+        "replanned output schema does not match the original output schema",
+    ))
 }
 
 async fn dataframe_for_lazy_table_from_session_parts(
@@ -3323,6 +3367,109 @@ mod tests {
 
         assert_eq!(markers, vec!["unrelated"]);
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+        let _restoration = replacement.restore().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_output_stream_factory_replans_dependent_output_against_active_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let big_output = output_request(
+            big.clone(),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let west_output = output_request(
+            west.clone(),
+            "west_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let plan = session.plan_mssql_output_cache(&[big_output, west_output.clone()]);
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        let replacement = session
+            .replace_registered_derived_alias_with_cache(&big)
+            .await?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
+        let markers = collect_stream_marker_values(factory().await?).await?;
+
+        assert_eq!(markers, vec!["shared"]);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+        let _restoration = replacement.restore().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_output_stream_factory_rejects_replanned_schema_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, _source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let big_output = output_request(
+            big.clone(),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let west_output = output_request(
+            west.clone(),
+            "west_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let plan = session.plan_mssql_output_cache(&[big_output, west_output.clone()]);
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        let pending_west = session
+            .pending_derived_tables
+            .iter_mut()
+            .find(|pending| pending.table.id() == west.id())
+            .ok_or("expected pending west table")?;
+        pending_west.schema = Arc::new(Schema::new(vec![Field::new(
+            "different_marker",
+            DataType::Utf8,
+            false,
+        )]));
+        let replacement = session
+            .replace_registered_derived_alias_with_cache(&big)
+            .await?;
+
+        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
+        let error = factory().await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("cached output stream setup failed for `west_output`")
+                    && message.contains("replanned output schema does not match")
+        ));
         let _restoration = replacement.restore().await?;
         Ok(())
     }
