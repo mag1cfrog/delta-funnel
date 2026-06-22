@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn mssql_connection_uses_arrow_tiberius_without_direct_transport_dependencies() {
-        let dependencies = direct_manifest_dependency_names(include_str!("../../Cargo.toml"));
+        let dependencies = direct_manifest_dependency_names(include_str!("../../../Cargo.toml"));
 
         assert!(dependencies.contains(&"arrow-tiberius"));
         assert!(!dependencies.contains(&"tiberius"));
