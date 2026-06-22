@@ -5,7 +5,7 @@
 //! provider, handoff, and sink modules stay async/pull-driven and do not own a
 //! hidden process-level runtime.
 
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::{Builder, Handle, Runtime};
 
 use crate::{
     DeltaFunnelError, DeltaFunnelSession, LazyTable, MssqlDryRunOutputReport,
@@ -19,7 +19,9 @@ use crate::{
 /// execute DataFusion, contact SQL Server, or write rows.
 ///
 /// The blocking methods are intended for non-async host threads. Rust async
-/// callers should use [`DeltaFunnelSession`] async methods directly.
+/// callers should use [`DeltaFunnelSession`] async methods directly. Calling
+/// these methods from inside an active Tokio runtime returns a configuration
+/// error instead of relying on Tokio's nested-runtime panic.
 pub struct DeltaFunnelRuntime {
     runtime: Runtime,
 }
@@ -52,6 +54,7 @@ impl DeltaFunnelRuntime {
         session: &mut DeltaFunnelSession,
         sql: &str,
     ) -> Result<LazyTable, DeltaFunnelError> {
+        reject_nested_runtime()?;
         self.runtime.block_on(session.table_from_sql(sql))
     }
 
@@ -65,6 +68,7 @@ impl DeltaFunnelRuntime {
         session: &DeltaFunnelSession,
         request: &OutputWritePlan,
     ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
         session.dry_run_to_mssql(request)
     }
 
@@ -78,6 +82,7 @@ impl DeltaFunnelRuntime {
         session: &DeltaFunnelSession,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
         session.dry_run_all_to_mssql(requests)
     }
 
@@ -91,6 +96,7 @@ impl DeltaFunnelRuntime {
         session: &DeltaFunnelSession,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
         self.runtime.block_on(session.write_to_mssql(request))
     }
 
@@ -104,6 +110,7 @@ impl DeltaFunnelRuntime {
         session: &DeltaFunnelSession,
         requests: &[OutputWritePlan],
     ) -> Result<WriteAllReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
         self.runtime.block_on(session.write_all(requests))
     }
 
@@ -118,9 +125,20 @@ impl DeltaFunnelRuntime {
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
         self.runtime
             .block_on(session.write_all_with_options(requests, options))
     }
+}
+
+fn reject_nested_runtime() -> Result<(), DeltaFunnelError> {
+    if Handle::try_current().is_ok() {
+        return Err(DeltaFunnelError::Config {
+            message: "DeltaFunnelRuntime blocking methods cannot be called from inside an active Tokio runtime; use DeltaFunnelSession async APIs directly".to_owned(),
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -211,6 +229,30 @@ mod tests {
             error,
             Err(DeltaFunnelError::MissingMssqlConnection { output_name })
                 if output_name == "orders_output"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_rejects_blocking_calls_inside_active_tokio_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = DeltaFunnelRuntime::new()?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let output = runtime.table_from_sql(&mut session, "select 1 as id")?;
+        let request = output_request(output, "orders_output", "orders_sink")?;
+        let host_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let error = host_runtime.block_on(async { runtime.dry_run_to_mssql(&session, &request) });
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::Config { message })
+                if message.contains("cannot be called from inside an active Tokio runtime")
+                    && message.contains("DeltaFunnelSession async APIs")
         ));
         Ok(())
     }
