@@ -3397,7 +3397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_output_stream_factory_replans_dependent_output_against_active_cache()
+    async fn cached_output_stream_factory_replans_dependent_outputs_against_active_cache()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
@@ -3411,6 +3411,9 @@ mod tests {
         let west = session
             .table_from_sql("select marker from big where region = 'west'")
             .await?;
+        let east = session
+            .table_from_sql("select marker from big where region = 'east'")
+            .await?;
         let big_output = output_request(
             big.clone(),
             "big_output",
@@ -3423,7 +3426,17 @@ mod tests {
             "west_orders",
             LoadMode::AppendExisting,
         )?;
-        let plan = session.plan_mssql_output_cache(&[big_output, west_output.clone()]);
+        let east_output = output_request(
+            east.clone(),
+            "east_output",
+            "east_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let plan = session.plan_mssql_output_cache(&[
+            big_output.clone(),
+            west_output.clone(),
+            east_output.clone(),
+        ]);
         let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
             return Err("expected cache aliases decision".into());
         };
@@ -3432,10 +3445,16 @@ mod tests {
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
-        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
-        let markers = collect_stream_marker_values(factory().await?).await?;
+        let big_factory = session.cached_output_batch_stream_factory(&big_output, caches)?;
+        let west_factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
+        let east_factory = session.cached_output_batch_stream_factory(&east_output, caches)?;
+        let big_markers = collect_stream_marker_values(big_factory().await?).await?;
+        let west_markers = collect_stream_marker_values(west_factory().await?).await?;
+        let east_markers = collect_stream_marker_values(east_factory().await?).await?;
 
-        assert_eq!(markers, vec!["shared"]);
+        assert_eq!(big_markers, vec!["shared", "shared"]);
+        assert_eq!(west_markers, vec!["shared"]);
+        assert_eq!(east_markers, vec!["shared"]);
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
         let _restoration = replacement.restore().await?;
         Ok(())
