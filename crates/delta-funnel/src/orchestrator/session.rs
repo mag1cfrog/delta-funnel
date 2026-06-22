@@ -5643,6 +5643,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn cache_error_with_restore_error_preserves_both_contexts() {
+        let primary_error = DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "simulated output workflow failure".to_owned(),
+        };
+        let restore_error = DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "simulated restore failure for alias big".to_owned(),
+        };
+
+        let error = cache_error_with_restore_error(primary_error, restore_error);
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message.contains("write_all auto cache failed")
+                    && message.contains("simulated output workflow failure")
+                    && message.contains("also failed to restore cache aliases")
+                    && message.contains("simulated restore failure for alias big")
+        ));
+    }
+
     #[tokio::test]
     async fn cached_alias_replacement_does_not_feed_existing_downstream_derived_tables()
     -> Result<(), Box<dyn std::error::Error>> {
