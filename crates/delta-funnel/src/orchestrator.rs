@@ -5,7 +5,7 @@ mod session;
 pub use session::{
     DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan,
     PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions,
-    ValidationOptions, WriteAllCacheAliasReport, WriteAllCacheCandidateSkip,
-    WriteAllCacheCandidateSkipReason, WriteAllCacheMode, WriteAllCacheReport,
-    WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
+    ValidationOptions, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
+    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheMode,
+    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
 };

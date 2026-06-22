@@ -22,9 +22,9 @@ pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
     DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan,
     PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions,
-    ValidationOptions, WriteAllCacheAliasReport, WriteAllCacheCandidateSkip,
-    WriteAllCacheCandidateSkipReason, WriteAllCacheMode, WriteAllCacheReport,
-    WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
+    ValidationOptions, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
+    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheMode,
+    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
 };
 pub use pipeline::{
     BatchHandoffError, BatchHandoffOutcome, BatchHandoffStats, BatchPipelinePhase,

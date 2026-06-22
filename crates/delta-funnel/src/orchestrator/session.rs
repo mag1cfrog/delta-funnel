@@ -545,6 +545,17 @@ impl WriteAllCacheReport {
     }
 
     fn from_plan(plan: &MssqlOutputCachePlan) -> Self {
+        Self::from_plan_with_alias_status(plan, WriteAllCacheAliasStatus::Selected)
+    }
+
+    fn from_executed_plan(plan: &MssqlOutputCachePlan) -> Self {
+        Self::from_plan_with_alias_status(plan, WriteAllCacheAliasStatus::MaterializedAndRestored)
+    }
+
+    fn from_plan_with_alias_status(
+        plan: &MssqlOutputCachePlan,
+        alias_status: WriteAllCacheAliasStatus,
+    ) -> Self {
         let skipped_candidates = plan
             .skipped_candidates()
             .iter()
@@ -559,7 +570,7 @@ impl WriteAllCacheReport {
             MssqlOutputCacheDecision::CacheAliases(aliases) => Self::CacheAliases {
                 aliases: aliases
                     .iter()
-                    .map(WriteAllCacheAliasReport::from_internal)
+                    .map(|alias| WriteAllCacheAliasReport::from_internal(alias, alias_status))
                     .collect(),
                 skipped_candidates,
             },
@@ -596,14 +607,16 @@ pub struct WriteAllCacheAliasReport {
     table_id: u64,
     alias: String,
     output_indexes: Vec<usize>,
+    status: WriteAllCacheAliasStatus,
 }
 
 impl WriteAllCacheAliasReport {
-    fn from_internal(alias: &MssqlDerivedCacheAliasPlan) -> Self {
+    fn from_internal(alias: &MssqlDerivedCacheAliasPlan, status: WriteAllCacheAliasStatus) -> Self {
         Self {
             table_id: alias.table_id(),
             alias: alias.alias().to_owned(),
             output_indexes: alias.output_indexes().to_vec(),
+            status,
         }
     }
 
@@ -624,6 +637,12 @@ impl WriteAllCacheAliasReport {
     pub fn output_indexes(&self) -> &[usize] {
         &self.output_indexes
     }
+
+    /// Returns this alias cache lifecycle status for the `write_all` call.
+    #[must_use]
+    pub const fn status(&self) -> WriteAllCacheAliasStatus {
+        self.status
+    }
 }
 
 impl fmt::Debug for WriteAllCacheAliasReport {
@@ -633,8 +652,18 @@ impl fmt::Debug for WriteAllCacheAliasReport {
             .field("table_id", &self.table_id)
             .field("alias", &sanitize_text_for_display(&self.alias))
             .field("output_indexes", &self.output_indexes)
+            .field("status", &self.status)
             .finish()
     }
+}
+
+/// Cache lifecycle status for one selected alias in a `write_all` report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAllCacheAliasStatus {
+    /// The alias was selected by cache planning.
+    Selected,
+    /// The alias was materialized, used for the workflow, and restored.
+    MaterializedAndRestored,
 }
 
 /// Registered derived alias skipped during conservative cache selection.
@@ -1849,9 +1878,9 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let cache = WriteAllCacheReport::from_plan(cache_plan);
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
+                let cache = WriteAllCacheReport::from_plan(cache_plan);
                 let workflow = self
                     .write_all_baseline_with_writer(planned_outputs, writer)
                     .await?;
@@ -1861,6 +1890,7 @@ impl DeltaFunnelSession {
                 let workflow = self
                     .write_all_cached_with_writer(planned_outputs, cache_aliases, writer)
                     .await?;
+                let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
                 Ok(WriteAllReport::new(workflow, cache))
             }
         }
@@ -1894,9 +1924,9 @@ impl DeltaFunnelSession {
         planned_outputs: &[PlannedMssqlOutput],
         cache_plan: &MssqlOutputCachePlan,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
-        let cache = WriteAllCacheReport::from_plan(cache_plan);
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
+                let cache = WriteAllCacheReport::from_plan(cache_plan);
                 let workflow = self.write_all_baseline(planned_outputs).await?;
                 Ok(WriteAllReport::new(workflow, cache))
             }
@@ -1904,6 +1934,7 @@ impl DeltaFunnelSession {
                 let workflow = self
                     .write_all_cached(planned_outputs, cache_aliases)
                     .await?;
+                let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
                 Ok(WriteAllReport::new(workflow, cache))
             }
         }
@@ -6248,6 +6279,10 @@ mod tests {
         assert_eq!(aliases[0].table_id(), big.id());
         assert_eq!(aliases[0].alias(), "big");
         assert_eq!(aliases[0].output_indexes(), &[0, 1]);
+        assert_eq!(
+            aliases[0].status(),
+            WriteAllCacheAliasStatus::MaterializedAndRestored
+        );
 
         let restored_big_factory = session.lazy_table_batch_stream_factory(big);
         let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
@@ -6296,6 +6331,7 @@ mod tests {
         assert!(debug.contains("warehouse-primary"));
         assert!(debug.contains("warehouse-override"));
         assert!(debug.contains("CacheAliases"));
+        assert!(debug.contains("MaterializedAndRestored"));
         assert!(!debug.contains("secret-token"));
         assert!(!debug.contains("override-secret"));
         assert!(!debug.contains("super-secret-literal"));
