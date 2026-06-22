@@ -2821,6 +2821,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_plan_rejects_cyclic_shared_candidate_relationships()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_names = session
+            .table_from_sql("select customer_name from orders")
+            .await?;
+        let names = session.register_alias("names", &pending_names)?;
+        for derived in &mut session.derived_tables {
+            if derived.table().id() == big.id() {
+                derived.lineage = DerivedTableLineage::complete(
+                    vec![DerivedTableDependency::RegisteredDerived {
+                        table_id: names.id(),
+                        name: "names".to_owned(),
+                    }],
+                    Vec::new(),
+                    Vec::new(),
+                );
+            } else if derived.table().id() == names.id() {
+                derived.lineage = DerivedTableLineage::complete(
+                    vec![DerivedTableDependency::RegisteredDerived {
+                        table_id: big.id(),
+                        name: "big".to_owned(),
+                    }],
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+        }
+        let west = session
+            .table_from_sql(
+                "select big.id from big join names on big.customer_name = names.customer_name",
+            )
+            .await?;
+        let east = session
+            .table_from_sql(
+                "select big.id from big join names on big.customer_name = names.customer_name",
+            )
+            .await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+
+        let plan = session.plan_mssql_output_cache(&[west, east]);
+
+        assert_eq!(
+            plan.decision(),
+            &MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::AmbiguousSharedDerivedAlias,
+            }
+        );
+        assert_eq!(plan.skipped_candidates().len(), 2);
+        assert_eq!(plan.skipped_candidates()[0].table_id(), big.id());
+        assert_eq!(
+            plan.skipped_candidates()[0].reason(),
+            &MssqlCacheCandidateSkipReason::AmbiguousDepth
+        );
+        assert_eq!(plan.skipped_candidates()[1].table_id(), names.id());
+        assert_eq!(
+            plan.skipped_candidates()[1].reason(),
+            &MssqlCacheCandidateSkipReason::AmbiguousDepth
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cache_plan_does_not_consider_shared_raw_source_as_candidate()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
