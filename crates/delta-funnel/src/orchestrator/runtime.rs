@@ -9,6 +9,8 @@ use tokio::runtime::{Builder, Handle, Runtime};
 
 #[cfg(test)]
 use super::session::OrchestratorMssqlOutputWriter;
+#[cfg(test)]
+use crate::MssqlWorkflowOutputWriter;
 use crate::{
     DeltaFunnelError, DeltaFunnelSession, LazyTable, MssqlDryRunOutputReport,
     MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, WriteAllOptions, WriteAllReport,
@@ -146,6 +148,21 @@ impl DeltaFunnelRuntime {
         self.runtime
             .block_on(session.write_all_with_options(requests, options))
     }
+
+    #[cfg(test)]
+    pub(crate) fn write_all_with_writer<W>(
+        &self,
+        session: &DeltaFunnelSession,
+        requests: &[OutputWritePlan],
+        writer: W,
+    ) -> Result<WriteAllReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.write_all_with_writer(requests, writer))
+    }
 }
 
 fn reject_nested_runtime() -> Result<(), DeltaFunnelError> {
@@ -265,6 +282,34 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl MssqlWorkflowOutputWriter for FakeRuntimeWriter {
+        async fn write_output(
+            &mut self,
+            output_schema: SchemaRef,
+            resolved_target: ResolvedMssqlTarget,
+            schema_options: crate::MssqlSchemaPlanOptions,
+            batches: MssqlOutputBatchStream,
+            write_options: MssqlWriteOptions,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+            let output_plan = crate::plan_mssql_target_for_resolved_output(
+                output_schema.as_ref(),
+                &resolved_target,
+                schema_options,
+            )?;
+
+            OrchestratorMssqlOutputWriter::write_output(
+                self,
+                output_schema,
+                output_plan,
+                resolved_target,
+                batches,
+                write_options,
+            )
+            .await
+        }
+    }
+
     #[test]
     fn runtime_constructs_without_starting_session_work() -> Result<(), DeltaFunnelError> {
         let _runtime = DeltaFunnelRuntime::new()?;
@@ -364,6 +409,39 @@ mod tests {
         assert_eq!(report.output_name(), "orders_output");
         assert_eq!(report.stats().rows_written(), 2);
         assert_eq!(report.stats().batches_written(), call.batches);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_drives_multi_output_write_with_injected_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = DeltaFunnelRuntime::new()?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west =
+            runtime.table_from_sql(&mut session, "select 1 as id union all select 2 as id")?;
+        let east = runtime.table_from_sql(&mut session, "select 3 as id")?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::CreateAndLoad)?;
+        let writer = FakeRuntimeWriter::default();
+
+        let report = runtime.write_all_with_writer(&session, &[west, east], writer)?;
+
+        assert_eq!(report.len(), 2);
+        assert!(report.all_succeeded());
+        assert_eq!(report.outputs()[0].output_name(), "west_output");
+        assert_eq!(report.outputs()[1].output_name(), "east_output");
+        let crate::MssqlOutputWriteStatus::Succeeded(west_report) = &report.outputs()[0] else {
+            return Err(format!("expected succeeded status, got {:?}", report.outputs()[0]).into());
+        };
+        let crate::MssqlOutputWriteStatus::Succeeded(east_report) = &report.outputs()[1] else {
+            return Err(format!("expected succeeded status, got {:?}", report.outputs()[1]).into());
+        };
+        assert_eq!(west_report.stats().rows_written(), 2);
+        assert_eq!(east_report.stats().rows_written(), 1);
         Ok(())
     }
 
