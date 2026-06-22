@@ -412,6 +412,45 @@ impl OutputWritePlan {
     }
 }
 
+/// Cache policy for one multi-output `write_all` call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WriteAllCacheMode {
+    /// Select and materialize conservative shared derived aliases when safe.
+    #[default]
+    Auto,
+    /// Use the baseline sequential workflow without cache planning or materialization.
+    Disabled,
+}
+
+/// Execution options for one multi-output `write_all` call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteAllOptions {
+    cache_mode: WriteAllCacheMode,
+}
+
+impl WriteAllOptions {
+    /// Creates default `write_all` options.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            cache_mode: WriteAllCacheMode::Auto,
+        }
+    }
+
+    /// Sets the cache policy for this `write_all` call.
+    #[must_use]
+    pub const fn with_cache_mode(mut self, cache_mode: WriteAllCacheMode) -> Self {
+        self.cache_mode = cache_mode;
+        self
+    }
+
+    /// Returns the cache policy for this `write_all` call.
+    #[must_use]
+    pub const fn cache_mode(&self) -> WriteAllCacheMode {
+        self.cache_mode
+    }
+}
+
 /// Planned MSSQL output request for one selected lazy table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedMssqlOutput {
@@ -1405,6 +1444,26 @@ impl DeltaFunnelSession {
     }
 
     #[allow(dead_code)]
+    pub(crate) async fn write_all_with_options_and_writer<W>(
+        &self,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+        writer: W,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        let planned_outputs = self.plan_write_all_outputs(requests)?;
+
+        match options.cache_mode() {
+            WriteAllCacheMode::Auto | WriteAllCacheMode::Disabled => {
+                self.write_all_baseline_with_writer(&planned_outputs, writer)
+                    .await
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     pub(crate) async fn write_all_with_writer<W>(
         &self,
         requests: &[OutputWritePlan],
@@ -1413,9 +1472,7 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let planned_outputs = self.plan_write_all_outputs(requests)?;
-
-        self.write_all_baseline_with_writer(&planned_outputs, writer)
+        self.write_all_with_options_and_writer(requests, WriteAllOptions::default(), writer)
             .await
     }
 
@@ -1446,9 +1503,33 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+        self.write_all_with_options(requests, WriteAllOptions::default())
+            .await
+    }
+
+    /// Writes multiple selected lazy tables to SQL Server sequentially with explicit options.
+    ///
+    /// `WriteAllCacheMode::Disabled` uses the baseline #254 no-cache path. The
+    /// default `Auto` mode currently delegates to the same baseline path until
+    /// the cache materialization branch is connected in this issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first pre-execution validation/planning error, or a workflow
+    /// execution error from the lower-level SQL Server workflow.
+    #[allow(dead_code)]
+    pub async fn write_all_with_options(
+        &self,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
         let planned_outputs = self.plan_write_all_outputs(requests)?;
 
-        self.write_all_baseline(&planned_outputs).await
+        match options.cache_mode() {
+            WriteAllCacheMode::Auto | WriteAllCacheMode::Disabled => {
+                self.write_all_baseline(&planned_outputs).await
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -3299,6 +3380,19 @@ mod tests {
         assert!(!debug.contains("password"));
         assert!(!debug.contains("server=tcp"));
         Ok(())
+    }
+
+    #[test]
+    fn write_all_options_default_to_auto_cache_mode() {
+        let options = WriteAllOptions::default();
+
+        assert_eq!(options.cache_mode(), WriteAllCacheMode::Auto);
+        assert_eq!(
+            WriteAllOptions::new()
+                .with_cache_mode(WriteAllCacheMode::Disabled)
+                .cache_mode(),
+            WriteAllCacheMode::Disabled
+        );
     }
 
     #[test]
@@ -5527,6 +5621,49 @@ mod tests {
         assert!(report.all_succeeded());
         assert_eq!(report.outputs()[0].output_name(), "west_output");
         assert_eq!(report.outputs()[1].output_name(), "east_output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_disabled_cache_mode_uses_baseline_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let big_output =
+            execute_output_request(big, "big_output", "big_orders", LoadMode::AppendExisting)?;
+        let west_output =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_options_and_writer(
+                &[big_output, west_output],
+                WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                writer,
+            )
+            .await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].rows, 2);
+        assert_eq!(calls[1].rows, 1);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        assert!(report.all_succeeded());
         Ok(())
     }
 
