@@ -8,7 +8,7 @@ use datafusion::prelude::SessionContext;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
-    error::DataFusionRegistrationSnafu, redaction::sanitize_uri_for_display,
+    error::DataFusionRegistrationSnafu, support::sanitize_uri_for_display,
     table_formats::validate_table_source_names,
 };
 

@@ -6,7 +6,7 @@
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::DeltaFunnelError;
-use crate::batch_pipeline::{BatchPipelinePhase, validate_nonzero_usize_option};
+use crate::pipeline::{BatchPipelinePhase, validate_nonzero_usize_option};
 
 /// Query execution options applied before DataFusion planning and execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

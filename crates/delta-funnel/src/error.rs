@@ -1,7 +1,7 @@
 //! Shared error pattern for DeltaFunnel.
 
 use crate::BatchPipelinePhase;
-use crate::redaction::{sanitize_text_for_display, sanitize_uri_for_display};
+use crate::support::{sanitize_text_for_display, sanitize_uri_for_display};
 
 use snafu::Snafu;
 

@@ -19,7 +19,7 @@ use super::{
         MssqlConnectedOutputClient, MssqlOutputConnectionRequest, connect_mssql_output_client,
         plan_mssql_output_connection_request,
     },
-    lifecycle_execution::{cleanup_mssql_prepared_target, prepare_mssql_target_lifecycle},
+    lifecycle::{cleanup_mssql_prepared_target, prepare_mssql_target_lifecycle},
     write::write_mssql_batches_with_writer,
 };
 
