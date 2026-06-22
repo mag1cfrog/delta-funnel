@@ -6,34 +6,25 @@
 
 #[allow(dead_code)]
 mod connection;
-mod ddl_planning;
 mod lifecycle_execution;
-mod lifecycle_planning;
-mod output_planning;
-mod schema_planning;
+mod planning;
 mod sink;
 mod target;
 mod workflow;
 mod write;
 
-pub use ddl_planning::{MssqlDdlPlan, plan_mssql_create_table_ddl};
 pub(crate) use lifecycle_execution::{MssqlConnectedLifecycleClient, table_name_from_target};
 pub use lifecycle_execution::{
     MssqlPreparedTarget, MssqlPreparedTargetAction, MssqlPreparedTargetReport,
 };
-pub use lifecycle_planning::{
-    MssqlLifecycleExecutionGuardrail, MssqlLifecycleGuardrailPolicy, MssqlLifecyclePlan,
-    MssqlTargetTableState, plan_mssql_lifecycle,
-};
-pub use output_planning::{
-    MssqlTargetOutputPlan, plan_mssql_target_for_output, plan_mssql_target_for_resolved_output,
-    plan_mssql_target_output,
-};
-pub use schema_planning::{
-    MssqlBinaryPolicy, MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy,
-    MssqlFloatPolicy, MssqlNanosecondPolicy, MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField,
-    MssqlSchemaPlan, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTimezonePolicy,
-    MssqlUInt64Policy, mssql_schema_diagnostic_reports, plan_mssql_output_schema,
+pub use planning::{
+    MssqlBinaryPolicy, MssqlDate64Policy, MssqlDdlPlan, MssqlDecimal256Policy, MssqlDecimalPolicy,
+    MssqlFloatPolicy, MssqlLifecycleExecutionGuardrail, MssqlLifecycleGuardrailPolicy,
+    MssqlLifecyclePlan, MssqlNanosecondPolicy, MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField,
+    MssqlSchemaPlan, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTargetOutputPlan,
+    MssqlTargetTableState, MssqlTimezonePolicy, MssqlUInt64Policy, mssql_schema_diagnostic_reports,
+    plan_mssql_create_table_ddl, plan_mssql_lifecycle, plan_mssql_output_schema,
+    plan_mssql_target_for_output, plan_mssql_target_for_resolved_output, plan_mssql_target_output,
 };
 pub use sink::write_output_batches_to_mssql;
 pub use target::{
