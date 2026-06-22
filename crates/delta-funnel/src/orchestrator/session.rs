@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use crate::{
     BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaProviderScanExecutionOptions,
     DeltaSourceConfig, DeltaTableProviderConfig, MssqlConnectionConfig, MssqlOutputBatchStream,
-    MssqlOutputBatchStreamFactory, MssqlSchemaPlanOptions, MssqlTargetConfig,
+    MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlSchemaPlanOptions, MssqlTargetConfig,
     MssqlTargetOutputPlan, MssqlWorkflowWriteOptions, MssqlWriteOptions, MssqlWriteReport,
     QueryOptions, RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase,
     datafusion_query_output_stream, datafusion_session_context, default_mssql_write_options,
@@ -1362,6 +1362,28 @@ impl DeltaFunnelSession {
             .map(|request| {
                 ensure_write_all_execute_run_mode(request.target().run_mode())?;
                 self.plan_mssql_output(request)
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn build_write_all_jobs(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
+        planned_outputs
+            .iter()
+            .map(|planned| {
+                let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
+                let batches = self.lazy_table_batch_stream_factory(planned.table().clone());
+
+                Ok(MssqlOutputWriteJob::new(
+                    output_schema,
+                    planned.resolved_target().clone(),
+                    planned.output_plan().schema_plan_options(),
+                    batches,
+                    self.options.mssql_write_options(),
+                ))
             })
             .collect()
     }
@@ -5236,6 +5258,40 @@ mod tests {
             Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
                 if message.contains("write_all requires RunMode::Execute")
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_write_all_jobs_preserves_output_metadata_without_stream_setup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("orders_source", source_provider)?;
+        let west = session
+            .table_from_sql("select marker from orders_source where region = 'west'")
+            .await?;
+        let east = session
+            .table_from_sql("select marker from orders_source where region = 'east'")
+            .await?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::CreateAndLoad)?;
+        let planned = session.plan_write_all_outputs(&[west, east])?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+
+        let jobs = session.build_write_all_jobs(&planned)?;
+
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].output_name(), "west_output");
+        assert_eq!(jobs[0].target_summary().table().table(), "west_orders");
+        assert_eq!(jobs[1].output_name(), "east_output");
+        assert_eq!(jobs[1].target_summary().table().table(), "east_orders");
         Ok(())
     }
 
