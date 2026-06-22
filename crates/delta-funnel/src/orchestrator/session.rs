@@ -24,8 +24,8 @@ use crate::{
     datafusion_session_context, default_mssql_write_options, load_delta_source,
     plan_mssql_target_for_resolved_output, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
-    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
-    write_output_batches_to_mssql,
+    table_formats::validate_table_source_names, write_mssql_outputs_to_mssql,
+    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
 };
 
 /// Query-load action mode requested by a caller.
@@ -1403,6 +1403,30 @@ impl DeltaFunnelSession {
         let jobs = self.build_write_all_jobs(&planned_outputs)?;
 
         write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
+    }
+
+    /// Writes multiple selected lazy tables to SQL Server sequentially.
+    ///
+    /// The baseline workflow validates and plans every selected output before
+    /// side effects, builds lazy async stream factories for attempted outputs,
+    /// and delegates sequential stop-on-first-failure behavior to the existing
+    /// SQL Server workflow layer. This method intentionally does not perform
+    /// automatic cache planning or cache materialization; that belongs to the
+    /// later cache integration slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first pre-execution validation/planning error, or a workflow
+    /// execution error from the lower-level SQL Server workflow.
+    #[allow(dead_code)]
+    pub async fn write_all(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+        let planned_outputs = self.plan_write_all_outputs(requests)?;
+        let jobs = self.build_write_all_jobs(&planned_outputs)?;
+
+        write_mssql_outputs_to_mssql(jobs, self.options.mssql_workflow_options()).await
     }
 
     #[allow(dead_code)]
@@ -5626,6 +5650,47 @@ mod tests {
         assert_eq!(report.outputs()[1].output_name(), "failing_output");
         assert!(report.outputs()[2].is_skipped());
         assert_eq!(report.outputs()[2].output_name(), "third_output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_rejects_duplicate_output_names_before_stream_setup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("orders_source", source_provider)?;
+        let west = session
+            .table_from_sql("select marker from orders_source where region = 'west'")
+            .await?;
+        let east = session
+            .table_from_sql("select marker from orders_source where region = 'east'")
+            .await?;
+        let west = execute_output_request(
+            west,
+            "orders_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let east = execute_output_request(
+            east,
+            "orders_output",
+            "east_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.write_all(&[west, east]).await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("write_all output names must be unique")
+                    && message.contains("orders_output")
+        ));
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
