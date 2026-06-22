@@ -5694,6 +5694,42 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn write_all_validation_errors_redact_connection_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west = session.table_from_sql("select 1 as id").await?;
+        let east = session.table_from_sql("select 2 as id").await?;
+        let west = execute_output_request(
+            west,
+            "orders_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let east = execute_output_request(
+            east,
+            "orders_output",
+            "east_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session
+            .write_all(&[west, east])
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("{error:?} {error}"));
+
+        assert!(
+            matches!(error, Err(display) if display.contains("orders_output")
+                && !display.contains("secret-token")
+                && !display.contains("password")
+                && !display.contains("server=tcp"))
+        );
+        Ok(())
+    }
+
     #[test]
     fn delta_lake_registers_source_and_returns_lazy_table() -> Result<(), Box<dyn std::error::Error>>
     {
