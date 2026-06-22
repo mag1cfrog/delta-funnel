@@ -726,6 +726,16 @@ pub(crate) enum MssqlCacheCandidateSkipReason {
     AmbiguousDepth,
 }
 
+enum MssqlCacheFrontierSelection {
+    Selected {
+        selected_aliases: Vec<MssqlDerivedCacheAliasPlan>,
+        covered_aliases: Vec<MssqlDerivedCacheAliasPlan>,
+    },
+    Ambiguous {
+        ambiguous_aliases: Vec<MssqlDerivedCacheAliasPlan>,
+    },
+}
+
 /// Registered Delta source tracked by a query-load session.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RegisteredSessionSource {
@@ -1283,44 +1293,52 @@ impl DeltaFunnelSession {
             );
         }
         if shared_candidates.len() > 1 {
-            if let Some(selected_index) =
-                self.deepest_shared_cache_candidate_index(&shared_candidates)
-            {
-                let selected_candidate = shared_candidates.remove(selected_index);
-                skipped_candidates.extend(shared_candidates.into_iter().filter_map(|candidate| {
-                    self.registered_derived_table_by_id(candidate.table_id())
-                        .map(|derived| {
-                            MssqlCacheCandidateSkip::from_registered(
-                                derived,
-                                MssqlCacheCandidateSkipReason::CoveredByDeeperSharedAlias {
-                                    selected_table_id: selected_candidate.table_id(),
-                                },
-                            )
-                        })
-                }));
-                return MssqlOutputCachePlan::new(
-                    selected_outputs,
-                    MssqlOutputCacheDecision::CacheAliases(vec![selected_candidate]),
-                    skipped_candidates,
-                );
+            match self.select_shared_cache_frontier(shared_candidates) {
+                MssqlCacheFrontierSelection::Selected {
+                    selected_aliases,
+                    covered_aliases,
+                } => {
+                    let selected_table_id = selected_aliases[0].table_id();
+                    skipped_candidates.extend(covered_aliases.into_iter().filter_map(
+                        |candidate| {
+                            self.registered_derived_table_by_id(candidate.table_id())
+                                .map(|derived| {
+                                    MssqlCacheCandidateSkip::from_registered(
+                                        derived,
+                                        MssqlCacheCandidateSkipReason::CoveredByDeeperSharedAlias {
+                                            selected_table_id,
+                                        },
+                                    )
+                                })
+                        },
+                    ));
+                    return MssqlOutputCachePlan::new(
+                        selected_outputs,
+                        MssqlOutputCacheDecision::CacheAliases(selected_aliases),
+                        skipped_candidates,
+                    );
+                }
+                MssqlCacheFrontierSelection::Ambiguous { ambiguous_aliases } => {
+                    skipped_candidates.extend(ambiguous_aliases.into_iter().filter_map(
+                        |candidate| {
+                            self.registered_derived_table_by_id(candidate.table_id())
+                                .map(|derived| {
+                                    MssqlCacheCandidateSkip::from_registered(
+                                        derived,
+                                        MssqlCacheCandidateSkipReason::AmbiguousDepth,
+                                    )
+                                })
+                        },
+                    ));
+                    return MssqlOutputCachePlan::new(
+                        selected_outputs,
+                        MssqlOutputCacheDecision::NoCache {
+                            reason: MssqlNoCacheReason::AmbiguousSharedDerivedAlias,
+                        },
+                        skipped_candidates,
+                    );
+                }
             }
-
-            skipped_candidates.extend(shared_candidates.into_iter().filter_map(|candidate| {
-                self.registered_derived_table_by_id(candidate.table_id())
-                    .map(|derived| {
-                        MssqlCacheCandidateSkip::from_registered(
-                            derived,
-                            MssqlCacheCandidateSkipReason::AmbiguousDepth,
-                        )
-                    })
-            }));
-            return MssqlOutputCachePlan::new(
-                selected_outputs,
-                MssqlOutputCacheDecision::NoCache {
-                    reason: MssqlNoCacheReason::AmbiguousSharedDerivedAlias,
-                },
-                skipped_candidates,
-            );
         }
 
         MssqlOutputCachePlan::new(
@@ -1391,10 +1409,10 @@ impl DeltaFunnelSession {
             .unwrap_or(false)
     }
 
-    fn deepest_shared_cache_candidate_index(
+    fn select_shared_cache_frontier(
         &self,
-        candidates: &[MssqlDerivedCacheAliasPlan],
-    ) -> Option<usize> {
+        candidates: Vec<MssqlDerivedCacheAliasPlan>,
+    ) -> MssqlCacheFrontierSelection {
         let deepest_indexes = candidates
             .iter()
             .enumerate()
@@ -1409,8 +1427,17 @@ impl DeltaFunnelSession {
             .collect::<Vec<_>>();
 
         match deepest_indexes.as_slice() {
-            [index] => Some(*index),
-            [] | [_, ..] => None,
+            [index] => {
+                let mut covered_aliases = candidates;
+                let selected_alias = covered_aliases.remove(*index);
+                MssqlCacheFrontierSelection::Selected {
+                    selected_aliases: vec![selected_alias],
+                    covered_aliases,
+                }
+            }
+            [] | [_, ..] => MssqlCacheFrontierSelection::Ambiguous {
+                ambiguous_aliases: candidates,
+            },
         }
     }
 
