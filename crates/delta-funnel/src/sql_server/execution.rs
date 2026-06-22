@@ -16,6 +16,7 @@ pub use workflow::{
     MssqlWriteFailureReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport,
     write_mssql_outputs_to_mssql,
 };
+pub(crate) use workflow::{MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer};
 pub(crate) use write::MssqlBulkLoadWriter;
 pub use write::{
     MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus, MssqlWriteFailureContext,

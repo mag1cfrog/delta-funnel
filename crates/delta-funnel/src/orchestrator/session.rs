@@ -18,12 +18,14 @@ use crate::{
     BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaProviderScanExecutionOptions,
     DeltaSourceConfig, DeltaTableProviderConfig, MssqlConnectionConfig, MssqlOutputBatchStream,
     MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlSchemaPlanOptions, MssqlTargetConfig,
-    MssqlTargetOutputPlan, MssqlWorkflowWriteOptions, MssqlWriteOptions, MssqlWriteReport,
-    QueryOptions, RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase,
-    datafusion_query_output_stream, datafusion_session_context, default_mssql_write_options,
-    load_delta_source, plan_mssql_target_for_resolved_output, preflight_delta_protocol,
+    MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWorkflowWriteOptions,
+    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, QueryOptions,
+    RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase, datafusion_query_output_stream,
+    datafusion_session_context, default_mssql_write_options, load_delta_source,
+    plan_mssql_target_for_resolved_output, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
-    table_formats::validate_table_source_names, write_output_batches_to_mssql,
+    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
+    write_output_batches_to_mssql,
 };
 
 /// Query-load action mode requested by a caller.
@@ -1389,6 +1391,21 @@ impl DeltaFunnelSession {
     }
 
     #[allow(dead_code)]
+    pub(crate) async fn write_all_with_writer<W>(
+        &self,
+        requests: &[OutputWritePlan],
+        writer: W,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        let planned_outputs = self.plan_write_all_outputs(requests)?;
+        let jobs = self.build_write_all_jobs(&planned_outputs)?;
+
+        write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn plan_mssql_output_cache(
         &self,
         requests: &[OutputWritePlan],
@@ -2553,7 +2570,10 @@ mod tests {
         any::Any,
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -2735,6 +2755,17 @@ mod tests {
         calls: Vec<FakeOrchestratorWriteCall>,
     }
 
+    #[derive(Clone, Default)]
+    struct FakeWorkflowWriter {
+        calls: Arc<Mutex<Vec<FakeOrchestratorWriteCall>>>,
+    }
+
+    impl FakeWorkflowWriter {
+        fn calls(&self) -> Arc<Mutex<Vec<FakeOrchestratorWriteCall>>> {
+            Arc::clone(&self.calls)
+        }
+    }
+
     #[async_trait]
     impl OrchestratorMssqlOutputWriter for FakeOrchestratorWriter {
         async fn write_output(
@@ -2766,6 +2797,59 @@ mod tests {
                 batches: batch_count,
                 schema_fields: output_schema.fields().len(),
             });
+
+            Ok(MssqlWriteReport::from_output_plan(
+                &output_plan,
+                rows,
+                batch_count,
+                0,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl MssqlWorkflowOutputWriter for FakeWorkflowWriter {
+        async fn write_output(
+            &mut self,
+            output_schema: SchemaRef,
+            resolved_target: ResolvedMssqlTarget,
+            schema_options: MssqlSchemaPlanOptions,
+            mut batches: MssqlOutputBatchStream,
+            _write_options: MssqlWriteOptions,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+            let mut rows = 0_u64;
+            let mut batch_count = 0_u64;
+
+            while let Some(batch) = batches.next().await {
+                let batch = batch?;
+                rows = rows.saturating_add(u64::try_from(batch.num_rows()).map_err(|_| {
+                    DeltaFunnelError::Config {
+                        message: "fake workflow writer row count overflowed u64".to_owned(),
+                    }
+                })?);
+                batch_count = batch_count.saturating_add(1);
+            }
+
+            let output_plan = plan_mssql_target_for_resolved_output(
+                output_schema.as_ref(),
+                &resolved_target,
+                schema_options,
+            )?;
+            self.calls
+                .lock()
+                .map_err(|_| DeltaFunnelError::Config {
+                    message: "fake workflow writer call lock poisoned".to_owned(),
+                })?
+                .push(FakeOrchestratorWriteCall {
+                    output_name: resolved_target.output_name().to_owned(),
+                    target_table: resolved_target.table().clone(),
+                    connection_source: resolved_target.connection_source(),
+                    rows,
+                    batches: batch_count,
+                    schema_fields: output_schema.fields().len(),
+                });
 
             Ok(MssqlWriteReport::from_output_plan(
                 &output_plan,
@@ -5292,6 +5376,42 @@ mod tests {
         assert_eq!(jobs[0].target_summary().table().table(), "west_orders");
         assert_eq!(jobs[1].output_name(), "east_output");
         assert_eq!(jobs[1].target_summary().table().table(), "east_orders");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_with_writer_executes_valid_outputs_in_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let east = session.table_from_sql("select 3 as id").await?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::CreateAndLoad)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session.write_all_with_writer(&[west, east], writer).await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].output_name, "west_output");
+        assert_eq!(calls[0].target_table.table(), "west_orders");
+        assert_eq!(calls[0].rows, 2);
+        assert_eq!(calls[1].output_name, "east_output");
+        assert_eq!(calls[1].target_table.table(), "east_orders");
+        assert_eq!(calls[1].rows, 1);
+        assert_eq!(report.len(), 2);
+        assert!(report.all_succeeded());
+        assert_eq!(report.outputs()[0].output_name(), "west_output");
+        assert_eq!(report.outputs()[1].output_name(), "east_output");
         Ok(())
     }
 

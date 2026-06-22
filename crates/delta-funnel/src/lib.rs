@@ -59,6 +59,7 @@ pub use sql_server::{
     validate_mssql_output_record_batch, validate_mssql_output_schema, write_mssql_outputs_to_mssql,
     write_output_batches_to_mssql,
 };
+pub(crate) use sql_server::{MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer};
 pub use table_formats::{
     DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,
     ProtocolPreflight, load_delta_source, load_delta_sources, preflight_delta_protocol,
