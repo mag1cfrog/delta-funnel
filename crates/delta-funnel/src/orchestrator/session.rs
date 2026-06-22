@@ -3352,7 +3352,9 @@ fn ensure_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
     match run_mode {
         RunMode::Execute => Ok(()),
         RunMode::DryRun => Err(DeltaFunnelError::MssqlWorkflowPlanning {
-            message: "write_to_mssql requires RunMode::Execute; use plan_mssql_output for dry-run planning".to_owned(),
+            message:
+                "write_to_mssql requires RunMode::Execute; use dry_run_to_mssql for dry-run planning"
+                    .to_owned(),
         }),
     }
 }
@@ -3372,7 +3374,7 @@ fn ensure_write_all_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunne
         RunMode::Execute => Ok(()),
         RunMode::DryRun => Err(DeltaFunnelError::MssqlWorkflowPlanning {
             message:
-                "write_all requires RunMode::Execute; use plan_mssql_output for dry-run planning"
+                "write_all requires RunMode::Execute; use dry_run_all_to_mssql for dry-run planning"
                     .to_owned(),
         }),
     }
@@ -6536,7 +6538,7 @@ mod tests {
             error,
             Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
                 if message.contains("RunMode::Execute")
-                    && message.contains("plan_mssql_output")
+                    && message.contains("dry_run_to_mssql")
         ));
         assert!(writer.calls.is_empty());
         Ok(())
@@ -6662,6 +6664,7 @@ mod tests {
             error,
             Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
                 if message.contains("write_all requires RunMode::Execute")
+                    && message.contains("dry_run_all_to_mssql")
         ));
         Ok(())
     }
