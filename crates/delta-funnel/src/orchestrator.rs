@@ -527,11 +527,16 @@ impl fmt::Debug for RegisteredSessionSource {
 pub struct RegisteredDerivedTable {
     table: LazyTable,
     schema: SchemaRef,
+    sql_text: String,
 }
 
 impl RegisteredDerivedTable {
-    fn new(table: LazyTable, schema: SchemaRef) -> Self {
-        Self { table, schema }
+    fn new(table: LazyTable, schema: SchemaRef, sql_text: String) -> Self {
+        Self {
+            table,
+            schema,
+            sql_text,
+        }
     }
 
     /// Returns the lazy table handle for this registered derived alias.
@@ -551,6 +556,13 @@ impl RegisteredDerivedTable {
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
+
+    /// Returns the retained SQL text used to create this derived alias.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn sql_text(&self) -> &str {
+        &self.sql_text
+    }
 }
 
 impl fmt::Debug for RegisteredDerivedTable {
@@ -559,6 +571,7 @@ impl fmt::Debug for RegisteredDerivedTable {
             .debug_struct("RegisteredDerivedTable")
             .field("table", &self.table)
             .field("schema", &self.schema)
+            .field("sql_text", &"<redacted>")
             .finish()
     }
 }
@@ -567,6 +580,7 @@ struct PendingDerivedTable {
     table: LazyTable,
     provider: Arc<dyn TableProvider>,
     schema: SchemaRef,
+    sql_text: String,
 }
 
 /// Rust backing session for lazy query-load workflows.
@@ -647,6 +661,7 @@ impl DeltaFunnelSession {
             table: table.clone(),
             provider,
             schema,
+            sql_text: sql.to_owned(),
         });
         Ok(table)
     }
@@ -694,6 +709,7 @@ impl DeltaFunnelSession {
         self.derived_tables.push(RegisteredDerivedTable::new(
             alias_table.clone(),
             pending.schema,
+            pending.sql_text,
         ));
         Ok(alias_table)
     }
@@ -969,6 +985,28 @@ impl DeltaFunnelSession {
                 }),
         }
         .ok_or_else(|| unknown_lazy_table_error(table))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sql_text_for_derived_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<&str, DeltaFunnelError> {
+        if table.kind() != LazyTableKind::DerivedSql {
+            return Err(unknown_lazy_table_error(table));
+        }
+
+        self.derived_tables
+            .iter()
+            .find(|derived| derived.table.id == table.id)
+            .map(RegisteredDerivedTable::sql_text)
+            .or_else(|| {
+                self.pending_derived_tables
+                    .iter()
+                    .find(|pending| pending.table.id == table.id)
+                    .map(|pending| pending.sql_text.as_str())
+            })
+            .ok_or_else(|| unknown_lazy_table_error(table))
     }
 }
 
@@ -2539,6 +2577,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_from_sql_retains_trimmed_pending_sql_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let derived = session
+            .table_from_sql(" \n\t select id from orders \t ")
+            .await?;
+
+        assert_eq!(
+            session.sql_text_for_derived_table(&derived)?,
+            "select id from orders"
+        );
+        assert!(session.derived_tables().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registered_derived_alias_can_be_referenced_by_later_sql()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
@@ -2563,6 +2620,35 @@ mod tests {
             .ok_or("registered derived alias missing")?;
         assert_eq!(registered.table(), &alias);
         assert_eq!(registered.schema().fields().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registered_derived_alias_retains_sql_text() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let derived = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+
+        let alias = session.register_alias("recent_orders", &derived)?;
+        let registered = session
+            .registered_derived_table("RECENT_ORDERS")
+            .ok_or("registered derived alias missing")?;
+
+        assert_eq!(
+            session.sql_text_for_derived_table(&alias)?,
+            "select id, customer_name from orders"
+        );
+        assert_eq!(
+            registered.sql_text(),
+            "select id, customer_name from orders"
+        );
+        assert_eq!(
+            session.sql_text_for_derived_table(&derived)?,
+            "select id, customer_name from orders"
+        );
         Ok(())
     }
 
@@ -2715,6 +2801,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_derived_alias_preserves_pending_sql_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let derived = session.table_from_sql("select id from orders").await?;
+
+        let error = session.register_alias("select", &derived);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::InvalidSourceName { name, .. }) if name == "select"
+        ));
+        assert_eq!(
+            session.sql_text_for_derived_table(&derived)?,
+            "select id from orders"
+        );
+        let alias = session.register_alias("recent_orders", &derived)?;
+        assert_eq!(
+            session.sql_text_for_derived_table(&alias)?,
+            "select id from orders"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn register_alias_rejects_non_pending_table_handle()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
@@ -2753,6 +2865,27 @@ mod tests {
         ));
         assert_eq!(session.derived_tables().len(), 1);
         assert!(session.context().table("RECENT_ORDERS").await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registered_derived_debug_redacts_retained_sql_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let derived = session
+            .table_from_sql("select 'super-secret-literal' as marker")
+            .await?;
+        session.register_alias("secret_marker", &derived)?;
+        let registered = session
+            .registered_derived_table("secret_marker")
+            .ok_or("registered derived alias missing")?;
+
+        let debug = format!("{registered:?}");
+
+        assert!(debug.contains("sql_text"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("super-secret-literal"));
+        assert!(!debug.contains("select '"));
         Ok(())
     }
 
