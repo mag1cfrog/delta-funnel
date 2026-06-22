@@ -1092,6 +1092,14 @@ mod tests {
         table_formats::RealParquetDeltaTable,
     };
     use async_trait::async_trait;
+    use datafusion::{
+        arrow::{
+            array::{Array, ArrayRef, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        },
+        datasource::MemTable,
+    };
 
     struct DeltaLogTable {
         path: PathBuf,
@@ -1302,6 +1310,58 @@ mod tests {
         }
 
         Ok(rows)
+    }
+
+    async fn collect_stream_marker_values(
+        mut stream: MssqlOutputBatchStream,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut batches = Vec::new();
+
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+
+        marker_values_from_batches(&batches)
+    }
+
+    fn marker_values_from_batches(
+        batches: &[RecordBatch],
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut markers = Vec::new();
+
+        for batch in batches {
+            let column = batch
+                .column_by_name("marker")
+                .ok_or_else(|| std::io::Error::other("expected marker column"))?;
+            let strings = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| std::io::Error::other("expected marker StringArray"))?;
+
+            for row in 0..strings.len() {
+                markers.push(strings.value(row).to_owned());
+            }
+        }
+
+        Ok(markers)
+    }
+
+    fn marker_region_provider(
+        marker: &str,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("marker", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![marker, marker])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["west", "east"])) as ArrayRef,
+            ],
+        )?;
+
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
     #[test]
@@ -1796,6 +1856,57 @@ mod tests {
         let rows = collect_stream_row_count(stream).await?;
 
         assert_eq!(rows, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_alias_replacement_does_not_feed_existing_downstream_derived_tables()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session
+            .context()
+            .register_table("big_source", marker_region_provider("original")?)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let _big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let east = session
+            .table_from_sql("select marker from big where region = 'east'")
+            .await?;
+
+        let replacement = session
+            .context()
+            .read_table(marker_region_provider("replacement")?)?
+            .cache()
+            .await?
+            .into_view();
+        let removed_big = session.context().deregister_table("big")?;
+        assert!(removed_big.is_some());
+        session.context().register_table("big", replacement)?;
+
+        let direct_big = session
+            .context()
+            .sql("select marker from big where region = 'west'")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            marker_values_from_batches(&direct_big)?,
+            vec!["replacement"]
+        );
+
+        let west_stream = session.batch_stream_for_lazy_table(&west).await?;
+        let east_stream = session.batch_stream_for_lazy_table(&east).await?;
+        let west_markers = collect_stream_marker_values(west_stream).await?;
+        let east_markers = collect_stream_marker_values(east_stream).await?;
+
+        // Conclusion for #245: existing downstream ViewTable providers keep the
+        // original resolved provider; catalog replacement alone does not rewire them.
+        assert_eq!(west_markers, vec!["original"]);
+        assert_eq!(east_markers, vec!["original"]);
         Ok(())
     }
 
