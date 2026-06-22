@@ -1101,9 +1101,10 @@ mod tests {
             record_batch::RecordBatch,
         },
         catalog::Session,
+        common::tree_node::{TreeNode, TreeNodeRecursion},
         datasource::MemTable,
         error::Result as DataFusionResult,
-        logical_expr::{Expr, TableType},
+        logical_expr::{Expr, LogicalPlan, TableType},
         physical_plan::ExecutionPlan,
     };
 
@@ -1425,6 +1426,51 @@ mod tests {
         };
 
         Ok((Arc::new(provider), scans))
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TableScanProofReference {
+        table_name: String,
+        nested_table_names: Vec<String>,
+    }
+
+    fn table_scan_proof_references(
+        plan: &LogicalPlan,
+    ) -> DataFusionResult<Vec<TableScanProofReference>> {
+        let mut references = Vec::new();
+
+        plan.apply(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                let nested_table_names = scan
+                    .source
+                    .get_logical_plan()
+                    .map(|nested| table_scan_table_names(nested.as_ref()))
+                    .transpose()?
+                    .unwrap_or_default();
+                references.push(TableScanProofReference {
+                    table_name: scan.table_name.table().to_owned(),
+                    nested_table_names,
+                });
+            }
+
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        Ok(references)
+    }
+
+    fn table_scan_table_names(plan: &LogicalPlan) -> DataFusionResult<Vec<String>> {
+        let mut names = Vec::new();
+
+        plan.apply(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                names.push(scan.table_name.table().to_owned());
+            }
+
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        Ok(names)
     }
 
     #[test]
@@ -2024,6 +2070,80 @@ mod tests {
         assert_eq!(west_markers, vec!["shared"]);
         assert_eq!(east_markers, vec!["shared"]);
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planned_downstream_sql_expands_registered_derived_alias_reference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MARKER_REGION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"marker\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]"#;
+
+        let table = DeltaLogTable::new_with_schema("orders", MARKER_REGION_SCHEMA_FIELDS_JSON)?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let source_dataframe = session
+            .plan_read_only_sql("select marker from orders")
+            .await?;
+        let source_references = table_scan_proof_references(source_dataframe.logical_plan())?;
+        assert_eq!(
+            source_references,
+            vec![TableScanProofReference {
+                table_name: "orders".to_owned(),
+                nested_table_names: Vec::new(),
+            }]
+        );
+        assert!(session.registered_source("orders").is_some());
+        assert!(session.registered_derived_table("orders").is_none());
+
+        let pending_big = session
+            .table_from_sql("select marker, region from orders")
+            .await?;
+        let _big = session.register_alias("big", &pending_big)?;
+        let west_dataframe = session
+            .plan_read_only_sql("select marker from BIG where region = 'west'")
+            .await?;
+        let east_dataframe = session
+            .plan_read_only_sql("select marker from big where region = 'east'")
+            .await?;
+        let west_references = table_scan_proof_references(west_dataframe.logical_plan())?;
+        let east_references = table_scan_proof_references(east_dataframe.logical_plan())?;
+
+        for references in [&west_references, &east_references] {
+            assert_eq!(
+                references,
+                &vec![TableScanProofReference {
+                    table_name: "orders".to_owned(),
+                    nested_table_names: Vec::new(),
+                }]
+            );
+            assert!(
+                session
+                    .registered_source(&references[0].table_name)
+                    .is_some()
+            );
+            assert!(
+                session
+                    .registered_derived_table(&references[0].table_name)
+                    .is_none()
+            );
+        }
+
+        // Conclusion for #257: DataFusion expands the registered derived
+        // alias during SQL planning, so planned LogicalPlan table scans do not
+        // preserve a structured west/east -> big dependency for #250.
+        assert!(
+            !west_references
+                .iter()
+                .any(|reference| reference.table_name.eq_ignore_ascii_case("big"))
+        );
+        assert!(
+            !east_references
+                .iter()
+                .any(|reference| reference.table_name.eq_ignore_ascii_case("big"))
+        );
+        assert!(session.registered_derived_table("big").is_some());
+        assert!(session.registered_source("big").is_none());
         Ok(())
     }
 
