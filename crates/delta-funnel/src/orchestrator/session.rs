@@ -6197,6 +6197,18 @@ mod tests {
         assert!(report.all_succeeded());
         assert_eq!(report.outputs()[0].output_name(), "west_output");
         assert_eq!(report.outputs()[1].output_name(), "east_output");
+        assert_eq!(report.workflow().outputs(), report.outputs());
+        let crate::sql_server::MssqlOutputWriteStatus::Succeeded(west_report) =
+            &report.outputs()[0]
+        else {
+            return Err(format!("expected succeeded status, got {:?}", report.outputs()[0]).into());
+        };
+        assert_eq!(west_report.stats().rows_written(), 2);
+        assert_eq!(west_report.stats().batches_written(), calls[0].batches);
+        assert_eq!(
+            west_report.cleanup(),
+            MssqlTargetCleanupStatus::NotApplicable
+        );
         Ok(())
     }
 
