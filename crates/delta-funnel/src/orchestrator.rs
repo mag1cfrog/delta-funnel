@@ -3062,6 +3062,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn derived_lineage_records_dependency_inside_from_subquery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+
+        let derived = session
+            .table_from_sql("select id from (select id from big) nested")
+            .await?;
+        let lineage = session.lineage_for_derived_table(&derived)?;
+
+        assert_eq!(
+            lineage.direct_dependencies(),
+            &[DerivedTableDependency::RegisteredDerived {
+                table_id: big.id(),
+                name: "big".to_owned(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn derived_lineage_finds_transitive_registered_derived_dependencies()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
@@ -3093,6 +3119,39 @@ mod tests {
                     name: "regional".to_owned(),
                 },
             ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_matches_shared_transitive_dependency_for_multiple_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+
+        let west = session
+            .table_from_sql("select id from big where customer_name = 'alice'")
+            .await?;
+        let east = session
+            .table_from_sql("select id from big where customer_name = 'bob'")
+            .await?;
+        let expected = vec![DerivedTableDependency::RegisteredDerived {
+            table_id: big.id(),
+            name: "big".to_owned(),
+        }];
+
+        assert_eq!(
+            session.transitive_registered_derived_dependencies(&west)?,
+            expected
+        );
+        assert_eq!(
+            session.transitive_registered_derived_dependencies(&east)?,
+            expected
         );
         Ok(())
     }
