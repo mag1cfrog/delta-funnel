@@ -3442,6 +3442,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_output_stream_factory_replans_dependent_output_against_multiple_active_caches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (big_source_provider, big_source_scans) = scan_counting_marker_region_provider("big")?;
+        let (names_source_provider, names_source_scans) =
+            scan_counting_marker_region_provider("name")?;
+        session
+            .context()
+            .register_table("big_source", big_source_provider)?;
+        session
+            .context()
+            .register_table("names_source", names_source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_names = session
+            .table_from_sql("select marker, region from names_source")
+            .await?;
+        let names = session.register_alias("names", &pending_names)?;
+        let west = session
+            .table_from_sql(
+                "select big.marker from big join names on big.region = names.region where big.region = 'west' and names.marker = 'name'",
+            )
+            .await?;
+        let east = session
+            .table_from_sql(
+                "select big.marker from big join names on big.region = names.region where big.region = 'east' and names.marker = 'name'",
+            )
+            .await?;
+        let west_output = output_request(
+            west.clone(),
+            "west_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let east_output =
+            output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+        let plan = session.plan_mssql_output_cache(&[west_output.clone(), east_output]);
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[0].table_id(), big.id());
+        assert_eq!(caches[1].table_id(), names.id());
+        let big_replacement = session
+            .replace_registered_derived_alias_with_cache(&big)
+            .await?;
+        let names_replacement = session
+            .replace_registered_derived_alias_with_cache(&names)
+            .await?;
+        assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
+
+        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
+        let markers = collect_stream_marker_values(factory().await?).await?;
+
+        assert_eq!(markers, vec!["big"]);
+        assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
+        let _names_restoration = names_replacement.restore().await?;
+        let _big_restoration = big_replacement.restore().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cached_output_stream_factory_rejects_replanned_schema_mismatch()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
