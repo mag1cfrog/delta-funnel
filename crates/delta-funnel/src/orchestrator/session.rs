@@ -590,8 +590,11 @@ impl fmt::Debug for MssqlOutputCachePlanOutput {
 pub(crate) enum MssqlOutputCacheDecision {
     /// No safe shared cache candidate was selected.
     NoCache { reason: MssqlNoCacheReason },
-    /// A registered derived alias should be cached for selected outputs.
-    CacheAlias(MssqlDerivedCacheAliasPlan),
+    /// Registered derived aliases that should be cached for selected outputs.
+    ///
+    /// This vector represents the cache frontier: eligible shared derived
+    /// aliases that are not covered by any deeper eligible shared alias.
+    CacheAliases(Vec<MssqlDerivedCacheAliasPlan>),
 }
 
 /// Conservative reason no cache alias was selected.
@@ -1275,7 +1278,7 @@ impl DeltaFunnelSession {
         if shared_candidates.len() == 1 {
             return MssqlOutputCachePlan::new(
                 selected_outputs,
-                MssqlOutputCacheDecision::CacheAlias(shared_candidates.remove(0)),
+                MssqlOutputCacheDecision::CacheAliases(vec![shared_candidates.remove(0)]),
                 skipped_candidates,
             );
         }
@@ -1297,7 +1300,7 @@ impl DeltaFunnelSession {
                 }));
                 return MssqlOutputCachePlan::new(
                     selected_outputs,
-                    MssqlOutputCacheDecision::CacheAlias(selected_candidate),
+                    MssqlOutputCacheDecision::CacheAliases(vec![selected_candidate]),
                     skipped_candidates,
                 );
             }
@@ -2547,9 +2550,11 @@ mod tests {
         let plan = session.plan_mssql_output_cache(&[west, east]);
 
         assert!(plan.skipped_candidates().is_empty());
-        let MssqlOutputCacheDecision::CacheAlias(cache) = plan.decision() else {
-            return Err("expected cache alias decision".into());
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
         };
+        assert_eq!(caches.len(), 1);
+        let cache = &caches[0];
         assert_eq!(cache.table_id(), big.id());
         assert_eq!(cache.alias(), "big");
         assert_eq!(cache.output_indexes(), &[0, 1]);
@@ -2580,9 +2585,11 @@ mod tests {
 
         let plan = session.plan_mssql_output_cache(&[big_output, west_output]);
 
-        let MssqlOutputCacheDecision::CacheAlias(cache) = plan.decision() else {
-            return Err("expected cache alias decision".into());
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
         };
+        assert_eq!(caches.len(), 1);
+        let cache = &caches[0];
         assert_eq!(cache.table_id(), big.id());
         assert_eq!(cache.alias(), "big");
         assert_eq!(cache.output_indexes(), &[0, 1]);
@@ -2659,9 +2666,11 @@ mod tests {
 
         let plan = session.plan_mssql_output_cache(&[west, east]);
 
-        let MssqlOutputCacheDecision::CacheAlias(cache) = plan.decision() else {
-            return Err("expected cache alias decision".into());
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
         };
+        assert_eq!(caches.len(), 1);
+        let cache = &caches[0];
         assert_eq!(cache.table_id(), filtered_big.id());
         assert_eq!(cache.alias(), "filtered_big");
         assert_eq!(cache.output_indexes(), &[0, 1]);
