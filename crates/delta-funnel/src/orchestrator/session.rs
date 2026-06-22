@@ -488,10 +488,15 @@ impl<'a> MssqlScopedCacheAliasReplacement<'a> {
         &self.alias_name
     }
 
-    /// Restores the original provider under the alias.
+    /// Restores the original provider under the alias and consumes the scope.
     ///
-    /// This is async by design so later cache cleanup can remain awaitable even
-    /// if DataFusion changes or additional async cleanup is needed.
+    /// This method transitions the catalog from "alias points at cached
+    /// provider" back to "alias points at the original provider". It is async
+    /// by design so later cache cleanup can remain awaitable even if DataFusion
+    /// changes or additional async cleanup is needed.
+    ///
+    /// Callers should await this method on both success and error paths that
+    /// leave the scoped replacement active.
     pub(crate) async fn restore(
         mut self,
     ) -> Result<MssqlScopedCacheAliasRestoration, DeltaFunnelError> {
@@ -1486,6 +1491,11 @@ impl DeltaFunnelSession {
             .find(|table| table.table().id() == table_id)
     }
 
+    /// Resolves the session metadata for an alias that is eligible for scoped caching.
+    ///
+    /// The cache primitive only supports registered SQL-derived aliases. Raw
+    /// sources, pending derived tables, and foreign or stale table handles are
+    /// rejected before any DataFusion catalog mutation can happen.
     fn registered_derived_for_scoped_cache_alias(
         &self,
         table: &LazyTable,
@@ -1498,6 +1508,15 @@ impl DeltaFunnelSession {
             .ok_or_else(|| unknown_lazy_table_error(table))
     }
 
+    /// Materializes one registered derived alias and temporarily replaces that alias.
+    ///
+    /// The method leaves the original catalog alias active while DataFusion
+    /// builds the cache, then swaps the catalog entry to the cached provider.
+    /// The returned scope owns the original provider and must be restored with
+    /// `MssqlScopedCacheAliasReplacement::restore`.
+    ///
+    /// This is intentionally a one-alias primitive. It does not choose cache
+    /// candidates, replan downstream SQL, or execute any outputs.
     #[allow(dead_code)]
     pub(crate) async fn replace_registered_derived_alias_with_cache(
         &self,
@@ -1519,43 +1538,8 @@ impl DeltaFunnelSession {
             })?
             .into_view();
 
-        let original_provider = self
-            .context
-            .deregister_table(alias_name.as_str())
-            .map_err(|error| {
-                mssql_scoped_cache_alias_error("deregister", alias_name.as_str(), error)
-            })?
-            .ok_or_else(|| {
-                mssql_scoped_cache_alias_error(
-                    "deregister",
-                    alias_name.as_str(),
-                    "registered alias was missing from the catalog",
-                )
-            })?;
-
-        if let Err(register_error) = self
-            .context
-            .register_table(alias_name.as_str(), cached_provider)
-        {
-            let restore_result = self
-                .context
-                .register_table(alias_name.as_str(), Arc::clone(&original_provider));
-            let message = match restore_result {
-                Ok(_) => format!(
-                    "failed to register cached provider for alias `{}`: {}",
-                    sanitize_text_for_display(&alias_name),
-                    sanitize_text_for_display(&register_error.to_string())
-                ),
-                Err(restore_error) => format!(
-                    "failed to register cached provider for alias `{}`: {}; also failed to restore original provider: {}",
-                    sanitize_text_for_display(&alias_name),
-                    sanitize_text_for_display(&register_error.to_string()),
-                    sanitize_text_for_display(&restore_error.to_string())
-                ),
-            };
-
-            return Err(DeltaFunnelError::MssqlWorkflowPlanning { message });
-        }
+        let original_provider =
+            self.install_scoped_cache_alias_provider(alias_name.as_str(), cached_provider)?;
 
         Ok(MssqlScopedCacheAliasReplacement {
             context: &self.context,
@@ -1563,6 +1547,71 @@ impl DeltaFunnelSession {
             alias_name,
             original_provider: Some(original_provider),
         })
+    }
+
+    /// Swaps a catalog alias from its original provider to a cached provider.
+    ///
+    /// On success, the alias points at `cached_provider` and the original
+    /// provider is returned to the caller for later restoration. If registering
+    /// the cached provider fails after the original provider has been removed,
+    /// this helper attempts to put the original provider back before returning
+    /// the error.
+    fn install_scoped_cache_alias_provider(
+        &self,
+        alias_name: &str,
+        cached_provider: Arc<dyn TableProvider>,
+    ) -> Result<Arc<dyn TableProvider>, DeltaFunnelError> {
+        let original_provider = self
+            .context
+            .deregister_table(alias_name)
+            .map_err(|error| mssql_scoped_cache_alias_error("deregister", alias_name, error))?
+            .ok_or_else(|| {
+                mssql_scoped_cache_alias_error(
+                    "deregister",
+                    alias_name,
+                    "registered alias was missing from the catalog",
+                )
+            })?;
+
+        if let Err(register_error) = self.context.register_table(alias_name, cached_provider) {
+            return Err(self.restore_original_after_cached_register_failure(
+                alias_name,
+                original_provider,
+                register_error,
+            ));
+        }
+
+        Ok(original_provider)
+    }
+
+    /// Restores the original provider after cached-provider registration fails.
+    ///
+    /// This helper is used only for the narrow failure window where the
+    /// original provider has already been deregistered but the cached provider
+    /// could not be registered. The returned error reports the cached register
+    /// failure and, if restoration also fails, includes that cleanup failure.
+    fn restore_original_after_cached_register_failure(
+        &self,
+        alias_name: &str,
+        original_provider: Arc<dyn TableProvider>,
+        register_error: impl fmt::Display,
+    ) -> DeltaFunnelError {
+        let restore_result = self.context.register_table(alias_name, original_provider);
+        let message = match restore_result {
+            Ok(_) => format!(
+                "failed to register cached provider for alias `{}`: {}",
+                sanitize_text_for_display(alias_name),
+                sanitize_text_for_display(&register_error.to_string())
+            ),
+            Err(restore_error) => format!(
+                "failed to register cached provider for alias `{}`: {}; also failed to restore original provider: {}",
+                sanitize_text_for_display(alias_name),
+                sanitize_text_for_display(&register_error.to_string()),
+                sanitize_text_for_display(&restore_error.to_string())
+            ),
+        };
+
+        DeltaFunnelError::MssqlWorkflowPlanning { message }
     }
 
     /// Returns whether a selected output uses a registered derived candidate.
@@ -3804,6 +3853,93 @@ mod tests {
         assert_eq!(restoration.table_id(), big.id());
         assert_eq!(restoration.alias_name(), "big");
         assert!(restoration.cached_alias_was_present());
+
+        let direct_restored_big = session
+            .context()
+            .sql("select marker from big where region = 'west'")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            marker_values_from_batches(&direct_restored_big)?,
+            vec!["shared"]
+        );
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_cache_alias_replacement_restores_original_after_cached_register_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let _big = session.register_alias("big", &pending_big)?;
+        let original_provider = session
+            .context()
+            .deregister_table("big")?
+            .ok_or("expected original provider")?;
+
+        let error = session.restore_original_after_cached_register_failure(
+            "big",
+            original_provider,
+            "injected cached register failure",
+        );
+
+        assert!(matches!(
+            &error,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message.contains("failed to register cached provider")
+                    && message.contains("injected cached register failure")
+        ));
+
+        let direct_restored_big = session
+            .context()
+            .sql("select marker from big where region = 'west'")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            marker_values_from_batches(&direct_restored_big)?,
+            vec!["shared"]
+        );
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_cache_alias_replacement_explicit_restore_cleans_up_after_later_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let replacement = session
+            .replace_registered_derived_alias_with_cache(&big)
+            .await?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let later_error = DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "simulated downstream planning failure".to_owned(),
+        };
+        let restoration = replacement.restore().await?;
+
+        assert!(matches!(
+            later_error,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message.contains("simulated downstream planning failure")
+        ));
+        assert_eq!(restoration.alias_name(), "big");
 
         let direct_restored_big = session
             .context()
