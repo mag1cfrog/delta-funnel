@@ -2848,6 +2848,58 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn cache_plan_skips_independent_unshared_registered_derived_aliases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_names = session
+            .table_from_sql("select customer_name from orders")
+            .await?;
+        let names = session.register_alias("names", &pending_names)?;
+        let west = session
+            .table_from_sql("select id from big where customer_name = 'alice'")
+            .await?;
+        let name_output = session
+            .table_from_sql("select customer_name from names")
+            .await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let name_output = output_request(
+            name_output,
+            "name_output",
+            "name_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let plan = session.plan_mssql_output_cache(&[west, name_output]);
+
+        assert_eq!(
+            plan.decision(),
+            &MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::NoSharedRegisteredDerivedAlias,
+            }
+        );
+        assert_eq!(plan.skipped_candidates().len(), 2);
+        assert_eq!(plan.skipped_candidates()[0].table_id(), big.id());
+        assert_eq!(plan.skipped_candidates()[0].alias(), "big");
+        assert_eq!(
+            plan.skipped_candidates()[0].reason(),
+            &MssqlCacheCandidateSkipReason::NotShared { output_count: 1 }
+        );
+        assert_eq!(plan.skipped_candidates()[1].table_id(), names.id());
+        assert_eq!(plan.skipped_candidates()[1].alias(), "names");
+        assert_eq!(
+            plan.skipped_candidates()[1].reason(),
+            &MssqlCacheCandidateSkipReason::NotShared { output_count: 1 }
+        );
+        Ok(())
+    }
+
     #[test]
     fn plan_mssql_output_uses_source_schema_and_session_connection()
     -> Result<(), Box<dyn std::error::Error>> {
