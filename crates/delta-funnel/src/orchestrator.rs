@@ -21,8 +21,8 @@ use crate::{
     MssqlWriteOptions, MssqlWriteReport, QueryOptions, RegisteredDeltaSource, ResolvedMssqlTarget,
     SqlTablePhase, datafusion_query_output_stream, datafusion_session_context,
     default_mssql_write_options, load_delta_source, plan_mssql_target_for_resolved_output,
-    preflight_delta_protocol, redaction::sanitize_text_for_display,
-    register_delta_sources_with_scan_execution_options, table_formats::validate_table_source_names,
+    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
+    support::sanitize_text_for_display, table_formats::validate_table_source_names,
     write_output_batches_to_mssql,
 };
 

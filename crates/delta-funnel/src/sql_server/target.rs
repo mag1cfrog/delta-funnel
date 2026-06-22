@@ -5,7 +5,7 @@ use std::fmt;
 use crate::{
     DeltaFunnelError,
     error::{MissingMssqlConnectionSnafu, MssqlTargetConfigSnafu},
-    redaction::sanitize_text_for_display,
+    support::sanitize_text_for_display,
 };
 
 use snafu::ensure;

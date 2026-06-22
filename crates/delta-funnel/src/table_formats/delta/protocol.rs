@@ -1,6 +1,6 @@
 //! Delta protocol preflight.
 
-use crate::redaction::sanitize_uri_for_display;
+use crate::support::sanitize_uri_for_display;
 use crate::{DeltaFunnelError, error::DeltaProtocolCompatibilitySnafu};
 
 use super::PlannedDeltaSource;

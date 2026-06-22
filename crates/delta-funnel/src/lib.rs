@@ -14,8 +14,8 @@ mod batch_pipeline;
 pub mod error;
 mod orchestrator;
 pub(crate) mod query_engine;
-mod redaction;
 mod sql_server;
+mod support;
 mod table_formats;
 
 pub use batch_pipeline::{

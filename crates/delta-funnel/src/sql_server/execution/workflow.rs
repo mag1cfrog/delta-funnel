@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::Stream;
 
-use crate::{DeltaFunnelError, redaction::sanitize_text_for_display};
+use crate::{DeltaFunnelError, support::sanitize_text_for_display};
 
 use super::{
     LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlSchemaPlanOptions,
