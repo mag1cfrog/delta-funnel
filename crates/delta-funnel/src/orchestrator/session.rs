@@ -726,14 +726,27 @@ pub(crate) enum MssqlCacheCandidateSkipReason {
     AmbiguousDepth,
 }
 
+// Result of selecting the cache frontier from already eligible shared
+// candidates.
 enum MssqlCacheFrontierSelection {
     Selected {
+        // Candidates that remain on the frontier and should be cached.
         selected_aliases: Vec<MssqlDerivedCacheAliasPlan>,
-        covered_aliases: Vec<MssqlDerivedCacheAliasPlan>,
+        // Broader upstream candidates removed because one selected alias is
+        // deeper and can cover the same upstream work more precisely.
+        covered_aliases: Vec<MssqlCoveredCacheAlias>,
     },
     Ambiguous {
+        // Candidates whose ordering could not produce a deterministic frontier.
         ambiguous_aliases: Vec<MssqlDerivedCacheAliasPlan>,
     },
+}
+
+struct MssqlCoveredCacheAlias {
+    // The skipped upstream alias.
+    alias: MssqlDerivedCacheAliasPlan,
+    // The selected downstream alias that covered it.
+    selected_table_id: u64,
 }
 
 /// Registered Delta source tracked by a query-load session.
@@ -1298,20 +1311,17 @@ impl DeltaFunnelSession {
                     selected_aliases,
                     covered_aliases,
                 } => {
-                    let selected_table_id = selected_aliases[0].table_id();
-                    skipped_candidates.extend(covered_aliases.into_iter().filter_map(
-                        |candidate| {
-                            self.registered_derived_table_by_id(candidate.table_id())
-                                .map(|derived| {
-                                    MssqlCacheCandidateSkip::from_registered(
-                                        derived,
-                                        MssqlCacheCandidateSkipReason::CoveredByDeeperSharedAlias {
-                                            selected_table_id,
-                                        },
-                                    )
-                                })
-                        },
-                    ));
+                    skipped_candidates.extend(covered_aliases.into_iter().filter_map(|covered| {
+                        self.registered_derived_table_by_id(covered.alias.table_id())
+                            .map(|derived| {
+                                MssqlCacheCandidateSkip::from_registered(
+                                    derived,
+                                    MssqlCacheCandidateSkipReason::CoveredByDeeperSharedAlias {
+                                        selected_table_id: covered.selected_table_id,
+                                    },
+                                )
+                            })
+                    }));
                     return MssqlOutputCachePlan::new(
                         selected_outputs,
                         MssqlOutputCacheDecision::CacheAliases(selected_aliases),
@@ -1384,18 +1394,27 @@ impl DeltaFunnelSession {
             .find(|table| table.table().id() == table_id)
     }
 
+    /// Returns whether a selected output uses a registered derived candidate.
+    ///
+    /// Direct use and lineage use both count for cache selection. Direct use
+    /// covers `big.to_mssql(...)`; lineage use covers downstream SQL such as
+    /// `west` reading from `big`, including transitive derived dependencies.
     fn cache_output_uses_registered_derived(
         &self,
         table: &LazyTable,
         candidate: &RegisteredDerivedTable,
     ) -> bool {
+        // The selected output itself can be the cache candidate.
         if table.id() == candidate.table().id() {
             return true;
         }
+        // Raw Delta sources cannot depend on registered derived aliases.
         if table.kind() == LazyTableKind::DeltaSource {
             return false;
         }
 
+        // Pending or registered derived outputs use captured lineage. If lineage
+        // lookup fails, the candidate is not counted for this output.
         self.transitive_registered_derived_dependencies(table)
             .map(|dependencies| {
                 dependencies.iter().any(|dependency| {
@@ -1409,10 +1428,19 @@ impl DeltaFunnelSession {
             .unwrap_or(false)
     }
 
+    /// Selects the cache frontier from eligible shared derived aliases.
+    ///
+    /// The frontier is every shared alias that is not covered by a deeper
+    /// shared alias. Chain-shaped candidates collapse to the deepest alias,
+    /// while independent candidates are kept together even when they serve the
+    /// same selected output indexes.
     fn select_shared_cache_frontier(
         &self,
         candidates: Vec<MssqlDerivedCacheAliasPlan>,
     ) -> MssqlCacheFrontierSelection {
+        // A candidate is covered when another shared candidate depends on it.
+        // Covered aliases are useful upstream work, but caching the deeper
+        // shared alias is closer to the final selected outputs.
         let deepest_indexes = candidates
             .iter()
             .enumerate()
@@ -1427,20 +1455,50 @@ impl DeltaFunnelSession {
             .collect::<Vec<_>>();
 
         match deepest_indexes.as_slice() {
-            [index] => {
-                let mut covered_aliases = candidates;
-                let selected_alias = covered_aliases.remove(*index);
+            [] => MssqlCacheFrontierSelection::Ambiguous {
+                ambiguous_aliases: candidates,
+            },
+            [_, ..] => {
+                // The indexes that remain are the frontier. More than one means
+                // independent shared aliases, not ambiguity, because no selected
+                // alias can replace the work represented by another.
+                let selected_aliases = deepest_indexes
+                    .iter()
+                    .map(|index| candidates[*index].clone())
+                    .collect::<Vec<_>>();
+                // Keep covered aliases visible in the plan so later reports can
+                // explain why broader upstream candidates were not selected.
+                let covered_aliases = candidates
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(candidate_index, candidate)| {
+                        if deepest_indexes.contains(&candidate_index) {
+                            return None;
+                        }
+                        selected_aliases
+                            .iter()
+                            .find(|selected| {
+                                self.cache_candidate_is_deeper_than(selected, candidate)
+                            })
+                            .map(|selected| MssqlCoveredCacheAlias {
+                                alias: candidate.clone(),
+                                selected_table_id: selected.table_id(),
+                            })
+                    })
+                    .collect::<Vec<_>>();
                 MssqlCacheFrontierSelection::Selected {
-                    selected_aliases: vec![selected_alias],
+                    selected_aliases,
                     covered_aliases,
                 }
             }
-            [] | [_, ..] => MssqlCacheFrontierSelection::Ambiguous {
-                ambiguous_aliases: candidates,
-            },
         }
     }
 
+    /// Returns whether `candidate` is a downstream derived alias of `other`.
+    ///
+    /// This is the ordering test used by frontier selection. It is intentionally
+    /// based on session-owned table identity plus captured lineage, not on alias
+    /// names, SQL text, registration order, or output order.
     fn cache_candidate_is_deeper_than(
         &self,
         candidate: &MssqlDerivedCacheAliasPlan,
@@ -1450,6 +1508,8 @@ impl DeltaFunnelSession {
             return false;
         }
 
+        // Missing metadata should not create a deeper-than relationship. The
+        // caller treats unprovable ordering conservatively when needed.
         let Some(candidate_table) = self.registered_derived_table_by_id(candidate.table_id())
         else {
             return false;
@@ -1458,6 +1518,9 @@ impl DeltaFunnelSession {
             return false;
         };
 
+        // Reuse the same direct-or-transitive dependency check as output
+        // classification. If candidate depends on other, candidate is closer to
+        // outputs that use candidate and can cover the broader upstream alias.
         self.cache_output_uses_registered_derived(candidate_table.table(), other_table)
     }
 
@@ -2715,7 +2778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_plan_rejects_ambiguous_incomparable_shared_aliases()
+    async fn cache_plan_selects_independent_shared_registered_derived_aliases()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -2743,25 +2806,17 @@ mod tests {
 
         let plan = session.plan_mssql_output_cache(&[west, east]);
 
-        assert_eq!(
-            plan.decision(),
-            &MssqlOutputCacheDecision::NoCache {
-                reason: MssqlNoCacheReason::AmbiguousSharedDerivedAlias,
-            }
-        );
-        assert_eq!(plan.skipped_candidates().len(), 2);
-        assert_eq!(plan.skipped_candidates()[0].table_id(), big.id());
-        assert_eq!(plan.skipped_candidates()[0].alias(), "big");
-        assert_eq!(
-            plan.skipped_candidates()[0].reason(),
-            &MssqlCacheCandidateSkipReason::AmbiguousDepth
-        );
-        assert_eq!(plan.skipped_candidates()[1].table_id(), names.id());
-        assert_eq!(plan.skipped_candidates()[1].alias(), "names");
-        assert_eq!(
-            plan.skipped_candidates()[1].reason(),
-            &MssqlCacheCandidateSkipReason::AmbiguousDepth
-        );
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        assert!(plan.skipped_candidates().is_empty());
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[0].table_id(), big.id());
+        assert_eq!(caches[0].alias(), "big");
+        assert_eq!(caches[0].output_indexes(), &[0, 1]);
+        assert_eq!(caches[1].table_id(), names.id());
+        assert_eq!(caches[1].alias(), "names");
+        assert_eq!(caches[1].output_indexes(), &[0, 1]);
         Ok(())
     }
 
