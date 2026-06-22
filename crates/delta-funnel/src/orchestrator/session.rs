@@ -5946,6 +5946,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_all_auto_caches_multiple_shared_aliases_for_dependent_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (big_source_provider, big_source_scans) = scan_counting_marker_region_provider("big")?;
+        let (names_source_provider, names_source_scans) =
+            scan_counting_marker_region_provider("names")?;
+        session
+            .context()
+            .register_table("big_source", big_source_provider)?;
+        session
+            .context()
+            .register_table("names_source", names_source_provider)?;
+        let pending_big = session
+            .table_from_sql(
+                "select marker as big_marker, region, \
+                 case when region = 'west' then 1 else 2 end as id \
+                 from big_source",
+            )
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_names = session
+            .table_from_sql(
+                "select marker as name_marker, region, \
+                 case when region = 'west' then 1 else 2 end as id \
+                 from names_source",
+            )
+            .await?;
+        let names = session.register_alias("names", &pending_names)?;
+        let west = session
+            .table_from_sql(
+                "select big.id, big.big_marker, names.name_marker \
+                 from big join names on big.id = names.id \
+                 where big.region = 'west'",
+            )
+            .await?;
+        let east = session
+            .table_from_sql(
+                "select big.id, big.big_marker, names.name_marker \
+                 from big join names on big.id = names.id \
+                 where big.region = 'east'",
+            )
+            .await?;
+        let west_output =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east_output =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_writer(&[west_output, east_output], writer)
+            .await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].output_name, "west_output");
+        assert_eq!(calls[0].rows, 1);
+        assert_eq!(calls[1].output_name, "east_output");
+        assert_eq!(calls[1].rows, 1);
+        assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
+        assert!(report.all_succeeded());
+        drop(calls);
+
+        let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+        let restored_names_factory = session.lazy_table_batch_stream_factory(names);
+        assert_eq!(
+            collect_stream_row_count(restored_big_factory().await?).await?,
+            2
+        );
+        assert_eq!(
+            collect_stream_row_count(restored_names_factory().await?).await?,
+            2
+        );
+        assert_eq!(big_source_scans.load(Ordering::SeqCst), 2);
+        assert_eq!(names_source_scans.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn write_all_disabled_cache_mode_uses_baseline_path()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(
