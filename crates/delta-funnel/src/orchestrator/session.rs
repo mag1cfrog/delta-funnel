@@ -6094,6 +6094,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_all_auto_cache_materialization_failure_prevents_output_attempts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = failing_scan_marker_region_provider();
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let east = session
+            .table_from_sql("select marker from big where region = 'east'")
+            .await?;
+        let west_output =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east_output =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let error = session
+            .write_all_with_writer(&[west_output, east_output], writer)
+            .await;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("scoped MSSQL cache alias materialize failed")
+                    && message.contains("big")
+        ));
+        assert!(calls.is_empty());
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+        drop(calls);
+
+        let restored_error = match session.batch_stream_for_lazy_table(&big).await {
+            Ok(stream) => match collect_stream_row_count(stream).await {
+                Ok(rows) => {
+                    return Err(
+                        format!("expected restored big read to fail, got {rows} rows").into(),
+                    );
+                }
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &restored_error,
+            DeltaFunnelError::BatchPipeline { message, .. }
+                if message.contains("forced scan planning failure")
+        ));
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn write_all_disabled_cache_mode_uses_baseline_path()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(
