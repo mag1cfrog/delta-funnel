@@ -6503,6 +6503,22 @@ mod tests {
             assert!(report.outputs()[2].is_skipped());
             assert_eq!(report.outputs()[2].output_name(), "east_output");
         }
+        let WriteAllCacheReport::CacheAliases {
+            aliases,
+            skipped_candidates,
+        } = report.cache()
+        else {
+            return Err(format!("expected cache aliases report, got {:?}", report.cache()).into());
+        };
+        assert!(skipped_candidates.is_empty());
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].table_id(), big.id());
+        assert_eq!(aliases[0].alias(), "big");
+        assert_eq!(aliases[0].output_indexes(), &[0, 1, 2]);
+        assert_eq!(
+            aliases[0].status(),
+            WriteAllCacheAliasStatus::MaterializedAndRestored
+        );
 
         let restored_big_factory = session.lazy_table_batch_stream_factory(big);
         let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
@@ -6746,6 +6762,22 @@ mod tests {
             assert!(report.outputs()[2].is_skipped());
             assert_eq!(report.outputs()[2].output_name(), "east_output");
         }
+        let WriteAllCacheReport::CacheAliases {
+            aliases,
+            skipped_candidates,
+        } = report.cache()
+        else {
+            return Err(format!("expected cache aliases report, got {:?}", report.cache()).into());
+        };
+        assert!(skipped_candidates.is_empty());
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].table_id(), big.id());
+        assert_eq!(aliases[0].alias(), "big");
+        assert_eq!(aliases[0].output_indexes(), &[0, 1, 2]);
+        assert_eq!(
+            aliases[0].status(),
+            WriteAllCacheAliasStatus::MaterializedAndRestored
+        );
 
         let restored_big_factory = session.lazy_table_batch_stream_factory(big);
         let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
