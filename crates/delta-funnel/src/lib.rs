@@ -20,9 +20,9 @@ mod table_formats;
 
 pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
-    DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan,
-    PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions,
-    ValidationOptions, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
+    DeltaFunnelSession, LazyTable, LazyTableKind, MssqlDryRunOutputReport, MssqlOutputTarget,
+    OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode,
+    SessionOptions, ValidationOptions, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
     WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheMode,
     WriteAllCacheReport, WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
 };
