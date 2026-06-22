@@ -462,6 +462,192 @@ impl PlannedMssqlOutput {
     }
 }
 
+/// Planner output for one `write_all` cache-selection pass.
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MssqlOutputCachePlan {
+    selected_outputs: Vec<MssqlOutputCachePlanOutput>,
+    decision: MssqlOutputCacheDecision,
+    skipped_candidates: Vec<MssqlCacheCandidateSkip>,
+}
+
+#[allow(dead_code)]
+impl MssqlOutputCachePlan {
+    fn no_cache(
+        selected_outputs: Vec<MssqlOutputCachePlanOutput>,
+        reason: MssqlNoCacheReason,
+    ) -> Self {
+        Self {
+            selected_outputs,
+            decision: MssqlOutputCacheDecision::NoCache { reason },
+            skipped_candidates: Vec::new(),
+        }
+    }
+
+    /// Returns selected outputs in caller-provided order.
+    #[must_use]
+    pub(crate) fn selected_outputs(&self) -> &[MssqlOutputCachePlanOutput] {
+        &self.selected_outputs
+    }
+
+    /// Returns the cache choice for this planning pass.
+    #[must_use]
+    pub(crate) const fn decision(&self) -> &MssqlOutputCacheDecision {
+        &self.decision
+    }
+
+    /// Returns candidates skipped for explicit conservative reasons.
+    #[must_use]
+    pub(crate) fn skipped_candidates(&self) -> &[MssqlCacheCandidateSkip] {
+        &self.skipped_candidates
+    }
+}
+
+impl fmt::Debug for MssqlOutputCachePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MssqlOutputCachePlan")
+            .field("selected_outputs", &self.selected_outputs)
+            .field("decision", &self.decision)
+            .field("skipped_candidates", &self.skipped_candidates)
+            .finish()
+    }
+}
+
+/// Selected output identity captured for cache planning.
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MssqlOutputCachePlanOutput {
+    index: usize,
+    table_id: u64,
+    table_name: String,
+    output_name: String,
+}
+
+#[allow(dead_code)]
+impl MssqlOutputCachePlanOutput {
+    fn from_request(index: usize, request: &OutputWritePlan) -> Self {
+        Self {
+            index,
+            table_id: request.table().id(),
+            table_name: request.table().name().to_owned(),
+            output_name: request.target().output_name().to_owned(),
+        }
+    }
+
+    /// Returns the output index from the caller-provided request list.
+    #[must_use]
+    pub(crate) const fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Returns the selected lazy table id.
+    #[must_use]
+    pub(crate) const fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
+    /// Returns the selected lazy table name.
+    #[must_use]
+    pub(crate) fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// Returns the selected output name.
+    #[must_use]
+    pub(crate) fn output_name(&self) -> &str {
+        &self.output_name
+    }
+}
+
+impl fmt::Debug for MssqlOutputCachePlanOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MssqlOutputCachePlanOutput")
+            .field("index", &self.index)
+            .field("table_id", &self.table_id)
+            .field("table_name", &sanitize_text_for_display(&self.table_name))
+            .field("output_name", &sanitize_text_for_display(&self.output_name))
+            .finish()
+    }
+}
+
+/// Cache decision for one `write_all` cache-selection pass.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MssqlOutputCacheDecision {
+    /// No safe shared cache candidate was selected.
+    NoCache { reason: MssqlNoCacheReason },
+    /// A registered derived alias should be cached for selected outputs.
+    CacheAlias(MssqlDerivedCacheAliasPlan),
+}
+
+/// Conservative reason no cache alias was selected.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MssqlNoCacheReason {
+    /// Cache selection only helps when at least two outputs use a candidate.
+    FewerThanTwoOutputs,
+    /// No registered derived alias is shared by at least two selected outputs.
+    NoSharedRegisteredDerivedAlias,
+    /// More than one candidate looked equally valid, so the planner declined.
+    AmbiguousSharedDerivedAlias,
+}
+
+/// Selected registered derived alias cache candidate.
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MssqlDerivedCacheAliasPlan {
+    table_id: u64,
+    alias: String,
+    output_indexes: Vec<usize>,
+}
+
+impl fmt::Debug for MssqlDerivedCacheAliasPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MssqlDerivedCacheAliasPlan")
+            .field("table_id", &self.table_id)
+            .field("alias", &sanitize_text_for_display(&self.alias))
+            .field("output_indexes", &self.output_indexes)
+            .finish()
+    }
+}
+
+/// Candidate skipped during conservative cache selection.
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MssqlCacheCandidateSkip {
+    table_id: u64,
+    alias: String,
+    reason: MssqlCacheCandidateSkipReason,
+}
+
+impl fmt::Debug for MssqlCacheCandidateSkip {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MssqlCacheCandidateSkip")
+            .field("table_id", &self.table_id)
+            .field("alias", &sanitize_text_for_display(&self.alias))
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+/// Reason a candidate was not eligible for cache selection.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MssqlCacheCandidateSkipReason {
+    /// Fewer than two selected outputs use this candidate.
+    NotShared { output_count: usize },
+    /// Retained SQL text was missing, so later replanning would be unsafe.
+    MissingSqlText,
+    /// Lineage was incomplete or could not be trusted.
+    IncompleteLineage,
+    /// The candidate's relative depth could not be ordered deterministically.
+    AmbiguousDepth,
+}
+
 /// Registered Delta source tracked by a query-load session.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RegisteredSessionSource {
@@ -951,6 +1137,25 @@ impl DeltaFunnelSession {
                 self.options.mssql_write_options(),
             )
             .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn plan_mssql_output_cache(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> MssqlOutputCachePlan {
+        let selected_outputs = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| MssqlOutputCachePlanOutput::from_request(index, request))
+            .collect::<Vec<_>>();
+        let reason = if selected_outputs.len() < 2 {
+            MssqlNoCacheReason::FewerThanTwoOutputs
+        } else {
+            MssqlNoCacheReason::NoSharedRegisteredDerivedAlias
+        };
+
+        MssqlOutputCachePlan::no_cache(selected_outputs, reason)
     }
 
     /// Returns registered Delta source reports in registration order.
@@ -1995,6 +2200,86 @@ mod tests {
 
         let debug = format!("{target:?}");
         assert!(debug.contains("orders_output"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("server=tcp"));
+        Ok(())
+    }
+
+    #[test]
+    fn cache_plan_shell_preserves_selected_output_order() -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let west = output_request(
+            LazyTable::placeholder(7, LazyTableKind::DerivedSql),
+            "west_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let east = output_request(
+            LazyTable::placeholder(8, LazyTableKind::DerivedSql),
+            "east_output",
+            "east_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let plan = session.plan_mssql_output_cache(&[west, east]);
+
+        assert_eq!(
+            plan.decision(),
+            &MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::NoSharedRegisteredDerivedAlias,
+            }
+        );
+        assert!(plan.skipped_candidates().is_empty());
+        assert_eq!(plan.selected_outputs().len(), 2);
+        assert_eq!(plan.selected_outputs()[0].index(), 0);
+        assert_eq!(plan.selected_outputs()[0].table_id(), 7);
+        assert_eq!(plan.selected_outputs()[0].table_name(), "table_7");
+        assert_eq!(plan.selected_outputs()[0].output_name(), "west_output");
+        assert_eq!(plan.selected_outputs()[1].index(), 1);
+        assert_eq!(plan.selected_outputs()[1].table_id(), 8);
+        assert_eq!(plan.selected_outputs()[1].table_name(), "table_8");
+        assert_eq!(plan.selected_outputs()[1].output_name(), "east_output");
+        Ok(())
+    }
+
+    #[test]
+    fn cache_plan_shell_reports_single_output_as_not_shared() -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let output = output_request(
+            LazyTable::placeholder(7, LazyTableKind::DerivedSql),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let plan = session.plan_mssql_output_cache(&[output]);
+
+        assert_eq!(
+            plan.decision(),
+            &MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::FewerThanTwoOutputs,
+            }
+        );
+        assert_eq!(plan.selected_outputs().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cache_plan_debug_omits_target_connection_material() -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?)
+            .with_connection(secret_connection()?);
+        let output = OutputWritePlan::new(
+            LazyTable::placeholder(7, LazyTableKind::DerivedSql),
+            MssqlOutputTarget::new("orders\noutput", target_config, RunMode::DryRun),
+        );
+
+        let debug = format!("{:?}", session.plan_mssql_output_cache(&[output]));
+
+        assert!(debug.contains("orders"));
+        assert!(debug.contains("output"));
+        assert!(!debug.contains('\n'));
         assert!(!debug.contains("secret-token"));
         assert!(!debug.contains("password"));
         assert!(!debug.contains("server=tcp"));
