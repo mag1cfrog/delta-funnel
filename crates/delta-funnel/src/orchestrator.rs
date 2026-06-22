@@ -806,6 +806,7 @@ impl DeltaFunnelSession {
     where
         W: OrchestratorMssqlOutputWriter,
     {
+        ensure_execute_run_mode(request.target().run_mode())?;
         let planned = self.plan_mssql_output(request)?;
         let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
         let batches = self.batch_stream_for_lazy_table(planned.table()).await?;
@@ -1067,6 +1068,15 @@ fn datafusion_handoff_setup_error(
     }
 }
 
+fn ensure_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
+    match run_mode {
+        RunMode::Execute => Ok(()),
+        RunMode::DryRun => Err(DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "write_to_mssql requires RunMode::Execute; use plan_mssql_output for dry-run planning".to_owned(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1191,11 +1201,36 @@ mod tests {
         target_table: &str,
         load_mode: LoadMode,
     ) -> Result<OutputWritePlan, DeltaFunnelError> {
+        output_request_with_run_mode(table, output_name, target_table, load_mode, RunMode::DryRun)
+    }
+
+    fn execute_output_request(
+        table: LazyTable,
+        output_name: &str,
+        target_table: &str,
+        load_mode: LoadMode,
+    ) -> Result<OutputWritePlan, DeltaFunnelError> {
+        output_request_with_run_mode(
+            table,
+            output_name,
+            target_table,
+            load_mode,
+            RunMode::Execute,
+        )
+    }
+
+    fn output_request_with_run_mode(
+        table: LazyTable,
+        output_name: &str,
+        target_table: &str,
+        load_mode: LoadMode,
+        run_mode: RunMode,
+    ) -> Result<OutputWritePlan, DeltaFunnelError> {
         let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", target_table)?)
             .with_load_mode(load_mode);
         Ok(OutputWritePlan::new(
             table,
-            MssqlOutputTarget::new(output_name, target_config, RunMode::DryRun),
+            MssqlOutputTarget::new(output_name, target_config, run_mode),
         ))
     }
 
@@ -1549,7 +1584,7 @@ mod tests {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
-        let request = output_request(
+        let request = execute_output_request(
             source,
             "orders_output",
             "orders_sink",
@@ -1787,7 +1822,7 @@ mod tests {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
-        let request = output_request(
+        let request = execute_output_request(
             source,
             "orders_output",
             "orders_sink",
@@ -1813,7 +1848,7 @@ mod tests {
         let derived = session
             .table_from_sql("select 1 as id union all select 2 as id")
             .await?;
-        let request = output_request(
+        let request = execute_output_request(
             derived,
             "orders_output",
             "orders_sink",
@@ -1841,6 +1876,33 @@ mod tests {
         assert_eq!(report.stats().rows_written(), 2);
         assert_eq!(report.stats().batches_written(), call.batches);
         assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_to_mssql_rejects_dry_run_before_planning_or_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let derived = session.table_from_sql("select 1 as id").await?;
+        let request = output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let mut writer = FakeOrchestratorWriter::default();
+
+        let error = session
+            .write_to_mssql_with_writer(&request, &mut writer)
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("RunMode::Execute")
+                    && message.contains("plan_mssql_output")
+        ));
+        assert!(writer.calls.is_empty());
         Ok(())
     }
 
