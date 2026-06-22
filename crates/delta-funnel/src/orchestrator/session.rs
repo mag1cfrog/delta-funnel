@@ -1394,6 +1394,19 @@ impl DeltaFunnelSession {
             .find(|table| table.table().id() == table_id)
     }
 
+    #[allow(dead_code)]
+    fn registered_derived_for_scoped_cache_alias(
+        &self,
+        table: &LazyTable,
+    ) -> Result<&RegisteredDerivedTable, DeltaFunnelError> {
+        if table.kind() != LazyTableKind::DerivedSql {
+            return Err(unknown_lazy_table_error(table));
+        }
+
+        self.registered_derived_table_by_id(table.id())
+            .ok_or_else(|| unknown_lazy_table_error(table))
+    }
+
     /// Returns whether a selected output uses a registered derived candidate.
     ///
     /// Direct use and lineage use both count for cache selection. Direct use
@@ -3513,6 +3526,70 @@ mod tests {
         let rows = collect_stream_row_count(stream).await?;
 
         assert_eq!(rows, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_cache_alias_guard_accepts_registered_derived_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let derived = session.table_from_sql("select 1 as id").await?;
+        let alias = session.register_alias("cached_candidate", &derived)?;
+
+        let registered = session.registered_derived_for_scoped_cache_alias(&alias)?;
+
+        assert_eq!(registered.table(), &alias);
+        assert_eq!(registered.name(), "cached_candidate");
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_cache_alias_guard_rejects_raw_source_before_catalog_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let error = session.registered_derived_for_scoped_cache_alias(&source);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("not registered in this session")
+        ));
+        assert!(session.registered_source("orders").is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_cache_alias_guard_rejects_pending_derived_before_catalog_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let pending = session.table_from_sql("select 1 as id").await?;
+
+        let error = session.registered_derived_for_scoped_cache_alias(&pending);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("not registered in this session")
+        ));
+        assert!(session.derived_tables().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_cache_alias_guard_rejects_unknown_derived_handle() -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let unknown = LazyTable::placeholder(252, LazyTableKind::DerivedSql);
+
+        let error = session.registered_derived_for_scoped_cache_alias(&unknown);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("not registered in this session")
+        ));
         Ok(())
     }
 
