@@ -5665,6 +5665,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_mssql_cache_aliases_after_error_preserves_broken_restore_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let broken_replacement = MssqlScopedCacheAliasReplacement {
+            context: session.context(),
+            table_id: 42,
+            alias_name: "big".to_owned(),
+            original_provider: None,
+        };
+        let primary_error = DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "simulated cached workflow failure".to_owned(),
+        };
+
+        let error =
+            restore_mssql_cache_aliases_after_error(primary_error, vec![broken_replacement]).await;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message.contains("write_all auto cache failed")
+                    && message.contains("simulated cached workflow failure")
+                    && message.contains("also failed to restore cache aliases")
+                    && message.contains("scoped MSSQL cache alias restore failed")
+                    && message.contains("big")
+                    && message.contains("original provider was already restored")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cached_alias_replacement_does_not_feed_existing_downstream_derived_tables()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
