@@ -6407,6 +6407,29 @@ mod tests {
             assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
             assert!(report.all_succeeded());
         }
+        let WriteAllCacheReport::CacheAliases {
+            aliases,
+            skipped_candidates,
+        } = report.cache()
+        else {
+            return Err(format!("expected cache aliases report, got {:?}", report.cache()).into());
+        };
+        assert!(skipped_candidates.is_empty());
+        assert_eq!(aliases.len(), 2);
+        assert_eq!(aliases[0].table_id(), big.id());
+        assert_eq!(aliases[0].alias(), "big");
+        assert_eq!(aliases[0].output_indexes(), &[0, 1]);
+        assert_eq!(
+            aliases[0].status(),
+            WriteAllCacheAliasStatus::MaterializedAndRestored
+        );
+        assert_eq!(aliases[1].table_id(), names.id());
+        assert_eq!(aliases[1].alias(), "names");
+        assert_eq!(aliases[1].output_indexes(), &[0, 1]);
+        assert_eq!(
+            aliases[1].status(),
+            WriteAllCacheAliasStatus::MaterializedAndRestored
+        );
 
         let restored_big_factory = session.lazy_table_batch_stream_factory(big);
         let restored_names_factory = session.lazy_table_batch_stream_factory(names);
