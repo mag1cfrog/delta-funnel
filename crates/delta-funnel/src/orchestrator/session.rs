@@ -6257,6 +6257,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_all_report_debug_redacts_connections_and_retained_sql()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, _source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql(
+                "select 'super-secret-literal' as marker, region \
+                 from big_source",
+            )
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let big_output =
+            execute_output_request(big, "big_output", "big_orders", LoadMode::AppendExisting)?;
+        let override_target_config =
+            MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "west_orders")?)
+                .with_load_mode(LoadMode::AppendExisting)
+                .with_connection(override_connection()?);
+        let west_output = OutputWritePlan::new(
+            west,
+            MssqlOutputTarget::new("west_output", override_target_config, RunMode::Execute),
+        );
+        let writer = FakeWorkflowWriter::default();
+
+        let report = session
+            .write_all_with_writer(&[big_output, west_output], writer)
+            .await?;
+
+        let debug = format!("{report:?}");
+        assert!(debug.contains("warehouse-primary"));
+        assert!(debug.contains("warehouse-override"));
+        assert!(debug.contains("CacheAliases"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("override-secret"));
+        assert!(!debug.contains("super-secret-literal"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn write_all_auto_caches_multiple_shared_aliases_for_dependent_outputs()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(
