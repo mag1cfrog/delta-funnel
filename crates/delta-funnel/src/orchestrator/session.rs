@@ -3956,6 +3956,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_cache_alias_restore_reinstalls_original_when_cached_alias_is_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let replacement = session
+            .replace_registered_derived_alias_with_cache(&big)
+            .await?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let removed_cached = session.context().deregister_table("big")?;
+        assert!(removed_cached.is_some());
+
+        let restoration = replacement.restore().await?;
+
+        assert_eq!(restoration.alias_name(), "big");
+        assert!(!restoration.cached_alias_was_present());
+
+        let direct_restored_big = session
+            .context()
+            .sql("select marker from big where region = 'west'")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            marker_values_from_batches(&direct_restored_big)?,
+            vec!["shared"]
+        );
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cached_alias_replacement_does_not_feed_existing_downstream_derived_tables()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
