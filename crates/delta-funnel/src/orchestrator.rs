@@ -1170,6 +1170,38 @@ impl DeltaFunnelSession {
         Ok(dependencies.into_iter().collect())
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn lazy_table_depends_on_registered_derived(
+        &self,
+        table: &LazyTable,
+        candidate: &LazyTable,
+    ) -> Result<bool, DeltaFunnelError> {
+        self.schema_for_lazy_table(table)?;
+        if candidate.kind() != LazyTableKind::DerivedSql {
+            return Err(unknown_lazy_table_error(candidate));
+        }
+
+        self.registered_derived_table_by_id(candidate.id())
+            .ok_or_else(|| unknown_lazy_table_error(candidate))?;
+        if table.id() == candidate.id() {
+            return Ok(true);
+        }
+        if table.kind() == LazyTableKind::DeltaSource {
+            return Ok(false);
+        }
+
+        Ok(self
+            .transitive_registered_derived_dependencies(table)?
+            .iter()
+            .any(|dependency| {
+                matches!(
+                    dependency,
+                    DerivedTableDependency::RegisteredDerived { table_id, .. }
+                        if *table_id == candidate.id()
+                )
+            }))
+    }
+
     fn collect_transitive_registered_derived_dependencies(
         &self,
         lineage: &DerivedTableLineage,
@@ -3062,6 +3094,35 @@ mod tests {
                 },
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_checks_registered_derived_candidate_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let orders = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_regional = session
+            .table_from_sql("select id, customer_name from big")
+            .await?;
+        let regional = session.register_alias("regional", &pending_regional)?;
+        let west = session
+            .table_from_sql("select id from regional where customer_name = 'alice'")
+            .await?;
+        let unrelated = session
+            .table_from_sql("select customer_name from orders")
+            .await?;
+
+        assert!(session.lazy_table_depends_on_registered_derived(&west, &big)?);
+        assert!(session.lazy_table_depends_on_registered_derived(&west, &regional)?);
+        assert!(session.lazy_table_depends_on_registered_derived(&big, &big)?);
+        assert!(!session.lazy_table_depends_on_registered_derived(&unrelated, &big)?);
+        assert!(!session.lazy_table_depends_on_registered_derived(&orders, &big)?);
         Ok(())
     }
 
