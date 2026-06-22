@@ -20,11 +20,12 @@ mod table_formats;
 
 pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
-    DeltaFunnelSession, LazyTable, LazyTableKind, MssqlDryRunOutputReport, MssqlOutputTarget,
-    OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode,
-    SessionOptions, ValidationOptions, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
-    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheMode,
-    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
+    DeltaFunnelSession, LazyTable, LazyTableKind, MssqlDryRunOutputReport,
+    MssqlDryRunWorkflowReport, MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput,
+    RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions, ValidationOptions,
+    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
+    WriteAllCacheCandidateSkipReason, WriteAllCacheMode, WriteAllCacheReport,
+    WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
 };
 pub use pipeline::{
     BatchHandoffError, BatchHandoffOutcome, BatchHandoffStats, BatchPipelinePhase,

@@ -894,6 +894,74 @@ impl MssqlDryRunOutputReport {
     }
 }
 
+/// Dry-run planning report for a multi-output MSSQL workflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MssqlDryRunWorkflowReport {
+    outputs: Vec<MssqlDryRunOutputReport>,
+}
+
+impl MssqlDryRunWorkflowReport {
+    fn new(outputs: Vec<MssqlDryRunOutputReport>) -> Self {
+        Self { outputs }
+    }
+
+    /// Returns the dry-run action mode.
+    #[must_use]
+    pub const fn run_mode(&self) -> RunMode {
+        RunMode::DryRun
+    }
+
+    /// Returns the number of selected outputs represented by this report.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Returns whether this report contains no selected outputs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
+    /// Returns per-output dry-run reports in caller-provided order.
+    #[must_use]
+    pub fn outputs(&self) -> &[MssqlDryRunOutputReport] {
+        &self.outputs
+    }
+
+    /// Returns whether dry-run planning contacted SQL Server for any output.
+    #[must_use]
+    pub fn sql_server_contacted(&self) -> bool {
+        self.outputs
+            .iter()
+            .any(MssqlDryRunOutputReport::sql_server_contacted)
+    }
+
+    /// Returns whether dry-run planning started row production for any output.
+    #[must_use]
+    pub fn row_production_started(&self) -> bool {
+        self.outputs
+            .iter()
+            .any(MssqlDryRunOutputReport::row_production_started)
+    }
+
+    /// Returns whether dry-run planning started table lifecycle work for any output.
+    #[must_use]
+    pub fn table_lifecycle_started(&self) -> bool {
+        self.outputs
+            .iter()
+            .any(MssqlDryRunOutputReport::table_lifecycle_started)
+    }
+
+    /// Returns whether dry-run planning opened a bulk writer for any output.
+    #[must_use]
+    pub fn bulk_writer_started(&self) -> bool {
+        self.outputs
+            .iter()
+            .any(MssqlDryRunOutputReport::bulk_writer_started)
+    }
+}
+
 /// Active replacement of one registered derived alias with a cached provider.
 ///
 /// The original provider is owned by this scope until `restore` is awaited.
@@ -1756,6 +1824,35 @@ impl DeltaFunnelSession {
         let planned = self.plan_mssql_output(request)?;
 
         Ok(MssqlDryRunOutputReport::new(planned))
+    }
+
+    /// Dry-runs multiple selected lazy tables as one MSSQL output workflow.
+    ///
+    /// The method plans each selected output in caller-provided order and stops
+    /// before cache materialization, physical DataFusion planning, row
+    /// production, SQL Server lifecycle work, bulk writer construction, or row
+    /// writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first duplicate-output, run-mode, or output-planning error.
+    pub fn dry_run_all_to_mssql(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        ensure_unique_write_all_output_names(requests)?;
+
+        let outputs = requests
+            .iter()
+            .map(|request| {
+                ensure_write_all_dry_run_mode(request.target().run_mode())?;
+                let planned = self.plan_mssql_output(request)?;
+
+                Ok(MssqlDryRunOutputReport::new(planned))
+            })
+            .collect::<Result<Vec<_>, DeltaFunnelError>>()?;
+
+        Ok(MssqlDryRunWorkflowReport::new(outputs))
     }
 
     /// Writes one selected lazy table to SQL Server.
@@ -3277,6 +3374,16 @@ fn ensure_write_all_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunne
             message:
                 "write_all requires RunMode::Execute; use plan_mssql_output for dry-run planning"
                     .to_owned(),
+        }),
+    }
+}
+
+fn ensure_write_all_dry_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
+    match run_mode {
+        RunMode::DryRun => Ok(()),
+        RunMode::Execute => Err(DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "dry_run_all_to_mssql requires RunMode::DryRun; use write_all for execution"
+                .to_owned(),
         }),
     }
 }
@@ -6129,6 +6236,119 @@ mod tests {
             error,
             Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
                 if message.contains("dry_run_to_mssql requires RunMode::DryRun")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_all_to_mssql_reports_all_outputs_without_row_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("orders_source", source_provider)?;
+        let west = session
+            .table_from_sql("select marker from orders_source where region = 'west'")
+            .await?;
+        let east = session
+            .table_from_sql("select marker from orders_source where region = 'east'")
+            .await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::CreateAndLoad)?;
+        let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+
+        let report = session.dry_run_all_to_mssql(&[west, east])?;
+
+        assert_eq!(report.run_mode(), RunMode::DryRun);
+        assert_eq!(report.len(), 2);
+        assert!(!report.is_empty());
+        assert_eq!(report.outputs()[0].output_name(), "west_output");
+        assert_eq!(report.outputs()[1].output_name(), "east_output");
+        assert_eq!(
+            report.outputs()[0]
+                .planned_output()
+                .output_plan()
+                .target_table()
+                .table(),
+            "west_orders"
+        );
+        assert_eq!(
+            report.outputs()[1]
+                .planned_output()
+                .output_plan()
+                .target_table()
+                .table(),
+            "east_orders"
+        );
+        assert!(!report.sql_server_contacted());
+        assert!(!report.row_production_started());
+        assert!(!report.table_lifecycle_started());
+        assert!(!report.bulk_writer_started());
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_all_to_mssql_rejects_execute_request_before_row_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("orders_source", source_provider)?;
+        let output = session
+            .table_from_sql("select marker from orders_source")
+            .await?;
+        let request = execute_output_request(
+            output,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.dry_run_all_to_mssql(&[request]);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("dry_run_all_to_mssql requires RunMode::DryRun")
+        ));
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_all_to_mssql_rejects_duplicate_output_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west = session.table_from_sql("select 1 as id").await?;
+        let east = session.table_from_sql("select 2 as id").await?;
+        let west = output_request(
+            west,
+            "orders_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let east = output_request(
+            east,
+            "orders_output",
+            "east_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.dry_run_all_to_mssql(&[west, east]);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("write_all output names must be unique")
+                    && message.contains("orders_output")
         ));
         Ok(())
     }
