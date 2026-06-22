@@ -1106,6 +1106,7 @@ mod tests {
         error::Result as DataFusionResult,
         logical_expr::{Expr, LogicalPlan, TableType},
         physical_plan::ExecutionPlan,
+        sql::{parser::DFParser, resolve::resolve_table_references},
     };
 
     struct DeltaLogTable {
@@ -1471,6 +1472,34 @@ mod tests {
         })?;
 
         Ok(names)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AstReferenceProof {
+        relations: Vec<String>,
+        ctes: Vec<String>,
+    }
+
+    fn ast_reference_proof(sql: &str) -> Result<AstReferenceProof, Box<dyn std::error::Error>> {
+        let mut statements = DFParser::parse_sql(sql)?;
+        if statements.len() != 1 {
+            return Err(std::io::Error::other("expected exactly one parsed statement").into());
+        }
+        let statement = statements
+            .pop_front()
+            .ok_or_else(|| std::io::Error::other("expected parsed statement"))?;
+        let (relations, ctes) = resolve_table_references(&statement, true)?;
+
+        Ok(AstReferenceProof {
+            relations: relations
+                .into_iter()
+                .map(|reference| reference.to_string())
+                .collect(),
+            ctes: ctes
+                .into_iter()
+                .map(|reference| reference.to_string())
+                .collect(),
+        })
     }
 
     #[test]
@@ -2144,6 +2173,83 @@ mod tests {
         );
         assert!(session.registered_derived_table("big").is_some());
         assert!(session.registered_source("big").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn datafusion_sql_ast_captures_session_alias_dependencies_before_planning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let _big = session.register_alias("big", &pending_big)?;
+
+        assert_eq!(
+            ast_reference_proof("select * from big where customer_name = 'alice'")?,
+            AstReferenceProof {
+                relations: vec!["big".to_owned()],
+                ctes: Vec::new(),
+            }
+        );
+        assert_eq!(
+            ast_reference_proof("select * from BIG where customer_name = 'alice'")?,
+            AstReferenceProof {
+                relations: vec!["big".to_owned()],
+                ctes: Vec::new(),
+            }
+        );
+        assert_eq!(
+            ast_reference_proof("select * from big b")?,
+            AstReferenceProof {
+                relations: vec!["big".to_owned()],
+                ctes: Vec::new(),
+            }
+        );
+        assert_eq!(
+            ast_reference_proof("select * from big join other_alias on big.id = other_alias.id")?,
+            AstReferenceProof {
+                relations: vec!["big".to_owned(), "other_alias".to_owned()],
+                ctes: Vec::new(),
+            }
+        );
+        assert_eq!(
+            ast_reference_proof("select * from (select * from big) b")?,
+            AstReferenceProof {
+                relations: vec!["big".to_owned()],
+                ctes: Vec::new(),
+            }
+        );
+
+        let shadowed = ast_reference_proof("with big as (select * from orders) select * from big")?;
+        assert_eq!(
+            shadowed,
+            AstReferenceProof {
+                relations: vec!["orders".to_owned()],
+                ctes: vec!["big".to_owned()],
+            }
+        );
+
+        assert!(session.registered_derived_table("big").is_some());
+        assert!(session.registered_source("big").is_none());
+        assert!(session.registered_source("orders").is_some());
+        assert!(session.registered_derived_table("orders").is_none());
+
+        // Conclusion for #259: DataFusion's DFParser plus
+        // resolve_table_references provides a structured pre-planning AST path
+        // that captures session alias dependencies and CTE shadowing for #250.
+        let derived_dependency = ast_reference_proof("select * from big")?
+            .relations
+            .into_iter()
+            .any(|name| session.registered_derived_table(&name).is_some());
+        let shadowed_derived_dependency = shadowed
+            .relations
+            .iter()
+            .any(|name| session.registered_derived_table(name).is_some());
+        assert!(derived_dependency);
+        assert!(!shadowed_derived_dependency);
         Ok(())
     }
 
