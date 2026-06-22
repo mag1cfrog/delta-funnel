@@ -5,7 +5,7 @@
 //! failure, and marks later outputs as skipped without invoking their lazy batch
 //! stream factories.
 
-use std::{fmt, pin::Pin};
+use std::{fmt, future::Future, pin::Pin};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -25,13 +25,17 @@ use super::{
 pub type MssqlOutputBatchStream =
     Pin<Box<dyn Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send>>;
 
-/// Factory that constructs a direct batch stream for one attempted output.
-pub type MssqlOutputBatchStreamFactory = Box<dyn FnOnce() -> MssqlOutputBatchStream + Send>;
+/// Fallible future that constructs a direct batch stream for one attempted output.
+pub type MssqlOutputBatchStreamFuture =
+    Pin<Box<dyn Future<Output = Result<MssqlOutputBatchStream, DeltaFunnelError>> + Send>>;
+
+/// Async factory that constructs a direct batch stream for one attempted output.
+pub type MssqlOutputBatchStreamFactory = Box<dyn FnOnce() -> MssqlOutputBatchStreamFuture + Send>;
 
 /// One deferred SQL Server output write job.
 ///
 /// The job owns an already resolved SQL Server target plus a lazy batch stream
-/// factory. The workflow calls the factory only after the output becomes the
+/// factory. The workflow awaits the factory only after the output becomes the
 /// next attempted output. Skipped jobs keep their stream factories uncalled, so
 /// skipped outputs do not start source reads, DataFusion execution, stream
 /// setup, SQL connections, lifecycle preparation, writer initialization, or
@@ -46,7 +50,7 @@ pub struct MssqlOutputWriteJob {
 
 impl MssqlOutputWriteJob {
     /// Creates a deferred SQL Server output write job.
-    pub fn new<F, S>(
+    pub fn new<F, Fut, S>(
         output_schema: SchemaRef,
         resolved_target: ResolvedMssqlTarget,
         schema_options: MssqlSchemaPlanOptions,
@@ -54,27 +58,34 @@ impl MssqlOutputWriteJob {
         write_options: MssqlWriteOptions,
     ) -> Self
     where
-        F: FnOnce() -> S + Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<S, DeltaFunnelError>> + Send + 'static,
         S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + 'static,
     {
         Self {
             output_schema,
             resolved_target,
             schema_options,
-            batches: Box::new(move || Box::pin(batches())),
+            batches: Box::new(move || {
+                Box::pin(async move {
+                    let stream = batches().await?;
+                    Ok(Box::pin(stream) as MssqlOutputBatchStream)
+                })
+            }),
             write_options,
         }
     }
 
     /// Creates a deferred SQL Server output write job using default write options.
-    pub fn with_default_write_options<F, S>(
+    pub fn with_default_write_options<F, Fut, S>(
         output_schema: SchemaRef,
         resolved_target: ResolvedMssqlTarget,
         schema_options: MssqlSchemaPlanOptions,
         batches: F,
     ) -> Self
     where
-        F: FnOnce() -> S + Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<S, DeltaFunnelError>> + Send + 'static,
         S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + 'static,
     {
         Self::new(
@@ -445,7 +456,11 @@ pub async fn write_mssql_outputs_to_mssql(
 pub(crate) trait MssqlWorkflowOutputWriter: Send {
     async fn write_output(
         &mut self,
-        job: MssqlOutputWriteJob,
+        output_schema: SchemaRef,
+        resolved_target: ResolvedMssqlTarget,
+        schema_options: MssqlSchemaPlanOptions,
+        batches: MssqlOutputBatchStream,
+        write_options: MssqlWriteOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
@@ -455,16 +470,17 @@ struct MssqlPublicOneOutputWriter;
 impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
     async fn write_output(
         &mut self,
-        job: MssqlOutputWriteJob,
+        output_schema: SchemaRef,
+        resolved_target: ResolvedMssqlTarget,
+        schema_options: MssqlSchemaPlanOptions,
+        batches: MssqlOutputBatchStream,
+        write_options: MssqlWriteOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        let (output_schema, resolved_target, schema_options, batches, write_options) =
-            job.into_parts();
-
         write_output_batches_to_mssql(
             output_schema.as_ref(),
             resolved_target,
             schema_options,
-            batches(),
+            batches,
             write_options,
         )
         .await
@@ -494,7 +510,28 @@ where
             continue;
         }
 
-        match writer.write_output(job).await {
+        let (output_schema, resolved_target, schema_options, batches, write_options) =
+            job.into_parts();
+        let batches = match batches().await {
+            Ok(batches) => batches,
+            Err(error) => {
+                let failure = MssqlWriteFailureReport::from_error(target, error);
+                failed_output_name = Some(failure.output_name().to_owned());
+                statuses.push(MssqlOutputWriteStatus::Failed(failure));
+                continue;
+            }
+        };
+
+        match writer
+            .write_output(
+                output_schema,
+                resolved_target,
+                schema_options,
+                batches,
+                write_options,
+            )
+            .await
+        {
             Ok(report) => statuses.push(MssqlOutputWriteStatus::Succeeded(report)),
             Err(error) => {
                 let failure = MssqlWriteFailureReport::from_error(target, error);
@@ -526,7 +563,7 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
 
     use super::*;
     use crate::{
@@ -539,7 +576,11 @@ mod tests {
     struct FakeWorkflowWriter {
         outcomes: VecDeque<Result<MssqlWriteReport, DeltaFunnelError>>,
         attempted_outputs: Arc<Mutex<Vec<String>>>,
-        invoke_stream_factories: bool,
+    }
+
+    #[derive(Default)]
+    struct StreamPollingWorkflowWriter {
+        attempted_outputs: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeWorkflowWriter {
@@ -547,20 +588,15 @@ mod tests {
             Self {
                 outcomes: outcomes.into(),
                 attempted_outputs: Arc::new(Mutex::new(Vec::new())),
-                invoke_stream_factories: true,
             }
         }
 
-        fn without_stream_factory_invocation(
-            outcomes: Vec<Result<MssqlWriteReport, DeltaFunnelError>>,
-        ) -> Self {
-            Self {
-                outcomes: outcomes.into(),
-                attempted_outputs: Arc::new(Mutex::new(Vec::new())),
-                invoke_stream_factories: false,
-            }
+        fn attempted_outputs(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.attempted_outputs)
         }
+    }
 
+    impl StreamPollingWorkflowWriter {
         fn attempted_outputs(&self) -> Arc<Mutex<Vec<String>>> {
             Arc::clone(&self.attempted_outputs)
         }
@@ -570,20 +606,43 @@ mod tests {
     impl MssqlWorkflowOutputWriter for FakeWorkflowWriter {
         async fn write_output(
             &mut self,
-            job: MssqlOutputWriteJob,
+            _output_schema: SchemaRef,
+            resolved_target: ResolvedMssqlTarget,
+            _schema_options: MssqlSchemaPlanOptions,
+            _batches: MssqlOutputBatchStream,
+            _write_options: MssqlWriteOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
                 .lock()
                 .map_err(|_| test_error("attempted output lock poisoned"))?
-                .push(job.output_name().to_owned());
-            let (_schema, _target, _schema_options, batches, _write_options) = job.into_parts();
-            if self.invoke_stream_factories {
-                let _stream = batches();
-            }
+                .push(resolved_target.output_name().to_owned());
 
             self.outcomes
                 .pop_front()
                 .ok_or_else(|| test_error("missing fake writer outcome"))?
+        }
+    }
+
+    #[async_trait]
+    impl MssqlWorkflowOutputWriter for StreamPollingWorkflowWriter {
+        async fn write_output(
+            &mut self,
+            _output_schema: SchemaRef,
+            resolved_target: ResolvedMssqlTarget,
+            _schema_options: MssqlSchemaPlanOptions,
+            mut batches: MssqlOutputBatchStream,
+            _write_options: MssqlWriteOptions,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+            self.attempted_outputs
+                .lock()
+                .map_err(|_| test_error("attempted output lock poisoned"))?
+                .push(resolved_target.output_name().to_owned());
+
+            match batches.next().await {
+                Some(Ok(_batch)) => Err(test_error("expected stream polling error")),
+                Some(Err(error)) => Err(error),
+                None => Err(test_error("expected at least one stream item")),
+            }
         }
     }
 
@@ -877,7 +936,7 @@ mod tests {
             MssqlTargetCleanupStatus::NotApplicable,
             "prepare failed",
         );
-        let writer = FakeWorkflowWriter::without_stream_factory_invocation(vec![Err(failure)]);
+        let writer = FakeWorkflowWriter::new(vec![Err(failure)]);
         let attempted = writer.attempted_outputs();
 
         let report = write_mssql_outputs_with_writer(
@@ -889,6 +948,87 @@ mod tests {
 
         assert_eq!(locked(&attempted)?.as_slice(), ["first".to_owned()]);
         assert!(report.outputs()[1].is_skipped());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_factory_setup_failure_fails_output_before_writer_and_skips_later_factories()
+    -> Result<(), DeltaFunnelError> {
+        let first = output_plan("first", LoadMode::AppendExisting)?;
+        let second = output_plan("second", LoadMode::AppendExisting)?;
+        let third = output_plan("third", LoadMode::AppendExisting)?;
+        let first_report =
+            write_report(&first, 1, 1, false, MssqlTargetCleanupStatus::NotApplicable);
+        let factory_calls = Arc::new(Mutex::new(Vec::new()));
+        let writer = FakeWorkflowWriter::new(vec![Ok(first_report)]);
+        let attempted = writer.attempted_outputs();
+
+        let report = write_mssql_outputs_with_writer(
+            vec![
+                counted_job(first, Arc::clone(&factory_calls))?,
+                failing_factory_job(
+                    second,
+                    Arc::clone(&factory_calls),
+                    "stream setup failed before SQL writer",
+                )?,
+                counted_job(third, Arc::clone(&factory_calls))?,
+            ],
+            MssqlWorkflowWriteOptions::default(),
+            writer,
+        )
+        .await?;
+
+        assert_eq!(
+            locked(&factory_calls)?.as_slice(),
+            ["first".to_owned(), "second".to_owned()]
+        );
+        assert_eq!(locked(&attempted)?.as_slice(), ["first".to_owned()]);
+        let [first_status, second_status, third_status] = report.outputs() else {
+            return Err(test_error("expected three output statuses"));
+        };
+        assert!(first_status.is_succeeded());
+        let MssqlOutputWriteStatus::Failed(failure) = second_status else {
+            return Err(test_error("expected second output to fail"));
+        };
+        assert_eq!(failure.output_name(), "second");
+        assert!(failure.context().is_none());
+        assert!(
+            failure
+                .error()
+                .contains("stream setup failed before SQL writer")
+        );
+        assert_skipped_after(third_status, "third", "second")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_polling_failure_after_setup_reaches_writer_boundary()
+    -> Result<(), DeltaFunnelError> {
+        let output = output_plan("poll_failure", LoadMode::AppendExisting)?;
+        let factory_calls = Arc::new(Mutex::new(Vec::new()));
+        let writer = StreamPollingWorkflowWriter::default();
+        let attempted = writer.attempted_outputs();
+
+        let report = write_mssql_outputs_with_writer(
+            vec![polling_error_job(output, Arc::clone(&factory_calls))?],
+            MssqlWorkflowWriteOptions::default(),
+            writer,
+        )
+        .await?;
+
+        assert_eq!(
+            locked(&factory_calls)?.as_slice(),
+            ["poll_failure".to_owned()]
+        );
+        assert_eq!(locked(&attempted)?.as_slice(), ["poll_failure".to_owned()]);
+        let [MssqlOutputWriteStatus::Failed(failure)] = report.outputs() else {
+            return Err(test_error("expected failed output status"));
+        };
+        assert_eq!(failure.output_name(), "poll_failure");
+        assert!(failure.error().contains("stream failed during polling"));
+        assert!(failure.context().is_none());
 
         Ok(())
     }
@@ -1029,7 +1169,54 @@ mod tests {
                 if let Ok(mut calls) = factory_calls.lock() {
                     calls.push(output_name);
                 }
-                stream::empty()
+                async { Ok(stream::empty()) }
+            },
+        ))
+    }
+
+    fn failing_factory_job(
+        output_plan: MssqlTargetOutputPlan,
+        factory_calls: Arc<Mutex<Vec<String>>>,
+        message: &'static str,
+    ) -> Result<MssqlOutputWriteJob, DeltaFunnelError> {
+        let output_name = output_plan.output_name().to_owned();
+        Ok(MssqlOutputWriteJob::with_default_write_options(
+            output_schema(),
+            resolved_target(output_plan)?,
+            MssqlSchemaPlanOptions::default(),
+            move || {
+                if let Ok(mut calls) = factory_calls.lock() {
+                    calls.push(output_name);
+                }
+                async move {
+                    Err::<stream::Empty<Result<RecordBatch, DeltaFunnelError>>, DeltaFunnelError>(
+                        test_error(message),
+                    )
+                }
+            },
+        ))
+    }
+
+    fn polling_error_job(
+        output_plan: MssqlTargetOutputPlan,
+        factory_calls: Arc<Mutex<Vec<String>>>,
+    ) -> Result<MssqlOutputWriteJob, DeltaFunnelError> {
+        let output_name = output_plan.output_name().to_owned();
+        Ok(MssqlOutputWriteJob::with_default_write_options(
+            output_schema(),
+            resolved_target(output_plan)?,
+            MssqlSchemaPlanOptions::default(),
+            move || {
+                if let Ok(mut calls) = factory_calls.lock() {
+                    calls.push(output_name);
+                }
+                async {
+                    Ok(stream::iter(vec![Err(
+                        DeltaFunnelError::MssqlWorkflowPlanning {
+                            message: "stream failed during polling".to_owned(),
+                        },
+                    )]))
+                }
             },
         ))
     }
