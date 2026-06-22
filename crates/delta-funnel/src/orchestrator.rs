@@ -981,6 +981,12 @@ impl DeltaFunnelSession {
             .find(|table| table.name().eq_ignore_ascii_case(name))
     }
 
+    fn registered_derived_table_by_id(&self, table_id: u64) -> Option<&RegisteredDerivedTable> {
+        self.derived_tables
+            .iter()
+            .find(|table| table.table().id() == table_id)
+    }
+
     async fn plan_read_only_sql(&self, sql: &str) -> Result<DataFrame, DeltaFunnelError> {
         self.context
             .sql_with_options(sql, read_only_sql_options())
@@ -1144,6 +1150,57 @@ impl DeltaFunnelSession {
                     .map(|pending| &pending.lineage)
             })
             .ok_or_else(|| unknown_lazy_table_error(table))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transitive_registered_derived_dependencies(
+        &self,
+        table: &LazyTable,
+    ) -> Result<Vec<DerivedTableDependency>, DeltaFunnelError> {
+        let lineage = self.lineage_for_derived_table(table)?;
+        let mut visited_table_ids = BTreeSet::new();
+        let mut dependencies = BTreeSet::new();
+
+        self.collect_transitive_registered_derived_dependencies(
+            lineage,
+            &mut visited_table_ids,
+            &mut dependencies,
+        )?;
+
+        Ok(dependencies.into_iter().collect())
+    }
+
+    fn collect_transitive_registered_derived_dependencies(
+        &self,
+        lineage: &DerivedTableLineage,
+        visited_table_ids: &mut BTreeSet<u64>,
+        dependencies: &mut BTreeSet<DerivedTableDependency>,
+    ) -> Result<(), DeltaFunnelError> {
+        for dependency in lineage.direct_dependencies() {
+            let DerivedTableDependency::RegisteredDerived { table_id, name } = dependency else {
+                continue;
+            };
+            if !visited_table_ids.insert(*table_id) {
+                continue;
+            }
+
+            dependencies.insert(dependency.clone());
+            let derived = self.registered_derived_table_by_id(*table_id).ok_or_else(|| {
+                DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: format!(
+                        "registered derived lineage dependency `{}` is not registered in this session",
+                        sanitize_text_for_display(name)
+                    ),
+                }
+            })?;
+            self.collect_transitive_registered_derived_dependencies(
+                derived.lineage(),
+                visited_table_ids,
+                dependencies,
+            )?;
+        }
+
+        Ok(())
     }
 
     fn derive_table_lineage_from_sql(&self, sql: &str) -> DerivedTableLineage {
@@ -2968,6 +3025,42 @@ mod tests {
                 table_id: big.id(),
                 name: "big".to_owned(),
             }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_finds_transitive_registered_derived_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_regional = session
+            .table_from_sql("select id, customer_name from big")
+            .await?;
+        let regional = session.register_alias("regional", &pending_regional)?;
+
+        let west = session
+            .table_from_sql("select id from regional where customer_name = 'alice'")
+            .await?;
+        let dependencies = session.transitive_registered_derived_dependencies(&west)?;
+
+        assert_eq!(
+            dependencies,
+            vec![
+                DerivedTableDependency::RegisteredDerived {
+                    table_id: big.id(),
+                    name: "big".to_owned(),
+                },
+                DerivedTableDependency::RegisteredDerived {
+                    table_id: regional.id(),
+                    name: "regional".to_owned(),
+                },
+            ]
         );
         Ok(())
     }
