@@ -6518,6 +6518,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_to_mssql_with_writer_executes_real_delta_source_fixture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let selected_orders = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let request = execute_output_request(
+            selected_orders,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let mut writer = FakeOrchestratorWriter::default();
+
+        let report = session
+            .write_to_mssql_with_writer(&request, &mut writer)
+            .await?;
+
+        assert_eq!(writer.calls.len(), 1);
+        let call = writer.calls.first().ok_or("expected fake writer call")?;
+        assert_eq!(call.output_name, "orders_output");
+        assert_eq!(call.rows, u64::try_from(table.rows())?);
+        assert!(call.batches >= 1);
+        assert_eq!(call.schema_fields, 2);
+        assert_eq!(report.stats().rows_written(), u64::try_from(table.rows())?);
+        assert_eq!(report.stats().batches_written(), call.batches);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_to_mssql_with_writer_executes_multi_source_delta_join_fixture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders = RealParquetDeltaTable::new_default("orders")?;
+        let customers = RealParquetDeltaTable::new_default("customers")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            orders.path().to_string_lossy().to_string(),
+        ))?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "customers",
+            customers.path().to_string_lossy().to_string(),
+        ))?;
+        let joined = session
+            .table_from_sql(
+                "select o.id, c.customer_name \
+                 from orders o \
+                 join customers c on o.id = c.id",
+            )
+            .await?;
+        let request = execute_output_request(
+            joined,
+            "joined_output",
+            "joined_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let mut writer = FakeOrchestratorWriter::default();
+
+        let report = session
+            .write_to_mssql_with_writer(&request, &mut writer)
+            .await?;
+
+        assert_eq!(writer.calls.len(), 1);
+        let call = writer.calls.first().ok_or("expected fake writer call")?;
+        assert_eq!(call.output_name, "joined_output");
+        assert_eq!(call.rows, 3);
+        assert!(call.batches >= 1);
+        assert_eq!(call.schema_fields, 2);
+        assert_eq!(report.stats().rows_written(), 3);
+        assert_eq!(report.stats().batches_written(), call.batches);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn write_to_mssql_rejects_dry_run_before_planning_or_writer()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
