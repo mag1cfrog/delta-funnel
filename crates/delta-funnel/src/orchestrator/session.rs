@@ -451,7 +451,12 @@ impl WriteAllOptions {
     }
 }
 
-/// Report for one `write_all` call.
+/// Report for one `write_all` call that reached the sequential workflow.
+///
+/// Planning and cache setup failures are returned as errors before this report
+/// exists. Once the workflow starts, output write failures and dependent-output
+/// stream setup failures are represented in the wrapped workflow report while
+/// cache metadata remains available through [`WriteAllReport::cache`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteAllReport {
     workflow: MssqlWorkflowWriteReport,
@@ -469,7 +474,7 @@ impl WriteAllReport {
         &self.workflow
     }
 
-    /// Returns cache planning and selection metadata for this call.
+    /// Returns cache planning, selection, and lifecycle metadata for this call.
     #[must_use]
     pub const fn cache(&self) -> &WriteAllCacheReport {
         &self.cache
@@ -518,7 +523,12 @@ impl WriteAllReport {
     }
 }
 
-/// Cache selection metadata for one `write_all` call.
+/// Cache metadata for one `write_all` call.
+///
+/// This report describes the conservative cache decision for calls that reached
+/// the sequential output workflow. Cache materialization failures occur before
+/// the workflow can start, so they are returned as errors instead of as
+/// `WriteAllCacheReport` values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteAllCacheReport {
     /// Cache planning was disabled for this call.
@@ -602,6 +612,10 @@ impl WriteAllNoCacheReason {
 }
 
 /// Selected registered derived alias cache metadata.
+///
+/// `output_indexes` uses caller-provided `write_all` request indexes. It
+/// includes direct writes of the selected alias and dependent outputs whose
+/// retained SQL was replanned against the active cached alias.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WriteAllCacheAliasReport {
     table_id: u64,
@@ -660,9 +674,17 @@ impl fmt::Debug for WriteAllCacheAliasReport {
 /// Cache lifecycle status for one selected alias in a `write_all` report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteAllCacheAliasStatus {
-    /// The alias was selected by cache planning.
+    /// The alias was selected by cache planning but has no completed workflow.
+    ///
+    /// This status is reserved for plan-shaped metadata. Normal successful
+    /// public `write_all` reports use [`Self::MaterializedAndRestored`] for
+    /// selected aliases because the scoped catalog replacement has already
+    /// been cleaned up before the report is returned.
     Selected,
     /// The alias was materialized, used for the workflow, and restored.
+    ///
+    /// The workflow may still contain per-output failures. This status only
+    /// states that cache setup and restoration completed for the alias.
     MaterializedAndRestored,
 }
 
