@@ -5,7 +5,7 @@
 //! failure, and marks later outputs as skipped without invoking their lazy batch
 //! stream factories.
 
-use std::{fmt, pin::Pin};
+use std::{fmt, future::Future, pin::Pin};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -25,13 +25,17 @@ use super::{
 pub type MssqlOutputBatchStream =
     Pin<Box<dyn Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send>>;
 
-/// Factory that constructs a direct batch stream for one attempted output.
-pub type MssqlOutputBatchStreamFactory = Box<dyn FnOnce() -> MssqlOutputBatchStream + Send>;
+/// Fallible future that constructs a direct batch stream for one attempted output.
+pub type MssqlOutputBatchStreamFuture =
+    Pin<Box<dyn Future<Output = Result<MssqlOutputBatchStream, DeltaFunnelError>> + Send>>;
+
+/// Async factory that constructs a direct batch stream for one attempted output.
+pub type MssqlOutputBatchStreamFactory = Box<dyn FnOnce() -> MssqlOutputBatchStreamFuture + Send>;
 
 /// One deferred SQL Server output write job.
 ///
 /// The job owns an already resolved SQL Server target plus a lazy batch stream
-/// factory. The workflow calls the factory only after the output becomes the
+/// factory. The workflow awaits the factory only after the output becomes the
 /// next attempted output. Skipped jobs keep their stream factories uncalled, so
 /// skipped outputs do not start source reads, DataFusion execution, stream
 /// setup, SQL connections, lifecycle preparation, writer initialization, or
@@ -46,7 +50,7 @@ pub struct MssqlOutputWriteJob {
 
 impl MssqlOutputWriteJob {
     /// Creates a deferred SQL Server output write job.
-    pub fn new<F, S>(
+    pub fn new<F, Fut, S>(
         output_schema: SchemaRef,
         resolved_target: ResolvedMssqlTarget,
         schema_options: MssqlSchemaPlanOptions,
@@ -54,27 +58,34 @@ impl MssqlOutputWriteJob {
         write_options: MssqlWriteOptions,
     ) -> Self
     where
-        F: FnOnce() -> S + Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<S, DeltaFunnelError>> + Send + 'static,
         S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + 'static,
     {
         Self {
             output_schema,
             resolved_target,
             schema_options,
-            batches: Box::new(move || Box::pin(batches())),
+            batches: Box::new(move || {
+                Box::pin(async move {
+                    let stream = batches().await?;
+                    Ok(Box::pin(stream) as MssqlOutputBatchStream)
+                })
+            }),
             write_options,
         }
     }
 
     /// Creates a deferred SQL Server output write job using default write options.
-    pub fn with_default_write_options<F, S>(
+    pub fn with_default_write_options<F, Fut, S>(
         output_schema: SchemaRef,
         resolved_target: ResolvedMssqlTarget,
         schema_options: MssqlSchemaPlanOptions,
         batches: F,
     ) -> Self
     where
-        F: FnOnce() -> S + Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<S, DeltaFunnelError>> + Send + 'static,
         S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + 'static,
     {
         Self::new(
@@ -464,7 +475,7 @@ impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
             output_schema.as_ref(),
             resolved_target,
             schema_options,
-            batches(),
+            batches().await?,
             write_options,
         )
         .await
@@ -578,7 +589,7 @@ mod tests {
                 .push(job.output_name().to_owned());
             let (_schema, _target, _schema_options, batches, _write_options) = job.into_parts();
             if self.invoke_stream_factories {
-                let _stream = batches();
+                let _stream = batches().await?;
             }
 
             self.outcomes
@@ -1029,7 +1040,7 @@ mod tests {
                 if let Ok(mut calls) = factory_calls.lock() {
                     calls.push(output_name);
                 }
-                stream::empty()
+                async { Ok(stream::empty()) }
             },
         ))
     }
