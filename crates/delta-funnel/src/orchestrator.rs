@@ -6,6 +6,7 @@
 
 use std::{fmt, sync::Arc};
 
+use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::prelude::{SQLOptions, SessionContext};
 use datafusion::{datasource::TableProvider, prelude::DataFrame};
@@ -793,18 +794,31 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        self.write_to_mssql_with_writer(request, &mut MssqlPublicOneOutputWriter)
+            .await
+    }
+
+    pub(crate) async fn write_to_mssql_with_writer<W>(
+        &self,
+        request: &OutputWritePlan,
+        writer: &mut W,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError>
+    where
+        W: OrchestratorMssqlOutputWriter,
+    {
         let planned = self.plan_mssql_output(request)?;
         let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
         let batches = self.batch_stream_for_lazy_table(planned.table()).await?;
 
-        write_output_batches_to_mssql(
-            output_schema.as_ref(),
-            planned.resolved_target().clone(),
-            planned.output_plan().schema_plan_options(),
-            batches,
-            self.options.mssql_write_options(),
-        )
-        .await
+        writer
+            .write_output(
+                output_schema,
+                planned.output_plan().clone(),
+                planned.resolved_target().clone(),
+                batches,
+                self.options.mssql_write_options(),
+            )
+            .await
     }
 
     /// Returns registered Delta source reports in registration order.
@@ -957,6 +971,41 @@ impl DeltaFunnelSession {
     }
 }
 
+#[async_trait]
+pub(crate) trait OrchestratorMssqlOutputWriter: Send {
+    async fn write_output(
+        &mut self,
+        output_schema: SchemaRef,
+        output_plan: MssqlTargetOutputPlan,
+        resolved_target: ResolvedMssqlTarget,
+        batches: MssqlOutputBatchStream,
+        write_options: MssqlWriteOptions,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError>;
+}
+
+struct MssqlPublicOneOutputWriter;
+
+#[async_trait]
+impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
+    async fn write_output(
+        &mut self,
+        output_schema: SchemaRef,
+        output_plan: MssqlTargetOutputPlan,
+        resolved_target: ResolvedMssqlTarget,
+        batches: MssqlOutputBatchStream,
+        write_options: MssqlWriteOptions,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        write_output_batches_to_mssql(
+            output_schema.as_ref(),
+            resolved_target,
+            output_plan.schema_plan_options(),
+            batches,
+            write_options,
+        )
+        .await
+    }
+}
+
 impl fmt::Debug for DeltaFunnelSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1029,8 +1078,10 @@ mod tests {
     use super::*;
     use crate::{
         BatchPipelinePhase, DeltaProviderReaderBackend, DeltaStorageOptions, LoadMode,
-        MssqlConnectionSource, MssqlTargetTable, table_formats::RealParquetDeltaTable,
+        MssqlConnectionSource, MssqlTargetCleanupStatus, MssqlTargetTable,
+        table_formats::RealParquetDeltaTable,
     };
+    use async_trait::async_trait;
 
     struct DeltaLogTable {
         path: PathBuf,
@@ -1146,6 +1197,64 @@ mod tests {
             table,
             MssqlOutputTarget::new(output_name, target_config, RunMode::DryRun),
         ))
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeOrchestratorWriteCall {
+        output_name: String,
+        target_table: MssqlTargetTable,
+        connection_source: MssqlConnectionSource,
+        rows: u64,
+        batches: u64,
+        schema_fields: usize,
+    }
+
+    #[derive(Default)]
+    struct FakeOrchestratorWriter {
+        calls: Vec<FakeOrchestratorWriteCall>,
+    }
+
+    #[async_trait]
+    impl OrchestratorMssqlOutputWriter for FakeOrchestratorWriter {
+        async fn write_output(
+            &mut self,
+            output_schema: SchemaRef,
+            output_plan: MssqlTargetOutputPlan,
+            resolved_target: ResolvedMssqlTarget,
+            mut batches: MssqlOutputBatchStream,
+            _write_options: MssqlWriteOptions,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+            let mut rows = 0_u64;
+            let mut batch_count = 0_u64;
+
+            while let Some(batch) = batches.next().await {
+                let batch = batch?;
+                rows = rows.saturating_add(u64::try_from(batch.num_rows()).map_err(|_| {
+                    DeltaFunnelError::Config {
+                        message: "fake writer row count overflowed u64".to_owned(),
+                    }
+                })?);
+                batch_count = batch_count.saturating_add(1);
+            }
+
+            self.calls.push(FakeOrchestratorWriteCall {
+                output_name: resolved_target.output_name().to_owned(),
+                target_table: resolved_target.table().clone(),
+                connection_source: resolved_target.connection_source(),
+                rows,
+                batches: batch_count,
+                schema_fields: output_schema.fields().len(),
+            });
+
+            Ok(MssqlWriteReport::from_output_plan(
+                &output_plan,
+                rows,
+                batch_count,
+                0,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ))
+        }
     }
 
     async fn collect_stream_row_count(
@@ -1692,6 +1801,46 @@ mod tests {
             Err(DeltaFunnelError::MissingMssqlConnection { output_name })
                 if output_name == "orders_output"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_to_mssql_with_writer_hands_query_stream_to_one_output_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let derived = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let request = output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+        let mut writer = FakeOrchestratorWriter::default();
+
+        let report = session
+            .write_to_mssql_with_writer(&request, &mut writer)
+            .await?;
+
+        assert_eq!(writer.calls.len(), 1);
+        let call = writer.calls.first().ok_or("expected fake writer call")?;
+        assert_eq!(call.output_name, "orders_output");
+        assert_eq!(call.target_table.schema(), Some("dbo"));
+        assert_eq!(call.target_table.table(), "orders_sink");
+        assert_eq!(
+            call.connection_source,
+            MssqlConnectionSource::ContextDefault
+        );
+        assert_eq!(call.rows, 2);
+        assert!(call.batches >= 1);
+        assert_eq!(call.schema_fields, 1);
+        assert_eq!(report.output_name(), "orders_output");
+        assert_eq!(report.stats().rows_written(), 2);
+        assert_eq!(report.stats().batches_written(), call.batches);
+        assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
         Ok(())
     }
 
