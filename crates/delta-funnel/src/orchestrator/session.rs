@@ -5925,18 +5925,19 @@ mod tests {
         let report = session
             .write_all_with_writer(&[big_output, west_output], writer)
             .await?;
-        let calls = calls
-            .lock()
-            .map_err(|_| "fake workflow call lock poisoned")?;
+        {
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
 
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].output_name, "big_output");
-        assert_eq!(calls[0].rows, 2);
-        assert_eq!(calls[1].output_name, "west_output");
-        assert_eq!(calls[1].rows, 1);
-        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-        assert!(report.all_succeeded());
-        drop(calls);
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].output_name, "big_output");
+            assert_eq!(calls[0].rows, 2);
+            assert_eq!(calls[1].output_name, "west_output");
+            assert_eq!(calls[1].rows, 1);
+            assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+            assert!(report.all_succeeded());
+        }
 
         let restored_big_factory = session.lazy_table_batch_stream_factory(big);
         let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
@@ -6000,19 +6001,20 @@ mod tests {
         let report = session
             .write_all_with_writer(&[west_output, east_output], writer)
             .await?;
-        let calls = calls
-            .lock()
-            .map_err(|_| "fake workflow call lock poisoned")?;
+        {
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
 
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].output_name, "west_output");
-        assert_eq!(calls[0].rows, 1);
-        assert_eq!(calls[1].output_name, "east_output");
-        assert_eq!(calls[1].rows, 1);
-        assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
-        assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
-        assert!(report.all_succeeded());
-        drop(calls);
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].output_name, "west_output");
+            assert_eq!(calls[0].rows, 1);
+            assert_eq!(calls[1].output_name, "east_output");
+            assert_eq!(calls[1].rows, 1);
+            assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
+            assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
+            assert!(report.all_succeeded());
+        }
 
         let restored_big_factory = session.lazy_table_batch_stream_factory(big);
         let restored_names_factory = session.lazy_table_batch_stream_factory(names);
@@ -6065,26 +6067,27 @@ mod tests {
         let report = session
             .write_all_with_writer(&[big_output, west_output, east_output], writer)
             .await?;
-        let calls = calls
-            .lock()
-            .map_err(|_| "fake workflow call lock poisoned")?;
+        {
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
 
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].output_name, "big_output");
-        assert_eq!(calls[0].rows, 2);
-        assert_eq!(calls[1].output_name, "west_output");
-        assert_eq!(calls[1].rows, 1);
-        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-        assert_eq!(report.succeeded_count(), 1);
-        assert_eq!(report.failed_count(), 1);
-        assert_eq!(report.skipped_count(), 1);
-        assert!(report.outputs()[0].is_succeeded());
-        assert_eq!(report.outputs()[0].output_name(), "big_output");
-        assert!(report.outputs()[1].is_failed());
-        assert_eq!(report.outputs()[1].output_name(), "west_output");
-        assert!(report.outputs()[2].is_skipped());
-        assert_eq!(report.outputs()[2].output_name(), "east_output");
-        drop(calls);
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].output_name, "big_output");
+            assert_eq!(calls[0].rows, 2);
+            assert_eq!(calls[1].output_name, "west_output");
+            assert_eq!(calls[1].rows, 1);
+            assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+            assert_eq!(report.succeeded_count(), 1);
+            assert_eq!(report.failed_count(), 1);
+            assert_eq!(report.skipped_count(), 1);
+            assert!(report.outputs()[0].is_succeeded());
+            assert_eq!(report.outputs()[0].output_name(), "big_output");
+            assert!(report.outputs()[1].is_failed());
+            assert_eq!(report.outputs()[1].output_name(), "west_output");
+            assert!(report.outputs()[2].is_skipped());
+            assert_eq!(report.outputs()[2].output_name(), "east_output");
+        }
 
         let restored_big_factory = session.lazy_table_batch_stream_factory(big);
         let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
@@ -6123,19 +6126,20 @@ mod tests {
         let error = session
             .write_all_with_writer(&[west_output, east_output], writer)
             .await;
-        let calls = calls
-            .lock()
-            .map_err(|_| "fake workflow call lock poisoned")?;
+        {
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
 
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
-                if message.contains("scoped MSSQL cache alias materialize failed")
-                    && message.contains("big")
-        ));
-        assert!(calls.is_empty());
-        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-        drop(calls);
+            assert!(matches!(
+                error,
+                Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                    if message.contains("scoped MSSQL cache alias materialize failed")
+                        && message.contains("big")
+            ));
+            assert!(calls.is_empty());
+            assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+        }
 
         let restored_error = match session.batch_stream_for_lazy_table(&big).await {
             Ok(stream) => match collect_stream_row_count(stream).await {
@@ -6211,20 +6215,21 @@ mod tests {
         let error = session
             .write_all_with_writer(&[west_output, east_output], writer)
             .await;
-        let calls = calls
-            .lock()
-            .map_err(|_| "fake workflow call lock poisoned")?;
+        {
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
 
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
-                if message.contains("scoped MSSQL cache alias materialize failed")
-                    && message.contains("names")
-        ));
-        assert!(calls.is_empty());
-        assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
-        assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
-        drop(calls);
+            assert!(matches!(
+                error,
+                Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                    if message.contains("scoped MSSQL cache alias materialize failed")
+                        && message.contains("names")
+            ));
+            assert!(calls.is_empty());
+            assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
+            assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
+        }
 
         let restored_big_factory = session.lazy_table_batch_stream_factory(big);
         assert_eq!(
@@ -6299,35 +6304,98 @@ mod tests {
         let report = session
             .write_all_with_writer(&[big_output, west_output, east_output], writer)
             .await?;
-        let calls = calls
-            .lock()
-            .map_err(|_| "fake workflow call lock poisoned")?;
+        {
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
 
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].output_name, "big_output");
-        assert_eq!(calls[0].rows, 2);
-        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-        assert_eq!(report.succeeded_count(), 1);
-        assert_eq!(report.failed_count(), 1);
-        assert_eq!(report.skipped_count(), 1);
-        assert!(report.outputs()[0].is_succeeded());
-        assert_eq!(report.outputs()[0].output_name(), "big_output");
-        assert!(report.outputs()[1].is_failed());
-        assert_eq!(report.outputs()[1].output_name(), "west_output");
-        let failure_message = match &report.outputs()[1] {
-            crate::sql_server::MssqlOutputWriteStatus::Failed(failure) => failure.error(),
-            status => return Err(format!("expected failed status, got {status:?}").into()),
-        };
-        assert!(failure_message.contains("cached output stream setup failed for `west_output`"));
-        assert!(failure_message.contains("replanned output schema does not match"));
-        assert!(report.outputs()[2].is_skipped());
-        assert_eq!(report.outputs()[2].output_name(), "east_output");
-        drop(calls);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].output_name, "big_output");
+            assert_eq!(calls[0].rows, 2);
+            assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+            assert_eq!(report.succeeded_count(), 1);
+            assert_eq!(report.failed_count(), 1);
+            assert_eq!(report.skipped_count(), 1);
+            assert!(report.outputs()[0].is_succeeded());
+            assert_eq!(report.outputs()[0].output_name(), "big_output");
+            assert!(report.outputs()[1].is_failed());
+            assert_eq!(report.outputs()[1].output_name(), "west_output");
+            let failure_message = match &report.outputs()[1] {
+                crate::sql_server::MssqlOutputWriteStatus::Failed(failure) => failure.error(),
+                status => return Err(format!("expected failed status, got {status:?}").into()),
+            };
+            assert!(
+                failure_message.contains("cached output stream setup failed for `west_output`")
+            );
+            assert!(failure_message.contains("replanned output schema does not match"));
+            assert!(report.outputs()[2].is_skipped());
+            assert_eq!(report.outputs()[2].output_name(), "east_output");
+        }
 
         let restored_big_factory = session.lazy_table_batch_stream_factory(big);
         let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
         assert_eq!(restored_big_rows, 2);
         assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_auto_keeps_unrelated_output_on_normal_stream_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (shared_provider, shared_scans) = scan_counting_marker_region_provider("shared")?;
+        let (unrelated_provider, unrelated_scans) =
+            scan_counting_marker_region_provider("unrelated")?;
+        session
+            .context()
+            .register_table("big_source", shared_provider)?;
+        session
+            .context()
+            .register_table("unrelated_source", unrelated_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let unrelated = session
+            .table_from_sql("select marker from unrelated_source where region = 'west'")
+            .await?;
+        let big_output =
+            execute_output_request(big, "big_output", "big_orders", LoadMode::AppendExisting)?;
+        let west_output =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let unrelated_output = execute_output_request(
+            unrelated,
+            "unrelated_output",
+            "unrelated_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_writer(&[big_output, unrelated_output, west_output], writer)
+            .await?;
+        {
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
+
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[0].output_name, "big_output");
+            assert_eq!(calls[0].rows, 2);
+            assert_eq!(calls[1].output_name, "unrelated_output");
+            assert_eq!(calls[1].rows, 1);
+            assert_eq!(calls[2].output_name, "west_output");
+            assert_eq!(calls[2].rows, 1);
+            assert_eq!(shared_scans.load(Ordering::SeqCst), 1);
+            assert_eq!(unrelated_scans.load(Ordering::SeqCst), 1);
+            assert!(report.all_succeeded());
+        }
         Ok(())
     }
 
