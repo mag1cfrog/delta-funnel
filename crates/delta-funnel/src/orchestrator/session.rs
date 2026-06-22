@@ -2593,7 +2593,7 @@ mod tests {
         catalog::Session,
         common::tree_node::{TreeNode, TreeNodeRecursion},
         datasource::MemTable,
-        error::Result as DataFusionResult,
+        error::{DataFusionError, Result as DataFusionResult},
         logical_expr::{Expr, LogicalPlan, TableType},
         physical_plan::ExecutionPlan,
         sql::{parser::DFParser, resolve::resolve_table_references},
@@ -2953,6 +2953,12 @@ mod tests {
         scans: Arc<AtomicUsize>,
     }
 
+    #[derive(Debug)]
+    struct FailingScanProvider {
+        schema: SchemaRef,
+        scans: Arc<AtomicUsize>,
+    }
+
     type CountedProvider = (Arc<dyn TableProvider>, Arc<AtomicUsize>);
 
     #[async_trait]
@@ -2981,6 +2987,34 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl TableProvider for FailingScanProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            Err(DataFusionError::Execution(
+                "forced scan planning failure".to_owned(),
+            ))
+        }
+    }
+
     fn scan_counting_marker_region_provider(
         marker: &str,
     ) -> Result<CountedProvider, Box<dyn std::error::Error>> {
@@ -3002,6 +3036,20 @@ mod tests {
         };
 
         Ok((Arc::new(provider), scans))
+    }
+
+    fn failing_scan_marker_region_provider() -> CountedProvider {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("marker", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let scans = Arc::new(AtomicUsize::new(0));
+        let provider = FailingScanProvider {
+            schema,
+            scans: Arc::clone(&scans),
+        };
+
+        (Arc::new(provider), scans)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5504,6 +5552,78 @@ mod tests {
         assert_eq!(report.outputs()[0].output_name(), "first_output");
         assert!(report.outputs()[1].is_failed());
         assert_eq!(report.outputs()[1].output_name(), "second_output");
+        assert!(report.outputs()[2].is_skipped());
+        assert_eq!(report.outputs()[2].output_name(), "third_output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_with_writer_reports_stream_setup_failure_before_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (first_provider, first_scans) = scan_counting_marker_region_provider("first")?;
+        let (failing_provider, failing_scans) = failing_scan_marker_region_provider();
+        let (third_provider, third_scans) = scan_counting_marker_region_provider("third")?;
+        session
+            .context()
+            .register_table("first_source", first_provider)?;
+        session
+            .context()
+            .register_table("failing_source", failing_provider)?;
+        session
+            .context()
+            .register_table("third_source", third_provider)?;
+        let first = session
+            .table_from_sql("select marker from first_source where region = 'west'")
+            .await?;
+        let failing = session
+            .table_from_sql("select marker from failing_source where region = 'west'")
+            .await?;
+        let third = session
+            .table_from_sql("select marker from third_source where region = 'west'")
+            .await?;
+        let first = execute_output_request(
+            first,
+            "first_output",
+            "first_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let failing = execute_output_request(
+            failing,
+            "failing_output",
+            "failing_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let third = execute_output_request(
+            third,
+            "third_output",
+            "third_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_writer(&[first, failing, third], writer)
+            .await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].output_name, "first_output");
+        assert_eq!(first_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(failing_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(third_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(report.succeeded_count(), 1);
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(report.skipped_count(), 1);
+        assert!(report.outputs()[0].is_succeeded());
+        assert_eq!(report.outputs()[0].output_name(), "first_output");
+        assert!(report.outputs()[1].is_failed());
+        assert_eq!(report.outputs()[1].output_name(), "failing_output");
         assert!(report.outputs()[2].is_skipped());
         assert_eq!(report.outputs()[2].output_name(), "third_output");
         Ok(())
