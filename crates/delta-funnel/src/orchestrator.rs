@@ -1080,8 +1080,10 @@ fn ensure_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
 #[cfg(test)]
 mod tests {
     use std::{
+        any::Any,
         fs,
         path::{Path, PathBuf},
+        sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1098,7 +1100,11 @@ mod tests {
             datatypes::{DataType, Field, Schema},
             record_batch::RecordBatch,
         },
+        catalog::Session,
         datasource::MemTable,
+        error::Result as DataFusionResult,
+        logical_expr::{Expr, TableType},
+        physical_plan::ExecutionPlan,
     };
 
     struct DeltaLogTable {
@@ -1362,6 +1368,63 @@ mod tests {
         )?;
 
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+
+    #[derive(Debug)]
+    struct ScanCountingProvider {
+        table: MemTable,
+        scans: Arc<AtomicUsize>,
+    }
+
+    type CountedProvider = (Arc<dyn TableProvider>, Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl TableProvider for ScanCountingProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.table.schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            self.table.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            self.table.scan(state, projection, filters, limit).await
+        }
+    }
+
+    fn scan_counting_marker_region_provider(
+        marker: &str,
+    ) -> Result<CountedProvider, Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("marker", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![marker, marker])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["west", "east"])) as ArrayRef,
+            ],
+        )?;
+        let scans = Arc::new(AtomicUsize::new(0));
+        let provider = ScanCountingProvider {
+            table: MemTable::try_new(schema, vec![vec![batch]])?,
+            scans: Arc::clone(&scans),
+        };
+
+        Ok((Arc::new(provider), scans))
     }
 
     #[test]
@@ -1907,6 +1970,60 @@ mod tests {
         // original resolved provider; catalog replacement alone does not rewire them.
         assert_eq!(west_markers, vec!["original"]);
         assert_eq!(east_markers, vec!["original"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replanned_downstream_sql_uses_cached_alias_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const WEST_SQL: &str = "select marker from big where region = 'west'";
+        const EAST_SQL: &str = "select marker from big where region = 'east'";
+
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let _big = session.register_alias("big", &pending_big)?;
+        let _old_west = session.table_from_sql(WEST_SQL).await?;
+        let _old_east = session.table_from_sql(EAST_SQL).await?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+
+        let cached_big = session
+            .context()
+            .table("big")
+            .await?
+            .cache()
+            .await?
+            .into_view();
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let removed_big = session.context().deregister_table("big")?;
+        assert!(removed_big.is_some());
+        session.context().register_table("big", cached_big)?;
+
+        let direct_big = session.context().sql(WEST_SQL).await?.collect().await?;
+        assert_eq!(marker_values_from_batches(&direct_big)?, vec!["shared"]);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let replanned_west = session.table_from_sql(WEST_SQL).await?;
+        let replanned_east = session.table_from_sql(EAST_SQL).await?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let west_stream = session.batch_stream_for_lazy_table(&replanned_west).await?;
+        let east_stream = session.batch_stream_for_lazy_table(&replanned_east).await?;
+        let west_markers = collect_stream_marker_values(west_stream).await?;
+        let east_markers = collect_stream_marker_values(east_stream).await?;
+
+        // Conclusion for #247: after cached big is installed under alias big,
+        // replanning downstream SQL reads the cached provider and does not
+        // rescan the original upstream provider per output.
+        assert_eq!(west_markers, vec!["shared"]);
+        assert_eq!(east_markers, vec!["shared"]);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
