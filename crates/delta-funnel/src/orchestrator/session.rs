@@ -17,12 +17,12 @@ use futures_util::StreamExt;
 use crate::{
     BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaProviderScanExecutionOptions,
     DeltaSourceConfig, DeltaTableProviderConfig, MssqlConnectionConfig, MssqlOutputBatchStream,
-    MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlSchemaPlanOptions, MssqlTargetConfig,
-    MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWorkflowWriteOptions,
-    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, QueryOptions,
-    RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase, datafusion_query_output_stream,
-    datafusion_session_context, default_mssql_write_options, load_delta_source,
-    plan_mssql_target_for_resolved_output, preflight_delta_protocol,
+    MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlOutputWriteStatus,
+    MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter,
+    MssqlWorkflowWriteOptions, MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport,
+    QueryOptions, RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase,
+    datafusion_query_output_stream, datafusion_session_context, default_mssql_write_options,
+    load_delta_source, plan_mssql_target_for_resolved_output, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
     table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
     write_output_batches_to_mssql,
@@ -448,6 +448,278 @@ impl WriteAllOptions {
     #[must_use]
     pub const fn cache_mode(&self) -> WriteAllCacheMode {
         self.cache_mode
+    }
+}
+
+/// Report for one `write_all` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAllReport {
+    workflow: MssqlWorkflowWriteReport,
+    cache: WriteAllCacheReport,
+}
+
+impl WriteAllReport {
+    fn new(workflow: MssqlWorkflowWriteReport, cache: WriteAllCacheReport) -> Self {
+        Self { workflow, cache }
+    }
+
+    /// Returns the lower-level SQL Server workflow report.
+    #[must_use]
+    pub const fn workflow(&self) -> &MssqlWorkflowWriteReport {
+        &self.workflow
+    }
+
+    /// Returns cache planning and selection metadata for this call.
+    #[must_use]
+    pub const fn cache(&self) -> &WriteAllCacheReport {
+        &self.cache
+    }
+
+    /// Returns the number of selected outputs represented by this report.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.workflow.len()
+    }
+
+    /// Returns whether this report contains no selected outputs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.workflow.is_empty()
+    }
+
+    /// Returns per-output SQL Server workflow statuses in caller-provided order.
+    #[must_use]
+    pub fn outputs(&self) -> &[MssqlOutputWriteStatus] {
+        self.workflow.outputs()
+    }
+
+    /// Returns whether every selected output completed successfully.
+    #[must_use]
+    pub fn all_succeeded(&self) -> bool {
+        self.workflow.all_succeeded()
+    }
+
+    /// Returns the number of outputs that completed successfully.
+    #[must_use]
+    pub fn succeeded_count(&self) -> usize {
+        self.workflow.succeeded_count()
+    }
+
+    /// Returns the number of outputs that failed.
+    #[must_use]
+    pub fn failed_count(&self) -> usize {
+        self.workflow.failed_count()
+    }
+
+    /// Returns the number of outputs skipped after a previous output failed.
+    #[must_use]
+    pub fn skipped_count(&self) -> usize {
+        self.workflow.skipped_count()
+    }
+}
+
+/// Cache selection metadata for one `write_all` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteAllCacheReport {
+    /// Cache planning was disabled for this call.
+    Disabled,
+    /// Cache planning ran but did not select a safe cache frontier.
+    NoCache {
+        /// Conservative reason no cache aliases were selected.
+        reason: WriteAllNoCacheReason,
+        /// Registered derived aliases skipped by conservative cache planning.
+        skipped_candidates: Vec<WriteAllCacheCandidateSkip>,
+    },
+    /// Cache planning selected registered derived aliases for this call.
+    CacheAliases {
+        /// Selected registered derived aliases in deterministic planner order.
+        aliases: Vec<WriteAllCacheAliasReport>,
+        /// Registered derived aliases skipped by conservative cache planning.
+        skipped_candidates: Vec<WriteAllCacheCandidateSkip>,
+    },
+}
+
+impl WriteAllCacheReport {
+    fn disabled() -> Self {
+        Self::Disabled
+    }
+
+    fn from_plan(plan: &MssqlOutputCachePlan) -> Self {
+        let skipped_candidates = plan
+            .skipped_candidates()
+            .iter()
+            .map(WriteAllCacheCandidateSkip::from_internal)
+            .collect::<Vec<_>>();
+
+        match plan.decision() {
+            MssqlOutputCacheDecision::NoCache { reason } => Self::NoCache {
+                reason: WriteAllNoCacheReason::from_internal(reason),
+                skipped_candidates,
+            },
+            MssqlOutputCacheDecision::CacheAliases(aliases) => Self::CacheAliases {
+                aliases: aliases
+                    .iter()
+                    .map(WriteAllCacheAliasReport::from_internal)
+                    .collect(),
+                skipped_candidates,
+            },
+        }
+    }
+}
+
+/// Conservative reason no cache alias was selected for `write_all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAllNoCacheReason {
+    /// Cache selection only helps when at least two outputs use a candidate.
+    FewerThanTwoOutputs,
+    /// No registered derived alias is shared by at least two selected outputs.
+    NoSharedRegisteredDerivedAlias,
+    /// Candidate relationships could not produce a deterministic cache frontier.
+    AmbiguousSharedDerivedAlias,
+}
+
+impl WriteAllNoCacheReason {
+    fn from_internal(reason: &MssqlNoCacheReason) -> Self {
+        match reason {
+            MssqlNoCacheReason::FewerThanTwoOutputs => Self::FewerThanTwoOutputs,
+            MssqlNoCacheReason::NoSharedRegisteredDerivedAlias => {
+                Self::NoSharedRegisteredDerivedAlias
+            }
+            MssqlNoCacheReason::AmbiguousSharedDerivedAlias => Self::AmbiguousSharedDerivedAlias,
+        }
+    }
+}
+
+/// Selected registered derived alias cache metadata.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WriteAllCacheAliasReport {
+    table_id: u64,
+    alias: String,
+    output_indexes: Vec<usize>,
+}
+
+impl WriteAllCacheAliasReport {
+    fn from_internal(alias: &MssqlDerivedCacheAliasPlan) -> Self {
+        Self {
+            table_id: alias.table_id(),
+            alias: alias.alias().to_owned(),
+            output_indexes: alias.output_indexes().to_vec(),
+        }
+    }
+
+    /// Returns the selected registered derived table id.
+    #[must_use]
+    pub const fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
+    /// Returns the selected registered derived alias.
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Returns selected output indexes that use this alias.
+    #[must_use]
+    pub fn output_indexes(&self) -> &[usize] {
+        &self.output_indexes
+    }
+}
+
+impl fmt::Debug for WriteAllCacheAliasReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WriteAllCacheAliasReport")
+            .field("table_id", &self.table_id)
+            .field("alias", &sanitize_text_for_display(&self.alias))
+            .field("output_indexes", &self.output_indexes)
+            .finish()
+    }
+}
+
+/// Registered derived alias skipped during conservative cache selection.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WriteAllCacheCandidateSkip {
+    table_id: u64,
+    alias: String,
+    reason: WriteAllCacheCandidateSkipReason,
+}
+
+impl WriteAllCacheCandidateSkip {
+    fn from_internal(skip: &MssqlCacheCandidateSkip) -> Self {
+        Self {
+            table_id: skip.table_id(),
+            alias: skip.alias().to_owned(),
+            reason: WriteAllCacheCandidateSkipReason::from_internal(skip.reason()),
+        }
+    }
+
+    /// Returns the skipped registered derived table id.
+    #[must_use]
+    pub const fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
+    /// Returns the skipped registered derived alias.
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Returns why this candidate was skipped.
+    #[must_use]
+    pub const fn reason(&self) -> &WriteAllCacheCandidateSkipReason {
+        &self.reason
+    }
+}
+
+impl fmt::Debug for WriteAllCacheCandidateSkip {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WriteAllCacheCandidateSkip")
+            .field("table_id", &self.table_id)
+            .field("alias", &sanitize_text_for_display(&self.alias))
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+/// Reason a cache candidate was skipped by conservative `write_all` planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteAllCacheCandidateSkipReason {
+    /// Fewer than two selected outputs use this candidate.
+    NotShared {
+        /// Number of selected outputs that use this candidate.
+        output_count: usize,
+    },
+    /// Retained SQL text was missing, so later replanning would be unsafe.
+    MissingSqlText,
+    /// Lineage was incomplete or could not be trusted.
+    IncompleteLineage,
+    /// A deeper shared alias is closer to all dependent outputs.
+    CoveredByDeeperSharedAlias {
+        /// Table id of the selected deeper alias that covers this candidate.
+        selected_table_id: u64,
+    },
+    /// The candidate's relative depth could not be ordered deterministically.
+    AmbiguousDepth,
+}
+
+impl WriteAllCacheCandidateSkipReason {
+    fn from_internal(reason: &MssqlCacheCandidateSkipReason) -> Self {
+        match reason {
+            MssqlCacheCandidateSkipReason::NotShared { output_count } => Self::NotShared {
+                output_count: *output_count,
+            },
+            MssqlCacheCandidateSkipReason::MissingSqlText => Self::MissingSqlText,
+            MssqlCacheCandidateSkipReason::IncompleteLineage => Self::IncompleteLineage,
+            MssqlCacheCandidateSkipReason::CoveredByDeeperSharedAlias { selected_table_id } => {
+                Self::CoveredByDeeperSharedAlias {
+                    selected_table_id: *selected_table_id,
+                }
+            }
+            MssqlCacheCandidateSkipReason::AmbiguousDepth => Self::AmbiguousDepth,
+        }
     }
 }
 
@@ -1507,7 +1779,7 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
         writer: W,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    ) -> Result<WriteAllReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
@@ -1519,8 +1791,13 @@ impl DeltaFunnelSession {
                     .await
             }
             WriteAllCacheMode::Disabled => {
-                self.write_all_baseline_with_writer(&planned_outputs, writer)
-                    .await
+                let workflow = self
+                    .write_all_baseline_with_writer(&planned_outputs, writer)
+                    .await?;
+                Ok(WriteAllReport::new(
+                    workflow,
+                    WriteAllCacheReport::disabled(),
+                ))
             }
         }
     }
@@ -1530,7 +1807,7 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
         writer: W,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    ) -> Result<WriteAllReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
@@ -1552,7 +1829,7 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
         planned_outputs: &[PlannedMssqlOutput],
         writer: W,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    ) -> Result<WriteAllReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
@@ -1568,18 +1845,23 @@ impl DeltaFunnelSession {
         planned_outputs: &[PlannedMssqlOutput],
         cache_plan: &MssqlOutputCachePlan,
         writer: W,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    ) -> Result<WriteAllReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
+        let cache = WriteAllCacheReport::from_plan(cache_plan);
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
-                self.write_all_baseline_with_writer(planned_outputs, writer)
-                    .await
+                let workflow = self
+                    .write_all_baseline_with_writer(planned_outputs, writer)
+                    .await?;
+                Ok(WriteAllReport::new(workflow, cache))
             }
             MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
-                self.write_all_cached_with_writer(planned_outputs, cache_aliases, writer)
-                    .await
+                let workflow = self
+                    .write_all_cached_with_writer(planned_outputs, cache_aliases, writer)
+                    .await?;
+                Ok(WriteAllReport::new(workflow, cache))
             }
         }
     }
@@ -1601,7 +1883,7 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
         planned_outputs: &[PlannedMssqlOutput],
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+    ) -> Result<WriteAllReport, DeltaFunnelError> {
         let cache_plan = self.plan_mssql_output_cache(requests);
 
         self.write_all_auto_plan(planned_outputs, &cache_plan).await
@@ -1611,25 +1893,28 @@ impl DeltaFunnelSession {
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         cache_plan: &MssqlOutputCachePlan,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+    ) -> Result<WriteAllReport, DeltaFunnelError> {
+        let cache = WriteAllCacheReport::from_plan(cache_plan);
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
-                self.write_all_baseline(planned_outputs).await
+                let workflow = self.write_all_baseline(planned_outputs).await?;
+                Ok(WriteAllReport::new(workflow, cache))
             }
             MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
-                self.write_all_cached(planned_outputs, cache_aliases).await
+                let workflow = self
+                    .write_all_cached(planned_outputs, cache_aliases)
+                    .await?;
+                Ok(WriteAllReport::new(workflow, cache))
             }
         }
     }
 
     /// Writes multiple selected lazy tables to SQL Server sequentially.
     ///
-    /// The baseline workflow validates and plans every selected output before
-    /// side effects, builds lazy async stream factories for attempted outputs,
-    /// and delegates sequential stop-on-first-failure behavior to the existing
-    /// SQL Server workflow layer. This method intentionally does not perform
-    /// automatic cache planning or cache materialization; that belongs to the
-    /// later cache integration slice.
+    /// The default mode performs conservative automatic cache planning for
+    /// shared registered derived aliases. The returned report wraps the
+    /// lower-level SQL Server workflow report and includes cache selection
+    /// metadata for this call.
     ///
     /// # Errors
     ///
@@ -1639,16 +1924,16 @@ impl DeltaFunnelSession {
     pub async fn write_all(
         &self,
         requests: &[OutputWritePlan],
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+    ) -> Result<WriteAllReport, DeltaFunnelError> {
         self.write_all_with_options(requests, WriteAllOptions::default())
             .await
     }
 
     /// Writes multiple selected lazy tables to SQL Server sequentially with explicit options.
     ///
-    /// `WriteAllCacheMode::Disabled` uses the baseline #254 no-cache path. The
-    /// default `Auto` mode currently delegates to the same baseline path until
-    /// the cache materialization branch is connected in this issue.
+    /// `WriteAllCacheMode::Disabled` uses the baseline no-cache path. The
+    /// default `Auto` mode performs conservative shared-cache planning and
+    /// reports the selected or skipped cache decision.
     ///
     /// # Errors
     ///
@@ -1659,12 +1944,18 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+    ) -> Result<WriteAllReport, DeltaFunnelError> {
         let planned_outputs = self.plan_write_all_outputs(requests)?;
 
         match options.cache_mode() {
             WriteAllCacheMode::Auto => self.write_all_auto(requests, &planned_outputs).await,
-            WriteAllCacheMode::Disabled => self.write_all_baseline(&planned_outputs).await,
+            WriteAllCacheMode::Disabled => {
+                let workflow = self.write_all_baseline(&planned_outputs).await?;
+                Ok(WriteAllReport::new(
+                    workflow,
+                    WriteAllCacheReport::disabled(),
+                ))
+            }
         }
     }
 
@@ -5891,6 +6182,13 @@ mod tests {
         assert_eq!(calls[1].rows, 1);
         assert_eq!(source_scans.load(Ordering::SeqCst), 2);
         assert!(report.all_succeeded());
+        assert!(matches!(
+            report.cache(),
+            WriteAllCacheReport::NoCache {
+                reason: WriteAllNoCacheReason::NoSharedRegisteredDerivedAlias,
+                skipped_candidates
+            } if skipped_candidates.is_empty()
+        ));
         Ok(())
     }
 
@@ -5938,6 +6236,18 @@ mod tests {
             assert_eq!(source_scans.load(Ordering::SeqCst), 1);
             assert!(report.all_succeeded());
         }
+        let WriteAllCacheReport::CacheAliases {
+            aliases,
+            skipped_candidates,
+        } = report.cache()
+        else {
+            return Err(format!("expected cache aliases report, got {:?}", report.cache()).into());
+        };
+        assert!(skipped_candidates.is_empty());
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].table_id(), big.id());
+        assert_eq!(aliases[0].alias(), "big");
+        assert_eq!(aliases[0].output_indexes(), &[0, 1]);
 
         let restored_big_factory = session.lazy_table_batch_stream_factory(big);
         let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
@@ -6439,6 +6749,7 @@ mod tests {
         assert_eq!(calls[1].rows, 1);
         assert_eq!(source_scans.load(Ordering::SeqCst), 2);
         assert!(report.all_succeeded());
+        assert_eq!(report.cache(), &WriteAllCacheReport::Disabled);
         Ok(())
     }
 
