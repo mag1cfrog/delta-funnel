@@ -10,23 +10,23 @@
 //! sink, and orchestration work should land in their own modules when the first
 //! real implementation slice needs them.
 
-mod batch_pipeline;
 pub mod error;
 mod orchestrator;
+mod pipeline;
 pub(crate) mod query_engine;
 mod sql_server;
 mod support;
 mod table_formats;
 
-pub use batch_pipeline::{
-    BatchHandoffError, BatchHandoffOutcome, BatchHandoffStats, BatchPipelinePhase,
-    RecordBatchConsumer, handoff_datafusion_query_output, handoff_record_batch_stream,
-};
 pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
     DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan,
     PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions,
     ValidationOptions,
+};
+pub use pipeline::{
+    BatchHandoffError, BatchHandoffOutcome, BatchHandoffStats, BatchPipelinePhase,
+    RecordBatchConsumer, handoff_datafusion_query_output, handoff_record_batch_stream,
 };
 pub use query_engine::{
     DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
