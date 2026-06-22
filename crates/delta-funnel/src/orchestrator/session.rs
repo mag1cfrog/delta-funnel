@@ -2758,9 +2758,17 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeWorkflowWriter {
         calls: Arc<Mutex<Vec<FakeOrchestratorWriteCall>>>,
+        fail_output_name: Option<String>,
     }
 
     impl FakeWorkflowWriter {
+        fn failing_on(output_name: &str) -> Self {
+            Self {
+                fail_output_name: Some(output_name.to_owned()),
+                ..Self::default()
+            }
+        }
+
         fn calls(&self) -> Arc<Mutex<Vec<FakeOrchestratorWriteCall>>> {
             Arc::clone(&self.calls)
         }
@@ -2850,6 +2858,19 @@ mod tests {
                     batches: batch_count,
                     schema_fields: output_schema.fields().len(),
                 });
+
+            if self
+                .fail_output_name
+                .as_deref()
+                .is_some_and(|output_name| output_name == resolved_target.output_name())
+            {
+                return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: format!(
+                        "fake workflow writer failed for `{}`",
+                        resolved_target.output_name()
+                    ),
+                });
+            }
 
             Ok(MssqlWriteReport::from_output_plan(
                 &output_plan,
@@ -5412,6 +5433,79 @@ mod tests {
         assert!(report.all_succeeded());
         assert_eq!(report.outputs()[0].output_name(), "west_output");
         assert_eq!(report.outputs()[1].output_name(), "east_output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_with_writer_skips_later_outputs_after_writer_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (first_provider, first_scans) = scan_counting_marker_region_provider("first")?;
+        let (second_provider, second_scans) = scan_counting_marker_region_provider("second")?;
+        let (third_provider, third_scans) = scan_counting_marker_region_provider("third")?;
+        session
+            .context()
+            .register_table("first_source", first_provider)?;
+        session
+            .context()
+            .register_table("second_source", second_provider)?;
+        session
+            .context()
+            .register_table("third_source", third_provider)?;
+        let first = session
+            .table_from_sql("select marker from first_source where region = 'west'")
+            .await?;
+        let second = session
+            .table_from_sql("select marker from second_source where region = 'west'")
+            .await?;
+        let third = session
+            .table_from_sql("select marker from third_source where region = 'west'")
+            .await?;
+        let first = execute_output_request(
+            first,
+            "first_output",
+            "first_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let second = execute_output_request(
+            second,
+            "second_output",
+            "second_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let third = execute_output_request(
+            third,
+            "third_output",
+            "third_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::failing_on("second_output");
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_writer(&[first, second, third], writer)
+            .await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].output_name, "first_output");
+        assert_eq!(calls[1].output_name, "second_output");
+        assert_eq!(first_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(second_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(third_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(report.succeeded_count(), 1);
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(report.skipped_count(), 1);
+        assert!(report.outputs()[0].is_succeeded());
+        assert_eq!(report.outputs()[0].output_name(), "first_output");
+        assert!(report.outputs()[1].is_failed());
+        assert_eq!(report.outputs()[1].output_name(), "second_output");
+        assert!(report.outputs()[2].is_skipped());
+        assert_eq!(report.outputs()[2].output_name(), "third_output");
         Ok(())
     }
 
