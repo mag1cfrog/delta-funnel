@@ -473,6 +473,18 @@ pub(crate) struct MssqlOutputCachePlan {
 
 #[allow(dead_code)]
 impl MssqlOutputCachePlan {
+    fn new(
+        selected_outputs: Vec<MssqlOutputCachePlanOutput>,
+        decision: MssqlOutputCacheDecision,
+        skipped_candidates: Vec<MssqlCacheCandidateSkip>,
+    ) -> Self {
+        Self {
+            selected_outputs,
+            decision,
+            skipped_candidates,
+        }
+    }
+
     fn no_cache(
         selected_outputs: Vec<MssqlOutputCachePlanOutput>,
         reason: MssqlNoCacheReason,
@@ -603,6 +615,35 @@ pub(crate) struct MssqlDerivedCacheAliasPlan {
     output_indexes: Vec<usize>,
 }
 
+#[allow(dead_code)]
+impl MssqlDerivedCacheAliasPlan {
+    fn from_registered(derived: &RegisteredDerivedTable, output_indexes: Vec<usize>) -> Self {
+        Self {
+            table_id: derived.table().id(),
+            alias: derived.name().to_owned(),
+            output_indexes,
+        }
+    }
+
+    /// Returns the selected registered derived table id.
+    #[must_use]
+    pub(crate) const fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
+    /// Returns the selected registered derived alias.
+    #[must_use]
+    pub(crate) fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Returns selected output indexes that use this alias.
+    #[must_use]
+    pub(crate) fn output_indexes(&self) -> &[usize] {
+        &self.output_indexes
+    }
+}
+
 impl fmt::Debug for MssqlDerivedCacheAliasPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -621,6 +662,38 @@ pub(crate) struct MssqlCacheCandidateSkip {
     table_id: u64,
     alias: String,
     reason: MssqlCacheCandidateSkipReason,
+}
+
+#[allow(dead_code)]
+impl MssqlCacheCandidateSkip {
+    fn from_registered(
+        derived: &RegisteredDerivedTable,
+        reason: MssqlCacheCandidateSkipReason,
+    ) -> Self {
+        Self {
+            table_id: derived.table().id(),
+            alias: derived.name().to_owned(),
+            reason,
+        }
+    }
+
+    /// Returns the skipped registered derived table id.
+    #[must_use]
+    pub(crate) const fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
+    /// Returns the skipped registered derived alias.
+    #[must_use]
+    pub(crate) fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Returns why the candidate was skipped.
+    #[must_use]
+    pub(crate) const fn reason(&self) -> &MssqlCacheCandidateSkipReason {
+        &self.reason
+    }
 }
 
 impl fmt::Debug for MssqlCacheCandidateSkip {
@@ -1149,13 +1222,87 @@ impl DeltaFunnelSession {
             .enumerate()
             .map(|(index, request)| MssqlOutputCachePlanOutput::from_request(index, request))
             .collect::<Vec<_>>();
-        let reason = if selected_outputs.len() < 2 {
-            MssqlNoCacheReason::FewerThanTwoOutputs
-        } else {
-            MssqlNoCacheReason::NoSharedRegisteredDerivedAlias
-        };
+        if selected_outputs.len() < 2 {
+            return MssqlOutputCachePlan::no_cache(
+                selected_outputs,
+                MssqlNoCacheReason::FewerThanTwoOutputs,
+            );
+        }
 
-        MssqlOutputCachePlan::no_cache(selected_outputs, reason)
+        let mut shared_candidates = Vec::new();
+        let mut skipped_candidates = Vec::new();
+        for derived in &self.derived_tables {
+            if derived.sql_text().trim().is_empty() {
+                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
+                    derived,
+                    MssqlCacheCandidateSkipReason::MissingSqlText,
+                ));
+                continue;
+            }
+            if !derived.lineage().is_complete() {
+                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
+                    derived,
+                    MssqlCacheCandidateSkipReason::IncompleteLineage,
+                ));
+                continue;
+            }
+
+            let output_indexes = requests
+                .iter()
+                .enumerate()
+                .filter_map(|(index, request)| {
+                    self.cache_output_uses_registered_derived(request.table(), derived)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if output_indexes.len() >= 2 {
+                shared_candidates.push(MssqlDerivedCacheAliasPlan::from_registered(
+                    derived,
+                    output_indexes,
+                ));
+            } else {
+                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
+                    derived,
+                    MssqlCacheCandidateSkipReason::NotShared {
+                        output_count: output_indexes.len(),
+                    },
+                ));
+            }
+        }
+
+        if shared_candidates.len() == 1 {
+            return MssqlOutputCachePlan::new(
+                selected_outputs,
+                MssqlOutputCacheDecision::CacheAlias(shared_candidates.remove(0)),
+                skipped_candidates,
+            );
+        }
+        if shared_candidates.len() > 1 {
+            skipped_candidates.extend(shared_candidates.into_iter().filter_map(|candidate| {
+                self.registered_derived_table_by_id(candidate.table_id())
+                    .map(|derived| {
+                        MssqlCacheCandidateSkip::from_registered(
+                            derived,
+                            MssqlCacheCandidateSkipReason::AmbiguousDepth,
+                        )
+                    })
+            }));
+            return MssqlOutputCachePlan::new(
+                selected_outputs,
+                MssqlOutputCacheDecision::NoCache {
+                    reason: MssqlNoCacheReason::AmbiguousSharedDerivedAlias,
+                },
+                skipped_candidates,
+            );
+        }
+
+        MssqlOutputCachePlan::new(
+            selected_outputs,
+            MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::NoSharedRegisteredDerivedAlias,
+            },
+            skipped_candidates,
+        )
     }
 
     /// Returns registered Delta source reports in registration order.
@@ -1190,6 +1337,31 @@ impl DeltaFunnelSession {
         self.derived_tables
             .iter()
             .find(|table| table.table().id() == table_id)
+    }
+
+    fn cache_output_uses_registered_derived(
+        &self,
+        table: &LazyTable,
+        candidate: &RegisteredDerivedTable,
+    ) -> bool {
+        if table.id() == candidate.table().id() {
+            return true;
+        }
+        if table.kind() == LazyTableKind::DeltaSource {
+            return false;
+        }
+
+        self.transitive_registered_derived_dependencies(table)
+            .map(|dependencies| {
+                dependencies.iter().any(|dependency| {
+                    matches!(
+                        dependency,
+                        DerivedTableDependency::RegisteredDerived { table_id, .. }
+                            if *table_id == candidate.table().id()
+                    )
+                })
+            })
+            .unwrap_or(false)
     }
 
     async fn plan_read_only_sql(&self, sql: &str) -> Result<DataFrame, DeltaFunnelError> {
@@ -2283,6 +2455,115 @@ mod tests {
         assert!(!debug.contains("secret-token"));
         assert!(!debug.contains("password"));
         assert!(!debug.contains("server=tcp"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_plan_selects_shared_registered_derived_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select id from big where customer_name = 'alice'")
+            .await?;
+        let east = session
+            .table_from_sql("select id from big where customer_name = 'bob'")
+            .await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+
+        let plan = session.plan_mssql_output_cache(&[west, east]);
+
+        assert!(plan.skipped_candidates().is_empty());
+        let MssqlOutputCacheDecision::CacheAlias(cache) = plan.decision() else {
+            return Err("expected cache alias decision".into());
+        };
+        assert_eq!(cache.table_id(), big.id());
+        assert_eq!(cache.alias(), "big");
+        assert_eq!(cache.output_indexes(), &[0, 1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_plan_counts_direct_selected_alias_use() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select id from big where customer_name = 'alice'")
+            .await?;
+        let big_output = output_request(
+            big.clone(),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let west_output =
+            output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+
+        let plan = session.plan_mssql_output_cache(&[big_output, west_output]);
+
+        let MssqlOutputCacheDecision::CacheAlias(cache) = plan.decision() else {
+            return Err("expected cache alias decision".into());
+        };
+        assert_eq!(cache.table_id(), big.id());
+        assert_eq!(cache.alias(), "big");
+        assert_eq!(cache.output_indexes(), &[0, 1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_plan_skips_unshared_registered_derived_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let unrelated = session
+            .table_from_sql("select customer_name from orders")
+            .await?;
+        let big_output = output_request(
+            big.clone(),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let unrelated_output = output_request(
+            unrelated,
+            "unrelated_output",
+            "unrelated_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let plan = session.plan_mssql_output_cache(&[big_output, unrelated_output]);
+
+        assert_eq!(
+            plan.decision(),
+            &MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::NoSharedRegisteredDerivedAlias,
+            }
+        );
+        assert_eq!(plan.skipped_candidates().len(), 1);
+        let skipped = &plan.skipped_candidates()[0];
+        assert_eq!(skipped.table_id(), big.id());
+        assert_eq!(skipped.alias(), "big");
+        assert_eq!(
+            skipped.reason(),
+            &MssqlCacheCandidateSkipReason::NotShared { output_count: 1 }
+        );
         Ok(())
     }
 
