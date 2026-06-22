@@ -24,8 +24,8 @@ use crate::{
     datafusion_session_context, default_mssql_write_options, load_delta_source,
     plan_mssql_target_for_resolved_output, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
-    table_formats::validate_table_source_names, write_mssql_outputs_to_mssql,
-    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
+    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
+    write_output_batches_to_mssql,
 };
 
 /// Query-load action mode requested by a caller.
@@ -1429,6 +1429,29 @@ impl DeltaFunnelSession {
             .collect()
     }
 
+    fn build_write_all_cached_jobs(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        active_aliases: &[MssqlDerivedCacheAliasPlan],
+    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
+        planned_outputs
+            .iter()
+            .map(|planned| {
+                let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
+                let batches =
+                    self.cached_output_batch_stream_factory(planned.request(), active_aliases)?;
+
+                Ok(MssqlOutputWriteJob::new(
+                    output_schema,
+                    planned.resolved_target().clone(),
+                    planned.output_plan().schema_plan_options(),
+                    batches,
+                    self.options.mssql_write_options(),
+                ))
+            })
+            .collect()
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn write_all_baseline_with_writer<W>(
         &self,
@@ -1441,6 +1464,41 @@ impl DeltaFunnelSession {
         let jobs = self.build_write_all_baseline_jobs(planned_outputs)?;
 
         write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
+    }
+
+    /// Runs the auto-cache path with an injected workflow writer.
+    ///
+    /// Tests use this to inject a fake writer while the public path supplies a
+    /// writer that calls the existing one-output SQL Server sink.
+    async fn write_all_cached_with_writer<W>(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        cache_aliases: &[MssqlDerivedCacheAliasPlan],
+        writer: W,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        let replacements = self.replace_mssql_cache_aliases(cache_aliases).await?;
+        let jobs = match self.build_write_all_cached_jobs(planned_outputs, cache_aliases) {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                return Err(restore_mssql_cache_aliases_after_error(error, replacements).await);
+            }
+        };
+        let write_result =
+            write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer)
+                .await;
+        let restore_result = restore_mssql_cache_aliases(replacements).await;
+
+        match (write_result, restore_result) {
+            (Ok(report), Ok(_restorations)) => Ok(report),
+            (Ok(_report), Err(restore_error)) => Err(restore_error),
+            (Err(write_error), Ok(_restorations)) => Err(write_error),
+            (Err(write_error), Err(restore_error)) => {
+                Err(cache_error_with_restore_error(write_error, restore_error))
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1484,9 +1542,8 @@ impl DeltaFunnelSession {
         &self,
         planned_outputs: &[PlannedMssqlOutput],
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
-        let jobs = self.build_write_all_baseline_jobs(planned_outputs)?;
-
-        write_mssql_outputs_to_mssql(jobs, self.options.mssql_workflow_options()).await
+        self.write_all_baseline_with_writer(planned_outputs, MssqlWorkflowPublicOutputWriter)
+            .await
     }
 
     #[allow(dead_code)]
@@ -1515,16 +1572,29 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        // This slice connects Auto mode to cache planning and preserves the
-        // baseline fallback. The cache-alias execution branch is connected in
-        // the next review slice.
         match cache_plan.decision() {
-            MssqlOutputCacheDecision::NoCache { .. }
-            | MssqlOutputCacheDecision::CacheAliases(_) => {
+            MssqlOutputCacheDecision::NoCache { .. } => {
                 self.write_all_baseline_with_writer(planned_outputs, writer)
                     .await
             }
+            MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
+                self.write_all_cached_with_writer(planned_outputs, cache_aliases, writer)
+                    .await
+            }
         }
+    }
+
+    async fn write_all_cached(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        cache_aliases: &[MssqlDerivedCacheAliasPlan],
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+        self.write_all_cached_with_writer(
+            planned_outputs,
+            cache_aliases,
+            MssqlWorkflowPublicOutputWriter,
+        )
+        .await
     }
 
     async fn write_all_auto(
@@ -1542,12 +1612,12 @@ impl DeltaFunnelSession {
         planned_outputs: &[PlannedMssqlOutput],
         cache_plan: &MssqlOutputCachePlan,
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
-        // Keep the public path behavior aligned with the test-writer path
-        // while cache-alias execution is connected incrementally.
         match cache_plan.decision() {
-            MssqlOutputCacheDecision::NoCache { .. }
-            | MssqlOutputCacheDecision::CacheAliases(_) => {
+            MssqlOutputCacheDecision::NoCache { .. } => {
                 self.write_all_baseline(planned_outputs).await
+            }
+            MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
+                self.write_all_cached(planned_outputs, cache_aliases).await
             }
         }
     }
@@ -1808,6 +1878,33 @@ impl DeltaFunnelSession {
             alias_name,
             original_provider: Some(original_provider),
         })
+    }
+
+    async fn replace_mssql_cache_aliases(
+        &self,
+        cache_aliases: &[MssqlDerivedCacheAliasPlan],
+    ) -> Result<Vec<MssqlScopedCacheAliasReplacement<'_>>, DeltaFunnelError> {
+        let mut replacements = Vec::new();
+
+        for cache_alias in cache_aliases {
+            let table = self
+                .registered_derived_table_by_id(cache_alias.table_id())
+                .ok_or_else(|| unknown_cached_alias_error(cache_alias))?
+                .table()
+                .clone();
+
+            match self
+                .replace_registered_derived_alias_with_cache(&table)
+                .await
+            {
+                Ok(replacement) => replacements.push(replacement),
+                Err(error) => {
+                    return Err(restore_mssql_cache_aliases_after_error(error, replacements).await);
+                }
+            }
+        }
+
+        Ok(replacements)
     }
 
     /// Swaps a catalog alias from its original provider to a cached provider.
@@ -2482,6 +2579,29 @@ impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
     }
 }
 
+struct MssqlWorkflowPublicOutputWriter;
+
+#[async_trait]
+impl MssqlWorkflowOutputWriter for MssqlWorkflowPublicOutputWriter {
+    async fn write_output(
+        &mut self,
+        output_schema: SchemaRef,
+        resolved_target: ResolvedMssqlTarget,
+        schema_options: MssqlSchemaPlanOptions,
+        batches: MssqlOutputBatchStream,
+        write_options: MssqlWriteOptions,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        write_output_batches_to_mssql(
+            output_schema.as_ref(),
+            resolved_target,
+            schema_options,
+            batches,
+            write_options,
+        )
+        .await
+    }
+}
+
 impl fmt::Debug for DeltaFunnelSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -2736,6 +2856,52 @@ fn ensure_unique_write_all_output_names(
     }
 
     Ok(())
+}
+
+async fn restore_mssql_cache_aliases(
+    replacements: Vec<MssqlScopedCacheAliasReplacement<'_>>,
+) -> Result<Vec<MssqlScopedCacheAliasRestoration>, DeltaFunnelError> {
+    let mut restorations = Vec::new();
+    let mut first_error = None;
+
+    for replacement in replacements.into_iter().rev() {
+        match replacement.restore().await {
+            Ok(restoration) => restorations.push(restoration),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(restorations),
+    }
+}
+
+async fn restore_mssql_cache_aliases_after_error(
+    error: DeltaFunnelError,
+    replacements: Vec<MssqlScopedCacheAliasReplacement<'_>>,
+) -> DeltaFunnelError {
+    match restore_mssql_cache_aliases(replacements).await {
+        Ok(_restorations) => error,
+        Err(restore_error) => cache_error_with_restore_error(error, restore_error),
+    }
+}
+
+fn cache_error_with_restore_error(
+    error: DeltaFunnelError,
+    restore_error: DeltaFunnelError,
+) -> DeltaFunnelError {
+    DeltaFunnelError::MssqlWorkflowPlanning {
+        message: format!(
+            "write_all auto cache failed: {}; also failed to restore cache aliases: {}",
+            sanitize_text_for_display(&error.to_string()),
+            sanitize_text_for_display(&restore_error.to_string())
+        ),
+    }
 }
 
 fn sorted_reference_strings(references: impl Iterator<Item = TableReference>) -> Vec<String> {
@@ -5725,6 +5891,57 @@ mod tests {
         assert_eq!(calls[1].rows, 1);
         assert_eq!(source_scans.load(Ordering::SeqCst), 2);
         assert!(report.all_succeeded());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_auto_caches_shared_alias_for_direct_and_dependent_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let big_output = execute_output_request(
+            big.clone(),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let west_output =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_writer(&[big_output, west_output], writer)
+            .await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].output_name, "big_output");
+        assert_eq!(calls[0].rows, 2);
+        assert_eq!(calls[1].output_name, "west_output");
+        assert_eq!(calls[1].rows, 1);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+        assert!(report.all_succeeded());
+        drop(calls);
+
+        let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+        let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
+        assert_eq!(restored_big_rows, 2);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
         Ok(())
     }
 
