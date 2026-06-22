@@ -17,13 +17,15 @@ use futures_util::StreamExt;
 use crate::{
     BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaProviderScanExecutionOptions,
     DeltaSourceConfig, DeltaTableProviderConfig, MssqlConnectionConfig, MssqlOutputBatchStream,
-    MssqlOutputBatchStreamFactory, MssqlSchemaPlanOptions, MssqlTargetConfig,
-    MssqlTargetOutputPlan, MssqlWorkflowWriteOptions, MssqlWriteOptions, MssqlWriteReport,
-    QueryOptions, RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase,
-    datafusion_query_output_stream, datafusion_session_context, default_mssql_write_options,
-    load_delta_source, plan_mssql_target_for_resolved_output, preflight_delta_protocol,
+    MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlSchemaPlanOptions, MssqlTargetConfig,
+    MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWorkflowWriteOptions,
+    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, QueryOptions,
+    RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase, datafusion_query_output_stream,
+    datafusion_session_context, default_mssql_write_options, load_delta_source,
+    plan_mssql_target_for_resolved_output, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
-    table_formats::validate_table_source_names, write_output_batches_to_mssql,
+    table_formats::validate_table_source_names, write_mssql_outputs_to_mssql,
+    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
 };
 
 /// Query-load action mode requested by a caller.
@@ -1351,6 +1353,83 @@ impl DeltaFunnelSession {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn plan_write_all_outputs(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<Vec<PlannedMssqlOutput>, DeltaFunnelError> {
+        ensure_unique_write_all_output_names(requests)?;
+
+        requests
+            .iter()
+            .map(|request| {
+                ensure_write_all_execute_run_mode(request.target().run_mode())?;
+                self.plan_mssql_output(request)
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn build_write_all_jobs(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
+        planned_outputs
+            .iter()
+            .map(|planned| {
+                let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
+                let batches = self.lazy_table_batch_stream_factory(planned.table().clone());
+
+                Ok(MssqlOutputWriteJob::new(
+                    output_schema,
+                    planned.resolved_target().clone(),
+                    planned.output_plan().schema_plan_options(),
+                    batches,
+                    self.options.mssql_write_options(),
+                ))
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn write_all_with_writer<W>(
+        &self,
+        requests: &[OutputWritePlan],
+        writer: W,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        let planned_outputs = self.plan_write_all_outputs(requests)?;
+        let jobs = self.build_write_all_jobs(&planned_outputs)?;
+
+        write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
+    }
+
+    /// Writes multiple selected lazy tables to SQL Server sequentially.
+    ///
+    /// The baseline workflow validates and plans every selected output before
+    /// side effects, builds lazy async stream factories for attempted outputs,
+    /// and delegates sequential stop-on-first-failure behavior to the existing
+    /// SQL Server workflow layer. This method intentionally does not perform
+    /// automatic cache planning or cache materialization; that belongs to the
+    /// later cache integration slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first pre-execution validation/planning error, or a workflow
+    /// execution error from the lower-level SQL Server workflow.
+    #[allow(dead_code)]
+    pub async fn write_all(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+        let planned_outputs = self.plan_write_all_outputs(requests)?;
+        let jobs = self.build_write_all_jobs(&planned_outputs)?;
+
+        write_mssql_outputs_to_mssql(jobs, self.options.mssql_workflow_options()).await
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn plan_mssql_output_cache(
         &self,
         requests: &[OutputWritePlan],
@@ -2460,6 +2539,36 @@ fn ensure_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
     }
 }
 
+fn ensure_write_all_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
+    match run_mode {
+        RunMode::Execute => Ok(()),
+        RunMode::DryRun => Err(DeltaFunnelError::MssqlWorkflowPlanning {
+            message:
+                "write_all requires RunMode::Execute; use plan_mssql_output for dry-run planning"
+                    .to_owned(),
+        }),
+    }
+}
+
+fn ensure_unique_write_all_output_names(
+    requests: &[OutputWritePlan],
+) -> Result<(), DeltaFunnelError> {
+    let mut output_names = BTreeSet::new();
+    for request in requests {
+        let output_name = request.target().output_name();
+        if !output_names.insert(output_name) {
+            return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                message: format!(
+                    "write_all output names must be unique; duplicate output name `{}`",
+                    sanitize_text_for_display(output_name)
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn sorted_reference_strings(references: impl Iterator<Item = TableReference>) -> Vec<String> {
     // Stable ordering and de-duplication make lineage deterministic for tests,
     // debug output, and later cache candidate comparisons.
@@ -2485,7 +2594,10 @@ mod tests {
         any::Any,
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -2505,7 +2617,7 @@ mod tests {
         catalog::Session,
         common::tree_node::{TreeNode, TreeNodeRecursion},
         datasource::MemTable,
-        error::Result as DataFusionResult,
+        error::{DataFusionError, Result as DataFusionResult},
         logical_expr::{Expr, LogicalPlan, TableType},
         physical_plan::ExecutionPlan,
         sql::{parser::DFParser, resolve::resolve_table_references},
@@ -2667,6 +2779,25 @@ mod tests {
         calls: Vec<FakeOrchestratorWriteCall>,
     }
 
+    #[derive(Clone, Default)]
+    struct FakeWorkflowWriter {
+        calls: Arc<Mutex<Vec<FakeOrchestratorWriteCall>>>,
+        fail_output_name: Option<String>,
+    }
+
+    impl FakeWorkflowWriter {
+        fn failing_on(output_name: &str) -> Self {
+            Self {
+                fail_output_name: Some(output_name.to_owned()),
+                ..Self::default()
+            }
+        }
+
+        fn calls(&self) -> Arc<Mutex<Vec<FakeOrchestratorWriteCall>>> {
+            Arc::clone(&self.calls)
+        }
+    }
+
     #[async_trait]
     impl OrchestratorMssqlOutputWriter for FakeOrchestratorWriter {
         async fn write_output(
@@ -2698,6 +2829,72 @@ mod tests {
                 batches: batch_count,
                 schema_fields: output_schema.fields().len(),
             });
+
+            Ok(MssqlWriteReport::from_output_plan(
+                &output_plan,
+                rows,
+                batch_count,
+                0,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl MssqlWorkflowOutputWriter for FakeWorkflowWriter {
+        async fn write_output(
+            &mut self,
+            output_schema: SchemaRef,
+            resolved_target: ResolvedMssqlTarget,
+            schema_options: MssqlSchemaPlanOptions,
+            mut batches: MssqlOutputBatchStream,
+            _write_options: MssqlWriteOptions,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+            let mut rows = 0_u64;
+            let mut batch_count = 0_u64;
+
+            while let Some(batch) = batches.next().await {
+                let batch = batch?;
+                rows = rows.saturating_add(u64::try_from(batch.num_rows()).map_err(|_| {
+                    DeltaFunnelError::Config {
+                        message: "fake workflow writer row count overflowed u64".to_owned(),
+                    }
+                })?);
+                batch_count = batch_count.saturating_add(1);
+            }
+
+            let output_plan = plan_mssql_target_for_resolved_output(
+                output_schema.as_ref(),
+                &resolved_target,
+                schema_options,
+            )?;
+            self.calls
+                .lock()
+                .map_err(|_| DeltaFunnelError::Config {
+                    message: "fake workflow writer call lock poisoned".to_owned(),
+                })?
+                .push(FakeOrchestratorWriteCall {
+                    output_name: resolved_target.output_name().to_owned(),
+                    target_table: resolved_target.table().clone(),
+                    connection_source: resolved_target.connection_source(),
+                    rows,
+                    batches: batch_count,
+                    schema_fields: output_schema.fields().len(),
+                });
+
+            if self
+                .fail_output_name
+                .as_deref()
+                .is_some_and(|output_name| output_name == resolved_target.output_name())
+            {
+                return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: format!(
+                        "fake workflow writer failed for `{}`",
+                        resolved_target.output_name()
+                    ),
+                });
+            }
 
             Ok(MssqlWriteReport::from_output_plan(
                 &output_plan,
@@ -2780,6 +2977,12 @@ mod tests {
         scans: Arc<AtomicUsize>,
     }
 
+    #[derive(Debug)]
+    struct FailingScanProvider {
+        schema: SchemaRef,
+        scans: Arc<AtomicUsize>,
+    }
+
     type CountedProvider = (Arc<dyn TableProvider>, Arc<AtomicUsize>);
 
     #[async_trait]
@@ -2808,6 +3011,34 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl TableProvider for FailingScanProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            Err(DataFusionError::Execution(
+                "forced scan planning failure".to_owned(),
+            ))
+        }
+    }
+
     fn scan_counting_marker_region_provider(
         marker: &str,
     ) -> Result<CountedProvider, Box<dyn std::error::Error>> {
@@ -2829,6 +3060,20 @@ mod tests {
         };
 
         Ok((Arc::new(provider), scans))
+    }
+
+    fn failing_scan_marker_region_provider() -> CountedProvider {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("marker", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let scans = Arc::new(AtomicUsize::new(0));
+        let provider = FailingScanProvider {
+            schema,
+            scans: Arc::clone(&scans),
+        };
+
+        (Arc::new(provider), scans)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5066,6 +5311,422 @@ mod tests {
                     && message.contains("plan_mssql_output")
         ));
         assert!(writer.calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_write_all_outputs_plans_valid_outputs_in_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west = session.table_from_sql("select 1 as id").await?;
+        let east = session.table_from_sql("select 2 as id").await?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::CreateAndLoad)?;
+
+        let planned = session.plan_write_all_outputs(&[west, east])?;
+
+        assert_eq!(planned.len(), 2);
+        assert_eq!(planned[0].output_plan().output_name(), "west_output");
+        assert_eq!(
+            planned[0].output_plan().target_table().table(),
+            "west_orders"
+        );
+        assert_eq!(planned[1].output_plan().output_name(), "east_output");
+        assert_eq!(
+            planned[1].output_plan().target_table().table(),
+            "east_orders"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_write_all_outputs_rejects_duplicate_output_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west = session.table_from_sql("select 1 as id").await?;
+        let east = session.table_from_sql("select 2 as id").await?;
+        let west = execute_output_request(
+            west,
+            "orders_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let east = execute_output_request(
+            east,
+            "orders_output",
+            "east_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.plan_write_all_outputs(&[west, east]);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("write_all output names must be unique")
+                    && message.contains("orders_output")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_write_all_outputs_rejects_missing_connection_before_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let west = session.table_from_sql("select 1 as id").await?;
+        let east = session.table_from_sql("select 2 as id").await?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+
+        let error = session.plan_write_all_outputs(&[west, east]);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MissingMssqlConnection { output_name })
+                if output_name == "west_output"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_write_all_outputs_rejects_replace_before_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west = session.table_from_sql("select 1 as id").await?;
+        let east = session.table_from_sql("select 2 as id").await?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east = execute_output_request(east, "east_output", "east_orders", LoadMode::Replace)?;
+
+        let error = session.plan_write_all_outputs(&[west, east]);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlLifecyclePlanning { output_name, message })
+                if output_name == "east_output"
+                    && message.contains("replace load mode is reserved")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_write_all_outputs_rejects_dry_run_before_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west = session.table_from_sql("select 1 as id").await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+
+        let error = session.plan_write_all_outputs(&[west]);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("write_all requires RunMode::Execute")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_write_all_jobs_preserves_output_metadata_without_stream_setup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("orders_source", source_provider)?;
+        let west = session
+            .table_from_sql("select marker from orders_source where region = 'west'")
+            .await?;
+        let east = session
+            .table_from_sql("select marker from orders_source where region = 'east'")
+            .await?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::CreateAndLoad)?;
+        let planned = session.plan_write_all_outputs(&[west, east])?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+
+        let jobs = session.build_write_all_jobs(&planned)?;
+
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].output_name(), "west_output");
+        assert_eq!(jobs[0].target_summary().table().table(), "west_orders");
+        assert_eq!(jobs[1].output_name(), "east_output");
+        assert_eq!(jobs[1].target_summary().table().table(), "east_orders");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_with_writer_executes_valid_outputs_in_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let east = session.table_from_sql("select 3 as id").await?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::CreateAndLoad)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session.write_all_with_writer(&[west, east], writer).await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].output_name, "west_output");
+        assert_eq!(calls[0].target_table.table(), "west_orders");
+        assert_eq!(calls[0].rows, 2);
+        assert_eq!(calls[1].output_name, "east_output");
+        assert_eq!(calls[1].target_table.table(), "east_orders");
+        assert_eq!(calls[1].rows, 1);
+        assert_eq!(report.len(), 2);
+        assert!(report.all_succeeded());
+        assert_eq!(report.outputs()[0].output_name(), "west_output");
+        assert_eq!(report.outputs()[1].output_name(), "east_output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_with_writer_skips_later_outputs_after_writer_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (first_provider, first_scans) = scan_counting_marker_region_provider("first")?;
+        let (second_provider, second_scans) = scan_counting_marker_region_provider("second")?;
+        let (third_provider, third_scans) = scan_counting_marker_region_provider("third")?;
+        session
+            .context()
+            .register_table("first_source", first_provider)?;
+        session
+            .context()
+            .register_table("second_source", second_provider)?;
+        session
+            .context()
+            .register_table("third_source", third_provider)?;
+        let first = session
+            .table_from_sql("select marker from first_source where region = 'west'")
+            .await?;
+        let second = session
+            .table_from_sql("select marker from second_source where region = 'west'")
+            .await?;
+        let third = session
+            .table_from_sql("select marker from third_source where region = 'west'")
+            .await?;
+        let first = execute_output_request(
+            first,
+            "first_output",
+            "first_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let second = execute_output_request(
+            second,
+            "second_output",
+            "second_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let third = execute_output_request(
+            third,
+            "third_output",
+            "third_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::failing_on("second_output");
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_writer(&[first, second, third], writer)
+            .await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].output_name, "first_output");
+        assert_eq!(calls[1].output_name, "second_output");
+        assert_eq!(first_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(second_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(third_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(report.succeeded_count(), 1);
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(report.skipped_count(), 1);
+        assert!(report.outputs()[0].is_succeeded());
+        assert_eq!(report.outputs()[0].output_name(), "first_output");
+        assert!(report.outputs()[1].is_failed());
+        assert_eq!(report.outputs()[1].output_name(), "second_output");
+        assert!(report.outputs()[2].is_skipped());
+        assert_eq!(report.outputs()[2].output_name(), "third_output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_with_writer_reports_stream_setup_failure_before_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (first_provider, first_scans) = scan_counting_marker_region_provider("first")?;
+        let (failing_provider, failing_scans) = failing_scan_marker_region_provider();
+        let (third_provider, third_scans) = scan_counting_marker_region_provider("third")?;
+        session
+            .context()
+            .register_table("first_source", first_provider)?;
+        session
+            .context()
+            .register_table("failing_source", failing_provider)?;
+        session
+            .context()
+            .register_table("third_source", third_provider)?;
+        let first = session
+            .table_from_sql("select marker from first_source where region = 'west'")
+            .await?;
+        let failing = session
+            .table_from_sql("select marker from failing_source where region = 'west'")
+            .await?;
+        let third = session
+            .table_from_sql("select marker from third_source where region = 'west'")
+            .await?;
+        let first = execute_output_request(
+            first,
+            "first_output",
+            "first_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let failing = execute_output_request(
+            failing,
+            "failing_output",
+            "failing_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let third = execute_output_request(
+            third,
+            "third_output",
+            "third_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_writer(&[first, failing, third], writer)
+            .await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].output_name, "first_output");
+        assert_eq!(first_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(failing_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(third_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(report.succeeded_count(), 1);
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(report.skipped_count(), 1);
+        assert!(report.outputs()[0].is_succeeded());
+        assert_eq!(report.outputs()[0].output_name(), "first_output");
+        assert!(report.outputs()[1].is_failed());
+        assert_eq!(report.outputs()[1].output_name(), "failing_output");
+        assert!(report.outputs()[2].is_skipped());
+        assert_eq!(report.outputs()[2].output_name(), "third_output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_rejects_duplicate_output_names_before_stream_setup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("orders_source", source_provider)?;
+        let west = session
+            .table_from_sql("select marker from orders_source where region = 'west'")
+            .await?;
+        let east = session
+            .table_from_sql("select marker from orders_source where region = 'east'")
+            .await?;
+        let west = execute_output_request(
+            west,
+            "orders_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let east = execute_output_request(
+            east,
+            "orders_output",
+            "east_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.write_all(&[west, east]).await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("write_all output names must be unique")
+                    && message.contains("orders_output")
+        ));
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_validation_errors_redact_connection_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west = session.table_from_sql("select 1 as id").await?;
+        let east = session.table_from_sql("select 2 as id").await?;
+        let west = execute_output_request(
+            west,
+            "orders_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let east = execute_output_request(
+            east,
+            "orders_output",
+            "east_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session
+            .write_all(&[west, east])
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("{error:?} {error}"));
+
+        assert!(
+            matches!(error, Err(display) if display.contains("orders_output")
+                && !display.contains("secret-token")
+                && !display.contains("password")
+                && !display.contains("server=tcp"))
+        );
         Ok(())
     }
 
