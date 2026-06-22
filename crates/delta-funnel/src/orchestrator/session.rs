@@ -1456,7 +1456,11 @@ impl DeltaFunnelSession {
         let planned_outputs = self.plan_write_all_outputs(requests)?;
 
         match options.cache_mode() {
-            WriteAllCacheMode::Auto | WriteAllCacheMode::Disabled => {
+            WriteAllCacheMode::Auto => {
+                self.write_all_auto_with_writer(requests, &planned_outputs, writer)
+                    .await
+            }
+            WriteAllCacheMode::Disabled => {
                 self.write_all_baseline_with_writer(&planned_outputs, writer)
                     .await
             }
@@ -1483,6 +1487,69 @@ impl DeltaFunnelSession {
         let jobs = self.build_write_all_baseline_jobs(planned_outputs)?;
 
         write_mssql_outputs_to_mssql(jobs, self.options.mssql_workflow_options()).await
+    }
+
+    #[allow(dead_code)]
+    async fn write_all_auto_with_writer<W>(
+        &self,
+        requests: &[OutputWritePlan],
+        planned_outputs: &[PlannedMssqlOutput],
+        writer: W,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        let cache_plan = self.plan_mssql_output_cache(requests);
+
+        self.write_all_auto_plan_with_writer(planned_outputs, &cache_plan, writer)
+            .await
+    }
+
+    #[allow(dead_code)]
+    async fn write_all_auto_plan_with_writer<W>(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        cache_plan: &MssqlOutputCachePlan,
+        writer: W,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        // This slice connects Auto mode to cache planning and preserves the
+        // baseline fallback. The cache-alias execution branch is connected in
+        // the next review slice.
+        match cache_plan.decision() {
+            MssqlOutputCacheDecision::NoCache { .. }
+            | MssqlOutputCacheDecision::CacheAliases(_) => {
+                self.write_all_baseline_with_writer(planned_outputs, writer)
+                    .await
+            }
+        }
+    }
+
+    async fn write_all_auto(
+        &self,
+        requests: &[OutputWritePlan],
+        planned_outputs: &[PlannedMssqlOutput],
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+        let cache_plan = self.plan_mssql_output_cache(requests);
+
+        self.write_all_auto_plan(planned_outputs, &cache_plan).await
+    }
+
+    async fn write_all_auto_plan(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        cache_plan: &MssqlOutputCachePlan,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+        // Keep the public path behavior aligned with the test-writer path
+        // while cache-alias execution is connected incrementally.
+        match cache_plan.decision() {
+            MssqlOutputCacheDecision::NoCache { .. }
+            | MssqlOutputCacheDecision::CacheAliases(_) => {
+                self.write_all_baseline(planned_outputs).await
+            }
+        }
     }
 
     /// Writes multiple selected lazy tables to SQL Server sequentially.
@@ -1526,9 +1593,8 @@ impl DeltaFunnelSession {
         let planned_outputs = self.plan_write_all_outputs(requests)?;
 
         match options.cache_mode() {
-            WriteAllCacheMode::Auto | WriteAllCacheMode::Disabled => {
-                self.write_all_baseline(&planned_outputs).await
-            }
+            WriteAllCacheMode::Auto => self.write_all_auto(requests, &planned_outputs).await,
+            WriteAllCacheMode::Disabled => self.write_all_baseline(&planned_outputs).await,
         }
     }
 
@@ -5621,6 +5687,44 @@ mod tests {
         assert!(report.all_succeeded());
         assert_eq!(report.outputs()[0].output_name(), "west_output");
         assert_eq!(report.outputs()[1].output_name(), "east_output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_auto_no_candidate_uses_baseline_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("orders_source", source_provider)?;
+        let west = session
+            .table_from_sql("select marker from orders_source where region = 'west'")
+            .await?;
+        let east = session
+            .table_from_sql("select marker from orders_source where region = 'east'")
+            .await?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session.write_all_with_writer(&[west, east], writer).await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].output_name, "west_output");
+        assert_eq!(calls[0].rows, 1);
+        assert_eq!(calls[1].output_name, "east_output");
+        assert_eq!(calls[1].rows, 1);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        assert!(report.all_succeeded());
         Ok(())
     }
 
