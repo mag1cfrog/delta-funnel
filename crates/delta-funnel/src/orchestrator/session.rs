@@ -1741,8 +1741,24 @@ impl DeltaFunnelSession {
             }
             MssqlCachedOutputStreamRoute::ReplannedCachedDependency(_) => {
                 let output_name = request.target().output_name().to_owned();
-                let sql_text = self.sql_text_for_derived_table(request.table())?.to_owned();
-                let expected_schema = Arc::clone(self.schema_for_lazy_table(request.table())?);
+                let sql_text = match self.sql_text_for_derived_table(request.table()) {
+                    Ok(sql_text) => sql_text.to_owned(),
+                    Err(error) => {
+                        return Ok(failing_cached_output_batch_stream_factory(
+                            output_name,
+                            error,
+                        ));
+                    }
+                };
+                let expected_schema = match self.schema_for_lazy_table(request.table()) {
+                    Ok(schema) => Arc::clone(schema),
+                    Err(error) => {
+                        return Ok(failing_cached_output_batch_stream_factory(
+                            output_name,
+                            error,
+                        ));
+                    }
+                };
                 let context = self.context.clone();
                 Ok(Box::new(move || {
                     Box::pin(async move {
@@ -2284,6 +2300,15 @@ async fn batch_stream_for_lazy_table_from_session_parts(
     Ok(Box::pin(stream.map(|batch| {
         batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
     })))
+}
+
+fn failing_cached_output_batch_stream_factory(
+    output_name: String,
+    error: DeltaFunnelError,
+) -> MssqlOutputBatchStreamFactory {
+    Box::new(move || {
+        Box::pin(async move { Err(cached_output_stream_setup_error(&output_name, error)) })
+    })
 }
 
 async fn replanned_sql_batch_stream(
@@ -3469,6 +3494,59 @@ mod tests {
             Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
                 if message.contains("cached output stream setup failed for `west_output`")
                     && message.contains("replanned output schema does not match")
+        ));
+        let _restoration = replacement.restore().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_output_stream_factory_returns_async_error_for_unreplayable_sql()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, _source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let big_output = output_request(
+            big.clone(),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let west_output = output_request(
+            west.clone(),
+            "west_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let plan = session.plan_mssql_output_cache(&[big_output, west_output.clone()]);
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        let pending_west = session
+            .pending_derived_tables
+            .iter_mut()
+            .find(|pending| pending.table.id() == west.id())
+            .ok_or("expected pending west table")?;
+        pending_west.sql_text.clear();
+        let replacement = session
+            .replace_registered_derived_alias_with_cache(&big)
+            .await?;
+
+        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
+        let error = factory().await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("cached output stream setup failed for `west_output`")
         ));
         let _restoration = replacement.restore().await?;
         Ok(())
