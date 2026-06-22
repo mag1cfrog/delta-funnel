@@ -1369,7 +1369,7 @@ impl DeltaFunnelSession {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn build_write_all_jobs(
+    pub(crate) fn build_write_all_baseline_jobs(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
@@ -1391,6 +1391,20 @@ impl DeltaFunnelSession {
     }
 
     #[allow(dead_code)]
+    pub(crate) async fn write_all_baseline_with_writer<W>(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        writer: W,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        let jobs = self.build_write_all_baseline_jobs(planned_outputs)?;
+
+        write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
+    }
+
+    #[allow(dead_code)]
     pub(crate) async fn write_all_with_writer<W>(
         &self,
         requests: &[OutputWritePlan],
@@ -1400,9 +1414,18 @@ impl DeltaFunnelSession {
         W: MssqlWorkflowOutputWriter,
     {
         let planned_outputs = self.plan_write_all_outputs(requests)?;
-        let jobs = self.build_write_all_jobs(&planned_outputs)?;
 
-        write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
+        self.write_all_baseline_with_writer(&planned_outputs, writer)
+            .await
+    }
+
+    async fn write_all_baseline(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
+        let jobs = self.build_write_all_baseline_jobs(planned_outputs)?;
+
+        write_mssql_outputs_to_mssql(jobs, self.options.mssql_workflow_options()).await
     }
 
     /// Writes multiple selected lazy tables to SQL Server sequentially.
@@ -1424,9 +1447,8 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
         let planned_outputs = self.plan_write_all_outputs(requests)?;
-        let jobs = self.build_write_all_jobs(&planned_outputs)?;
 
-        write_mssql_outputs_to_mssql(jobs, self.options.mssql_workflow_options()).await
+        self.write_all_baseline(&planned_outputs).await
     }
 
     #[allow(dead_code)]
@@ -5439,7 +5461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_write_all_jobs_preserves_output_metadata_without_stream_setup()
+    async fn build_write_all_baseline_jobs_preserves_output_metadata_without_stream_setup()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -5461,7 +5483,7 @@ mod tests {
         let planned = session.plan_write_all_outputs(&[west, east])?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
 
-        let jobs = session.build_write_all_jobs(&planned)?;
+        let jobs = session.build_write_all_baseline_jobs(&planned)?;
 
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
         assert_eq!(jobs.len(), 2);
