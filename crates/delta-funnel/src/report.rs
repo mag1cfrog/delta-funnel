@@ -697,6 +697,159 @@ impl fmt::Display for ValidationStatus {
     }
 }
 
+/// Classification for a workflow phase status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseStatusKind {
+    /// The phase completed successfully.
+    Completed,
+    /// The phase failed.
+    Failed,
+    /// The phase was intentionally skipped.
+    Skipped,
+    /// The phase had not started.
+    NotStarted,
+    /// The phase status was unavailable.
+    Unavailable,
+}
+
+impl PhaseStatusKind {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::NotStarted => "not_started",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl fmt::Display for PhaseStatusKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Status for a workflow phase such as planning, loading, writing, or validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseStatus {
+    /// The phase completed successfully.
+    Completed,
+    /// The phase failed.
+    Failed,
+    /// The phase was intentionally skipped.
+    Skipped {
+        /// Stable reason code explaining why the phase was skipped.
+        reason: ReportReasonCode,
+    },
+    /// The phase had not started.
+    NotStarted {
+        /// Stable reason code explaining why the phase did not start.
+        reason: ReportReasonCode,
+    },
+    /// The phase status was unavailable.
+    Unavailable {
+        /// Stable reason code explaining why the phase status was unavailable.
+        reason: ReportReasonCode,
+    },
+}
+
+impl PhaseStatus {
+    /// Creates a completed phase status.
+    #[must_use]
+    pub const fn completed() -> Self {
+        Self::Completed
+    }
+
+    /// Creates a failed phase status.
+    #[must_use]
+    pub const fn failed() -> Self {
+        Self::Failed
+    }
+
+    /// Creates a skipped phase status with a stable reason code.
+    #[must_use]
+    pub const fn skipped(reason: ReportReasonCode) -> Self {
+        Self::Skipped { reason }
+    }
+
+    /// Creates a not-started phase status with a stable reason code.
+    #[must_use]
+    pub const fn not_started(reason: ReportReasonCode) -> Self {
+        Self::NotStarted { reason }
+    }
+
+    /// Creates an unavailable phase status with a stable reason code.
+    #[must_use]
+    pub const fn unavailable(reason: ReportReasonCode) -> Self {
+        Self::Unavailable { reason }
+    }
+
+    /// Returns the phase status classification.
+    #[must_use]
+    pub const fn kind(&self) -> PhaseStatusKind {
+        match self {
+            Self::Completed => PhaseStatusKind::Completed,
+            Self::Failed => PhaseStatusKind::Failed,
+            Self::Skipped { .. } => PhaseStatusKind::Skipped,
+            Self::NotStarted { .. } => PhaseStatusKind::NotStarted,
+            Self::Unavailable { .. } => PhaseStatusKind::Unavailable,
+        }
+    }
+
+    /// Returns the stable reason code when this status carries one.
+    #[must_use]
+    pub const fn reason(&self) -> Option<ReportReasonCode> {
+        match self {
+            Self::Skipped { reason }
+            | Self::NotStarted { reason }
+            | Self::Unavailable { reason } => Some(*reason),
+            Self::Completed | Self::Failed => None,
+        }
+    }
+
+    /// Returns whether the phase completed successfully.
+    #[must_use]
+    pub const fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed)
+    }
+
+    /// Returns whether the phase failed.
+    #[must_use]
+    pub const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    /// Returns whether the phase was skipped.
+    #[must_use]
+    pub const fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped { .. })
+    }
+
+    /// Returns whether the phase had not started.
+    #[must_use]
+    pub const fn is_not_started(&self) -> bool {
+        matches!(self, Self::NotStarted { .. })
+    }
+
+    /// Returns whether the phase status was unavailable.
+    #[must_use]
+    pub const fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
+}
+
+impl fmt::Display for PhaseStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason() {
+            Some(reason) => write!(formatter, "{}:{reason}", self.kind()),
+            None => formatter.write_str(self.kind().as_str()),
+        }
+    }
+}
+
 /// Validation and scan-summary options checked before workflow side effects.
 ///
 /// This type carries validation intent without starting validation I/O. Target
@@ -792,9 +945,9 @@ impl ValidationOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        DryRunScanSummaryMode, FileCount, FileCountKind, ReportReasonCode, RowCount, RowCountKind,
-        TargetValidationMode, ValidationOptions, ValidationStatus, ValidationStatusKind,
-        u128_to_u64_saturating,
+        DryRunScanSummaryMode, FileCount, FileCountKind, PhaseStatus, PhaseStatusKind,
+        ReportReasonCode, RowCount, RowCountKind, TargetValidationMode, ValidationOptions,
+        ValidationStatus, ValidationStatusKind, u128_to_u64_saturating,
     };
 
     #[test]
@@ -1135,6 +1288,74 @@ mod tests {
             ValidationStatus::required_but_failed(ReportReasonCode::MissingTargetAccess)
         );
         assert!(debug.contains("RequiredButFailed"));
+        assert!(!debug.contains("server="));
+        assert!(!debug.contains("password"));
+    }
+
+    #[test]
+    fn phase_status_kinds_expose_stable_codes() {
+        assert_eq!(PhaseStatusKind::Completed.as_str(), "completed");
+        assert_eq!(PhaseStatusKind::Failed.as_str(), "failed");
+        assert_eq!(PhaseStatusKind::Skipped.as_str(), "skipped");
+        assert_eq!(PhaseStatusKind::NotStarted.as_str(), "not_started");
+        assert_eq!(PhaseStatusKind::Unavailable.as_str(), "unavailable");
+        assert_eq!(PhaseStatusKind::NotStarted.to_string(), "not_started");
+    }
+
+    #[test]
+    fn phase_status_variants_expose_kind_reasons_and_helpers() {
+        let completed = PhaseStatus::completed();
+        let failed = PhaseStatus::failed();
+        let skipped = PhaseStatus::skipped(ReportReasonCode::DryRun);
+        let not_started = PhaseStatus::not_started(ReportReasonCode::PriorFailure);
+        let unavailable = PhaseStatus::unavailable(ReportReasonCode::CapabilityUnavailable);
+
+        assert_eq!(completed.kind(), PhaseStatusKind::Completed);
+        assert_eq!(completed.reason(), None);
+        assert!(completed.is_completed());
+
+        assert_eq!(failed.kind(), PhaseStatusKind::Failed);
+        assert_eq!(failed.reason(), None);
+        assert!(failed.is_failed());
+
+        assert_eq!(skipped.kind(), PhaseStatusKind::Skipped);
+        assert_eq!(skipped.reason(), Some(ReportReasonCode::DryRun));
+        assert!(skipped.is_skipped());
+
+        assert_eq!(not_started.kind(), PhaseStatusKind::NotStarted);
+        assert_eq!(not_started.reason(), Some(ReportReasonCode::PriorFailure));
+        assert!(not_started.is_not_started());
+
+        assert_eq!(unavailable.kind(), PhaseStatusKind::Unavailable);
+        assert_eq!(
+            unavailable.reason(),
+            Some(ReportReasonCode::CapabilityUnavailable)
+        );
+        assert!(unavailable.is_unavailable());
+    }
+
+    #[test]
+    fn phase_status_display_is_stable_and_safe() {
+        assert_eq!(PhaseStatus::completed().to_string(), "completed");
+        assert_eq!(PhaseStatus::failed().to_string(), "failed");
+        assert_eq!(
+            PhaseStatus::skipped(ReportReasonCode::DryRun).to_string(),
+            "skipped:dry_run"
+        );
+        assert_eq!(
+            PhaseStatus::not_started(ReportReasonCode::PriorFailure).to_string(),
+            "not_started:prior_failure"
+        );
+        assert_eq!(
+            PhaseStatus::unavailable(ReportReasonCode::CapabilityUnavailable).to_string(),
+            "unavailable:capability_unavailable"
+        );
+
+        let debug = format!(
+            "{:?}",
+            PhaseStatus::unavailable(ReportReasonCode::MissingTargetAccess)
+        );
+        assert!(debug.contains("Unavailable"));
         assert!(!debug.contains("server="));
         assert!(!debug.contains("password"));
     }
