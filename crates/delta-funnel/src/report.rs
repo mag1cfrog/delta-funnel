@@ -1038,6 +1038,154 @@ impl fmt::Display for OutputStatus {
     }
 }
 
+/// Classification for a workflow-level status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowStatusKind {
+    /// The workflow completed successfully.
+    Success,
+    /// The workflow completed with at least one successful output and at least one non-success.
+    PartialSuccess,
+    /// The workflow failed without a complete successful result.
+    Failure,
+    /// The workflow was intentionally skipped.
+    Skipped,
+    /// The workflow had no work to perform.
+    NoOp,
+}
+
+impl WorkflowStatusKind {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::PartialSuccess => "partial_success",
+            Self::Failure => "failure",
+            Self::Skipped => "skipped",
+            Self::NoOp => "no_op",
+        }
+    }
+}
+
+impl fmt::Display for WorkflowStatusKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Workflow-level status for a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowStatus {
+    /// The workflow completed successfully.
+    Success,
+    /// The workflow completed with at least one successful output and at least one non-success.
+    PartialSuccess,
+    /// The workflow failed without a complete successful result.
+    Failure,
+    /// The workflow was intentionally skipped.
+    Skipped {
+        /// Stable reason code explaining why the workflow was skipped.
+        reason: ReportReasonCode,
+    },
+    /// The workflow had no work to perform.
+    NoOp {
+        /// Stable reason code explaining why the workflow had no work.
+        reason: ReportReasonCode,
+    },
+}
+
+impl WorkflowStatus {
+    /// Creates a successful workflow status.
+    #[must_use]
+    pub const fn success() -> Self {
+        Self::Success
+    }
+
+    /// Creates a partial-success workflow status.
+    #[must_use]
+    pub const fn partial_success() -> Self {
+        Self::PartialSuccess
+    }
+
+    /// Creates a failed workflow status.
+    #[must_use]
+    pub const fn failure() -> Self {
+        Self::Failure
+    }
+
+    /// Creates a skipped workflow status with a stable reason code.
+    #[must_use]
+    pub const fn skipped(reason: ReportReasonCode) -> Self {
+        Self::Skipped { reason }
+    }
+
+    /// Creates a no-op workflow status with a stable reason code.
+    #[must_use]
+    pub const fn no_op(reason: ReportReasonCode) -> Self {
+        Self::NoOp { reason }
+    }
+
+    /// Returns the workflow status classification.
+    #[must_use]
+    pub const fn kind(&self) -> WorkflowStatusKind {
+        match self {
+            Self::Success => WorkflowStatusKind::Success,
+            Self::PartialSuccess => WorkflowStatusKind::PartialSuccess,
+            Self::Failure => WorkflowStatusKind::Failure,
+            Self::Skipped { .. } => WorkflowStatusKind::Skipped,
+            Self::NoOp { .. } => WorkflowStatusKind::NoOp,
+        }
+    }
+
+    /// Returns the stable reason code when this status carries one.
+    #[must_use]
+    pub const fn reason(&self) -> Option<ReportReasonCode> {
+        match self {
+            Self::Skipped { reason } | Self::NoOp { reason } => Some(*reason),
+            Self::Success | Self::PartialSuccess | Self::Failure => None,
+        }
+    }
+
+    /// Returns whether the workflow completed successfully.
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    /// Returns whether the workflow partially succeeded.
+    #[must_use]
+    pub const fn is_partial_success(&self) -> bool {
+        matches!(self, Self::PartialSuccess)
+    }
+
+    /// Returns whether the workflow failed.
+    #[must_use]
+    pub const fn is_failure(&self) -> bool {
+        matches!(self, Self::Failure)
+    }
+
+    /// Returns whether the workflow was skipped.
+    #[must_use]
+    pub const fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped { .. })
+    }
+
+    /// Returns whether the workflow had no work to perform.
+    #[must_use]
+    pub const fn is_no_op(&self) -> bool {
+        matches!(self, Self::NoOp { .. })
+    }
+}
+
+impl fmt::Display for WorkflowStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason() {
+            Some(reason) => write!(formatter, "{}:{reason}", self.kind()),
+            None => formatter.write_str(self.kind().as_str()),
+        }
+    }
+}
+
 /// Validation and scan-summary options checked before workflow side effects.
 ///
 /// This type carries validation intent without starting validation I/O. Target
@@ -1136,7 +1284,7 @@ mod tests {
         DryRunScanSummaryMode, FileCount, FileCountKind, OutputStatus, OutputStatusKind,
         PhaseStatus, PhaseStatusKind, ReportReasonCode, RowCount, RowCountKind,
         TargetValidationMode, ValidationOptions, ValidationStatus, ValidationStatusKind,
-        u128_to_u64_saturating,
+        WorkflowStatus, WorkflowStatusKind, u128_to_u64_saturating,
     };
 
     #[test]
@@ -1629,6 +1777,77 @@ mod tests {
             ))
         );
         assert!(debug.contains("ValidationFailed"));
+        assert!(!debug.contains("server="));
+        assert!(!debug.contains("password"));
+    }
+
+    #[test]
+    fn workflow_status_kinds_expose_stable_codes() {
+        assert_eq!(WorkflowStatusKind::Success.as_str(), "success");
+        assert_eq!(
+            WorkflowStatusKind::PartialSuccess.as_str(),
+            "partial_success"
+        );
+        assert_eq!(WorkflowStatusKind::Failure.as_str(), "failure");
+        assert_eq!(WorkflowStatusKind::Skipped.as_str(), "skipped");
+        assert_eq!(WorkflowStatusKind::NoOp.as_str(), "no_op");
+        assert_eq!(
+            WorkflowStatusKind::PartialSuccess.to_string(),
+            "partial_success"
+        );
+    }
+
+    #[test]
+    fn workflow_status_variants_expose_kind_reasons_and_helpers() {
+        let success = WorkflowStatus::success();
+        let partial = WorkflowStatus::partial_success();
+        let failure = WorkflowStatus::failure();
+        let skipped = WorkflowStatus::skipped(ReportReasonCode::DryRun);
+        let no_op = WorkflowStatus::no_op(ReportReasonCode::NotExecuted);
+
+        assert_eq!(success.kind(), WorkflowStatusKind::Success);
+        assert_eq!(success.reason(), None);
+        assert!(success.is_success());
+
+        assert_eq!(partial.kind(), WorkflowStatusKind::PartialSuccess);
+        assert_eq!(partial.reason(), None);
+        assert!(partial.is_partial_success());
+
+        assert_eq!(failure.kind(), WorkflowStatusKind::Failure);
+        assert_eq!(failure.reason(), None);
+        assert!(failure.is_failure());
+
+        assert_eq!(skipped.kind(), WorkflowStatusKind::Skipped);
+        assert_eq!(skipped.reason(), Some(ReportReasonCode::DryRun));
+        assert!(skipped.is_skipped());
+
+        assert_eq!(no_op.kind(), WorkflowStatusKind::NoOp);
+        assert_eq!(no_op.reason(), Some(ReportReasonCode::NotExecuted));
+        assert!(no_op.is_no_op());
+    }
+
+    #[test]
+    fn workflow_status_display_is_stable_and_safe() {
+        assert_eq!(WorkflowStatus::success().to_string(), "success");
+        assert_eq!(
+            WorkflowStatus::partial_success().to_string(),
+            "partial_success"
+        );
+        assert_eq!(WorkflowStatus::failure().to_string(), "failure");
+        assert_eq!(
+            WorkflowStatus::skipped(ReportReasonCode::DryRun).to_string(),
+            "skipped:dry_run"
+        );
+        assert_eq!(
+            WorkflowStatus::no_op(ReportReasonCode::NotExecuted).to_string(),
+            "no_op:not_executed"
+        );
+
+        let debug = format!(
+            "{:?}",
+            WorkflowStatus::skipped(ReportReasonCode::PriorFailure)
+        );
+        assert!(debug.contains("Skipped"));
         assert!(!debug.contains("server="));
         assert!(!debug.contains("password"));
     }
