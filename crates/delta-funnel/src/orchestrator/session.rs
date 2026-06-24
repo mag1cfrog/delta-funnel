@@ -96,6 +96,16 @@ impl DeltaSourceReport {
         }
     }
 
+    fn with_usage(
+        mut self,
+        usage_status: SourceUsageStatus,
+        used_by_output_names: Vec<String>,
+    ) -> Self {
+        self.usage_status = usage_status;
+        self.used_by_output_names = used_by_output_names;
+        self
+    }
+
     /// Returns the DataFusion table name for this source.
     #[must_use]
     pub fn source_name(&self) -> &str {
@@ -1937,10 +1947,9 @@ impl DeltaFunnelSession {
             })
             .collect::<Result<Vec<_>, DeltaFunnelError>>()?;
 
-        Ok(MssqlDryRunWorkflowReport::new(
-            outputs,
-            self.source_reports(),
-        ))
+        let sources = self.source_reports_for_dry_run_outputs(&outputs)?;
+
+        Ok(MssqlDryRunWorkflowReport::new(outputs, sources))
     }
 
     /// Writes one selected lazy table to SQL Server.
@@ -2418,6 +2427,49 @@ impl DeltaFunnelSession {
             .iter()
             .map(DeltaSourceReport::metadata_only)
             .collect()
+    }
+
+    fn source_reports_for_dry_run_outputs(
+        &self,
+        outputs: &[MssqlDryRunOutputReport],
+    ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        let mut output_sources = Vec::with_capacity(outputs.len());
+        let mut all_usage_known = true;
+
+        for output in outputs {
+            match self.known_source_dependencies_for_table(output.planned_output().table())? {
+                Some(source_ids) => {
+                    output_sources.push((output.output_name().to_owned(), source_ids));
+                }
+                None => {
+                    all_usage_known = false;
+                }
+            }
+        }
+
+        Ok(self
+            .sources
+            .iter()
+            .map(|source| {
+                let used_by_output_names = output_sources
+                    .iter()
+                    .filter(|(_, source_ids)| source_ids.contains(&source.table().id()))
+                    .map(|(output_name, _)| output_name.clone())
+                    .collect::<Vec<_>>();
+                let usage_status = if used_by_output_names.is_empty() {
+                    if all_usage_known {
+                        SourceUsageStatus::NotUsed
+                    } else {
+                        SourceUsageStatus::Unknown
+                    }
+                } else {
+                    SourceUsageStatus::Used
+                };
+
+                DeltaSourceReport::metadata_only(source)
+                    .with_usage(usage_status, used_by_output_names)
+            })
+            .collect())
     }
 
     /// Finds a registered Delta source by alias using unquoted SQL semantics.
@@ -3018,6 +3070,31 @@ impl DeltaFunnelSession {
         Ok(dependencies.into_iter().collect())
     }
 
+    fn known_source_dependencies_for_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<Option<BTreeSet<u64>>, DeltaFunnelError> {
+        self.schema_for_lazy_table(table)?;
+
+        match table.kind() {
+            LazyTableKind::DeltaSource => Ok(Some(BTreeSet::from([table.id()]))),
+            LazyTableKind::DerivedSql => {
+                let lineage = self.lineage_for_derived_table(table)?;
+                if !lineage.is_complete() {
+                    return Ok(None);
+                }
+                let mut visited_derived_table_ids = BTreeSet::new();
+                let mut source_table_ids = BTreeSet::new();
+                let usage_known = self.collect_transitive_source_dependencies(
+                    lineage,
+                    &mut visited_derived_table_ids,
+                    &mut source_table_ids,
+                )?;
+                Ok(usage_known.then_some(source_table_ids))
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn lazy_table_depends_on_registered_derived(
         &self,
@@ -3081,6 +3158,47 @@ impl DeltaFunnelSession {
         }
 
         Ok(())
+    }
+
+    fn collect_transitive_source_dependencies(
+        &self,
+        lineage: &DerivedTableLineage,
+        visited_derived_table_ids: &mut BTreeSet<u64>,
+        source_table_ids: &mut BTreeSet<u64>,
+    ) -> Result<bool, DeltaFunnelError> {
+        let mut usage_known = true;
+
+        for dependency in lineage.direct_dependencies() {
+            match dependency {
+                DerivedTableDependency::RegisteredSource { table_id, .. } => {
+                    source_table_ids.insert(*table_id);
+                }
+                DerivedTableDependency::RegisteredDerived { table_id, name } => {
+                    if !visited_derived_table_ids.insert(*table_id) {
+                        continue;
+                    }
+                    let derived = self.registered_derived_table_by_id(*table_id).ok_or_else(|| {
+                        DeltaFunnelError::MssqlWorkflowPlanning {
+                            message: format!(
+                                "registered derived lineage dependency `{}` is not registered in this session",
+                                sanitize_text_for_display(name)
+                            ),
+                        }
+                    })?;
+                    if !derived.lineage().is_complete() {
+                        usage_known = false;
+                        continue;
+                    }
+                    usage_known &= self.collect_transitive_source_dependencies(
+                        derived.lineage(),
+                        visited_derived_table_ids,
+                        source_table_ids,
+                    )?;
+                }
+            }
+        }
+
+        Ok(usage_known)
     }
 
     fn derive_table_lineage_from_sql(&self, sql: &str) -> DerivedTableLineage {
@@ -6497,9 +6615,52 @@ mod tests {
             Some(crate::ReportReasonCode::CostAvoidance)
         );
         assert!(!source.scan_metadata_exhausted());
-        assert_eq!(source.usage_status(), SourceUsageStatus::Unknown);
-        assert!(source.used_by_output_names().is_empty());
+        assert_eq!(source.usage_status(), SourceUsageStatus::Used);
+        assert_eq!(source.used_by_output_names(), &["orders_output".to_owned()]);
         assert!(!report.row_production_started());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_all_to_mssql_reports_multi_source_usage_when_lineage_is_known()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders_table = DeltaLogTable::new("orders")?;
+        let customers_table = DeltaLogTable::new("customers")?;
+        let inventory_table = DeltaLogTable::new("inventory")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new("orders", orders_table.uri()))?;
+        session.delta_lake(DeltaSourceConfig::new("customers", customers_table.uri()))?;
+        session.delta_lake(DeltaSourceConfig::new("inventory", inventory_table.uri()))?;
+        let joined = session
+            .table_from_sql(
+                "select orders.id from orders inner join customers on orders.id = customers.id",
+            )
+            .await?;
+        let request = output_request(
+            joined,
+            "joined_output",
+            "joined_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+
+        let report = session.dry_run_all_to_mssql(&[request])?;
+
+        assert_eq!(report.sources().len(), 3);
+        for source in report.sources() {
+            match source.source_name() {
+                "orders" | "customers" => {
+                    assert_eq!(source.usage_status(), SourceUsageStatus::Used);
+                    assert_eq!(source.used_by_output_names(), &["joined_output".to_owned()]);
+                }
+                "inventory" => {
+                    assert_eq!(source.usage_status(), SourceUsageStatus::NotUsed);
+                    assert!(source.used_by_output_names().is_empty());
+                }
+                name => return Err(format!("unexpected source report: {name}").into()),
+            }
+        }
         Ok(())
     }
 
