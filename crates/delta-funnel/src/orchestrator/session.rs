@@ -967,11 +967,12 @@ impl MssqlDryRunOutputReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlDryRunWorkflowReport {
     outputs: Vec<MssqlDryRunOutputReport>,
+    sources: Vec<DeltaSourceReport>,
 }
 
 impl MssqlDryRunWorkflowReport {
-    fn new(outputs: Vec<MssqlDryRunOutputReport>) -> Self {
-        Self { outputs }
+    fn new(outputs: Vec<MssqlDryRunOutputReport>, sources: Vec<DeltaSourceReport>) -> Self {
+        Self { outputs, sources }
     }
 
     /// Returns the dry-run action mode.
@@ -996,6 +997,12 @@ impl MssqlDryRunWorkflowReport {
     #[must_use]
     pub fn outputs(&self) -> &[MssqlDryRunOutputReport] {
         &self.outputs
+    }
+
+    /// Returns source-level reports in session registration order.
+    #[must_use]
+    pub fn sources(&self) -> &[DeltaSourceReport] {
+        &self.sources
     }
 
     /// Returns whether dry-run planning contacted SQL Server for any output.
@@ -1930,7 +1937,10 @@ impl DeltaFunnelSession {
             })
             .collect::<Result<Vec<_>, DeltaFunnelError>>()?;
 
-        Ok(MssqlDryRunWorkflowReport::new(outputs))
+        Ok(MssqlDryRunWorkflowReport::new(
+            outputs,
+            self.source_reports(),
+        ))
     }
 
     /// Writes one selected lazy table to SQL Server.
@@ -6433,6 +6443,7 @@ mod tests {
         assert!(!report.is_empty());
         assert_eq!(report.outputs()[0].output_name(), "west_output");
         assert_eq!(report.outputs()[1].output_name(), "east_output");
+        assert!(report.sources().is_empty());
         assert_eq!(
             report.outputs()[0]
                 .planned_output()
@@ -6454,6 +6465,41 @@ mod tests {
         assert!(!report.table_lifecycle_started());
         assert!(!report.bulk_writer_started());
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_all_to_mssql_includes_registered_delta_source_reports()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(
+            source,
+            "orders_output",
+            "orders_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+
+        let report = session.dry_run_all_to_mssql(&[request])?;
+
+        assert_eq!(report.outputs().len(), 1);
+        assert_eq!(report.sources().len(), 1);
+        let source = &report.sources()[0];
+        assert_eq!(source.source_name(), "orders");
+        assert_eq!(source.snapshot_version(), 1);
+        assert_eq!(source.protocol().source_name, "orders");
+        assert_eq!(source.file_count(), crate::FileCount::unavailable());
+        assert_eq!(
+            source.file_count_reason(),
+            Some(crate::ReportReasonCode::CostAvoidance)
+        );
+        assert!(!source.scan_metadata_exhausted());
+        assert_eq!(source.usage_status(), SourceUsageStatus::Unknown);
+        assert!(source.used_by_output_names().is_empty());
+        assert!(!report.row_production_started());
         Ok(())
     }
 
