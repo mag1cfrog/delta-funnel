@@ -9,6 +9,26 @@ use std::fmt;
 
 use crate::error::DeltaFunnelError;
 
+/// Saturates a platform-sized count into the public `u64` report shape.
+#[must_use]
+pub const fn usize_to_u64_saturating(value: usize) -> u64 {
+    if size_of::<usize>() > size_of::<u64>() && value > u64::MAX as usize {
+        u64::MAX
+    } else {
+        value as u64
+    }
+}
+
+/// Saturates a wide count into the public `u64` report shape.
+#[must_use]
+pub const fn u128_to_u64_saturating(value: u128) -> u64 {
+    if value > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        value as u64
+    }
+}
+
 /// Controls whether target-side validation should run when a workflow supports it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TargetValidationMode {
@@ -63,6 +83,377 @@ impl DryRunScanSummaryMode {
 impl fmt::Display for DryRunScanSummaryMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// Classification for a reported row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowCountKind {
+    /// The count is exact for the reported scope.
+    Exact,
+    /// The count is an estimate from metadata, planning, or another non-exact source.
+    Estimated,
+    /// The count is an observed partial total and must not be treated as exact.
+    Partial,
+    /// No row count is available.
+    Unavailable,
+}
+
+impl RowCountKind {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Estimated => "estimated",
+            Self::Partial => "partial",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl fmt::Display for RowCountKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Row count evidence for a report field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowCount {
+    /// An exact row count for the reported scope.
+    Exact(u64),
+    /// A row count estimate from metadata, planning, or another non-exact source.
+    Estimated(u64),
+    /// A partial observed count. This is not proof of the final total.
+    Partial(u64),
+    /// No row count is available.
+    Unavailable,
+}
+
+impl RowCount {
+    /// Creates an exact row count.
+    #[must_use]
+    pub const fn exact(value: u64) -> Self {
+        Self::Exact(value)
+    }
+
+    /// Creates an exact row count from a platform-sized value, saturating at `u64::MAX`.
+    #[must_use]
+    pub const fn exact_from_usize(value: usize) -> Self {
+        Self::Exact(usize_to_u64_saturating(value))
+    }
+
+    /// Creates an exact row count from a wide value, saturating at `u64::MAX`.
+    #[must_use]
+    pub const fn exact_from_u128(value: u128) -> Self {
+        Self::Exact(u128_to_u64_saturating(value))
+    }
+
+    /// Creates an estimated row count.
+    #[must_use]
+    pub const fn estimated(value: u64) -> Self {
+        Self::Estimated(value)
+    }
+
+    /// Creates an estimated row count from a platform-sized value, saturating at `u64::MAX`.
+    #[must_use]
+    pub const fn estimated_from_usize(value: usize) -> Self {
+        Self::Estimated(usize_to_u64_saturating(value))
+    }
+
+    /// Creates an estimated row count from a wide value, saturating at `u64::MAX`.
+    #[must_use]
+    pub const fn estimated_from_u128(value: u128) -> Self {
+        Self::Estimated(u128_to_u64_saturating(value))
+    }
+
+    /// Creates a partial observed row count.
+    #[must_use]
+    pub const fn partial(value: u64) -> Self {
+        Self::Partial(value)
+    }
+
+    /// Creates a partial observed row count from a platform-sized value, saturating at `u64::MAX`.
+    #[must_use]
+    pub const fn partial_from_usize(value: usize) -> Self {
+        Self::Partial(usize_to_u64_saturating(value))
+    }
+
+    /// Creates a partial observed row count from a wide value, saturating at `u64::MAX`.
+    #[must_use]
+    pub const fn partial_from_u128(value: u128) -> Self {
+        Self::Partial(u128_to_u64_saturating(value))
+    }
+
+    /// Creates an unavailable row count.
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self::Unavailable
+    }
+
+    /// Returns the count classification.
+    #[must_use]
+    pub const fn kind(&self) -> RowCountKind {
+        match self {
+            Self::Exact(_) => RowCountKind::Exact,
+            Self::Estimated(_) => RowCountKind::Estimated,
+            Self::Partial(_) => RowCountKind::Partial,
+            Self::Unavailable => RowCountKind::Unavailable,
+        }
+    }
+
+    /// Returns the numeric count when the report carries one.
+    #[must_use]
+    pub const fn value(&self) -> Option<u64> {
+        match self {
+            Self::Exact(value) | Self::Estimated(value) | Self::Partial(value) => Some(*value),
+            Self::Unavailable => None,
+        }
+    }
+
+    /// Returns the exact count, if this value proves one.
+    #[must_use]
+    pub const fn exact_value(&self) -> Option<u64> {
+        match self {
+            Self::Exact(value) => Some(*value),
+            Self::Estimated(_) | Self::Partial(_) | Self::Unavailable => None,
+        }
+    }
+
+    /// Returns the estimated count, if this value carries an estimate.
+    #[must_use]
+    pub const fn estimated_value(&self) -> Option<u64> {
+        match self {
+            Self::Estimated(value) => Some(*value),
+            Self::Exact(_) | Self::Partial(_) | Self::Unavailable => None,
+        }
+    }
+
+    /// Returns the partial count, if this value carries a partial observation.
+    #[must_use]
+    pub const fn partial_value(&self) -> Option<u64> {
+        match self {
+            Self::Partial(value) => Some(*value),
+            Self::Exact(_) | Self::Estimated(_) | Self::Unavailable => None,
+        }
+    }
+
+    /// Returns whether the count is exact.
+    #[must_use]
+    pub const fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact(_))
+    }
+
+    /// Returns whether the count is estimated.
+    #[must_use]
+    pub const fn is_estimated(&self) -> bool {
+        matches!(self, Self::Estimated(_))
+    }
+
+    /// Returns whether the count is partial.
+    #[must_use]
+    pub const fn is_partial(&self) -> bool {
+        matches!(self, Self::Partial(_))
+    }
+
+    /// Returns whether no row count is available.
+    #[must_use]
+    pub const fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+}
+
+impl fmt::Display for RowCount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.value() {
+            Some(value) => write!(formatter, "{}:{value}", self.kind()),
+            None => formatter.write_str(self.kind().as_str()),
+        }
+    }
+}
+
+/// Classification for a reported file count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCountKind {
+    /// The count is exact for the reported scope.
+    Exact,
+    /// The count is an estimate from metadata, planning, or another non-exact source.
+    Estimated,
+    /// No file count is available.
+    Unavailable,
+    /// File counting was intentionally skipped.
+    Skipped,
+    /// The workflow step that would count files did not execute.
+    NotExecuted,
+}
+
+impl FileCountKind {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Estimated => "estimated",
+            Self::Unavailable => "unavailable",
+            Self::Skipped => "skipped",
+            Self::NotExecuted => "not_executed",
+        }
+    }
+}
+
+impl fmt::Display for FileCountKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// File count evidence for a report field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCount {
+    /// An exact file count for the reported scope.
+    Exact(u64),
+    /// A file count estimate from metadata, planning, or another non-exact source.
+    Estimated(u64),
+    /// No file count is available.
+    Unavailable,
+    /// File counting was intentionally skipped.
+    Skipped,
+    /// The workflow step that would count files did not execute.
+    NotExecuted,
+}
+
+impl FileCount {
+    /// Creates an exact file count.
+    #[must_use]
+    pub const fn exact(value: u64) -> Self {
+        Self::Exact(value)
+    }
+
+    /// Creates an exact file count from a platform-sized value, saturating at `u64::MAX`.
+    #[must_use]
+    pub const fn exact_from_usize(value: usize) -> Self {
+        Self::Exact(usize_to_u64_saturating(value))
+    }
+
+    /// Creates an exact file count from a wide value, saturating at `u64::MAX`.
+    #[must_use]
+    pub const fn exact_from_u128(value: u128) -> Self {
+        Self::Exact(u128_to_u64_saturating(value))
+    }
+
+    /// Creates an estimated file count.
+    #[must_use]
+    pub const fn estimated(value: u64) -> Self {
+        Self::Estimated(value)
+    }
+
+    /// Creates an estimated file count from a platform-sized value, saturating at `u64::MAX`.
+    #[must_use]
+    pub const fn estimated_from_usize(value: usize) -> Self {
+        Self::Estimated(usize_to_u64_saturating(value))
+    }
+
+    /// Creates an estimated file count from a wide value, saturating at `u64::MAX`.
+    #[must_use]
+    pub const fn estimated_from_u128(value: u128) -> Self {
+        Self::Estimated(u128_to_u64_saturating(value))
+    }
+
+    /// Creates an unavailable file count.
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self::Unavailable
+    }
+
+    /// Creates a skipped file count.
+    #[must_use]
+    pub const fn skipped() -> Self {
+        Self::Skipped
+    }
+
+    /// Creates a not-executed file count.
+    #[must_use]
+    pub const fn not_executed() -> Self {
+        Self::NotExecuted
+    }
+
+    /// Returns the count classification.
+    #[must_use]
+    pub const fn kind(&self) -> FileCountKind {
+        match self {
+            Self::Exact(_) => FileCountKind::Exact,
+            Self::Estimated(_) => FileCountKind::Estimated,
+            Self::Unavailable => FileCountKind::Unavailable,
+            Self::Skipped => FileCountKind::Skipped,
+            Self::NotExecuted => FileCountKind::NotExecuted,
+        }
+    }
+
+    /// Returns the numeric count when the report carries one.
+    #[must_use]
+    pub const fn value(&self) -> Option<u64> {
+        match self {
+            Self::Exact(value) | Self::Estimated(value) => Some(*value),
+            Self::Unavailable | Self::Skipped | Self::NotExecuted => None,
+        }
+    }
+
+    /// Returns the exact count, if this value proves one.
+    #[must_use]
+    pub const fn exact_value(&self) -> Option<u64> {
+        match self {
+            Self::Exact(value) => Some(*value),
+            Self::Estimated(_) | Self::Unavailable | Self::Skipped | Self::NotExecuted => None,
+        }
+    }
+
+    /// Returns the estimated count, if this value carries an estimate.
+    #[must_use]
+    pub const fn estimated_value(&self) -> Option<u64> {
+        match self {
+            Self::Estimated(value) => Some(*value),
+            Self::Exact(_) | Self::Unavailable | Self::Skipped | Self::NotExecuted => None,
+        }
+    }
+
+    /// Returns whether the count is exact.
+    #[must_use]
+    pub const fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact(_))
+    }
+
+    /// Returns whether the count is estimated.
+    #[must_use]
+    pub const fn is_estimated(&self) -> bool {
+        matches!(self, Self::Estimated(_))
+    }
+
+    /// Returns whether no file count is available.
+    #[must_use]
+    pub const fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+
+    /// Returns whether file counting was intentionally skipped.
+    #[must_use]
+    pub const fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped)
+    }
+
+    /// Returns whether the workflow step that would count files did not execute.
+    #[must_use]
+    pub const fn is_not_executed(&self) -> bool {
+        matches!(self, Self::NotExecuted)
+    }
+}
+
+impl fmt::Display for FileCount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.value() {
+            Some(value) => write!(formatter, "{}:{value}", self.kind()),
+            None => formatter.write_str(self.kind().as_str()),
+        }
     }
 }
 
@@ -160,7 +551,10 @@ impl ValidationOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{DryRunScanSummaryMode, TargetValidationMode, ValidationOptions};
+    use super::{
+        DryRunScanSummaryMode, FileCount, FileCountKind, RowCount, RowCountKind,
+        TargetValidationMode, ValidationOptions, u128_to_u64_saturating,
+    };
 
     #[test]
     fn target_validation_modes_expose_stable_codes() {
@@ -238,5 +632,126 @@ mod tests {
         assert!(debug.contains("MetadataOnly"));
         assert!(!debug.contains("server="));
         assert!(!debug.contains("password"));
+    }
+
+    #[test]
+    fn row_count_variants_expose_kind_and_values() {
+        let exact = RowCount::exact(10);
+        let estimated = RowCount::estimated(20);
+        let partial = RowCount::partial(30);
+        let unavailable = RowCount::unavailable();
+
+        assert_eq!(exact.kind(), RowCountKind::Exact);
+        assert_eq!(exact.value(), Some(10));
+        assert_eq!(exact.exact_value(), Some(10));
+        assert!(exact.is_exact());
+
+        assert_eq!(estimated.kind(), RowCountKind::Estimated);
+        assert_eq!(estimated.value(), Some(20));
+        assert_eq!(estimated.estimated_value(), Some(20));
+        assert!(estimated.is_estimated());
+
+        assert_eq!(partial.kind(), RowCountKind::Partial);
+        assert_eq!(partial.value(), Some(30));
+        assert_eq!(partial.partial_value(), Some(30));
+        assert_eq!(partial.exact_value(), None);
+        assert!(partial.is_partial());
+
+        assert_eq!(unavailable.kind(), RowCountKind::Unavailable);
+        assert_eq!(unavailable.value(), None);
+        assert!(unavailable.is_unavailable());
+    }
+
+    #[test]
+    fn file_count_variants_expose_kind_and_values() {
+        let exact = FileCount::exact(2);
+        let estimated = FileCount::estimated(3);
+        let unavailable = FileCount::unavailable();
+        let skipped = FileCount::skipped();
+        let not_executed = FileCount::not_executed();
+
+        assert_eq!(exact.kind(), FileCountKind::Exact);
+        assert_eq!(exact.value(), Some(2));
+        assert_eq!(exact.exact_value(), Some(2));
+        assert!(exact.is_exact());
+
+        assert_eq!(estimated.kind(), FileCountKind::Estimated);
+        assert_eq!(estimated.value(), Some(3));
+        assert_eq!(estimated.estimated_value(), Some(3));
+        assert!(estimated.is_estimated());
+
+        assert_eq!(unavailable.kind(), FileCountKind::Unavailable);
+        assert_eq!(unavailable.value(), None);
+        assert!(unavailable.is_unavailable());
+
+        assert_eq!(skipped.kind(), FileCountKind::Skipped);
+        assert_eq!(skipped.value(), None);
+        assert!(skipped.is_skipped());
+
+        assert_eq!(not_executed.kind(), FileCountKind::NotExecuted);
+        assert_eq!(not_executed.value(), None);
+        assert!(not_executed.is_not_executed());
+    }
+
+    #[test]
+    fn count_kinds_expose_stable_codes() {
+        assert_eq!(RowCountKind::Exact.as_str(), "exact");
+        assert_eq!(RowCountKind::Estimated.as_str(), "estimated");
+        assert_eq!(RowCountKind::Partial.as_str(), "partial");
+        assert_eq!(RowCountKind::Unavailable.as_str(), "unavailable");
+        assert_eq!(RowCountKind::Partial.to_string(), "partial");
+
+        assert_eq!(FileCountKind::Exact.as_str(), "exact");
+        assert_eq!(FileCountKind::Estimated.as_str(), "estimated");
+        assert_eq!(FileCountKind::Unavailable.as_str(), "unavailable");
+        assert_eq!(FileCountKind::Skipped.as_str(), "skipped");
+        assert_eq!(FileCountKind::NotExecuted.as_str(), "not_executed");
+        assert_eq!(FileCountKind::NotExecuted.to_string(), "not_executed");
+    }
+
+    #[test]
+    fn count_display_is_stable_and_safe() {
+        assert_eq!(RowCount::exact(12).to_string(), "exact:12");
+        assert_eq!(RowCount::estimated(34).to_string(), "estimated:34");
+        assert_eq!(RowCount::partial(56).to_string(), "partial:56");
+        assert_eq!(RowCount::unavailable().to_string(), "unavailable");
+
+        assert_eq!(FileCount::exact(7).to_string(), "exact:7");
+        assert_eq!(FileCount::estimated(8).to_string(), "estimated:8");
+        assert_eq!(FileCount::unavailable().to_string(), "unavailable");
+        assert_eq!(FileCount::skipped().to_string(), "skipped");
+        assert_eq!(FileCount::not_executed().to_string(), "not_executed");
+
+        let debug = format!("{:?} {:?}", RowCount::partial(1), FileCount::not_executed());
+        assert!(!debug.contains("server="));
+        assert!(!debug.contains("password"));
+    }
+
+    #[test]
+    fn count_constructors_saturate_wide_values() {
+        assert_eq!(u128_to_u64_saturating(u128::from(u64::MAX) + 1), u64::MAX);
+        assert_eq!(RowCount::exact_from_u128(u128::MAX).value(), Some(u64::MAX));
+        assert_eq!(
+            RowCount::estimated_from_u128(u128::MAX).value(),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            RowCount::partial_from_u128(u128::MAX).value(),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            FileCount::exact_from_u128(u128::MAX).value(),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            FileCount::estimated_from_u128(u128::MAX).value(),
+            Some(u64::MAX)
+        );
+
+        assert_eq!(RowCount::exact_from_usize(5).value(), Some(5));
+        assert_eq!(RowCount::estimated_from_usize(6).value(), Some(6));
+        assert_eq!(RowCount::partial_from_usize(7).value(), Some(7));
+        assert_eq!(FileCount::exact_from_usize(8).value(), Some(8));
+        assert_eq!(FileCount::estimated_from_usize(9).value(), Some(9));
     }
 }
