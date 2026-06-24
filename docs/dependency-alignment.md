@@ -7,18 +7,26 @@ owning feature work needs them.
 ## Selected Dependencies
 
 - `snafu = "0.9"` is the Rust error-handling framework.
-- `arrow-tiberius = "0.1.1"` is the Arrow to SQL Server planning and write
-  path.
-- `arrow-tiberius` brings in `tiberius-raw-bulk =0.12.3-raw-bulk.13`
-  transitively. DeltaFunnel should add a direct `tiberius` dependency only when
-  the SQL sink issue constructs a `tiberius::Client`; that direct dependency
-  must use the `tiberius-raw-bulk` package identity.
+- `arrow-tiberius = "0.1.3"` is the Arrow to SQL Server planning and write
+  path. It emits writer lifecycle spans and events under the `arrow_tiberius`
+  tracing target, but it does not install a tracing subscriber.
+- `arrow-tiberius` brings in `tiberius-raw-bulk =0.12.3-raw-bulk.14`
+  transitively. That protocol layer emits sanitized TDS/protocol spans and
+  events under the `tiberius_raw_bulk::protocol` tracing target. DeltaFunnel
+  should add a direct `tiberius` dependency only when the SQL sink issue
+  constructs a `tiberius::Client`; that direct dependency must use the
+  `tiberius-raw-bulk` package identity.
 - `delta_kernel = "0.23.0"` is used with Arrow 58, the default engine, and an
   explicit `internal-api` decision.
 
 The public `RecordBatch` path should stay on Arrow 58 across `delta_kernel`,
 `arrow-tiberius`, and DeltaFunnel. A second Arrow major version in that path is
 a blocker unless a deliberate conversion boundary is added.
+
+DeltaFunnel workflow tracing is separate from the writer/protocol tracing above.
+Library code should emit spans and events only when the owning observability
+issue adds DeltaFunnel tracing; subscriber setup belongs to applications,
+tests, or package entry points.
 
 ## Error Pattern
 

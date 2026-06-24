@@ -210,12 +210,31 @@ mod tests {
 
     #[test]
     fn mssql_connection_uses_arrow_tiberius_without_direct_transport_dependencies() {
-        let dependencies = direct_manifest_dependency_names(include_str!("../../../Cargo.toml"));
+        let manifest = include_str!("../../../Cargo.toml");
+        let dependencies = direct_manifest_dependency_names(manifest);
 
         assert!(dependencies.contains(&"arrow-tiberius"));
+        assert_eq!(
+            direct_manifest_dependency_version(manifest, "arrow-tiberius"),
+            Some("0.1.3")
+        );
         assert!(!dependencies.contains(&"tiberius"));
         assert!(!dependencies.contains(&"tiberius-raw-bulk"));
         assert!(!dependencies.contains(&"tokio-util"));
+    }
+
+    #[test]
+    fn dependency_alignment_doc_tracks_arrow_tiberius_observability_release() {
+        let docs = include_str!("../../../../../docs/dependency-alignment.md");
+
+        assert!(docs.contains("arrow-tiberius = \"0.1.3\""));
+        assert!(docs.contains("tiberius-raw-bulk =0.12.3-raw-bulk.14"));
+        assert!(docs.contains("arrow_tiberius"));
+        assert!(docs.contains("tiberius_raw_bulk::protocol"));
+        assert!(!docs.contains("arrow-tiberius = \"0.1.1\""));
+        assert!(!docs.contains("arrow-tiberius = \"0.1.2\""));
+        assert!(!docs.contains("raw-bulk.13"));
+        assert!(!docs.contains("pre-publish"));
     }
 
     #[test]
@@ -430,5 +449,32 @@ mod tests {
         }
 
         dependency_names
+    }
+
+    fn direct_manifest_dependency_version<'a>(
+        manifest: &'a str,
+        expected_dependency: &str,
+    ) -> Option<&'a str> {
+        let mut in_dependency_section = false;
+
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                in_dependency_section = line == "[dependencies]";
+                continue;
+            }
+            if !in_dependency_section || line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((dependency_name, value)) = line.split_once('=') else {
+                continue;
+            };
+            if dependency_name.trim().trim_matches('"') != expected_dependency {
+                continue;
+            }
+            return Some(value.trim().trim_matches('"'));
+        }
+
+        None
     }
 }
