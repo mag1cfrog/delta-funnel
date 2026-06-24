@@ -1,10 +1,14 @@
 //! Rust backing model for lazy query-load orchestration.
 //!
 //! This module owns the high-level session and request data shapes that will
-//! later back the Python `Session` and `Table` API. It intentionally does not
-//! contact SQL Server, produce physical query plans, or execute rows.
+//! later back the Python `Session` and `Table` API. Metadata report helpers do
+//! not contact SQL Server or execute rows unless a write path explicitly does so.
 
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -21,11 +25,12 @@ use crate::{
     MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter,
     MssqlWorkflowWriteOptions, MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport,
     QueryOptions, RegisteredDeltaSource, ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase,
-    ValidationOptions, datafusion_query_output_stream, datafusion_session_context,
-    default_mssql_write_options, load_delta_source, plan_mssql_target_for_resolved_output,
-    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
-    support::sanitize_text_for_display, table_formats::validate_table_source_names,
-    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
+    ValidationOptions, collect_delta_provider_read_stats, datafusion_query_output_stream,
+    datafusion_session_context, default_mssql_write_options, load_delta_source,
+    plan_mssql_target_for_resolved_output, preflight_delta_protocol,
+    register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
+    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
+    write_output_batches_to_mssql,
 };
 
 /// Query-load action mode requested by a caller.
@@ -79,6 +84,8 @@ pub struct DeltaSourceReport {
     scan_metadata_exhausted: bool,
     usage_status: SourceUsageStatus,
     used_by_output_names: Vec<String>,
+    provider_read_stats: Option<crate::DeltaProviderReadStatsSnapshot>,
+    provider_stats_reason: Option<ReportReasonCode>,
 }
 
 impl DeltaSourceReport {
@@ -93,6 +100,8 @@ impl DeltaSourceReport {
             scan_metadata_exhausted: false,
             usage_status: SourceUsageStatus::Unknown,
             used_by_output_names: Vec::new(),
+            provider_read_stats: None,
+            provider_stats_reason: Some(ReportReasonCode::NotExecuted),
         }
     }
 
@@ -103,6 +112,25 @@ impl DeltaSourceReport {
     ) -> Self {
         self.usage_status = usage_status;
         self.used_by_output_names = used_by_output_names;
+        self
+    }
+
+    fn with_provider_read_stats(mut self, stats: crate::DeltaProviderReadStatsSnapshot) -> Self {
+        self.scan_metadata_exhausted = stats.scan_metadata_exhausted.unwrap_or(false);
+        self.file_count = match stats.scan_metadata_exhausted {
+            Some(true) => crate::FileCount::exact(stats.files_planned),
+            Some(false) => crate::FileCount::estimated(stats.files_planned),
+            None => crate::FileCount::unavailable(),
+        };
+        self.file_count_reason = match self.file_count {
+            crate::FileCount::Exact(_) | crate::FileCount::Estimated(_) => None,
+            crate::FileCount::Unavailable => Some(ReportReasonCode::CapabilityUnavailable),
+            crate::FileCount::Skipped | crate::FileCount::NotExecuted => {
+                Some(ReportReasonCode::NotExecuted)
+            }
+        };
+        self.provider_read_stats = Some(stats);
+        self.provider_stats_reason = None;
         self
     }
 
@@ -158,6 +186,18 @@ impl DeltaSourceReport {
     #[must_use]
     pub fn used_by_output_names(&self) -> &[String] {
         &self.used_by_output_names
+    }
+
+    /// Returns provider read statistics when planning or execution made them available.
+    #[must_use]
+    pub const fn provider_read_stats(&self) -> Option<&crate::DeltaProviderReadStatsSnapshot> {
+        self.provider_read_stats.as_ref()
+    }
+
+    /// Returns the stable reason code when provider read statistics are absent.
+    #[must_use]
+    pub const fn provider_stats_reason(&self) -> Option<ReportReasonCode> {
+        self.provider_stats_reason
     }
 }
 
@@ -2426,6 +2466,52 @@ impl DeltaFunnelSession {
         self.sources
             .iter()
             .map(DeltaSourceReport::metadata_only)
+            .collect()
+    }
+
+    /// Returns Delta source reports enriched from the physical plan for `table`.
+    ///
+    /// This method resolves the lazy table and builds a DataFusion physical plan
+    /// so provider planning metadata can be reported. It does not execute row
+    /// streams or contact SQL Server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table is unknown or DataFusion cannot build the
+    /// physical plan.
+    pub async fn source_reports_for_lazy_table_plan(
+        &self,
+        table: &LazyTable,
+    ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        let dataframe = self.dataframe_for_lazy_table(table).await?;
+        let physical_plan = dataframe
+            .create_physical_plan()
+            .await
+            .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
+        let provider_stats = collect_delta_provider_read_stats(physical_plan.as_ref());
+
+        Ok(self.source_reports_with_provider_read_stats(provider_stats))
+    }
+
+    fn source_reports_with_provider_read_stats(
+        &self,
+        provider_stats: Vec<crate::DeltaProviderReadStatsSnapshot>,
+    ) -> Vec<DeltaSourceReport> {
+        let mut provider_stats_by_source = BTreeMap::new();
+        for stats in provider_stats {
+            provider_stats_by_source.insert(stats.source_name.clone(), stats);
+        }
+
+        self.sources
+            .iter()
+            .map(|source| {
+                let report = DeltaSourceReport::metadata_only(source);
+                if let Some(stats) = provider_stats_by_source.remove(source.name()) {
+                    report.with_provider_read_stats(stats)
+                } else {
+                    report
+                }
+            })
             .collect()
     }
 
@@ -8107,7 +8193,63 @@ mod tests {
         assert!(!report.scan_metadata_exhausted());
         assert_eq!(report.usage_status(), SourceUsageStatus::Unknown);
         assert!(report.used_by_output_names().is_empty());
+        assert!(report.provider_read_stats().is_none());
+        assert_eq!(
+            report.provider_stats_reason(),
+            Some(crate::ReportReasonCode::NotExecuted)
+        );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_reports_for_lazy_table_plan_include_provider_stats_without_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let reports = session.source_reports_for_lazy_table_plan(&source).await?;
+
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.source_name(), "orders");
+        assert_eq!(report.provider_stats_reason(), None);
+        let stats = report
+            .provider_read_stats()
+            .ok_or("expected provider read stats")?;
+        assert_eq!(stats.source_name, "orders");
+        assert_eq!(stats.snapshot_version, report.snapshot_version());
+        assert_eq!(stats.files_started, 0);
+        assert_eq!(stats.files_completed, 0);
+        assert_eq!(stats.batches_produced, 0);
+        assert_eq!(stats.rows_produced, 0);
+        match stats.scan_metadata_exhausted {
+            Some(true) => {
+                assert_eq!(
+                    report.file_count(),
+                    crate::FileCount::exact(stats.files_planned)
+                );
+                assert_eq!(report.file_count_reason(), None);
+                assert!(report.scan_metadata_exhausted());
+            }
+            Some(false) => {
+                assert_eq!(
+                    report.file_count(),
+                    crate::FileCount::estimated(stats.files_planned)
+                );
+                assert_eq!(report.file_count_reason(), None);
+                assert!(!report.scan_metadata_exhausted());
+            }
+            None => {
+                assert_eq!(report.file_count(), crate::FileCount::unavailable());
+                assert_eq!(
+                    report.file_count_reason(),
+                    Some(crate::ReportReasonCode::CapabilityUnavailable)
+                );
+                assert!(!report.scan_metadata_exhausted());
+            }
+        }
         Ok(())
     }
 
