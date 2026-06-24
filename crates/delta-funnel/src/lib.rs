@@ -14,6 +14,7 @@ pub mod error;
 mod orchestrator;
 mod pipeline;
 pub(crate) mod query_engine;
+mod report;
 mod sql_server;
 mod support;
 mod table_formats;
@@ -22,7 +23,7 @@ pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
     DeltaFunnelRuntime, DeltaFunnelSession, LazyTable, LazyTableKind, MssqlDryRunOutputReport,
     MssqlDryRunWorkflowReport, MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput,
-    RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions, ValidationOptions,
+    RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions,
     WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
     WriteAllCacheCandidateSkipReason, WriteAllCacheMode, WriteAllCacheReport,
     WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
@@ -41,6 +42,12 @@ pub use query_engine::{
     delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic, register_delta_sources,
     register_delta_sources_with_scan_execution_options,
+};
+pub use report::{
+    DryRunScanSummaryMode, FileCount, FileCountKind, OutputStatus, OutputStatusKind, PhaseStatus,
+    PhaseStatusKind, ReportReasonCode, RowCount, RowCountKind, TargetValidationMode,
+    ValidationOptions, ValidationStatus, ValidationStatusKind, WorkflowStatus, WorkflowStatusKind,
+    u128_to_u64_saturating, usize_to_u64_saturating,
 };
 pub use sql_server::{
     LoadMode, MssqlBinaryPolicy, MssqlConnectionConfig, MssqlConnectionSource,

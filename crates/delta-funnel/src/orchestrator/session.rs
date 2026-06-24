@@ -20,7 +20,7 @@ use crate::{
     MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlOutputWriteStatus,
     MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter,
     MssqlWorkflowWriteOptions, MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport,
-    QueryOptions, RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase,
+    QueryOptions, RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase, ValidationOptions,
     datafusion_query_output_stream, datafusion_session_context, default_mssql_write_options,
     load_delta_source, plan_mssql_target_for_resolved_output, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
@@ -36,50 +36,6 @@ pub enum RunMode {
     Execute,
     /// Reuse planning paths without row production or SQL Server write effects.
     DryRun,
-}
-
-/// Validation options that can be checked before workflow side effects.
-///
-/// Rich row-count and target-side validation belongs to issue #10. This type
-/// exists so the session API can carry validation intent without starting
-/// validation I/O in the session-model slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ValidationOptions {
-    require_successful_planning: bool,
-}
-
-impl Default for ValidationOptions {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ValidationOptions {
-    /// Creates default local validation options.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            require_successful_planning: true,
-        }
-    }
-
-    /// Returns whether planning failures should be treated as terminal.
-    #[must_use]
-    pub const fn require_successful_planning(&self) -> bool {
-        self.require_successful_planning
-    }
-
-    /// Validates local validation options before workflow side effects.
-    ///
-    /// # Errors
-    ///
-    /// Currently returns `Ok(())` for all representable values. The method is
-    /// intentionally present so later validation options can be wired through
-    /// the same pre-side-effect path.
-    pub const fn validate(&self) -> Result<(), DeltaFunnelError> {
-        let _ = self.require_successful_planning;
-        Ok(())
-    }
 }
 
 /// Session-wide options for lazy query-load orchestration.
