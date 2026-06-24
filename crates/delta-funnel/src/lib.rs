@@ -44,9 +44,10 @@ pub use query_engine::{
     register_delta_sources_with_scan_execution_options,
 };
 pub use report::{
-    DryRunScanSummaryMode, FileCount, FileCountKind, PhaseStatus, PhaseStatusKind,
-    ReportReasonCode, RowCount, RowCountKind, TargetValidationMode, ValidationOptions,
-    ValidationStatus, ValidationStatusKind, u128_to_u64_saturating, usize_to_u64_saturating,
+    DryRunScanSummaryMode, FileCount, FileCountKind, OutputStatus, OutputStatusKind, PhaseStatus,
+    PhaseStatusKind, ReportReasonCode, RowCount, RowCountKind, TargetValidationMode,
+    ValidationOptions, ValidationStatus, ValidationStatusKind, u128_to_u64_saturating,
+    usize_to_u64_saturating,
 };
 pub use sql_server::{
     LoadMode, MssqlBinaryPolicy, MssqlConnectionConfig, MssqlConnectionSource,

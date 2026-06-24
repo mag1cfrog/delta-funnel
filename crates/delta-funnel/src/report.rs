@@ -850,6 +850,194 @@ impl fmt::Display for PhaseStatus {
     }
 }
 
+/// Classification for an output-level workflow status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStatusKind {
+    /// The output was planned but not executed yet.
+    Planned,
+    /// The output completed successfully.
+    Succeeded,
+    /// The output failed during planning, execution, or reporting.
+    Failed,
+    /// The output was intentionally skipped.
+    Skipped,
+    /// The output was planned as part of a dry run.
+    DryRunPlanned,
+    /// The output failed validation.
+    ValidationFailed,
+}
+
+impl OutputStatusKind {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::DryRunPlanned => "dry_run_planned",
+            Self::ValidationFailed => "validation_failed",
+        }
+    }
+}
+
+impl fmt::Display for OutputStatusKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Output-level workflow status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStatus {
+    /// The output was planned but not executed yet.
+    Planned,
+    /// The output completed successfully.
+    Succeeded,
+    /// The output failed during planning, execution, or reporting.
+    Failed,
+    /// The output was intentionally skipped.
+    Skipped {
+        /// Stable reason code explaining why the output was skipped.
+        reason: ReportReasonCode,
+    },
+    /// The output was planned as part of a dry run.
+    DryRunPlanned,
+    /// The output failed validation.
+    ValidationFailed {
+        /// Validation status explaining the validation failure.
+        validation: ValidationStatus,
+    },
+}
+
+impl OutputStatus {
+    /// Creates a planned output status.
+    #[must_use]
+    pub const fn planned() -> Self {
+        Self::Planned
+    }
+
+    /// Creates a succeeded output status.
+    #[must_use]
+    pub const fn succeeded() -> Self {
+        Self::Succeeded
+    }
+
+    /// Creates a failed output status.
+    #[must_use]
+    pub const fn failed() -> Self {
+        Self::Failed
+    }
+
+    /// Creates a skipped output status with a stable reason code.
+    #[must_use]
+    pub const fn skipped(reason: ReportReasonCode) -> Self {
+        Self::Skipped { reason }
+    }
+
+    /// Creates a dry-run-planned output status.
+    #[must_use]
+    pub const fn dry_run_planned() -> Self {
+        Self::DryRunPlanned
+    }
+
+    /// Creates a validation-failed output status.
+    #[must_use]
+    pub const fn validation_failed(validation: ValidationStatus) -> Self {
+        Self::ValidationFailed { validation }
+    }
+
+    /// Returns the output status classification.
+    #[must_use]
+    pub const fn kind(&self) -> OutputStatusKind {
+        match self {
+            Self::Planned => OutputStatusKind::Planned,
+            Self::Succeeded => OutputStatusKind::Succeeded,
+            Self::Failed => OutputStatusKind::Failed,
+            Self::Skipped { .. } => OutputStatusKind::Skipped,
+            Self::DryRunPlanned => OutputStatusKind::DryRunPlanned,
+            Self::ValidationFailed { .. } => OutputStatusKind::ValidationFailed,
+        }
+    }
+
+    /// Returns the stable reason code when this status carries one.
+    #[must_use]
+    pub const fn reason(&self) -> Option<ReportReasonCode> {
+        match self {
+            Self::Skipped { reason } => Some(*reason),
+            Self::Planned
+            | Self::Succeeded
+            | Self::Failed
+            | Self::DryRunPlanned
+            | Self::ValidationFailed { .. } => None,
+        }
+    }
+
+    /// Returns the validation status when this output failed validation.
+    #[must_use]
+    pub const fn validation(&self) -> Option<ValidationStatus> {
+        match self {
+            Self::ValidationFailed { validation } => Some(*validation),
+            Self::Planned
+            | Self::Succeeded
+            | Self::Failed
+            | Self::Skipped { .. }
+            | Self::DryRunPlanned => None,
+        }
+    }
+
+    /// Returns whether the output was planned but not executed yet.
+    #[must_use]
+    pub const fn is_planned(&self) -> bool {
+        matches!(self, Self::Planned)
+    }
+
+    /// Returns whether the output succeeded.
+    #[must_use]
+    pub const fn is_succeeded(&self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+
+    /// Returns whether the output failed.
+    #[must_use]
+    pub const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed | Self::ValidationFailed { .. })
+    }
+
+    /// Returns whether the output was skipped.
+    #[must_use]
+    pub const fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped { .. })
+    }
+
+    /// Returns whether the output was planned as part of a dry run.
+    #[must_use]
+    pub const fn is_dry_run_planned(&self) -> bool {
+        matches!(self, Self::DryRunPlanned)
+    }
+
+    /// Returns whether the output failed validation.
+    #[must_use]
+    pub const fn is_validation_failed(&self) -> bool {
+        matches!(self, Self::ValidationFailed { .. })
+    }
+}
+
+impl fmt::Display for OutputStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Skipped { reason } => write!(formatter, "{}:{reason}", self.kind()),
+            Self::ValidationFailed { validation } => {
+                write!(formatter, "{}:{validation}", self.kind())
+            }
+            Self::Planned | Self::Succeeded | Self::Failed | Self::DryRunPlanned => {
+                formatter.write_str(self.kind().as_str())
+            }
+        }
+    }
+}
+
 /// Validation and scan-summary options checked before workflow side effects.
 ///
 /// This type carries validation intent without starting validation I/O. Target
@@ -945,9 +1133,10 @@ impl ValidationOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        DryRunScanSummaryMode, FileCount, FileCountKind, PhaseStatus, PhaseStatusKind,
-        ReportReasonCode, RowCount, RowCountKind, TargetValidationMode, ValidationOptions,
-        ValidationStatus, ValidationStatusKind, u128_to_u64_saturating,
+        DryRunScanSummaryMode, FileCount, FileCountKind, OutputStatus, OutputStatusKind,
+        PhaseStatus, PhaseStatusKind, ReportReasonCode, RowCount, RowCountKind,
+        TargetValidationMode, ValidationOptions, ValidationStatus, ValidationStatusKind,
+        u128_to_u64_saturating,
     };
 
     #[test]
@@ -1356,6 +1545,90 @@ mod tests {
             PhaseStatus::unavailable(ReportReasonCode::MissingTargetAccess)
         );
         assert!(debug.contains("Unavailable"));
+        assert!(!debug.contains("server="));
+        assert!(!debug.contains("password"));
+    }
+
+    #[test]
+    fn output_status_kinds_expose_stable_codes() {
+        assert_eq!(OutputStatusKind::Planned.as_str(), "planned");
+        assert_eq!(OutputStatusKind::Succeeded.as_str(), "succeeded");
+        assert_eq!(OutputStatusKind::Failed.as_str(), "failed");
+        assert_eq!(OutputStatusKind::Skipped.as_str(), "skipped");
+        assert_eq!(OutputStatusKind::DryRunPlanned.as_str(), "dry_run_planned");
+        assert_eq!(
+            OutputStatusKind::ValidationFailed.as_str(),
+            "validation_failed"
+        );
+        assert_eq!(
+            OutputStatusKind::DryRunPlanned.to_string(),
+            "dry_run_planned"
+        );
+    }
+
+    #[test]
+    fn output_status_variants_expose_kind_reasons_validation_and_helpers() {
+        let planned = OutputStatus::planned();
+        let succeeded = OutputStatus::succeeded();
+        let failed = OutputStatus::failed();
+        let skipped = OutputStatus::skipped(ReportReasonCode::PriorFailure);
+        let dry_run = OutputStatus::dry_run_planned();
+        let validation =
+            ValidationStatus::required_but_failed(ReportReasonCode::MissingExactOutputRows);
+        let validation_failed = OutputStatus::validation_failed(validation);
+
+        assert_eq!(planned.kind(), OutputStatusKind::Planned);
+        assert_eq!(planned.reason(), None);
+        assert!(planned.is_planned());
+
+        assert_eq!(succeeded.kind(), OutputStatusKind::Succeeded);
+        assert!(succeeded.is_succeeded());
+
+        assert_eq!(failed.kind(), OutputStatusKind::Failed);
+        assert!(failed.is_failed());
+        assert!(!failed.is_validation_failed());
+
+        assert_eq!(skipped.kind(), OutputStatusKind::Skipped);
+        assert_eq!(skipped.reason(), Some(ReportReasonCode::PriorFailure));
+        assert!(skipped.is_skipped());
+
+        assert_eq!(dry_run.kind(), OutputStatusKind::DryRunPlanned);
+        assert!(dry_run.is_dry_run_planned());
+
+        assert_eq!(validation_failed.kind(), OutputStatusKind::ValidationFailed);
+        assert_eq!(validation_failed.validation(), Some(validation));
+        assert!(validation_failed.is_failed());
+        assert!(validation_failed.is_validation_failed());
+    }
+
+    #[test]
+    fn output_status_display_is_stable_and_safe() {
+        assert_eq!(OutputStatus::planned().to_string(), "planned");
+        assert_eq!(OutputStatus::succeeded().to_string(), "succeeded");
+        assert_eq!(OutputStatus::failed().to_string(), "failed");
+        assert_eq!(
+            OutputStatus::skipped(ReportReasonCode::PriorFailure).to_string(),
+            "skipped:prior_failure"
+        );
+        assert_eq!(
+            OutputStatus::dry_run_planned().to_string(),
+            "dry_run_planned"
+        );
+        assert_eq!(
+            OutputStatus::validation_failed(ValidationStatus::required_but_failed(
+                ReportReasonCode::MissingExactOutputRows
+            ))
+            .to_string(),
+            "validation_failed:required_but_failed:missing_exact_output_rows"
+        );
+
+        let debug = format!(
+            "{:?}",
+            OutputStatus::validation_failed(ValidationStatus::unavailable(
+                ReportReasonCode::MissingTargetAccess
+            ))
+        );
+        assert!(debug.contains("ValidationFailed"));
         assert!(!debug.contains("server="));
         assert!(!debug.contains("password"));
     }
