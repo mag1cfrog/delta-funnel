@@ -45,7 +45,8 @@ pub use query_engine::{
 };
 pub use report::{
     DryRunScanSummaryMode, FileCount, FileCountKind, ReportReasonCode, RowCount, RowCountKind,
-    TargetValidationMode, ValidationOptions, u128_to_u64_saturating, usize_to_u64_saturating,
+    TargetValidationMode, ValidationOptions, ValidationStatus, ValidationStatusKind,
+    u128_to_u64_saturating, usize_to_u64_saturating,
 };
 pub use sql_server::{
     LoadMode, MssqlBinaryPolicy, MssqlConnectionConfig, MssqlConnectionSource,

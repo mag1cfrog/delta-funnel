@@ -514,6 +514,189 @@ impl fmt::Display for ReportReasonCode {
     }
 }
 
+/// Classification for target-side validation status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationStatusKind {
+    /// Validation was disabled by caller configuration.
+    Disabled,
+    /// Validation ran and passed.
+    Passed,
+    /// Validation ran and failed.
+    Failed,
+    /// Validation did not run because it was intentionally skipped.
+    Skipped,
+    /// Validation could not run because required evidence was unavailable.
+    Unavailable,
+    /// Validation was required and could not pass.
+    RequiredButFailed,
+}
+
+impl ValidationStatusKind {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Unavailable => "unavailable",
+            Self::RequiredButFailed => "required_but_failed",
+        }
+    }
+}
+
+impl fmt::Display for ValidationStatusKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Target-side validation status for a report scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationStatus {
+    /// Validation was disabled by caller configuration.
+    Disabled {
+        /// Stable reason code explaining why validation is disabled.
+        reason: ReportReasonCode,
+    },
+    /// Validation ran and passed.
+    Passed,
+    /// Validation ran and failed.
+    Failed,
+    /// Validation did not run because it was intentionally skipped.
+    Skipped {
+        /// Stable reason code explaining why validation was skipped.
+        reason: ReportReasonCode,
+    },
+    /// Validation could not run because required evidence was unavailable.
+    Unavailable {
+        /// Stable reason code explaining why validation was unavailable.
+        reason: ReportReasonCode,
+    },
+    /// Validation was required and could not pass.
+    RequiredButFailed {
+        /// Stable reason code explaining why required validation failed.
+        reason: ReportReasonCode,
+    },
+}
+
+impl ValidationStatus {
+    /// Creates a disabled validation status.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self::Disabled {
+            reason: ReportReasonCode::ValidationDisabled,
+        }
+    }
+
+    /// Creates a passed validation status.
+    #[must_use]
+    pub const fn passed() -> Self {
+        Self::Passed
+    }
+
+    /// Creates a failed validation status.
+    #[must_use]
+    pub const fn failed() -> Self {
+        Self::Failed
+    }
+
+    /// Creates a skipped validation status with a stable reason code.
+    #[must_use]
+    pub const fn skipped(reason: ReportReasonCode) -> Self {
+        Self::Skipped { reason }
+    }
+
+    /// Creates an unavailable validation status with a stable reason code.
+    #[must_use]
+    pub const fn unavailable(reason: ReportReasonCode) -> Self {
+        Self::Unavailable { reason }
+    }
+
+    /// Creates a required-but-failed validation status with a stable reason code.
+    #[must_use]
+    pub const fn required_but_failed(reason: ReportReasonCode) -> Self {
+        Self::RequiredButFailed { reason }
+    }
+
+    /// Returns the validation status classification.
+    #[must_use]
+    pub const fn kind(&self) -> ValidationStatusKind {
+        match self {
+            Self::Disabled { .. } => ValidationStatusKind::Disabled,
+            Self::Passed => ValidationStatusKind::Passed,
+            Self::Failed => ValidationStatusKind::Failed,
+            Self::Skipped { .. } => ValidationStatusKind::Skipped,
+            Self::Unavailable { .. } => ValidationStatusKind::Unavailable,
+            Self::RequiredButFailed { .. } => ValidationStatusKind::RequiredButFailed,
+        }
+    }
+
+    /// Returns the stable reason code when this status carries one.
+    #[must_use]
+    pub const fn reason(&self) -> Option<ReportReasonCode> {
+        match self {
+            Self::Disabled { reason }
+            | Self::Skipped { reason }
+            | Self::Unavailable { reason }
+            | Self::RequiredButFailed { reason } => Some(*reason),
+            Self::Passed | Self::Failed => None,
+        }
+    }
+
+    /// Returns whether validation was disabled.
+    #[must_use]
+    pub const fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled { .. })
+    }
+
+    /// Returns whether validation passed.
+    #[must_use]
+    pub const fn is_passed(&self) -> bool {
+        matches!(self, Self::Passed)
+    }
+
+    /// Returns whether validation failed after running.
+    #[must_use]
+    pub const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    /// Returns whether validation was skipped.
+    #[must_use]
+    pub const fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped { .. })
+    }
+
+    /// Returns whether validation was unavailable.
+    #[must_use]
+    pub const fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
+
+    /// Returns whether required validation failed.
+    #[must_use]
+    pub const fn is_required_but_failed(&self) -> bool {
+        matches!(self, Self::RequiredButFailed { .. })
+    }
+
+    /// Returns whether this status represents successful validation.
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        matches!(self, Self::Passed)
+    }
+}
+
+impl fmt::Display for ValidationStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason() {
+            Some(reason) => write!(formatter, "{}:{reason}", self.kind()),
+            None => formatter.write_str(self.kind().as_str()),
+        }
+    }
+}
+
 /// Validation and scan-summary options checked before workflow side effects.
 ///
 /// This type carries validation intent without starting validation I/O. Target
@@ -610,7 +793,8 @@ impl ValidationOptions {
 mod tests {
     use super::{
         DryRunScanSummaryMode, FileCount, FileCountKind, ReportReasonCode, RowCount, RowCountKind,
-        TargetValidationMode, ValidationOptions, u128_to_u64_saturating,
+        TargetValidationMode, ValidationOptions, ValidationStatus, ValidationStatusKind,
+        u128_to_u64_saturating,
     };
 
     #[test]
@@ -857,6 +1041,100 @@ mod tests {
         let debug = format!("{:?}", ReportReasonCode::MissingTargetAccess);
 
         assert!(debug.contains("MissingTargetAccess"));
+        assert!(!debug.contains("server="));
+        assert!(!debug.contains("password"));
+    }
+
+    #[test]
+    fn validation_status_kinds_expose_stable_codes() {
+        assert_eq!(ValidationStatusKind::Disabled.as_str(), "disabled");
+        assert_eq!(ValidationStatusKind::Passed.as_str(), "passed");
+        assert_eq!(ValidationStatusKind::Failed.as_str(), "failed");
+        assert_eq!(ValidationStatusKind::Skipped.as_str(), "skipped");
+        assert_eq!(ValidationStatusKind::Unavailable.as_str(), "unavailable");
+        assert_eq!(
+            ValidationStatusKind::RequiredButFailed.as_str(),
+            "required_but_failed"
+        );
+        assert_eq!(
+            ValidationStatusKind::RequiredButFailed.to_string(),
+            "required_but_failed"
+        );
+    }
+
+    #[test]
+    fn validation_status_variants_expose_kind_reasons_and_helpers() {
+        let disabled = ValidationStatus::disabled();
+        let passed = ValidationStatus::passed();
+        let failed = ValidationStatus::failed();
+        let skipped = ValidationStatus::skipped(ReportReasonCode::DryRun);
+        let unavailable = ValidationStatus::unavailable(ReportReasonCode::MissingTargetAccess);
+        let required =
+            ValidationStatus::required_but_failed(ReportReasonCode::MissingExactOutputRows);
+
+        assert_eq!(disabled.kind(), ValidationStatusKind::Disabled);
+        assert_eq!(
+            disabled.reason(),
+            Some(ReportReasonCode::ValidationDisabled)
+        );
+        assert!(disabled.is_disabled());
+
+        assert_eq!(passed.kind(), ValidationStatusKind::Passed);
+        assert_eq!(passed.reason(), None);
+        assert!(passed.is_passed());
+        assert!(passed.is_success());
+
+        assert_eq!(failed.kind(), ValidationStatusKind::Failed);
+        assert_eq!(failed.reason(), None);
+        assert!(failed.is_failed());
+        assert!(!failed.is_success());
+
+        assert_eq!(skipped.kind(), ValidationStatusKind::Skipped);
+        assert_eq!(skipped.reason(), Some(ReportReasonCode::DryRun));
+        assert!(skipped.is_skipped());
+
+        assert_eq!(unavailable.kind(), ValidationStatusKind::Unavailable);
+        assert_eq!(
+            unavailable.reason(),
+            Some(ReportReasonCode::MissingTargetAccess)
+        );
+        assert!(unavailable.is_unavailable());
+
+        assert_eq!(required.kind(), ValidationStatusKind::RequiredButFailed);
+        assert_eq!(
+            required.reason(),
+            Some(ReportReasonCode::MissingExactOutputRows)
+        );
+        assert!(required.is_required_but_failed());
+    }
+
+    #[test]
+    fn validation_status_display_is_stable_and_safe() {
+        assert_eq!(
+            ValidationStatus::disabled().to_string(),
+            "disabled:validation_disabled"
+        );
+        assert_eq!(ValidationStatus::passed().to_string(), "passed");
+        assert_eq!(ValidationStatus::failed().to_string(), "failed");
+        assert_eq!(
+            ValidationStatus::skipped(ReportReasonCode::DryRun).to_string(),
+            "skipped:dry_run"
+        );
+        assert_eq!(
+            ValidationStatus::unavailable(ReportReasonCode::PermissionUnavailable).to_string(),
+            "unavailable:permission_unavailable"
+        );
+        assert_eq!(
+            ValidationStatus::required_but_failed(ReportReasonCode::MissingExactOutputRows)
+                .to_string(),
+            "required_but_failed:missing_exact_output_rows"
+        );
+
+        let debug = format!(
+            "{:?}",
+            ValidationStatus::required_but_failed(ReportReasonCode::MissingTargetAccess)
+        );
+        assert!(debug.contains("RequiredButFailed"));
         assert!(!debug.contains("server="));
         assert!(!debug.contains("password"));
     }
