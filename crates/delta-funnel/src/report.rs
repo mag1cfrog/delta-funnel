@@ -457,6 +457,63 @@ impl fmt::Display for FileCount {
     }
 }
 
+/// Stable reason codes for skipped, unavailable, and not-executed report states.
+///
+/// These codes are intentionally reusable across validation, source summary,
+/// output execution, and workflow phases so later reports do not need parallel
+/// reason vocabularies for the same state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportReasonCode {
+    /// Validation was disabled by caller configuration.
+    ValidationDisabled,
+    /// The workflow ran in dry-run mode.
+    DryRun,
+    /// A required system, provider, or output capability was unavailable.
+    CapabilityUnavailable,
+    /// A required permission was unavailable.
+    PermissionUnavailable,
+    /// A prior failure made this report state unreachable.
+    PriorFailure,
+    /// The requested load mode does not support this report state.
+    UnsupportedLoadMode,
+    /// The target could not be accessed for this report state.
+    MissingTargetAccess,
+    /// Exact output row evidence was required but not available.
+    MissingExactOutputRows,
+    /// Work was skipped to avoid expensive or invasive reads.
+    CostAvoidance,
+    /// The workflow step was not executed.
+    NotExecuted,
+    /// The workflow failed before validation could run.
+    FailureBeforeValidation,
+}
+
+impl ReportReasonCode {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ValidationDisabled => "validation_disabled",
+            Self::DryRun => "dry_run",
+            Self::CapabilityUnavailable => "capability_unavailable",
+            Self::PermissionUnavailable => "permission_unavailable",
+            Self::PriorFailure => "prior_failure",
+            Self::UnsupportedLoadMode => "unsupported_load_mode",
+            Self::MissingTargetAccess => "missing_target_access",
+            Self::MissingExactOutputRows => "missing_exact_output_rows",
+            Self::CostAvoidance => "cost_avoidance",
+            Self::NotExecuted => "not_executed",
+            Self::FailureBeforeValidation => "failure_before_validation",
+        }
+    }
+}
+
+impl fmt::Display for ReportReasonCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Validation and scan-summary options checked before workflow side effects.
 ///
 /// This type carries validation intent without starting validation I/O. Target
@@ -552,7 +609,7 @@ impl ValidationOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        DryRunScanSummaryMode, FileCount, FileCountKind, RowCount, RowCountKind,
+        DryRunScanSummaryMode, FileCount, FileCountKind, ReportReasonCode, RowCount, RowCountKind,
         TargetValidationMode, ValidationOptions, u128_to_u64_saturating,
     };
 
@@ -753,5 +810,54 @@ mod tests {
         assert_eq!(RowCount::partial_from_usize(7).value(), Some(7));
         assert_eq!(FileCount::exact_from_usize(8).value(), Some(8));
         assert_eq!(FileCount::estimated_from_usize(9).value(), Some(9));
+    }
+
+    #[test]
+    fn report_reason_codes_cover_stable_skip_and_unavailable_reasons() {
+        let cases = [
+            (ReportReasonCode::ValidationDisabled, "validation_disabled"),
+            (ReportReasonCode::DryRun, "dry_run"),
+            (
+                ReportReasonCode::CapabilityUnavailable,
+                "capability_unavailable",
+            ),
+            (
+                ReportReasonCode::PermissionUnavailable,
+                "permission_unavailable",
+            ),
+            (ReportReasonCode::PriorFailure, "prior_failure"),
+            (
+                ReportReasonCode::UnsupportedLoadMode,
+                "unsupported_load_mode",
+            ),
+            (
+                ReportReasonCode::MissingTargetAccess,
+                "missing_target_access",
+            ),
+            (
+                ReportReasonCode::MissingExactOutputRows,
+                "missing_exact_output_rows",
+            ),
+            (ReportReasonCode::CostAvoidance, "cost_avoidance"),
+            (ReportReasonCode::NotExecuted, "not_executed"),
+            (
+                ReportReasonCode::FailureBeforeValidation,
+                "failure_before_validation",
+            ),
+        ];
+
+        for (reason, code) in cases {
+            assert_eq!(reason.as_str(), code);
+            assert_eq!(reason.to_string(), code);
+        }
+    }
+
+    #[test]
+    fn report_reason_debug_does_not_include_external_values() {
+        let debug = format!("{:?}", ReportReasonCode::MissingTargetAccess);
+
+        assert!(debug.contains("MissingTargetAccess"));
+        assert!(!debug.contains("server="));
+        assert!(!debug.contains("password"));
     }
 }
