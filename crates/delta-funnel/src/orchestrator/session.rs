@@ -20,12 +20,12 @@ use crate::{
     MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlOutputWriteStatus,
     MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter,
     MssqlWorkflowWriteOptions, MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport,
-    QueryOptions, RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase, ValidationOptions,
-    datafusion_query_output_stream, datafusion_session_context, default_mssql_write_options,
-    load_delta_source, plan_mssql_target_for_resolved_output, preflight_delta_protocol,
-    register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
-    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
-    write_output_batches_to_mssql,
+    QueryOptions, RegisteredDeltaSource, ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase,
+    ValidationOptions, datafusion_query_output_stream, datafusion_session_context,
+    default_mssql_write_options, load_delta_source, plan_mssql_target_for_resolved_output,
+    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
+    support::sanitize_text_for_display, table_formats::validate_table_source_names,
+    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
 };
 
 /// Query-load action mode requested by a caller.
@@ -36,6 +36,119 @@ pub enum RunMode {
     Execute,
     /// Reuse planning paths without row production or SQL Server write effects.
     DryRun,
+}
+
+/// Conservative source usage status for a workflow report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceUsageStatus {
+    /// Source usage is known and the source was used by at least one selected output.
+    Used,
+    /// Source usage is known and the source was not used by selected outputs.
+    NotUsed,
+    /// Source usage could not be proven from available workflow analysis.
+    Unknown,
+}
+
+impl SourceUsageStatus {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Used => "used",
+            Self::NotUsed => "not_used",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for SourceUsageStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Source-level readiness report for one registered Delta source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaSourceReport {
+    source_name: String,
+    source_uri: String,
+    snapshot_version: u64,
+    protocol: DeltaProtocolReport,
+    file_count: crate::FileCount,
+    file_count_reason: Option<ReportReasonCode>,
+    scan_metadata_exhausted: bool,
+    usage_status: SourceUsageStatus,
+    used_by_output_names: Vec<String>,
+}
+
+impl DeltaSourceReport {
+    fn metadata_only(source: &RegisteredSessionSource) -> Self {
+        Self {
+            source_name: source.name().to_owned(),
+            source_uri: source.source_uri().to_owned(),
+            snapshot_version: source.snapshot_version(),
+            protocol: source.protocol().clone(),
+            file_count: crate::FileCount::unavailable(),
+            file_count_reason: Some(ReportReasonCode::CostAvoidance),
+            scan_metadata_exhausted: false,
+            usage_status: SourceUsageStatus::Unknown,
+            used_by_output_names: Vec::new(),
+        }
+    }
+
+    /// Returns the DataFusion table name for this source.
+    #[must_use]
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    /// Returns the sanitized Delta source URI or display summary.
+    #[must_use]
+    pub fn source_uri(&self) -> &str {
+        &self.source_uri
+    }
+
+    /// Returns the resolved Delta snapshot version.
+    #[must_use]
+    pub const fn snapshot_version(&self) -> u64 {
+        self.snapshot_version
+    }
+
+    /// Returns the Delta protocol report captured for this source.
+    #[must_use]
+    pub const fn protocol(&self) -> &DeltaProtocolReport {
+        &self.protocol
+    }
+
+    /// Returns file-count evidence for this source.
+    #[must_use]
+    pub const fn file_count(&self) -> crate::FileCount {
+        self.file_count
+    }
+
+    /// Returns the stable reason code for unavailable, skipped, or not-executed file counts.
+    #[must_use]
+    pub const fn file_count_reason(&self) -> Option<ReportReasonCode> {
+        self.file_count_reason
+    }
+
+    /// Returns whether scan metadata was exhausted while building this report.
+    #[must_use]
+    pub const fn scan_metadata_exhausted(&self) -> bool {
+        self.scan_metadata_exhausted
+    }
+
+    /// Returns known source usage status for the workflow scope that produced this report.
+    #[must_use]
+    pub const fn usage_status(&self) -> SourceUsageStatus {
+        self.usage_status
+    }
+
+    /// Returns selected output names known to use this source.
+    #[must_use]
+    pub fn used_by_output_names(&self) -> &[String] {
+        &self.used_by_output_names
+    }
 }
 
 /// Session-wide options for lazy query-load orchestration.
@@ -1318,6 +1431,7 @@ struct MssqlCoveredCacheAlias {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RegisteredSessionSource {
     table: LazyTable,
+    source_uri: String,
     snapshot_version: u64,
     schema: SchemaRef,
     protocol: DeltaProtocolReport,
@@ -1327,6 +1441,7 @@ impl RegisteredSessionSource {
     fn from_registered(table: LazyTable, registered: RegisteredDeltaSource) -> Self {
         Self {
             table,
+            source_uri: registered.table_uri,
             snapshot_version: registered.snapshot_version,
             schema: registered.schema,
             protocol: registered.protocol,
@@ -1343,6 +1458,12 @@ impl RegisteredSessionSource {
     #[must_use]
     pub fn name(&self) -> &str {
         self.table.name()
+    }
+
+    /// Returns the sanitized Delta source URI or display summary.
+    #[must_use]
+    pub fn source_uri(&self) -> &str {
+        &self.source_uri
     }
 
     /// Returns the resolved Delta snapshot version.
@@ -1369,6 +1490,7 @@ impl fmt::Debug for RegisteredSessionSource {
         formatter
             .debug_struct("RegisteredSessionSource")
             .field("table", &self.table)
+            .field("source_uri", &self.source_uri)
             .field("snapshot_version", &self.snapshot_version)
             .field("schema", &self.schema)
             .field("protocol", &self.protocol)
@@ -2277,6 +2399,15 @@ impl DeltaFunnelSession {
     #[must_use]
     pub fn sources(&self) -> &[RegisteredSessionSource] {
         &self.sources
+    }
+
+    /// Returns metadata-only Delta source readiness reports in registration order.
+    #[must_use]
+    pub fn source_reports(&self) -> Vec<DeltaSourceReport> {
+        self.sources
+            .iter()
+            .map(DeltaSourceReport::metadata_only)
+            .collect()
     }
 
     /// Finds a registered Delta source by alias using unquoted SQL semantics.
@@ -3989,6 +4120,14 @@ mod tests {
                 .map(|reference| reference.to_string())
                 .collect(),
         })
+    }
+
+    #[test]
+    fn source_usage_status_exposes_stable_codes() {
+        assert_eq!(SourceUsageStatus::Used.as_str(), "used");
+        assert_eq!(SourceUsageStatus::NotUsed.as_str(), "not_used");
+        assert_eq!(SourceUsageStatus::Unknown.as_str(), "unknown");
+        assert_eq!(SourceUsageStatus::Unknown.to_string(), "unknown");
     }
 
     #[test]
@@ -7742,9 +7881,25 @@ mod tests {
             .ok_or("expected registered source")?;
         assert_eq!(registered.table(), &lazy);
         assert_eq!(registered.name(), "orders");
+        assert!(registered.source_uri().starts_with("file://"));
         assert_eq!(registered.snapshot_version(), 1);
         assert_eq!(registered.protocol().source_name, "orders");
         assert_eq!(registered.schema().fields().len(), 2);
+        let source_reports = session.source_reports();
+        assert_eq!(source_reports.len(), 1);
+        let report = &source_reports[0];
+        assert_eq!(report.source_name(), "orders");
+        assert_eq!(report.source_uri(), registered.source_uri());
+        assert_eq!(report.snapshot_version(), 1);
+        assert_eq!(report.protocol().source_name, "orders");
+        assert_eq!(report.file_count(), crate::FileCount::unavailable());
+        assert_eq!(
+            report.file_count_reason(),
+            Some(crate::ReportReasonCode::CostAvoidance)
+        );
+        assert!(!report.scan_metadata_exhausted());
+        assert_eq!(report.usage_status(), SourceUsageStatus::Unknown);
+        assert!(report.used_by_output_names().is_empty());
 
         Ok(())
     }
@@ -8514,6 +8669,10 @@ mod tests {
         assert!(debug.contains("orders"));
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("AWS_SECRET_ACCESS_KEY"));
+        let report_debug = format!("{:?}", session.source_reports());
+        assert!(report_debug.contains("orders"));
+        assert!(!report_debug.contains("super-secret"));
+        assert!(!report_debug.contains("AWS_SECRET_ACCESS_KEY"));
         Ok(())
     }
 
