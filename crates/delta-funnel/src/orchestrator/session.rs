@@ -212,6 +212,12 @@ impl DeltaSourceReport {
         self
     }
 
+    fn with_provider_stats_reason(mut self, reason: ReportReasonCode) -> Self {
+        self.provider_read_stats = None;
+        self.provider_stats_reason = Some(reason);
+        self
+    }
+
     /// Returns the DataFusion table name for this source.
     #[must_use]
     pub fn source_name(&self) -> &str {
@@ -664,11 +670,20 @@ impl WriteAllOptions {
 pub struct WriteAllReport {
     workflow: MssqlWorkflowWriteReport,
     cache: WriteAllCacheReport,
+    sources: Vec<DeltaSourceReport>,
 }
 
 impl WriteAllReport {
-    fn new(workflow: MssqlWorkflowWriteReport, cache: WriteAllCacheReport) -> Self {
-        Self { workflow, cache }
+    fn new(
+        workflow: MssqlWorkflowWriteReport,
+        cache: WriteAllCacheReport,
+        sources: Vec<DeltaSourceReport>,
+    ) -> Self {
+        Self {
+            workflow,
+            cache,
+            sources,
+        }
     }
 
     /// Returns the lower-level SQL Server workflow report.
@@ -681,6 +696,12 @@ impl WriteAllReport {
     #[must_use]
     pub const fn cache(&self) -> &WriteAllCacheReport {
         &self.cache
+    }
+
+    /// Returns Delta source reports in session registration order.
+    #[must_use]
+    pub fn sources(&self) -> &[DeltaSourceReport] {
+        &self.sources
     }
 
     /// Returns the number of selected outputs represented by this report.
@@ -2251,9 +2272,11 @@ impl DeltaFunnelSession {
                 let workflow = self
                     .write_all_baseline_with_writer(&planned_outputs, writer)
                     .await?;
+                let sources = self.source_reports_for_planned_outputs(&planned_outputs)?;
                 Ok(WriteAllReport::new(
                     workflow,
                     WriteAllCacheReport::disabled(),
+                    sources,
                 ))
             }
         }
@@ -2312,14 +2335,16 @@ impl DeltaFunnelSession {
                 let workflow = self
                     .write_all_baseline_with_writer(planned_outputs, writer)
                     .await?;
-                Ok(WriteAllReport::new(workflow, cache))
+                let sources = self.source_reports_for_planned_outputs(planned_outputs)?;
+                Ok(WriteAllReport::new(workflow, cache, sources))
             }
             MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
                 let workflow = self
                     .write_all_cached_with_writer(planned_outputs, cache_aliases, writer)
                     .await?;
                 let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
-                Ok(WriteAllReport::new(workflow, cache))
+                let sources = self.source_reports_for_planned_outputs(planned_outputs)?;
+                Ok(WriteAllReport::new(workflow, cache, sources))
             }
         }
     }
@@ -2356,14 +2381,16 @@ impl DeltaFunnelSession {
             MssqlOutputCacheDecision::NoCache { .. } => {
                 let cache = WriteAllCacheReport::from_plan(cache_plan);
                 let workflow = self.write_all_baseline(planned_outputs).await?;
-                Ok(WriteAllReport::new(workflow, cache))
+                let sources = self.source_reports_for_planned_outputs(planned_outputs)?;
+                Ok(WriteAllReport::new(workflow, cache, sources))
             }
             MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
                 let workflow = self
                     .write_all_cached(planned_outputs, cache_aliases)
                     .await?;
                 let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
-                Ok(WriteAllReport::new(workflow, cache))
+                let sources = self.source_reports_for_planned_outputs(planned_outputs)?;
+                Ok(WriteAllReport::new(workflow, cache, sources))
             }
         }
     }
@@ -2410,9 +2437,11 @@ impl DeltaFunnelSession {
             WriteAllCacheMode::Auto => self.write_all_auto(requests, &planned_outputs).await,
             WriteAllCacheMode::Disabled => {
                 let workflow = self.write_all_baseline(&planned_outputs).await?;
+                let sources = self.source_reports_for_planned_outputs(&planned_outputs)?;
                 Ok(WriteAllReport::new(
                     workflow,
                     WriteAllCacheReport::disabled(),
+                    sources,
                 ))
             }
         }
@@ -2605,13 +2634,44 @@ impl DeltaFunnelSession {
         &self,
         outputs: &[MssqlDryRunOutputReport],
     ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        self.source_reports_for_output_tables(outputs.iter().map(|output| {
+            (
+                output.output_name().to_owned(),
+                output.planned_output().table(),
+            )
+        }))
+    }
+
+    fn source_reports_for_planned_outputs(
+        &self,
+        outputs: &[PlannedMssqlOutput],
+    ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        Ok(self
+            .source_reports_for_output_tables(outputs.iter().map(|output| {
+                (
+                    output.output_plan().output_name().to_owned(),
+                    output.table(),
+                )
+            }))?
+            .into_iter()
+            .map(|report| {
+                report.with_provider_stats_reason(ReportReasonCode::CapabilityUnavailable)
+            })
+            .collect())
+    }
+
+    fn source_reports_for_output_tables<'a>(
+        &self,
+        outputs: impl IntoIterator<Item = (String, &'a LazyTable)>,
+    ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        let outputs = outputs.into_iter().collect::<Vec<_>>();
         let mut output_sources = Vec::with_capacity(outputs.len());
         let mut all_usage_known = true;
 
-        for output in outputs {
-            match self.known_source_dependencies_for_table(output.planned_output().table())? {
+        for (output_name, table) in outputs {
+            match self.known_source_dependencies_for_table(table)? {
                 Some(source_ids) => {
-                    output_sources.push((output.output_name().to_owned(), source_ids));
+                    output_sources.push((output_name, source_ids));
                 }
                 None => {
                     all_usage_known = false;
@@ -7311,6 +7371,56 @@ mod tests {
         assert_eq!(
             west_report.cleanup(),
             MssqlTargetCleanupStatus::NotApplicable
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_with_writer_reports_delta_sources_for_executed_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let selected_orders = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let request = execute_output_request(
+            selected_orders,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::default();
+
+        let report = session
+            .write_all_with_options_and_writer(
+                &[request],
+                WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                writer,
+            )
+            .await?;
+
+        assert_eq!(report.outputs().len(), 1);
+        assert_eq!(report.outputs()[0].output_name(), "orders_output");
+        assert_eq!(report.sources().len(), 1);
+        let source = &report.sources()[0];
+        assert_eq!(source.source_name(), "orders");
+        assert_eq!(source.usage_status(), SourceUsageStatus::Used);
+        assert_eq!(source.used_by_output_names(), &["orders_output".to_owned()]);
+        assert_eq!(source.file_count(), crate::FileCount::unavailable());
+        assert_eq!(
+            source.file_count_reason(),
+            Some(crate::ReportReasonCode::CostAvoidance)
+        );
+        assert!(source.provider_read_stats().is_none());
+        assert_eq!(
+            source.provider_stats_reason(),
+            Some(crate::ReportReasonCode::CapabilityUnavailable)
         );
         Ok(())
     }
