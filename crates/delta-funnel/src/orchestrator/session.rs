@@ -1150,6 +1150,24 @@ impl MssqlDryRunOutputReport {
         self.planned_output.output_plan().output_name()
     }
 
+    /// Returns the selected lazy table id.
+    #[must_use]
+    pub const fn table_id(&self) -> u64 {
+        self.planned_output.table().id()
+    }
+
+    /// Returns the selected lazy table kind.
+    #[must_use]
+    pub const fn table_kind(&self) -> LazyTableKind {
+        self.planned_output.table().kind()
+    }
+
+    /// Returns the selected lazy table name.
+    #[must_use]
+    pub fn table_name(&self) -> &str {
+        self.planned_output.table().name()
+    }
+
     /// Returns the planned Arrow output schema in output field order.
     #[must_use]
     pub fn output_schema(&self) -> &[MssqlDryRunOutputFieldReport] {
@@ -7234,6 +7252,8 @@ mod tests {
         let east = session
             .table_from_sql("select marker from orders_source where region = 'east'")
             .await?;
+        let west_table_id = west.id();
+        let west_table_name = west.name().to_owned();
         let west = output_request(west, "west_output", "west_orders", LoadMode::CreateAndLoad)?;
         let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
 
@@ -7245,6 +7265,9 @@ mod tests {
         assert!(!report.is_empty());
         assert_eq!(report.outputs()[0].output_name(), "west_output");
         assert_eq!(report.outputs()[1].output_name(), "east_output");
+        assert_eq!(report.outputs()[0].table_id(), west_table_id);
+        assert_eq!(report.outputs()[0].table_kind(), LazyTableKind::DerivedSql);
+        assert_eq!(report.outputs()[0].table_name(), west_table_name);
         assert_eq!(
             report.outputs()[0].status(),
             OutputStatus::dry_run_planned()
