@@ -626,6 +626,50 @@ impl OutputWritePlan {
     }
 }
 
+/// Output schema field included in an MSSQL dry-run report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MssqlDryRunOutputFieldReport {
+    index: u64,
+    name: String,
+    arrow_type: String,
+    nullable: bool,
+}
+
+impl MssqlDryRunOutputFieldReport {
+    fn from_mapping(mapping: &arrow_tiberius::SchemaMapping) -> Self {
+        Self {
+            index: crate::usize_to_u64_saturating(mapping.arrow().index()),
+            name: mapping.arrow().name().to_owned(),
+            arrow_type: mapping.arrow().data_type().to_string(),
+            nullable: mapping.arrow().nullable(),
+        }
+    }
+
+    /// Returns the zero-based output field index.
+    #[must_use]
+    pub const fn index(&self) -> u64 {
+        self.index
+    }
+
+    /// Returns the output field name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the Arrow data type as a stable display string.
+    #[must_use]
+    pub fn arrow_type(&self) -> &str {
+        &self.arrow_type
+    }
+
+    /// Returns true when the output field is nullable.
+    #[must_use]
+    pub const fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
 /// Cache policy for one multi-output `write_all` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WriteAllCacheMode {
@@ -1063,6 +1107,7 @@ impl PlannedMssqlOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlDryRunOutputReport {
     planned_output: PlannedMssqlOutput,
+    output_schema: Vec<MssqlDryRunOutputFieldReport>,
     sql_server_contacted: bool,
     row_production_started: bool,
     table_lifecycle_started: bool,
@@ -1071,8 +1116,16 @@ pub struct MssqlDryRunOutputReport {
 
 impl MssqlDryRunOutputReport {
     fn new(planned_output: PlannedMssqlOutput) -> Self {
+        let output_schema = planned_output
+            .output_plan()
+            .schema_mappings()
+            .iter()
+            .map(MssqlDryRunOutputFieldReport::from_mapping)
+            .collect();
+
         Self {
             planned_output,
+            output_schema,
             sql_server_contacted: false,
             row_production_started: false,
             table_lifecycle_started: false,
@@ -1090,6 +1143,12 @@ impl MssqlDryRunOutputReport {
     #[must_use]
     pub fn output_name(&self) -> &str {
         self.planned_output.output_plan().output_name()
+    }
+
+    /// Returns the planned Arrow output schema in output field order.
+    #[must_use]
+    pub fn output_schema(&self) -> &[MssqlDryRunOutputFieldReport] {
+        &self.output_schema
     }
 
     /// Returns the dry-run action mode.
@@ -7013,6 +7072,11 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(report.output_schema().len(), 1);
+        assert_eq!(report.output_schema()[0].index(), 0);
+        assert_eq!(report.output_schema()[0].name(), "marker");
+        assert_eq!(report.output_schema()[0].arrow_type(), "Utf8");
+        assert!(!report.output_schema()[0].nullable());
         assert!(!report.sql_server_contacted());
         assert!(!report.row_production_started());
         assert!(!report.table_lifecycle_started());

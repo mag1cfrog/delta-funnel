@@ -6,9 +6,9 @@ mod session;
 pub use runtime::DeltaFunnelRuntime;
 pub use session::{
     DeltaFunnelSession, DeltaProviderSchedulingReport, DeltaSourceReport, LazyTable, LazyTableKind,
-    MssqlDryRunOutputReport, MssqlDryRunWorkflowReport, MssqlOutputTarget, OutputWritePlan,
-    PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions,
-    SourceUsageStatus, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
-    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheMode,
-    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
+    MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunWorkflowReport,
+    MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable,
+    RegisteredSessionSource, RunMode, SessionOptions, SourceUsageStatus, WriteAllCacheAliasReport,
+    WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
+    WriteAllCacheMode, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
 };
