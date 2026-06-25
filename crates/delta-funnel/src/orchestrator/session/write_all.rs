@@ -1748,7 +1748,13 @@ pub(super) fn ensure_unique_write_all_output_names(
 
 #[cfg(test)]
 mod tests {
-    use super::{WriteAllCacheMode, WriteAllOptions};
+    use super::super::{
+        DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, RunMode,
+        SessionOptions,
+        test_support::{output_request, secret_connection},
+    };
+    use super::{MssqlNoCacheReason, MssqlOutputCacheDecision, WriteAllCacheMode, WriteAllOptions};
+    use crate::{DeltaFunnelError, LoadMode, MssqlTargetConfig, MssqlTargetTable};
 
     #[test]
     fn write_all_options_default_to_auto_cache_mode() {
@@ -1761,5 +1767,85 @@ mod tests {
                 .cache_mode(),
             WriteAllCacheMode::Disabled
         );
+    }
+
+    #[test]
+    fn cache_plan_shell_preserves_selected_output_order() -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let west = output_request(
+            LazyTable::placeholder(7, LazyTableKind::DerivedSql),
+            "west_output",
+            "west_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let east = output_request(
+            LazyTable::placeholder(8, LazyTableKind::DerivedSql),
+            "east_output",
+            "east_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let plan = session.plan_mssql_output_cache(&[west, east]);
+
+        assert_eq!(
+            plan.decision(),
+            &MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::NoSharedRegisteredDerivedAlias,
+            }
+        );
+        assert!(plan.skipped_candidates().is_empty());
+        assert_eq!(plan.selected_outputs().len(), 2);
+        assert_eq!(plan.selected_outputs()[0].index(), 0);
+        assert_eq!(plan.selected_outputs()[0].table_id(), 7);
+        assert_eq!(plan.selected_outputs()[0].table_name(), "table_7");
+        assert_eq!(plan.selected_outputs()[0].output_name(), "west_output");
+        assert_eq!(plan.selected_outputs()[1].index(), 1);
+        assert_eq!(plan.selected_outputs()[1].table_id(), 8);
+        assert_eq!(plan.selected_outputs()[1].table_name(), "table_8");
+        assert_eq!(plan.selected_outputs()[1].output_name(), "east_output");
+        Ok(())
+    }
+
+    #[test]
+    fn cache_plan_shell_reports_single_output_as_not_shared() -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let output = output_request(
+            LazyTable::placeholder(7, LazyTableKind::DerivedSql),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let plan = session.plan_mssql_output_cache(&[output]);
+
+        assert_eq!(
+            plan.decision(),
+            &MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::FewerThanTwoOutputs,
+            }
+        );
+        assert_eq!(plan.selected_outputs().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cache_plan_debug_omits_target_connection_material() -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?)
+            .with_connection(secret_connection()?);
+        let output = OutputWritePlan::new(
+            LazyTable::placeholder(7, LazyTableKind::DerivedSql),
+            MssqlOutputTarget::new("orders\noutput", target_config, RunMode::DryRun),
+        );
+
+        let debug = format!("{:?}", session.plan_mssql_output_cache(&[output]));
+
+        assert!(debug.contains("orders"));
+        assert!(debug.contains("output"));
+        assert!(!debug.contains('\n'));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("server=tcp"));
+        Ok(())
     }
 }
