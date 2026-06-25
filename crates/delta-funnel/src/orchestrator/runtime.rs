@@ -90,6 +90,22 @@ impl DeltaFunnelRuntime {
         session.dry_run_all_to_mssql(requests)
     }
 
+    /// Runs a multi-output dry run with source scan-summary options.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as
+    /// [`DeltaFunnelSession::dry_run_all_to_mssql_with_scan_summary`].
+    pub fn dry_run_all_to_mssql_with_scan_summary(
+        &self,
+        session: &DeltaFunnelSession,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.dry_run_all_to_mssql_with_scan_summary(requests))
+    }
+
     /// Blocks on one selected output write.
     ///
     /// # Errors
@@ -183,9 +199,11 @@ mod tests {
     use futures_util::StreamExt;
 
     use crate::{
-        LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlOutputBatchStream,
-        MssqlOutputTarget, MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetOutputPlan,
-        MssqlTargetTable, MssqlWriteOptions, ResolvedMssqlTarget, RunMode, SessionOptions,
+        DeltaSourceConfig, DryRunScanSummaryMode, LoadMode, MssqlConnectionConfig,
+        MssqlConnectionSource, MssqlOutputBatchStream, MssqlOutputTarget, MssqlTargetCleanupStatus,
+        MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteOptions,
+        ResolvedMssqlTarget, RunMode, SessionOptions, ValidationOptions,
+        table_formats::RealParquetDeltaTable,
     };
 
     fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
@@ -352,6 +370,32 @@ mod tests {
         assert_eq!(report.outputs()[0].output_name(), "west_output");
         assert_eq!(report.outputs()[1].output_name(), "east_output");
         assert!(!report.sql_server_contacted());
+        assert!(!report.row_production_started());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_drives_dry_run_scan_summary() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = DeltaFunnelRuntime::new()?;
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new()
+                .with_default_mssql_connection(secret_connection()?)
+                .with_validation_options(
+                    ValidationOptions::new()
+                        .with_dry_run_scan_summary_mode(DryRunScanSummaryMode::ExhaustScanMetadata),
+                ),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let request = output_request(source, "orders_output", "orders_sink")?;
+
+        let report = runtime.dry_run_all_to_mssql_with_scan_summary(&session, &[request])?;
+
+        assert_eq!(report.sources().len(), 1);
+        assert!(report.sources()[0].provider_read_stats().is_some());
         assert!(!report.row_production_started());
         Ok(())
     }

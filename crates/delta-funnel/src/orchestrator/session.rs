@@ -1,32 +1,42 @@
 //! Rust backing model for lazy query-load orchestration.
 //!
 //! This module owns the high-level session and request data shapes that will
-//! later back the Python `Session` and `Table` API. It intentionally does not
-//! contact SQL Server, produce physical query plans, or execute rows.
+//! later back the Python `Session` and `Table` API. Metadata report helpers do
+//! not contact SQL Server or execute rows unless a write path explicitly does so.
 
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use datafusion::common::TableReference;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SQLOptions, SessionContext};
 use datafusion::sql::{parser::DFParser, resolve::resolve_table_references};
 use datafusion::{datasource::TableProvider, prelude::DataFrame};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 
 use crate::{
-    BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaProviderScanExecutionOptions,
-    DeltaSourceConfig, DeltaTableProviderConfig, MssqlConnectionConfig, MssqlOutputBatchStream,
-    MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlOutputWriteStatus,
-    MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter,
-    MssqlWorkflowWriteOptions, MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport,
-    QueryOptions, RegisteredDeltaSource, ResolvedMssqlTarget, SqlTablePhase, ValidationOptions,
-    datafusion_query_output_stream, datafusion_session_context, default_mssql_write_options,
-    load_delta_source, plan_mssql_target_for_resolved_output, preflight_delta_protocol,
-    register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
-    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
-    write_output_batches_to_mssql,
+    BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaProviderReaderBackend,
+    DeltaProviderScanExecutionOptions, DeltaSourceConfig, DeltaTableProviderConfig,
+    MssqlConnectionConfig, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
+    MssqlOutputWriteJob, MssqlOutputWriteStatus, MssqlSchemaPlanOptions, MssqlTargetConfig,
+    MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWorkflowWriteOptions,
+    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, QueryOptions,
+    RegisteredDeltaSource, ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase, ValidationOptions,
+    collect_delta_provider_read_stats, datafusion_query_output_stream, datafusion_session_context,
+    default_mssql_write_options, load_delta_source, plan_mssql_target_for_resolved_output,
+    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
+    support::sanitize_text_for_display, table_formats::validate_table_source_names,
+    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
 };
+
+type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
 
 /// Query-load action mode requested by a caller.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -36,6 +46,254 @@ pub enum RunMode {
     Execute,
     /// Reuse planning paths without row production or SQL Server write effects.
     DryRun,
+}
+
+/// Conservative source usage status for a workflow report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceUsageStatus {
+    /// Source usage is known and the source was used by at least one selected output.
+    Used,
+    /// Source usage is known and the source was not used by selected outputs.
+    NotUsed,
+    /// Source usage could not be proven from available workflow analysis.
+    Unknown,
+}
+
+impl SourceUsageStatus {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Used => "used",
+            Self::NotUsed => "not_used",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for SourceUsageStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Source-level readiness report for one registered Delta source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaSourceReport {
+    source_name: String,
+    source_uri: String,
+    snapshot_version: u64,
+    protocol: DeltaProtocolReport,
+    scheduling: DeltaProviderSchedulingReport,
+    file_count: crate::FileCount,
+    file_count_reason: Option<ReportReasonCode>,
+    scan_metadata_exhausted: bool,
+    usage_status: SourceUsageStatus,
+    used_by_output_names: Vec<String>,
+    provider_read_stats: Option<crate::DeltaProviderReadStatsSnapshot>,
+    provider_stats_reason: Option<ReportReasonCode>,
+}
+
+/// Configured provider scheduling options included with a Delta source report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaProviderSchedulingReport {
+    query_target_partitions: Option<u64>,
+    reader_backend: DeltaProviderReaderBackend,
+    max_concurrent_file_reads_per_scan: u64,
+    max_concurrent_file_reads_per_partition: u64,
+    output_buffer_capacity_per_partition: u64,
+    native_async_prefetch_file_count_per_partition: u64,
+}
+
+impl DeltaProviderSchedulingReport {
+    fn from_options(
+        query_options: QueryOptions,
+        scan_options: DeltaProviderScanExecutionOptions,
+    ) -> Self {
+        Self {
+            query_target_partitions: query_options
+                .target_partitions
+                .map(crate::usize_to_u64_saturating),
+            reader_backend: scan_options.reader_backend,
+            max_concurrent_file_reads_per_scan: crate::usize_to_u64_saturating(
+                scan_options.max_concurrent_file_reads_per_scan,
+            ),
+            max_concurrent_file_reads_per_partition: crate::usize_to_u64_saturating(
+                scan_options.max_concurrent_file_reads_per_partition,
+            ),
+            output_buffer_capacity_per_partition: crate::usize_to_u64_saturating(
+                scan_options.output_buffer_capacity_per_partition,
+            ),
+            native_async_prefetch_file_count_per_partition: crate::usize_to_u64_saturating(
+                scan_options.native_async_prefetch_file_count_per_partition,
+            ),
+        }
+    }
+
+    /// Returns the configured DataFusion target partition count, when set.
+    #[must_use]
+    pub const fn query_target_partitions(&self) -> Option<u64> {
+        self.query_target_partitions
+    }
+
+    /// Returns the provider reader backend configured for source scans.
+    #[must_use]
+    pub const fn reader_backend(&self) -> DeltaProviderReaderBackend {
+        self.reader_backend
+    }
+
+    /// Returns the configured scan-wide file-read concurrency cap.
+    #[must_use]
+    pub const fn max_concurrent_file_reads_per_scan(&self) -> u64 {
+        self.max_concurrent_file_reads_per_scan
+    }
+
+    /// Returns the configured per-partition file-read concurrency cap.
+    #[must_use]
+    pub const fn max_concurrent_file_reads_per_partition(&self) -> u64 {
+        self.max_concurrent_file_reads_per_partition
+    }
+
+    /// Returns the configured per-partition provider output buffer capacity.
+    #[must_use]
+    pub const fn output_buffer_capacity_per_partition(&self) -> u64 {
+        self.output_buffer_capacity_per_partition
+    }
+
+    /// Returns the native async prefetch depth per execution partition.
+    #[must_use]
+    pub const fn native_async_prefetch_file_count_per_partition(&self) -> u64 {
+        self.native_async_prefetch_file_count_per_partition
+    }
+}
+
+impl DeltaSourceReport {
+    fn metadata_only(
+        source: &RegisteredSessionSource,
+        scheduling: DeltaProviderSchedulingReport,
+    ) -> Self {
+        Self {
+            source_name: source.name().to_owned(),
+            source_uri: source.source_uri().to_owned(),
+            snapshot_version: source.snapshot_version(),
+            protocol: source.protocol().clone(),
+            scheduling,
+            file_count: crate::FileCount::unavailable(),
+            file_count_reason: Some(ReportReasonCode::CostAvoidance),
+            scan_metadata_exhausted: false,
+            usage_status: SourceUsageStatus::Unknown,
+            used_by_output_names: Vec::new(),
+            provider_read_stats: None,
+            provider_stats_reason: Some(ReportReasonCode::NotExecuted),
+        }
+    }
+
+    fn with_usage(
+        mut self,
+        usage_status: SourceUsageStatus,
+        used_by_output_names: Vec<String>,
+    ) -> Self {
+        self.usage_status = usage_status;
+        self.used_by_output_names = used_by_output_names;
+        self
+    }
+
+    fn with_provider_read_stats(mut self, stats: crate::DeltaProviderReadStatsSnapshot) -> Self {
+        self.scan_metadata_exhausted = stats.scan_metadata_exhausted.unwrap_or(false);
+        self.file_count = match stats.scan_metadata_exhausted {
+            Some(true) => crate::FileCount::exact(stats.files_planned),
+            Some(false) => crate::FileCount::estimated(stats.files_planned),
+            None => crate::FileCount::unavailable(),
+        };
+        self.file_count_reason = match self.file_count {
+            crate::FileCount::Exact(_) | crate::FileCount::Estimated(_) => None,
+            crate::FileCount::Unavailable => Some(ReportReasonCode::CapabilityUnavailable),
+            crate::FileCount::Skipped | crate::FileCount::NotExecuted => {
+                Some(ReportReasonCode::NotExecuted)
+            }
+        };
+        self.provider_read_stats = Some(stats);
+        self.provider_stats_reason = None;
+        self
+    }
+
+    fn with_provider_stats_reason(mut self, reason: ReportReasonCode) -> Self {
+        self.provider_read_stats = None;
+        self.provider_stats_reason = Some(reason);
+        self
+    }
+
+    /// Returns the DataFusion table name for this source.
+    #[must_use]
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    /// Returns the sanitized Delta source URI or display summary.
+    #[must_use]
+    pub fn source_uri(&self) -> &str {
+        &self.source_uri
+    }
+
+    /// Returns the resolved Delta snapshot version.
+    #[must_use]
+    pub const fn snapshot_version(&self) -> u64 {
+        self.snapshot_version
+    }
+
+    /// Returns the Delta protocol report captured for this source.
+    #[must_use]
+    pub const fn protocol(&self) -> &DeltaProtocolReport {
+        &self.protocol
+    }
+
+    /// Returns the configured provider scheduling options for this source.
+    #[must_use]
+    pub const fn scheduling(&self) -> &DeltaProviderSchedulingReport {
+        &self.scheduling
+    }
+
+    /// Returns file-count evidence for this source.
+    #[must_use]
+    pub const fn file_count(&self) -> crate::FileCount {
+        self.file_count
+    }
+
+    /// Returns the stable reason code for unavailable, skipped, or not-executed file counts.
+    #[must_use]
+    pub const fn file_count_reason(&self) -> Option<ReportReasonCode> {
+        self.file_count_reason
+    }
+
+    /// Returns whether scan metadata was exhausted while building this report.
+    #[must_use]
+    pub const fn scan_metadata_exhausted(&self) -> bool {
+        self.scan_metadata_exhausted
+    }
+
+    /// Returns known source usage status for the workflow scope that produced this report.
+    #[must_use]
+    pub const fn usage_status(&self) -> SourceUsageStatus {
+        self.usage_status
+    }
+
+    /// Returns selected output names known to use this source.
+    #[must_use]
+    pub fn used_by_output_names(&self) -> &[String] {
+        &self.used_by_output_names
+    }
+
+    /// Returns provider read statistics when planning or execution made them available.
+    #[must_use]
+    pub const fn provider_read_stats(&self) -> Option<&crate::DeltaProviderReadStatsSnapshot> {
+        self.provider_read_stats.as_ref()
+    }
+
+    /// Returns the stable reason code when provider read statistics are absent.
+    #[must_use]
+    pub const fn provider_stats_reason(&self) -> Option<ReportReasonCode> {
+        self.provider_stats_reason
+    }
 }
 
 /// Session-wide options for lazy query-load orchestration.
@@ -417,11 +675,20 @@ impl WriteAllOptions {
 pub struct WriteAllReport {
     workflow: MssqlWorkflowWriteReport,
     cache: WriteAllCacheReport,
+    sources: Vec<DeltaSourceReport>,
 }
 
 impl WriteAllReport {
-    fn new(workflow: MssqlWorkflowWriteReport, cache: WriteAllCacheReport) -> Self {
-        Self { workflow, cache }
+    fn new(
+        workflow: MssqlWorkflowWriteReport,
+        cache: WriteAllCacheReport,
+        sources: Vec<DeltaSourceReport>,
+    ) -> Self {
+        Self {
+            workflow,
+            cache,
+            sources,
+        }
     }
 
     /// Returns the lower-level SQL Server workflow report.
@@ -434,6 +701,12 @@ impl WriteAllReport {
     #[must_use]
     pub const fn cache(&self) -> &WriteAllCacheReport {
         &self.cache
+    }
+
+    /// Returns Delta source reports in session registration order.
+    #[must_use]
+    pub fn sources(&self) -> &[DeltaSourceReport] {
+        &self.sources
     }
 
     /// Returns the number of selected outputs represented by this report.
@@ -854,11 +1127,12 @@ impl MssqlDryRunOutputReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlDryRunWorkflowReport {
     outputs: Vec<MssqlDryRunOutputReport>,
+    sources: Vec<DeltaSourceReport>,
 }
 
 impl MssqlDryRunWorkflowReport {
-    fn new(outputs: Vec<MssqlDryRunOutputReport>) -> Self {
-        Self { outputs }
+    fn new(outputs: Vec<MssqlDryRunOutputReport>, sources: Vec<DeltaSourceReport>) -> Self {
+        Self { outputs, sources }
     }
 
     /// Returns the dry-run action mode.
@@ -883,6 +1157,12 @@ impl MssqlDryRunWorkflowReport {
     #[must_use]
     pub fn outputs(&self) -> &[MssqlDryRunOutputReport] {
         &self.outputs
+    }
+
+    /// Returns source-level reports in session registration order.
+    #[must_use]
+    pub fn sources(&self) -> &[DeltaSourceReport] {
+        &self.sources
     }
 
     /// Returns whether dry-run planning contacted SQL Server for any output.
@@ -1318,6 +1598,7 @@ struct MssqlCoveredCacheAlias {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RegisteredSessionSource {
     table: LazyTable,
+    source_uri: String,
     snapshot_version: u64,
     schema: SchemaRef,
     protocol: DeltaProtocolReport,
@@ -1327,6 +1608,7 @@ impl RegisteredSessionSource {
     fn from_registered(table: LazyTable, registered: RegisteredDeltaSource) -> Self {
         Self {
             table,
+            source_uri: registered.table_uri,
             snapshot_version: registered.snapshot_version,
             schema: registered.schema,
             protocol: registered.protocol,
@@ -1343,6 +1625,12 @@ impl RegisteredSessionSource {
     #[must_use]
     pub fn name(&self) -> &str {
         self.table.name()
+    }
+
+    /// Returns the sanitized Delta source URI or display summary.
+    #[must_use]
+    pub fn source_uri(&self) -> &str {
+        &self.source_uri
     }
 
     /// Returns the resolved Delta snapshot version.
@@ -1369,6 +1657,7 @@ impl fmt::Debug for RegisteredSessionSource {
         formatter
             .debug_struct("RegisteredSessionSource")
             .field("table", &self.table)
+            .field("source_uri", &self.source_uri)
             .field("snapshot_version", &self.snapshot_version)
             .field("schema", &self.schema)
             .field("protocol", &self.protocol)
@@ -1796,9 +2085,55 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        let outputs = self.plan_dry_run_all_outputs(requests)?;
+        let sources = self.source_reports_for_dry_run_outputs(&outputs)?;
+
+        Ok(MssqlDryRunWorkflowReport::new(outputs, sources))
+    }
+
+    /// Dry-runs multiple selected lazy tables and honors source scan-summary options.
+    ///
+    /// This method is async because
+    /// [`crate::DryRunScanSummaryMode::ExhaustScanMetadata`] requires
+    /// DataFusion physical planning to expose provider scan metadata. It still
+    /// stops before row production, SQL Server lifecycle work, bulk writer
+    /// construction, or row writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first duplicate-output, run-mode, output-planning, or
+    /// DataFusion physical-planning error.
+    pub async fn dry_run_all_to_mssql_with_scan_summary(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        let outputs = self.plan_dry_run_all_outputs(requests)?;
+        let sources = match self
+            .options
+            .validation_options()
+            .dry_run_scan_summary_mode()
+        {
+            crate::DryRunScanSummaryMode::MetadataOnly => {
+                self.source_reports_for_dry_run_outputs(&outputs)?
+            }
+            crate::DryRunScanSummaryMode::ExhaustScanMetadata => self
+                .source_reports_for_dry_run_outputs_with_provider_stats(
+                    &outputs,
+                    self.provider_read_stats_for_dry_run_outputs(&outputs)
+                        .await?,
+                )?,
+        };
+
+        Ok(MssqlDryRunWorkflowReport::new(outputs, sources))
+    }
+
+    fn plan_dry_run_all_outputs(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<Vec<MssqlDryRunOutputReport>, DeltaFunnelError> {
         ensure_unique_write_all_output_names(requests)?;
 
-        let outputs = requests
+        requests
             .iter()
             .map(|request| {
                 ensure_write_all_dry_run_mode(request.target().run_mode())?;
@@ -1806,9 +2141,7 @@ impl DeltaFunnelSession {
 
                 Ok(MssqlDryRunOutputReport::new(planned))
             })
-            .collect::<Result<Vec<_>, DeltaFunnelError>>()?;
-
-        Ok(MssqlDryRunWorkflowReport::new(outputs))
+            .collect()
     }
 
     /// Writes one selected lazy table to SQL Server.
@@ -1876,11 +2209,22 @@ impl DeltaFunnelSession {
         &self,
         planned_outputs: &[PlannedMssqlOutput],
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
+        self.build_write_all_baseline_jobs_with_provider_stats(planned_outputs, None)
+    }
+
+    fn build_write_all_baseline_jobs_with_provider_stats(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
         planned_outputs
             .iter()
             .map(|planned| {
                 let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
-                let batches = self.lazy_table_batch_stream_factory(planned.table().clone());
+                let batches = self.lazy_table_batch_stream_factory_with_provider_stats(
+                    planned.table().clone(),
+                    provider_stats.clone(),
+                );
 
                 Ok(MssqlOutputWriteJob::new(
                     output_schema,
@@ -1893,17 +2237,30 @@ impl DeltaFunnelSession {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn build_write_all_cached_jobs(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         active_aliases: &[MssqlDerivedCacheAliasPlan],
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
+        self.build_write_all_cached_jobs_with_provider_stats(planned_outputs, active_aliases, None)
+    }
+
+    fn build_write_all_cached_jobs_with_provider_stats(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        active_aliases: &[MssqlDerivedCacheAliasPlan],
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
         planned_outputs
             .iter()
             .map(|planned| {
                 let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
-                let batches =
-                    self.cached_output_batch_stream_factory(planned.request(), active_aliases)?;
+                let batches = self.cached_output_batch_stream_factory_with_provider_stats(
+                    planned.request(),
+                    active_aliases,
+                    provider_stats.clone(),
+                )?;
 
                 Ok(MssqlOutputWriteJob::new(
                     output_schema,
@@ -1925,7 +2282,21 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let jobs = self.build_write_all_baseline_jobs(planned_outputs)?;
+        self.write_all_baseline_with_writer_and_provider_stats(planned_outputs, writer, None)
+            .await
+    }
+
+    async fn write_all_baseline_with_writer_and_provider_stats<W>(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        writer: W,
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        let jobs = self
+            .build_write_all_baseline_jobs_with_provider_stats(planned_outputs, provider_stats)?;
 
         write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
     }
@@ -1934,6 +2305,7 @@ impl DeltaFunnelSession {
     ///
     /// Tests use this to inject a fake writer while the public path supplies a
     /// writer that calls the existing one-output SQL Server sink.
+    #[allow(dead_code)]
     async fn write_all_cached_with_writer<W>(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
@@ -1943,8 +2315,31 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
+        self.write_all_cached_with_writer_and_provider_stats(
+            planned_outputs,
+            cache_aliases,
+            writer,
+            None,
+        )
+        .await
+    }
+
+    async fn write_all_cached_with_writer_and_provider_stats<W>(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        cache_aliases: &[MssqlDerivedCacheAliasPlan],
+        writer: W,
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
         let replacements = self.replace_mssql_cache_aliases(cache_aliases).await?;
-        let jobs = match self.build_write_all_cached_jobs(planned_outputs, cache_aliases) {
+        let jobs = match self.build_write_all_cached_jobs_with_provider_stats(
+            planned_outputs,
+            cache_aliases,
+            provider_stats,
+        ) {
             Ok(jobs) => jobs,
             Err(error) => {
                 return Err(restore_mssql_cache_aliases_after_error(error, replacements).await);
@@ -1983,12 +2378,22 @@ impl DeltaFunnelSession {
                     .await
             }
             WriteAllCacheMode::Disabled => {
+                let provider_stats = shared_provider_read_stats();
                 let workflow = self
-                    .write_all_baseline_with_writer(&planned_outputs, writer)
+                    .write_all_baseline_with_writer_and_provider_stats(
+                        &planned_outputs,
+                        writer,
+                        Some(Arc::clone(&provider_stats)),
+                    )
                     .await?;
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    &planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
                 Ok(WriteAllReport::new(
                     workflow,
                     WriteAllCacheReport::disabled(),
+                    sources,
                 ))
             }
         }
@@ -2007,6 +2412,7 @@ impl DeltaFunnelSession {
             .await
     }
 
+    #[allow(dead_code)]
     async fn write_all_baseline(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
@@ -2044,21 +2450,41 @@ impl DeltaFunnelSession {
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
                 let cache = WriteAllCacheReport::from_plan(cache_plan);
+                let provider_stats = shared_provider_read_stats();
                 let workflow = self
-                    .write_all_baseline_with_writer(planned_outputs, writer)
+                    .write_all_baseline_with_writer_and_provider_stats(
+                        planned_outputs,
+                        writer,
+                        Some(Arc::clone(&provider_stats)),
+                    )
                     .await?;
-                Ok(WriteAllReport::new(workflow, cache))
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
+                Ok(WriteAllReport::new(workflow, cache, sources))
             }
             MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
+                let provider_stats = shared_provider_read_stats();
                 let workflow = self
-                    .write_all_cached_with_writer(planned_outputs, cache_aliases, writer)
+                    .write_all_cached_with_writer_and_provider_stats(
+                        planned_outputs,
+                        cache_aliases,
+                        writer,
+                        Some(Arc::clone(&provider_stats)),
+                    )
                     .await?;
                 let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
-                Ok(WriteAllReport::new(workflow, cache))
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
+                Ok(WriteAllReport::new(workflow, cache, sources))
             }
         }
     }
 
+    #[allow(dead_code)]
     async fn write_all_cached(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
@@ -2090,15 +2516,36 @@ impl DeltaFunnelSession {
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
                 let cache = WriteAllCacheReport::from_plan(cache_plan);
-                let workflow = self.write_all_baseline(planned_outputs).await?;
-                Ok(WriteAllReport::new(workflow, cache))
+                let provider_stats = shared_provider_read_stats();
+                let workflow = self
+                    .write_all_baseline_with_writer_and_provider_stats(
+                        planned_outputs,
+                        MssqlWorkflowPublicOutputWriter,
+                        Some(Arc::clone(&provider_stats)),
+                    )
+                    .await?;
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
+                Ok(WriteAllReport::new(workflow, cache, sources))
             }
             MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
+                let provider_stats = shared_provider_read_stats();
                 let workflow = self
-                    .write_all_cached(planned_outputs, cache_aliases)
+                    .write_all_cached_with_writer_and_provider_stats(
+                        planned_outputs,
+                        cache_aliases,
+                        MssqlWorkflowPublicOutputWriter,
+                        Some(Arc::clone(&provider_stats)),
+                    )
                     .await?;
                 let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
-                Ok(WriteAllReport::new(workflow, cache))
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
+                Ok(WriteAllReport::new(workflow, cache, sources))
             }
         }
     }
@@ -2144,10 +2591,22 @@ impl DeltaFunnelSession {
         match options.cache_mode() {
             WriteAllCacheMode::Auto => self.write_all_auto(requests, &planned_outputs).await,
             WriteAllCacheMode::Disabled => {
-                let workflow = self.write_all_baseline(&planned_outputs).await?;
+                let provider_stats = shared_provider_read_stats();
+                let workflow = self
+                    .write_all_baseline_with_writer_and_provider_stats(
+                        &planned_outputs,
+                        MssqlWorkflowPublicOutputWriter,
+                        Some(Arc::clone(&provider_stats)),
+                    )
+                    .await?;
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    &planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
                 Ok(WriteAllReport::new(
                     workflow,
                     WriteAllCacheReport::disabled(),
+                    sources,
                 ))
             }
         }
@@ -2277,6 +2736,204 @@ impl DeltaFunnelSession {
     #[must_use]
     pub fn sources(&self) -> &[RegisteredSessionSource] {
         &self.sources
+    }
+
+    /// Returns metadata-only Delta source readiness reports in registration order.
+    #[must_use]
+    pub fn source_reports(&self) -> Vec<DeltaSourceReport> {
+        let scheduling = self.delta_source_scheduling_report();
+        self.sources
+            .iter()
+            .map(|source| DeltaSourceReport::metadata_only(source, scheduling))
+            .collect()
+    }
+
+    /// Returns Delta source reports enriched from the physical plan for `table`.
+    ///
+    /// This method resolves the lazy table and builds a DataFusion physical plan
+    /// so provider planning metadata can be reported. It does not execute row
+    /// streams or contact SQL Server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table is unknown or DataFusion cannot build the
+    /// physical plan.
+    pub async fn source_reports_for_lazy_table_plan(
+        &self,
+        table: &LazyTable,
+    ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        let dataframe = self.dataframe_for_lazy_table(table).await?;
+        let physical_plan = dataframe
+            .create_physical_plan()
+            .await
+            .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
+        let provider_stats = collect_delta_provider_read_stats(physical_plan.as_ref());
+
+        Ok(self.source_reports_with_provider_read_stats(provider_stats))
+    }
+
+    fn source_reports_with_provider_read_stats(
+        &self,
+        provider_stats: Vec<crate::DeltaProviderReadStatsSnapshot>,
+    ) -> Vec<DeltaSourceReport> {
+        let scheduling = self.delta_source_scheduling_report();
+        let mut provider_stats_by_source = BTreeMap::new();
+        for stats in provider_stats {
+            provider_stats_by_source.insert(stats.source_name.clone(), stats);
+        }
+
+        self.sources
+            .iter()
+            .map(|source| {
+                let report = DeltaSourceReport::metadata_only(source, scheduling);
+                if let Some(stats) = provider_stats_by_source.remove(source.name()) {
+                    report.with_provider_read_stats(stats)
+                } else {
+                    report
+                }
+            })
+            .collect()
+    }
+
+    fn source_reports_for_dry_run_outputs(
+        &self,
+        outputs: &[MssqlDryRunOutputReport],
+    ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        self.source_reports_for_output_tables(outputs.iter().map(|output| {
+            (
+                output.output_name().to_owned(),
+                output.planned_output().table(),
+            )
+        }))
+    }
+
+    fn source_reports_for_dry_run_outputs_with_provider_stats(
+        &self,
+        outputs: &[MssqlDryRunOutputReport],
+        provider_stats: Vec<crate::DeltaProviderReadStatsSnapshot>,
+    ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        let mut provider_stats_by_source = BTreeMap::new();
+        for stats in provider_stats {
+            provider_stats_by_source.insert(stats.source_name.clone(), stats);
+        }
+
+        Ok(self
+            .source_reports_for_dry_run_outputs(outputs)?
+            .into_iter()
+            .map(|report| {
+                if let Some(stats) = provider_stats_by_source.remove(report.source_name()) {
+                    report.with_provider_read_stats(stats)
+                } else {
+                    report.with_provider_stats_reason(ReportReasonCode::CapabilityUnavailable)
+                }
+            })
+            .collect())
+    }
+
+    async fn provider_read_stats_for_dry_run_outputs(
+        &self,
+        outputs: &[MssqlDryRunOutputReport],
+    ) -> Result<Vec<crate::DeltaProviderReadStatsSnapshot>, DeltaFunnelError> {
+        let mut provider_stats = Vec::new();
+        for output in outputs {
+            provider_stats.extend(
+                self.provider_read_stats_for_lazy_table(output.planned_output().table())
+                    .await?,
+            );
+        }
+        Ok(provider_stats)
+    }
+
+    async fn provider_read_stats_for_lazy_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<Vec<crate::DeltaProviderReadStatsSnapshot>, DeltaFunnelError> {
+        let dataframe = self.dataframe_for_lazy_table(table).await?;
+        let physical_plan = dataframe
+            .create_physical_plan()
+            .await
+            .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
+
+        Ok(collect_delta_provider_read_stats(physical_plan.as_ref()))
+    }
+
+    fn source_reports_for_planned_outputs_with_provider_stats(
+        &self,
+        outputs: &[PlannedMssqlOutput],
+        provider_stats: Vec<crate::DeltaProviderReadStatsSnapshot>,
+    ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        let mut provider_stats_by_source = BTreeMap::new();
+        for stats in provider_stats {
+            provider_stats_by_source.insert(stats.source_name.clone(), stats);
+        }
+
+        Ok(self
+            .source_reports_for_output_tables(outputs.iter().map(|output| {
+                (
+                    output.output_plan().output_name().to_owned(),
+                    output.table(),
+                )
+            }))?
+            .into_iter()
+            .map(|report| {
+                if let Some(stats) = provider_stats_by_source.remove(report.source_name()) {
+                    report.with_provider_read_stats(stats)
+                } else {
+                    report.with_provider_stats_reason(ReportReasonCode::CapabilityUnavailable)
+                }
+            })
+            .collect())
+    }
+
+    fn source_reports_for_output_tables<'a>(
+        &self,
+        outputs: impl IntoIterator<Item = (String, &'a LazyTable)>,
+    ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        let outputs = outputs.into_iter().collect::<Vec<_>>();
+        let mut output_sources = Vec::with_capacity(outputs.len());
+        let mut all_usage_known = true;
+
+        for (output_name, table) in outputs {
+            match self.known_source_dependencies_for_table(table)? {
+                Some(source_ids) => {
+                    output_sources.push((output_name, source_ids));
+                }
+                None => {
+                    all_usage_known = false;
+                }
+            }
+        }
+
+        Ok(self
+            .sources
+            .iter()
+            .map(|source| {
+                let used_by_output_names = output_sources
+                    .iter()
+                    .filter(|(_, source_ids)| source_ids.contains(&source.table().id()))
+                    .map(|(output_name, _)| output_name.clone())
+                    .collect::<Vec<_>>();
+                let usage_status = if used_by_output_names.is_empty() {
+                    if all_usage_known {
+                        SourceUsageStatus::NotUsed
+                    } else {
+                        SourceUsageStatus::Unknown
+                    }
+                } else {
+                    SourceUsageStatus::Used
+                };
+
+                DeltaSourceReport::metadata_only(source, self.delta_source_scheduling_report())
+                    .with_usage(usage_status, used_by_output_names)
+            })
+            .collect())
+    }
+
+    fn delta_source_scheduling_report(&self) -> DeltaProviderSchedulingReport {
+        DeltaProviderSchedulingReport::from_options(
+            self.options.query_options(),
+            self.options.provider_scan_options(),
+        )
     }
 
     /// Finds a registered Delta source by alias using unquoted SQL semantics.
@@ -2563,12 +3220,23 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
         active_aliases: &[MssqlDerivedCacheAliasPlan],
     ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
+        self.cached_output_batch_stream_factory_with_provider_stats(request, active_aliases, None)
+    }
+
+    fn cached_output_batch_stream_factory_with_provider_stats(
+        &self,
+        request: &OutputWritePlan,
+        active_aliases: &[MssqlDerivedCacheAliasPlan],
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
         let route = self.cached_output_stream_route(request, active_aliases)?;
         match route {
             MssqlCachedOutputStreamRoute::DirectCachedAlias(_)
-            | MssqlCachedOutputStreamRoute::UncachedLazyTable => {
-                Ok(self.lazy_table_batch_stream_factory(request.table().clone()))
-            }
+            | MssqlCachedOutputStreamRoute::UncachedLazyTable => Ok(self
+                .lazy_table_batch_stream_factory_with_provider_stats(
+                    request.table().clone(),
+                    provider_stats,
+                )),
             MssqlCachedOutputStreamRoute::ReplannedCachedDependency(_) => {
                 let output_name = request.target().output_name().to_owned();
                 let sql_text = match self.sql_text_for_derived_table(request.table()) {
@@ -2592,15 +3260,30 @@ impl DeltaFunnelSession {
                 let context = self.context.clone();
                 Ok(Box::new(move || {
                     Box::pin(async move {
-                        replanned_sql_batch_stream(context, output_name, sql_text, expected_schema)
-                            .await
+                        replanned_sql_batch_stream(
+                            context,
+                            output_name,
+                            sql_text,
+                            expected_schema,
+                            provider_stats,
+                        )
+                        .await
                     })
                 }))
             }
         }
     }
 
+    #[allow(dead_code)]
     fn lazy_table_batch_stream_factory(&self, table: LazyTable) -> MssqlOutputBatchStreamFactory {
+        self.lazy_table_batch_stream_factory_with_provider_stats(table, None)
+    }
+
+    fn lazy_table_batch_stream_factory_with_provider_stats(
+        &self,
+        table: LazyTable,
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> MssqlOutputBatchStreamFactory {
         let context = self.context.clone();
         let sources = self.sources.clone();
         let derived_tables = self.derived_tables.clone();
@@ -2614,6 +3297,7 @@ impl DeltaFunnelSession {
                     sources,
                     derived_tables,
                     pending_derived_tables,
+                    provider_stats,
                 )
                 .await
             })
@@ -2877,6 +3561,31 @@ impl DeltaFunnelSession {
         Ok(dependencies.into_iter().collect())
     }
 
+    fn known_source_dependencies_for_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<Option<BTreeSet<u64>>, DeltaFunnelError> {
+        self.schema_for_lazy_table(table)?;
+
+        match table.kind() {
+            LazyTableKind::DeltaSource => Ok(Some(BTreeSet::from([table.id()]))),
+            LazyTableKind::DerivedSql => {
+                let lineage = self.lineage_for_derived_table(table)?;
+                if !lineage.is_complete() {
+                    return Ok(None);
+                }
+                let mut visited_derived_table_ids = BTreeSet::new();
+                let mut source_table_ids = BTreeSet::new();
+                let usage_known = self.collect_transitive_source_dependencies(
+                    lineage,
+                    &mut visited_derived_table_ids,
+                    &mut source_table_ids,
+                )?;
+                Ok(usage_known.then_some(source_table_ids))
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn lazy_table_depends_on_registered_derived(
         &self,
@@ -2940,6 +3649,47 @@ impl DeltaFunnelSession {
         }
 
         Ok(())
+    }
+
+    fn collect_transitive_source_dependencies(
+        &self,
+        lineage: &DerivedTableLineage,
+        visited_derived_table_ids: &mut BTreeSet<u64>,
+        source_table_ids: &mut BTreeSet<u64>,
+    ) -> Result<bool, DeltaFunnelError> {
+        let mut usage_known = true;
+
+        for dependency in lineage.direct_dependencies() {
+            match dependency {
+                DerivedTableDependency::RegisteredSource { table_id, .. } => {
+                    source_table_ids.insert(*table_id);
+                }
+                DerivedTableDependency::RegisteredDerived { table_id, name } => {
+                    if !visited_derived_table_ids.insert(*table_id) {
+                        continue;
+                    }
+                    let derived = self.registered_derived_table_by_id(*table_id).ok_or_else(|| {
+                        DeltaFunnelError::MssqlWorkflowPlanning {
+                            message: format!(
+                                "registered derived lineage dependency `{}` is not registered in this session",
+                                sanitize_text_for_display(name)
+                            ),
+                        }
+                    })?;
+                    if !derived.lineage().is_complete() {
+                        usage_known = false;
+                        continue;
+                    }
+                    usage_known &= self.collect_transitive_source_dependencies(
+                        derived.lineage(),
+                        visited_derived_table_ids,
+                        source_table_ids,
+                    )?;
+                }
+            }
+        }
+
+        Ok(usage_known)
     }
 
     fn derive_table_lineage_from_sql(&self, sql: &str) -> DerivedTableLineage {
@@ -3128,12 +3878,81 @@ fn sql_table_error<T>(
     })
 }
 
+fn shared_provider_read_stats() -> SharedProviderReadStats {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn provider_read_stats_snapshot(
+    provider_stats: &SharedProviderReadStats,
+) -> Vec<crate::DeltaProviderReadStatsSnapshot> {
+    match provider_stats.lock() {
+        Ok(provider_stats) => provider_stats.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+struct ProviderStatsRecordingStream {
+    inner: MssqlOutputBatchStream,
+    physical_plan: Arc<dyn ExecutionPlan>,
+    provider_stats: SharedProviderReadStats,
+    recorded: bool,
+}
+
+impl ProviderStatsRecordingStream {
+    fn new(
+        inner: MssqlOutputBatchStream,
+        physical_plan: Arc<dyn ExecutionPlan>,
+        provider_stats: SharedProviderReadStats,
+    ) -> Self {
+        Self {
+            inner,
+            physical_plan,
+            provider_stats,
+            recorded: false,
+        }
+    }
+
+    fn record_if_needed(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        let snapshots = collect_delta_provider_read_stats(self.physical_plan.as_ref());
+        if snapshots.is_empty() {
+            return;
+        }
+        match self.provider_stats.lock() {
+            Ok(mut provider_stats) => provider_stats.extend(snapshots),
+            Err(poisoned) => poisoned.into_inner().extend(snapshots),
+        }
+    }
+}
+
+impl Stream for ProviderStatsRecordingStream {
+    type Item = Result<RecordBatch, DeltaFunnelError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(context) {
+            Poll::Ready(None) => {
+                self.record_if_needed();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.record_if_needed();
+                Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+}
+
 async fn batch_stream_for_lazy_table_from_session_parts(
     context: SessionContext,
     table: LazyTable,
     sources: Vec<RegisteredSessionSource>,
     derived_tables: Vec<RegisteredDerivedTable>,
     pending_derived_tables: Vec<PendingDerivedTable>,
+    provider_stats: Option<SharedProviderReadStats>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     let dataframe = dataframe_for_lazy_table_from_session_parts(
         &context,
@@ -3147,8 +3966,17 @@ async fn batch_stream_for_lazy_table_from_session_parts(
         .create_physical_plan()
         .await
         .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
-    let stream = datafusion_query_output_stream(physical_plan, context.task_ctx())
+    let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
         .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
+    if let Some(provider_stats) = provider_stats {
+        return Ok(Box::pin(ProviderStatsRecordingStream::new(
+            Box::pin(stream.map(|batch| {
+                batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
+            })),
+            physical_plan,
+            provider_stats,
+        )));
+    }
 
     Ok(Box::pin(stream.map(|batch| {
         batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
@@ -3169,6 +3997,7 @@ async fn replanned_sql_batch_stream(
     output_name: String,
     sql_text: String,
     expected_schema: SchemaRef,
+    provider_stats: Option<SharedProviderReadStats>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     let dataframe = context
         .sql_with_options(sql_text.as_str(), read_only_sql_options())
@@ -3183,8 +4012,18 @@ async fn replanned_sql_batch_stream(
         .create_physical_plan()
         .await
         .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
-    let stream = datafusion_query_output_stream(physical_plan, context.task_ctx())
+    let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
         .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
+    if let Some(provider_stats) = provider_stats {
+        let error_output_name = output_name.clone();
+        return Ok(Box::pin(ProviderStatsRecordingStream::new(
+            Box::pin(stream.map(move |batch| {
+                batch.map_err(|error| cached_output_stream_setup_error(&error_output_name, error))
+            })),
+            physical_plan,
+            provider_stats,
+        )));
+    }
 
     Ok(Box::pin(stream.map(move |batch| {
         batch.map_err(|error| cached_output_stream_setup_error(&output_name, error))
@@ -3989,6 +4828,14 @@ mod tests {
                 .map(|reference| reference.to_string())
                 .collect(),
         })
+    }
+
+    #[test]
+    fn source_usage_status_exposes_stable_codes() {
+        assert_eq!(SourceUsageStatus::Used.as_str(), "used");
+        assert_eq!(SourceUsageStatus::NotUsed.as_str(), "not_used");
+        assert_eq!(SourceUsageStatus::Unknown.as_str(), "unknown");
+        assert_eq!(SourceUsageStatus::Unknown.to_string(), "unknown");
     }
 
     #[test]
@@ -6294,6 +7141,7 @@ mod tests {
         assert!(!report.is_empty());
         assert_eq!(report.outputs()[0].output_name(), "west_output");
         assert_eq!(report.outputs()[1].output_name(), "east_output");
+        assert!(report.sources().is_empty());
         assert_eq!(
             report.outputs()[0]
                 .planned_output()
@@ -6315,6 +7163,149 @@ mod tests {
         assert!(!report.table_lifecycle_started());
         assert!(!report.bulk_writer_started());
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_all_to_mssql_includes_registered_delta_source_reports()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(
+            source,
+            "orders_output",
+            "orders_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+
+        let report = session.dry_run_all_to_mssql(&[request])?;
+
+        assert_eq!(report.outputs().len(), 1);
+        assert_eq!(report.sources().len(), 1);
+        let source = &report.sources()[0];
+        assert_eq!(source.source_name(), "orders");
+        assert_eq!(source.snapshot_version(), 1);
+        assert_eq!(source.protocol().source_name, "orders");
+        assert_eq!(source.file_count(), crate::FileCount::unavailable());
+        assert_eq!(
+            source.file_count_reason(),
+            Some(crate::ReportReasonCode::CostAvoidance)
+        );
+        assert!(!source.scan_metadata_exhausted());
+        assert_eq!(source.usage_status(), SourceUsageStatus::Used);
+        assert_eq!(source.used_by_output_names(), &["orders_output".to_owned()]);
+        assert!(!report.row_production_started());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_all_to_mssql_scan_summary_exhausts_provider_metadata_without_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new()
+                .with_default_mssql_connection(secret_connection()?)
+                .with_validation_options(ValidationOptions::new().with_dry_run_scan_summary_mode(
+                    crate::DryRunScanSummaryMode::ExhaustScanMetadata,
+                )),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(
+            source,
+            "orders_output",
+            "orders_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+
+        let report = session
+            .dry_run_all_to_mssql_with_scan_summary(&[request])
+            .await?;
+
+        assert_eq!(report.outputs().len(), 1);
+        assert!(!report.outputs()[0].row_production_started());
+        assert_eq!(report.sources().len(), 1);
+        let source = &report.sources()[0];
+        assert_eq!(source.source_name(), "orders");
+        assert_eq!(source.usage_status(), SourceUsageStatus::Used);
+        assert_eq!(source.used_by_output_names(), &["orders_output".to_owned()]);
+        assert_eq!(source.provider_stats_reason(), None);
+        let stats = source
+            .provider_read_stats()
+            .ok_or("expected provider stats from dry-run scan summary")?;
+        assert_eq!(stats.source_name, "orders");
+        assert_eq!(stats.files_started, 0);
+        assert_eq!(stats.files_completed, 0);
+        assert_eq!(stats.batches_produced, 0);
+        assert_eq!(stats.rows_produced, 0);
+        match stats.scan_metadata_exhausted {
+            Some(true) => {
+                assert_eq!(
+                    source.file_count(),
+                    crate::FileCount::exact(stats.files_planned)
+                );
+                assert_eq!(source.file_count_reason(), None);
+            }
+            Some(false) => {
+                assert_eq!(
+                    source.file_count(),
+                    crate::FileCount::estimated(stats.files_planned)
+                );
+                assert_eq!(source.file_count_reason(), None);
+            }
+            None => {
+                assert_eq!(source.file_count(), crate::FileCount::unavailable());
+                assert_eq!(
+                    source.file_count_reason(),
+                    Some(crate::ReportReasonCode::CapabilityUnavailable)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_all_to_mssql_reports_multi_source_usage_when_lineage_is_known()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders_table = DeltaLogTable::new("orders")?;
+        let customers_table = DeltaLogTable::new("customers")?;
+        let inventory_table = DeltaLogTable::new("inventory")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new("orders", orders_table.uri()))?;
+        session.delta_lake(DeltaSourceConfig::new("customers", customers_table.uri()))?;
+        session.delta_lake(DeltaSourceConfig::new("inventory", inventory_table.uri()))?;
+        let joined = session
+            .table_from_sql(
+                "select orders.id from orders inner join customers on orders.id = customers.id",
+            )
+            .await?;
+        let request = output_request(
+            joined,
+            "joined_output",
+            "joined_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+
+        let report = session.dry_run_all_to_mssql(&[request])?;
+
+        assert_eq!(report.sources().len(), 3);
+        for source in report.sources() {
+            match source.source_name() {
+                "orders" | "customers" => {
+                    assert_eq!(source.usage_status(), SourceUsageStatus::Used);
+                    assert_eq!(source.used_by_output_names(), &["joined_output".to_owned()]);
+                }
+                "inventory" => {
+                    assert_eq!(source.usage_status(), SourceUsageStatus::NotUsed);
+                    assert!(source.used_by_output_names().is_empty());
+                }
+                name => return Err(format!("unexpected source report: {name}").into()),
+            }
+        }
         Ok(())
     }
 
@@ -6787,6 +7778,127 @@ mod tests {
             west_report.cleanup(),
             MssqlTargetCleanupStatus::NotApplicable
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_with_writer_reports_delta_sources_for_executed_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let selected_orders = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let request = execute_output_request(
+            selected_orders,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::default();
+
+        let report = session
+            .write_all_with_options_and_writer(
+                &[request],
+                WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                writer,
+            )
+            .await?;
+
+        assert_eq!(report.outputs().len(), 1);
+        assert_eq!(report.outputs()[0].output_name(), "orders_output");
+        assert_eq!(report.sources().len(), 1);
+        let source = &report.sources()[0];
+        assert_eq!(source.source_name(), "orders");
+        assert_eq!(source.usage_status(), SourceUsageStatus::Used);
+        assert_eq!(source.used_by_output_names(), &["orders_output".to_owned()]);
+        assert_eq!(source.provider_stats_reason(), None);
+        let stats = source
+            .provider_read_stats()
+            .ok_or("expected execution provider stats")?;
+        assert_eq!(stats.source_name, "orders");
+        assert_eq!(stats.snapshot_version, source.snapshot_version());
+        assert!(stats.files_started > 0);
+        assert_eq!(stats.files_started, stats.files_completed);
+        assert!(stats.rows_produced > 0);
+        assert!(stats.batches_produced > 0);
+        match stats.scan_metadata_exhausted {
+            Some(true) => {
+                assert_eq!(
+                    source.file_count(),
+                    crate::FileCount::exact(stats.files_planned)
+                );
+                assert_eq!(source.file_count_reason(), None);
+            }
+            Some(false) => {
+                assert_eq!(
+                    source.file_count(),
+                    crate::FileCount::estimated(stats.files_planned)
+                );
+                assert_eq!(source.file_count_reason(), None);
+            }
+            None => {
+                assert_eq!(source.file_count(), crate::FileCount::unavailable());
+                assert_eq!(
+                    source.file_count_reason(),
+                    Some(crate::ReportReasonCode::CapabilityUnavailable)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_keeps_source_rows_separate_from_output_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let aggregate = session
+            .table_from_sql("select count(*) as order_count from orders")
+            .await?;
+        let request = execute_output_request(
+            aggregate,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::default();
+
+        let report = session
+            .write_all_with_options_and_writer(
+                &[request],
+                WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                writer,
+            )
+            .await?;
+
+        let crate::sql_server::MssqlOutputWriteStatus::Succeeded(output_report) =
+            &report.outputs()[0]
+        else {
+            return Err(format!("expected succeeded status, got {:?}", report.outputs()[0]).into());
+        };
+        assert_eq!(output_report.stats().rows_written(), 1);
+        let source = report
+            .sources()
+            .first()
+            .ok_or("expected executed source report")?;
+        let stats = source
+            .provider_read_stats()
+            .ok_or("expected execution provider stats")?;
+        assert_eq!(stats.rows_produced, u64::try_from(table.rows())?);
+        assert_ne!(stats.rows_produced, output_report.stats().rows_written());
         Ok(())
     }
 
@@ -7742,10 +8854,87 @@ mod tests {
             .ok_or("expected registered source")?;
         assert_eq!(registered.table(), &lazy);
         assert_eq!(registered.name(), "orders");
+        assert!(registered.source_uri().starts_with("file://"));
         assert_eq!(registered.snapshot_version(), 1);
         assert_eq!(registered.protocol().source_name, "orders");
         assert_eq!(registered.schema().fields().len(), 2);
+        let source_reports = session.source_reports();
+        assert_eq!(source_reports.len(), 1);
+        let report = &source_reports[0];
+        assert_eq!(report.source_name(), "orders");
+        assert_eq!(report.source_uri(), registered.source_uri());
+        assert_eq!(report.snapshot_version(), 1);
+        assert_eq!(report.protocol().source_name, "orders");
+        assert_eq!(report.scheduling().query_target_partitions(), None);
+        assert_eq!(
+            report.scheduling().reader_backend(),
+            DeltaProviderReaderBackend::NativeAsync
+        );
+        assert_eq!(report.file_count(), crate::FileCount::unavailable());
+        assert_eq!(
+            report.file_count_reason(),
+            Some(crate::ReportReasonCode::CostAvoidance)
+        );
+        assert!(!report.scan_metadata_exhausted());
+        assert_eq!(report.usage_status(), SourceUsageStatus::Unknown);
+        assert!(report.used_by_output_names().is_empty());
+        assert!(report.provider_read_stats().is_none());
+        assert_eq!(
+            report.provider_stats_reason(),
+            Some(crate::ReportReasonCode::NotExecuted)
+        );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_reports_for_lazy_table_plan_include_provider_stats_without_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let reports = session.source_reports_for_lazy_table_plan(&source).await?;
+
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.source_name(), "orders");
+        assert_eq!(report.provider_stats_reason(), None);
+        let stats = report
+            .provider_read_stats()
+            .ok_or("expected provider read stats")?;
+        assert_eq!(stats.source_name, "orders");
+        assert_eq!(stats.snapshot_version, report.snapshot_version());
+        assert_eq!(stats.files_started, 0);
+        assert_eq!(stats.files_completed, 0);
+        assert_eq!(stats.batches_produced, 0);
+        assert_eq!(stats.rows_produced, 0);
+        match stats.scan_metadata_exhausted {
+            Some(true) => {
+                assert_eq!(
+                    report.file_count(),
+                    crate::FileCount::exact(stats.files_planned)
+                );
+                assert_eq!(report.file_count_reason(), None);
+                assert!(report.scan_metadata_exhausted());
+            }
+            Some(false) => {
+                assert_eq!(
+                    report.file_count(),
+                    crate::FileCount::estimated(stats.files_planned)
+                );
+                assert_eq!(report.file_count_reason(), None);
+                assert!(!report.scan_metadata_exhausted());
+            }
+            None => {
+                assert_eq!(report.file_count(), crate::FileCount::unavailable());
+                assert_eq!(
+                    report.file_count_reason(),
+                    Some(crate::ReportReasonCode::CapabilityUnavailable)
+                );
+                assert!(!report.scan_metadata_exhausted());
+            }
+        }
         Ok(())
     }
 
@@ -8514,6 +9703,10 @@ mod tests {
         assert!(debug.contains("orders"));
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("AWS_SECRET_ACCESS_KEY"));
+        let report_debug = format!("{:?}", session.source_reports());
+        assert!(report_debug.contains("orders"));
+        assert!(!report_debug.contains("super-secret"));
+        assert!(!report_debug.contains("AWS_SECRET_ACCESS_KEY"));
         Ok(())
     }
 
@@ -8521,19 +9714,40 @@ mod tests {
     fn source_registration_honors_configured_provider_options()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("configured-provider")?;
-        let mut session =
-            DeltaFunnelSession::new(SessionOptions::new().with_provider_scan_options(
-                DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
-                    DeltaProviderReaderBackend::OfficialKernel,
-                    2,
-                    1,
-                )?,
-            ))?;
+        let provider_scan_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::OfficialKernel,
+            2,
+            1,
+        )?
+        .with_output_buffer_capacity_per_partition(3)?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new()
+                .with_query_options(QueryOptions {
+                    target_partitions: Some(4),
+                    output_batch_size: None,
+                })
+                .with_provider_scan_options(provider_scan_options),
+        )?;
 
         session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
 
         assert_eq!(session.sources().len(), 1);
         assert!(session.registered_source("orders").is_some());
+        let reports = session.source_reports();
+        assert_eq!(reports.len(), 1);
+        let scheduling = reports[0].scheduling();
+        assert_eq!(scheduling.query_target_partitions(), Some(4));
+        assert_eq!(
+            scheduling.reader_backend(),
+            DeltaProviderReaderBackend::OfficialKernel
+        );
+        assert_eq!(scheduling.max_concurrent_file_reads_per_scan(), 2);
+        assert_eq!(scheduling.max_concurrent_file_reads_per_partition(), 1);
+        assert_eq!(scheduling.output_buffer_capacity_per_partition(), 3);
+        assert_eq!(
+            scheduling.native_async_prefetch_file_count_per_partition(),
+            0
+        );
         Ok(())
     }
 }

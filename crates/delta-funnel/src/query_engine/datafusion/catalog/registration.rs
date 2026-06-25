@@ -40,6 +40,8 @@ pub struct RegisteredDeltaSources {
 pub struct RegisteredDeltaSource {
     /// DataFusion table name for this source.
     pub name: String,
+    /// Sanitized normalized Delta table URI context.
+    pub table_uri: String,
     /// Resolved Delta snapshot version.
     pub snapshot_version: u64,
     /// Logical Arrow schema exposed to DataFusion.
@@ -154,6 +156,7 @@ fn register_delta_provider(
 ) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
     let registered = RegisteredDeltaSource {
         name: provider.source_name().to_owned(),
+        table_uri: sanitize_uri_for_display(provider.source_table_uri()),
         snapshot_version: provider.snapshot_version(),
         schema: provider.schema(),
         protocol: provider.protocol().clone(),
@@ -265,6 +268,7 @@ mod tests {
 
         assert_eq!(registered.sources.len(), 1);
         assert_eq!(registered.sources[0].name, "orders");
+        assert!(registered.sources[0].table_uri.starts_with("file://"));
         assert_eq!(registered.sources[0].snapshot_version, 1);
         assert_eq!(registered.sources[0].schema.field(0).name(), "id");
         assert_eq!(registered.sources[0].protocol.source_name, "orders");
