@@ -626,6 +626,18 @@ fn ensure_write_all_dry_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelErr
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlOutputTarget, MssqlTargetConfig,
+        MssqlTargetTable,
+    };
+
+    use super::super::{
+        DeltaFunnelSession, OutputWritePlan, RunMode, SessionOptions,
+        test_support::{
+            DeltaLogTable, execute_output_request, output_request, override_connection,
+            secret_connection,
+        },
+    };
     use super::{MssqlDryRunSqlIdentityState, stable_sql_identity_hash};
 
     #[test]
@@ -640,5 +652,99 @@ mod tests {
             stable_sql_identity_hash("select marker where region = 'west'"),
             "cbd6889e027b0f88"
         );
+    }
+
+    #[tokio::test]
+    async fn dry_run_to_mssql_rejects_execute_request_before_planning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let output = session.table_from_sql("select 1 as id").await?;
+        let request = execute_output_request(
+            output,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.dry_run_to_mssql(&request);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("dry_run_to_mssql requires RunMode::DryRun")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_to_mssql_rejects_missing_connection_before_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(
+            source,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+
+        let error = session.dry_run_to_mssql(&request);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MissingMssqlConnection { output_name })
+                if output_name == "orders_output"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_to_mssql_rejects_replace_before_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(source, "orders_output", "orders_sink", LoadMode::Replace)?;
+
+        let error = session.dry_run_to_mssql(&request);
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlLifecyclePlanning { output_name, message })
+                if output_name == "orders_output" && message.contains("replace load mode")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_to_mssql_report_debug_redacts_connection_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders_sink")?)
+            .with_connection(override_connection()?);
+        let request = OutputWritePlan::new(
+            source,
+            MssqlOutputTarget::new("orders_output", target_config, RunMode::DryRun),
+        );
+
+        let report = session.dry_run_to_mssql(&request)?;
+        let debug = format!("{report:?}");
+
+        assert!(debug.contains("orders_output"));
+        assert!(debug.contains("warehouse-override"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("override-secret"));
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("server=tcp"));
+        Ok(())
     }
 }
