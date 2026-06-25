@@ -1,8 +1,15 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-use crate::{MssqlOutputWriteStatus, MssqlWorkflowWriteReport, support::sanitize_text_for_display};
+use datafusion::{datasource::TableProvider, prelude::SessionContext};
 
-use super::{DeltaSourceReport, OutputWritePlan, RegisteredDerivedTable};
+use crate::{
+    DeltaFunnelError, MssqlOutputWriteStatus, MssqlWorkflowWriteReport,
+    support::sanitize_text_for_display,
+};
+
+use super::{
+    DeltaSourceReport, OutputWritePlan, RegisteredDerivedTable, mssql_scoped_cache_alias_error,
+};
 
 /// Cache policy for one multi-output `write_all` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -378,6 +385,131 @@ impl WriteAllCacheCandidateSkipReason {
             }
             MssqlCacheCandidateSkipReason::AmbiguousDepth => Self::AmbiguousDepth,
         }
+    }
+}
+
+/// Active replacement of one registered derived alias with a cached provider.
+///
+/// The original provider is owned by this scope until `restore` is awaited.
+/// Callers must not rely on `Drop` for restoration.
+#[allow(dead_code)]
+pub(crate) struct MssqlScopedCacheAliasReplacement<'a> {
+    context: &'a SessionContext,
+    table_id: u64,
+    alias_name: String,
+    original_provider: Option<Arc<dyn TableProvider>>,
+}
+
+#[allow(dead_code)]
+impl<'a> MssqlScopedCacheAliasReplacement<'a> {
+    pub(super) fn new(
+        context: &'a SessionContext,
+        table_id: u64,
+        alias_name: String,
+        original_provider: Arc<dyn TableProvider>,
+    ) -> Self {
+        Self {
+            context,
+            table_id,
+            alias_name,
+            original_provider: Some(original_provider),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn broken_for_test(
+        context: &'a SessionContext,
+        table_id: u64,
+        alias_name: String,
+    ) -> Self {
+        Self {
+            context,
+            table_id,
+            alias_name,
+            original_provider: None,
+        }
+    }
+
+    /// Returns the session table id for the replaced alias.
+    #[must_use]
+    pub(crate) const fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
+    /// Returns the registered alias name currently backed by the cached provider.
+    #[must_use]
+    pub(crate) fn alias_name(&self) -> &str {
+        &self.alias_name
+    }
+
+    /// Restores the original provider under the alias and consumes the scope.
+    ///
+    /// This method transitions the catalog from "alias points at cached
+    /// provider" back to "alias points at the original provider". It is async
+    /// by design so later cache cleanup can remain awaitable even if DataFusion
+    /// changes or additional async cleanup is needed.
+    ///
+    /// Callers should await this method on both success and error paths that
+    /// leave the scoped replacement active.
+    pub(crate) async fn restore(
+        mut self,
+    ) -> Result<MssqlScopedCacheAliasRestoration, DeltaFunnelError> {
+        let Some(original_provider) = self.original_provider.take() else {
+            return Err(mssql_scoped_cache_alias_error(
+                "restore",
+                &self.alias_name,
+                "original provider was already restored",
+            ));
+        };
+
+        let removed_cached = self
+            .context
+            .deregister_table(self.alias_name.as_str())
+            .map_err(|error| {
+                mssql_scoped_cache_alias_error("restore_deregister", &self.alias_name, error)
+            })?;
+
+        self.context
+            .register_table(self.alias_name.as_str(), original_provider)
+            .map_err(|error| {
+                mssql_scoped_cache_alias_error("restore_register", &self.alias_name, error)
+            })?;
+
+        Ok(MssqlScopedCacheAliasRestoration {
+            table_id: self.table_id,
+            alias_name: self.alias_name,
+            cached_alias_was_present: removed_cached.is_some(),
+        })
+    }
+}
+
+/// Report returned after a scoped cache alias replacement restores the original alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct MssqlScopedCacheAliasRestoration {
+    table_id: u64,
+    alias_name: String,
+    cached_alias_was_present: bool,
+}
+
+#[allow(dead_code)]
+impl MssqlScopedCacheAliasRestoration {
+    /// Returns the restored session table id.
+    #[must_use]
+    pub(crate) const fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
+    /// Returns the restored alias name.
+    #[must_use]
+    pub(crate) fn alias_name(&self) -> &str {
+        &self.alias_name
+    }
+
+    /// Returns whether a cached alias was present when restoration started.
+    #[must_use]
+    pub(crate) const fn cached_alias_was_present(&self) -> bool {
+        self.cached_alias_was_present
     }
 }
 
