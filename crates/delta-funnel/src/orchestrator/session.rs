@@ -1017,51 +1017,6 @@ impl DeltaFunnelSession {
         )
     }
 
-    /// Finds a registered Delta source by alias using unquoted SQL semantics.
-    #[must_use]
-    pub fn registered_source(&self, name: &str) -> Option<&RegisteredSessionSource> {
-        self.sources
-            .iter()
-            .find(|source| source.name().eq_ignore_ascii_case(name))
-    }
-
-    /// Returns registered SQL-derived aliases in registration order.
-    #[must_use]
-    pub fn derived_tables(&self) -> &[RegisteredDerivedTable] {
-        &self.derived_tables
-    }
-
-    /// Finds a registered SQL-derived alias by name using unquoted SQL semantics.
-    #[must_use]
-    pub fn registered_derived_table(&self, name: &str) -> Option<&RegisteredDerivedTable> {
-        self.derived_tables
-            .iter()
-            .find(|table| table.name().eq_ignore_ascii_case(name))
-    }
-
-    fn registered_derived_table_by_id(&self, table_id: u64) -> Option<&RegisteredDerivedTable> {
-        self.derived_tables
-            .iter()
-            .find(|table| table.table().id() == table_id)
-    }
-
-    /// Resolves the session metadata for an alias that is eligible for scoped caching.
-    ///
-    /// The cache primitive only supports registered SQL-derived aliases. Raw
-    /// sources, pending derived tables, and foreign or stale table handles are
-    /// rejected before any DataFusion catalog mutation can happen.
-    fn registered_derived_for_scoped_cache_alias(
-        &self,
-        table: &LazyTable,
-    ) -> Result<&RegisteredDerivedTable, DeltaFunnelError> {
-        if table.kind() != LazyTableKind::DerivedSql {
-            return Err(unknown_lazy_table_error(table));
-        }
-
-        self.registered_derived_table_by_id(table.id())
-            .ok_or_else(|| unknown_lazy_table_error(table))
-    }
-
     /// Materializes one registered derived alias and temporarily replaces that alias.
     ///
     /// The method leaves the original catalog alias active while DataFusion
