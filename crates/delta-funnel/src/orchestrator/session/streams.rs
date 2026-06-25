@@ -23,8 +23,8 @@ use super::{
         cached_output_stream_setup_error, datafusion_handoff_setup_error,
         unknown_cached_alias_error, unknown_lazy_table_error,
     },
+    mssql::{MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan},
     registry::{DerivedTableDependency, read_only_sql_options},
-    write_all::{MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan},
 };
 
 pub(super) type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;

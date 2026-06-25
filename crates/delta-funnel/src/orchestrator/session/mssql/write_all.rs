@@ -10,7 +10,7 @@ use crate::{
     write_mssql_outputs_with_writer, write_output_batches_to_mssql,
 };
 
-use super::{
+use super::super::{
     DeltaFunnelSession, DeltaSourceReport, LazyTable, LazyTableKind, OutputWritePlan,
     PlannedMssqlOutput, RegisteredDerivedTable, RunMode,
     errors::mssql_scoped_cache_alias_error,
@@ -1727,7 +1727,7 @@ fn ensure_write_all_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunne
     }
 }
 
-pub(super) fn ensure_unique_write_all_output_names(
+pub(crate) fn ensure_unique_write_all_output_names(
     requests: &[OutputWritePlan],
 ) -> Result<(), DeltaFunnelError> {
     let mut output_names = BTreeSet::new();
@@ -1754,7 +1754,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use futures_util::StreamExt;
 
-    use super::super::{
+    use super::super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, RunMode,
         SessionOptions, SourceUsageStatus,
         registry::{DerivedTableDependency, DerivedTableLineage},

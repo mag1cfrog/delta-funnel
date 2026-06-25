@@ -9,7 +9,7 @@ use crate::{
     write_output_batches_to_mssql,
 };
 
-use super::{DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode};
+use super::super::{DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode};
 
 impl DeltaFunnelSession {
     /// Plans one lazy table as an MSSQL output without executing the table.
@@ -157,7 +157,7 @@ mod tests {
         ResolvedMssqlTarget, table_formats::RealParquetDeltaTable,
     };
 
-    use super::super::{
+    use super::super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, OutputWritePlan, RunMode, SessionOptions,
         test_support::{
             DeltaLogTable, UNSUPPORTED_SCHEMA_FIELDS_JSON, execute_output_request, output_request,

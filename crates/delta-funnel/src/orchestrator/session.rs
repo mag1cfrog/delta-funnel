@@ -7,14 +7,13 @@
 mod dry_run_report;
 mod errors;
 mod handles;
-mod mssql_output;
+mod mssql;
 mod options;
 mod registry;
 mod source_report;
 mod streams;
 #[cfg(test)]
 mod test_support;
-mod write_all;
 
 use std::fmt;
 
@@ -25,21 +24,21 @@ use crate::{DeltaFunnelError, datafusion_session_context};
 pub use handles::{
     LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput, RunMode,
 };
-pub use options::SessionOptions;
-pub use registry::{RegisteredDerivedTable, RegisteredSessionSource};
-pub use source_report::{DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus};
-pub use write_all::{
+pub use mssql::{
     WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
     WriteAllCacheCandidateSkipReason, WriteAllCacheMode, WriteAllCacheReport,
     WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
 };
+pub use options::SessionOptions;
+pub use registry::{RegisteredDerivedTable, RegisteredSessionSource};
+pub use source_report::{DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus};
 
 pub use dry_run_report::{
     MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
     MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
 };
 #[cfg(test)]
-pub(crate) use mssql_output::OrchestratorMssqlOutputWriter;
+pub(crate) use mssql::OrchestratorMssqlOutputWriter;
 use registry::PendingDerivedTable;
 
 /// Rust backing session for lazy query-load workflows.
