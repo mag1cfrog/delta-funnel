@@ -13,7 +13,7 @@ mod source_report;
 mod streams;
 mod write_all;
 
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -23,13 +23,12 @@ use futures_util::StreamExt;
 
 use crate::{
     DeltaFunnelError, DeltaSourceConfig, DeltaTableProviderConfig, MssqlOutputBatchStream,
-    MssqlOutputWriteJob, MssqlSchemaPlanOptions, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter,
+    MssqlSchemaPlanOptions, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter,
     MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget,
     SqlTablePhase, datafusion_query_output_stream, datafusion_session_context, load_delta_source,
     plan_mssql_target_for_resolved_output, preflight_delta_protocol,
-    register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
-    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
-    write_output_batches_to_mssql,
+    register_delta_sources_with_scan_execution_options, table_formats::validate_table_source_names,
+    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
 };
 
 pub use handles::{
@@ -316,91 +315,6 @@ impl DeltaFunnelSession {
                 self.options.mssql_write_options(),
             )
             .await
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn plan_write_all_outputs(
-        &self,
-        requests: &[OutputWritePlan],
-    ) -> Result<Vec<PlannedMssqlOutput>, DeltaFunnelError> {
-        ensure_unique_write_all_output_names(requests)?;
-
-        requests
-            .iter()
-            .map(|request| {
-                ensure_write_all_execute_run_mode(request.target().run_mode())?;
-                self.plan_mssql_output(request)
-            })
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn build_write_all_baseline_jobs(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
-        self.build_write_all_baseline_jobs_with_provider_stats(planned_outputs, None)
-    }
-
-    fn build_write_all_baseline_jobs_with_provider_stats(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        provider_stats: Option<SharedProviderReadStats>,
-    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
-        planned_outputs
-            .iter()
-            .map(|planned| {
-                let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
-                let batches = self.lazy_table_batch_stream_factory_with_provider_stats(
-                    planned.table().clone(),
-                    provider_stats.clone(),
-                );
-
-                Ok(MssqlOutputWriteJob::new(
-                    output_schema,
-                    planned.resolved_target().clone(),
-                    planned.output_plan().schema_plan_options(),
-                    batches,
-                    self.options.mssql_write_options(),
-                ))
-            })
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    fn build_write_all_cached_jobs(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        active_aliases: &[MssqlDerivedCacheAliasPlan],
-    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
-        self.build_write_all_cached_jobs_with_provider_stats(planned_outputs, active_aliases, None)
-    }
-
-    fn build_write_all_cached_jobs_with_provider_stats(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        active_aliases: &[MssqlDerivedCacheAliasPlan],
-        provider_stats: Option<SharedProviderReadStats>,
-    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
-        planned_outputs
-            .iter()
-            .map(|planned| {
-                let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
-                let batches = self.cached_output_batch_stream_factory_with_provider_stats(
-                    planned.request(),
-                    active_aliases,
-                    provider_stats.clone(),
-                )?;
-
-                Ok(MssqlOutputWriteJob::new(
-                    output_schema,
-                    planned.resolved_target().clone(),
-                    planned.output_plan().schema_plan_options(),
-                    batches,
-                    self.options.mssql_write_options(),
-                ))
-            })
-            .collect()
     }
 
     #[allow(dead_code)]
@@ -935,36 +849,6 @@ fn ensure_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
                     .to_owned(),
         }),
     }
-}
-
-fn ensure_write_all_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
-    match run_mode {
-        RunMode::Execute => Ok(()),
-        RunMode::DryRun => Err(DeltaFunnelError::MssqlWorkflowPlanning {
-            message:
-                "write_all requires RunMode::Execute; use dry_run_all_to_mssql for dry-run planning"
-                    .to_owned(),
-        }),
-    }
-}
-
-fn ensure_unique_write_all_output_names(
-    requests: &[OutputWritePlan],
-) -> Result<(), DeltaFunnelError> {
-    let mut output_names = BTreeSet::new();
-    for request in requests {
-        let output_name = request.target().output_name();
-        if !output_names.insert(output_name) {
-            return Err(DeltaFunnelError::MssqlWorkflowPlanning {
-                message: format!(
-                    "write_all output names must be unique; duplicate output name `{}`",
-                    sanitize_text_for_display(output_name)
-                ),
-            });
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

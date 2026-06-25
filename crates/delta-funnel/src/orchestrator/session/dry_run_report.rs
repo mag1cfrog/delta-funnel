@@ -7,7 +7,8 @@ use crate::{
 
 use super::{
     DeltaFunnelSession, DeltaSourceReport, LazyTable, LazyTableKind, OutputWritePlan,
-    PlannedMssqlOutput, RunMode, SourceUsageStatus, ensure_unique_write_all_output_names,
+    PlannedMssqlOutput, RunMode, SourceUsageStatus,
+    write_all::ensure_unique_write_all_output_names,
 };
 
 /// Output schema field included in an MSSQL dry-run report.
