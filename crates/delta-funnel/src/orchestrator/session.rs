@@ -8,7 +8,7 @@ mod dry_run_report;
 mod handles;
 mod options;
 mod source_report;
-mod write_all_options;
+mod write_all;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -30,21 +30,21 @@ use futures_util::{Stream, StreamExt};
 use crate::{
     BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaSourceConfig,
     DeltaTableProviderConfig, LoadMode, MssqlDdlPlan, MssqlLifecyclePlan, MssqlOutputBatchStream,
-    MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlOutputWriteStatus, MssqlSchemaPlan,
-    MssqlSchemaPlanOptions, MssqlTargetOutputPlan, MssqlTargetTable, MssqlWorkflowOutputWriter,
-    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, OutputStatus,
-    RegisteredDeltaSource, ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase, ValidationStatus,
-    WorkflowStatus, collect_delta_provider_read_stats, datafusion_query_output_stream,
-    datafusion_session_context, load_delta_source, plan_mssql_target_for_resolved_output,
-    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
-    support::sanitize_text_for_display, table_formats::validate_table_source_names,
-    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
+    MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlSchemaPlan, MssqlSchemaPlanOptions,
+    MssqlTargetOutputPlan, MssqlTargetTable, MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport,
+    MssqlWriteOptions, MssqlWriteReport, OutputStatus, RegisteredDeltaSource, ReportReasonCode,
+    ResolvedMssqlTarget, SqlTablePhase, ValidationStatus, WorkflowStatus,
+    collect_delta_provider_read_stats, datafusion_query_output_stream, datafusion_session_context,
+    load_delta_source, plan_mssql_target_for_resolved_output, preflight_delta_protocol,
+    register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
+    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
+    write_output_batches_to_mssql,
 };
 
 pub use handles::{LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, RunMode};
 pub use options::SessionOptions;
 pub use source_report::{DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus};
-pub use write_all_options::{WriteAllCacheMode, WriteAllOptions};
+pub use write_all::{WriteAllCacheMode, WriteAllOptions, WriteAllReport};
 
 use dry_run_report::stable_sql_identity_hash;
 pub use dry_run_report::{
@@ -52,93 +52,6 @@ pub use dry_run_report::{
 };
 
 type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
-
-/// Report for one `write_all` call that reached the sequential workflow.
-///
-/// Planning and cache setup failures are returned as errors before this report
-/// exists. Once the workflow starts, output write failures and dependent-output
-/// stream setup failures are represented in the wrapped workflow report while
-/// cache metadata remains available through [`WriteAllReport::cache`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WriteAllReport {
-    workflow: MssqlWorkflowWriteReport,
-    cache: WriteAllCacheReport,
-    sources: Vec<DeltaSourceReport>,
-}
-
-impl WriteAllReport {
-    fn new(
-        workflow: MssqlWorkflowWriteReport,
-        cache: WriteAllCacheReport,
-        sources: Vec<DeltaSourceReport>,
-    ) -> Self {
-        Self {
-            workflow,
-            cache,
-            sources,
-        }
-    }
-
-    /// Returns the lower-level SQL Server workflow report.
-    #[must_use]
-    pub const fn workflow(&self) -> &MssqlWorkflowWriteReport {
-        &self.workflow
-    }
-
-    /// Returns cache planning, selection, and lifecycle metadata for this call.
-    #[must_use]
-    pub const fn cache(&self) -> &WriteAllCacheReport {
-        &self.cache
-    }
-
-    /// Returns Delta source reports in session registration order.
-    #[must_use]
-    pub fn sources(&self) -> &[DeltaSourceReport] {
-        &self.sources
-    }
-
-    /// Returns the number of selected outputs represented by this report.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.workflow.len()
-    }
-
-    /// Returns whether this report contains no selected outputs.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.workflow.is_empty()
-    }
-
-    /// Returns per-output SQL Server workflow statuses in caller-provided order.
-    #[must_use]
-    pub fn outputs(&self) -> &[MssqlOutputWriteStatus] {
-        self.workflow.outputs()
-    }
-
-    /// Returns whether every selected output completed successfully.
-    #[must_use]
-    pub fn all_succeeded(&self) -> bool {
-        self.workflow.all_succeeded()
-    }
-
-    /// Returns the number of outputs that completed successfully.
-    #[must_use]
-    pub fn succeeded_count(&self) -> usize {
-        self.workflow.succeeded_count()
-    }
-
-    /// Returns the number of outputs that failed.
-    #[must_use]
-    pub fn failed_count(&self) -> usize {
-        self.workflow.failed_count()
-    }
-
-    /// Returns the number of outputs skipped after a previous output failed.
-    #[must_use]
-    pub fn skipped_count(&self) -> usize {
-        self.workflow.skipped_count()
-    }
-}
 
 /// Cache metadata for one `write_all` call.
 ///
