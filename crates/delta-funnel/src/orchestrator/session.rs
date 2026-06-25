@@ -7855,6 +7855,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_all_keeps_source_rows_separate_from_output_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let aggregate = session
+            .table_from_sql("select count(*) as order_count from orders")
+            .await?;
+        let request = execute_output_request(
+            aggregate,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::default();
+
+        let report = session
+            .write_all_with_options_and_writer(
+                &[request],
+                WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                writer,
+            )
+            .await?;
+
+        let crate::sql_server::MssqlOutputWriteStatus::Succeeded(output_report) =
+            &report.outputs()[0]
+        else {
+            return Err(format!("expected succeeded status, got {:?}", report.outputs()[0]).into());
+        };
+        assert_eq!(output_report.stats().rows_written(), 1);
+        let source = report
+            .sources()
+            .first()
+            .ok_or("expected executed source report")?;
+        let stats = source
+            .provider_read_stats()
+            .ok_or("expected execution provider stats")?;
+        assert_eq!(stats.rows_produced, u64::try_from(table.rows())?);
+        assert_ne!(stats.rows_produced, output_report.stats().rows_written());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn write_all_auto_no_candidate_uses_baseline_path()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(
