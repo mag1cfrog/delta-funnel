@@ -1,7 +1,17 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
+};
+
+use datafusion::{
+    arrow::{
+        array::{ArrayRef, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    },
+    datasource::{MemTable, TableProvider},
 };
 
 pub(super) struct DeltaLogTable {
@@ -87,4 +97,22 @@ fn add_json(path: &str) -> String {
 fn unique_name(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     Ok(format!("{}-{name}-{nanos}", std::process::id()))
+}
+
+pub(super) fn marker_region_provider(
+    marker: &str,
+) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("marker", DataType::Utf8, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![marker, marker])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["west", "east"])) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
 }

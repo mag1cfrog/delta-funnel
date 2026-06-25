@@ -756,7 +756,7 @@ mod tests {
 
     use super::super::{
         DeltaFunnelSession, LazyTableKind, SessionOptions, SourceUsageStatus,
-        test_support::DeltaLogTable,
+        test_support::{DeltaLogTable, marker_region_provider},
     };
     use super::DerivedTableDependency;
 
@@ -1534,6 +1534,28 @@ mod tests {
                     dependency,
                     DerivedTableDependency::RegisteredDerived { name, .. } if name == "big"
                 ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_records_unknown_external_references()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session
+            .context()
+            .register_table("external_orders", marker_region_provider("external")?)?;
+
+        let derived = session
+            .table_from_sql("select marker from external_orders")
+            .await?;
+        let lineage = session.lineage_for_derived_table(&derived)?;
+
+        assert!(lineage.is_complete());
+        assert!(lineage.direct_dependencies().is_empty());
+        assert_eq!(
+            lineage.unknown_references(),
+            &["external_orders".to_owned()]
         );
         Ok(())
     }

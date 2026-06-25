@@ -225,7 +225,7 @@ mod tests {
     };
 
     use super::registry::{DerivedTableDependency, DerivedTableLineage};
-    use super::test_support::DeltaLogTable;
+    use super::test_support::{DeltaLogTable, marker_region_provider};
     use super::write_all::{
         MssqlCacheCandidateSkipReason, MssqlCachedOutputStreamRoute, MssqlNoCacheReason,
     };
@@ -498,24 +498,6 @@ mod tests {
         }
 
         Ok(markers)
-    }
-
-    fn marker_region_provider(
-        marker: &str,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error>> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("marker", DataType::Utf8, false),
-            Field::new("region", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec![marker, marker])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["west", "east"])) as ArrayRef,
-            ],
-        )?;
-
-        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
     #[derive(Debug)]
@@ -4685,28 +4667,6 @@ mod tests {
                 assert!(!report.scan_metadata_exhausted());
             }
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn derived_lineage_records_unknown_external_references()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session
-            .context()
-            .register_table("external_orders", marker_region_provider("external")?)?;
-
-        let derived = session
-            .table_from_sql("select marker from external_orders")
-            .await?;
-        let lineage = session.lineage_for_derived_table(&derived)?;
-
-        assert!(lineage.is_complete());
-        assert!(lineage.direct_dependencies().is_empty());
-        assert_eq!(
-            lineage.unknown_references(),
-            &["external_orders".to_owned()]
-        );
         Ok(())
     }
 }
