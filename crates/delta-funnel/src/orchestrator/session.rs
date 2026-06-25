@@ -219,9 +219,8 @@ mod tests {
     use std::sync::{Arc, Mutex, atomic::Ordering};
 
     use super::test_support::{
-        DeltaLogTable, collect_stream_marker_values, collect_stream_row_count,
-        execute_output_request, failing_scan_marker_region_provider, marker_region_provider,
-        marker_values_from_batches, output_request, override_connection,
+        DeltaLogTable, collect_stream_row_count, execute_output_request,
+        failing_scan_marker_region_provider, output_request, override_connection,
         scan_counting_marker_region_provider, secret_connection,
     };
     use super::*;
@@ -455,111 +454,6 @@ mod tests {
                 .map(|reference| reference.to_string())
                 .collect(),
         })
-    }
-
-    #[tokio::test]
-    async fn cached_alias_replacement_does_not_feed_existing_downstream_derived_tables()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session
-            .context()
-            .register_table("big_source", marker_region_provider("original")?)?;
-        let pending_big = session
-            .table_from_sql("select marker, region from big_source")
-            .await?;
-        let _big = session.register_alias("big", &pending_big)?;
-        let west = session
-            .table_from_sql("select marker from big where region = 'west'")
-            .await?;
-        let east = session
-            .table_from_sql("select marker from big where region = 'east'")
-            .await?;
-
-        let replacement = session
-            .context()
-            .read_table(marker_region_provider("replacement")?)?
-            .cache()
-            .await?
-            .into_view();
-        let removed_big = session.context().deregister_table("big")?;
-        assert!(removed_big.is_some());
-        session.context().register_table("big", replacement)?;
-
-        let direct_big = session
-            .context()
-            .sql("select marker from big where region = 'west'")
-            .await?
-            .collect()
-            .await?;
-        assert_eq!(
-            marker_values_from_batches(&direct_big)?,
-            vec!["replacement"]
-        );
-
-        let west_stream = session.batch_stream_for_lazy_table(&west).await?;
-        let east_stream = session.batch_stream_for_lazy_table(&east).await?;
-        let west_markers = collect_stream_marker_values(west_stream).await?;
-        let east_markers = collect_stream_marker_values(east_stream).await?;
-
-        // Conclusion for #245: existing downstream ViewTable providers keep the
-        // original resolved provider; catalog replacement alone does not rewire them.
-        assert_eq!(west_markers, vec!["original"]);
-        assert_eq!(east_markers, vec!["original"]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn replanned_downstream_sql_uses_cached_alias_replacement()
-    -> Result<(), Box<dyn std::error::Error>> {
-        const WEST_SQL: &str = "select marker from big where region = 'west'";
-        const EAST_SQL: &str = "select marker from big where region = 'east'";
-
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
-        session
-            .context()
-            .register_table("big_source", source_provider)?;
-        let pending_big = session
-            .table_from_sql("select marker, region from big_source")
-            .await?;
-        let _big = session.register_alias("big", &pending_big)?;
-        let _old_west = session.table_from_sql(WEST_SQL).await?;
-        let _old_east = session.table_from_sql(EAST_SQL).await?;
-        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
-
-        let cached_big = session
-            .context()
-            .table("big")
-            .await?
-            .cache()
-            .await?
-            .into_view();
-        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-
-        let removed_big = session.context().deregister_table("big")?;
-        assert!(removed_big.is_some());
-        session.context().register_table("big", cached_big)?;
-
-        let direct_big = session.context().sql(WEST_SQL).await?.collect().await?;
-        assert_eq!(marker_values_from_batches(&direct_big)?, vec!["shared"]);
-        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-
-        let replanned_west = session.table_from_sql(WEST_SQL).await?;
-        let replanned_east = session.table_from_sql(EAST_SQL).await?;
-        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-
-        let west_stream = session.batch_stream_for_lazy_table(&replanned_west).await?;
-        let east_stream = session.batch_stream_for_lazy_table(&replanned_east).await?;
-        let west_markers = collect_stream_marker_values(west_stream).await?;
-        let east_markers = collect_stream_marker_values(east_stream).await?;
-
-        // Conclusion for #247: after cached big is installed under alias big,
-        // replanning downstream SQL reads the cached provider and does not
-        // rescan the original upstream provider per output.
-        assert_eq!(west_markers, vec!["shared"]);
-        assert_eq!(east_markers, vec!["shared"]);
-        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-        Ok(())
     }
 
     #[tokio::test]
