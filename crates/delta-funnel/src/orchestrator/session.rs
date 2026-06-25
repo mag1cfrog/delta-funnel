@@ -20,11 +20,7 @@ use std::fmt;
 
 use datafusion::prelude::SessionContext;
 
-use crate::{
-    DeltaFunnelError, DeltaSourceConfig, DeltaTableProviderConfig, datafusion_session_context,
-    load_delta_source, preflight_delta_protocol,
-    register_delta_sources_with_scan_execution_options,
-};
+use crate::{DeltaFunnelError, datafusion_session_context};
 
 pub use handles::{
     LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput, RunMode,
@@ -97,51 +93,6 @@ impl DeltaFunnelSession {
     #[must_use]
     pub const fn next_table_id(&self) -> u64 {
         self.next_table_id
-    }
-
-    /// Registers one Delta source and returns its lazy table handle.
-    ///
-    /// The method performs source setup only: Delta snapshot metadata loading,
-    /// protocol preflight, and DataFusion table registration. It does not scan
-    /// data files for row production, parse user SQL, contact SQL Server, or
-    /// execute an output action.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first Delta source loading, protocol preflight, duplicate
-    /// alias, schema conversion, or DataFusion registration error. Session
-    /// source state is updated only after the DataFusion registration succeeds.
-    pub fn delta_lake(&mut self, source: DeltaSourceConfig) -> Result<LazyTable, DeltaFunnelError> {
-        self.reject_registered_alias_name(&source.name)?;
-        let planned = load_delta_source(source)?;
-        let preflight = preflight_delta_protocol(&planned)?;
-        let registered = register_delta_sources_with_scan_execution_options(
-            &self.context,
-            vec![DeltaTableProviderConfig {
-                source: planned,
-                protocol: preflight,
-                scan_target_partitions: None,
-            }],
-            self.options.provider_scan_options(),
-        )?;
-        let registered =
-            registered
-                .sources
-                .into_iter()
-                .next()
-                .ok_or_else(|| DeltaFunnelError::Config {
-                    message: "Delta source registration returned no registered source".to_owned(),
-                })?;
-        let table = self.allocate_delta_source_table(registered.name.clone());
-        let session_source = RegisteredSessionSource::from_registered(table.clone(), registered);
-        self.sources.push(session_source);
-        Ok(table)
-    }
-
-    fn allocate_delta_source_table(&mut self, name: String) -> LazyTable {
-        let id = self.next_table_id;
-        self.next_table_id = self.next_table_id.saturating_add(1);
-        LazyTable::delta_source(id, name)
     }
 }
 
