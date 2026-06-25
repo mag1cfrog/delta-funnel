@@ -1,6 +1,11 @@
-use crate::{MssqlOutputWriteStatus, MssqlWorkflowWriteReport};
+use std::fmt;
 
-use super::{DeltaSourceReport, WriteAllCacheReport};
+use crate::{MssqlOutputWriteStatus, MssqlWorkflowWriteReport, support::sanitize_text_for_display};
+
+use super::{
+    DeltaSourceReport, MssqlCacheCandidateSkip, MssqlCacheCandidateSkipReason,
+    MssqlDerivedCacheAliasPlan, MssqlNoCacheReason, MssqlOutputCacheDecision, MssqlOutputCachePlan,
+};
 
 /// Cache policy for one multi-output `write_all` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -125,6 +130,257 @@ impl WriteAllReport {
     #[must_use]
     pub fn skipped_count(&self) -> usize {
         self.workflow.skipped_count()
+    }
+}
+
+/// Cache metadata for one `write_all` call.
+///
+/// This report describes the conservative cache decision for calls that reached
+/// the sequential output workflow. Cache materialization failures occur before
+/// the workflow can start, so they are returned as errors instead of as
+/// `WriteAllCacheReport` values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteAllCacheReport {
+    /// Cache planning was disabled for this call.
+    Disabled,
+    /// Cache planning ran but did not select a safe cache frontier.
+    NoCache {
+        /// Conservative reason no cache aliases were selected.
+        reason: WriteAllNoCacheReason,
+        /// Registered derived aliases skipped by conservative cache planning.
+        skipped_candidates: Vec<WriteAllCacheCandidateSkip>,
+    },
+    /// Cache planning selected registered derived aliases for this call.
+    CacheAliases {
+        /// Selected registered derived aliases in deterministic planner order.
+        aliases: Vec<WriteAllCacheAliasReport>,
+        /// Registered derived aliases skipped by conservative cache planning.
+        skipped_candidates: Vec<WriteAllCacheCandidateSkip>,
+    },
+}
+
+impl WriteAllCacheReport {
+    pub(super) fn disabled() -> Self {
+        Self::Disabled
+    }
+
+    pub(super) fn from_plan(plan: &MssqlOutputCachePlan) -> Self {
+        Self::from_plan_with_alias_status(plan, WriteAllCacheAliasStatus::Selected)
+    }
+
+    pub(super) fn from_executed_plan(plan: &MssqlOutputCachePlan) -> Self {
+        Self::from_plan_with_alias_status(plan, WriteAllCacheAliasStatus::MaterializedAndRestored)
+    }
+
+    fn from_plan_with_alias_status(
+        plan: &MssqlOutputCachePlan,
+        alias_status: WriteAllCacheAliasStatus,
+    ) -> Self {
+        let skipped_candidates = plan
+            .skipped_candidates()
+            .iter()
+            .map(WriteAllCacheCandidateSkip::from_internal)
+            .collect::<Vec<_>>();
+
+        match plan.decision() {
+            MssqlOutputCacheDecision::NoCache { reason } => Self::NoCache {
+                reason: WriteAllNoCacheReason::from_internal(reason),
+                skipped_candidates,
+            },
+            MssqlOutputCacheDecision::CacheAliases(aliases) => Self::CacheAliases {
+                aliases: aliases
+                    .iter()
+                    .map(|alias| WriteAllCacheAliasReport::from_internal(alias, alias_status))
+                    .collect(),
+                skipped_candidates,
+            },
+        }
+    }
+}
+
+/// Conservative reason no cache alias was selected for `write_all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAllNoCacheReason {
+    /// Cache selection only helps when at least two outputs use a candidate.
+    FewerThanTwoOutputs,
+    /// No registered derived alias is shared by at least two selected outputs.
+    NoSharedRegisteredDerivedAlias,
+    /// Candidate relationships could not produce a deterministic cache frontier.
+    AmbiguousSharedDerivedAlias,
+}
+
+impl WriteAllNoCacheReason {
+    fn from_internal(reason: &MssqlNoCacheReason) -> Self {
+        match reason {
+            MssqlNoCacheReason::FewerThanTwoOutputs => Self::FewerThanTwoOutputs,
+            MssqlNoCacheReason::NoSharedRegisteredDerivedAlias => {
+                Self::NoSharedRegisteredDerivedAlias
+            }
+            MssqlNoCacheReason::AmbiguousSharedDerivedAlias => Self::AmbiguousSharedDerivedAlias,
+        }
+    }
+}
+
+/// Selected registered derived alias cache metadata.
+///
+/// `output_indexes` uses caller-provided `write_all` request indexes. It
+/// includes direct writes of the selected alias and dependent outputs whose
+/// retained SQL was replanned against the active cached alias.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WriteAllCacheAliasReport {
+    table_id: u64,
+    alias: String,
+    output_indexes: Vec<usize>,
+    status: WriteAllCacheAliasStatus,
+}
+
+impl WriteAllCacheAliasReport {
+    fn from_internal(alias: &MssqlDerivedCacheAliasPlan, status: WriteAllCacheAliasStatus) -> Self {
+        Self {
+            table_id: alias.table_id(),
+            alias: alias.alias().to_owned(),
+            output_indexes: alias.output_indexes().to_vec(),
+            status,
+        }
+    }
+
+    /// Returns the selected registered derived table id.
+    #[must_use]
+    pub const fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
+    /// Returns the selected registered derived alias.
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Returns selected output indexes that use this alias.
+    #[must_use]
+    pub fn output_indexes(&self) -> &[usize] {
+        &self.output_indexes
+    }
+
+    /// Returns this alias cache lifecycle status for the `write_all` call.
+    #[must_use]
+    pub const fn status(&self) -> WriteAllCacheAliasStatus {
+        self.status
+    }
+}
+
+impl fmt::Debug for WriteAllCacheAliasReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WriteAllCacheAliasReport")
+            .field("table_id", &self.table_id)
+            .field("alias", &sanitize_text_for_display(&self.alias))
+            .field("output_indexes", &self.output_indexes)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+/// Cache lifecycle status for one selected alias in a `write_all` report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAllCacheAliasStatus {
+    /// The alias was selected by cache planning but has no completed workflow.
+    ///
+    /// This status is reserved for plan-shaped metadata. Normal successful
+    /// public `write_all` reports use [`Self::MaterializedAndRestored`] for
+    /// selected aliases because the scoped catalog replacement has already
+    /// been cleaned up before the report is returned.
+    Selected,
+    /// The alias was materialized, used for the workflow, and restored.
+    ///
+    /// The workflow may still contain per-output failures. This status only
+    /// states that cache setup and restoration completed for the alias.
+    MaterializedAndRestored,
+}
+
+/// Registered derived alias skipped during conservative cache selection.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WriteAllCacheCandidateSkip {
+    table_id: u64,
+    alias: String,
+    reason: WriteAllCacheCandidateSkipReason,
+}
+
+impl WriteAllCacheCandidateSkip {
+    fn from_internal(skip: &MssqlCacheCandidateSkip) -> Self {
+        Self {
+            table_id: skip.table_id(),
+            alias: skip.alias().to_owned(),
+            reason: WriteAllCacheCandidateSkipReason::from_internal(skip.reason()),
+        }
+    }
+
+    /// Returns the skipped registered derived table id.
+    #[must_use]
+    pub const fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
+    /// Returns the skipped registered derived alias.
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Returns why this candidate was skipped.
+    #[must_use]
+    pub const fn reason(&self) -> &WriteAllCacheCandidateSkipReason {
+        &self.reason
+    }
+}
+
+impl fmt::Debug for WriteAllCacheCandidateSkip {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WriteAllCacheCandidateSkip")
+            .field("table_id", &self.table_id)
+            .field("alias", &sanitize_text_for_display(&self.alias))
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+/// Reason a cache candidate was skipped by conservative `write_all` planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteAllCacheCandidateSkipReason {
+    /// Fewer than two selected outputs use this candidate.
+    NotShared {
+        /// Number of selected outputs that use this candidate.
+        output_count: usize,
+    },
+    /// Retained SQL text was missing, so later replanning would be unsafe.
+    MissingSqlText,
+    /// Lineage was incomplete or could not be trusted.
+    IncompleteLineage,
+    /// A deeper shared alias is closer to all dependent outputs.
+    CoveredByDeeperSharedAlias {
+        /// Table id of the selected deeper alias that covers this candidate.
+        selected_table_id: u64,
+    },
+    /// The candidate's relative depth could not be ordered deterministically.
+    AmbiguousDepth,
+}
+
+impl WriteAllCacheCandidateSkipReason {
+    fn from_internal(reason: &MssqlCacheCandidateSkipReason) -> Self {
+        match reason {
+            MssqlCacheCandidateSkipReason::NotShared { output_count } => Self::NotShared {
+                output_count: *output_count,
+            },
+            MssqlCacheCandidateSkipReason::MissingSqlText => Self::MissingSqlText,
+            MssqlCacheCandidateSkipReason::IncompleteLineage => Self::IncompleteLineage,
+            MssqlCacheCandidateSkipReason::CoveredByDeeperSharedAlias { selected_table_id } => {
+                Self::CoveredByDeeperSharedAlias {
+                    selected_table_id: *selected_table_id,
+                }
+            }
+            MssqlCacheCandidateSkipReason::AmbiguousDepth => Self::AmbiguousDepth,
+        }
     }
 }
 
