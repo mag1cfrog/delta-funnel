@@ -1759,16 +1759,17 @@ mod tests {
         SessionOptions, SourceUsageStatus,
         registry::{DerivedTableDependency, DerivedTableLineage},
         test_support::{
-            DeltaLogTable, collect_stream_marker_values, execute_output_request,
-            marker_region_provider, marker_values_from_batches, output_request,
-            scan_counting_marker_region_provider, secret_connection,
+            DeltaLogTable, collect_stream_marker_values, collect_stream_row_count,
+            execute_output_request, marker_region_provider, marker_values_from_batches,
+            output_request, override_connection, scan_counting_marker_region_provider,
+            secret_connection,
         },
     };
     use super::{
         MssqlCacheCandidateSkipReason, MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan,
         MssqlNoCacheReason, MssqlOutputCacheDecision, MssqlScopedCacheAliasReplacement,
-        WriteAllCacheMode, WriteAllOptions, cache_error_with_restore_error,
-        restore_mssql_cache_aliases_after_error,
+        WriteAllCacheAliasStatus, WriteAllCacheMode, WriteAllCacheReport, WriteAllNoCacheReason,
+        WriteAllOptions, cache_error_with_restore_error, restore_mssql_cache_aliases_after_error,
     };
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlOutputBatchStream,
@@ -2185,6 +2186,378 @@ mod tests {
             .ok_or("expected execution provider stats")?;
         assert_eq!(stats.rows_produced, u64::try_from(table.rows())?);
         assert_ne!(stats.rows_produced, output_report.stats().rows_written());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_auto_no_candidate_uses_baseline_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("orders_source", source_provider)?;
+        let west = session
+            .table_from_sql("select marker from orders_source where region = 'west'")
+            .await?;
+        let east = session
+            .table_from_sql("select marker from orders_source where region = 'east'")
+            .await?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session.write_all_with_writer(&[west, east], writer).await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].output_name, "west_output");
+        assert_eq!(calls[0].rows, 1);
+        assert_eq!(calls[1].output_name, "east_output");
+        assert_eq!(calls[1].rows, 1);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        assert!(report.all_succeeded());
+        assert!(matches!(
+            report.cache(),
+            WriteAllCacheReport::NoCache {
+                reason: WriteAllNoCacheReason::NoSharedRegisteredDerivedAlias,
+                skipped_candidates
+            } if skipped_candidates.is_empty()
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_auto_caches_shared_alias_for_direct_and_dependent_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let big_output = execute_output_request(
+            big.clone(),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let west_output =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_writer(&[big_output, west_output], writer)
+            .await?;
+        {
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
+
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].output_name, "big_output");
+            assert_eq!(calls[0].rows, 2);
+            assert_eq!(calls[1].output_name, "west_output");
+            assert_eq!(calls[1].rows, 1);
+            assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+            assert!(report.all_succeeded());
+        }
+        let WriteAllCacheReport::CacheAliases {
+            aliases,
+            skipped_candidates,
+        } = report.cache()
+        else {
+            return Err(format!("expected cache aliases report, got {:?}", report.cache()).into());
+        };
+        assert!(skipped_candidates.is_empty());
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].table_id(), big.id());
+        assert_eq!(aliases[0].alias(), "big");
+        assert_eq!(aliases[0].output_indexes(), &[0, 1]);
+        assert_eq!(
+            aliases[0].status(),
+            WriteAllCacheAliasStatus::MaterializedAndRestored
+        );
+
+        let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+        let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
+        assert_eq!(restored_big_rows, 2);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_report_debug_redacts_connections_and_retained_sql()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, _source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql(
+                "select 'super-secret-literal' as marker, region \
+                 from big_source",
+            )
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let big_output =
+            execute_output_request(big, "big_output", "big_orders", LoadMode::AppendExisting)?;
+        let override_target_config =
+            MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "west_orders")?)
+                .with_load_mode(LoadMode::AppendExisting)
+                .with_connection(override_connection()?);
+        let west_output = OutputWritePlan::new(
+            west,
+            MssqlOutputTarget::new("west_output", override_target_config, RunMode::Execute),
+        );
+        let writer = FakeWorkflowWriter::default();
+
+        let report = session
+            .write_all_with_writer(&[big_output, west_output], writer)
+            .await?;
+
+        let debug = format!("{report:?}");
+        assert!(debug.contains("warehouse-primary"));
+        assert!(debug.contains("warehouse-override"));
+        assert!(debug.contains("CacheAliases"));
+        assert!(debug.contains("MaterializedAndRestored"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("override-secret"));
+        assert!(!debug.contains("super-secret-literal"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_auto_caches_multiple_shared_aliases_for_dependent_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (big_source_provider, big_source_scans) = scan_counting_marker_region_provider("big")?;
+        let (names_source_provider, names_source_scans) =
+            scan_counting_marker_region_provider("names")?;
+        session
+            .context()
+            .register_table("big_source", big_source_provider)?;
+        session
+            .context()
+            .register_table("names_source", names_source_provider)?;
+        let pending_big = session
+            .table_from_sql(
+                "select marker as big_marker, region, \
+                 case when region = 'west' then 1 else 2 end as id \
+                 from big_source",
+            )
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_names = session
+            .table_from_sql(
+                "select marker as name_marker, region, \
+                 case when region = 'west' then 1 else 2 end as id \
+                 from names_source",
+            )
+            .await?;
+        let names = session.register_alias("names", &pending_names)?;
+        let west = session
+            .table_from_sql(
+                "select big.id, big.big_marker, names.name_marker \
+                 from big join names on big.id = names.id \
+                 where big.region = 'west'",
+            )
+            .await?;
+        let east = session
+            .table_from_sql(
+                "select big.id, big.big_marker, names.name_marker \
+                 from big join names on big.id = names.id \
+                 where big.region = 'east'",
+            )
+            .await?;
+        let west_output =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east_output =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_writer(&[west_output, east_output], writer)
+            .await?;
+        {
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
+
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].output_name, "west_output");
+            assert_eq!(calls[0].rows, 1);
+            assert_eq!(calls[1].output_name, "east_output");
+            assert_eq!(calls[1].rows, 1);
+            assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
+            assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
+            assert!(report.all_succeeded());
+        }
+        let WriteAllCacheReport::CacheAliases {
+            aliases,
+            skipped_candidates,
+        } = report.cache()
+        else {
+            return Err(format!("expected cache aliases report, got {:?}", report.cache()).into());
+        };
+        assert!(skipped_candidates.is_empty());
+        assert_eq!(aliases.len(), 2);
+        assert_eq!(aliases[0].table_id(), big.id());
+        assert_eq!(aliases[0].alias(), "big");
+        assert_eq!(aliases[0].output_indexes(), &[0, 1]);
+        assert_eq!(
+            aliases[0].status(),
+            WriteAllCacheAliasStatus::MaterializedAndRestored
+        );
+        assert_eq!(aliases[1].table_id(), names.id());
+        assert_eq!(aliases[1].alias(), "names");
+        assert_eq!(aliases[1].output_indexes(), &[0, 1]);
+        assert_eq!(
+            aliases[1].status(),
+            WriteAllCacheAliasStatus::MaterializedAndRestored
+        );
+
+        let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+        let restored_names_factory = session.lazy_table_batch_stream_factory(names);
+        assert_eq!(
+            collect_stream_row_count(restored_big_factory().await?).await?,
+            2
+        );
+        assert_eq!(
+            collect_stream_row_count(restored_names_factory().await?).await?,
+            2
+        );
+        assert_eq!(big_source_scans.load(Ordering::SeqCst), 2);
+        assert_eq!(names_source_scans.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_auto_keeps_unrelated_output_on_normal_stream_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (shared_provider, shared_scans) = scan_counting_marker_region_provider("shared")?;
+        let (unrelated_provider, unrelated_scans) =
+            scan_counting_marker_region_provider("unrelated")?;
+        session
+            .context()
+            .register_table("big_source", shared_provider)?;
+        session
+            .context()
+            .register_table("unrelated_source", unrelated_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let unrelated = session
+            .table_from_sql("select marker from unrelated_source where region = 'west'")
+            .await?;
+        let big_output =
+            execute_output_request(big, "big_output", "big_orders", LoadMode::AppendExisting)?;
+        let west_output =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let unrelated_output = execute_output_request(
+            unrelated,
+            "unrelated_output",
+            "unrelated_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_writer(&[big_output, unrelated_output, west_output], writer)
+            .await?;
+        {
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
+
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[0].output_name, "big_output");
+            assert_eq!(calls[0].rows, 2);
+            assert_eq!(calls[1].output_name, "unrelated_output");
+            assert_eq!(calls[1].rows, 1);
+            assert_eq!(calls[2].output_name, "west_output");
+            assert_eq!(calls[2].rows, 1);
+            assert_eq!(shared_scans.load(Ordering::SeqCst), 1);
+            assert_eq!(unrelated_scans.load(Ordering::SeqCst), 1);
+            assert!(report.all_succeeded());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_disabled_cache_mode_uses_baseline_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let big_output =
+            execute_output_request(big, "big_output", "big_orders", LoadMode::AppendExisting)?;
+        let west_output =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session
+            .write_all_with_options_and_writer(
+                &[big_output, west_output],
+                WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                writer,
+            )
+            .await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].rows, 2);
+        assert_eq!(calls[1].rows, 1);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        assert!(report.all_succeeded());
+        assert_eq!(report.cache(), &WriteAllCacheReport::Disabled);
         Ok(())
     }
 
