@@ -23,11 +23,11 @@ use futures_util::StreamExt;
 
 use crate::{
     DeltaFunnelError, DeltaSourceConfig, DeltaTableProviderConfig, MssqlOutputBatchStream,
-    MssqlSchemaPlanOptions, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWriteOptions,
-    MssqlWriteReport, ResolvedMssqlTarget, SqlTablePhase, datafusion_query_output_stream,
-    datafusion_session_context, load_delta_source, plan_mssql_target_for_resolved_output,
-    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
-    table_formats::validate_table_source_names, write_output_batches_to_mssql,
+    MssqlTargetOutputPlan, MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget, SqlTablePhase,
+    datafusion_query_output_stream, datafusion_session_context, load_delta_source,
+    plan_mssql_target_for_resolved_output, preflight_delta_protocol,
+    register_delta_sources_with_scan_execution_options, table_formats::validate_table_source_names,
+    write_output_batches_to_mssql,
 };
 
 pub use handles::{
@@ -438,29 +438,6 @@ impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
     }
 }
 
-struct MssqlWorkflowPublicOutputWriter;
-
-#[async_trait]
-impl MssqlWorkflowOutputWriter for MssqlWorkflowPublicOutputWriter {
-    async fn write_output(
-        &mut self,
-        output_schema: SchemaRef,
-        resolved_target: ResolvedMssqlTarget,
-        schema_options: MssqlSchemaPlanOptions,
-        batches: MssqlOutputBatchStream,
-        write_options: MssqlWriteOptions,
-    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql(
-            output_schema.as_ref(),
-            resolved_target,
-            schema_options,
-            batches,
-            write_options,
-        )
-        .await
-    }
-}
-
 impl fmt::Debug for DeltaFunnelSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -527,9 +504,10 @@ mod tests {
     use super::*;
     use crate::{
         DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions, DeltaStorageOptions,
-        LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlTargetCleanupStatus,
-        MssqlTargetConfig, MssqlTargetTable, OutputStatus, QueryOptions, ReportReasonCode,
-        ValidationOptions, ValidationStatus, WorkflowStatus, table_formats::RealParquetDeltaTable,
+        LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlSchemaPlanOptions,
+        MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetTable, MssqlWorkflowOutputWriter,
+        OutputStatus, QueryOptions, ReportReasonCode, ValidationOptions, ValidationStatus,
+        WorkflowStatus, table_formats::RealParquetDeltaTable,
     };
     use async_trait::async_trait;
     use datafusion::{

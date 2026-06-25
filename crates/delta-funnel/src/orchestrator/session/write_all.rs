@@ -1,21 +1,46 @@
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
-use datafusion::{datasource::TableProvider, prelude::SessionContext};
+use async_trait::async_trait;
+use datafusion::{arrow::datatypes::SchemaRef, datasource::TableProvider, prelude::SessionContext};
 
 use crate::{
-    DeltaFunnelError, MssqlOutputWriteJob, MssqlOutputWriteStatus, MssqlWorkflowOutputWriter,
-    MssqlWorkflowWriteReport, support::sanitize_text_for_display, write_mssql_outputs_with_writer,
+    DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputWriteJob, MssqlOutputWriteStatus,
+    MssqlSchemaPlanOptions, MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, MssqlWriteOptions,
+    MssqlWriteReport, ResolvedMssqlTarget, support::sanitize_text_for_display,
+    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
 };
 
 use super::{
-    DeltaFunnelSession, DeltaSourceReport, LazyTable, LazyTableKind,
-    MssqlWorkflowPublicOutputWriter, OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable,
-    RunMode,
+    DeltaFunnelSession, DeltaSourceReport, LazyTable, LazyTableKind, OutputWritePlan,
+    PlannedMssqlOutput, RegisteredDerivedTable, RunMode,
     errors::mssql_scoped_cache_alias_error,
     errors::unknown_cached_alias_error,
     registry::DerivedTableDependency,
     streams::{SharedProviderReadStats, provider_read_stats_snapshot, shared_provider_read_stats},
 };
+
+struct MssqlWorkflowPublicOutputWriter;
+
+#[async_trait]
+impl MssqlWorkflowOutputWriter for MssqlWorkflowPublicOutputWriter {
+    async fn write_output(
+        &mut self,
+        output_schema: SchemaRef,
+        resolved_target: ResolvedMssqlTarget,
+        schema_options: MssqlSchemaPlanOptions,
+        batches: MssqlOutputBatchStream,
+        write_options: MssqlWriteOptions,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        write_output_batches_to_mssql(
+            output_schema.as_ref(),
+            resolved_target,
+            schema_options,
+            batches,
+            write_options,
+        )
+        .await
+    }
+}
 
 /// Cache policy for one multi-output `write_all` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
