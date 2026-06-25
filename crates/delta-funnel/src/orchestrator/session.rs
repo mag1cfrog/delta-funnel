@@ -23,15 +23,16 @@ use futures_util::{Stream, StreamExt};
 
 use crate::{
     BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaProviderReaderBackend,
-    DeltaProviderScanExecutionOptions, DeltaSourceConfig, DeltaTableProviderConfig,
-    MssqlConnectionConfig, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
-    MssqlOutputWriteJob, MssqlOutputWriteStatus, MssqlSchemaPlanOptions, MssqlTargetConfig,
-    MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWorkflowWriteOptions,
-    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, OutputStatus, QueryOptions,
-    RegisteredDeltaSource, ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase, ValidationOptions,
-    ValidationStatus, WorkflowStatus, collect_delta_provider_read_stats,
-    datafusion_query_output_stream, datafusion_session_context, default_mssql_write_options,
-    load_delta_source, plan_mssql_target_for_resolved_output, preflight_delta_protocol,
+    DeltaProviderScanExecutionOptions, DeltaSourceConfig, DeltaTableProviderConfig, LoadMode,
+    MssqlConnectionConfig, MssqlDdlPlan, MssqlLifecyclePlan, MssqlOutputBatchStream,
+    MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlOutputWriteStatus, MssqlSchemaPlan,
+    MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable,
+    MssqlWorkflowOutputWriter, MssqlWorkflowWriteOptions, MssqlWorkflowWriteReport,
+    MssqlWriteOptions, MssqlWriteReport, OutputStatus, QueryOptions, RegisteredDeltaSource,
+    ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase, ValidationOptions, ValidationStatus,
+    WorkflowStatus, collect_delta_provider_read_stats, datafusion_query_output_stream,
+    datafusion_session_context, default_mssql_write_options, load_delta_source,
+    plan_mssql_target_for_resolved_output, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
     table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
     write_output_batches_to_mssql,
@@ -1268,6 +1269,36 @@ impl MssqlDryRunOutputReport {
     #[must_use]
     pub fn output_schema(&self) -> &[MssqlDryRunOutputFieldReport] {
         &self.output_schema
+    }
+
+    /// Returns the planned SQL Server target table.
+    #[must_use]
+    pub fn target_table(&self) -> &MssqlTargetTable {
+        self.planned_output.output_plan().target_table()
+    }
+
+    /// Returns the requested target load mode.
+    #[must_use]
+    pub fn load_mode(&self) -> LoadMode {
+        self.planned_output.output_plan().load_mode()
+    }
+
+    /// Returns the planned Arrow-to-MSSQL schema mapping artifact.
+    #[must_use]
+    pub fn target_schema_plan(&self) -> &MssqlSchemaPlan {
+        self.planned_output.output_plan().schema_plan()
+    }
+
+    /// Returns the planned SQL Server DDL artifact.
+    #[must_use]
+    pub fn target_ddl_plan(&self) -> &MssqlDdlPlan {
+        self.planned_output.output_plan().ddl_plan()
+    }
+
+    /// Returns the planned SQL Server table lifecycle artifact.
+    #[must_use]
+    pub fn target_lifecycle_plan(&self) -> &MssqlLifecyclePlan {
+        self.planned_output.output_plan().lifecycle_plan()
     }
 
     /// Returns the redacted SQL identity for the selected lazy table.
@@ -7262,6 +7293,16 @@ mod tests {
             report.validation_status(),
             ValidationStatus::skipped(ReportReasonCode::DryRun)
         );
+        assert_eq!(report.target_table().schema(), Some("dbo"));
+        assert_eq!(report.target_table().table(), "west_orders");
+        assert_eq!(report.load_mode(), LoadMode::CreateAndLoad);
+        assert_eq!(report.target_schema_plan().mappings().len(), 1);
+        assert!(report.target_ddl_plan().create_table_sql().is_some());
+        assert!(report.target_lifecycle_plan().create_table_sql_required());
+        assert_eq!(
+            report.target_lifecycle_plan().expected_target_state(),
+            crate::MssqlTargetTableState::Absent
+        );
         assert_eq!(
             report.planned_output().output_plan().target_table().table(),
             "west_orders"
@@ -7438,21 +7479,21 @@ mod tests {
             ValidationStatus::skipped(ReportReasonCode::DryRun)
         );
         assert!(report.sources().is_empty());
+        assert_eq!(report.outputs()[0].target_table().table(), "west_orders");
+        assert_eq!(report.outputs()[0].load_mode(), LoadMode::CreateAndLoad);
         assert_eq!(
             report.outputs()[0]
-                .planned_output()
-                .output_plan()
-                .target_table()
-                .table(),
-            "west_orders"
+                .target_lifecycle_plan()
+                .expected_target_state(),
+            crate::MssqlTargetTableState::Absent
         );
+        assert_eq!(report.outputs()[1].target_table().table(), "east_orders");
+        assert_eq!(report.outputs()[1].load_mode(), LoadMode::AppendExisting);
         assert_eq!(
             report.outputs()[1]
-                .planned_output()
-                .output_plan()
-                .target_table()
-                .table(),
-            "east_orders"
+                .target_lifecycle_plan()
+                .expected_target_state(),
+            crate::MssqlTargetTableState::Exists
         );
         assert!(!report.sql_server_contacted());
         assert!(!report.row_production_started());
