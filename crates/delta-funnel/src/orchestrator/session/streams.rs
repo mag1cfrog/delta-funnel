@@ -18,8 +18,10 @@ use crate::{
 
 use super::{
     LazyTable, LazyTableKind, PendingDerivedTable, RegisteredDerivedTable, RegisteredSessionSource,
-    cached_output_stream_setup_error, datafusion_handoff_setup_error, read_only_sql_options,
-    unknown_lazy_table_error,
+    errors::{
+        cached_output_stream_setup_error, datafusion_handoff_setup_error, unknown_lazy_table_error,
+    },
+    read_only_sql_options,
 };
 
 pub(super) type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;

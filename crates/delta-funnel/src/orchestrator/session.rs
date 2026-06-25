@@ -5,6 +5,7 @@
 //! not contact SQL Server or execute rows unless a write path explicitly does so.
 
 mod dry_run_report;
+mod errors;
 mod handles;
 mod options;
 mod registry;
@@ -27,13 +28,12 @@ use datafusion::{datasource::TableProvider, prelude::DataFrame};
 use futures_util::StreamExt;
 
 use crate::{
-    BatchPipelinePhase, DeltaFunnelError, DeltaSourceConfig, DeltaTableProviderConfig,
-    MssqlOutputBatchStream, MssqlOutputBatchStreamFactory, MssqlOutputWriteJob,
-    MssqlSchemaPlanOptions, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter,
-    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, ReportReasonCode,
-    ResolvedMssqlTarget, SqlTablePhase, collect_delta_provider_read_stats,
-    datafusion_query_output_stream, datafusion_session_context, load_delta_source,
-    plan_mssql_target_for_resolved_output, preflight_delta_protocol,
+    DeltaFunnelError, DeltaSourceConfig, DeltaTableProviderConfig, MssqlOutputBatchStream,
+    MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlSchemaPlanOptions,
+    MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, MssqlWriteOptions,
+    MssqlWriteReport, ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase,
+    collect_delta_provider_read_stats, datafusion_query_output_stream, datafusion_session_context,
+    load_delta_source, plan_mssql_target_for_resolved_output, preflight_delta_protocol,
     register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
     table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
     write_output_batches_to_mssql,
@@ -55,6 +55,10 @@ use dry_run_report::stable_sql_identity_hash;
 pub use dry_run_report::{
     MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
     MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
+};
+use errors::{
+    datafusion_handoff_setup_error, mssql_scoped_cache_alias_error, sql_table_error,
+    unknown_cached_alias_error, unknown_lazy_table_error,
 };
 use registry::{DerivedTableDependency, DerivedTableLineage, PendingDerivedTable};
 use streams::{
@@ -2150,72 +2154,6 @@ fn classify_sql_error_phase(error: &str) -> SqlTablePhase {
         SqlTablePhase::ValidateSql
     } else {
         SqlTablePhase::PlanSql
-    }
-}
-
-fn sql_table_error<T>(
-    phase: SqlTablePhase,
-    message: impl Into<String>,
-) -> Result<T, DeltaFunnelError> {
-    Err(DeltaFunnelError::SqlTable {
-        phase,
-        message: message.into(),
-    })
-}
-
-fn unknown_lazy_table_error(table: &LazyTable) -> DeltaFunnelError {
-    DeltaFunnelError::MssqlWorkflowPlanning {
-        message: format!(
-            "lazy table `{}` is not registered in this session",
-            sanitize_text_for_display(table.name())
-        ),
-    }
-}
-
-fn unknown_cached_alias_error(alias: &MssqlDerivedCacheAliasPlan) -> DeltaFunnelError {
-    DeltaFunnelError::MssqlWorkflowPlanning {
-        message: format!(
-            "cached alias `{}` is not registered in this session",
-            sanitize_text_for_display(alias.alias())
-        ),
-    }
-}
-
-fn cached_output_stream_setup_error(
-    output_name: &str,
-    message: impl fmt::Display,
-) -> DeltaFunnelError {
-    DeltaFunnelError::MssqlWorkflowPlanning {
-        message: format!(
-            "cached output stream setup failed for `{}`: {}",
-            sanitize_text_for_display(output_name),
-            sanitize_text_for_display(&message.to_string())
-        ),
-    }
-}
-
-fn mssql_scoped_cache_alias_error(
-    phase: &'static str,
-    alias_name: &str,
-    error: impl fmt::Display,
-) -> DeltaFunnelError {
-    DeltaFunnelError::MssqlWorkflowPlanning {
-        message: format!(
-            "scoped MSSQL cache alias {phase} failed for `{}`: {}",
-            sanitize_text_for_display(alias_name),
-            sanitize_text_for_display(&error.to_string())
-        ),
-    }
-}
-
-fn datafusion_handoff_setup_error(
-    option: &'static str,
-    error: impl fmt::Display,
-) -> DeltaFunnelError {
-    DeltaFunnelError::BatchPipeline {
-        phase: BatchPipelinePhase::HandoffSetup,
-        option,
-        message: error.to_string(),
     }
 }
 

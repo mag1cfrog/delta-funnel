@@ -8,7 +8,8 @@ use crate::{
 };
 
 use super::{
-    DeltaSourceReport, OutputWritePlan, RegisteredDerivedTable, mssql_scoped_cache_alias_error,
+    DeltaSourceReport, OutputWritePlan, RegisteredDerivedTable,
+    errors::mssql_scoped_cache_alias_error,
 };
 
 /// Cache policy for one multi-output `write_all` call.
