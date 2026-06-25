@@ -470,7 +470,9 @@ impl DeltaFunnelSession {
 
 #[cfg(test)]
 mod tests {
-    use super::SourceUsageStatus;
+    use super::super::{SessionOptions, test_support::DeltaLogTable};
+    use super::{DeltaFunnelSession, SourceUsageStatus};
+    use crate::{DeltaSourceConfig, FileCount, ReportReasonCode};
 
     #[test]
     fn source_usage_status_exposes_stable_codes() {
@@ -478,5 +480,53 @@ mod tests {
         assert_eq!(SourceUsageStatus::NotUsed.as_str(), "not_used");
         assert_eq!(SourceUsageStatus::Unknown.as_str(), "unknown");
         assert_eq!(SourceUsageStatus::Unknown.to_string(), "unknown");
+    }
+
+    #[tokio::test]
+    async fn source_reports_for_lazy_table_plan_include_provider_stats_without_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let reports = session.source_reports_for_lazy_table_plan(&source).await?;
+
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.source_name(), "orders");
+        assert_eq!(report.provider_stats_reason(), None);
+        let stats = report
+            .provider_read_stats()
+            .ok_or("expected provider read stats")?;
+        assert_eq!(stats.source_name, "orders");
+        assert_eq!(stats.snapshot_version, report.snapshot_version());
+        assert_eq!(stats.files_started, 0);
+        assert_eq!(stats.files_completed, 0);
+        assert_eq!(stats.batches_produced, 0);
+        assert_eq!(stats.rows_produced, 0);
+        match stats.scan_metadata_exhausted {
+            Some(true) => {
+                assert_eq!(report.file_count(), FileCount::exact(stats.files_planned));
+                assert_eq!(report.file_count_reason(), None);
+                assert!(report.scan_metadata_exhausted());
+            }
+            Some(false) => {
+                assert_eq!(
+                    report.file_count(),
+                    FileCount::estimated(stats.files_planned)
+                );
+                assert_eq!(report.file_count_reason(), None);
+                assert!(!report.scan_metadata_exhausted());
+            }
+            None => {
+                assert_eq!(report.file_count(), FileCount::unavailable());
+                assert_eq!(
+                    report.file_count_reason(),
+                    Some(ReportReasonCode::CapabilityUnavailable)
+                );
+                assert!(!report.scan_metadata_exhausted());
+            }
+        }
+        Ok(())
     }
 }
