@@ -22,7 +22,8 @@ mod table_formats;
 pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
     DeltaFunnelRuntime, DeltaFunnelSession, DeltaProviderSchedulingReport, DeltaSourceReport,
-    LazyTable, LazyTableKind, MssqlDryRunOutputReport, MssqlDryRunWorkflowReport,
+    LazyTable, LazyTableKind, MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport,
+    MssqlDryRunSqlIdentityReport, MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
     MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable,
     RegisteredSessionSource, RunMode, SessionOptions, SourceUsageStatus, WriteAllCacheAliasReport,
     WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,

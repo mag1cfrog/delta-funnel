@@ -23,17 +23,19 @@ use futures_util::{Stream, StreamExt};
 
 use crate::{
     BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaProviderReaderBackend,
-    DeltaProviderScanExecutionOptions, DeltaSourceConfig, DeltaTableProviderConfig,
-    MssqlConnectionConfig, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
-    MssqlOutputWriteJob, MssqlOutputWriteStatus, MssqlSchemaPlanOptions, MssqlTargetConfig,
-    MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWorkflowWriteOptions,
-    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, QueryOptions,
-    RegisteredDeltaSource, ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase, ValidationOptions,
-    collect_delta_provider_read_stats, datafusion_query_output_stream, datafusion_session_context,
-    default_mssql_write_options, load_delta_source, plan_mssql_target_for_resolved_output,
-    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
-    support::sanitize_text_for_display, table_formats::validate_table_source_names,
-    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
+    DeltaProviderScanExecutionOptions, DeltaSourceConfig, DeltaTableProviderConfig, LoadMode,
+    MssqlConnectionConfig, MssqlDdlPlan, MssqlLifecyclePlan, MssqlOutputBatchStream,
+    MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlOutputWriteStatus, MssqlSchemaPlan,
+    MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable,
+    MssqlWorkflowOutputWriter, MssqlWorkflowWriteOptions, MssqlWorkflowWriteReport,
+    MssqlWriteOptions, MssqlWriteReport, OutputStatus, QueryOptions, RegisteredDeltaSource,
+    ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase, ValidationOptions, ValidationStatus,
+    WorkflowStatus, collect_delta_provider_read_stats, datafusion_query_output_stream,
+    datafusion_session_context, default_mssql_write_options, load_delta_source,
+    plan_mssql_target_for_resolved_output, preflight_delta_protocol,
+    register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
+    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
+    write_output_batches_to_mssql,
 };
 
 type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
@@ -626,6 +628,144 @@ impl OutputWritePlan {
     }
 }
 
+/// Output schema field included in an MSSQL dry-run report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MssqlDryRunOutputFieldReport {
+    index: u64,
+    name: String,
+    arrow_type: String,
+    nullable: bool,
+}
+
+impl MssqlDryRunOutputFieldReport {
+    fn from_mapping(mapping: &arrow_tiberius::SchemaMapping) -> Self {
+        Self {
+            index: crate::usize_to_u64_saturating(mapping.arrow().index()),
+            name: mapping.arrow().name().to_owned(),
+            arrow_type: mapping.arrow().data_type().to_string(),
+            nullable: mapping.arrow().nullable(),
+        }
+    }
+
+    /// Returns the zero-based output field index.
+    #[must_use]
+    pub const fn index(&self) -> u64 {
+        self.index
+    }
+
+    /// Returns the output field name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the Arrow data type as a stable display string.
+    #[must_use]
+    pub fn arrow_type(&self) -> &str {
+        &self.arrow_type
+    }
+
+    /// Returns true when the output field is nullable.
+    #[must_use]
+    pub const fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
+/// SQL identity state included in an MSSQL dry-run output report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MssqlDryRunSqlIdentityState {
+    /// A stable SQL identity hash is available.
+    Present,
+    /// No SQL identity applies to the selected lazy table.
+    Absent,
+    /// A SQL identity applies, but could not be reported from available metadata.
+    Unavailable,
+}
+
+impl MssqlDryRunSqlIdentityState {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Absent => "absent",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl fmt::Display for MssqlDryRunSqlIdentityState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Redacted SQL identity included in an MSSQL dry-run output report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MssqlDryRunSqlIdentityReport {
+    state: MssqlDryRunSqlIdentityState,
+    hash: Option<String>,
+    reason: Option<ReportReasonCode>,
+}
+
+impl MssqlDryRunSqlIdentityReport {
+    fn present(hash: String) -> Self {
+        Self {
+            state: MssqlDryRunSqlIdentityState::Present,
+            hash: Some(hash),
+            reason: None,
+        }
+    }
+
+    fn absent() -> Self {
+        Self {
+            state: MssqlDryRunSqlIdentityState::Absent,
+            hash: None,
+            reason: None,
+        }
+    }
+
+    fn unavailable(reason: ReportReasonCode) -> Self {
+        Self {
+            state: MssqlDryRunSqlIdentityState::Unavailable,
+            hash: None,
+            reason: Some(reason),
+        }
+    }
+
+    /// Returns whether a SQL identity hash is present, absent, or unavailable.
+    #[must_use]
+    pub const fn state(&self) -> MssqlDryRunSqlIdentityState {
+        self.state
+    }
+
+    /// Returns the stable SQL identity hash when retained SQL is available.
+    #[must_use]
+    pub fn hash(&self) -> Option<&str> {
+        self.hash.as_deref()
+    }
+
+    /// Returns the reason when SQL identity reporting is unavailable.
+    #[must_use]
+    pub const fn reason(&self) -> Option<ReportReasonCode> {
+        self.reason
+    }
+}
+
+fn stable_sql_identity_hash(sql: &str) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in sql.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    format!("{hash:016x}")
+}
+
 /// Cache policy for one multi-output `write_all` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WriteAllCacheMode {
@@ -1063,6 +1203,14 @@ impl PlannedMssqlOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlDryRunOutputReport {
     planned_output: PlannedMssqlOutput,
+    output_schema: Vec<MssqlDryRunOutputFieldReport>,
+    sql_identity: MssqlDryRunSqlIdentityReport,
+    source_usage_status: SourceUsageStatus,
+    used_source_names: Vec<String>,
+    output_row_count: crate::RowCount,
+    output_row_count_reason: Option<ReportReasonCode>,
+    status: OutputStatus,
+    validation_status: ValidationStatus,
     sql_server_contacted: bool,
     row_production_started: bool,
     table_lifecycle_started: bool,
@@ -1070,9 +1218,29 @@ pub struct MssqlDryRunOutputReport {
 }
 
 impl MssqlDryRunOutputReport {
-    fn new(planned_output: PlannedMssqlOutput) -> Self {
+    fn new(
+        planned_output: PlannedMssqlOutput,
+        sql_identity: MssqlDryRunSqlIdentityReport,
+        source_usage_status: SourceUsageStatus,
+        used_source_names: Vec<String>,
+    ) -> Self {
+        let output_schema = planned_output
+            .output_plan()
+            .schema_mappings()
+            .iter()
+            .map(MssqlDryRunOutputFieldReport::from_mapping)
+            .collect();
+
         Self {
             planned_output,
+            output_schema,
+            sql_identity,
+            source_usage_status,
+            used_source_names,
+            output_row_count: crate::RowCount::unavailable(),
+            output_row_count_reason: Some(ReportReasonCode::NotExecuted),
+            status: OutputStatus::dry_run_planned(),
+            validation_status: ValidationStatus::skipped(ReportReasonCode::DryRun),
             sql_server_contacted: false,
             row_production_started: false,
             table_lifecycle_started: false,
@@ -1090,6 +1258,102 @@ impl MssqlDryRunOutputReport {
     #[must_use]
     pub fn output_name(&self) -> &str {
         self.planned_output.output_plan().output_name()
+    }
+
+    /// Returns the selected lazy table id.
+    #[must_use]
+    pub const fn table_id(&self) -> u64 {
+        self.planned_output.table().id()
+    }
+
+    /// Returns the selected lazy table kind.
+    #[must_use]
+    pub const fn table_kind(&self) -> LazyTableKind {
+        self.planned_output.table().kind()
+    }
+
+    /// Returns the selected lazy table name.
+    #[must_use]
+    pub fn table_name(&self) -> &str {
+        self.planned_output.table().name()
+    }
+
+    /// Returns the planned Arrow output schema in output field order.
+    #[must_use]
+    pub fn output_schema(&self) -> &[MssqlDryRunOutputFieldReport] {
+        &self.output_schema
+    }
+
+    /// Returns the planned SQL Server target table.
+    #[must_use]
+    pub fn target_table(&self) -> &MssqlTargetTable {
+        self.planned_output.output_plan().target_table()
+    }
+
+    /// Returns the requested target load mode.
+    #[must_use]
+    pub fn load_mode(&self) -> LoadMode {
+        self.planned_output.output_plan().load_mode()
+    }
+
+    /// Returns the planned Arrow-to-MSSQL schema mapping artifact.
+    #[must_use]
+    pub fn target_schema_plan(&self) -> &MssqlSchemaPlan {
+        self.planned_output.output_plan().schema_plan()
+    }
+
+    /// Returns the planned SQL Server DDL artifact.
+    #[must_use]
+    pub fn target_ddl_plan(&self) -> &MssqlDdlPlan {
+        self.planned_output.output_plan().ddl_plan()
+    }
+
+    /// Returns the planned SQL Server table lifecycle artifact.
+    #[must_use]
+    pub fn target_lifecycle_plan(&self) -> &MssqlLifecyclePlan {
+        self.planned_output.output_plan().lifecycle_plan()
+    }
+
+    /// Returns the redacted SQL identity for the selected lazy table.
+    #[must_use]
+    pub const fn sql_identity(&self) -> &MssqlDryRunSqlIdentityReport {
+        &self.sql_identity
+    }
+
+    /// Returns known source usage status for this selected output.
+    #[must_use]
+    pub const fn source_usage_status(&self) -> SourceUsageStatus {
+        self.source_usage_status
+    }
+
+    /// Returns registered source names known to be used by this selected output.
+    #[must_use]
+    pub fn used_source_names(&self) -> &[String] {
+        &self.used_source_names
+    }
+
+    /// Returns output row-count evidence for this dry-run output.
+    #[must_use]
+    pub const fn output_row_count(&self) -> crate::RowCount {
+        self.output_row_count
+    }
+
+    /// Returns the stable reason code when output row count is unavailable.
+    #[must_use]
+    pub const fn output_row_count_reason(&self) -> Option<ReportReasonCode> {
+        self.output_row_count_reason
+    }
+
+    /// Returns the dry-run output status.
+    #[must_use]
+    pub const fn status(&self) -> OutputStatus {
+        self.status
+    }
+
+    /// Returns the target validation status for this dry-run output.
+    #[must_use]
+    pub const fn validation_status(&self) -> ValidationStatus {
+        self.validation_status
     }
 
     /// Returns the dry-run action mode.
@@ -1128,17 +1392,34 @@ impl MssqlDryRunOutputReport {
 pub struct MssqlDryRunWorkflowReport {
     outputs: Vec<MssqlDryRunOutputReport>,
     sources: Vec<DeltaSourceReport>,
+    status: WorkflowStatus,
 }
 
 impl MssqlDryRunWorkflowReport {
     fn new(outputs: Vec<MssqlDryRunOutputReport>, sources: Vec<DeltaSourceReport>) -> Self {
-        Self { outputs, sources }
+        let status = if outputs.is_empty() {
+            WorkflowStatus::no_op(ReportReasonCode::NotExecuted)
+        } else {
+            WorkflowStatus::success()
+        };
+
+        Self {
+            outputs,
+            sources,
+            status,
+        }
     }
 
     /// Returns the dry-run action mode.
     #[must_use]
     pub const fn run_mode(&self) -> RunMode {
         RunMode::DryRun
+    }
+
+    /// Returns the dry-run workflow status.
+    #[must_use]
+    pub const fn status(&self) -> WorkflowStatus {
+        self.status
     }
 
     /// Returns the number of selected outputs represented by this report.
@@ -1163,6 +1444,26 @@ impl MssqlDryRunWorkflowReport {
     #[must_use]
     pub fn sources(&self) -> &[DeltaSourceReport] {
         &self.sources
+    }
+
+    /// Returns whether scan metadata was exhausted for every known query-used source.
+    ///
+    /// This returns false when no source is known to be used by the selected
+    /// outputs, or when any used source only has metadata-only or unavailable
+    /// scan evidence.
+    #[must_use]
+    pub fn query_used_source_scan_metadata_exhausted(&self) -> bool {
+        let mut used_source_seen = false;
+        for source in &self.sources {
+            if source.usage_status() == SourceUsageStatus::Used {
+                used_source_seen = true;
+                if !source.scan_metadata_exhausted() {
+                    return false;
+                }
+            }
+        }
+
+        used_source_seen
     }
 
     /// Returns whether dry-run planning contacted SQL Server for any output.
@@ -2068,7 +2369,7 @@ impl DeltaFunnelSession {
         ensure_dry_run_mode(request.target().run_mode())?;
         let planned = self.plan_mssql_output(request)?;
 
-        Ok(MssqlDryRunOutputReport::new(planned))
+        self.dry_run_output_report_for_plan(planned)
     }
 
     /// Dry-runs multiple selected lazy tables as one MSSQL output workflow.
@@ -2139,9 +2440,62 @@ impl DeltaFunnelSession {
                 ensure_write_all_dry_run_mode(request.target().run_mode())?;
                 let planned = self.plan_mssql_output(request)?;
 
-                Ok(MssqlDryRunOutputReport::new(planned))
+                self.dry_run_output_report_for_plan(planned)
             })
             .collect()
+    }
+
+    fn dry_run_output_report_for_plan(
+        &self,
+        planned_output: PlannedMssqlOutput,
+    ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
+        let sql_identity = self.sql_identity_for_lazy_table(planned_output.table());
+        let (source_usage_status, used_source_names) =
+            self.source_usage_for_lazy_table(planned_output.table())?;
+        Ok(MssqlDryRunOutputReport::new(
+            planned_output,
+            sql_identity,
+            source_usage_status,
+            used_source_names,
+        ))
+    }
+
+    fn source_usage_for_lazy_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<(SourceUsageStatus, Vec<String>), DeltaFunnelError> {
+        let Some(source_ids) = self.known_source_dependencies_for_table(table)? else {
+            return Ok((SourceUsageStatus::Unknown, Vec::new()));
+        };
+
+        let used_source_names = self
+            .sources
+            .iter()
+            .filter(|source| source_ids.contains(&source.table().id()))
+            .map(|source| source.name().to_owned())
+            .collect::<Vec<_>>();
+        let source_usage_status = if used_source_names.is_empty() {
+            SourceUsageStatus::NotUsed
+        } else {
+            SourceUsageStatus::Used
+        };
+
+        Ok((source_usage_status, used_source_names))
+    }
+
+    fn sql_identity_for_lazy_table(&self, table: &LazyTable) -> MssqlDryRunSqlIdentityReport {
+        if table.kind() != LazyTableKind::DerivedSql {
+            return MssqlDryRunSqlIdentityReport::absent();
+        }
+
+        match self.sql_text_for_derived_table(table) {
+            Ok(sql_text) => {
+                MssqlDryRunSqlIdentityReport::present(stable_sql_identity_hash(sql_text))
+            }
+            Err(_) => {
+                MssqlDryRunSqlIdentityReport::unavailable(ReportReasonCode::CapabilityUnavailable)
+            }
+        }
     }
 
     /// Writes one selected lazy table to SQL Server.
@@ -7001,6 +7355,21 @@ mod tests {
 
         assert_eq!(report.output_name(), "west_output");
         assert_eq!(report.run_mode(), RunMode::DryRun);
+        assert_eq!(report.status(), OutputStatus::dry_run_planned());
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::DryRun)
+        );
+        assert_eq!(report.target_table().schema(), Some("dbo"));
+        assert_eq!(report.target_table().table(), "west_orders");
+        assert_eq!(report.load_mode(), LoadMode::CreateAndLoad);
+        assert_eq!(report.target_schema_plan().mappings().len(), 1);
+        assert!(report.target_ddl_plan().create_table_sql().is_some());
+        assert!(report.target_lifecycle_plan().create_table_sql_required());
+        assert_eq!(
+            report.target_lifecycle_plan().expected_target_state(),
+            crate::MssqlTargetTableState::Absent
+        );
         assert_eq!(
             report.planned_output().output_plan().target_table().table(),
             "west_orders"
@@ -7013,6 +7382,34 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(report.output_schema().len(), 1);
+        assert_eq!(report.output_schema()[0].index(), 0);
+        assert_eq!(report.output_schema()[0].name(), "marker");
+        assert_eq!(report.output_schema()[0].arrow_type(), "Utf8");
+        assert!(!report.output_schema()[0].nullable());
+        assert_eq!(report.source_usage_status(), SourceUsageStatus::NotUsed);
+        assert!(report.used_source_names().is_empty());
+        assert_eq!(report.output_row_count(), crate::RowCount::unavailable());
+        assert_eq!(
+            report.output_row_count_reason(),
+            Some(ReportReasonCode::NotExecuted)
+        );
+        assert_eq!(MssqlDryRunSqlIdentityState::Present.as_str(), "present");
+        assert_eq!(MssqlDryRunSqlIdentityState::Absent.to_string(), "absent");
+        assert_eq!(
+            MssqlDryRunSqlIdentityState::Unavailable.as_str(),
+            "unavailable"
+        );
+        assert_eq!(
+            report.sql_identity().state(),
+            MssqlDryRunSqlIdentityState::Present
+        );
+        assert_eq!(report.sql_identity().hash(), Some("a65390dacb7eb6f1"));
+        assert_eq!(report.sql_identity().reason(), None);
+        let debug = format!("{report:?}");
+        assert!(debug.contains("a65390dacb7eb6f1"));
+        assert!(!debug.contains("select marker"));
+        assert!(!debug.contains("region = 'west'"));
         assert!(!report.sql_server_contacted());
         assert!(!report.row_production_started());
         assert!(!report.table_lifecycle_started());
@@ -7131,32 +7528,54 @@ mod tests {
         let east = session
             .table_from_sql("select marker from orders_source where region = 'east'")
             .await?;
+        let west_table_id = west.id();
+        let west_table_name = west.name().to_owned();
         let west = output_request(west, "west_output", "west_orders", LoadMode::CreateAndLoad)?;
         let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
 
         let report = session.dry_run_all_to_mssql(&[west, east])?;
 
         assert_eq!(report.run_mode(), RunMode::DryRun);
+        assert_eq!(report.status(), WorkflowStatus::success());
         assert_eq!(report.len(), 2);
         assert!(!report.is_empty());
         assert_eq!(report.outputs()[0].output_name(), "west_output");
         assert_eq!(report.outputs()[1].output_name(), "east_output");
-        assert!(report.sources().is_empty());
+        assert_eq!(report.outputs()[0].table_id(), west_table_id);
+        assert_eq!(report.outputs()[0].table_kind(), LazyTableKind::DerivedSql);
+        assert_eq!(report.outputs()[0].table_name(), west_table_name);
         assert_eq!(
-            report.outputs()[0]
-                .planned_output()
-                .output_plan()
-                .target_table()
-                .table(),
-            "west_orders"
+            report.outputs()[0].status(),
+            OutputStatus::dry_run_planned()
         );
         assert_eq!(
+            report.outputs()[0].validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::DryRun)
+        );
+        assert_eq!(
+            report.outputs()[0].output_row_count(),
+            crate::RowCount::unavailable()
+        );
+        assert_eq!(
+            report.outputs()[0].output_row_count_reason(),
+            Some(ReportReasonCode::NotExecuted)
+        );
+        assert!(report.sources().is_empty());
+        assert_eq!(report.outputs()[0].target_table().table(), "west_orders");
+        assert_eq!(report.outputs()[0].load_mode(), LoadMode::CreateAndLoad);
+        assert_eq!(
+            report.outputs()[0]
+                .target_lifecycle_plan()
+                .expected_target_state(),
+            crate::MssqlTargetTableState::Absent
+        );
+        assert_eq!(report.outputs()[1].target_table().table(), "east_orders");
+        assert_eq!(report.outputs()[1].load_mode(), LoadMode::AppendExisting);
+        assert_eq!(
             report.outputs()[1]
-                .planned_output()
-                .output_plan()
-                .target_table()
-                .table(),
-            "east_orders"
+                .target_lifecycle_plan()
+                .expected_target_state(),
+            crate::MssqlTargetTableState::Exists
         );
         assert!(!report.sql_server_contacted());
         assert!(!report.row_production_started());
@@ -7184,6 +7603,21 @@ mod tests {
         let report = session.dry_run_all_to_mssql(&[request])?;
 
         assert_eq!(report.outputs().len(), 1);
+        assert!(!report.query_used_source_scan_metadata_exhausted());
+        assert_eq!(
+            report.outputs()[0].sql_identity().state(),
+            MssqlDryRunSqlIdentityState::Absent
+        );
+        assert_eq!(report.outputs()[0].sql_identity().hash(), None);
+        assert_eq!(report.outputs()[0].sql_identity().reason(), None);
+        assert_eq!(
+            report.outputs()[0].source_usage_status(),
+            SourceUsageStatus::Used
+        );
+        assert_eq!(
+            report.outputs()[0].used_source_names(),
+            &["orders".to_owned()]
+        );
         assert_eq!(report.sources().len(), 1);
         let source = &report.sources()[0];
         assert_eq!(source.source_name(), "orders");
@@ -7263,6 +7697,10 @@ mod tests {
                 );
             }
         }
+        assert_eq!(
+            report.query_used_source_scan_metadata_exhausted(),
+            source.scan_metadata_exhausted()
+        );
         Ok(())
     }
 
@@ -7292,6 +7730,15 @@ mod tests {
 
         let report = session.dry_run_all_to_mssql(&[request])?;
 
+        assert!(!report.query_used_source_scan_metadata_exhausted());
+        assert_eq!(
+            report.outputs()[0].source_usage_status(),
+            SourceUsageStatus::Used
+        );
+        assert_eq!(
+            report.outputs()[0].used_source_names(),
+            &["orders".to_owned(), "customers".to_owned()]
+        );
         assert_eq!(report.sources().len(), 3);
         for source in report.sources() {
             match source.source_name() {
