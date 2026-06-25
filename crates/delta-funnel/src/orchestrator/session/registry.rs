@@ -1,10 +1,21 @@
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
-use datafusion::{arrow::datatypes::SchemaRef, datasource::TableProvider};
+use datafusion::{
+    arrow::datatypes::SchemaRef,
+    common::TableReference,
+    datasource::TableProvider,
+    sql::{parser::DFParser, resolve::resolve_table_references},
+};
 
-use crate::{DeltaFunnelError, DeltaProtocolReport, RegisteredDeltaSource};
+use crate::{
+    DeltaFunnelError, DeltaProtocolReport, RegisteredDeltaSource, SqlTablePhase,
+    support::sanitize_text_for_display,
+};
 
-use super::{DeltaFunnelSession, LazyTable, LazyTableKind, errors::unknown_lazy_table_error};
+use super::{
+    DeltaFunnelSession, LazyTable, LazyTableKind,
+    errors::{sql_table_error, unknown_lazy_table_error},
+};
 
 /// Registered Delta source tracked by a query-load session.
 #[derive(Clone, PartialEq, Eq)]
@@ -296,5 +307,303 @@ impl DeltaFunnelSession {
 
         self.registered_derived_table_by_id(table.id())
             .ok_or_else(|| unknown_lazy_table_error(table))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sql_text_for_derived_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<&str, DeltaFunnelError> {
+        if table.kind() != LazyTableKind::DerivedSql {
+            return Err(unknown_lazy_table_error(table));
+        }
+
+        self.derived_tables
+            .iter()
+            .find(|derived| derived.table().id() == table.id())
+            .map(RegisteredDerivedTable::sql_text)
+            .or_else(|| {
+                self.pending_derived_tables
+                    .iter()
+                    .find(|pending| pending.table.id() == table.id())
+                    .map(|pending| pending.sql_text.as_str())
+            })
+            .ok_or_else(|| unknown_lazy_table_error(table))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn lineage_for_derived_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<&DerivedTableLineage, DeltaFunnelError> {
+        if table.kind() != LazyTableKind::DerivedSql {
+            return Err(unknown_lazy_table_error(table));
+        }
+
+        self.derived_tables
+            .iter()
+            .find(|derived| derived.table().id() == table.id())
+            .map(RegisteredDerivedTable::lineage)
+            .or_else(|| {
+                self.pending_derived_tables
+                    .iter()
+                    .find(|pending| pending.table.id() == table.id())
+                    .map(|pending| &pending.lineage)
+            })
+            .ok_or_else(|| unknown_lazy_table_error(table))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transitive_registered_derived_dependencies(
+        &self,
+        table: &LazyTable,
+    ) -> Result<Vec<DerivedTableDependency>, DeltaFunnelError> {
+        let lineage = self.lineage_for_derived_table(table)?;
+        let mut visited_table_ids = BTreeSet::new();
+        let mut dependencies = BTreeSet::new();
+
+        self.collect_transitive_registered_derived_dependencies(
+            lineage,
+            &mut visited_table_ids,
+            &mut dependencies,
+        )?;
+
+        Ok(dependencies.into_iter().collect())
+    }
+
+    pub(super) fn known_source_dependencies_for_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<Option<BTreeSet<u64>>, DeltaFunnelError> {
+        self.schema_for_lazy_table(table)?;
+
+        match table.kind() {
+            LazyTableKind::DeltaSource => Ok(Some(BTreeSet::from([table.id()]))),
+            LazyTableKind::DerivedSql => {
+                let lineage = self.lineage_for_derived_table(table)?;
+                if !lineage.is_complete() {
+                    return Ok(None);
+                }
+                let mut visited_derived_table_ids = BTreeSet::new();
+                let mut source_table_ids = BTreeSet::new();
+                let usage_known = self.collect_transitive_source_dependencies(
+                    lineage,
+                    &mut visited_derived_table_ids,
+                    &mut source_table_ids,
+                )?;
+                Ok(usage_known.then_some(source_table_ids))
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn lazy_table_depends_on_registered_derived(
+        &self,
+        table: &LazyTable,
+        candidate: &LazyTable,
+    ) -> Result<bool, DeltaFunnelError> {
+        self.schema_for_lazy_table(table)?;
+        if candidate.kind() != LazyTableKind::DerivedSql {
+            return Err(unknown_lazy_table_error(candidate));
+        }
+
+        self.registered_derived_table_by_id(candidate.id())
+            .ok_or_else(|| unknown_lazy_table_error(candidate))?;
+        if table.id() == candidate.id() {
+            return Ok(true);
+        }
+        if table.kind() == LazyTableKind::DeltaSource {
+            return Ok(false);
+        }
+
+        Ok(self
+            .transitive_registered_derived_dependencies(table)?
+            .iter()
+            .any(|dependency| {
+                matches!(
+                    dependency,
+                    DerivedTableDependency::RegisteredDerived { table_id, .. }
+                        if *table_id == candidate.id()
+                )
+            }))
+    }
+
+    fn collect_transitive_registered_derived_dependencies(
+        &self,
+        lineage: &DerivedTableLineage,
+        visited_table_ids: &mut BTreeSet<u64>,
+        dependencies: &mut BTreeSet<DerivedTableDependency>,
+    ) -> Result<(), DeltaFunnelError> {
+        for dependency in lineage.direct_dependencies() {
+            let DerivedTableDependency::RegisteredDerived { table_id, name } = dependency else {
+                continue;
+            };
+            if !visited_table_ids.insert(*table_id) {
+                continue;
+            }
+
+            dependencies.insert(dependency.clone());
+            let derived = self.registered_derived_table_by_id(*table_id).ok_or_else(|| {
+                DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: format!(
+                        "registered derived lineage dependency `{}` is not registered in this session",
+                        sanitize_text_for_display(name)
+                    ),
+                }
+            })?;
+            self.collect_transitive_registered_derived_dependencies(
+                derived.lineage(),
+                visited_table_ids,
+                dependencies,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn collect_transitive_source_dependencies(
+        &self,
+        lineage: &DerivedTableLineage,
+        visited_derived_table_ids: &mut BTreeSet<u64>,
+        source_table_ids: &mut BTreeSet<u64>,
+    ) -> Result<bool, DeltaFunnelError> {
+        let mut usage_known = true;
+
+        for dependency in lineage.direct_dependencies() {
+            match dependency {
+                DerivedTableDependency::RegisteredSource { table_id, .. } => {
+                    source_table_ids.insert(*table_id);
+                }
+                DerivedTableDependency::RegisteredDerived { table_id, name } => {
+                    if !visited_derived_table_ids.insert(*table_id) {
+                        continue;
+                    }
+                    let derived = self.registered_derived_table_by_id(*table_id).ok_or_else(|| {
+                        DeltaFunnelError::MssqlWorkflowPlanning {
+                            message: format!(
+                                "registered derived lineage dependency `{}` is not registered in this session",
+                                sanitize_text_for_display(name)
+                            ),
+                        }
+                    })?;
+                    if !derived.lineage().is_complete() {
+                        usage_known = false;
+                        continue;
+                    }
+                    usage_known &= self.collect_transitive_source_dependencies(
+                        derived.lineage(),
+                        visited_derived_table_ids,
+                        source_table_ids,
+                    )?;
+                }
+            }
+        }
+
+        Ok(usage_known)
+    }
+
+    pub(super) fn derive_table_lineage_from_sql(&self, sql: &str) -> DerivedTableLineage {
+        match self.extract_table_lineage_from_sql(sql) {
+            Ok(lineage) => lineage,
+            // Lineage is advisory metadata for later cache planning. Keep the
+            // existing table_from_sql behavior intact if extraction fails.
+            Err(error) => DerivedTableLineage::incomplete(error.to_string()),
+        }
+    }
+
+    fn extract_table_lineage_from_sql(
+        &self,
+        sql: &str,
+    ) -> Result<DerivedTableLineage, DeltaFunnelError> {
+        // Reuse DataFusion's SQL parser and table-reference resolver so lineage
+        // follows the same SQL dialect and CTE scoping rules as planning.
+        let mut statements =
+            DFParser::parse_sql(sql).map_err(|error| DeltaFunnelError::SqlTable {
+                phase: SqlTablePhase::ValidateSql,
+                message: error.to_string(),
+            })?;
+        if statements.len() != 1 {
+            return sql_table_error(
+                SqlTablePhase::ValidateSql,
+                "expected exactly one SQL statement for lineage extraction",
+            );
+        }
+        let statement = statements
+            .pop_front()
+            .ok_or_else(|| DeltaFunnelError::SqlTable {
+                phase: SqlTablePhase::ValidateSql,
+                message: "expected parsed SQL statement for lineage extraction".to_owned(),
+            })?;
+        let (relations, ctes) = resolve_table_references(&statement, true).map_err(|error| {
+            DeltaFunnelError::SqlTable {
+                phase: SqlTablePhase::ValidateSql,
+                message: error.to_string(),
+            }
+        })?;
+
+        Ok(self.classify_lineage_references(relations, ctes))
+    }
+
+    fn classify_lineage_references(
+        &self,
+        relations: Vec<TableReference>,
+        ctes: Vec<TableReference>,
+    ) -> DerivedTableLineage {
+        // CTE names are local to this SQL statement. They can shadow session
+        // aliases, so classify them before checking registered session tables.
+        let local_references = sorted_reference_strings(ctes.into_iter());
+        let local_reference_names = local_references
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut dependencies = BTreeSet::new();
+        let mut unknown_references = BTreeSet::new();
+
+        for relation in relations {
+            // Session aliases are currently registered as bare names. Qualified
+            // references might be external catalog/schema names, so keep them
+            // visible as unknown instead of guessing.
+            let Some(name) = bare_table_reference_name(&relation) else {
+                unknown_references.insert(relation.to_string());
+                continue;
+            };
+            if local_reference_names.contains(name) {
+                continue;
+            }
+            // Alias registration rejects source/derived name collisions, so a
+            // bare name can map to at most one session-owned object.
+            if let Some(derived) = self.registered_derived_table(name) {
+                dependencies.insert(DerivedTableDependency::registered_derived(derived));
+            } else if let Some(source) = self.registered_source(name) {
+                dependencies.insert(DerivedTableDependency::registered_source(source));
+            } else {
+                unknown_references.insert(relation.to_string());
+            }
+        }
+
+        DerivedTableLineage::complete(
+            dependencies.into_iter().collect(),
+            local_references,
+            unknown_references.into_iter().collect(),
+        )
+    }
+}
+
+fn sorted_reference_strings(references: impl Iterator<Item = TableReference>) -> Vec<String> {
+    // Stable ordering and de-duplication make lineage deterministic for tests,
+    // debug output, and later cache candidate comparisons.
+    references
+        .map(|reference| reference.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn bare_table_reference_name(reference: &TableReference) -> Option<&str> {
+    match reference {
+        TableReference::Bare { table } => Some(table.as_ref()),
+        // Do not collapse catalog/schema-qualified names into a bare alias.
+        // That would make external tables look session-owned.
+        TableReference::Partial { .. } | TableReference::Full { .. } => None,
     }
 }
