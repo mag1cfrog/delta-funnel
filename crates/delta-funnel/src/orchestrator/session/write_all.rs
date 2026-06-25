@@ -1761,8 +1761,8 @@ mod tests {
         },
     };
     use super::{
-        MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan, MssqlNoCacheReason,
-        MssqlOutputCacheDecision, WriteAllCacheMode, WriteAllOptions,
+        MssqlCacheCandidateSkipReason, MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan,
+        MssqlNoCacheReason, MssqlOutputCacheDecision, WriteAllCacheMode, WriteAllOptions,
     };
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlTargetConfig, MssqlTargetTable,
@@ -1926,6 +1926,142 @@ mod tests {
         assert_eq!(cache.table_id(), big.id());
         assert_eq!(cache.alias(), "big");
         assert_eq!(cache.output_indexes(), &[0, 1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_plan_skips_unshared_registered_derived_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let unrelated = session
+            .table_from_sql("select customer_name from orders")
+            .await?;
+        let big_output = output_request(
+            big.clone(),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let unrelated_output = output_request(
+            unrelated,
+            "unrelated_output",
+            "unrelated_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        let plan = session.plan_mssql_output_cache(&[big_output, unrelated_output]);
+
+        assert_eq!(
+            plan.decision(),
+            &MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::NoSharedRegisteredDerivedAlias,
+            }
+        );
+        assert_eq!(plan.skipped_candidates().len(), 1);
+        let skipped = &plan.skipped_candidates()[0];
+        assert_eq!(skipped.table_id(), big.id());
+        assert_eq!(skipped.alias(), "big");
+        assert_eq!(
+            skipped.reason(),
+            &MssqlCacheCandidateSkipReason::NotShared { output_count: 1 }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_plan_prefers_deepest_shared_registered_derived_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_filtered = session
+            .table_from_sql("select id, customer_name from big where id > 0")
+            .await?;
+        let filtered_big = session.register_alias("filtered_big", &pending_filtered)?;
+        let west = session
+            .table_from_sql("select id from filtered_big where customer_name = 'alice'")
+            .await?;
+        let east = session
+            .table_from_sql("select id from filtered_big where customer_name = 'bob'")
+            .await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+
+        let plan = session.plan_mssql_output_cache(&[west, east]);
+
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        assert_eq!(caches.len(), 1);
+        let cache = &caches[0];
+        assert_eq!(cache.table_id(), filtered_big.id());
+        assert_eq!(cache.alias(), "filtered_big");
+        assert_eq!(cache.output_indexes(), &[0, 1]);
+        assert_eq!(plan.skipped_candidates().len(), 1);
+        let skipped = &plan.skipped_candidates()[0];
+        assert_eq!(skipped.table_id(), big.id());
+        assert_eq!(skipped.alias(), "big");
+        assert_eq!(
+            skipped.reason(),
+            &MssqlCacheCandidateSkipReason::CoveredByDeeperSharedAlias {
+                selected_table_id: filtered_big.id(),
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_plan_selects_independent_shared_aliases_with_same_output_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_names = session
+            .table_from_sql("select customer_name from orders")
+            .await?;
+        let names = session.register_alias("names", &pending_names)?;
+        let west = session
+            .table_from_sql(
+                "select big.id from big join names on big.customer_name = names.customer_name",
+            )
+            .await?;
+        let east = session
+            .table_from_sql(
+                "select big.id from big join names on big.customer_name = names.customer_name",
+            )
+            .await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+
+        let plan = session.plan_mssql_output_cache(&[west, east]);
+
+        // Sharing the same selected output indexes is not ambiguity when the
+        // aliases are independent in the derived lineage graph.
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        assert!(plan.skipped_candidates().is_empty());
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[0].table_id(), big.id());
+        assert_eq!(caches[0].alias(), "big");
+        assert_eq!(caches[0].output_indexes(), &[0, 1]);
+        assert_eq!(caches[1].table_id(), names.id());
+        assert_eq!(caches[1].alias(), "names");
+        assert_eq!(caches[1].output_indexes(), &[0, 1]);
         Ok(())
     }
 
