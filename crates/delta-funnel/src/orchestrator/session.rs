@@ -41,7 +41,9 @@ use crate::{
     write_output_batches_to_mssql,
 };
 
-pub use handles::{LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, RunMode};
+pub use handles::{
+    LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput, RunMode,
+};
 pub use options::SessionOptions;
 pub use registry::{RegisteredDerivedTable, RegisteredSessionSource};
 pub use source_report::{DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus};
@@ -65,58 +67,6 @@ use write_all::{
 };
 
 type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
-
-/// Planned MSSQL output request for one selected lazy table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedMssqlOutput {
-    request: OutputWritePlan,
-    resolved_target: ResolvedMssqlTarget,
-    output_plan: MssqlTargetOutputPlan,
-}
-
-impl PlannedMssqlOutput {
-    fn new(
-        request: OutputWritePlan,
-        resolved_target: ResolvedMssqlTarget,
-        output_plan: MssqlTargetOutputPlan,
-    ) -> Self {
-        Self {
-            request,
-            resolved_target,
-            output_plan,
-        }
-    }
-
-    /// Returns the original lazy-table output request.
-    #[must_use]
-    pub const fn request(&self) -> &OutputWritePlan {
-        &self.request
-    }
-
-    /// Returns the selected lazy table.
-    #[must_use]
-    pub const fn table(&self) -> &LazyTable {
-        self.request.table()
-    }
-
-    /// Returns the selected MSSQL target request.
-    #[must_use]
-    pub const fn target(&self) -> &MssqlOutputTarget {
-        self.request.target()
-    }
-
-    /// Returns the resolved SQL Server target, including the private connection config.
-    #[must_use]
-    pub const fn resolved_target(&self) -> &ResolvedMssqlTarget {
-        &self.resolved_target
-    }
-
-    /// Returns the complete SQL Server target output plan.
-    #[must_use]
-    pub const fn output_plan(&self) -> &MssqlTargetOutputPlan {
-        &self.output_plan
-    }
-}
 
 /// Rust backing session for lazy query-load workflows.
 pub struct DeltaFunnelSession {

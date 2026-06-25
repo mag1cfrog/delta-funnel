@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::{MssqlTargetConfig, support::sanitize_text_for_display};
+use crate::{
+    MssqlTargetConfig, MssqlTargetOutputPlan, ResolvedMssqlTarget,
+    support::sanitize_text_for_display,
+};
 
 /// Query-load action mode requested by a caller.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -164,6 +167,58 @@ impl OutputWritePlan {
     #[must_use]
     pub const fn target(&self) -> &MssqlOutputTarget {
         &self.target
+    }
+}
+
+/// Planned MSSQL output request for one selected lazy table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedMssqlOutput {
+    request: OutputWritePlan,
+    resolved_target: ResolvedMssqlTarget,
+    output_plan: MssqlTargetOutputPlan,
+}
+
+impl PlannedMssqlOutput {
+    pub(super) fn new(
+        request: OutputWritePlan,
+        resolved_target: ResolvedMssqlTarget,
+        output_plan: MssqlTargetOutputPlan,
+    ) -> Self {
+        Self {
+            request,
+            resolved_target,
+            output_plan,
+        }
+    }
+
+    /// Returns the original lazy-table output request.
+    #[must_use]
+    pub const fn request(&self) -> &OutputWritePlan {
+        &self.request
+    }
+
+    /// Returns the selected lazy table.
+    #[must_use]
+    pub const fn table(&self) -> &LazyTable {
+        self.request.table()
+    }
+
+    /// Returns the selected MSSQL target request.
+    #[must_use]
+    pub const fn target(&self) -> &MssqlOutputTarget {
+        self.request.target()
+    }
+
+    /// Returns the resolved SQL Server target, including the private connection config.
+    #[must_use]
+    pub const fn resolved_target(&self) -> &ResolvedMssqlTarget {
+        &self.resolved_target
+    }
+
+    /// Returns the complete SQL Server target output plan.
+    #[must_use]
+    pub const fn output_plan(&self) -> &MssqlTargetOutputPlan {
+        &self.output_plan
     }
 }
 
