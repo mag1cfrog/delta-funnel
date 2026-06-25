@@ -1205,6 +1205,8 @@ pub struct MssqlDryRunOutputReport {
     planned_output: PlannedMssqlOutput,
     output_schema: Vec<MssqlDryRunOutputFieldReport>,
     sql_identity: MssqlDryRunSqlIdentityReport,
+    source_usage_status: SourceUsageStatus,
+    used_source_names: Vec<String>,
     status: OutputStatus,
     validation_status: ValidationStatus,
     sql_server_contacted: bool,
@@ -1214,7 +1216,12 @@ pub struct MssqlDryRunOutputReport {
 }
 
 impl MssqlDryRunOutputReport {
-    fn new(planned_output: PlannedMssqlOutput, sql_identity: MssqlDryRunSqlIdentityReport) -> Self {
+    fn new(
+        planned_output: PlannedMssqlOutput,
+        sql_identity: MssqlDryRunSqlIdentityReport,
+        source_usage_status: SourceUsageStatus,
+        used_source_names: Vec<String>,
+    ) -> Self {
         let output_schema = planned_output
             .output_plan()
             .schema_mappings()
@@ -1226,6 +1233,8 @@ impl MssqlDryRunOutputReport {
             planned_output,
             output_schema,
             sql_identity,
+            source_usage_status,
+            used_source_names,
             status: OutputStatus::dry_run_planned(),
             validation_status: ValidationStatus::skipped(ReportReasonCode::DryRun),
             sql_server_contacted: false,
@@ -1305,6 +1314,18 @@ impl MssqlDryRunOutputReport {
     #[must_use]
     pub const fn sql_identity(&self) -> &MssqlDryRunSqlIdentityReport {
         &self.sql_identity
+    }
+
+    /// Returns known source usage status for this selected output.
+    #[must_use]
+    pub const fn source_usage_status(&self) -> SourceUsageStatus {
+        self.source_usage_status
+    }
+
+    /// Returns registered source names known to be used by this selected output.
+    #[must_use]
+    pub fn used_source_names(&self) -> &[String] {
+        &self.used_source_names
     }
 
     /// Returns the dry-run output status.
@@ -2332,7 +2353,7 @@ impl DeltaFunnelSession {
         ensure_dry_run_mode(request.target().run_mode())?;
         let planned = self.plan_mssql_output(request)?;
 
-        Ok(self.dry_run_output_report_for_plan(planned))
+        self.dry_run_output_report_for_plan(planned)
     }
 
     /// Dry-runs multiple selected lazy tables as one MSSQL output workflow.
@@ -2403,7 +2424,7 @@ impl DeltaFunnelSession {
                 ensure_write_all_dry_run_mode(request.target().run_mode())?;
                 let planned = self.plan_mssql_output(request)?;
 
-                Ok(self.dry_run_output_report_for_plan(planned))
+                self.dry_run_output_report_for_plan(planned)
             })
             .collect()
     }
@@ -2411,9 +2432,39 @@ impl DeltaFunnelSession {
     fn dry_run_output_report_for_plan(
         &self,
         planned_output: PlannedMssqlOutput,
-    ) -> MssqlDryRunOutputReport {
+    ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
         let sql_identity = self.sql_identity_for_lazy_table(planned_output.table());
-        MssqlDryRunOutputReport::new(planned_output, sql_identity)
+        let (source_usage_status, used_source_names) =
+            self.source_usage_for_lazy_table(planned_output.table())?;
+        Ok(MssqlDryRunOutputReport::new(
+            planned_output,
+            sql_identity,
+            source_usage_status,
+            used_source_names,
+        ))
+    }
+
+    fn source_usage_for_lazy_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<(SourceUsageStatus, Vec<String>), DeltaFunnelError> {
+        let Some(source_ids) = self.known_source_dependencies_for_table(table)? else {
+            return Ok((SourceUsageStatus::Unknown, Vec::new()));
+        };
+
+        let used_source_names = self
+            .sources
+            .iter()
+            .filter(|source| source_ids.contains(&source.table().id()))
+            .map(|source| source.name().to_owned())
+            .collect::<Vec<_>>();
+        let source_usage_status = if used_source_names.is_empty() {
+            SourceUsageStatus::NotUsed
+        } else {
+            SourceUsageStatus::Used
+        };
+
+        Ok((source_usage_status, used_source_names))
     }
 
     fn sql_identity_for_lazy_table(&self, table: &LazyTable) -> MssqlDryRunSqlIdentityReport {
@@ -7320,6 +7371,8 @@ mod tests {
         assert_eq!(report.output_schema()[0].name(), "marker");
         assert_eq!(report.output_schema()[0].arrow_type(), "Utf8");
         assert!(!report.output_schema()[0].nullable());
+        assert_eq!(report.source_usage_status(), SourceUsageStatus::NotUsed);
+        assert!(report.used_source_names().is_empty());
         assert_eq!(MssqlDryRunSqlIdentityState::Present.as_str(), "present");
         assert_eq!(MssqlDryRunSqlIdentityState::Absent.to_string(), "absent");
         assert_eq!(
@@ -7528,6 +7581,14 @@ mod tests {
         );
         assert_eq!(report.outputs()[0].sql_identity().hash(), None);
         assert_eq!(report.outputs()[0].sql_identity().reason(), None);
+        assert_eq!(
+            report.outputs()[0].source_usage_status(),
+            SourceUsageStatus::Used
+        );
+        assert_eq!(
+            report.outputs()[0].used_source_names(),
+            &["orders".to_owned()]
+        );
         assert_eq!(report.sources().len(), 1);
         let source = &report.sources()[0];
         assert_eq!(source.source_name(), "orders");
@@ -7641,6 +7702,14 @@ mod tests {
         let report = session.dry_run_all_to_mssql(&[request])?;
 
         assert!(!report.query_used_source_scan_metadata_exhausted());
+        assert_eq!(
+            report.outputs()[0].source_usage_status(),
+            SourceUsageStatus::Used
+        );
+        assert_eq!(
+            report.outputs()[0].used_source_names(),
+            &["orders".to_owned(), "customers".to_owned()]
+        );
         assert_eq!(report.sources().len(), 3);
         for source in report.sources() {
             match source.source_name() {
