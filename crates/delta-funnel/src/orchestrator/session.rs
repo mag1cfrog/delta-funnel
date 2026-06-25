@@ -216,18 +216,13 @@ impl fmt::Debug for DeltaFunnelSession {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        any::Any,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-    };
+    use std::sync::{Arc, Mutex, atomic::Ordering};
 
     use super::registry::{DerivedTableDependency, DerivedTableLineage};
     use super::test_support::{
-        DeltaLogTable, collect_stream_row_count, execute_output_request, marker_region_provider,
-        output_request, override_connection, secret_connection,
+        DeltaLogTable, collect_stream_row_count, execute_output_request,
+        failing_scan_marker_region_provider, marker_region_provider, output_request,
+        override_connection, scan_counting_marker_region_provider, secret_connection,
     };
     use super::write_all::{
         MssqlCacheCandidateSkipReason, MssqlCachedOutputStreamRoute, MssqlNoCacheReason,
@@ -247,16 +242,13 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::{
         arrow::{
-            array::{Array, ArrayRef, StringArray},
+            array::{Array, StringArray},
             datatypes::{DataType, Field, Schema},
             record_batch::RecordBatch,
         },
-        catalog::Session,
         common::tree_node::{TreeNode, TreeNodeRecursion},
-        datasource::{MemTable, TableProvider},
-        error::{DataFusionError, Result as DataFusionResult},
-        logical_expr::{Expr, LogicalPlan, TableType},
-        physical_plan::ExecutionPlan,
+        error::Result as DataFusionResult,
+        logical_expr::LogicalPlan,
         sql::{parser::DFParser, resolve::resolve_table_references},
     };
 
@@ -435,111 +427,6 @@ mod tests {
         }
 
         Ok(markers)
-    }
-
-    #[derive(Debug)]
-    struct ScanCountingProvider {
-        table: MemTable,
-        scans: Arc<AtomicUsize>,
-    }
-
-    #[derive(Debug)]
-    struct FailingScanProvider {
-        schema: SchemaRef,
-        scans: Arc<AtomicUsize>,
-    }
-
-    type CountedProvider = (Arc<dyn TableProvider>, Arc<AtomicUsize>);
-
-    #[async_trait]
-    impl TableProvider for ScanCountingProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn schema(&self) -> SchemaRef {
-            self.table.schema()
-        }
-
-        fn table_type(&self) -> TableType {
-            self.table.table_type()
-        }
-
-        async fn scan(
-            &self,
-            state: &dyn Session,
-            projection: Option<&Vec<usize>>,
-            filters: &[Expr],
-            limit: Option<usize>,
-        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            self.scans.fetch_add(1, Ordering::SeqCst);
-            self.table.scan(state, projection, filters, limit).await
-        }
-    }
-
-    #[async_trait]
-    impl TableProvider for FailingScanProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-
-        fn table_type(&self) -> TableType {
-            TableType::Base
-        }
-
-        async fn scan(
-            &self,
-            _state: &dyn Session,
-            _projection: Option<&Vec<usize>>,
-            _filters: &[Expr],
-            _limit: Option<usize>,
-        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            self.scans.fetch_add(1, Ordering::SeqCst);
-            Err(DataFusionError::Execution(
-                "forced scan planning failure".to_owned(),
-            ))
-        }
-    }
-
-    fn scan_counting_marker_region_provider(
-        marker: &str,
-    ) -> Result<CountedProvider, Box<dyn std::error::Error>> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("marker", DataType::Utf8, false),
-            Field::new("region", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec![marker, marker])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["west", "east"])) as ArrayRef,
-            ],
-        )?;
-        let scans = Arc::new(AtomicUsize::new(0));
-        let provider = ScanCountingProvider {
-            table: MemTable::try_new(schema, vec![vec![batch]])?,
-            scans: Arc::clone(&scans),
-        };
-
-        Ok((Arc::new(provider), scans))
-    }
-
-    fn failing_scan_marker_region_provider() -> CountedProvider {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("marker", DataType::Utf8, false),
-            Field::new("region", DataType::Utf8, false),
-        ]));
-        let scans = Arc::new(AtomicUsize::new(0));
-        let provider = FailingScanProvider {
-            schema,
-            scans: Arc::clone(&scans),
-        };
-
-        (Arc::new(provider), scans)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,17 +1,26 @@
 use std::{
+    any::Any,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
 use datafusion::{
     arrow::{
         array::{ArrayRef, StringArray},
-        datatypes::{DataType, Field, Schema},
+        datatypes::{DataType, Field, Schema, SchemaRef},
         record_batch::RecordBatch,
     },
+    catalog::Session,
     datasource::{MemTable, TableProvider},
+    error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::{Expr, TableType},
+    physical_plan::ExecutionPlan,
 };
 use futures_util::StreamExt;
 
@@ -189,4 +198,109 @@ pub(super) async fn collect_stream_row_count(
     }
 
     Ok(rows)
+}
+
+#[derive(Debug)]
+struct ScanCountingProvider {
+    table: MemTable,
+    scans: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct FailingScanProvider {
+    schema: SchemaRef,
+    scans: Arc<AtomicUsize>,
+}
+
+type CountedProvider = (Arc<dyn TableProvider>, Arc<AtomicUsize>);
+
+#[async_trait]
+impl TableProvider for ScanCountingProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.table.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.table.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        self.table.scan(state, projection, filters, limit).await
+    }
+}
+
+#[async_trait]
+impl TableProvider for FailingScanProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        Err(DataFusionError::Execution(
+            "forced scan planning failure".to_owned(),
+        ))
+    }
+}
+
+pub(super) fn scan_counting_marker_region_provider(
+    marker: &str,
+) -> Result<CountedProvider, Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("marker", DataType::Utf8, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![marker, marker])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["west", "east"])) as ArrayRef,
+        ],
+    )?;
+    let scans = Arc::new(AtomicUsize::new(0));
+    let provider = ScanCountingProvider {
+        table: MemTable::try_new(schema, vec![vec![batch]])?,
+        scans: Arc::clone(&scans),
+    };
+
+    Ok((Arc::new(provider), scans))
+}
+
+pub(super) fn failing_scan_marker_region_provider() -> CountedProvider {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("marker", DataType::Utf8, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let scans = Arc::new(AtomicUsize::new(0));
+    let provider = FailingScanProvider {
+        schema,
+        scans: Arc::clone(&scans),
+    };
+
+    (Arc::new(provider), scans)
 }
