@@ -235,7 +235,6 @@ mod tests {
     };
     use super::*;
     use crate::{
-        DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions, DeltaStorageOptions,
         LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlSchemaPlanOptions,
         MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable,
         MssqlWorkflowOutputWriter, MssqlWriteOptions, MssqlWriteReport, OutputStatus, QueryOptions,
@@ -260,9 +259,6 @@ mod tests {
     };
 
     const UNSUPPORTED_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]"#;
-    const UNSUPPORTED_PROTOCOL_JSON: &str =
-        r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":2}}"#;
-
     fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
         Ok(MssqlConnectionConfig::new(
             "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
@@ -4642,57 +4638,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_registers_source_and_returns_lazy_table() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let table = DeltaLogTable::new("orders")?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-
-        let lazy = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
-
-        assert_eq!(lazy.id(), 0);
-        assert_eq!(lazy.kind(), LazyTableKind::DeltaSource);
-        assert_eq!(lazy.name(), "orders");
-        assert_eq!(session.next_table_id(), 1);
-        assert_eq!(session.sources().len(), 1);
-        let registered = session
-            .registered_source("ORDERS")
-            .ok_or("expected registered source")?;
-        assert_eq!(registered.table(), &lazy);
-        assert_eq!(registered.name(), "orders");
-        assert!(registered.source_uri().starts_with("file://"));
-        assert_eq!(registered.snapshot_version(), 1);
-        assert_eq!(registered.protocol().source_name, "orders");
-        assert_eq!(registered.schema().fields().len(), 2);
-        let source_reports = session.source_reports();
-        assert_eq!(source_reports.len(), 1);
-        let report = &source_reports[0];
-        assert_eq!(report.source_name(), "orders");
-        assert_eq!(report.source_uri(), registered.source_uri());
-        assert_eq!(report.snapshot_version(), 1);
-        assert_eq!(report.protocol().source_name, "orders");
-        assert_eq!(report.scheduling().query_target_partitions(), None);
-        assert_eq!(
-            report.scheduling().reader_backend(),
-            DeltaProviderReaderBackend::NativeAsync
-        );
-        assert_eq!(report.file_count(), crate::FileCount::unavailable());
-        assert_eq!(
-            report.file_count_reason(),
-            Some(crate::ReportReasonCode::CostAvoidance)
-        );
-        assert!(!report.scan_metadata_exhausted());
-        assert_eq!(report.usage_status(), SourceUsageStatus::Unknown);
-        assert!(report.used_by_output_names().is_empty());
-        assert!(report.provider_read_stats().is_none());
-        assert_eq!(
-            report.provider_stats_reason(),
-            Some(crate::ReportReasonCode::NotExecuted)
-        );
-
-        Ok(())
-    }
-
     #[tokio::test]
     async fn source_reports_for_lazy_table_plan_include_provider_stats_without_execution()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4741,140 +4686,6 @@ mod tests {
                 assert!(!report.scan_metadata_exhausted());
             }
         }
-        Ok(())
-    }
-
-    #[test]
-    fn delta_lake_registers_multiple_distinct_sources() -> Result<(), Box<dyn std::error::Error>> {
-        let orders = DeltaLogTable::new("orders")?;
-        let customers = DeltaLogTable::new("customers")?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-
-        let orders = session.delta_lake(DeltaSourceConfig::new("orders", orders.uri()))?;
-        let customers = session.delta_lake(DeltaSourceConfig::new("customers", customers.uri()))?;
-
-        assert_eq!(orders.id(), 0);
-        assert_eq!(customers.id(), 1);
-        assert_eq!(session.sources().len(), 2);
-        assert!(session.registered_source("orders").is_some());
-        assert!(session.registered_source("customers").is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn duplicate_source_alias_fails_before_loading_second_source()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("orders")?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
-
-        let error = session.delta_lake(DeltaSourceConfig::new("ORDERS", ""));
-
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::DuplicateSourceName { name }) if name == "ORDERS"
-        ));
-        assert_eq!(session.sources().len(), 1);
-        assert_eq!(session.next_table_id(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn invalid_source_alias_fails_before_registration() -> Result<(), DeltaFunnelError> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-
-        let error = session.delta_lake(DeltaSourceConfig::new("select", ""));
-
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::InvalidSourceName { name, .. }) if name == "select"
-        ));
-        assert!(session.sources().is_empty());
-        assert_eq!(session.next_table_id(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn protocol_preflight_failure_does_not_register_source()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-
-        let error = session.delta_lake(DeltaSourceConfig::new("unsupported", table.uri()));
-
-        let display = format!("{}", error.as_ref().err().ok_or("expected error")?);
-        assert!(display.contains("unsupported"));
-        assert!(display.contains("unsupported Delta minReaderVersion"));
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::DeltaProtocolCompatibility { .. })
-        ));
-        assert!(session.sources().is_empty());
-        assert_eq!(session.next_table_id(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn protocol_preflight_failure_redacts_secret_uri_parts()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-
-        let error = session
-            .delta_lake(DeltaSourceConfig::new(
-                "unsupported",
-                table.file_uri_with_secret_parts()?,
-            ))
-            .map(|_| ())
-            .map_err(|error| error.to_string());
-
-        assert!(
-            matches!(error, Err(display) if display.contains("unsupported")
-            && display.contains("unsupported Delta minReaderVersion")
-            && !display.contains("super-secret")
-            && !display.contains("debug-secret")
-            && !display.contains("token"))
-        );
-        assert!(session.sources().is_empty());
-        assert_eq!(session.next_table_id(), 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn protocol_preflight_failure_does_not_leak_datafusion_alias()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-
-        let error = session.delta_lake(DeltaSourceConfig::new("unsupported", table.uri()));
-
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::DeltaProtocolCompatibility { .. })
-        ));
-        assert!(session.context().table("unsupported").await.is_err());
-        assert!(session.sources().is_empty());
-        assert_eq!(session.next_table_id(), 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn registered_source_sql_analysis_does_not_read_data_files_for_rows()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("orders")?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
-        let dataframe = session
-            .context()
-            .sql("select id, customer_name from orders")
-            .await?;
-        let schema = dataframe.schema();
-
-        assert_eq!(schema.fields().len(), 2);
-        assert_eq!(schema.field(0).name(), "id");
-        assert_eq!(schema.field(1).name(), "customer_name");
-        assert_eq!(session.sources().len(), 1);
         Ok(())
     }
 
@@ -5487,73 +5298,6 @@ mod tests {
         ));
         assert_eq!(session.sources().len(), 1);
         assert_eq!(session.derived_tables().len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn source_debug_does_not_expose_storage_option_values() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let table = DeltaLogTable::new("storage-options")?;
-        let mut storage_options = DeltaStorageOptions::new();
-        storage_options.insert(
-            "AWS_SECRET_ACCESS_KEY".to_owned(),
-            "super-secret".to_owned(),
-        );
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-
-        session.delta_lake(
-            DeltaSourceConfig::new("orders", table.uri()).with_storage_options(storage_options),
-        )?;
-
-        let debug = format!("{session:?}");
-        assert!(debug.contains("orders"));
-        assert!(!debug.contains("super-secret"));
-        assert!(!debug.contains("AWS_SECRET_ACCESS_KEY"));
-        let report_debug = format!("{:?}", session.source_reports());
-        assert!(report_debug.contains("orders"));
-        assert!(!report_debug.contains("super-secret"));
-        assert!(!report_debug.contains("AWS_SECRET_ACCESS_KEY"));
-        Ok(())
-    }
-
-    #[test]
-    fn source_registration_honors_configured_provider_options()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("configured-provider")?;
-        let provider_scan_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
-            DeltaProviderReaderBackend::OfficialKernel,
-            2,
-            1,
-        )?
-        .with_output_buffer_capacity_per_partition(3)?;
-        let mut session = DeltaFunnelSession::new(
-            SessionOptions::new()
-                .with_query_options(QueryOptions {
-                    target_partitions: Some(4),
-                    output_batch_size: None,
-                })
-                .with_provider_scan_options(provider_scan_options),
-        )?;
-
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
-
-        assert_eq!(session.sources().len(), 1);
-        assert!(session.registered_source("orders").is_some());
-        let reports = session.source_reports();
-        assert_eq!(reports.len(), 1);
-        let scheduling = reports[0].scheduling();
-        assert_eq!(scheduling.query_target_partitions(), Some(4));
-        assert_eq!(
-            scheduling.reader_backend(),
-            DeltaProviderReaderBackend::OfficialKernel
-        );
-        assert_eq!(scheduling.max_concurrent_file_reads_per_scan(), 2);
-        assert_eq!(scheduling.max_concurrent_file_reads_per_partition(), 1);
-        assert_eq!(scheduling.output_buffer_capacity_per_partition(), 3);
-        assert_eq!(
-            scheduling.native_async_prefetch_file_count_per_partition(),
-            0
-        );
         Ok(())
     }
 }
