@@ -758,6 +758,7 @@ mod tests {
         DeltaFunnelSession, LazyTableKind, SessionOptions, SourceUsageStatus,
         test_support::DeltaLogTable,
     };
+    use super::DerivedTableDependency;
 
     const UNSUPPORTED_PROTOCOL_JSON: &str =
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":2}}"#;
@@ -1296,6 +1297,244 @@ mod tests {
         ));
         assert_eq!(session.sources().len(), 1);
         assert_eq!(session.derived_tables().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_records_raw_source_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let orders = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        let big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let lineage = session.lineage_for_derived_table(&big)?;
+
+        assert!(lineage.is_complete());
+        assert_eq!(
+            lineage.direct_dependencies(),
+            &[DerivedTableDependency::RegisteredSource {
+                table_id: orders.id(),
+                name: "orders".to_owned(),
+            }]
+        );
+        assert!(lineage.unknown_references().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_records_registered_derived_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+
+        let west = session
+            .table_from_sql("select * from BIG b where customer_name = 'alice'")
+            .await?;
+        let lineage = session.lineage_for_derived_table(&west)?;
+
+        assert!(lineage.is_complete());
+        assert_eq!(
+            lineage.direct_dependencies(),
+            &[DerivedTableDependency::RegisteredDerived {
+                table_id: big.id(),
+                name: "big".to_owned(),
+            }]
+        );
+        assert!(lineage.unknown_references().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_deduplicates_repeated_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+
+        let repeated = session
+            .table_from_sql("select * from big where id in (select id from big)")
+            .await?;
+        let lineage = session.lineage_for_derived_table(&repeated)?;
+
+        assert_eq!(
+            lineage.direct_dependencies(),
+            &[DerivedTableDependency::RegisteredDerived {
+                table_id: big.id(),
+                name: "big".to_owned(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_records_dependency_inside_from_subquery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+
+        let derived = session
+            .table_from_sql("select id from (select id from big) nested")
+            .await?;
+        let lineage = session.lineage_for_derived_table(&derived)?;
+
+        assert_eq!(
+            lineage.direct_dependencies(),
+            &[DerivedTableDependency::RegisteredDerived {
+                table_id: big.id(),
+                name: "big".to_owned(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_finds_transitive_registered_derived_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_regional = session
+            .table_from_sql("select id, customer_name from big")
+            .await?;
+        let regional = session.register_alias("regional", &pending_regional)?;
+
+        let west = session
+            .table_from_sql("select id from regional where customer_name = 'alice'")
+            .await?;
+        let dependencies = session.transitive_registered_derived_dependencies(&west)?;
+
+        assert_eq!(
+            dependencies,
+            vec![
+                DerivedTableDependency::RegisteredDerived {
+                    table_id: big.id(),
+                    name: "big".to_owned(),
+                },
+                DerivedTableDependency::RegisteredDerived {
+                    table_id: regional.id(),
+                    name: "regional".to_owned(),
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_matches_shared_transitive_dependency_for_multiple_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+
+        let west = session
+            .table_from_sql("select id from big where customer_name = 'alice'")
+            .await?;
+        let east = session
+            .table_from_sql("select id from big where customer_name = 'bob'")
+            .await?;
+        let expected = vec![DerivedTableDependency::RegisteredDerived {
+            table_id: big.id(),
+            name: "big".to_owned(),
+        }];
+
+        assert_eq!(
+            session.transitive_registered_derived_dependencies(&west)?,
+            expected
+        );
+        assert_eq!(
+            session.transitive_registered_derived_dependencies(&east)?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_checks_registered_derived_candidate_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let orders = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_regional = session
+            .table_from_sql("select id, customer_name from big")
+            .await?;
+        let regional = session.register_alias("regional", &pending_regional)?;
+        let west = session
+            .table_from_sql("select id from regional where customer_name = 'alice'")
+            .await?;
+        let unrelated = session
+            .table_from_sql("select customer_name from orders")
+            .await?;
+
+        assert!(session.lazy_table_depends_on_registered_derived(&west, &big)?);
+        assert!(session.lazy_table_depends_on_registered_derived(&west, &regional)?);
+        assert!(session.lazy_table_depends_on_registered_derived(&big, &big)?);
+        assert!(!session.lazy_table_depends_on_registered_derived(&unrelated, &big)?);
+        assert!(!session.lazy_table_depends_on_registered_derived(&orders, &big)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_lineage_treats_cte_shadowing_as_local_reference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let orders = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let _big = session.register_alias("big", &pending_big)?;
+
+        let shadowed = session
+            .table_from_sql("with big as (select id from orders) select id from big")
+            .await?;
+        let lineage = session.lineage_for_derived_table(&shadowed)?;
+
+        assert_eq!(lineage.local_references(), &["big".to_owned()]);
+        assert_eq!(
+            lineage.direct_dependencies(),
+            &[DerivedTableDependency::RegisteredSource {
+                table_id: orders.id(),
+                name: "orders".to_owned(),
+            }]
+        );
+        assert!(
+            !lineage
+                .direct_dependencies()
+                .iter()
+                .any(|dependency| matches!(
+                    dependency,
+                    DerivedTableDependency::RegisteredDerived { name, .. } if name == "big"
+                ))
+        );
         Ok(())
     }
 
