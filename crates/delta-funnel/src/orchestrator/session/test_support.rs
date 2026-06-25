@@ -14,6 +14,12 @@ use datafusion::{
     datasource::{MemTable, TableProvider},
 };
 
+use crate::{
+    DeltaFunnelError, LoadMode, MssqlConnectionConfig, MssqlTargetConfig, MssqlTargetTable,
+};
+
+use super::{LazyTable, MssqlOutputTarget, OutputWritePlan, RunMode};
+
 pub(super) struct DeltaLogTable {
     path: PathBuf,
 }
@@ -81,6 +87,7 @@ impl DeltaLogTable {
 
 const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
 const DEFAULT_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+pub(super) const UNSUPPORTED_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]"#;
 
 fn metadata_json(schema_fields_json: &str) -> String {
     format!(
@@ -115,4 +122,57 @@ pub(super) fn marker_region_provider(
     )?;
 
     Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+}
+
+pub(super) fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
+    Ok(MssqlConnectionConfig::new(
+        "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+    )?
+    .with_display_label("warehouse-primary"))
+}
+
+pub(super) fn override_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
+    Ok(MssqlConnectionConfig::new(
+        "server=tcp:override.example.com;database=warehouse;user=writer;password=override-secret",
+    )?
+    .with_display_label("warehouse-override"))
+}
+
+pub(super) fn output_request(
+    table: LazyTable,
+    output_name: &str,
+    target_table: &str,
+    load_mode: LoadMode,
+) -> Result<OutputWritePlan, DeltaFunnelError> {
+    output_request_with_run_mode(table, output_name, target_table, load_mode, RunMode::DryRun)
+}
+
+pub(super) fn execute_output_request(
+    table: LazyTable,
+    output_name: &str,
+    target_table: &str,
+    load_mode: LoadMode,
+) -> Result<OutputWritePlan, DeltaFunnelError> {
+    output_request_with_run_mode(
+        table,
+        output_name,
+        target_table,
+        load_mode,
+        RunMode::Execute,
+    )
+}
+
+fn output_request_with_run_mode(
+    table: LazyTable,
+    output_name: &str,
+    target_table: &str,
+    load_mode: LoadMode,
+    run_mode: RunMode,
+) -> Result<OutputWritePlan, DeltaFunnelError> {
+    let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", target_table)?)
+        .with_load_mode(load_mode);
+    Ok(OutputWritePlan::new(
+        table,
+        MssqlOutputTarget::new(output_name, target_config, run_mode),
+    ))
 }

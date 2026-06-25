@@ -225,7 +225,10 @@ mod tests {
     };
 
     use super::registry::{DerivedTableDependency, DerivedTableLineage};
-    use super::test_support::{DeltaLogTable, marker_region_provider};
+    use super::test_support::{
+        DeltaLogTable, UNSUPPORTED_SCHEMA_FIELDS_JSON, execute_output_request,
+        marker_region_provider, output_request, override_connection, secret_connection,
+    };
     use super::write_all::{
         MssqlCacheCandidateSkipReason, MssqlCachedOutputStreamRoute, MssqlNoCacheReason,
     };
@@ -235,10 +238,10 @@ mod tests {
     };
     use super::*;
     use crate::{
-        LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlSchemaPlanOptions,
-        MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable,
-        MssqlWorkflowOutputWriter, MssqlWriteOptions, MssqlWriteReport, OutputStatus, QueryOptions,
-        ReportReasonCode, ResolvedMssqlTarget, ValidationOptions, ValidationStatus, WorkflowStatus,
+        LoadMode, MssqlConnectionSource, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus,
+        MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable, MssqlWorkflowOutputWriter,
+        MssqlWriteOptions, MssqlWriteReport, OutputStatus, QueryOptions, ReportReasonCode,
+        ResolvedMssqlTarget, ValidationOptions, ValidationStatus, WorkflowStatus,
         plan_mssql_target_for_resolved_output, table_formats::RealParquetDeltaTable,
     };
     use async_trait::async_trait;
@@ -256,60 +259,6 @@ mod tests {
         physical_plan::ExecutionPlan,
         sql::{parser::DFParser, resolve::resolve_table_references},
     };
-
-    const UNSUPPORTED_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]"#;
-    fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
-        Ok(MssqlConnectionConfig::new(
-            "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
-        )?
-        .with_display_label("warehouse-primary"))
-    }
-
-    fn override_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
-        Ok(MssqlConnectionConfig::new(
-            "server=tcp:override.example.com;database=warehouse;user=writer;password=override-secret",
-        )?
-        .with_display_label("warehouse-override"))
-    }
-
-    fn output_request(
-        table: LazyTable,
-        output_name: &str,
-        target_table: &str,
-        load_mode: LoadMode,
-    ) -> Result<OutputWritePlan, DeltaFunnelError> {
-        output_request_with_run_mode(table, output_name, target_table, load_mode, RunMode::DryRun)
-    }
-
-    fn execute_output_request(
-        table: LazyTable,
-        output_name: &str,
-        target_table: &str,
-        load_mode: LoadMode,
-    ) -> Result<OutputWritePlan, DeltaFunnelError> {
-        output_request_with_run_mode(
-            table,
-            output_name,
-            target_table,
-            load_mode,
-            RunMode::Execute,
-        )
-    }
-
-    fn output_request_with_run_mode(
-        table: LazyTable,
-        output_name: &str,
-        target_table: &str,
-        load_mode: LoadMode,
-        run_mode: RunMode,
-    ) -> Result<OutputWritePlan, DeltaFunnelError> {
-        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", target_table)?)
-            .with_load_mode(load_mode);
-        Ok(OutputWritePlan::new(
-            table,
-            MssqlOutputTarget::new(output_name, target_config, run_mode),
-        ))
-    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeOrchestratorWriteCall {
