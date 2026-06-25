@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use datafusion::{
     arrow::{
-        array::{ArrayRef, StringArray},
+        array::{Array, ArrayRef, StringArray},
         datatypes::{DataType, Field, Schema, SchemaRef},
         record_batch::RecordBatch,
     },
@@ -198,6 +198,40 @@ pub(super) async fn collect_stream_row_count(
     }
 
     Ok(rows)
+}
+
+pub(super) async fn collect_stream_marker_values(
+    mut stream: MssqlOutputBatchStream,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut batches = Vec::new();
+
+    while let Some(batch) = stream.next().await {
+        batches.push(batch?);
+    }
+
+    marker_values_from_batches(&batches)
+}
+
+pub(super) fn marker_values_from_batches(
+    batches: &[RecordBatch],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut markers = Vec::new();
+
+    for batch in batches {
+        let column = batch
+            .column_by_name("marker")
+            .ok_or_else(|| std::io::Error::other("expected marker column"))?;
+        let strings = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| std::io::Error::other("expected marker StringArray"))?;
+
+        for row in 0..strings.len() {
+            markers.push(strings.value(row).to_owned());
+        }
+    }
+
+    Ok(markers)
 }
 
 #[derive(Debug)]

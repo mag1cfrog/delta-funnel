@@ -220,9 +220,10 @@ mod tests {
 
     use super::registry::{DerivedTableDependency, DerivedTableLineage};
     use super::test_support::{
-        DeltaLogTable, collect_stream_row_count, execute_output_request,
-        failing_scan_marker_region_provider, marker_region_provider, output_request,
-        override_connection, scan_counting_marker_region_provider, secret_connection,
+        DeltaLogTable, collect_stream_marker_values, collect_stream_row_count,
+        execute_output_request, failing_scan_marker_region_provider, marker_region_provider,
+        marker_values_from_batches, output_request, override_connection,
+        scan_counting_marker_region_provider, secret_connection,
     };
     use super::write_all::{MssqlCacheCandidateSkipReason, MssqlNoCacheReason};
     use super::write_all::{
@@ -239,11 +240,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use datafusion::{
-        arrow::{
-            array::{Array, StringArray},
-            datatypes::{DataType, Field, Schema},
-            record_batch::RecordBatch,
-        },
+        arrow::datatypes::{DataType, Field, Schema},
         common::tree_node::{TreeNode, TreeNodeRecursion},
         error::Result as DataFusionResult,
         logical_expr::LogicalPlan,
@@ -391,40 +388,6 @@ mod tests {
                 MssqlTargetCleanupStatus::NotApplicable,
             ))
         }
-    }
-
-    async fn collect_stream_marker_values(
-        mut stream: MssqlOutputBatchStream,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let mut batches = Vec::new();
-
-        while let Some(batch) = stream.next().await {
-            batches.push(batch?);
-        }
-
-        marker_values_from_batches(&batches)
-    }
-
-    fn marker_values_from_batches(
-        batches: &[RecordBatch],
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let mut markers = Vec::new();
-
-        for batch in batches {
-            let column = batch
-                .column_by_name("marker")
-                .ok_or_else(|| std::io::Error::other("expected marker column"))?;
-            let strings = column
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| std::io::Error::other("expected marker StringArray"))?;
-
-            for row in 0..strings.len() {
-                markers.push(strings.value(row).to_owned());
-            }
-        }
-
-        Ok(markers)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
