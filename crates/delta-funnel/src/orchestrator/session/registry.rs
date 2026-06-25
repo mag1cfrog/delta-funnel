@@ -4,12 +4,13 @@ use datafusion::{
     arrow::datatypes::SchemaRef,
     common::TableReference,
     datasource::TableProvider,
+    prelude::{DataFrame, SQLOptions},
     sql::{parser::DFParser, resolve::resolve_table_references},
 };
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, RegisteredDeltaSource, SqlTablePhase,
-    support::sanitize_text_for_display,
+    support::sanitize_text_for_display, table_formats::validate_table_source_names,
 };
 
 use super::{
@@ -261,6 +262,87 @@ pub(super) struct PendingDerivedTable {
 }
 
 impl DeltaFunnelSession {
+    /// Builds a lazy SQL-derived table without registering a query alias.
+    ///
+    /// The SQL must be one read-only tabular query. Planning uses DataFusion to
+    /// produce a lazy table provider and does not execute rows, contact SQL
+    /// Server, or create an output target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeltaFunnelError::SqlTable`] when the SQL is empty, contains
+    /// an unsupported or non-read-only statement, or cannot be planned against
+    /// the session's registered aliases.
+    pub async fn table_from_sql(&mut self, sql: &str) -> Result<LazyTable, DeltaFunnelError> {
+        let sql = sql.trim();
+        if sql.is_empty() {
+            return sql_table_error(SqlTablePhase::ValidateSql, "SQL text must not be empty");
+        }
+
+        let dataframe = self.plan_read_only_sql(sql).await?;
+        let schema = Arc::new(dataframe.schema().as_arrow().clone());
+        let provider = dataframe.into_view();
+        let lineage = self.derive_table_lineage_from_sql(sql);
+        let table = self.allocate_derived_sql_table();
+        self.pending_derived_tables.push(PendingDerivedTable {
+            table: table.clone(),
+            provider,
+            schema,
+            sql_text: sql.to_owned(),
+            lineage,
+        });
+        Ok(table)
+    }
+
+    /// Registers a session-owned alias for a lazy SQL-derived table.
+    ///
+    /// Alias names use the same unquoted identifier rules as Delta source
+    /// aliases. The alias is registered into the session's DataFusion catalog
+    /// only after all local validation succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeltaFunnelError::InvalidSourceName`] or
+    /// [`DeltaFunnelError::DuplicateSourceName`] for invalid or ambiguous
+    /// aliases, and [`DeltaFunnelError::SqlTable`] when the table handle is not
+    /// a pending SQL-derived table owned by this session or DataFusion rejects
+    /// the alias registration.
+    pub fn register_alias(
+        &mut self,
+        name: impl Into<String>,
+        table: &LazyTable,
+    ) -> Result<LazyTable, DeltaFunnelError> {
+        let name = name.into();
+        validate_table_source_names([name.as_str()])?;
+        self.reject_registered_alias_name(&name)?;
+
+        let Some(index) = self.find_pending_derived_table(table) else {
+            return sql_table_error(
+                SqlTablePhase::RegisterDerivedAlias,
+                "lazy table is not a pending SQL-derived table owned by this session",
+            );
+        };
+        let pending = self.pending_derived_tables.remove(index);
+
+        if let Err(error) = self
+            .context
+            .register_table(name.as_str(), Arc::clone(&pending.provider))
+        {
+            let message = error.to_string();
+            self.pending_derived_tables.push(pending);
+            return sql_table_error(SqlTablePhase::RegisterDerivedAlias, message);
+        }
+
+        let alias_table = pending.table.with_name(name);
+        self.derived_tables.push(RegisteredDerivedTable::new(
+            alias_table.clone(),
+            pending.schema,
+            pending.sql_text,
+            pending.lineage,
+        ));
+        Ok(alias_table)
+    }
+
     /// Finds a registered Delta source by alias using unquoted SQL semantics.
     #[must_use]
     pub fn registered_source(&self, name: &str) -> Option<&RegisteredSessionSource> {
@@ -586,6 +668,63 @@ impl DeltaFunnelSession {
             local_references,
             unknown_references.into_iter().collect(),
         )
+    }
+
+    pub(super) async fn plan_read_only_sql(
+        &self,
+        sql: &str,
+    ) -> Result<DataFrame, DeltaFunnelError> {
+        self.context
+            .sql_with_options(sql, read_only_sql_options())
+            .await
+            .map_err(|error| DeltaFunnelError::SqlTable {
+                phase: classify_sql_error_phase(&error.to_string()),
+                message: error.to_string(),
+            })
+    }
+
+    fn allocate_derived_sql_table(&mut self) -> LazyTable {
+        let id = self.next_table_id;
+        self.next_table_id = self.next_table_id.saturating_add(1);
+        LazyTable::derived_sql(id)
+    }
+
+    pub(super) fn reject_registered_alias_name(&self, name: &str) -> Result<(), DeltaFunnelError> {
+        if self.registered_source(name).is_some() || self.registered_derived_table(name).is_some() {
+            return Err(DeltaFunnelError::DuplicateSourceName {
+                name: name.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn find_pending_derived_table(&self, table: &LazyTable) -> Option<usize> {
+        if table.kind() != LazyTableKind::DerivedSql {
+            return None;
+        }
+
+        self.pending_derived_tables
+            .iter()
+            .position(|pending| pending.table.id() == table.id())
+    }
+}
+
+pub(super) fn read_only_sql_options() -> SQLOptions {
+    SQLOptions::new()
+        .with_allow_ddl(false)
+        .with_allow_dml(false)
+        .with_allow_statements(false)
+}
+
+fn classify_sql_error_phase(error: &str) -> SqlTablePhase {
+    if error.contains("DDL not supported")
+        || error.contains("DML not supported")
+        || error.contains("Statement not supported")
+        || error.contains("only supports a single SQL statement")
+    {
+        SqlTablePhase::ValidateSql
+    } else {
+        SqlTablePhase::PlanSql
     }
 }
 
