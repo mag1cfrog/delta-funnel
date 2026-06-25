@@ -7,16 +7,19 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    sync::Arc,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
 };
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use datafusion::common::TableReference;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SQLOptions, SessionContext};
 use datafusion::sql::{parser::DFParser, resolve::resolve_table_references};
 use datafusion::{datasource::TableProvider, prelude::DataFrame};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 
 use crate::{
     BatchPipelinePhase, DeltaFunnelError, DeltaProtocolReport, DeltaProviderReaderBackend,
@@ -32,6 +35,8 @@ use crate::{
     support::sanitize_text_for_display, table_formats::validate_table_source_names,
     write_mssql_outputs_with_writer, write_output_batches_to_mssql,
 };
+
+type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
 
 /// Query-load action mode requested by a caller.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2162,11 +2167,22 @@ impl DeltaFunnelSession {
         &self,
         planned_outputs: &[PlannedMssqlOutput],
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
+        self.build_write_all_baseline_jobs_with_provider_stats(planned_outputs, None)
+    }
+
+    fn build_write_all_baseline_jobs_with_provider_stats(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
         planned_outputs
             .iter()
             .map(|planned| {
                 let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
-                let batches = self.lazy_table_batch_stream_factory(planned.table().clone());
+                let batches = self.lazy_table_batch_stream_factory_with_provider_stats(
+                    planned.table().clone(),
+                    provider_stats.clone(),
+                );
 
                 Ok(MssqlOutputWriteJob::new(
                     output_schema,
@@ -2179,17 +2195,30 @@ impl DeltaFunnelSession {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn build_write_all_cached_jobs(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         active_aliases: &[MssqlDerivedCacheAliasPlan],
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
+        self.build_write_all_cached_jobs_with_provider_stats(planned_outputs, active_aliases, None)
+    }
+
+    fn build_write_all_cached_jobs_with_provider_stats(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        active_aliases: &[MssqlDerivedCacheAliasPlan],
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
         planned_outputs
             .iter()
             .map(|planned| {
                 let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
-                let batches =
-                    self.cached_output_batch_stream_factory(planned.request(), active_aliases)?;
+                let batches = self.cached_output_batch_stream_factory_with_provider_stats(
+                    planned.request(),
+                    active_aliases,
+                    provider_stats.clone(),
+                )?;
 
                 Ok(MssqlOutputWriteJob::new(
                     output_schema,
@@ -2211,7 +2240,21 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let jobs = self.build_write_all_baseline_jobs(planned_outputs)?;
+        self.write_all_baseline_with_writer_and_provider_stats(planned_outputs, writer, None)
+            .await
+    }
+
+    async fn write_all_baseline_with_writer_and_provider_stats<W>(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        writer: W,
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        let jobs = self
+            .build_write_all_baseline_jobs_with_provider_stats(planned_outputs, provider_stats)?;
 
         write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
     }
@@ -2220,6 +2263,7 @@ impl DeltaFunnelSession {
     ///
     /// Tests use this to inject a fake writer while the public path supplies a
     /// writer that calls the existing one-output SQL Server sink.
+    #[allow(dead_code)]
     async fn write_all_cached_with_writer<W>(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
@@ -2229,8 +2273,31 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
+        self.write_all_cached_with_writer_and_provider_stats(
+            planned_outputs,
+            cache_aliases,
+            writer,
+            None,
+        )
+        .await
+    }
+
+    async fn write_all_cached_with_writer_and_provider_stats<W>(
+        &self,
+        planned_outputs: &[PlannedMssqlOutput],
+        cache_aliases: &[MssqlDerivedCacheAliasPlan],
+        writer: W,
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
         let replacements = self.replace_mssql_cache_aliases(cache_aliases).await?;
-        let jobs = match self.build_write_all_cached_jobs(planned_outputs, cache_aliases) {
+        let jobs = match self.build_write_all_cached_jobs_with_provider_stats(
+            planned_outputs,
+            cache_aliases,
+            provider_stats,
+        ) {
             Ok(jobs) => jobs,
             Err(error) => {
                 return Err(restore_mssql_cache_aliases_after_error(error, replacements).await);
@@ -2269,10 +2336,18 @@ impl DeltaFunnelSession {
                     .await
             }
             WriteAllCacheMode::Disabled => {
+                let provider_stats = shared_provider_read_stats();
                 let workflow = self
-                    .write_all_baseline_with_writer(&planned_outputs, writer)
+                    .write_all_baseline_with_writer_and_provider_stats(
+                        &planned_outputs,
+                        writer,
+                        Some(Arc::clone(&provider_stats)),
+                    )
                     .await?;
-                let sources = self.source_reports_for_planned_outputs(&planned_outputs)?;
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    &planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
                 Ok(WriteAllReport::new(
                     workflow,
                     WriteAllCacheReport::disabled(),
@@ -2295,6 +2370,7 @@ impl DeltaFunnelSession {
             .await
     }
 
+    #[allow(dead_code)]
     async fn write_all_baseline(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
@@ -2332,23 +2408,41 @@ impl DeltaFunnelSession {
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
                 let cache = WriteAllCacheReport::from_plan(cache_plan);
+                let provider_stats = shared_provider_read_stats();
                 let workflow = self
-                    .write_all_baseline_with_writer(planned_outputs, writer)
+                    .write_all_baseline_with_writer_and_provider_stats(
+                        planned_outputs,
+                        writer,
+                        Some(Arc::clone(&provider_stats)),
+                    )
                     .await?;
-                let sources = self.source_reports_for_planned_outputs(planned_outputs)?;
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
                 Ok(WriteAllReport::new(workflow, cache, sources))
             }
             MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
+                let provider_stats = shared_provider_read_stats();
                 let workflow = self
-                    .write_all_cached_with_writer(planned_outputs, cache_aliases, writer)
+                    .write_all_cached_with_writer_and_provider_stats(
+                        planned_outputs,
+                        cache_aliases,
+                        writer,
+                        Some(Arc::clone(&provider_stats)),
+                    )
                     .await?;
                 let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
-                let sources = self.source_reports_for_planned_outputs(planned_outputs)?;
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
                 Ok(WriteAllReport::new(workflow, cache, sources))
             }
         }
     }
 
+    #[allow(dead_code)]
     async fn write_all_cached(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
@@ -2380,16 +2474,35 @@ impl DeltaFunnelSession {
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
                 let cache = WriteAllCacheReport::from_plan(cache_plan);
-                let workflow = self.write_all_baseline(planned_outputs).await?;
-                let sources = self.source_reports_for_planned_outputs(planned_outputs)?;
+                let provider_stats = shared_provider_read_stats();
+                let workflow = self
+                    .write_all_baseline_with_writer_and_provider_stats(
+                        planned_outputs,
+                        MssqlWorkflowPublicOutputWriter,
+                        Some(Arc::clone(&provider_stats)),
+                    )
+                    .await?;
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
                 Ok(WriteAllReport::new(workflow, cache, sources))
             }
             MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
+                let provider_stats = shared_provider_read_stats();
                 let workflow = self
-                    .write_all_cached(planned_outputs, cache_aliases)
+                    .write_all_cached_with_writer_and_provider_stats(
+                        planned_outputs,
+                        cache_aliases,
+                        MssqlWorkflowPublicOutputWriter,
+                        Some(Arc::clone(&provider_stats)),
+                    )
                     .await?;
                 let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
-                let sources = self.source_reports_for_planned_outputs(planned_outputs)?;
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
                 Ok(WriteAllReport::new(workflow, cache, sources))
             }
         }
@@ -2436,8 +2549,18 @@ impl DeltaFunnelSession {
         match options.cache_mode() {
             WriteAllCacheMode::Auto => self.write_all_auto(requests, &planned_outputs).await,
             WriteAllCacheMode::Disabled => {
-                let workflow = self.write_all_baseline(&planned_outputs).await?;
-                let sources = self.source_reports_for_planned_outputs(&planned_outputs)?;
+                let provider_stats = shared_provider_read_stats();
+                let workflow = self
+                    .write_all_baseline_with_writer_and_provider_stats(
+                        &planned_outputs,
+                        MssqlWorkflowPublicOutputWriter,
+                        Some(Arc::clone(&provider_stats)),
+                    )
+                    .await?;
+                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                    &planned_outputs,
+                    provider_read_stats_snapshot(&provider_stats),
+                )?;
                 Ok(WriteAllReport::new(
                     workflow,
                     WriteAllCacheReport::disabled(),
@@ -2642,10 +2765,16 @@ impl DeltaFunnelSession {
         }))
     }
 
-    fn source_reports_for_planned_outputs(
+    fn source_reports_for_planned_outputs_with_provider_stats(
         &self,
         outputs: &[PlannedMssqlOutput],
+        provider_stats: Vec<crate::DeltaProviderReadStatsSnapshot>,
     ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
+        let mut provider_stats_by_source = BTreeMap::new();
+        for stats in provider_stats {
+            provider_stats_by_source.insert(stats.source_name.clone(), stats);
+        }
+
         Ok(self
             .source_reports_for_output_tables(outputs.iter().map(|output| {
                 (
@@ -2655,7 +2784,11 @@ impl DeltaFunnelSession {
             }))?
             .into_iter()
             .map(|report| {
-                report.with_provider_stats_reason(ReportReasonCode::CapabilityUnavailable)
+                if let Some(stats) = provider_stats_by_source.remove(report.source_name()) {
+                    report.with_provider_read_stats(stats)
+                } else {
+                    report.with_provider_stats_reason(ReportReasonCode::CapabilityUnavailable)
+                }
             })
             .collect())
     }
@@ -2995,12 +3128,23 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
         active_aliases: &[MssqlDerivedCacheAliasPlan],
     ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
+        self.cached_output_batch_stream_factory_with_provider_stats(request, active_aliases, None)
+    }
+
+    fn cached_output_batch_stream_factory_with_provider_stats(
+        &self,
+        request: &OutputWritePlan,
+        active_aliases: &[MssqlDerivedCacheAliasPlan],
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
         let route = self.cached_output_stream_route(request, active_aliases)?;
         match route {
             MssqlCachedOutputStreamRoute::DirectCachedAlias(_)
-            | MssqlCachedOutputStreamRoute::UncachedLazyTable => {
-                Ok(self.lazy_table_batch_stream_factory(request.table().clone()))
-            }
+            | MssqlCachedOutputStreamRoute::UncachedLazyTable => Ok(self
+                .lazy_table_batch_stream_factory_with_provider_stats(
+                    request.table().clone(),
+                    provider_stats,
+                )),
             MssqlCachedOutputStreamRoute::ReplannedCachedDependency(_) => {
                 let output_name = request.target().output_name().to_owned();
                 let sql_text = match self.sql_text_for_derived_table(request.table()) {
@@ -3024,15 +3168,30 @@ impl DeltaFunnelSession {
                 let context = self.context.clone();
                 Ok(Box::new(move || {
                     Box::pin(async move {
-                        replanned_sql_batch_stream(context, output_name, sql_text, expected_schema)
-                            .await
+                        replanned_sql_batch_stream(
+                            context,
+                            output_name,
+                            sql_text,
+                            expected_schema,
+                            provider_stats,
+                        )
+                        .await
                     })
                 }))
             }
         }
     }
 
+    #[allow(dead_code)]
     fn lazy_table_batch_stream_factory(&self, table: LazyTable) -> MssqlOutputBatchStreamFactory {
+        self.lazy_table_batch_stream_factory_with_provider_stats(table, None)
+    }
+
+    fn lazy_table_batch_stream_factory_with_provider_stats(
+        &self,
+        table: LazyTable,
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> MssqlOutputBatchStreamFactory {
         let context = self.context.clone();
         let sources = self.sources.clone();
         let derived_tables = self.derived_tables.clone();
@@ -3046,6 +3205,7 @@ impl DeltaFunnelSession {
                     sources,
                     derived_tables,
                     pending_derived_tables,
+                    provider_stats,
                 )
                 .await
             })
@@ -3626,12 +3786,81 @@ fn sql_table_error<T>(
     })
 }
 
+fn shared_provider_read_stats() -> SharedProviderReadStats {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn provider_read_stats_snapshot(
+    provider_stats: &SharedProviderReadStats,
+) -> Vec<crate::DeltaProviderReadStatsSnapshot> {
+    match provider_stats.lock() {
+        Ok(provider_stats) => provider_stats.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+struct ProviderStatsRecordingStream {
+    inner: MssqlOutputBatchStream,
+    physical_plan: Arc<dyn ExecutionPlan>,
+    provider_stats: SharedProviderReadStats,
+    recorded: bool,
+}
+
+impl ProviderStatsRecordingStream {
+    fn new(
+        inner: MssqlOutputBatchStream,
+        physical_plan: Arc<dyn ExecutionPlan>,
+        provider_stats: SharedProviderReadStats,
+    ) -> Self {
+        Self {
+            inner,
+            physical_plan,
+            provider_stats,
+            recorded: false,
+        }
+    }
+
+    fn record_if_needed(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        let snapshots = collect_delta_provider_read_stats(self.physical_plan.as_ref());
+        if snapshots.is_empty() {
+            return;
+        }
+        match self.provider_stats.lock() {
+            Ok(mut provider_stats) => provider_stats.extend(snapshots),
+            Err(poisoned) => poisoned.into_inner().extend(snapshots),
+        }
+    }
+}
+
+impl Stream for ProviderStatsRecordingStream {
+    type Item = Result<RecordBatch, DeltaFunnelError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(context) {
+            Poll::Ready(None) => {
+                self.record_if_needed();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.record_if_needed();
+                Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+}
+
 async fn batch_stream_for_lazy_table_from_session_parts(
     context: SessionContext,
     table: LazyTable,
     sources: Vec<RegisteredSessionSource>,
     derived_tables: Vec<RegisteredDerivedTable>,
     pending_derived_tables: Vec<PendingDerivedTable>,
+    provider_stats: Option<SharedProviderReadStats>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     let dataframe = dataframe_for_lazy_table_from_session_parts(
         &context,
@@ -3645,8 +3874,17 @@ async fn batch_stream_for_lazy_table_from_session_parts(
         .create_physical_plan()
         .await
         .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
-    let stream = datafusion_query_output_stream(physical_plan, context.task_ctx())
+    let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
         .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
+    if let Some(provider_stats) = provider_stats {
+        return Ok(Box::pin(ProviderStatsRecordingStream::new(
+            Box::pin(stream.map(|batch| {
+                batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
+            })),
+            physical_plan,
+            provider_stats,
+        )));
+    }
 
     Ok(Box::pin(stream.map(|batch| {
         batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
@@ -3667,6 +3905,7 @@ async fn replanned_sql_batch_stream(
     output_name: String,
     sql_text: String,
     expected_schema: SchemaRef,
+    provider_stats: Option<SharedProviderReadStats>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     let dataframe = context
         .sql_with_options(sql_text.as_str(), read_only_sql_options())
@@ -3681,8 +3920,18 @@ async fn replanned_sql_batch_stream(
         .create_physical_plan()
         .await
         .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
-    let stream = datafusion_query_output_stream(physical_plan, context.task_ctx())
+    let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
         .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
+    if let Some(provider_stats) = provider_stats {
+        let error_output_name = output_name.clone();
+        return Ok(Box::pin(ProviderStatsRecordingStream::new(
+            Box::pin(stream.map(move |batch| {
+                batch.map_err(|error| cached_output_stream_setup_error(&error_output_name, error))
+            })),
+            physical_plan,
+            provider_stats,
+        )));
+    }
 
     Ok(Box::pin(stream.map(move |batch| {
         batch.map_err(|error| cached_output_stream_setup_error(&output_name, error))
@@ -7412,16 +7661,39 @@ mod tests {
         assert_eq!(source.source_name(), "orders");
         assert_eq!(source.usage_status(), SourceUsageStatus::Used);
         assert_eq!(source.used_by_output_names(), &["orders_output".to_owned()]);
-        assert_eq!(source.file_count(), crate::FileCount::unavailable());
-        assert_eq!(
-            source.file_count_reason(),
-            Some(crate::ReportReasonCode::CostAvoidance)
-        );
-        assert!(source.provider_read_stats().is_none());
-        assert_eq!(
-            source.provider_stats_reason(),
-            Some(crate::ReportReasonCode::CapabilityUnavailable)
-        );
+        assert_eq!(source.provider_stats_reason(), None);
+        let stats = source
+            .provider_read_stats()
+            .ok_or("expected execution provider stats")?;
+        assert_eq!(stats.source_name, "orders");
+        assert_eq!(stats.snapshot_version, source.snapshot_version());
+        assert!(stats.files_started > 0);
+        assert_eq!(stats.files_started, stats.files_completed);
+        assert!(stats.rows_produced > 0);
+        assert!(stats.batches_produced > 0);
+        match stats.scan_metadata_exhausted {
+            Some(true) => {
+                assert_eq!(
+                    source.file_count(),
+                    crate::FileCount::exact(stats.files_planned)
+                );
+                assert_eq!(source.file_count_reason(), None);
+            }
+            Some(false) => {
+                assert_eq!(
+                    source.file_count(),
+                    crate::FileCount::estimated(stats.files_planned)
+                );
+                assert_eq!(source.file_count_reason(), None);
+            }
+            None => {
+                assert_eq!(source.file_count(), crate::FileCount::unavailable());
+                assert_eq!(
+                    source.file_count_reason(),
+                    Some(crate::ReportReasonCode::CapabilityUnavailable)
+                );
+            }
+        }
         Ok(())
     }
 
