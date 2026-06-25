@@ -182,6 +182,62 @@ pub(super) async fn replanned_sql_batch_stream(
 }
 
 impl DeltaFunnelSession {
+    pub(crate) async fn batch_stream_for_lazy_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
+        let dataframe = self.dataframe_for_lazy_table(table).await?;
+        let physical_plan = dataframe
+            .create_physical_plan()
+            .await
+            .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
+        let stream = datafusion_query_output_stream(physical_plan, self.context.task_ctx())
+            .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
+
+        Ok(Box::pin(stream.map(|batch| {
+            batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
+        })))
+    }
+
+    pub(super) async fn dataframe_for_lazy_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<DataFrame, DeltaFunnelError> {
+        dataframe_for_lazy_table_from_session_parts(
+            &self.context,
+            table,
+            &self.sources,
+            &self.derived_tables,
+            &self.pending_derived_tables,
+        )
+        .await
+    }
+
+    pub(super) fn schema_for_lazy_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<&SchemaRef, DeltaFunnelError> {
+        match table.kind() {
+            LazyTableKind::DeltaSource => self
+                .sources
+                .iter()
+                .find(|source| source.table().id() == table.id())
+                .map(RegisteredSessionSource::schema),
+            LazyTableKind::DerivedSql => self
+                .derived_tables
+                .iter()
+                .find(|derived| derived.table().id() == table.id())
+                .map(RegisteredDerivedTable::schema)
+                .or_else(|| {
+                    self.pending_derived_tables
+                        .iter()
+                        .find(|pending| pending.table.id() == table.id())
+                        .map(|pending| &pending.schema)
+                }),
+        }
+        .ok_or_else(|| unknown_lazy_table_error(table))
+    }
+
     /// Classifies one selected output relative to active cached aliases.
     ///
     /// Direct selected-alias use wins over lineage use because the normal

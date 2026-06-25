@@ -18,14 +18,12 @@ mod write_all;
 
 use std::fmt;
 
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::prelude::{DataFrame, SessionContext};
-use futures_util::StreamExt;
+use datafusion::prelude::SessionContext;
 
 use crate::{
-    DeltaFunnelError, DeltaSourceConfig, DeltaTableProviderConfig, MssqlOutputBatchStream,
-    datafusion_query_output_stream, datafusion_session_context, load_delta_source,
-    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
+    DeltaFunnelError, DeltaSourceConfig, DeltaTableProviderConfig, datafusion_session_context,
+    load_delta_source, preflight_delta_protocol,
+    register_delta_sources_with_scan_execution_options,
 };
 
 pub use handles::{
@@ -44,11 +42,9 @@ pub use dry_run_report::{
     MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
     MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
 };
-use errors::{datafusion_handoff_setup_error, unknown_lazy_table_error};
 #[cfg(test)]
 pub(crate) use mssql_output::OrchestratorMssqlOutputWriter;
 use registry::PendingDerivedTable;
-use streams::dataframe_for_lazy_table_from_session_parts;
 
 /// Rust backing session for lazy query-load workflows.
 pub struct DeltaFunnelSession {
@@ -146,59 +142,6 @@ impl DeltaFunnelSession {
         let id = self.next_table_id;
         self.next_table_id = self.next_table_id.saturating_add(1);
         LazyTable::delta_source(id, name)
-    }
-
-    pub(crate) async fn batch_stream_for_lazy_table(
-        &self,
-        table: &LazyTable,
-    ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
-        let dataframe = self.dataframe_for_lazy_table(table).await?;
-        let physical_plan = dataframe
-            .create_physical_plan()
-            .await
-            .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
-        let stream = datafusion_query_output_stream(physical_plan, self.context.task_ctx())
-            .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
-
-        Ok(Box::pin(stream.map(|batch| {
-            batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
-        })))
-    }
-
-    async fn dataframe_for_lazy_table(
-        &self,
-        table: &LazyTable,
-    ) -> Result<DataFrame, DeltaFunnelError> {
-        dataframe_for_lazy_table_from_session_parts(
-            &self.context,
-            table,
-            &self.sources,
-            &self.derived_tables,
-            &self.pending_derived_tables,
-        )
-        .await
-    }
-
-    fn schema_for_lazy_table(&self, table: &LazyTable) -> Result<&SchemaRef, DeltaFunnelError> {
-        match table.kind() {
-            LazyTableKind::DeltaSource => self
-                .sources
-                .iter()
-                .find(|source| source.table().id() == table.id())
-                .map(RegisteredSessionSource::schema),
-            LazyTableKind::DerivedSql => self
-                .derived_tables
-                .iter()
-                .find(|derived| derived.table().id() == table.id())
-                .map(RegisteredDerivedTable::schema)
-                .or_else(|| {
-                    self.pending_derived_tables
-                        .iter()
-                        .find(|pending| pending.table.id() == table.id())
-                        .map(|pending| &pending.schema)
-                }),
-        }
-        .ok_or_else(|| unknown_lazy_table_error(table))
     }
 }
 
