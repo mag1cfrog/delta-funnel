@@ -23,12 +23,11 @@ use futures_util::StreamExt;
 
 use crate::{
     DeltaFunnelError, DeltaSourceConfig, DeltaTableProviderConfig, MssqlOutputBatchStream,
-    MssqlSchemaPlanOptions, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter,
-    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget,
-    SqlTablePhase, datafusion_query_output_stream, datafusion_session_context, load_delta_source,
-    plan_mssql_target_for_resolved_output, preflight_delta_protocol,
-    register_delta_sources_with_scan_execution_options, table_formats::validate_table_source_names,
-    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
+    MssqlSchemaPlanOptions, MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWriteOptions,
+    MssqlWriteReport, ResolvedMssqlTarget, SqlTablePhase, datafusion_query_output_stream,
+    datafusion_session_context, load_delta_source, plan_mssql_target_for_resolved_output,
+    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
+    table_formats::validate_table_source_names, write_output_batches_to_mssql,
 };
 
 pub use handles::{
@@ -49,15 +48,7 @@ pub use dry_run_report::{
 };
 use errors::{datafusion_handoff_setup_error, sql_table_error, unknown_lazy_table_error};
 use registry::PendingDerivedTable;
-use streams::{
-    SharedProviderReadStats, dataframe_for_lazy_table_from_session_parts,
-    provider_read_stats_snapshot, shared_provider_read_stats,
-};
-use write_all::{
-    MssqlDerivedCacheAliasPlan, MssqlOutputCacheDecision, MssqlOutputCachePlan,
-    cache_error_with_restore_error, restore_mssql_cache_aliases,
-    restore_mssql_cache_aliases_after_error,
-};
+use streams::dataframe_for_lazy_table_from_session_parts;
 
 /// Rust backing session for lazy query-load workflows.
 pub struct DeltaFunnelSession {
@@ -317,345 +308,6 @@ impl DeltaFunnelSession {
             .await
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn write_all_baseline_with_writer<W>(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        writer: W,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        self.write_all_baseline_with_writer_and_provider_stats(planned_outputs, writer, None)
-            .await
-    }
-
-    async fn write_all_baseline_with_writer_and_provider_stats<W>(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        writer: W,
-        provider_stats: Option<SharedProviderReadStats>,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        let jobs = self
-            .build_write_all_baseline_jobs_with_provider_stats(planned_outputs, provider_stats)?;
-
-        write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
-    }
-
-    /// Runs the auto-cache path with an injected workflow writer.
-    ///
-    /// Tests use this to inject a fake writer while the public path supplies a
-    /// writer that calls the existing one-output SQL Server sink.
-    #[allow(dead_code)]
-    async fn write_all_cached_with_writer<W>(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        cache_aliases: &[MssqlDerivedCacheAliasPlan],
-        writer: W,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        self.write_all_cached_with_writer_and_provider_stats(
-            planned_outputs,
-            cache_aliases,
-            writer,
-            None,
-        )
-        .await
-    }
-
-    async fn write_all_cached_with_writer_and_provider_stats<W>(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        cache_aliases: &[MssqlDerivedCacheAliasPlan],
-        writer: W,
-        provider_stats: Option<SharedProviderReadStats>,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        let replacements = self.replace_mssql_cache_aliases(cache_aliases).await?;
-        let jobs = match self.build_write_all_cached_jobs_with_provider_stats(
-            planned_outputs,
-            cache_aliases,
-            provider_stats,
-        ) {
-            Ok(jobs) => jobs,
-            Err(error) => {
-                return Err(restore_mssql_cache_aliases_after_error(error, replacements).await);
-            }
-        };
-        let write_result =
-            write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer)
-                .await;
-        let restore_result = restore_mssql_cache_aliases(replacements).await;
-
-        match (write_result, restore_result) {
-            (Ok(report), Ok(_restorations)) => Ok(report),
-            (Ok(_report), Err(restore_error)) => Err(restore_error),
-            (Err(write_error), Ok(_restorations)) => Err(write_error),
-            (Err(write_error), Err(restore_error)) => {
-                Err(cache_error_with_restore_error(write_error, restore_error))
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn write_all_with_options_and_writer<W>(
-        &self,
-        requests: &[OutputWritePlan],
-        options: WriteAllOptions,
-        writer: W,
-    ) -> Result<WriteAllReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        let planned_outputs = self.plan_write_all_outputs(requests)?;
-
-        match options.cache_mode() {
-            WriteAllCacheMode::Auto => {
-                self.write_all_auto_with_writer(requests, &planned_outputs, writer)
-                    .await
-            }
-            WriteAllCacheMode::Disabled => {
-                let provider_stats = shared_provider_read_stats();
-                let workflow = self
-                    .write_all_baseline_with_writer_and_provider_stats(
-                        &planned_outputs,
-                        writer,
-                        Some(Arc::clone(&provider_stats)),
-                    )
-                    .await?;
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    &planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                Ok(WriteAllReport::new(
-                    workflow,
-                    WriteAllCacheReport::disabled(),
-                    sources,
-                ))
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn write_all_with_writer<W>(
-        &self,
-        requests: &[OutputWritePlan],
-        writer: W,
-    ) -> Result<WriteAllReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        self.write_all_with_options_and_writer(requests, WriteAllOptions::default(), writer)
-            .await
-    }
-
-    #[allow(dead_code)]
-    async fn write_all_baseline(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
-        self.write_all_baseline_with_writer(planned_outputs, MssqlWorkflowPublicOutputWriter)
-            .await
-    }
-
-    #[allow(dead_code)]
-    async fn write_all_auto_with_writer<W>(
-        &self,
-        requests: &[OutputWritePlan],
-        planned_outputs: &[PlannedMssqlOutput],
-        writer: W,
-    ) -> Result<WriteAllReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        let cache_plan = self.plan_mssql_output_cache(requests);
-
-        self.write_all_auto_plan_with_writer(planned_outputs, &cache_plan, writer)
-            .await
-    }
-
-    #[allow(dead_code)]
-    async fn write_all_auto_plan_with_writer<W>(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        cache_plan: &MssqlOutputCachePlan,
-        writer: W,
-    ) -> Result<WriteAllReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        match cache_plan.decision() {
-            MssqlOutputCacheDecision::NoCache { .. } => {
-                let cache = WriteAllCacheReport::from_plan(cache_plan);
-                let provider_stats = shared_provider_read_stats();
-                let workflow = self
-                    .write_all_baseline_with_writer_and_provider_stats(
-                        planned_outputs,
-                        writer,
-                        Some(Arc::clone(&provider_stats)),
-                    )
-                    .await?;
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                Ok(WriteAllReport::new(workflow, cache, sources))
-            }
-            MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
-                let provider_stats = shared_provider_read_stats();
-                let workflow = self
-                    .write_all_cached_with_writer_and_provider_stats(
-                        planned_outputs,
-                        cache_aliases,
-                        writer,
-                        Some(Arc::clone(&provider_stats)),
-                    )
-                    .await?;
-                let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                Ok(WriteAllReport::new(workflow, cache, sources))
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn write_all_cached(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        cache_aliases: &[MssqlDerivedCacheAliasPlan],
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
-        self.write_all_cached_with_writer(
-            planned_outputs,
-            cache_aliases,
-            MssqlWorkflowPublicOutputWriter,
-        )
-        .await
-    }
-
-    async fn write_all_auto(
-        &self,
-        requests: &[OutputWritePlan],
-        planned_outputs: &[PlannedMssqlOutput],
-    ) -> Result<WriteAllReport, DeltaFunnelError> {
-        let cache_plan = self.plan_mssql_output_cache(requests);
-
-        self.write_all_auto_plan(planned_outputs, &cache_plan).await
-    }
-
-    async fn write_all_auto_plan(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        cache_plan: &MssqlOutputCachePlan,
-    ) -> Result<WriteAllReport, DeltaFunnelError> {
-        match cache_plan.decision() {
-            MssqlOutputCacheDecision::NoCache { .. } => {
-                let cache = WriteAllCacheReport::from_plan(cache_plan);
-                let provider_stats = shared_provider_read_stats();
-                let workflow = self
-                    .write_all_baseline_with_writer_and_provider_stats(
-                        planned_outputs,
-                        MssqlWorkflowPublicOutputWriter,
-                        Some(Arc::clone(&provider_stats)),
-                    )
-                    .await?;
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                Ok(WriteAllReport::new(workflow, cache, sources))
-            }
-            MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
-                let provider_stats = shared_provider_read_stats();
-                let workflow = self
-                    .write_all_cached_with_writer_and_provider_stats(
-                        planned_outputs,
-                        cache_aliases,
-                        MssqlWorkflowPublicOutputWriter,
-                        Some(Arc::clone(&provider_stats)),
-                    )
-                    .await?;
-                let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                Ok(WriteAllReport::new(workflow, cache, sources))
-            }
-        }
-    }
-
-    /// Writes multiple selected lazy tables to SQL Server sequentially.
-    ///
-    /// The default mode performs conservative automatic cache planning for
-    /// shared registered derived aliases. The returned report wraps the
-    /// lower-level SQL Server workflow report and includes cache selection
-    /// metadata for this call.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first pre-execution validation/planning error, or a workflow
-    /// execution error from the lower-level SQL Server workflow.
-    #[allow(dead_code)]
-    pub async fn write_all(
-        &self,
-        requests: &[OutputWritePlan],
-    ) -> Result<WriteAllReport, DeltaFunnelError> {
-        self.write_all_with_options(requests, WriteAllOptions::default())
-            .await
-    }
-
-    /// Writes multiple selected lazy tables to SQL Server sequentially with explicit options.
-    ///
-    /// `WriteAllCacheMode::Disabled` uses the baseline no-cache path. The
-    /// default `Auto` mode performs conservative shared-cache planning and
-    /// reports the selected or skipped cache decision.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first pre-execution validation/planning error, or a workflow
-    /// execution error from the lower-level SQL Server workflow.
-    #[allow(dead_code)]
-    pub async fn write_all_with_options(
-        &self,
-        requests: &[OutputWritePlan],
-        options: WriteAllOptions,
-    ) -> Result<WriteAllReport, DeltaFunnelError> {
-        let planned_outputs = self.plan_write_all_outputs(requests)?;
-
-        match options.cache_mode() {
-            WriteAllCacheMode::Auto => self.write_all_auto(requests, &planned_outputs).await,
-            WriteAllCacheMode::Disabled => {
-                let provider_stats = shared_provider_read_stats();
-                let workflow = self
-                    .write_all_baseline_with_writer_and_provider_stats(
-                        &planned_outputs,
-                        MssqlWorkflowPublicOutputWriter,
-                        Some(Arc::clone(&provider_stats)),
-                    )
-                    .await?;
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    &planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                Ok(WriteAllReport::new(
-                    workflow,
-                    WriteAllCacheReport::disabled(),
-                    sources,
-                ))
-            }
-        }
-    }
-
     async fn plan_read_only_sql(&self, sql: &str) -> Result<DataFrame, DeltaFunnelError> {
         self.context
             .sql_with_options(sql, read_only_sql_options())
@@ -865,9 +517,12 @@ mod tests {
     };
 
     use super::registry::{DerivedTableDependency, DerivedTableLineage};
-    use super::write_all::MssqlScopedCacheAliasReplacement;
     use super::write_all::{
         MssqlCacheCandidateSkipReason, MssqlCachedOutputStreamRoute, MssqlNoCacheReason,
+    };
+    use super::write_all::{
+        MssqlDerivedCacheAliasPlan, MssqlOutputCacheDecision, MssqlScopedCacheAliasReplacement,
+        cache_error_with_restore_error, restore_mssql_cache_aliases_after_error,
     };
     use super::*;
     use crate::{
