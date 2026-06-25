@@ -1207,6 +1207,8 @@ pub struct MssqlDryRunOutputReport {
     sql_identity: MssqlDryRunSqlIdentityReport,
     source_usage_status: SourceUsageStatus,
     used_source_names: Vec<String>,
+    output_row_count: crate::RowCount,
+    output_row_count_reason: Option<ReportReasonCode>,
     status: OutputStatus,
     validation_status: ValidationStatus,
     sql_server_contacted: bool,
@@ -1235,6 +1237,8 @@ impl MssqlDryRunOutputReport {
             sql_identity,
             source_usage_status,
             used_source_names,
+            output_row_count: crate::RowCount::unavailable(),
+            output_row_count_reason: Some(ReportReasonCode::NotExecuted),
             status: OutputStatus::dry_run_planned(),
             validation_status: ValidationStatus::skipped(ReportReasonCode::DryRun),
             sql_server_contacted: false,
@@ -1326,6 +1330,18 @@ impl MssqlDryRunOutputReport {
     #[must_use]
     pub fn used_source_names(&self) -> &[String] {
         &self.used_source_names
+    }
+
+    /// Returns output row-count evidence for this dry-run output.
+    #[must_use]
+    pub const fn output_row_count(&self) -> crate::RowCount {
+        self.output_row_count
+    }
+
+    /// Returns the stable reason code when output row count is unavailable.
+    #[must_use]
+    pub const fn output_row_count_reason(&self) -> Option<ReportReasonCode> {
+        self.output_row_count_reason
     }
 
     /// Returns the dry-run output status.
@@ -7373,6 +7389,11 @@ mod tests {
         assert!(!report.output_schema()[0].nullable());
         assert_eq!(report.source_usage_status(), SourceUsageStatus::NotUsed);
         assert!(report.used_source_names().is_empty());
+        assert_eq!(report.output_row_count(), crate::RowCount::unavailable());
+        assert_eq!(
+            report.output_row_count_reason(),
+            Some(ReportReasonCode::NotExecuted)
+        );
         assert_eq!(MssqlDryRunSqlIdentityState::Present.as_str(), "present");
         assert_eq!(MssqlDryRunSqlIdentityState::Absent.to_string(), "absent");
         assert_eq!(
@@ -7530,6 +7551,14 @@ mod tests {
         assert_eq!(
             report.outputs()[0].validation_status(),
             ValidationStatus::skipped(ReportReasonCode::DryRun)
+        );
+        assert_eq!(
+            report.outputs()[0].output_row_count(),
+            crate::RowCount::unavailable()
+        );
+        assert_eq!(
+            report.outputs()[0].output_row_count_reason(),
+            Some(ReportReasonCode::NotExecuted)
         );
         assert!(report.sources().is_empty());
         assert_eq!(report.outputs()[0].target_table().table(), "west_orders");
