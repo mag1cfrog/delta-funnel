@@ -1748,13 +1748,15 @@ pub(super) fn ensure_unique_write_all_output_names(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::Ordering};
+    use std::sync::{Arc, Mutex, atomic::Ordering};
 
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use async_trait::async_trait;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use futures_util::StreamExt;
 
     use super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, RunMode,
-        SessionOptions,
+        SessionOptions, SourceUsageStatus,
         registry::{DerivedTableDependency, DerivedTableLineage},
         test_support::{
             DeltaLogTable, collect_stream_marker_values, execute_output_request,
@@ -1769,8 +1771,81 @@ mod tests {
         restore_mssql_cache_aliases_after_error,
     };
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlTargetConfig, MssqlTargetTable,
+        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlOutputBatchStream,
+        MssqlSchemaPlanOptions, MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetTable,
+        MssqlWorkflowOutputWriter, MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget,
+        plan_mssql_target_for_resolved_output, table_formats::RealParquetDeltaTable,
     };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeOrchestratorWriteCall {
+        output_name: String,
+        target_table: MssqlTargetTable,
+        rows: u64,
+        batches: u64,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeWorkflowWriter {
+        calls: Arc<Mutex<Vec<FakeOrchestratorWriteCall>>>,
+    }
+
+    impl FakeWorkflowWriter {
+        fn calls(&self) -> Arc<Mutex<Vec<FakeOrchestratorWriteCall>>> {
+            Arc::clone(&self.calls)
+        }
+    }
+
+    #[async_trait]
+    impl MssqlWorkflowOutputWriter for FakeWorkflowWriter {
+        async fn write_output(
+            &mut self,
+            output_schema: SchemaRef,
+            resolved_target: ResolvedMssqlTarget,
+            schema_options: MssqlSchemaPlanOptions,
+            mut batches: MssqlOutputBatchStream,
+            _write_options: MssqlWriteOptions,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+            let mut rows = 0_u64;
+            let mut batch_count = 0_u64;
+
+            while let Some(batch) = batches.next().await {
+                let batch = batch?;
+                rows = rows.saturating_add(u64::try_from(batch.num_rows()).map_err(|_| {
+                    DeltaFunnelError::Config {
+                        message: "fake workflow writer row count overflowed u64".to_owned(),
+                    }
+                })?);
+                batch_count = batch_count.saturating_add(1);
+            }
+
+            let output_plan = plan_mssql_target_for_resolved_output(
+                output_schema.as_ref(),
+                &resolved_target,
+                schema_options,
+            )?;
+            self.calls
+                .lock()
+                .map_err(|_| DeltaFunnelError::Config {
+                    message: "fake workflow writer call lock poisoned".to_owned(),
+                })?
+                .push(FakeOrchestratorWriteCall {
+                    output_name: resolved_target.output_name().to_owned(),
+                    target_table: resolved_target.table().clone(),
+                    rows,
+                    batches: batch_count,
+                });
+
+            Ok(MssqlWriteReport::from_output_plan(
+                &output_plan,
+                rows,
+                batch_count,
+                0,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ))
+        }
+    }
 
     #[test]
     fn write_all_options_default_to_auto_cache_mode() {
@@ -1941,6 +2016,175 @@ mod tests {
         assert_eq!(jobs[0].target_summary().table().table(), "west_orders");
         assert_eq!(jobs[1].output_name(), "east_output");
         assert_eq!(jobs[1].target_summary().table().table(), "east_orders");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_with_writer_executes_valid_outputs_in_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let west = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let east = session.table_from_sql("select 3 as id").await?;
+        let west =
+            execute_output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east =
+            execute_output_request(east, "east_output", "east_orders", LoadMode::CreateAndLoad)?;
+        let writer = FakeWorkflowWriter::default();
+        let calls = writer.calls();
+
+        let report = session.write_all_with_writer(&[west, east], writer).await?;
+        let calls = calls
+            .lock()
+            .map_err(|_| "fake workflow call lock poisoned")?;
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].output_name, "west_output");
+        assert_eq!(calls[0].target_table.table(), "west_orders");
+        assert_eq!(calls[0].rows, 2);
+        assert_eq!(calls[1].output_name, "east_output");
+        assert_eq!(calls[1].target_table.table(), "east_orders");
+        assert_eq!(calls[1].rows, 1);
+        assert_eq!(report.len(), 2);
+        assert!(report.all_succeeded());
+        assert_eq!(report.outputs()[0].output_name(), "west_output");
+        assert_eq!(report.outputs()[1].output_name(), "east_output");
+        assert_eq!(report.workflow().outputs(), report.outputs());
+        let crate::sql_server::MssqlOutputWriteStatus::Succeeded(west_report) =
+            &report.outputs()[0]
+        else {
+            return Err(format!("expected succeeded status, got {:?}", report.outputs()[0]).into());
+        };
+        assert_eq!(west_report.stats().rows_written(), 2);
+        assert_eq!(west_report.stats().batches_written(), calls[0].batches);
+        assert_eq!(
+            west_report.cleanup(),
+            MssqlTargetCleanupStatus::NotApplicable
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_with_writer_reports_delta_sources_for_executed_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let selected_orders = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let request = execute_output_request(
+            selected_orders,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::default();
+
+        let report = session
+            .write_all_with_options_and_writer(
+                &[request],
+                WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                writer,
+            )
+            .await?;
+
+        assert_eq!(report.outputs().len(), 1);
+        assert_eq!(report.outputs()[0].output_name(), "orders_output");
+        assert_eq!(report.sources().len(), 1);
+        let source = &report.sources()[0];
+        assert_eq!(source.source_name(), "orders");
+        assert_eq!(source.usage_status(), SourceUsageStatus::Used);
+        assert_eq!(source.used_by_output_names(), &["orders_output".to_owned()]);
+        assert_eq!(source.provider_stats_reason(), None);
+        let stats = source
+            .provider_read_stats()
+            .ok_or("expected execution provider stats")?;
+        assert_eq!(stats.source_name, "orders");
+        assert_eq!(stats.snapshot_version, source.snapshot_version());
+        assert!(stats.files_started > 0);
+        assert_eq!(stats.files_started, stats.files_completed);
+        assert!(stats.rows_produced > 0);
+        assert!(stats.batches_produced > 0);
+        match stats.scan_metadata_exhausted {
+            Some(true) => {
+                assert_eq!(
+                    source.file_count(),
+                    crate::FileCount::exact(stats.files_planned)
+                );
+                assert_eq!(source.file_count_reason(), None);
+            }
+            Some(false) => {
+                assert_eq!(
+                    source.file_count(),
+                    crate::FileCount::estimated(stats.files_planned)
+                );
+                assert_eq!(source.file_count_reason(), None);
+            }
+            None => {
+                assert_eq!(source.file_count(), crate::FileCount::unavailable());
+                assert_eq!(
+                    source.file_count_reason(),
+                    Some(crate::ReportReasonCode::CapabilityUnavailable)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_all_keeps_source_rows_separate_from_output_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let aggregate = session
+            .table_from_sql("select count(*) as order_count from orders")
+            .await?;
+        let request = execute_output_request(
+            aggregate,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let writer = FakeWorkflowWriter::default();
+
+        let report = session
+            .write_all_with_options_and_writer(
+                &[request],
+                WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                writer,
+            )
+            .await?;
+
+        let crate::sql_server::MssqlOutputWriteStatus::Succeeded(output_report) =
+            &report.outputs()[0]
+        else {
+            return Err(format!("expected succeeded status, got {:?}", report.outputs()[0]).into());
+        };
+        assert_eq!(output_report.stats().rows_written(), 1);
+        let source = report
+            .sources()
+            .first()
+            .ok_or("expected executed source report")?;
+        let stats = source
+            .provider_read_stats()
+            .ok_or("expected execution provider stats")?;
+        assert_eq!(stats.rows_produced, u64::try_from(table.rows())?);
+        assert_ne!(stats.rows_produced, output_report.stats().rows_written());
         Ok(())
     }
 
