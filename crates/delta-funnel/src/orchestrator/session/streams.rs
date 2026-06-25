@@ -17,11 +17,15 @@ use crate::{
 };
 
 use super::{
-    LazyTable, LazyTableKind, PendingDerivedTable, RegisteredDerivedTable, RegisteredSessionSource,
+    DeltaFunnelSession, LazyTable, LazyTableKind, OutputWritePlan, PendingDerivedTable,
+    RegisteredDerivedTable, RegisteredSessionSource,
     errors::{
-        cached_output_stream_setup_error, datafusion_handoff_setup_error, unknown_lazy_table_error,
+        cached_output_stream_setup_error, datafusion_handoff_setup_error,
+        unknown_cached_alias_error, unknown_lazy_table_error,
     },
     read_only_sql_options,
+    registry::DerivedTableDependency,
+    write_all::{MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan},
 };
 
 pub(super) type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
@@ -176,6 +180,167 @@ pub(super) async fn replanned_sql_batch_stream(
     Ok(Box::pin(stream.map(move |batch| {
         batch.map_err(|error| cached_output_stream_setup_error(&output_name, error))
     })))
+}
+
+impl DeltaFunnelSession {
+    /// Classifies one selected output relative to active cached aliases.
+    ///
+    /// Direct selected-alias use wins over lineage use because the normal
+    /// registered-alias stream path should read the active cached provider.
+    /// Dependent outputs are identified from captured lineage so later stream
+    /// construction can replan from retained SQL while all cache aliases are
+    /// installed.
+    #[allow(dead_code)]
+    pub(super) fn cached_output_stream_route(
+        &self,
+        request: &OutputWritePlan,
+        active_aliases: &[MssqlDerivedCacheAliasPlan],
+    ) -> Result<MssqlCachedOutputStreamRoute, DeltaFunnelError> {
+        if active_aliases.is_empty() {
+            return Ok(MssqlCachedOutputStreamRoute::UncachedLazyTable);
+        }
+
+        for alias in active_aliases {
+            self.registered_derived_table_by_id(alias.table_id())
+                .ok_or_else(|| unknown_cached_alias_error(alias))?;
+        }
+
+        if let Some(alias) = active_aliases
+            .iter()
+            .find(|alias| request.table().id() == alias.table_id())
+        {
+            return Ok(MssqlCachedOutputStreamRoute::DirectCachedAlias(
+                alias.clone(),
+            ));
+        }
+
+        if request.table().kind() == LazyTableKind::DeltaSource {
+            return Ok(MssqlCachedOutputStreamRoute::UncachedLazyTable);
+        }
+
+        let dependencies = self.transitive_registered_derived_dependencies(request.table())?;
+        let dependent_aliases = active_aliases
+            .iter()
+            .filter(|alias| {
+                dependencies.iter().any(|dependency| {
+                    matches!(
+                        dependency,
+                        DerivedTableDependency::RegisteredDerived { table_id, .. }
+                            if *table_id == alias.table_id()
+                    )
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if dependent_aliases.is_empty() {
+            Ok(MssqlCachedOutputStreamRoute::UncachedLazyTable)
+        } else {
+            Ok(MssqlCachedOutputStreamRoute::ReplannedCachedDependency(
+                dependent_aliases,
+            ))
+        }
+    }
+
+    /// Builds an async stream factory for one output while cache aliases are active.
+    ///
+    /// The returned factory performs DataFusion stream setup when the workflow
+    /// attempts this output. Direct cached aliases and unrelated outputs reuse
+    /// the normal lazy-table stream path. Dependent outputs replan from the
+    /// retained SQL text so active scoped cache aliases can replace the
+    /// registered providers referenced by that SQL.
+    #[allow(dead_code)]
+    pub(super) fn cached_output_batch_stream_factory(
+        &self,
+        request: &OutputWritePlan,
+        active_aliases: &[MssqlDerivedCacheAliasPlan],
+    ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
+        self.cached_output_batch_stream_factory_with_provider_stats(request, active_aliases, None)
+    }
+
+    pub(super) fn cached_output_batch_stream_factory_with_provider_stats(
+        &self,
+        request: &OutputWritePlan,
+        active_aliases: &[MssqlDerivedCacheAliasPlan],
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
+        let route = self.cached_output_stream_route(request, active_aliases)?;
+        match route {
+            MssqlCachedOutputStreamRoute::DirectCachedAlias(_)
+            | MssqlCachedOutputStreamRoute::UncachedLazyTable => Ok(self
+                .lazy_table_batch_stream_factory_with_provider_stats(
+                    request.table().clone(),
+                    provider_stats,
+                )),
+            MssqlCachedOutputStreamRoute::ReplannedCachedDependency(_) => {
+                let output_name = request.target().output_name().to_owned();
+                let sql_text = match self.sql_text_for_derived_table(request.table()) {
+                    Ok(sql_text) => sql_text.to_owned(),
+                    Err(error) => {
+                        return Ok(failing_cached_output_batch_stream_factory(
+                            output_name,
+                            error,
+                        ));
+                    }
+                };
+                let expected_schema = match self.schema_for_lazy_table(request.table()) {
+                    Ok(schema) => Arc::clone(schema),
+                    Err(error) => {
+                        return Ok(failing_cached_output_batch_stream_factory(
+                            output_name,
+                            error,
+                        ));
+                    }
+                };
+                let context = self.context.clone();
+                Ok(Box::new(move || {
+                    Box::pin(async move {
+                        replanned_sql_batch_stream(
+                            context,
+                            output_name,
+                            sql_text,
+                            expected_schema,
+                            provider_stats,
+                        )
+                        .await
+                    })
+                }))
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn lazy_table_batch_stream_factory(
+        &self,
+        table: LazyTable,
+    ) -> MssqlOutputBatchStreamFactory {
+        self.lazy_table_batch_stream_factory_with_provider_stats(table, None)
+    }
+
+    pub(super) fn lazy_table_batch_stream_factory_with_provider_stats(
+        &self,
+        table: LazyTable,
+        provider_stats: Option<SharedProviderReadStats>,
+    ) -> MssqlOutputBatchStreamFactory {
+        let context = self.context.clone();
+        let sources = self.sources.clone();
+        let derived_tables = self.derived_tables.clone();
+        let pending_derived_tables = self.pending_derived_tables.clone();
+
+        Box::new(move || {
+            Box::pin(async move {
+                batch_stream_for_lazy_table_from_session_parts(
+                    context,
+                    table,
+                    sources,
+                    derived_tables,
+                    pending_derived_tables,
+                    provider_stats,
+                )
+                .await
+            })
+        })
+    }
 }
 
 fn validate_replanned_output_schema(
