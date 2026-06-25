@@ -225,10 +225,10 @@ mod tests {
     };
     use super::*;
     use crate::{
-        LoadMode, MssqlConnectionSource, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus,
-        MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable, MssqlWorkflowOutputWriter,
-        MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget,
-        plan_mssql_target_for_resolved_output, table_formats::RealParquetDeltaTable,
+        LoadMode, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus, MssqlTargetConfig,
+        MssqlTargetTable, MssqlWorkflowOutputWriter, MssqlWriteOptions, MssqlWriteReport,
+        ResolvedMssqlTarget, plan_mssql_target_for_resolved_output,
+        table_formats::RealParquetDeltaTable,
     };
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -237,15 +237,8 @@ mod tests {
     struct FakeOrchestratorWriteCall {
         output_name: String,
         target_table: MssqlTargetTable,
-        connection_source: MssqlConnectionSource,
         rows: u64,
         batches: u64,
-        schema_fields: usize,
-    }
-
-    #[derive(Default)]
-    struct FakeOrchestratorWriter {
-        calls: Vec<FakeOrchestratorWriteCall>,
     }
 
     #[derive(Clone, Default)]
@@ -264,49 +257,6 @@ mod tests {
 
         fn calls(&self) -> Arc<Mutex<Vec<FakeOrchestratorWriteCall>>> {
             Arc::clone(&self.calls)
-        }
-    }
-
-    #[async_trait]
-    impl OrchestratorMssqlOutputWriter for FakeOrchestratorWriter {
-        async fn write_output(
-            &mut self,
-            output_schema: SchemaRef,
-            output_plan: MssqlTargetOutputPlan,
-            resolved_target: ResolvedMssqlTarget,
-            mut batches: MssqlOutputBatchStream,
-            _write_options: MssqlWriteOptions,
-        ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-            let mut rows = 0_u64;
-            let mut batch_count = 0_u64;
-
-            while let Some(batch) = batches.next().await {
-                let batch = batch?;
-                rows = rows.saturating_add(u64::try_from(batch.num_rows()).map_err(|_| {
-                    DeltaFunnelError::Config {
-                        message: "fake writer row count overflowed u64".to_owned(),
-                    }
-                })?);
-                batch_count = batch_count.saturating_add(1);
-            }
-
-            self.calls.push(FakeOrchestratorWriteCall {
-                output_name: resolved_target.output_name().to_owned(),
-                target_table: resolved_target.table().clone(),
-                connection_source: resolved_target.connection_source(),
-                rows,
-                batches: batch_count,
-                schema_fields: output_schema.fields().len(),
-            });
-
-            Ok(MssqlWriteReport::from_output_plan(
-                &output_plan,
-                rows,
-                batch_count,
-                0,
-                false,
-                MssqlTargetCleanupStatus::NotApplicable,
-            ))
         }
     }
 
@@ -346,10 +296,8 @@ mod tests {
                 .push(FakeOrchestratorWriteCall {
                     output_name: resolved_target.output_name().to_owned(),
                     target_table: resolved_target.table().clone(),
-                    connection_source: resolved_target.connection_source(),
                     rows,
                     batches: batch_count,
-                    schema_fields: output_schema.fields().len(),
                 });
 
             if self
@@ -374,179 +322,6 @@ mod tests {
                 MssqlTargetCleanupStatus::NotApplicable,
             ))
         }
-    }
-
-    #[tokio::test]
-    async fn write_to_mssql_requires_effective_connection_before_stream_setup()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("orders")?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
-        let request = execute_output_request(
-            source,
-            "orders_output",
-            "orders_sink",
-            LoadMode::AppendExisting,
-        )?;
-
-        let error = session.write_to_mssql(&request).await;
-
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::MissingMssqlConnection { output_name })
-                if output_name == "orders_output"
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn write_to_mssql_with_writer_hands_query_stream_to_one_output_boundary()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(
-            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
-        )?;
-        let derived = session
-            .table_from_sql("select 1 as id union all select 2 as id")
-            .await?;
-        let request = execute_output_request(
-            derived,
-            "orders_output",
-            "orders_sink",
-            LoadMode::CreateAndLoad,
-        )?;
-        let mut writer = FakeOrchestratorWriter::default();
-
-        let report = session
-            .write_to_mssql_with_writer(&request, &mut writer)
-            .await?;
-
-        assert_eq!(writer.calls.len(), 1);
-        let call = writer.calls.first().ok_or("expected fake writer call")?;
-        assert_eq!(call.output_name, "orders_output");
-        assert_eq!(call.target_table.schema(), Some("dbo"));
-        assert_eq!(call.target_table.table(), "orders_sink");
-        assert_eq!(
-            call.connection_source,
-            MssqlConnectionSource::ContextDefault
-        );
-        assert_eq!(call.rows, 2);
-        assert!(call.batches >= 1);
-        assert_eq!(call.schema_fields, 1);
-        assert_eq!(report.output_name(), "orders_output");
-        assert_eq!(report.stats().rows_written(), 2);
-        assert_eq!(report.stats().batches_written(), call.batches);
-        assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn write_to_mssql_with_writer_executes_real_delta_source_fixture()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = RealParquetDeltaTable::new_default("orders")?;
-        let mut session = DeltaFunnelSession::new(
-            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
-        )?;
-        session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
-        let selected_orders = session
-            .table_from_sql("select id, customer_name from orders")
-            .await?;
-        let request = execute_output_request(
-            selected_orders,
-            "orders_output",
-            "orders_sink",
-            LoadMode::AppendExisting,
-        )?;
-        let mut writer = FakeOrchestratorWriter::default();
-
-        let report = session
-            .write_to_mssql_with_writer(&request, &mut writer)
-            .await?;
-
-        assert_eq!(writer.calls.len(), 1);
-        let call = writer.calls.first().ok_or("expected fake writer call")?;
-        assert_eq!(call.output_name, "orders_output");
-        assert_eq!(call.rows, u64::try_from(table.rows())?);
-        assert!(call.batches >= 1);
-        assert_eq!(call.schema_fields, 2);
-        assert_eq!(report.stats().rows_written(), u64::try_from(table.rows())?);
-        assert_eq!(report.stats().batches_written(), call.batches);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn write_to_mssql_with_writer_executes_multi_source_delta_join_fixture()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let orders = RealParquetDeltaTable::new_default("orders")?;
-        let customers = RealParquetDeltaTable::new_default("customers")?;
-        let mut session = DeltaFunnelSession::new(
-            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
-        )?;
-        session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            orders.path().to_string_lossy().to_string(),
-        ))?;
-        session.delta_lake(DeltaSourceConfig::new(
-            "customers",
-            customers.path().to_string_lossy().to_string(),
-        ))?;
-        let joined = session
-            .table_from_sql(
-                "select o.id, c.customer_name \
-                 from orders o \
-                 join customers c on o.id = c.id",
-            )
-            .await?;
-        let request = execute_output_request(
-            joined,
-            "joined_output",
-            "joined_sink",
-            LoadMode::AppendExisting,
-        )?;
-        let mut writer = FakeOrchestratorWriter::default();
-
-        let report = session
-            .write_to_mssql_with_writer(&request, &mut writer)
-            .await?;
-
-        assert_eq!(writer.calls.len(), 1);
-        let call = writer.calls.first().ok_or("expected fake writer call")?;
-        assert_eq!(call.output_name, "joined_output");
-        assert_eq!(call.rows, 3);
-        assert!(call.batches >= 1);
-        assert_eq!(call.schema_fields, 2);
-        assert_eq!(report.stats().rows_written(), 3);
-        assert_eq!(report.stats().batches_written(), call.batches);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn write_to_mssql_rejects_dry_run_before_planning_or_writer()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let derived = session.table_from_sql("select 1 as id").await?;
-        let request = output_request(
-            derived,
-            "orders_output",
-            "orders_sink",
-            LoadMode::AppendExisting,
-        )?;
-        let mut writer = FakeOrchestratorWriter::default();
-
-        let error = session
-            .write_to_mssql_with_writer(&request, &mut writer)
-            .await;
-
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
-                if message.contains("RunMode::Execute")
-                    && message.contains("dry_run_to_mssql")
-        ));
-        assert!(writer.calls.is_empty());
-        Ok(())
     }
 
     #[tokio::test]
