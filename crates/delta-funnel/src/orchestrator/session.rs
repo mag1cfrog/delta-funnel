@@ -1378,6 +1378,26 @@ impl MssqlDryRunWorkflowReport {
         &self.sources
     }
 
+    /// Returns whether scan metadata was exhausted for every known query-used source.
+    ///
+    /// This returns false when no source is known to be used by the selected
+    /// outputs, or when any used source only has metadata-only or unavailable
+    /// scan evidence.
+    #[must_use]
+    pub fn query_used_source_scan_metadata_exhausted(&self) -> bool {
+        let mut used_source_seen = false;
+        for source in &self.sources {
+            if source.usage_status() == SourceUsageStatus::Used {
+                used_source_seen = true;
+                if !source.scan_metadata_exhausted() {
+                    return false;
+                }
+            }
+        }
+
+        used_source_seen
+    }
+
     /// Returns whether dry-run planning contacted SQL Server for any output.
     #[must_use]
     pub fn sql_server_contacted(&self) -> bool {
@@ -7460,6 +7480,7 @@ mod tests {
         let report = session.dry_run_all_to_mssql(&[request])?;
 
         assert_eq!(report.outputs().len(), 1);
+        assert!(!report.query_used_source_scan_metadata_exhausted());
         assert_eq!(
             report.outputs()[0].sql_identity().state(),
             MssqlDryRunSqlIdentityState::Absent
@@ -7545,6 +7566,10 @@ mod tests {
                 );
             }
         }
+        assert_eq!(
+            report.query_used_source_scan_metadata_exhausted(),
+            source.scan_metadata_exhausted()
+        );
         Ok(())
     }
 
@@ -7574,6 +7599,7 @@ mod tests {
 
         let report = session.dry_run_all_to_mssql(&[request])?;
 
+        assert!(!report.query_used_source_scan_metadata_exhausted());
         assert_eq!(report.sources().len(), 3);
         for source in report.sources() {
             match source.source_name() {
