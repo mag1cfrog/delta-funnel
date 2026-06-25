@@ -8,8 +8,9 @@ use crate::{
 };
 
 use super::{
-    DeltaSourceReport, OutputWritePlan, RegisteredDerivedTable,
-    errors::mssql_scoped_cache_alias_error,
+    DeltaFunnelSession, DeltaSourceReport, LazyTable, LazyTableKind, OutputWritePlan,
+    RegisteredDerivedTable, errors::mssql_scoped_cache_alias_error,
+    registry::DerivedTableDependency,
 };
 
 /// Cache policy for one multi-output `write_all` call.
@@ -822,6 +823,263 @@ pub(super) struct MssqlCoveredCacheAlias {
     pub(super) alias: MssqlDerivedCacheAliasPlan,
     // The selected downstream alias that covered it.
     pub(super) selected_table_id: u64,
+}
+
+impl DeltaFunnelSession {
+    #[allow(dead_code)]
+    pub(crate) fn plan_mssql_output_cache(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> MssqlOutputCachePlan {
+        let selected_outputs = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| MssqlOutputCachePlanOutput::from_request(index, request))
+            .collect::<Vec<_>>();
+        if selected_outputs.len() < 2 {
+            return MssqlOutputCachePlan::no_cache(
+                selected_outputs,
+                MssqlNoCacheReason::FewerThanTwoOutputs,
+            );
+        }
+
+        let mut shared_candidates = Vec::new();
+        let mut skipped_candidates = Vec::new();
+        for derived in &self.derived_tables {
+            if derived.sql_text().trim().is_empty() {
+                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
+                    derived,
+                    MssqlCacheCandidateSkipReason::MissingSqlText,
+                ));
+                continue;
+            }
+            if !derived.lineage().is_complete() {
+                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
+                    derived,
+                    MssqlCacheCandidateSkipReason::IncompleteLineage,
+                ));
+                continue;
+            }
+
+            let output_indexes = requests
+                .iter()
+                .enumerate()
+                .filter_map(|(index, request)| {
+                    self.cache_output_uses_registered_derived(request.table(), derived)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if output_indexes.len() >= 2 {
+                shared_candidates.push(MssqlDerivedCacheAliasPlan::from_registered(
+                    derived,
+                    output_indexes,
+                ));
+            } else {
+                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
+                    derived,
+                    MssqlCacheCandidateSkipReason::NotShared {
+                        output_count: output_indexes.len(),
+                    },
+                ));
+            }
+        }
+
+        if shared_candidates.len() == 1 {
+            return MssqlOutputCachePlan::new(
+                selected_outputs,
+                MssqlOutputCacheDecision::CacheAliases(vec![shared_candidates.remove(0)]),
+                skipped_candidates,
+            );
+        }
+        if shared_candidates.len() > 1 {
+            match self.select_shared_cache_frontier(shared_candidates) {
+                MssqlCacheFrontierSelection::Selected {
+                    selected_aliases,
+                    covered_aliases,
+                } => {
+                    skipped_candidates.extend(covered_aliases.into_iter().filter_map(|covered| {
+                        self.registered_derived_table_by_id(covered.alias.table_id())
+                            .map(|derived| {
+                                MssqlCacheCandidateSkip::from_registered(
+                                    derived,
+                                    MssqlCacheCandidateSkipReason::CoveredByDeeperSharedAlias {
+                                        selected_table_id: covered.selected_table_id,
+                                    },
+                                )
+                            })
+                    }));
+                    return MssqlOutputCachePlan::new(
+                        selected_outputs,
+                        MssqlOutputCacheDecision::CacheAliases(selected_aliases),
+                        skipped_candidates,
+                    );
+                }
+                MssqlCacheFrontierSelection::Ambiguous { ambiguous_aliases } => {
+                    skipped_candidates.extend(ambiguous_aliases.into_iter().filter_map(
+                        |candidate| {
+                            self.registered_derived_table_by_id(candidate.table_id())
+                                .map(|derived| {
+                                    MssqlCacheCandidateSkip::from_registered(
+                                        derived,
+                                        MssqlCacheCandidateSkipReason::AmbiguousDepth,
+                                    )
+                                })
+                        },
+                    ));
+                    return MssqlOutputCachePlan::new(
+                        selected_outputs,
+                        MssqlOutputCacheDecision::NoCache {
+                            reason: MssqlNoCacheReason::AmbiguousSharedDerivedAlias,
+                        },
+                        skipped_candidates,
+                    );
+                }
+            }
+        }
+
+        MssqlOutputCachePlan::new(
+            selected_outputs,
+            MssqlOutputCacheDecision::NoCache {
+                reason: MssqlNoCacheReason::NoSharedRegisteredDerivedAlias,
+            },
+            skipped_candidates,
+        )
+    }
+
+    /// Returns whether a selected output uses a registered derived candidate.
+    ///
+    /// Direct use and lineage use both count for cache selection. Direct use
+    /// covers `big.to_mssql(...)`; lineage use covers downstream SQL such as
+    /// `west` reading from `big`, including transitive derived dependencies.
+    fn cache_output_uses_registered_derived(
+        &self,
+        table: &LazyTable,
+        candidate: &RegisteredDerivedTable,
+    ) -> bool {
+        // The selected output itself can be the cache candidate.
+        if table.id() == candidate.table().id() {
+            return true;
+        }
+        // Raw Delta sources cannot depend on registered derived aliases.
+        if table.kind() == LazyTableKind::DeltaSource {
+            return false;
+        }
+
+        // Pending or registered derived outputs use captured lineage. If lineage
+        // lookup fails, the candidate is not counted for this output.
+        self.transitive_registered_derived_dependencies(table)
+            .map(|dependencies| {
+                dependencies.iter().any(|dependency| {
+                    matches!(
+                        dependency,
+                        DerivedTableDependency::RegisteredDerived { table_id, .. }
+                            if *table_id == candidate.table().id()
+                    )
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Selects the cache frontier from eligible shared derived aliases.
+    ///
+    /// The frontier is every shared alias that is not covered by a deeper
+    /// shared alias. Chain-shaped candidates collapse to the deepest alias,
+    /// while independent candidates are kept together even when they serve the
+    /// same selected output indexes.
+    fn select_shared_cache_frontier(
+        &self,
+        candidates: Vec<MssqlDerivedCacheAliasPlan>,
+    ) -> MssqlCacheFrontierSelection {
+        // A candidate is covered when another shared candidate depends on it.
+        // Covered aliases are useful upstream work, but caching the deeper
+        // shared alias is closer to the final selected outputs.
+        let deepest_indexes = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(candidate_index, candidate)| {
+                let covered_by_deeper_candidate =
+                    candidates.iter().enumerate().any(|(other_index, other)| {
+                        candidate_index != other_index
+                            && self.cache_candidate_is_deeper_than(other, candidate)
+                    });
+                (!covered_by_deeper_candidate).then_some(candidate_index)
+            })
+            .collect::<Vec<_>>();
+
+        match deepest_indexes.as_slice() {
+            [] => MssqlCacheFrontierSelection::Ambiguous {
+                ambiguous_aliases: candidates,
+            },
+            [_, ..] => {
+                // The indexes that remain are the frontier. More than one means
+                // independent shared aliases, not ambiguity, because no selected
+                // alias can replace the work represented by another.
+                let selected_aliases = deepest_indexes
+                    .iter()
+                    .map(|index| candidates[*index].clone())
+                    .collect::<Vec<_>>();
+                // Keep covered aliases visible in the plan so later reports can
+                // explain why broader upstream candidates were not selected.
+                let covered_aliases = candidates
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(candidate_index, candidate)| {
+                        if deepest_indexes.contains(&candidate_index) {
+                            return None;
+                        }
+                        selected_aliases
+                            .iter()
+                            .find(|selected| {
+                                self.cache_candidate_is_deeper_than(selected, candidate)
+                            })
+                            .map(|selected| MssqlCoveredCacheAlias {
+                                alias: candidate.clone(),
+                                selected_table_id: selected.table_id(),
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                if deepest_indexes.len() + covered_aliases.len() != candidates.len() {
+                    return MssqlCacheFrontierSelection::Ambiguous {
+                        ambiguous_aliases: candidates,
+                    };
+                }
+                MssqlCacheFrontierSelection::Selected {
+                    selected_aliases,
+                    covered_aliases,
+                }
+            }
+        }
+    }
+
+    /// Returns whether `candidate` is a downstream derived alias of `other`.
+    ///
+    /// This is the ordering test used by frontier selection. It is intentionally
+    /// based on session-owned table identity plus captured lineage, not on alias
+    /// names, SQL text, registration order, or output order.
+    fn cache_candidate_is_deeper_than(
+        &self,
+        candidate: &MssqlDerivedCacheAliasPlan,
+        other: &MssqlDerivedCacheAliasPlan,
+    ) -> bool {
+        if candidate.table_id() == other.table_id() {
+            return false;
+        }
+
+        // Missing metadata should not create a deeper-than relationship. The
+        // caller treats unprovable ordering conservatively when needed.
+        let Some(candidate_table) = self.registered_derived_table_by_id(candidate.table_id())
+        else {
+            return false;
+        };
+        let Some(other_table) = self.registered_derived_table_by_id(other.table_id()) else {
+            return false;
+        };
+
+        // Reuse the same direct-or-transitive dependency check as output
+        // classification. If candidate depends on other, candidate is closer to
+        // outputs that use candidate and can cover the broader upstream alias.
+        self.cache_output_uses_registered_derived(candidate_table.table(), other_table)
+    }
 }
 
 #[cfg(test)]
