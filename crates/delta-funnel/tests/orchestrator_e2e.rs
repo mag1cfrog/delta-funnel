@@ -8,8 +8,9 @@ use std::{
 };
 
 use delta_funnel::{
-    DeltaFunnelSession, DeltaSourceConfig, LoadMode, MssqlConnectionConfig, MssqlOutputTarget,
-    MssqlTargetConfig, MssqlTargetTable, OutputWritePlan, RunMode, SessionOptions,
+    DeltaFunnelSession, DeltaSourceConfig, FileCount, LoadMode, MssqlConnectionConfig,
+    MssqlOutputTarget, MssqlTargetConfig, MssqlTargetTable, OutputWritePlan, ReportReasonCode,
+    RunMode, SessionOptions, SourceUsageStatus,
 };
 
 type TestError = Box<dyn Error + Send + Sync + 'static>;
@@ -122,6 +123,63 @@ async fn dry_run_plans_multi_source_join_through_public_api() -> TestResult<()> 
 }
 
 #[tokio::test]
+async fn dry_run_all_reports_sources_through_public_api() -> TestResult<()> {
+    let orders = DeltaLogFixture::new("orders", ORDERS_SCHEMA_FIELDS_JSON)?;
+    let customers = DeltaLogFixture::new("customers", CUSTOMERS_SCHEMA_FIELDS_JSON)?;
+    let regions = DeltaLogFixture::new("regions", REGIONS_SCHEMA_FIELDS_JSON)?;
+    let mut session = session_with_default_connection()?;
+    session.delta_lake(DeltaSourceConfig::new("orders", orders.uri()))?;
+    session.delta_lake(DeltaSourceConfig::new("customers", customers.uri()))?;
+    session.delta_lake(DeltaSourceConfig::new("regions", regions.uri()))?;
+    let joined = session
+        .table_from_sql(
+            "select o.id, c.customer_name \
+             from orders o \
+             join customers c on o.customer_id = c.id",
+        )
+        .await?;
+    let output = output_request(
+        joined,
+        "joined_output",
+        "joined_sink",
+        LoadMode::AppendExisting,
+        RunMode::DryRun,
+    )?;
+
+    let report = session.dry_run_all_to_mssql(&[output])?;
+
+    assert_eq!(report.len(), 1);
+    assert_eq!(report.sources().len(), 3);
+    let orders = source_report(report.sources(), "orders")?;
+    assert_eq!(orders.snapshot_version(), 0);
+    assert_eq!(orders.protocol().min_reader_version, 1);
+    assert_eq!(orders.file_count(), FileCount::unavailable());
+    assert_eq!(
+        orders.file_count_reason(),
+        Some(ReportReasonCode::CostAvoidance)
+    );
+    assert_eq!(
+        orders.provider_stats_reason(),
+        Some(ReportReasonCode::NotExecuted)
+    );
+    assert_eq!(orders.usage_status(), SourceUsageStatus::Used);
+    assert_eq!(orders.used_by_output_names(), &["joined_output".to_owned()]);
+
+    let customers = source_report(report.sources(), "customers")?;
+    assert_eq!(customers.usage_status(), SourceUsageStatus::Used);
+    assert_eq!(
+        customers.used_by_output_names(),
+        &["joined_output".to_owned()]
+    );
+
+    let regions = source_report(report.sources(), "regions")?;
+    assert_eq!(regions.usage_status(), SourceUsageStatus::NotUsed);
+    assert!(regions.used_by_output_names().is_empty());
+    assert!(!report.row_production_started());
+    Ok(())
+}
+
+#[tokio::test]
 async fn dry_run_plans_shared_derived_table_for_two_outputs() -> TestResult<()> {
     let orders = DeltaLogFixture::new("orders", ORDERS_SCHEMA_FIELDS_JSON)?;
     let mut session = session_with_default_connection()?;
@@ -206,6 +264,16 @@ fn output_request(
     ))
 }
 
+fn source_report<'a>(
+    sources: &'a [delta_funnel::DeltaSourceReport],
+    source_name: &str,
+) -> TestResult<&'a delta_funnel::DeltaSourceReport> {
+    sources
+        .iter()
+        .find(|source| source.source_name() == source_name)
+        .ok_or_else(|| format!("missing source report for {source_name}").into())
+}
+
 fn metadata_json(schema_fields_json: &str) -> String {
     format!(
         r#"{{"metaData":{{"id":"delta-funnel-e2e-test","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":{schema_fields_json}}}","partitionColumns":[],"configuration":{{}},"createdTime":1587968585495}}}}"#
@@ -222,3 +290,4 @@ fn env_unique_path(name: &str) -> TestResult<PathBuf> {
 
 const ORDERS_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
 const CUSTOMERS_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+const REGIONS_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
