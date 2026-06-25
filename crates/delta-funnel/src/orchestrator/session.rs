@@ -27,12 +27,11 @@ use crate::{
     DeltaFunnelError, DeltaSourceConfig, DeltaTableProviderConfig, MssqlOutputBatchStream,
     MssqlOutputBatchStreamFactory, MssqlOutputWriteJob, MssqlSchemaPlanOptions,
     MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, MssqlWriteOptions,
-    MssqlWriteReport, ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase,
-    datafusion_query_output_stream, datafusion_session_context, load_delta_source,
-    plan_mssql_target_for_resolved_output, preflight_delta_protocol,
-    register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
-    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
-    write_output_batches_to_mssql,
+    MssqlWriteReport, ResolvedMssqlTarget, SqlTablePhase, datafusion_query_output_stream,
+    datafusion_session_context, load_delta_source, plan_mssql_target_for_resolved_output,
+    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
+    support::sanitize_text_for_display, table_formats::validate_table_source_names,
+    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
 };
 
 pub use handles::{
@@ -47,7 +46,6 @@ pub use write_all::{
     WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
 };
 
-use dry_run_report::stable_sql_identity_hash;
 pub use dry_run_report::{
     MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
     MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
@@ -281,152 +279,6 @@ impl DeltaFunnelSession {
             resolved_target,
             output_plan,
         ))
-    }
-
-    /// Dry-runs one selected lazy table as an MSSQL output.
-    ///
-    /// The method reuses the same session output planner as execute mode, then
-    /// stops before physical DataFusion planning, row production, SQL Server
-    /// lifecycle work, bulk writer construction, or row writes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an MSSQL planning error when the request is not in
-    /// [`RunMode::DryRun`], or the first error from session output planning.
-    pub fn dry_run_to_mssql(
-        &self,
-        request: &OutputWritePlan,
-    ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
-        ensure_dry_run_mode(request.target().run_mode())?;
-        let planned = self.plan_mssql_output(request)?;
-
-        self.dry_run_output_report_for_plan(planned)
-    }
-
-    /// Dry-runs multiple selected lazy tables as one MSSQL output workflow.
-    ///
-    /// The method plans each selected output in caller-provided order and stops
-    /// before cache materialization, physical DataFusion planning, row
-    /// production, SQL Server lifecycle work, bulk writer construction, or row
-    /// writes.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first duplicate-output, run-mode, or output-planning error.
-    pub fn dry_run_all_to_mssql(
-        &self,
-        requests: &[OutputWritePlan],
-    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
-        let outputs = self.plan_dry_run_all_outputs(requests)?;
-        let sources = self.source_reports_for_dry_run_outputs(&outputs)?;
-
-        Ok(MssqlDryRunWorkflowReport::new(outputs, sources))
-    }
-
-    /// Dry-runs multiple selected lazy tables and honors source scan-summary options.
-    ///
-    /// This method is async because
-    /// [`crate::DryRunScanSummaryMode::ExhaustScanMetadata`] requires
-    /// DataFusion physical planning to expose provider scan metadata. It still
-    /// stops before row production, SQL Server lifecycle work, bulk writer
-    /// construction, or row writes.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first duplicate-output, run-mode, output-planning, or
-    /// DataFusion physical-planning error.
-    pub async fn dry_run_all_to_mssql_with_scan_summary(
-        &self,
-        requests: &[OutputWritePlan],
-    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
-        let outputs = self.plan_dry_run_all_outputs(requests)?;
-        let sources = match self
-            .options
-            .validation_options()
-            .dry_run_scan_summary_mode()
-        {
-            crate::DryRunScanSummaryMode::MetadataOnly => {
-                self.source_reports_for_dry_run_outputs(&outputs)?
-            }
-            crate::DryRunScanSummaryMode::ExhaustScanMetadata => self
-                .source_reports_for_dry_run_outputs_with_provider_stats(
-                    &outputs,
-                    self.provider_read_stats_for_dry_run_outputs(&outputs)
-                        .await?,
-                )?,
-        };
-
-        Ok(MssqlDryRunWorkflowReport::new(outputs, sources))
-    }
-
-    fn plan_dry_run_all_outputs(
-        &self,
-        requests: &[OutputWritePlan],
-    ) -> Result<Vec<MssqlDryRunOutputReport>, DeltaFunnelError> {
-        ensure_unique_write_all_output_names(requests)?;
-
-        requests
-            .iter()
-            .map(|request| {
-                ensure_write_all_dry_run_mode(request.target().run_mode())?;
-                let planned = self.plan_mssql_output(request)?;
-
-                self.dry_run_output_report_for_plan(planned)
-            })
-            .collect()
-    }
-
-    fn dry_run_output_report_for_plan(
-        &self,
-        planned_output: PlannedMssqlOutput,
-    ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
-        let sql_identity = self.sql_identity_for_lazy_table(planned_output.table());
-        let (source_usage_status, used_source_names) =
-            self.source_usage_for_lazy_table(planned_output.table())?;
-        Ok(MssqlDryRunOutputReport::new(
-            planned_output,
-            sql_identity,
-            source_usage_status,
-            used_source_names,
-        ))
-    }
-
-    fn source_usage_for_lazy_table(
-        &self,
-        table: &LazyTable,
-    ) -> Result<(SourceUsageStatus, Vec<String>), DeltaFunnelError> {
-        let Some(source_ids) = self.known_source_dependencies_for_table(table)? else {
-            return Ok((SourceUsageStatus::Unknown, Vec::new()));
-        };
-
-        let used_source_names = self
-            .sources
-            .iter()
-            .filter(|source| source_ids.contains(&source.table().id()))
-            .map(|source| source.name().to_owned())
-            .collect::<Vec<_>>();
-        let source_usage_status = if used_source_names.is_empty() {
-            SourceUsageStatus::NotUsed
-        } else {
-            SourceUsageStatus::Used
-        };
-
-        Ok((source_usage_status, used_source_names))
-    }
-
-    fn sql_identity_for_lazy_table(&self, table: &LazyTable) -> MssqlDryRunSqlIdentityReport {
-        if table.kind() != LazyTableKind::DerivedSql {
-            return MssqlDryRunSqlIdentityReport::absent();
-        }
-
-        match self.sql_text_for_derived_table(table) {
-            Ok(sql_text) => {
-                MssqlDryRunSqlIdentityReport::present(stable_sql_identity_hash(sql_text))
-            }
-            Err(_) => {
-                MssqlDryRunSqlIdentityReport::unavailable(ReportReasonCode::CapabilityUnavailable)
-            }
-        }
     }
 
     /// Writes one selected lazy table to SQL Server.
@@ -1915,16 +1767,6 @@ fn ensure_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
     }
 }
 
-fn ensure_dry_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
-    match run_mode {
-        RunMode::DryRun => Ok(()),
-        RunMode::Execute => Err(DeltaFunnelError::MssqlWorkflowPlanning {
-            message: "dry_run_to_mssql requires RunMode::DryRun; use write_to_mssql for execution"
-                .to_owned(),
-        }),
-    }
-}
-
 fn ensure_write_all_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
     match run_mode {
         RunMode::Execute => Ok(()),
@@ -1932,16 +1774,6 @@ fn ensure_write_all_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunne
             message:
                 "write_all requires RunMode::Execute; use dry_run_all_to_mssql for dry-run planning"
                     .to_owned(),
-        }),
-    }
-}
-
-fn ensure_write_all_dry_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
-    match run_mode {
-        RunMode::DryRun => Ok(()),
-        RunMode::Execute => Err(DeltaFunnelError::MssqlWorkflowPlanning {
-            message: "dry_run_all_to_mssql requires RunMode::DryRun; use write_all for execution"
-                .to_owned(),
         }),
     }
 }
@@ -2047,8 +1879,8 @@ mod tests {
     use crate::{
         DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions, DeltaStorageOptions,
         LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlTargetCleanupStatus,
-        MssqlTargetConfig, MssqlTargetTable, OutputStatus, QueryOptions, ValidationOptions,
-        ValidationStatus, WorkflowStatus, table_formats::RealParquetDeltaTable,
+        MssqlTargetConfig, MssqlTargetTable, OutputStatus, QueryOptions, ReportReasonCode,
+        ValidationOptions, ValidationStatus, WorkflowStatus, table_formats::RealParquetDeltaTable,
     };
     use async_trait::async_trait;
     use datafusion::{
