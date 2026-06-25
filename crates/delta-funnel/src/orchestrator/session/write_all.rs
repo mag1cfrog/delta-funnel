@@ -1757,13 +1757,15 @@ mod tests {
         SessionOptions,
         registry::{DerivedTableDependency, DerivedTableLineage},
         test_support::{
-            DeltaLogTable, collect_stream_marker_values, output_request,
-            scan_counting_marker_region_provider, secret_connection,
+            DeltaLogTable, collect_stream_marker_values, marker_values_from_batches,
+            output_request, scan_counting_marker_region_provider, secret_connection,
         },
     };
     use super::{
         MssqlCacheCandidateSkipReason, MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan,
-        MssqlNoCacheReason, MssqlOutputCacheDecision, WriteAllCacheMode, WriteAllOptions,
+        MssqlNoCacheReason, MssqlOutputCacheDecision, MssqlScopedCacheAliasReplacement,
+        WriteAllCacheMode, WriteAllOptions, cache_error_with_restore_error,
+        restore_mssql_cache_aliases_after_error,
     };
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlTargetConfig, MssqlTargetTable,
@@ -2387,6 +2389,236 @@ mod tests {
             plan.skipped_candidates()[1].reason(),
             &MssqlCacheCandidateSkipReason::NotShared { output_count: 1 }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_cache_alias_replacement_materializes_cache_and_restores_original_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+
+        let replacement = session
+            .replace_registered_derived_alias_with_cache(&big)
+            .await?;
+
+        assert_eq!(replacement.table_id(), big.id());
+        assert_eq!(replacement.alias_name(), "big");
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let direct_cached_big = session
+            .context()
+            .sql("select marker from big where region = 'west'")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            marker_values_from_batches(&direct_cached_big)?,
+            vec!["shared"]
+        );
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let restoration = replacement.restore().await?;
+
+        assert_eq!(restoration.table_id(), big.id());
+        assert_eq!(restoration.alias_name(), "big");
+        assert!(restoration.cached_alias_was_present());
+
+        let direct_restored_big = session
+            .context()
+            .sql("select marker from big where region = 'west'")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            marker_values_from_batches(&direct_restored_big)?,
+            vec!["shared"]
+        );
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_cache_alias_replacement_restores_original_after_cached_register_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let _big = session.register_alias("big", &pending_big)?;
+        let original_provider = session
+            .context()
+            .deregister_table("big")?
+            .ok_or("expected original provider")?;
+
+        let error = session.restore_original_after_cached_register_failure(
+            "big",
+            original_provider,
+            "injected cached register failure",
+        );
+
+        assert!(matches!(
+            &error,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message.contains("failed to register cached provider")
+                    && message.contains("injected cached register failure")
+        ));
+
+        let direct_restored_big = session
+            .context()
+            .sql("select marker from big where region = 'west'")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            marker_values_from_batches(&direct_restored_big)?,
+            vec!["shared"]
+        );
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_cache_alias_replacement_explicit_restore_cleans_up_after_later_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let replacement = session
+            .replace_registered_derived_alias_with_cache(&big)
+            .await?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let later_error = DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "simulated downstream planning failure".to_owned(),
+        };
+        let restoration = replacement.restore().await?;
+
+        assert!(matches!(
+            later_error,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message.contains("simulated downstream planning failure")
+        ));
+        assert_eq!(restoration.alias_name(), "big");
+
+        let direct_restored_big = session
+            .context()
+            .sql("select marker from big where region = 'west'")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            marker_values_from_batches(&direct_restored_big)?,
+            vec!["shared"]
+        );
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_cache_alias_restore_reinstalls_original_when_cached_alias_is_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let replacement = session
+            .replace_registered_derived_alias_with_cache(&big)
+            .await?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let removed_cached = session.context().deregister_table("big")?;
+        assert!(removed_cached.is_some());
+
+        let restoration = replacement.restore().await?;
+
+        assert_eq!(restoration.alias_name(), "big");
+        assert!(!restoration.cached_alias_was_present());
+
+        let direct_restored_big = session
+            .context()
+            .sql("select marker from big where region = 'west'")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            marker_values_from_batches(&direct_restored_big)?,
+            vec!["shared"]
+        );
+        assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn cache_error_with_restore_error_preserves_both_contexts() {
+        let primary_error = DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "simulated output workflow failure".to_owned(),
+        };
+        let restore_error = DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "simulated restore failure for alias big".to_owned(),
+        };
+
+        let error = cache_error_with_restore_error(primary_error, restore_error);
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message.contains("write_all auto cache failed")
+                    && message.contains("simulated output workflow failure")
+                    && message.contains("also failed to restore cache aliases")
+                    && message.contains("simulated restore failure for alias big")
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_mssql_cache_aliases_after_error_preserves_broken_restore_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let broken_replacement = MssqlScopedCacheAliasReplacement::broken_for_test(
+            session.context(),
+            42,
+            "big".to_owned(),
+        );
+        let primary_error = DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "simulated cached workflow failure".to_owned(),
+        };
+
+        let error =
+            restore_mssql_cache_aliases_after_error(primary_error, vec![broken_replacement]).await;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message.contains("write_all auto cache failed")
+                    && message.contains("simulated cached workflow failure")
+                    && message.contains("also failed to restore cache aliases")
+                    && message.contains("scoped MSSQL cache alias restore failed")
+                    && message.contains("big")
+                    && message.contains("original provider was already restored")
+        ));
         Ok(())
     }
 
