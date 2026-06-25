@@ -398,3 +398,84 @@ pub(super) async fn dataframe_for_lazy_table_from_session_parts(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        DeltaFunnelError, DeltaSourceConfig, QueryOptions, table_formats::RealParquetDeltaTable,
+    };
+
+    use super::super::{
+        DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
+        test_support::collect_stream_row_count,
+    };
+
+    #[tokio::test]
+    async fn batch_stream_for_lazy_table_reads_registered_delta_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+
+        let stream = session.batch_stream_for_lazy_table(&source).await?;
+        let rows = collect_stream_row_count(stream).await?;
+
+        assert_eq!(rows, table.rows());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_stream_for_lazy_table_reads_pending_derived_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session_options = SessionOptions::new().with_query_options(QueryOptions {
+            target_partitions: None,
+            output_batch_size: Some(1),
+        });
+        let mut session = DeltaFunnelSession::new(session_options)?;
+        let derived = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+
+        let stream = session.batch_stream_for_lazy_table(&derived).await?;
+        let rows = collect_stream_row_count(stream).await?;
+
+        assert_eq!(rows, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_stream_for_lazy_table_reads_registered_derived_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let derived = session
+            .table_from_sql("select 'alice' as customer_name")
+            .await?;
+        let alias = session.register_alias("customer_names", &derived)?;
+
+        let stream = session.batch_stream_for_lazy_table(&alias).await?;
+        let rows = collect_stream_row_count(stream).await?;
+
+        assert_eq!(rows, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_stream_for_lazy_table_rejects_unknown_table_before_execution()
+    -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session
+            .batch_stream_for_lazy_table(&LazyTable::placeholder(42, LazyTableKind::DeltaSource))
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("not registered in this session")
+        ));
+        Ok(())
+    }
+}

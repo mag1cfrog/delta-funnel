@@ -13,9 +13,11 @@ use datafusion::{
     },
     datasource::{MemTable, TableProvider},
 };
+use futures_util::StreamExt;
 
 use crate::{
-    DeltaFunnelError, LoadMode, MssqlConnectionConfig, MssqlTargetConfig, MssqlTargetTable,
+    DeltaFunnelError, LoadMode, MssqlConnectionConfig, MssqlOutputBatchStream, MssqlTargetConfig,
+    MssqlTargetTable,
 };
 
 use super::{LazyTable, MssqlOutputTarget, OutputWritePlan, RunMode};
@@ -175,4 +177,16 @@ fn output_request_with_run_mode(
         table,
         MssqlOutputTarget::new(output_name, target_config, run_mode),
     ))
+}
+
+pub(super) async fn collect_stream_row_count(
+    mut stream: MssqlOutputBatchStream,
+) -> Result<usize, DeltaFunnelError> {
+    let mut rows = 0_usize;
+
+    while let Some(batch) = stream.next().await {
+        rows = rows.saturating_add(batch?.num_rows());
+    }
+
+    Ok(rows)
 }
