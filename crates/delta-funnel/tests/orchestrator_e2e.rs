@@ -9,8 +9,9 @@ use std::{
 
 use delta_funnel::{
     DeltaFunnelSession, DeltaSourceConfig, FileCount, LoadMode, MssqlConnectionConfig,
-    MssqlOutputTarget, MssqlTargetConfig, MssqlTargetTable, OutputWritePlan, ReportReasonCode,
-    RunMode, SessionOptions, SourceUsageStatus,
+    MssqlDryRunSqlIdentityState, MssqlOutputTarget, MssqlTargetConfig, MssqlTargetTable,
+    OutputStatus, OutputWritePlan, ReportReasonCode, RowCount, RunMode, SessionOptions,
+    SourceUsageStatus, ValidationStatus,
 };
 
 type TestError = Box<dyn Error + Send + Sync + 'static>;
@@ -69,13 +70,24 @@ async fn dry_run_plans_one_source_one_output_through_public_api() -> TestResult<
     assert_eq!(orders_table.name(), "orders");
     assert_eq!(report.output_name(), "orders_output");
     assert_eq!(report.run_mode(), RunMode::DryRun);
+    assert_eq!(report.status(), OutputStatus::dry_run_planned());
     assert_eq!(
-        report
-            .planned_output()
-            .output_plan()
-            .schema_mappings()
-            .len(),
-        2
+        report.validation_status(),
+        ValidationStatus::skipped(ReportReasonCode::DryRun)
+    );
+    assert_eq!(report.output_schema().len(), 2);
+    assert_eq!(report.output_schema()[0].name(), "id");
+    assert_eq!(report.output_schema()[1].name(), "region");
+    assert_eq!(report.target_table().table(), "orders_sink");
+    assert_eq!(report.load_mode(), LoadMode::AppendExisting);
+    assert_eq!(report.output_row_count(), RowCount::unavailable());
+    assert_eq!(
+        report.output_row_count_reason(),
+        Some(ReportReasonCode::NotExecuted)
+    );
+    assert_eq!(
+        report.sql_identity().state(),
+        MssqlDryRunSqlIdentityState::Present
     );
     assert!(!report.sql_server_contacted());
     assert!(!report.row_production_started());
@@ -109,13 +121,11 @@ async fn dry_run_plans_multi_source_join_through_public_api() -> TestResult<()> 
     let report = session.dry_run_to_mssql(&output)?;
 
     assert_eq!(report.output_name(), "joined_output");
+    assert_eq!(report.output_schema().len(), 2);
+    assert_eq!(report.source_usage_status(), SourceUsageStatus::Used);
     assert_eq!(
-        report
-            .planned_output()
-            .output_plan()
-            .schema_mappings()
-            .len(),
-        2
+        report.used_source_names(),
+        &["orders".to_owned(), "customers".to_owned()]
     );
     assert!(!report.sql_server_contacted());
     assert!(!report.row_production_started());
@@ -149,6 +159,7 @@ async fn dry_run_all_reports_sources_through_public_api() -> TestResult<()> {
     let report = session.dry_run_all_to_mssql(&[output])?;
 
     assert_eq!(report.len(), 1);
+    assert!(!report.query_used_source_scan_metadata_exhausted());
     assert_eq!(report.sources().len(), 3);
     let orders = source_report(report.sources(), "orders")?;
     assert_eq!(orders.snapshot_version(), 0);
@@ -214,22 +225,12 @@ async fn dry_run_plans_shared_derived_table_for_two_outputs() -> TestResult<()> 
     assert_eq!(report.len(), 2);
     assert_eq!(report.outputs()[0].output_name(), "west_output");
     assert_eq!(report.outputs()[1].output_name(), "east_output");
-    assert_eq!(
-        report.outputs()[0]
-            .planned_output()
-            .output_plan()
-            .schema_mappings()
-            .len(),
-        1
-    );
-    assert_eq!(
-        report.outputs()[1]
-            .planned_output()
-            .output_plan()
-            .schema_mappings()
-            .len(),
-        1
-    );
+    assert_eq!(report.outputs()[0].output_schema().len(), 1);
+    assert_eq!(report.outputs()[0].target_table().table(), "west_orders");
+    assert_eq!(report.outputs()[0].load_mode(), LoadMode::AppendExisting);
+    assert_eq!(report.outputs()[1].output_schema().len(), 1);
+    assert_eq!(report.outputs()[1].target_table().table(), "east_orders");
+    assert_eq!(report.outputs()[1].load_mode(), LoadMode::CreateAndLoad);
     assert!(!report.sql_server_contacted());
     assert!(!report.row_production_started());
     assert!(!report.table_lifecycle_started());
