@@ -27,13 +27,14 @@ use crate::{
     MssqlConnectionConfig, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
     MssqlOutputWriteJob, MssqlOutputWriteStatus, MssqlSchemaPlanOptions, MssqlTargetConfig,
     MssqlTargetOutputPlan, MssqlWorkflowOutputWriter, MssqlWorkflowWriteOptions,
-    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, QueryOptions,
+    MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport, OutputStatus, QueryOptions,
     RegisteredDeltaSource, ReportReasonCode, ResolvedMssqlTarget, SqlTablePhase, ValidationOptions,
-    collect_delta_provider_read_stats, datafusion_query_output_stream, datafusion_session_context,
-    default_mssql_write_options, load_delta_source, plan_mssql_target_for_resolved_output,
-    preflight_delta_protocol, register_delta_sources_with_scan_execution_options,
-    support::sanitize_text_for_display, table_formats::validate_table_source_names,
-    write_mssql_outputs_with_writer, write_output_batches_to_mssql,
+    ValidationStatus, WorkflowStatus, collect_delta_provider_read_stats,
+    datafusion_query_output_stream, datafusion_session_context, default_mssql_write_options,
+    load_delta_source, plan_mssql_target_for_resolved_output, preflight_delta_protocol,
+    register_delta_sources_with_scan_execution_options, support::sanitize_text_for_display,
+    table_formats::validate_table_source_names, write_mssql_outputs_with_writer,
+    write_output_batches_to_mssql,
 };
 
 type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
@@ -1108,6 +1109,8 @@ impl PlannedMssqlOutput {
 pub struct MssqlDryRunOutputReport {
     planned_output: PlannedMssqlOutput,
     output_schema: Vec<MssqlDryRunOutputFieldReport>,
+    status: OutputStatus,
+    validation_status: ValidationStatus,
     sql_server_contacted: bool,
     row_production_started: bool,
     table_lifecycle_started: bool,
@@ -1126,6 +1129,8 @@ impl MssqlDryRunOutputReport {
         Self {
             planned_output,
             output_schema,
+            status: OutputStatus::dry_run_planned(),
+            validation_status: ValidationStatus::skipped(ReportReasonCode::DryRun),
             sql_server_contacted: false,
             row_production_started: false,
             table_lifecycle_started: false,
@@ -1149,6 +1154,18 @@ impl MssqlDryRunOutputReport {
     #[must_use]
     pub fn output_schema(&self) -> &[MssqlDryRunOutputFieldReport] {
         &self.output_schema
+    }
+
+    /// Returns the dry-run output status.
+    #[must_use]
+    pub const fn status(&self) -> OutputStatus {
+        self.status
+    }
+
+    /// Returns the target validation status for this dry-run output.
+    #[must_use]
+    pub const fn validation_status(&self) -> ValidationStatus {
+        self.validation_status
     }
 
     /// Returns the dry-run action mode.
@@ -1187,17 +1204,34 @@ impl MssqlDryRunOutputReport {
 pub struct MssqlDryRunWorkflowReport {
     outputs: Vec<MssqlDryRunOutputReport>,
     sources: Vec<DeltaSourceReport>,
+    status: WorkflowStatus,
 }
 
 impl MssqlDryRunWorkflowReport {
     fn new(outputs: Vec<MssqlDryRunOutputReport>, sources: Vec<DeltaSourceReport>) -> Self {
-        Self { outputs, sources }
+        let status = if outputs.is_empty() {
+            WorkflowStatus::no_op(ReportReasonCode::NotExecuted)
+        } else {
+            WorkflowStatus::success()
+        };
+
+        Self {
+            outputs,
+            sources,
+            status,
+        }
     }
 
     /// Returns the dry-run action mode.
     #[must_use]
     pub const fn run_mode(&self) -> RunMode {
         RunMode::DryRun
+    }
+
+    /// Returns the dry-run workflow status.
+    #[must_use]
+    pub const fn status(&self) -> WorkflowStatus {
+        self.status
     }
 
     /// Returns the number of selected outputs represented by this report.
@@ -7060,6 +7094,11 @@ mod tests {
 
         assert_eq!(report.output_name(), "west_output");
         assert_eq!(report.run_mode(), RunMode::DryRun);
+        assert_eq!(report.status(), OutputStatus::dry_run_planned());
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::DryRun)
+        );
         assert_eq!(
             report.planned_output().output_plan().target_table().table(),
             "west_orders"
@@ -7201,10 +7240,19 @@ mod tests {
         let report = session.dry_run_all_to_mssql(&[west, east])?;
 
         assert_eq!(report.run_mode(), RunMode::DryRun);
+        assert_eq!(report.status(), WorkflowStatus::success());
         assert_eq!(report.len(), 2);
         assert!(!report.is_empty());
         assert_eq!(report.outputs()[0].output_name(), "west_output");
         assert_eq!(report.outputs()[1].output_name(), "east_output");
+        assert_eq!(
+            report.outputs()[0].status(),
+            OutputStatus::dry_run_planned()
+        );
+        assert_eq!(
+            report.outputs()[0].validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::DryRun)
+        );
         assert!(report.sources().is_empty());
         assert_eq!(
             report.outputs()[0]
