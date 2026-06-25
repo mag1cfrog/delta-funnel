@@ -671,6 +671,100 @@ impl MssqlDryRunOutputFieldReport {
     }
 }
 
+/// SQL identity state included in an MSSQL dry-run output report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MssqlDryRunSqlIdentityState {
+    /// A stable SQL identity hash is available.
+    Present,
+    /// No SQL identity applies to the selected lazy table.
+    Absent,
+    /// A SQL identity applies, but could not be reported from available metadata.
+    Unavailable,
+}
+
+impl MssqlDryRunSqlIdentityState {
+    /// Returns a stable lower-snake-case code for report serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Absent => "absent",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl fmt::Display for MssqlDryRunSqlIdentityState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Redacted SQL identity included in an MSSQL dry-run output report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MssqlDryRunSqlIdentityReport {
+    state: MssqlDryRunSqlIdentityState,
+    hash: Option<String>,
+    reason: Option<ReportReasonCode>,
+}
+
+impl MssqlDryRunSqlIdentityReport {
+    fn present(hash: String) -> Self {
+        Self {
+            state: MssqlDryRunSqlIdentityState::Present,
+            hash: Some(hash),
+            reason: None,
+        }
+    }
+
+    fn absent() -> Self {
+        Self {
+            state: MssqlDryRunSqlIdentityState::Absent,
+            hash: None,
+            reason: None,
+        }
+    }
+
+    fn unavailable(reason: ReportReasonCode) -> Self {
+        Self {
+            state: MssqlDryRunSqlIdentityState::Unavailable,
+            hash: None,
+            reason: Some(reason),
+        }
+    }
+
+    /// Returns whether a SQL identity hash is present, absent, or unavailable.
+    #[must_use]
+    pub const fn state(&self) -> MssqlDryRunSqlIdentityState {
+        self.state
+    }
+
+    /// Returns the stable SQL identity hash when retained SQL is available.
+    #[must_use]
+    pub fn hash(&self) -> Option<&str> {
+        self.hash.as_deref()
+    }
+
+    /// Returns the reason when SQL identity reporting is unavailable.
+    #[must_use]
+    pub const fn reason(&self) -> Option<ReportReasonCode> {
+        self.reason
+    }
+}
+
+fn stable_sql_identity_hash(sql: &str) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in sql.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    format!("{hash:016x}")
+}
+
 /// Cache policy for one multi-output `write_all` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WriteAllCacheMode {
@@ -1109,6 +1203,7 @@ impl PlannedMssqlOutput {
 pub struct MssqlDryRunOutputReport {
     planned_output: PlannedMssqlOutput,
     output_schema: Vec<MssqlDryRunOutputFieldReport>,
+    sql_identity: MssqlDryRunSqlIdentityReport,
     status: OutputStatus,
     validation_status: ValidationStatus,
     sql_server_contacted: bool,
@@ -1118,7 +1213,7 @@ pub struct MssqlDryRunOutputReport {
 }
 
 impl MssqlDryRunOutputReport {
-    fn new(planned_output: PlannedMssqlOutput) -> Self {
+    fn new(planned_output: PlannedMssqlOutput, sql_identity: MssqlDryRunSqlIdentityReport) -> Self {
         let output_schema = planned_output
             .output_plan()
             .schema_mappings()
@@ -1129,6 +1224,7 @@ impl MssqlDryRunOutputReport {
         Self {
             planned_output,
             output_schema,
+            sql_identity,
             status: OutputStatus::dry_run_planned(),
             validation_status: ValidationStatus::skipped(ReportReasonCode::DryRun),
             sql_server_contacted: false,
@@ -1172,6 +1268,12 @@ impl MssqlDryRunOutputReport {
     #[must_use]
     pub fn output_schema(&self) -> &[MssqlDryRunOutputFieldReport] {
         &self.output_schema
+    }
+
+    /// Returns the redacted SQL identity for the selected lazy table.
+    #[must_use]
+    pub const fn sql_identity(&self) -> &MssqlDryRunSqlIdentityReport {
+        &self.sql_identity
     }
 
     /// Returns the dry-run output status.
@@ -2179,7 +2281,7 @@ impl DeltaFunnelSession {
         ensure_dry_run_mode(request.target().run_mode())?;
         let planned = self.plan_mssql_output(request)?;
 
-        Ok(MssqlDryRunOutputReport::new(planned))
+        Ok(self.dry_run_output_report_for_plan(planned))
     }
 
     /// Dry-runs multiple selected lazy tables as one MSSQL output workflow.
@@ -2250,9 +2352,32 @@ impl DeltaFunnelSession {
                 ensure_write_all_dry_run_mode(request.target().run_mode())?;
                 let planned = self.plan_mssql_output(request)?;
 
-                Ok(MssqlDryRunOutputReport::new(planned))
+                Ok(self.dry_run_output_report_for_plan(planned))
             })
             .collect()
+    }
+
+    fn dry_run_output_report_for_plan(
+        &self,
+        planned_output: PlannedMssqlOutput,
+    ) -> MssqlDryRunOutputReport {
+        let sql_identity = self.sql_identity_for_lazy_table(planned_output.table());
+        MssqlDryRunOutputReport::new(planned_output, sql_identity)
+    }
+
+    fn sql_identity_for_lazy_table(&self, table: &LazyTable) -> MssqlDryRunSqlIdentityReport {
+        if table.kind() != LazyTableKind::DerivedSql {
+            return MssqlDryRunSqlIdentityReport::absent();
+        }
+
+        match self.sql_text_for_derived_table(table) {
+            Ok(sql_text) => {
+                MssqlDryRunSqlIdentityReport::present(stable_sql_identity_hash(sql_text))
+            }
+            Err(_) => {
+                MssqlDryRunSqlIdentityReport::unavailable(ReportReasonCode::CapabilityUnavailable)
+            }
+        }
     }
 
     /// Writes one selected lazy table to SQL Server.
@@ -7134,6 +7259,22 @@ mod tests {
         assert_eq!(report.output_schema()[0].name(), "marker");
         assert_eq!(report.output_schema()[0].arrow_type(), "Utf8");
         assert!(!report.output_schema()[0].nullable());
+        assert_eq!(MssqlDryRunSqlIdentityState::Present.as_str(), "present");
+        assert_eq!(MssqlDryRunSqlIdentityState::Absent.to_string(), "absent");
+        assert_eq!(
+            MssqlDryRunSqlIdentityState::Unavailable.as_str(),
+            "unavailable"
+        );
+        assert_eq!(
+            report.sql_identity().state(),
+            MssqlDryRunSqlIdentityState::Present
+        );
+        assert_eq!(report.sql_identity().hash(), Some("a65390dacb7eb6f1"));
+        assert_eq!(report.sql_identity().reason(), None);
+        let debug = format!("{report:?}");
+        assert!(debug.contains("a65390dacb7eb6f1"));
+        assert!(!debug.contains("select marker"));
+        assert!(!debug.contains("region = 'west'"));
         assert!(!report.sql_server_contacted());
         assert!(!report.row_production_started());
         assert!(!report.table_lifecycle_started());
@@ -7319,6 +7460,12 @@ mod tests {
         let report = session.dry_run_all_to_mssql(&[request])?;
 
         assert_eq!(report.outputs().len(), 1);
+        assert_eq!(
+            report.outputs()[0].sql_identity().state(),
+            MssqlDryRunSqlIdentityState::Absent
+        );
+        assert_eq!(report.outputs()[0].sql_identity().hash(), None);
+        assert_eq!(report.outputs()[0].sql_identity().reason(), None);
         assert_eq!(report.sources().len(), 1);
         let source = &report.sources()[0];
         assert_eq!(source.source_name(), "orders");
