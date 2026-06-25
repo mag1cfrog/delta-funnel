@@ -1751,10 +1751,12 @@ mod tests {
     use super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, RunMode,
         SessionOptions,
-        test_support::{output_request, secret_connection},
+        test_support::{DeltaLogTable, output_request, secret_connection},
     };
     use super::{MssqlNoCacheReason, MssqlOutputCacheDecision, WriteAllCacheMode, WriteAllOptions};
-    use crate::{DeltaFunnelError, LoadMode, MssqlTargetConfig, MssqlTargetTable};
+    use crate::{
+        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlTargetConfig, MssqlTargetTable,
+    };
 
     #[test]
     fn write_all_options_default_to_auto_cache_mode() {
@@ -1846,6 +1848,74 @@ mod tests {
         assert!(!debug.contains("secret-token"));
         assert!(!debug.contains("password"));
         assert!(!debug.contains("server=tcp"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_plan_selects_shared_registered_derived_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select id from big where customer_name = 'alice'")
+            .await?;
+        let east = session
+            .table_from_sql("select id from big where customer_name = 'bob'")
+            .await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+
+        let plan = session.plan_mssql_output_cache(&[west, east]);
+
+        assert!(plan.skipped_candidates().is_empty());
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        assert_eq!(caches.len(), 1);
+        let cache = &caches[0];
+        assert_eq!(cache.table_id(), big.id());
+        assert_eq!(cache.alias(), "big");
+        assert_eq!(cache.output_indexes(), &[0, 1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_plan_counts_direct_selected_alias_use() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select id from big where customer_name = 'alice'")
+            .await?;
+        let big_output = output_request(
+            big.clone(),
+            "big_output",
+            "big_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let west_output =
+            output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+
+        let plan = session.plan_mssql_output_cache(&[big_output, west_output]);
+
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        assert_eq!(caches.len(), 1);
+        let cache = &caches[0];
+        assert_eq!(cache.table_id(), big.id());
+        assert_eq!(cache.alias(), "big");
+        assert_eq!(cache.output_indexes(), &[0, 1]);
         Ok(())
     }
 }
