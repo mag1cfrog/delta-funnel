@@ -151,6 +151,16 @@ impl MssqlBatchShapingReport {
         }
     }
 
+    pub(crate) fn skipped(reason: ReportReasonCode) -> Self {
+        Self {
+            status: PhaseStatus::skipped(reason),
+            input_batches: 0,
+            input_rows: 0,
+            output_batches: 0,
+            output_rows: 0,
+        }
+    }
+
     /// Returns the batch shaping phase status.
     #[must_use]
     pub const fn status(&self) -> PhaseStatus {

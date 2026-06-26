@@ -12,12 +12,12 @@ use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::Stream;
 
-use crate::{DeltaFunnelError, support::sanitize_text_for_display};
+use crate::{DeltaFunnelError, ReportReasonCode, RowCount, support::sanitize_text_for_display};
 
 use super::{
-    LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlSchemaPlanOptions,
-    MssqlTargetSummary, MssqlTargetTable, MssqlWriteFailureContext, MssqlWriteOptions,
-    MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_options,
+    LoadMode, MssqlBatchShapingReport, MssqlConnectionSource, MssqlConnectionSummary,
+    MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteFailureContext,
+    MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_options,
     write_output_batches_to_mssql,
 };
 
@@ -331,6 +331,26 @@ impl MssqlOutputWriteStatus {
         }
     }
 
+    /// Returns query output row evidence for this output.
+    #[must_use]
+    pub fn output_row_count(&self) -> RowCount {
+        match self {
+            Self::Succeeded(report) => report.output_row_count(),
+            Self::Failed(report) => report.output_row_count(),
+            Self::Skipped(report) => report.output_row_count(),
+        }
+    }
+
+    /// Returns batch-shaping counters for this output.
+    #[must_use]
+    pub fn batch_shaping(&self) -> MssqlBatchShapingReport {
+        match self {
+            Self::Succeeded(report) => report.batch_shaping(),
+            Self::Failed(report) => report.batch_shaping(),
+            Self::Skipped(report) => report.batch_shaping(),
+        }
+    }
+
     /// Returns whether this output succeeded.
     #[must_use]
     pub const fn is_succeeded(&self) -> bool {
@@ -356,15 +376,27 @@ pub struct MssqlWriteFailureReport {
     target: MssqlTargetSummary,
     error: String,
     context: Option<MssqlWriteFailureContext>,
+    output_row_count: RowCount,
+    batch_shaping: MssqlBatchShapingReport,
 }
 
 impl MssqlWriteFailureReport {
     fn from_error(target: MssqlTargetSummary, error: DeltaFunnelError) -> Self {
         let context = failure_context(&error).cloned();
+        let output_row_count = context.as_ref().map_or(
+            RowCount::unavailable(),
+            MssqlWriteFailureContext::output_row_count,
+        );
+        let batch_shaping = context.as_ref().map_or_else(
+            || MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
+            MssqlWriteFailureContext::batch_shaping,
+        );
         Self {
             target,
             error: sanitize_text_for_display(&error.to_string()),
             context,
+            output_row_count,
+            batch_shaping,
         }
     }
 
@@ -392,6 +424,18 @@ impl MssqlWriteFailureReport {
     pub const fn context(&self) -> Option<&MssqlWriteFailureContext> {
         self.context.as_ref()
     }
+
+    /// Returns query output row evidence known at failure time.
+    #[must_use]
+    pub const fn output_row_count(&self) -> RowCount {
+        self.output_row_count
+    }
+
+    /// Returns batch-shaping counters known at failure time.
+    #[must_use]
+    pub const fn batch_shaping(&self) -> MssqlBatchShapingReport {
+        self.batch_shaping
+    }
 }
 
 /// Structured report for a skipped SQL Server output.
@@ -399,6 +443,8 @@ impl MssqlWriteFailureReport {
 pub struct MssqlWriteSkippedReport {
     target: MssqlTargetSummary,
     reason: MssqlWriteSkippedReason,
+    output_row_count: RowCount,
+    batch_shaping: MssqlBatchShapingReport,
 }
 
 impl MssqlWriteSkippedReport {
@@ -406,6 +452,8 @@ impl MssqlWriteSkippedReport {
         Self {
             target,
             reason: MssqlWriteSkippedReason::PreviousOutputFailed { failed_output_name },
+            output_row_count: RowCount::unavailable(),
+            batch_shaping: MssqlBatchShapingReport::skipped(ReportReasonCode::PriorFailure),
         }
     }
 
@@ -425,6 +473,18 @@ impl MssqlWriteSkippedReport {
     #[must_use]
     pub const fn reason(&self) -> &MssqlWriteSkippedReason {
         &self.reason
+    }
+
+    /// Returns query output row evidence for this skipped output.
+    #[must_use]
+    pub const fn output_row_count(&self) -> RowCount {
+        self.output_row_count
+    }
+
+    /// Returns batch-shaping counters for this skipped output.
+    #[must_use]
+    pub const fn batch_shaping(&self) -> MssqlBatchShapingReport {
+        self.batch_shaping
     }
 }
 
@@ -569,7 +629,7 @@ mod tests {
     use crate::{
         LoadMode, MssqlConnectionConfig, MssqlTargetCleanupStatus, MssqlTargetConfig,
         MssqlTargetOutputPlan, MssqlTargetResolutionContext, MssqlTargetTable, MssqlWritePhase,
-        plan_mssql_target_for_output,
+        PhaseStatus, plan_mssql_target_for_output,
     };
 
     #[derive(Default)]
@@ -699,6 +759,24 @@ mod tests {
         assert!(report.all_succeeded());
         assert_status_output(report.outputs(), 0, "first")?;
         assert_status_output(report.outputs(), 1, "second")?;
+        assert_eq!(report.outputs()[0].output_row_count(), RowCount::exact(2));
+        assert_batch_shaping(
+            report.outputs()[0].batch_shaping(),
+            PhaseStatus::completed(),
+            1,
+            2,
+            1,
+            2,
+        );
+        assert_eq!(report.outputs()[1].output_row_count(), RowCount::exact(3));
+        assert_batch_shaping(
+            report.outputs()[1].batch_shaping(),
+            PhaseStatus::completed(),
+            2,
+            3,
+            2,
+            3,
+        );
         assert_eq!(
             locked(&attempted)?.as_slice(),
             ["first".to_owned(), "second".to_owned()]
@@ -828,6 +906,8 @@ mod tests {
         assert_eq!(report.failed_count(), 1);
         assert_eq!(report.skipped_count(), 2);
         assert!(matches!(failed, MssqlOutputWriteStatus::Failed(_)));
+        assert_eq!(failed.output_row_count(), RowCount::partial(0));
+        assert_batch_shaping(failed.batch_shaping(), PhaseStatus::failed(), 0, 0, 0, 0);
         assert_skipped_after(skipped_second, "second", "first")?;
         assert_skipped_after(skipped_third, "third", "first")?;
 
@@ -993,6 +1073,15 @@ mod tests {
         };
         assert_eq!(failure.output_name(), "second");
         assert!(failure.context().is_none());
+        assert_eq!(failure.output_row_count(), RowCount::unavailable());
+        assert_batch_shaping(
+            failure.batch_shaping(),
+            PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+            0,
+            0,
+            0,
+            0,
+        );
         assert!(
             failure
                 .error()
@@ -1029,6 +1118,15 @@ mod tests {
         assert_eq!(failure.output_name(), "poll_failure");
         assert!(failure.error().contains("stream failed during polling"));
         assert!(failure.context().is_none());
+        assert_eq!(failure.output_row_count(), RowCount::unavailable());
+        assert_batch_shaping(
+            failure.batch_shaping(),
+            PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+            0,
+            0,
+            0,
+            0,
+        );
 
         Ok(())
     }
@@ -1342,7 +1440,31 @@ mod tests {
                 failed_output_name: expected_failed_output_name.to_owned()
             }
         );
+        assert_eq!(status.output_row_count(), RowCount::unavailable());
+        assert_batch_shaping(
+            status.batch_shaping(),
+            PhaseStatus::skipped(ReportReasonCode::PriorFailure),
+            0,
+            0,
+            0,
+            0,
+        );
         Ok(())
+    }
+
+    fn assert_batch_shaping(
+        report: MssqlBatchShapingReport,
+        expected_status: PhaseStatus,
+        expected_input_batches: u64,
+        expected_input_rows: u64,
+        expected_output_batches: u64,
+        expected_output_rows: u64,
+    ) {
+        assert_eq!(report.status(), expected_status);
+        assert_eq!(report.input_batches(), expected_input_batches);
+        assert_eq!(report.input_rows(), expected_input_rows);
+        assert_eq!(report.output_batches(), expected_output_batches);
+        assert_eq!(report.output_rows(), expected_output_rows);
     }
 
     fn locked<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, DeltaFunnelError> {
