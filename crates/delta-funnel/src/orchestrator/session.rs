@@ -7,14 +7,13 @@
 mod dry_run_report;
 mod errors;
 mod handles;
-mod mssql_output;
 mod options;
+mod query_handoff;
 mod registry;
 mod source_report;
-mod streams;
+mod sql_server_workflows;
 #[cfg(test)]
 mod test_support;
-mod write_all;
 
 use std::fmt;
 
@@ -28,7 +27,7 @@ pub use handles::{
 pub use options::SessionOptions;
 pub use registry::{RegisteredDerivedTable, RegisteredSessionSource};
 pub use source_report::{DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus};
-pub use write_all::{
+pub use sql_server_workflows::{
     WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
     WriteAllCacheCandidateSkipReason, WriteAllCacheMode, WriteAllCacheReport,
     WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
@@ -38,9 +37,9 @@ pub use dry_run_report::{
     MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
     MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
 };
-#[cfg(test)]
-pub(crate) use mssql_output::OrchestratorMssqlOutputWriter;
 use registry::PendingDerivedTable;
+#[cfg(test)]
+pub(crate) use sql_server_workflows::OrchestratorMssqlOutputWriter;
 
 /// Rust backing session for lazy query-load workflows.
 pub struct DeltaFunnelSession {

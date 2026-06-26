@@ -17,14 +17,9 @@ use crate::{
 };
 
 use super::{
-    DeltaFunnelSession, LazyTable, LazyTableKind, OutputWritePlan, PendingDerivedTable,
-    RegisteredDerivedTable, RegisteredSessionSource,
-    errors::{
-        cached_output_stream_setup_error, datafusion_handoff_setup_error,
-        unknown_cached_alias_error, unknown_lazy_table_error,
-    },
-    registry::{DerivedTableDependency, read_only_sql_options},
-    write_all::{MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan},
+    DeltaFunnelSession, LazyTable, LazyTableKind, PendingDerivedTable, RegisteredDerivedTable,
+    RegisteredSessionSource,
+    errors::{datafusion_handoff_setup_error, unknown_lazy_table_error},
 };
 
 pub(super) type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
@@ -42,7 +37,7 @@ pub(super) fn provider_read_stats_snapshot(
     }
 }
 
-struct ProviderStatsRecordingStream {
+pub(crate) struct ProviderStatsRecordingStream {
     inner: MssqlOutputBatchStream,
     physical_plan: Arc<dyn ExecutionPlan>,
     provider_stats: SharedProviderReadStats,
@@ -50,7 +45,7 @@ struct ProviderStatsRecordingStream {
 }
 
 impl ProviderStatsRecordingStream {
-    fn new(
+    pub(crate) fn new(
         inner: MssqlOutputBatchStream,
         physical_plan: Arc<dyn ExecutionPlan>,
         provider_stats: SharedProviderReadStats,
@@ -134,53 +129,6 @@ pub(super) async fn batch_stream_for_lazy_table_from_session_parts(
     })))
 }
 
-pub(super) fn failing_cached_output_batch_stream_factory(
-    output_name: String,
-    error: DeltaFunnelError,
-) -> MssqlOutputBatchStreamFactory {
-    Box::new(move || {
-        Box::pin(async move { Err(cached_output_stream_setup_error(&output_name, error)) })
-    })
-}
-
-pub(super) async fn replanned_sql_batch_stream(
-    context: SessionContext,
-    output_name: String,
-    sql_text: String,
-    expected_schema: SchemaRef,
-    provider_stats: Option<SharedProviderReadStats>,
-) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
-    let dataframe = context
-        .sql_with_options(sql_text.as_str(), read_only_sql_options())
-        .await
-        .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
-    validate_replanned_output_schema(
-        &output_name,
-        dataframe.schema().as_arrow(),
-        &expected_schema,
-    )?;
-    let physical_plan = dataframe
-        .create_physical_plan()
-        .await
-        .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
-    let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
-        .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
-    if let Some(provider_stats) = provider_stats {
-        let error_output_name = output_name.clone();
-        return Ok(Box::pin(ProviderStatsRecordingStream::new(
-            Box::pin(stream.map(move |batch| {
-                batch.map_err(|error| cached_output_stream_setup_error(&error_output_name, error))
-            })),
-            physical_plan,
-            provider_stats,
-        )));
-    }
-
-    Ok(Box::pin(stream.map(move |batch| {
-        batch.map_err(|error| cached_output_stream_setup_error(&output_name, error))
-    })))
-}
-
 impl DeltaFunnelSession {
     pub(crate) async fn batch_stream_for_lazy_table(
         &self,
@@ -238,132 +186,6 @@ impl DeltaFunnelSession {
         .ok_or_else(|| unknown_lazy_table_error(table))
     }
 
-    /// Classifies one selected output relative to active cached aliases.
-    ///
-    /// Direct selected-alias use wins over lineage use because the normal
-    /// registered-alias stream path should read the active cached provider.
-    /// Dependent outputs are identified from captured lineage so later stream
-    /// construction can replan from retained SQL while all cache aliases are
-    /// installed.
-    #[allow(dead_code)]
-    pub(super) fn cached_output_stream_route(
-        &self,
-        request: &OutputWritePlan,
-        active_aliases: &[MssqlDerivedCacheAliasPlan],
-    ) -> Result<MssqlCachedOutputStreamRoute, DeltaFunnelError> {
-        if active_aliases.is_empty() {
-            return Ok(MssqlCachedOutputStreamRoute::UncachedLazyTable);
-        }
-
-        for alias in active_aliases {
-            self.registered_derived_table_by_id(alias.table_id())
-                .ok_or_else(|| unknown_cached_alias_error(alias))?;
-        }
-
-        if let Some(alias) = active_aliases
-            .iter()
-            .find(|alias| request.table().id() == alias.table_id())
-        {
-            return Ok(MssqlCachedOutputStreamRoute::DirectCachedAlias(
-                alias.clone(),
-            ));
-        }
-
-        if request.table().kind() == LazyTableKind::DeltaSource {
-            return Ok(MssqlCachedOutputStreamRoute::UncachedLazyTable);
-        }
-
-        let dependencies = self.transitive_registered_derived_dependencies(request.table())?;
-        let dependent_aliases = active_aliases
-            .iter()
-            .filter(|alias| {
-                dependencies.iter().any(|dependency| {
-                    matches!(
-                        dependency,
-                        DerivedTableDependency::RegisteredDerived { table_id, .. }
-                            if *table_id == alias.table_id()
-                    )
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if dependent_aliases.is_empty() {
-            Ok(MssqlCachedOutputStreamRoute::UncachedLazyTable)
-        } else {
-            Ok(MssqlCachedOutputStreamRoute::ReplannedCachedDependency(
-                dependent_aliases,
-            ))
-        }
-    }
-
-    /// Builds an async stream factory for one output while cache aliases are active.
-    ///
-    /// The returned factory performs DataFusion stream setup when the workflow
-    /// attempts this output. Direct cached aliases and unrelated outputs reuse
-    /// the normal lazy-table stream path. Dependent outputs replan from the
-    /// retained SQL text so active scoped cache aliases can replace the
-    /// registered providers referenced by that SQL.
-    #[allow(dead_code)]
-    pub(super) fn cached_output_batch_stream_factory(
-        &self,
-        request: &OutputWritePlan,
-        active_aliases: &[MssqlDerivedCacheAliasPlan],
-    ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
-        self.cached_output_batch_stream_factory_with_provider_stats(request, active_aliases, None)
-    }
-
-    pub(super) fn cached_output_batch_stream_factory_with_provider_stats(
-        &self,
-        request: &OutputWritePlan,
-        active_aliases: &[MssqlDerivedCacheAliasPlan],
-        provider_stats: Option<SharedProviderReadStats>,
-    ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
-        let route = self.cached_output_stream_route(request, active_aliases)?;
-        match route {
-            MssqlCachedOutputStreamRoute::DirectCachedAlias(_)
-            | MssqlCachedOutputStreamRoute::UncachedLazyTable => Ok(self
-                .lazy_table_batch_stream_factory_with_provider_stats(
-                    request.table().clone(),
-                    provider_stats,
-                )),
-            MssqlCachedOutputStreamRoute::ReplannedCachedDependency(_) => {
-                let output_name = request.target().output_name().to_owned();
-                let sql_text = match self.sql_text_for_derived_table(request.table()) {
-                    Ok(sql_text) => sql_text.to_owned(),
-                    Err(error) => {
-                        return Ok(failing_cached_output_batch_stream_factory(
-                            output_name,
-                            error,
-                        ));
-                    }
-                };
-                let expected_schema = match self.schema_for_lazy_table(request.table()) {
-                    Ok(schema) => Arc::clone(schema),
-                    Err(error) => {
-                        return Ok(failing_cached_output_batch_stream_factory(
-                            output_name,
-                            error,
-                        ));
-                    }
-                };
-                let context = self.context.clone();
-                Ok(Box::new(move || {
-                    Box::pin(async move {
-                        replanned_sql_batch_stream(
-                            context,
-                            output_name,
-                            sql_text,
-                            expected_schema,
-                            provider_stats,
-                        )
-                        .await
-                    })
-                }))
-            }
-        }
-    }
-
     #[allow(dead_code)]
     pub(super) fn lazy_table_batch_stream_factory(
         &self,
@@ -396,21 +218,6 @@ impl DeltaFunnelSession {
             })
         })
     }
-}
-
-fn validate_replanned_output_schema(
-    output_name: &str,
-    replanned_schema: &datafusion::arrow::datatypes::Schema,
-    expected_schema: &SchemaRef,
-) -> Result<(), DeltaFunnelError> {
-    if replanned_schema == expected_schema.as_ref() {
-        return Ok(());
-    }
-
-    Err(cached_output_stream_setup_error(
-        output_name,
-        "replanned output schema does not match the original output schema",
-    ))
 }
 
 pub(super) async fn dataframe_for_lazy_table_from_session_parts(
@@ -457,13 +264,19 @@ pub(super) async fn dataframe_for_lazy_table_from_session_parts(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, QueryOptions, table_formats::RealParquetDeltaTable,
     };
 
     use super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
-        test_support::{DeltaLogTable, collect_stream_row_count},
+        test_support::{
+            DeltaLogTable, collect_stream_marker_values, collect_stream_row_count,
+            marker_region_provider, marker_values_from_batches,
+            scan_counting_marker_region_provider,
+        },
     };
 
     #[tokio::test]
@@ -596,6 +409,110 @@ mod tests {
             Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
                 if message.contains("not registered in this session")
         ));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn cached_alias_replacement_does_not_feed_existing_downstream_derived_tables()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session
+            .context()
+            .register_table("big_source", marker_region_provider("original")?)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let _big = session.register_alias("big", &pending_big)?;
+        let west = session
+            .table_from_sql("select marker from big where region = 'west'")
+            .await?;
+        let east = session
+            .table_from_sql("select marker from big where region = 'east'")
+            .await?;
+
+        let replacement = session
+            .context()
+            .read_table(marker_region_provider("replacement")?)?
+            .cache()
+            .await?
+            .into_view();
+        let removed_big = session.context().deregister_table("big")?;
+        assert!(removed_big.is_some());
+        session.context().register_table("big", replacement)?;
+
+        let direct_big = session
+            .context()
+            .sql("select marker from big where region = 'west'")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            marker_values_from_batches(&direct_big)?,
+            vec!["replacement"]
+        );
+
+        let west_stream = session.batch_stream_for_lazy_table(&west).await?;
+        let east_stream = session.batch_stream_for_lazy_table(&east).await?;
+        let west_markers = collect_stream_marker_values(west_stream).await?;
+        let east_markers = collect_stream_marker_values(east_stream).await?;
+
+        // Conclusion for #245: existing downstream ViewTable providers keep the
+        // original resolved provider; catalog replacement alone does not rewire them.
+        assert_eq!(west_markers, vec!["original"]);
+        assert_eq!(east_markers, vec!["original"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replanned_downstream_sql_uses_cached_alias_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const WEST_SQL: &str = "select marker from big where region = 'west'";
+        const EAST_SQL: &str = "select marker from big where region = 'east'";
+
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let _big = session.register_alias("big", &pending_big)?;
+        let _old_west = session.table_from_sql(WEST_SQL).await?;
+        let _old_east = session.table_from_sql(EAST_SQL).await?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+
+        let cached_big = session
+            .context()
+            .table("big")
+            .await?
+            .cache()
+            .await?
+            .into_view();
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let removed_big = session.context().deregister_table("big")?;
+        assert!(removed_big.is_some());
+        session.context().register_table("big", cached_big)?;
+
+        let direct_big = session.context().sql(WEST_SQL).await?.collect().await?;
+        assert_eq!(marker_values_from_batches(&direct_big)?, vec!["shared"]);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let replanned_west = session.table_from_sql(WEST_SQL).await?;
+        let replanned_east = session.table_from_sql(EAST_SQL).await?;
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+
+        let west_stream = session.batch_stream_for_lazy_table(&replanned_west).await?;
+        let east_stream = session.batch_stream_for_lazy_table(&replanned_east).await?;
+        let west_markers = collect_stream_marker_values(west_stream).await?;
+        let east_markers = collect_stream_marker_values(east_stream).await?;
+
+        // Conclusion for #247: after cached big is installed under alias big,
+        // replanning downstream SQL reads the cached provider and does not
+        // rescan the original upstream provider per output.
+        assert_eq!(west_markers, vec!["shared"]);
+        assert_eq!(east_markers, vec!["shared"]);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 1);
         Ok(())
     }
 }
