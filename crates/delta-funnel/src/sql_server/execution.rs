@@ -7,6 +7,10 @@ mod sink;
 mod workflow;
 mod write;
 
+pub use crate::report::sql_server::{
+    MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlOutputFieldReport,
+    MssqlTargetCleanupStatus, MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteStats,
+};
 pub(crate) use lifecycle::{MssqlConnectedLifecycleClient, table_name_from_target};
 pub use lifecycle::{MssqlPreparedTarget, MssqlPreparedTargetAction, MssqlPreparedTargetReport};
 pub use sink::write_output_batches_to_mssql;
@@ -19,10 +23,9 @@ pub use workflow::{
 pub(crate) use workflow::{MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer};
 pub(crate) use write::MssqlBulkLoadWriter;
 pub use write::{
-    MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus, MssqlWriteFailureContext,
-    MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport, MssqlWriteStats,
-    default_mssql_write_options, mssql_write_options_for_output_plan,
-    validate_mssql_output_record_batch, validate_mssql_output_schema,
+    MssqlWriteOptions, MssqlWritePhase, default_mssql_write_options,
+    mssql_write_options_for_output_plan, validate_mssql_output_record_batch,
+    validate_mssql_output_schema,
 };
 
 pub(super) use super::{

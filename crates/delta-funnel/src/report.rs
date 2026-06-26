@@ -9,6 +9,8 @@ use std::fmt;
 
 use crate::error::DeltaFunnelError;
 
+pub mod sql_server;
+
 /// Saturates a platform-sized count into the public `u64` report shape.
 #[must_use]
 pub const fn usize_to_u64_saturating(value: usize) -> u64 {
