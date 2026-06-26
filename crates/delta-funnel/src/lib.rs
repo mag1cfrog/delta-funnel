@@ -23,9 +23,7 @@ pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
     DeltaFunnelRuntime, DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget,
     OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode,
-    SessionOptions, WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
-    WriteAllCacheCandidateSkipReason, WriteAllCacheMode, WriteAllCacheReport,
-    WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
+    SessionOptions, WriteAllCacheMode, WriteAllOptions,
 };
 pub use pipeline::{
     BatchHandoffError, BatchHandoffOutcome, BatchHandoffStats, BatchPipelinePhase,
@@ -48,7 +46,9 @@ pub use report::{
     MssqlDryRunSqlIdentityReport, MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
     OutputStatus, OutputStatusKind, PhaseStatus, PhaseStatusKind, ReportReasonCode, RowCount,
     RowCountKind, SourceUsageStatus, TargetValidationMode, ValidationOptions, ValidationStatus,
-    ValidationStatusKind, WorkflowStatus, WorkflowStatusKind, u128_to_u64_saturating,
+    ValidationStatusKind, WorkflowStatus, WorkflowStatusKind, WriteAllCacheAliasReport,
+    WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
+    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport, u128_to_u64_saturating,
     usize_to_u64_saturating,
 };
 pub use sql_server::{

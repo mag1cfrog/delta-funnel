@@ -1,16 +1,12 @@
 mod cache_alias;
 mod cache_plan;
+mod cache_report;
 mod cached_stream;
-mod report;
 mod request;
 mod workflow;
 pub(crate) use cache_plan::{
     MssqlCacheCandidateSkip, MssqlCacheCandidateSkipReason, MssqlCachedOutputStreamRoute,
     MssqlDerivedCacheAliasPlan, MssqlNoCacheReason, MssqlOutputCacheDecision, MssqlOutputCachePlan,
-};
-pub use report::{
-    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
-    WriteAllCacheCandidateSkipReason, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
 };
 pub(crate) use request::ensure_unique_write_all_output_names;
 

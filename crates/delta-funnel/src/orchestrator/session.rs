@@ -21,17 +21,13 @@ use datafusion::prelude::SessionContext;
 
 use crate::{DeltaFunnelError, datafusion_session_context};
 
-pub use crate::report::delta::{DeltaSourceReport, SourceUsageStatus};
+pub use crate::report::delta::SourceUsageStatus;
 pub use handles::{
     LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput, RunMode,
 };
 pub use options::SessionOptions;
 pub use registry::{RegisteredDerivedTable, RegisteredSessionSource};
-pub use sql_server_workflows::{
-    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
-    WriteAllCacheCandidateSkipReason, WriteAllCacheMode, WriteAllCacheReport,
-    WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
-};
+pub use sql_server_workflows::{WriteAllCacheMode, WriteAllOptions};
 
 pub use crate::report::sql_server::MssqlDryRunOutputReport;
 use registry::PendingDerivedTable;

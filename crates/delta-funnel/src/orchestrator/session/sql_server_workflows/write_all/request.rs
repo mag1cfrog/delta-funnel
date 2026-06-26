@@ -1,14 +1,17 @@
 use std::{collections::BTreeSet, sync::Arc};
 
-use crate::{DeltaFunnelError, MssqlWorkflowOutputWriter, support::sanitize_text_for_display};
+use crate::{
+    DeltaFunnelError, MssqlWorkflowOutputWriter, report::sql_server::WriteAllReport,
+    support::sanitize_text_for_display,
+};
 
 use super::super::super::{
     DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode,
     query_handoff::{provider_read_stats_snapshot, shared_provider_read_stats},
 };
 use super::{
-    MssqlOutputCacheDecision, MssqlOutputCachePlan, WriteAllCacheMode, WriteAllCacheReport,
-    WriteAllOptions, WriteAllReport, workflow::MssqlWorkflowPublicOutputWriter,
+    MssqlOutputCacheDecision, MssqlOutputCachePlan, WriteAllCacheMode, WriteAllOptions,
+    cache_report, workflow::MssqlWorkflowPublicOutputWriter,
 };
 
 impl DeltaFunnelSession {
@@ -60,7 +63,7 @@ impl DeltaFunnelSession {
                 )?;
                 Ok(WriteAllReport::new(
                     workflow,
-                    WriteAllCacheReport::disabled(),
+                    cache_report::disabled(),
                     sources,
                 ))
             }
@@ -108,7 +111,7 @@ impl DeltaFunnelSession {
     {
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
-                let cache = WriteAllCacheReport::from_plan(cache_plan);
+                let cache = cache_report::from_plan(cache_plan);
                 let provider_stats = shared_provider_read_stats();
                 let workflow = self
                     .write_all_baseline_with_writer_and_provider_stats(
@@ -133,7 +136,7 @@ impl DeltaFunnelSession {
                         Some(Arc::clone(&provider_stats)),
                     )
                     .await?;
-                let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
+                let cache = cache_report::from_executed_plan(cache_plan);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     planned_outputs,
                     provider_read_stats_snapshot(&provider_stats),
@@ -160,7 +163,7 @@ impl DeltaFunnelSession {
     ) -> Result<WriteAllReport, DeltaFunnelError> {
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
-                let cache = WriteAllCacheReport::from_plan(cache_plan);
+                let cache = cache_report::from_plan(cache_plan);
                 let provider_stats = shared_provider_read_stats();
                 let workflow = self
                     .write_all_baseline_with_writer_and_provider_stats(
@@ -185,7 +188,7 @@ impl DeltaFunnelSession {
                         Some(Arc::clone(&provider_stats)),
                     )
                     .await?;
-                let cache = WriteAllCacheReport::from_executed_plan(cache_plan);
+                let cache = cache_report::from_executed_plan(cache_plan);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     planned_outputs,
                     provider_read_stats_snapshot(&provider_stats),
@@ -250,7 +253,7 @@ impl DeltaFunnelSession {
                 )?;
                 Ok(WriteAllReport::new(
                     workflow,
-                    WriteAllCacheReport::disabled(),
+                    cache_report::disabled(),
                     sources,
                 ))
             }
@@ -305,16 +308,14 @@ mod tests {
             secret_connection,
         },
     };
-    use super::super::{
-        WriteAllCacheAliasStatus, WriteAllCacheMode, WriteAllCacheReport, WriteAllNoCacheReason,
-        WriteAllOptions,
-    };
+    use super::super::{WriteAllCacheMode, WriteAllOptions};
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlBatchShapingReport,
         MssqlOutputBatchStream, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus,
         MssqlTargetConfig, MssqlTargetTable, MssqlWorkflowOutputWriter, MssqlWriteFailureContext,
         MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport, PhaseStatus, ReportReasonCode,
-        ResolvedMssqlTarget, RowCount, plan_mssql_target_for_resolved_output,
+        ResolvedMssqlTarget, RowCount, WriteAllCacheAliasStatus, WriteAllCacheReport,
+        WriteAllNoCacheReason, plan_mssql_target_for_resolved_output,
         table_formats::RealParquetDeltaTable,
     };
 
