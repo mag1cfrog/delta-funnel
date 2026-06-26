@@ -14,11 +14,17 @@ use futures_util::{
     pin_mut,
 };
 
-use crate::DeltaFunnelError;
+use crate::{
+    DeltaFunnelError, ReportReasonCode, RowCount,
+    report::sql_server::{
+        MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
+        MssqlWriteFailureContext, MssqlWriteReport,
+    },
+};
 
 use super::{
-    LoadMode, MssqlConnectionSource, MssqlConnectionSummary, MssqlLifecycleExecutionGuardrail,
-    MssqlPreparedTarget, MssqlPreparedTargetAction, MssqlTargetOutputPlan, MssqlTargetTable,
+    LoadMode, MssqlLifecycleExecutionGuardrail, MssqlPreparedTarget, MssqlPreparedTargetAction,
+    MssqlTargetOutputPlan,
 };
 
 /// Fakeable bulk-load writer boundary for one planned SQL Server output.
@@ -180,57 +186,6 @@ impl MssqlBulkWriterInitializationRequest {
     }
 }
 
-/// Per-output SQL Server write statistics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MssqlWriteStats {
-    output_name: String,
-    rows_written: u64,
-    batches_written: u64,
-    elapsed_ms: u64,
-}
-
-impl MssqlWriteStats {
-    /// Builds write statistics for one selected output.
-    #[must_use]
-    pub fn new(
-        output_name: impl Into<String>,
-        rows_written: u64,
-        batches_written: u64,
-        elapsed_ms: u64,
-    ) -> Self {
-        Self {
-            output_name: output_name.into(),
-            rows_written,
-            batches_written,
-            elapsed_ms,
-        }
-    }
-
-    /// Returns the selected output name.
-    #[must_use]
-    pub fn output_name(&self) -> &str {
-        &self.output_name
-    }
-
-    /// Returns the number of rows accepted by SQL Server writing.
-    #[must_use]
-    pub const fn rows_written(&self) -> u64 {
-        self.rows_written
-    }
-
-    /// Returns the number of batches accepted by SQL Server writing.
-    #[must_use]
-    pub const fn batches_written(&self) -> u64 {
-        self.batches_written
-    }
-
-    /// Returns elapsed write time in milliseconds.
-    #[must_use]
-    pub const fn elapsed_ms(&self) -> u64 {
-        self.elapsed_ms
-    }
-}
-
 /// Phase of one-output SQL Server write execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MssqlWritePhase {
@@ -264,264 +219,6 @@ impl fmt::Display for MssqlWritePhase {
             Self::Finalize => "finalize",
             Self::Cleanup => "cleanup",
         })
-    }
-}
-
-/// Cleanup reporting state for a SQL Server target owned by create-and-load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MssqlTargetCleanupStatus {
-    /// No cleanup is owned by this output, such as append-existing mode.
-    NotApplicable,
-    /// Cleanup would be owned by this output, but the target was not created.
-    NotAttempted,
-    /// Cleanup was required, attempted, and succeeded.
-    Succeeded,
-    /// Cleanup was required, attempted, and failed.
-    Failed,
-}
-
-impl fmt::Display for MssqlTargetCleanupStatus {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::NotApplicable => "not applicable",
-            Self::NotAttempted => "not attempted",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-        })
-    }
-}
-
-/// Redacted per-output SQL Server write report.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MssqlWriteReport {
-    output_name: String,
-    target_table: MssqlTargetTable,
-    load_mode: LoadMode,
-    connection_source: MssqlConnectionSource,
-    connection: MssqlConnectionSummary,
-    stats: MssqlWriteStats,
-    partial_write_possible: bool,
-    cleanup: MssqlTargetCleanupStatus,
-}
-
-/// Redacted report for a successful planned-output schema validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MssqlOutputBatchValidationReport {
-    output_name: String,
-    target_table: MssqlTargetTable,
-    load_mode: LoadMode,
-    connection_source: MssqlConnectionSource,
-    connection: MssqlConnectionSummary,
-}
-
-impl MssqlOutputBatchValidationReport {
-    /// Builds a validation report from the already planned SQL Server output target.
-    #[must_use]
-    pub fn from_output_plan(output_plan: &MssqlTargetOutputPlan) -> Self {
-        Self {
-            output_name: output_plan.output_name().to_owned(),
-            target_table: output_plan.target_table().clone(),
-            load_mode: output_plan.load_mode(),
-            connection_source: output_plan.connection_source(),
-            connection: output_plan.connection().clone(),
-        }
-    }
-
-    /// Returns the selected output name.
-    #[must_use]
-    pub fn output_name(&self) -> &str {
-        &self.output_name
-    }
-
-    /// Returns the effective target table.
-    #[must_use]
-    pub const fn target_table(&self) -> &MssqlTargetTable {
-        &self.target_table
-    }
-
-    /// Returns the requested target lifecycle mode.
-    #[must_use]
-    pub const fn load_mode(&self) -> LoadMode {
-        self.load_mode
-    }
-
-    /// Returns where the effective connection came from.
-    #[must_use]
-    pub const fn connection_source(&self) -> MssqlConnectionSource {
-        self.connection_source
-    }
-
-    /// Returns the redacted effective connection summary.
-    #[must_use]
-    pub const fn connection(&self) -> &MssqlConnectionSummary {
-        &self.connection
-    }
-}
-
-impl MssqlWriteReport {
-    /// Builds a write report from the already planned SQL Server output target.
-    #[must_use]
-    pub fn from_output_plan(
-        output_plan: &MssqlTargetOutputPlan,
-        rows_written: u64,
-        batches_written: u64,
-        elapsed_ms: u64,
-        partial_write_possible: bool,
-        cleanup: MssqlTargetCleanupStatus,
-    ) -> Self {
-        let output_name = output_plan.output_name().to_owned();
-
-        Self {
-            output_name: output_name.clone(),
-            target_table: output_plan.target_table().clone(),
-            load_mode: output_plan.load_mode(),
-            connection_source: output_plan.connection_source(),
-            connection: output_plan.connection().clone(),
-            stats: MssqlWriteStats::new(output_name, rows_written, batches_written, elapsed_ms),
-            partial_write_possible,
-            cleanup,
-        }
-    }
-
-    /// Returns the selected output name.
-    #[must_use]
-    pub fn output_name(&self) -> &str {
-        &self.output_name
-    }
-
-    /// Returns the effective target table.
-    #[must_use]
-    pub fn target_table(&self) -> &MssqlTargetTable {
-        &self.target_table
-    }
-
-    /// Returns the requested target lifecycle mode.
-    #[must_use]
-    pub const fn load_mode(&self) -> LoadMode {
-        self.load_mode
-    }
-
-    /// Returns where the effective connection came from.
-    #[must_use]
-    pub const fn connection_source(&self) -> MssqlConnectionSource {
-        self.connection_source
-    }
-
-    /// Returns the redacted effective connection summary.
-    #[must_use]
-    pub const fn connection(&self) -> &MssqlConnectionSummary {
-        &self.connection
-    }
-
-    /// Returns per-output write statistics.
-    #[must_use]
-    pub const fn stats(&self) -> &MssqlWriteStats {
-        &self.stats
-    }
-
-    /// Returns whether the target may contain a partial write after failure.
-    #[must_use]
-    pub const fn partial_write_possible(&self) -> bool {
-        self.partial_write_possible
-    }
-
-    /// Returns cleanup reporting state for DeltaFunnel-owned target cleanup.
-    #[must_use]
-    pub const fn cleanup(&self) -> MssqlTargetCleanupStatus {
-        self.cleanup
-    }
-}
-
-/// Structured context for a one-output SQL Server write failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MssqlWriteFailureContext {
-    phase: MssqlWritePhase,
-    report: MssqlWriteReport,
-}
-
-impl MssqlWriteFailureContext {
-    /// Builds failure context from the already planned SQL Server output target.
-    #[must_use]
-    pub fn from_output_plan(
-        output_plan: &MssqlTargetOutputPlan,
-        phase: MssqlWritePhase,
-        rows_written: u64,
-        batches_written: u64,
-        elapsed_ms: u64,
-        partial_write_possible: bool,
-        cleanup: MssqlTargetCleanupStatus,
-    ) -> Self {
-        Self {
-            phase,
-            report: MssqlWriteReport::from_output_plan(
-                output_plan,
-                rows_written,
-                batches_written,
-                elapsed_ms,
-                partial_write_possible,
-                cleanup,
-            ),
-        }
-    }
-
-    /// Returns the write phase associated with the failure.
-    #[must_use]
-    pub const fn phase(&self) -> MssqlWritePhase {
-        self.phase
-    }
-
-    /// Returns the selected output name.
-    #[must_use]
-    pub fn output_name(&self) -> &str {
-        self.report.output_name()
-    }
-
-    /// Returns the effective target table.
-    #[must_use]
-    pub fn target_table(&self) -> &MssqlTargetTable {
-        self.report.target_table()
-    }
-
-    /// Returns the requested target lifecycle mode.
-    #[must_use]
-    pub const fn load_mode(&self) -> LoadMode {
-        self.report.load_mode()
-    }
-
-    /// Returns where the effective connection came from.
-    #[must_use]
-    pub const fn connection_source(&self) -> MssqlConnectionSource {
-        self.report.connection_source()
-    }
-
-    /// Returns the redacted effective connection summary.
-    #[must_use]
-    pub const fn connection(&self) -> &MssqlConnectionSummary {
-        self.report.connection()
-    }
-
-    /// Returns accepted write statistics known at failure time.
-    #[must_use]
-    pub const fn stats(&self) -> &MssqlWriteStats {
-        self.report.stats()
-    }
-
-    /// Returns whether the target may contain a partial write after failure.
-    #[must_use]
-    pub const fn partial_write_possible(&self) -> bool {
-        self.report.partial_write_possible()
-    }
-
-    /// Returns cleanup reporting state for DeltaFunnel-owned target cleanup.
-    #[must_use]
-    pub const fn cleanup(&self) -> MssqlTargetCleanupStatus {
-        self.report.cleanup()
-    }
-
-    /// Returns the redacted write report associated with the failure.
-    #[must_use]
-    pub const fn report(&self) -> &MssqlWriteReport {
-        &self.report
     }
 }
 
@@ -599,6 +296,8 @@ pub fn validate_mssql_output_schema(
         mssql_batch_schema_validation_error(
             output_plan,
             source,
+            RowCount::unavailable(),
+            MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
             MssqlWriteProgress::zero(),
             false,
             MssqlTargetCleanupStatus::NotApplicable,
@@ -626,6 +325,8 @@ pub fn validate_mssql_output_record_batch(
         mssql_batch_schema_validation_error(
             output_plan,
             source,
+            RowCount::unavailable(),
+            MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
             MssqlWriteProgress::zero(),
             false,
             MssqlTargetCleanupStatus::NotApplicable,
@@ -640,20 +341,26 @@ pub fn validate_mssql_output_record_batch(
 fn mssql_batch_schema_validation_error(
     output_plan: &MssqlTargetOutputPlan,
     source: arrow_tiberius::Error,
+    output_row_count: RowCount,
+    batch_shaping: MssqlBatchShapingReport,
     progress: MssqlWriteProgress,
     partial_write_possible: bool,
     cleanup: MssqlTargetCleanupStatus,
 ) -> DeltaFunnelError {
     DeltaFunnelError::MssqlBatchSchemaValidation {
-        context: Box::new(MssqlWriteFailureContext::from_output_plan(
-            output_plan,
-            MssqlWritePhase::ValidateBatchSchema,
-            progress.rows_written,
-            progress.batches_written,
-            progress.elapsed_ms,
-            partial_write_possible,
-            cleanup,
-        )),
+        context: Box::new(
+            MssqlWriteFailureContext::from_output_plan_with_batch_shaping(
+                output_plan,
+                MssqlWritePhase::ValidateBatchSchema,
+                output_row_count,
+                batch_shaping,
+                progress.rows_written,
+                progress.batches_written,
+                progress.elapsed_ms,
+                partial_write_possible,
+                cleanup,
+            ),
+        ),
         source,
     }
 }
@@ -672,6 +379,10 @@ where
 {
     let mut rows_written = 0_u64;
     let mut batches_written = 0_u64;
+    let mut input_rows = 0_u64;
+    let mut input_batches = 0_u64;
+    let mut shaped_rows = 0_u64;
+    let mut shaped_batches = 0_u64;
     let cleanup = MssqlTargetCleanupStatus::NotApplicable;
     let started_at = Instant::now();
     pin_mut!(batches);
@@ -682,12 +393,23 @@ where
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::PollBatchStream,
+                RowCount::partial(input_rows),
+                MssqlBatchShapingReport::failed(
+                    input_batches,
+                    input_rows,
+                    shaped_batches,
+                    shaped_rows,
+                ),
                 MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                 partial_write_possible(output_plan, rows_written, batches_written),
                 cleanup,
                 source.to_string(),
             )
         })?;
+
+        let row_count = batch_row_count(batch.num_rows());
+        input_rows = input_rows.saturating_add(row_count);
+        input_batches = input_batches.saturating_add(1);
 
         arrow_tiberius::validate_record_batch_schema_against_mappings(
             &batch,
@@ -698,13 +420,19 @@ where
             mssql_batch_schema_validation_error(
                 output_plan,
                 source,
+                RowCount::partial(input_rows),
+                MssqlBatchShapingReport::failed(
+                    input_batches,
+                    input_rows,
+                    shaped_batches,
+                    shaped_rows,
+                ),
                 MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                 partial_write_possible(output_plan, rows_written, batches_written),
                 cleanup,
             )
         })?;
 
-        let row_count = batch_row_count(batch.num_rows());
         MssqlBulkLoadWriter::write_batch(&mut writer, &batch)
             .await
             .map_err(|source| {
@@ -712,6 +440,13 @@ where
                 mssql_write_phase_error(
                     output_plan,
                     MssqlWritePhase::WriteBatch,
+                    RowCount::partial(input_rows),
+                    MssqlBatchShapingReport::failed(
+                        input_batches,
+                        input_rows,
+                        shaped_batches,
+                        shaped_rows,
+                    ),
                     MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                     partial_write_possible(output_plan, rows_written, batches_written),
                     cleanup,
@@ -721,6 +456,8 @@ where
 
         rows_written = rows_written.saturating_add(row_count);
         batches_written = batches_written.saturating_add(1);
+        shaped_rows = shaped_rows.saturating_add(row_count);
+        shaped_batches = shaped_batches.saturating_add(1);
     }
 
     MssqlBulkLoadWriter::finish(writer)
@@ -730,6 +467,13 @@ where
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::Finalize,
+                RowCount::exact(input_rows),
+                MssqlBatchShapingReport::completed(
+                    input_batches,
+                    input_rows,
+                    shaped_batches,
+                    shaped_rows,
+                ),
                 MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                 partial_write_possible(output_plan, rows_written, batches_written),
                 cleanup,
@@ -737,8 +481,10 @@ where
             )
         })?;
 
-    Ok(MssqlWriteReport::from_output_plan(
+    Ok(MssqlWriteReport::from_output_plan_with_batch_shaping(
         output_plan,
+        RowCount::exact(input_rows),
+        MssqlBatchShapingReport::completed(input_batches, input_rows, shaped_batches, shaped_rows),
         rows_written,
         batches_written,
         elapsed_ms_since(started_at),
@@ -750,21 +496,27 @@ where
 fn mssql_write_phase_error(
     output_plan: &MssqlTargetOutputPlan,
     phase: MssqlWritePhase,
+    output_row_count: RowCount,
+    batch_shaping: MssqlBatchShapingReport,
     progress: MssqlWriteProgress,
     partial_write_possible: bool,
     cleanup: MssqlTargetCleanupStatus,
     message: String,
 ) -> DeltaFunnelError {
     DeltaFunnelError::MssqlWritePhase {
-        context: Box::new(MssqlWriteFailureContext::from_output_plan(
-            output_plan,
-            phase,
-            progress.rows_written,
-            progress.batches_written,
-            progress.elapsed_ms,
-            partial_write_possible,
-            cleanup,
-        )),
+        context: Box::new(
+            MssqlWriteFailureContext::from_output_plan_with_batch_shaping(
+                output_plan,
+                phase,
+                output_row_count,
+                batch_shaping,
+                progress.rows_written,
+                progress.batches_written,
+                progress.elapsed_ms,
+                partial_write_possible,
+                cleanup,
+            ),
+        ),
         message,
     }
 }
@@ -778,6 +530,8 @@ fn mssql_writer_initialization_error(
     mssql_write_phase_error(
         output_plan,
         MssqlWritePhase::InitializeWriter,
+        RowCount::unavailable(),
+        MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
         MssqlWriteProgress::zero(),
         false,
         cleanup,
@@ -878,7 +632,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        DeltaFunnelError, MssqlConnectionConfig, MssqlTargetConfig, MssqlTargetTable,
+        DeltaFunnelError, MssqlBatchShapingReport, MssqlConnectionConfig, MssqlConnectionSource,
+        MssqlOutputFieldReport, MssqlTargetConfig, MssqlTargetTable, MssqlWriteStats, PhaseStatus,
         plan_mssql_target_for_output,
     };
 
@@ -1123,7 +878,7 @@ mod tests {
     fn assert_batch_schema_validation_error(
         error: DeltaFunnelError,
         expected_field: Option<(usize, &str)>,
-    ) -> Result<(), DeltaFunnelError> {
+    ) -> Result<Box<MssqlWriteFailureContext>, DeltaFunnelError> {
         let DeltaFunnelError::MssqlBatchSchemaValidation { context, source } = error else {
             return Err(DeltaFunnelError::Config {
                 message: "expected MSSQL batch schema validation error".to_owned(),
@@ -1151,7 +906,7 @@ mod tests {
                 .map(|field| (field.index(), field.name())),
             expected_field
         );
-        Ok(())
+        Ok(context)
     }
 
     fn assert_write_phase_error(
@@ -1160,7 +915,7 @@ mod tests {
         expected_rows_written: u64,
         expected_batches_written: u64,
         expected_partial_write_possible: bool,
-    ) -> Result<(), DeltaFunnelError> {
+    ) -> Result<Box<MssqlWriteFailureContext>, DeltaFunnelError> {
         let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
             return Err(DeltaFunnelError::Config {
                 message: "expected MSSQL write phase error".to_owned(),
@@ -1179,7 +934,34 @@ mod tests {
             expected_partial_write_possible
         );
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
-        Ok(())
+        Ok(context)
+    }
+
+    fn assert_output_schema(fields: &[MssqlOutputFieldReport]) {
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].index(), 0);
+        assert_eq!(fields[0].name(), "order_id");
+        assert_eq!(fields[0].arrow_type(), "Int64");
+        assert!(!fields[0].nullable());
+        assert_eq!(fields[1].index(), 1);
+        assert_eq!(fields[1].name(), "status");
+        assert_eq!(fields[1].arrow_type(), "Utf8");
+        assert!(fields[1].nullable());
+    }
+
+    fn assert_batch_shaping(
+        report: MssqlBatchShapingReport,
+        expected_status: PhaseStatus,
+        expected_input_batches: u64,
+        expected_input_rows: u64,
+        expected_output_batches: u64,
+        expected_output_rows: u64,
+    ) {
+        assert_eq!(report.status(), expected_status);
+        assert_eq!(report.input_batches(), expected_input_batches);
+        assert_eq!(report.input_rows(), expected_input_rows);
+        assert_eq!(report.output_batches(), expected_output_batches);
+        assert_eq!(report.output_rows(), expected_output_rows);
     }
 
     fn assert_initialize_writer_error(
@@ -1404,6 +1186,12 @@ mod tests {
         assert!(report.stats().elapsed_ms() > 0);
         assert!(!report.partial_write_possible());
         assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert_output_schema(report.output_schema());
+        assert_eq!(report.output_row_count(), RowCount::exact(3));
+        assert_batch_shaping(report.batch_shaping(), PhaseStatus::completed(), 2, 3, 2, 3);
+        let debug = format!("{report:?}");
+        assert!(!debug.contains("open"));
+        assert!(!debug.contains("closed"));
 
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
@@ -1430,6 +1218,8 @@ mod tests {
         assert_eq!(report.stats().rows_written(), 0);
         assert_eq!(report.stats().batches_written(), 0);
         assert!(!report.partial_write_possible());
+        assert_eq!(report.output_row_count(), RowCount::exact(0));
+        assert_batch_shaping(report.batch_shaping(), PhaseStatus::completed(), 0, 0, 0, 0);
         let log = lock_fake_writer_log(&log)?;
         assert!(log.batch_rows.is_empty());
         assert_eq!(log.finish_count, 1);
@@ -1466,7 +1256,10 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_write_phase_error(error, MssqlWritePhase::PollBatchStream, 2, 1, true)?;
+        let context =
+            assert_write_phase_error(error, MssqlWritePhase::PollBatchStream, 2, 1, true)?;
+        assert_eq!(context.output_row_count(), RowCount::partial(2));
+        assert_batch_shaping(context.batch_shaping(), PhaseStatus::failed(), 1, 2, 1, 2);
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2]);
         assert_eq!(log.finish_count, 0);
@@ -1496,7 +1289,9 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_batch_schema_validation_error(error, Some((0, "order_id")))?;
+        let context = assert_batch_schema_validation_error(error, Some((0, "order_id")))?;
+        assert_eq!(context.output_row_count(), RowCount::partial(1));
+        assert_batch_shaping(context.batch_shaping(), PhaseStatus::failed(), 1, 1, 0, 0);
         let log = lock_fake_writer_log(&log)?;
         assert!(log.batch_rows.is_empty());
         assert_eq!(log.finish_count, 0);
@@ -1540,6 +1335,8 @@ mod tests {
         assert_eq!(context.output_name(), "orders_output");
         assert_eq!(context.stats().rows_written(), 2);
         assert_eq!(context.stats().batches_written(), 1);
+        assert_eq!(context.output_row_count(), RowCount::partial(3));
+        assert_batch_shaping(context.batch_shaping(), PhaseStatus::failed(), 2, 3, 1, 2);
         assert!(context.stats().elapsed_ms() > 0);
         assert!(context.partial_write_possible());
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
@@ -1616,7 +1413,16 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_write_phase_error(error, MssqlWritePhase::Finalize, 3, 2, true)?;
+        let context = assert_write_phase_error(error, MssqlWritePhase::Finalize, 3, 2, true)?;
+        assert_eq!(context.output_row_count(), RowCount::exact(3));
+        assert_batch_shaping(
+            context.batch_shaping(),
+            PhaseStatus::completed(),
+            2,
+            3,
+            2,
+            3,
+        );
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 1);
@@ -1700,6 +1506,16 @@ mod tests {
         assert_eq!(report.stats().rows_written(), 42);
         assert_eq!(report.stats().batches_written(), 3);
         assert_eq!(report.stats().elapsed_ms(), 125);
+        assert_output_schema(report.output_schema());
+        assert_eq!(report.output_row_count(), RowCount::exact(42));
+        assert_batch_shaping(
+            report.batch_shaping(),
+            PhaseStatus::completed(),
+            3,
+            42,
+            3,
+            42,
+        );
         assert!(report.partial_write_possible());
         assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
         Ok(())
@@ -1772,6 +1588,8 @@ mod tests {
         assert_eq!(context.stats().rows_written(), 42);
         assert_eq!(context.stats().batches_written(), 3);
         assert_eq!(context.stats().elapsed_ms(), 125);
+        assert_eq!(context.output_row_count(), RowCount::partial(42));
+        assert_batch_shaping(context.batch_shaping(), PhaseStatus::failed(), 3, 42, 3, 42);
         assert!(context.partial_write_possible());
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
         assert_eq!(context.report().output_name(), "orders_output");

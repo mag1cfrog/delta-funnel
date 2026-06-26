@@ -11,8 +11,9 @@ mod target;
 pub(crate) use execution::MssqlBulkLoadWriter;
 pub(crate) use execution::table_name_from_target;
 pub use execution::{
-    MssqlOutputBatchStream, MssqlOutputBatchStreamFactory, MssqlOutputBatchValidationReport,
-    MssqlOutputWriteJob, MssqlOutputWriteStatus, MssqlPreparedTarget, MssqlPreparedTargetAction,
+    MssqlBatchShapingReport, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
+    MssqlOutputBatchValidationReport, MssqlOutputFieldReport, MssqlOutputWriteJob,
+    MssqlOutputWriteStatus, MssqlPreparedTarget, MssqlPreparedTargetAction,
     MssqlPreparedTargetReport, MssqlTargetCleanupStatus, MssqlWorkflowWriteOptions,
     MssqlWorkflowWriteReport, MssqlWriteFailureContext, MssqlWriteFailureReport, MssqlWriteOptions,
     MssqlWritePhase, MssqlWriteReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport,
