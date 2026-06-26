@@ -120,6 +120,12 @@ impl DeltaFunnelSession {
         self.sources.push(session_source);
         Ok(table)
     }
+
+    fn allocate_delta_source_table(&mut self, name: String) -> LazyTable {
+        let id = self.next_table_id;
+        self.next_table_id = self.next_table_id.saturating_add(1);
+        LazyTable::delta_source(id, name)
+    }
 }
 
 #[cfg(test)]
