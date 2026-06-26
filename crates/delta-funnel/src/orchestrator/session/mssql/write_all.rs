@@ -1,5 +1,6 @@
 mod cache_alias;
 mod cache_plan;
+mod cached_stream;
 mod report;
 mod request;
 mod workflow;

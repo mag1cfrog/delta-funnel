@@ -8,13 +8,13 @@ use crate::{
     datafusion_query_output_stream,
 };
 
-use super::super::{
+use super::super::super::{
     DeltaFunnelSession, LazyTableKind, OutputWritePlan,
     errors::{cached_output_stream_setup_error, unknown_cached_alias_error},
-    mssql::{MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan},
     registry::{DerivedTableDependency, read_only_sql_options},
+    streams::{ProviderStatsRecordingStream, SharedProviderReadStats},
 };
-use super::{ProviderStatsRecordingStream, SharedProviderReadStats};
+use super::{MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan};
 
 pub(super) fn failing_cached_output_batch_stream_factory(
     output_name: String,
@@ -214,15 +214,15 @@ mod tests {
 
     use crate::{DeltaFunnelError, DeltaSourceConfig, LoadMode};
 
-    use super::super::super::{
+    use super::super::super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
-        mssql::{
-            MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan, MssqlOutputCacheDecision,
-        },
         test_support::{
             DeltaLogTable, collect_stream_marker_values, output_request,
             scan_counting_marker_region_provider,
         },
+    };
+    use super::super::{
+        MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan, MssqlOutputCacheDecision,
     };
 
     #[tokio::test]

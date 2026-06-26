@@ -11,8 +11,6 @@ use datafusion::{
 };
 use futures_util::{Stream, StreamExt};
 
-mod cached_output;
-
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
     collect_delta_provider_read_stats, datafusion_query_output_stream,
@@ -39,7 +37,7 @@ pub(super) fn provider_read_stats_snapshot(
     }
 }
 
-struct ProviderStatsRecordingStream {
+pub(crate) struct ProviderStatsRecordingStream {
     inner: MssqlOutputBatchStream,
     physical_plan: Arc<dyn ExecutionPlan>,
     provider_stats: SharedProviderReadStats,
@@ -47,7 +45,7 @@ struct ProviderStatsRecordingStream {
 }
 
 impl ProviderStatsRecordingStream {
-    fn new(
+    pub(crate) fn new(
         inner: MssqlOutputBatchStream,
         physical_plan: Arc<dyn ExecutionPlan>,
         provider_stats: SharedProviderReadStats,
