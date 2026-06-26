@@ -21,11 +21,9 @@ mod table_formats;
 
 pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
-    DeltaFunnelRuntime, DeltaFunnelSession, LazyTable, LazyTableKind, MssqlDryRunOutputFieldReport,
-    MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport, MssqlDryRunSqlIdentityState,
-    MssqlDryRunWorkflowReport, MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput,
-    RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions,
-    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
+    DeltaFunnelRuntime, DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget,
+    OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode,
+    SessionOptions, WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
     WriteAllCacheCandidateSkipReason, WriteAllCacheMode, WriteAllCacheReport,
     WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
 };
@@ -46,10 +44,12 @@ pub use query_engine::{
 };
 pub use report::{
     DeltaProtocolReport, DeltaProviderSchedulingReport, DeltaSourceReport, DryRunScanSummaryMode,
-    FileCount, FileCountKind, OutputStatus, OutputStatusKind, PhaseStatus, PhaseStatusKind,
-    ReportReasonCode, RowCount, RowCountKind, SourceUsageStatus, TargetValidationMode,
-    ValidationOptions, ValidationStatus, ValidationStatusKind, WorkflowStatus, WorkflowStatusKind,
-    u128_to_u64_saturating, usize_to_u64_saturating,
+    FileCount, FileCountKind, MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport,
+    MssqlDryRunSqlIdentityReport, MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
+    OutputStatus, OutputStatusKind, PhaseStatus, PhaseStatusKind, ReportReasonCode, RowCount,
+    RowCountKind, SourceUsageStatus, TargetValidationMode, ValidationOptions, ValidationStatus,
+    ValidationStatusKind, WorkflowStatus, WorkflowStatusKind, u128_to_u64_saturating,
+    usize_to_u64_saturating,
 };
 pub use sql_server::{
     LoadMode, MssqlBatchShapingReport, MssqlBinaryPolicy, MssqlConnectionConfig,

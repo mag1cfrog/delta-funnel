@@ -33,10 +33,7 @@ pub use sql_server_workflows::{
     WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
 };
 
-pub use dry_run_report::{
-    MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
-    MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
-};
+pub use crate::report::sql_server::MssqlDryRunOutputReport;
 use registry::PendingDerivedTable;
 #[cfg(test)]
 pub(crate) use sql_server_workflows::OrchestratorMssqlOutputWriter;
