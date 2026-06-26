@@ -1,7 +1,7 @@
 //! Delta protocol preflight.
 
 use crate::support::sanitize_uri_for_display;
-use crate::{DeltaFunnelError, error::DeltaProtocolCompatibilitySnafu};
+use crate::{DeltaFunnelError, DeltaProtocolReport, error::DeltaProtocolCompatibilitySnafu};
 
 use super::PlannedDeltaSource;
 use super::kernel::{
@@ -11,25 +11,6 @@ use super::kernel::{
 // Reader features are Delta correctness requirements. Add features only after
 // the provider path proves the relevant semantics before rows reach DataFusion.
 const SUPPORTED_READER_FEATURES: &[&str] = &["timestampNtz", "deletionVectors", "columnMapping"];
-
-/// Protocol details for one named Delta source.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeltaProtocolReport {
-    /// DataFusion table name for this source.
-    pub source_name: String,
-    /// Sanitized normalized Delta table URI context.
-    pub table_uri: String,
-    /// Resolved Delta snapshot version.
-    pub snapshot_version: Version,
-    /// Delta minimum reader protocol version.
-    pub min_reader_version: i32,
-    /// Delta minimum writer protocol version.
-    pub min_writer_version: i32,
-    /// Delta reader table features required by this source.
-    pub reader_features: Vec<String>,
-    /// Delta writer table features advertised by this source.
-    pub writer_features: Vec<String>,
-}
 
 /// Successful protocol preflight for one source.
 #[derive(Debug, Clone, PartialEq, Eq)]

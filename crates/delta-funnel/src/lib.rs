@@ -45,10 +45,10 @@ pub use query_engine::{
     register_delta_sources_with_scan_execution_options,
 };
 pub use report::{
-    DryRunScanSummaryMode, FileCount, FileCountKind, OutputStatus, OutputStatusKind, PhaseStatus,
-    PhaseStatusKind, ReportReasonCode, RowCount, RowCountKind, TargetValidationMode,
-    ValidationOptions, ValidationStatus, ValidationStatusKind, WorkflowStatus, WorkflowStatusKind,
-    u128_to_u64_saturating, usize_to_u64_saturating,
+    DeltaProtocolReport, DryRunScanSummaryMode, FileCount, FileCountKind, OutputStatus,
+    OutputStatusKind, PhaseStatus, PhaseStatusKind, ReportReasonCode, RowCount, RowCountKind,
+    TargetValidationMode, ValidationOptions, ValidationStatus, ValidationStatusKind,
+    WorkflowStatus, WorkflowStatusKind, u128_to_u64_saturating, usize_to_u64_saturating,
 };
 pub use sql_server::{
     LoadMode, MssqlBatchShapingReport, MssqlBinaryPolicy, MssqlConnectionConfig,
@@ -72,9 +72,8 @@ pub use sql_server::{
 };
 pub(crate) use sql_server::{MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer};
 pub use table_formats::{
-    DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,
-    ProtocolPreflight, load_delta_source, load_delta_sources, preflight_delta_protocol,
-    preflight_delta_sources,
+    DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource, ProtocolPreflight,
+    load_delta_source, load_delta_sources, preflight_delta_protocol, preflight_delta_sources,
 };
 
 /// Current crate version.
