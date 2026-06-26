@@ -1,11 +1,8 @@
 use std::fmt;
 
-use crate::{MssqlOutputWriteStatus, MssqlWorkflowWriteReport, support::sanitize_text_for_display};
-
-use super::super::super::DeltaSourceReport;
-use super::{
-    MssqlCacheCandidateSkip, MssqlCacheCandidateSkipReason, MssqlDerivedCacheAliasPlan,
-    MssqlNoCacheReason, MssqlOutputCacheDecision, MssqlOutputCachePlan,
+use crate::{
+    DeltaSourceReport, MssqlOutputWriteStatus, MssqlWorkflowWriteReport,
+    support::sanitize_text_for_display,
 };
 
 /// Report for one `write_all` call that reached the sequential workflow.
@@ -126,36 +123,23 @@ impl WriteAllCacheReport {
         Self::Disabled
     }
 
-    pub(crate) fn from_plan(plan: &MssqlOutputCachePlan) -> Self {
-        Self::from_plan_with_alias_status(plan, WriteAllCacheAliasStatus::Selected)
-    }
-
-    pub(crate) fn from_executed_plan(plan: &MssqlOutputCachePlan) -> Self {
-        Self::from_plan_with_alias_status(plan, WriteAllCacheAliasStatus::MaterializedAndRestored)
-    }
-
-    fn from_plan_with_alias_status(
-        plan: &MssqlOutputCachePlan,
-        alias_status: WriteAllCacheAliasStatus,
+    pub(crate) fn no_cache(
+        reason: WriteAllNoCacheReason,
+        skipped_candidates: Vec<WriteAllCacheCandidateSkip>,
     ) -> Self {
-        let skipped_candidates = plan
-            .skipped_candidates()
-            .iter()
-            .map(WriteAllCacheCandidateSkip::from_internal)
-            .collect::<Vec<_>>();
+        Self::NoCache {
+            reason,
+            skipped_candidates,
+        }
+    }
 
-        match plan.decision() {
-            MssqlOutputCacheDecision::NoCache { reason } => Self::NoCache {
-                reason: WriteAllNoCacheReason::from_internal(reason),
-                skipped_candidates,
-            },
-            MssqlOutputCacheDecision::CacheAliases(aliases) => Self::CacheAliases {
-                aliases: aliases
-                    .iter()
-                    .map(|alias| WriteAllCacheAliasReport::from_internal(alias, alias_status))
-                    .collect(),
-                skipped_candidates,
-            },
+    pub(crate) fn cache_aliases(
+        aliases: Vec<WriteAllCacheAliasReport>,
+        skipped_candidates: Vec<WriteAllCacheCandidateSkip>,
+    ) -> Self {
+        Self::CacheAliases {
+            aliases,
+            skipped_candidates,
         }
     }
 }
@@ -169,18 +153,6 @@ pub enum WriteAllNoCacheReason {
     NoSharedRegisteredDerivedAlias,
     /// Candidate relationships could not produce a deterministic cache frontier.
     AmbiguousSharedDerivedAlias,
-}
-
-impl WriteAllNoCacheReason {
-    fn from_internal(reason: &MssqlNoCacheReason) -> Self {
-        match reason {
-            MssqlNoCacheReason::FewerThanTwoOutputs => Self::FewerThanTwoOutputs,
-            MssqlNoCacheReason::NoSharedRegisteredDerivedAlias => {
-                Self::NoSharedRegisteredDerivedAlias
-            }
-            MssqlNoCacheReason::AmbiguousSharedDerivedAlias => Self::AmbiguousSharedDerivedAlias,
-        }
-    }
 }
 
 /// Selected registered derived alias cache metadata.
@@ -197,11 +169,16 @@ pub struct WriteAllCacheAliasReport {
 }
 
 impl WriteAllCacheAliasReport {
-    fn from_internal(alias: &MssqlDerivedCacheAliasPlan, status: WriteAllCacheAliasStatus) -> Self {
+    pub(crate) fn new(
+        table_id: u64,
+        alias: impl Into<String>,
+        output_indexes: Vec<usize>,
+        status: WriteAllCacheAliasStatus,
+    ) -> Self {
         Self {
-            table_id: alias.table_id(),
-            alias: alias.alias().to_owned(),
-            output_indexes: alias.output_indexes().to_vec(),
+            table_id,
+            alias: alias.into(),
+            output_indexes,
             status,
         }
     }
@@ -269,11 +246,15 @@ pub struct WriteAllCacheCandidateSkip {
 }
 
 impl WriteAllCacheCandidateSkip {
-    fn from_internal(skip: &MssqlCacheCandidateSkip) -> Self {
+    pub(crate) fn new(
+        table_id: u64,
+        alias: impl Into<String>,
+        reason: WriteAllCacheCandidateSkipReason,
+    ) -> Self {
         Self {
-            table_id: skip.table_id(),
-            alias: skip.alias().to_owned(),
-            reason: WriteAllCacheCandidateSkipReason::from_internal(skip.reason()),
+            table_id,
+            alias: alias.into(),
+            reason,
         }
     }
 
@@ -326,22 +307,4 @@ pub enum WriteAllCacheCandidateSkipReason {
     },
     /// The candidate's relative depth could not be ordered deterministically.
     AmbiguousDepth,
-}
-
-impl WriteAllCacheCandidateSkipReason {
-    fn from_internal(reason: &MssqlCacheCandidateSkipReason) -> Self {
-        match reason {
-            MssqlCacheCandidateSkipReason::NotShared { output_count } => Self::NotShared {
-                output_count: *output_count,
-            },
-            MssqlCacheCandidateSkipReason::MissingSqlText => Self::MissingSqlText,
-            MssqlCacheCandidateSkipReason::IncompleteLineage => Self::IncompleteLineage,
-            MssqlCacheCandidateSkipReason::CoveredByDeeperSharedAlias { selected_table_id } => {
-                Self::CoveredByDeeperSharedAlias {
-                    selected_table_id: *selected_table_id,
-                }
-            }
-            MssqlCacheCandidateSkipReason::AmbiguousDepth => Self::AmbiguousDepth,
-        }
-    }
 }

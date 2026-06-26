@@ -26,8 +26,7 @@ pub(crate) use delta::{
     delta_source_arrow_schema, kernel_partition_scalar_to_datafusion_scalar,
 };
 pub use delta::{
-    DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,
-    ProtocolPreflight, load_delta_source, load_delta_sources, preflight_delta_protocol,
-    preflight_delta_sources,
+    DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource, ProtocolPreflight,
+    load_delta_source, load_delta_sources, preflight_delta_protocol, preflight_delta_sources,
 };
 pub(crate) use name::validate_table_source_names;

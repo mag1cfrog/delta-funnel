@@ -21,13 +21,9 @@ mod table_formats;
 
 pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
-    DeltaFunnelRuntime, DeltaFunnelSession, DeltaProviderSchedulingReport, DeltaSourceReport,
-    LazyTable, LazyTableKind, MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport,
-    MssqlDryRunSqlIdentityReport, MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
-    MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable,
-    RegisteredSessionSource, RunMode, SessionOptions, SourceUsageStatus, WriteAllCacheAliasReport,
-    WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
-    WriteAllCacheMode, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllOptions, WriteAllReport,
+    DeltaFunnelRuntime, DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget,
+    OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode,
+    SessionOptions, WriteAllCacheMode, WriteAllOptions,
 };
 pub use pipeline::{
     BatchHandoffError, BatchHandoffOutcome, BatchHandoffStats, BatchPipelinePhase,
@@ -45,10 +41,15 @@ pub use query_engine::{
     register_delta_sources_with_scan_execution_options,
 };
 pub use report::{
-    DryRunScanSummaryMode, FileCount, FileCountKind, OutputStatus, OutputStatusKind, PhaseStatus,
-    PhaseStatusKind, ReportReasonCode, RowCount, RowCountKind, TargetValidationMode,
-    ValidationOptions, ValidationStatus, ValidationStatusKind, WorkflowStatus, WorkflowStatusKind,
-    u128_to_u64_saturating, usize_to_u64_saturating,
+    DeltaProtocolReport, DeltaProviderSchedulingReport, DeltaSourceReport, DryRunScanSummaryMode,
+    FileCount, FileCountKind, MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport,
+    MssqlDryRunSqlIdentityReport, MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
+    OutputStatus, OutputStatusKind, PhaseStatus, PhaseStatusKind, ReportReasonCode, RowCount,
+    RowCountKind, SourceUsageStatus, TargetValidationMode, ValidationOptions, ValidationStatus,
+    ValidationStatusKind, WorkflowStatus, WorkflowStatusKind, WriteAllCacheAliasReport,
+    WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
+    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport, u128_to_u64_saturating,
+    usize_to_u64_saturating,
 };
 pub use sql_server::{
     LoadMode, MssqlBatchShapingReport, MssqlBinaryPolicy, MssqlConnectionConfig,
@@ -72,9 +73,8 @@ pub use sql_server::{
 };
 pub(crate) use sql_server::{MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer};
 pub use table_formats::{
-    DeltaProtocolReport, DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource,
-    ProtocolPreflight, load_delta_source, load_delta_sources, preflight_delta_protocol,
-    preflight_delta_sources,
+    DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource, ProtocolPreflight,
+    load_delta_source, load_delta_sources, preflight_delta_protocol, preflight_delta_sources,
 };
 
 /// Current crate version.

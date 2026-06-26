@@ -9,7 +9,18 @@ use std::fmt;
 
 use crate::error::DeltaFunnelError;
 
+pub mod delta;
 pub mod sql_server;
+
+pub use delta::{
+    DeltaProtocolReport, DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus,
+};
+pub use sql_server::{
+    MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
+    MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport, WriteAllCacheAliasReport,
+    WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
+    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
+};
 
 /// Saturates a platform-sized count into the public `u64` report shape.
 #[must_use]

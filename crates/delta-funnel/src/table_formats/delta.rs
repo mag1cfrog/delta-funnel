@@ -30,9 +30,7 @@ pub(crate) use kernel::{
     arrow_partition_type_to_kernel_primitive, datafusion_expr_to_kernel_predicate,
     kernel_partition_scalar_to_datafusion_scalar,
 };
-pub use protocol::{
-    DeltaProtocolReport, ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources,
-};
+pub use protocol::{ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources};
 pub(crate) use read::{
     KernelDataFilePredicateEvalRequest, KernelDataFileReadRequest, KernelDataFileReader,
     KernelDataFileReaderConfig, KernelDataFileTransformRequest, KernelScanReadSchema,
