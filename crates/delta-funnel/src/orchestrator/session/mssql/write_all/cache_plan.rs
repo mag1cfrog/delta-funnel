@@ -165,7 +165,7 @@ pub(crate) struct MssqlDerivedCacheAliasPlan {
 
 #[allow(dead_code)]
 impl MssqlDerivedCacheAliasPlan {
-    pub(super) fn new(table_id: u64, alias: String, output_indexes: Vec<usize>) -> Self {
+    pub(crate) fn new(table_id: u64, alias: String, output_indexes: Vec<usize>) -> Self {
         Self {
             table_id,
             alias,
