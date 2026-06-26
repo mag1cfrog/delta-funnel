@@ -22,7 +22,7 @@ pub struct WriteAllReport {
 }
 
 impl WriteAllReport {
-    pub(super) fn new(
+    pub(crate) fn new(
         workflow: MssqlWorkflowWriteReport,
         cache: WriteAllCacheReport,
         sources: Vec<DeltaSourceReport>,
@@ -122,15 +122,15 @@ pub enum WriteAllCacheReport {
 }
 
 impl WriteAllCacheReport {
-    pub(super) fn disabled() -> Self {
+    pub(crate) fn disabled() -> Self {
         Self::Disabled
     }
 
-    pub(super) fn from_plan(plan: &MssqlOutputCachePlan) -> Self {
+    pub(crate) fn from_plan(plan: &MssqlOutputCachePlan) -> Self {
         Self::from_plan_with_alias_status(plan, WriteAllCacheAliasStatus::Selected)
     }
 
-    pub(super) fn from_executed_plan(plan: &MssqlOutputCachePlan) -> Self {
+    pub(crate) fn from_executed_plan(plan: &MssqlOutputCachePlan) -> Self {
         Self::from_plan_with_alias_status(plan, WriteAllCacheAliasStatus::MaterializedAndRestored)
     }
 
