@@ -4,7 +4,7 @@ use crate::{DeltaFunnelError, MssqlWorkflowOutputWriter, support::sanitize_text_
 
 use super::super::super::{
     DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode,
-    streams::{provider_read_stats_snapshot, shared_provider_read_stats},
+    query_handoff::{provider_read_stats_snapshot, shared_provider_read_stats},
 };
 use super::{
     MssqlOutputCacheDecision, MssqlOutputCachePlan, WriteAllCacheMode, WriteAllCacheReport,

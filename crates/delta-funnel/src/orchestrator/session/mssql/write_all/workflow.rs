@@ -10,7 +10,7 @@ use crate::{
 };
 
 use super::super::super::{
-    DeltaFunnelSession, PlannedMssqlOutput, streams::SharedProviderReadStats,
+    DeltaFunnelSession, PlannedMssqlOutput, query_handoff::SharedProviderReadStats,
 };
 use super::{
     MssqlDerivedCacheAliasPlan,

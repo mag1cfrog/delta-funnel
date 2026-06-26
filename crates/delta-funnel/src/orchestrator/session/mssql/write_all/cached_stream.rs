@@ -11,8 +11,8 @@ use crate::{
 use super::super::super::{
     DeltaFunnelSession, LazyTableKind, OutputWritePlan,
     errors::{cached_output_stream_setup_error, unknown_cached_alias_error},
+    query_handoff::{ProviderStatsRecordingStream, SharedProviderReadStats},
     registry::{DerivedTableDependency, read_only_sql_options},
-    streams::{ProviderStatsRecordingStream, SharedProviderReadStats},
 };
 use super::{MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan};
 

@@ -9,9 +9,9 @@ mod errors;
 mod handles;
 mod mssql;
 mod options;
+mod query_handoff;
 mod registry;
 mod source_report;
-mod streams;
 #[cfg(test)]
 mod test_support;
 
