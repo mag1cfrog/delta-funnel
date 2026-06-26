@@ -12,7 +12,9 @@ use crate::error::DeltaFunnelError;
 pub mod delta;
 pub mod sql_server;
 
-pub use delta::DeltaProtocolReport;
+pub use delta::{
+    DeltaProtocolReport, DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus,
+};
 
 /// Saturates a platform-sized count into the public `u64` report shape.
 #[must_use]
