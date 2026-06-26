@@ -18,7 +18,7 @@ use crate::{
     DeltaFunnelError, ReportReasonCode, RowCount,
     report::sql_server::{
         MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
-        MssqlWriteFailureContext, MssqlWriteReport,
+        MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
     },
 };
 
@@ -296,11 +296,13 @@ pub fn validate_mssql_output_schema(
         mssql_batch_schema_validation_error(
             output_plan,
             source,
-            RowCount::unavailable(),
-            MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
-            MssqlWriteProgress::zero(),
-            false,
-            MssqlTargetCleanupStatus::NotApplicable,
+            write_report_metrics(
+                RowCount::unavailable(),
+                MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
+                MssqlWriteProgress::zero(),
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ),
         )
     })?;
 
@@ -325,11 +327,13 @@ pub fn validate_mssql_output_record_batch(
         mssql_batch_schema_validation_error(
             output_plan,
             source,
-            RowCount::unavailable(),
-            MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
-            MssqlWriteProgress::zero(),
-            false,
-            MssqlTargetCleanupStatus::NotApplicable,
+            write_report_metrics(
+                RowCount::unavailable(),
+                MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
+                MssqlWriteProgress::zero(),
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ),
         )
     })?;
 
@@ -341,28 +345,34 @@ pub fn validate_mssql_output_record_batch(
 fn mssql_batch_schema_validation_error(
     output_plan: &MssqlTargetOutputPlan,
     source: arrow_tiberius::Error,
+    metrics: MssqlWriteReportMetrics,
+) -> DeltaFunnelError {
+    DeltaFunnelError::MssqlBatchSchemaValidation {
+        context: Box::new(MssqlWriteFailureContext::from_output_plan_with_metrics(
+            output_plan,
+            MssqlWritePhase::ValidateBatchSchema,
+            metrics,
+        )),
+        source,
+    }
+}
+
+fn write_report_metrics(
     output_row_count: RowCount,
     batch_shaping: MssqlBatchShapingReport,
     progress: MssqlWriteProgress,
     partial_write_possible: bool,
     cleanup: MssqlTargetCleanupStatus,
-) -> DeltaFunnelError {
-    DeltaFunnelError::MssqlBatchSchemaValidation {
-        context: Box::new(
-            MssqlWriteFailureContext::from_output_plan_with_batch_shaping(
-                output_plan,
-                MssqlWritePhase::ValidateBatchSchema,
-                output_row_count,
-                batch_shaping,
-                progress.rows_written,
-                progress.batches_written,
-                progress.elapsed_ms,
-                partial_write_possible,
-                cleanup,
-            ),
-        ),
-        source,
-    }
+) -> MssqlWriteReportMetrics {
+    MssqlWriteReportMetrics::new(
+        output_row_count,
+        batch_shaping,
+        progress.rows_written,
+        progress.batches_written,
+        progress.elapsed_ms,
+        partial_write_possible,
+        cleanup,
+    )
 }
 
 /// Writes one planned SQL Server output through an injected bulk-load writer.
@@ -393,16 +403,18 @@ where
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::PollBatchStream,
-                RowCount::partial(input_rows),
-                MssqlBatchShapingReport::failed(
-                    input_batches,
-                    input_rows,
-                    shaped_batches,
-                    shaped_rows,
+                write_report_metrics(
+                    RowCount::partial(input_rows),
+                    MssqlBatchShapingReport::failed(
+                        input_batches,
+                        input_rows,
+                        shaped_batches,
+                        shaped_rows,
+                    ),
+                    MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
+                    partial_write_possible(output_plan, rows_written, batches_written),
+                    cleanup,
                 ),
-                MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
-                partial_write_possible(output_plan, rows_written, batches_written),
-                cleanup,
                 source.to_string(),
             )
         })?;
@@ -420,26 +432,7 @@ where
             mssql_batch_schema_validation_error(
                 output_plan,
                 source,
-                RowCount::partial(input_rows),
-                MssqlBatchShapingReport::failed(
-                    input_batches,
-                    input_rows,
-                    shaped_batches,
-                    shaped_rows,
-                ),
-                MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
-                partial_write_possible(output_plan, rows_written, batches_written),
-                cleanup,
-            )
-        })?;
-
-        MssqlBulkLoadWriter::write_batch(&mut writer, &batch)
-            .await
-            .map_err(|source| {
-                let elapsed_ms = elapsed_ms_since(started_at);
-                mssql_write_phase_error(
-                    output_plan,
-                    MssqlWritePhase::WriteBatch,
+                write_report_metrics(
                     RowCount::partial(input_rows),
                     MssqlBatchShapingReport::failed(
                         input_batches,
@@ -450,6 +443,29 @@ where
                     MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                     partial_write_possible(output_plan, rows_written, batches_written),
                     cleanup,
+                ),
+            )
+        })?;
+
+        MssqlBulkLoadWriter::write_batch(&mut writer, &batch)
+            .await
+            .map_err(|source| {
+                let elapsed_ms = elapsed_ms_since(started_at);
+                mssql_write_phase_error(
+                    output_plan,
+                    MssqlWritePhase::WriteBatch,
+                    write_report_metrics(
+                        RowCount::partial(input_rows),
+                        MssqlBatchShapingReport::failed(
+                            input_batches,
+                            input_rows,
+                            shaped_batches,
+                            shaped_rows,
+                        ),
+                        MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
+                        partial_write_possible(output_plan, rows_written, batches_written),
+                        cleanup,
+                    ),
                     source.to_string(),
                 )
             })?;
@@ -467,56 +483,51 @@ where
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::Finalize,
-                RowCount::exact(input_rows),
-                MssqlBatchShapingReport::completed(
-                    input_batches,
-                    input_rows,
-                    shaped_batches,
-                    shaped_rows,
+                write_report_metrics(
+                    RowCount::exact(input_rows),
+                    MssqlBatchShapingReport::completed(
+                        input_batches,
+                        input_rows,
+                        shaped_batches,
+                        shaped_rows,
+                    ),
+                    MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
+                    partial_write_possible(output_plan, rows_written, batches_written),
+                    cleanup,
                 ),
-                MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
-                partial_write_possible(output_plan, rows_written, batches_written),
-                cleanup,
                 source.to_string(),
             )
         })?;
 
-    Ok(MssqlWriteReport::from_output_plan_with_batch_shaping(
+    Ok(MssqlWriteReport::from_output_plan_with_metrics(
         output_plan,
-        RowCount::exact(input_rows),
-        MssqlBatchShapingReport::completed(input_batches, input_rows, shaped_batches, shaped_rows),
-        rows_written,
-        batches_written,
-        elapsed_ms_since(started_at),
-        false,
-        cleanup,
+        write_report_metrics(
+            RowCount::exact(input_rows),
+            MssqlBatchShapingReport::completed(
+                input_batches,
+                input_rows,
+                shaped_batches,
+                shaped_rows,
+            ),
+            MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms_since(started_at)),
+            false,
+            cleanup,
+        ),
     ))
 }
 
 fn mssql_write_phase_error(
     output_plan: &MssqlTargetOutputPlan,
     phase: MssqlWritePhase,
-    output_row_count: RowCount,
-    batch_shaping: MssqlBatchShapingReport,
-    progress: MssqlWriteProgress,
-    partial_write_possible: bool,
-    cleanup: MssqlTargetCleanupStatus,
+    metrics: MssqlWriteReportMetrics,
     message: String,
 ) -> DeltaFunnelError {
     DeltaFunnelError::MssqlWritePhase {
-        context: Box::new(
-            MssqlWriteFailureContext::from_output_plan_with_batch_shaping(
-                output_plan,
-                phase,
-                output_row_count,
-                batch_shaping,
-                progress.rows_written,
-                progress.batches_written,
-                progress.elapsed_ms,
-                partial_write_possible,
-                cleanup,
-            ),
-        ),
+        context: Box::new(MssqlWriteFailureContext::from_output_plan_with_metrics(
+            output_plan,
+            phase,
+            metrics,
+        )),
         message,
     }
 }
@@ -530,11 +541,13 @@ fn mssql_writer_initialization_error(
     mssql_write_phase_error(
         output_plan,
         MssqlWritePhase::InitializeWriter,
-        RowCount::unavailable(),
-        MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
-        MssqlWriteProgress::zero(),
-        false,
-        cleanup,
+        write_report_metrics(
+            RowCount::unavailable(),
+            MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
+            MssqlWriteProgress::zero(),
+            false,
+            cleanup,
+        ),
         format!("prepared target action {prepared_action:?}: {message}"),
     )
 }

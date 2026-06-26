@@ -192,6 +192,39 @@ impl MssqlBatchShapingReport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MssqlWriteReportMetrics {
+    pub(crate) output_row_count: RowCount,
+    pub(crate) batch_shaping: MssqlBatchShapingReport,
+    pub(crate) rows_written: u64,
+    pub(crate) batches_written: u64,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) partial_write_possible: bool,
+    pub(crate) cleanup: MssqlTargetCleanupStatus,
+}
+
+impl MssqlWriteReportMetrics {
+    pub(crate) const fn new(
+        output_row_count: RowCount,
+        batch_shaping: MssqlBatchShapingReport,
+        rows_written: u64,
+        batches_written: u64,
+        elapsed_ms: u64,
+        partial_write_possible: bool,
+        cleanup: MssqlTargetCleanupStatus,
+    ) -> Self {
+        Self {
+            output_row_count,
+            batch_shaping,
+            rows_written,
+            batches_written,
+            elapsed_ms,
+            partial_write_possible,
+            cleanup,
+        }
+    }
+}
+
 /// Cleanup reporting state for a SQL Server target owned by create-and-load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MssqlTargetCleanupStatus {
@@ -243,32 +276,28 @@ impl MssqlWriteReport {
         partial_write_possible: bool,
         cleanup: MssqlTargetCleanupStatus,
     ) -> Self {
-        Self::from_output_plan_with_batch_shaping(
+        Self::from_output_plan_with_metrics(
             output_plan,
-            RowCount::exact(rows_written),
-            MssqlBatchShapingReport::completed(
-                batches_written,
+            MssqlWriteReportMetrics::new(
+                RowCount::exact(rows_written),
+                MssqlBatchShapingReport::completed(
+                    batches_written,
+                    rows_written,
+                    batches_written,
+                    rows_written,
+                ),
                 rows_written,
                 batches_written,
-                rows_written,
+                elapsed_ms,
+                partial_write_possible,
+                cleanup,
             ),
-            rows_written,
-            batches_written,
-            elapsed_ms,
-            partial_write_possible,
-            cleanup,
         )
     }
 
-    pub(crate) fn from_output_plan_with_batch_shaping(
+    pub(crate) fn from_output_plan_with_metrics(
         output_plan: &MssqlTargetOutputPlan,
-        output_row_count: RowCount,
-        batch_shaping: MssqlBatchShapingReport,
-        rows_written: u64,
-        batches_written: u64,
-        elapsed_ms: u64,
-        partial_write_possible: bool,
-        cleanup: MssqlTargetCleanupStatus,
+        metrics: MssqlWriteReportMetrics,
     ) -> Self {
         let output_name = output_plan.output_name().to_owned();
         let output_schema = output_plan
@@ -284,11 +313,16 @@ impl MssqlWriteReport {
             connection_source: output_plan.connection_source(),
             connection: output_plan.connection().clone(),
             output_schema,
-            output_row_count,
-            batch_shaping,
-            stats: MssqlWriteStats::new(output_name, rows_written, batches_written, elapsed_ms),
-            partial_write_possible,
-            cleanup,
+            output_row_count: metrics.output_row_count,
+            batch_shaping: metrics.batch_shaping,
+            stats: MssqlWriteStats::new(
+                output_name,
+                metrics.rows_written,
+                metrics.batches_written,
+                metrics.elapsed_ms,
+            ),
+            partial_write_possible: metrics.partial_write_possible,
+            cleanup: metrics.cleanup,
         }
     }
 
@@ -432,47 +466,34 @@ impl MssqlWriteFailureContext {
         partial_write_possible: bool,
         cleanup: MssqlTargetCleanupStatus,
     ) -> Self {
-        Self::from_output_plan_with_batch_shaping(
+        Self::from_output_plan_with_metrics(
             output_plan,
             phase,
-            RowCount::partial(rows_written),
-            MssqlBatchShapingReport::failed(
-                batches_written,
-                rows_written,
-                batches_written,
-                rows_written,
-            ),
-            rows_written,
-            batches_written,
-            elapsed_ms,
-            partial_write_possible,
-            cleanup,
-        )
-    }
-
-    pub(crate) fn from_output_plan_with_batch_shaping(
-        output_plan: &MssqlTargetOutputPlan,
-        phase: MssqlWritePhase,
-        output_row_count: RowCount,
-        batch_shaping: MssqlBatchShapingReport,
-        rows_written: u64,
-        batches_written: u64,
-        elapsed_ms: u64,
-        partial_write_possible: bool,
-        cleanup: MssqlTargetCleanupStatus,
-    ) -> Self {
-        Self {
-            phase,
-            report: MssqlWriteReport::from_output_plan_with_batch_shaping(
-                output_plan,
-                output_row_count,
-                batch_shaping,
+            MssqlWriteReportMetrics::new(
+                RowCount::partial(rows_written),
+                MssqlBatchShapingReport::failed(
+                    batches_written,
+                    rows_written,
+                    batches_written,
+                    rows_written,
+                ),
                 rows_written,
                 batches_written,
                 elapsed_ms,
                 partial_write_possible,
                 cleanup,
             ),
+        )
+    }
+
+    pub(crate) fn from_output_plan_with_metrics(
+        output_plan: &MssqlTargetOutputPlan,
+        phase: MssqlWritePhase,
+        metrics: MssqlWriteReportMetrics,
+    ) -> Self {
+        Self {
+            phase,
+            report: MssqlWriteReport::from_output_plan_with_metrics(output_plan, metrics),
         }
     }
 
