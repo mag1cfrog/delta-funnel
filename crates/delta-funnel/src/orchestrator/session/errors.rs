@@ -4,7 +4,7 @@ use crate::{
     BatchPipelinePhase, DeltaFunnelError, SqlTablePhase, support::sanitize_text_for_display,
 };
 
-use super::{LazyTable, mssql::MssqlDerivedCacheAliasPlan};
+use super::{LazyTable, sql_server_workflows::MssqlDerivedCacheAliasPlan};
 
 pub(super) fn sql_table_error<T>(
     phase: SqlTablePhase,
