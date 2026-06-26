@@ -310,10 +310,12 @@ mod tests {
         WriteAllOptions,
     };
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlOutputBatchStream,
-        MssqlSchemaPlanOptions, MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetTable,
-        MssqlWorkflowOutputWriter, MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget,
-        plan_mssql_target_for_resolved_output, table_formats::RealParquetDeltaTable,
+        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlBatchShapingReport,
+        MssqlOutputBatchStream, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus,
+        MssqlTargetConfig, MssqlTargetTable, MssqlWorkflowOutputWriter, MssqlWriteFailureContext,
+        MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport, PhaseStatus, ReportReasonCode,
+        ResolvedMssqlTarget, RowCount, plan_mssql_target_for_resolved_output,
+        table_formats::RealParquetDeltaTable,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,7 +390,18 @@ mod tests {
                 .as_deref()
                 .is_some_and(|output_name| output_name == resolved_target.output_name())
             {
-                return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                let partial_write_possible = output_plan.load_mode() == LoadMode::AppendExisting
+                    && (rows > 0 || batch_count > 0);
+                return Err(DeltaFunnelError::MssqlWritePhase {
+                    context: Box::new(MssqlWriteFailureContext::from_output_plan(
+                        &output_plan,
+                        MssqlWritePhase::WriteBatch,
+                        rows,
+                        batch_count,
+                        0,
+                        partial_write_possible,
+                        MssqlTargetCleanupStatus::NotApplicable,
+                    )),
                     message: format!(
                         "fake workflow writer failed for `{}`",
                         resolved_target.output_name()
@@ -405,6 +418,21 @@ mod tests {
                 MssqlTargetCleanupStatus::NotApplicable,
             ))
         }
+    }
+
+    fn assert_batch_shaping(
+        report: MssqlBatchShapingReport,
+        expected_status: PhaseStatus,
+        expected_input_batches: u64,
+        expected_input_rows: u64,
+        expected_output_batches: u64,
+        expected_output_rows: u64,
+    ) {
+        assert_eq!(report.status(), expected_status);
+        assert_eq!(report.input_batches(), expected_input_batches);
+        assert_eq!(report.input_rows(), expected_input_rows);
+        assert_eq!(report.output_batches(), expected_output_batches);
+        assert_eq!(report.output_rows(), expected_output_rows);
     }
 
     mod planning {
@@ -612,6 +640,24 @@ mod tests {
             };
             assert_eq!(west_report.stats().rows_written(), 2);
             assert_eq!(west_report.stats().batches_written(), calls[0].batches);
+            assert_eq!(report.outputs()[0].output_row_count(), RowCount::exact(2));
+            assert_batch_shaping(
+                report.outputs()[0].batch_shaping(),
+                PhaseStatus::completed(),
+                calls[0].batches,
+                2,
+                calls[0].batches,
+                2,
+            );
+            assert_eq!(report.outputs()[1].output_row_count(), RowCount::exact(1));
+            assert_batch_shaping(
+                report.outputs()[1].batch_shaping(),
+                PhaseStatus::completed(),
+                calls[1].batches,
+                1,
+                calls[1].batches,
+                1,
+            );
             assert_eq!(
                 west_report.cleanup(),
                 MssqlTargetCleanupStatus::NotApplicable
@@ -730,6 +776,7 @@ mod tests {
                 );
             };
             assert_eq!(output_report.stats().rows_written(), 1);
+            assert_eq!(output_report.output_row_count(), RowCount::exact(1));
             let source = report
                 .sources()
                 .first()
@@ -739,6 +786,10 @@ mod tests {
                 .ok_or("expected execution provider stats")?;
             assert_eq!(stats.rows_produced, u64::try_from(table.rows())?);
             assert_ne!(stats.rows_produced, output_report.stats().rows_written());
+            assert_ne!(
+                stats.rows_produced,
+                output_report.output_row_count().exact_value().unwrap_or(0)
+            );
             Ok(())
         }
     }
@@ -1601,8 +1652,32 @@ mod tests {
             assert_eq!(report.outputs()[0].output_name(), "first_output");
             assert!(report.outputs()[1].is_failed());
             assert_eq!(report.outputs()[1].output_name(), "second_output");
+            assert_eq!(
+                report.outputs()[1].output_row_count(),
+                RowCount::partial(calls[1].rows)
+            );
+            assert_batch_shaping(
+                report.outputs()[1].batch_shaping(),
+                PhaseStatus::failed(),
+                calls[1].batches,
+                calls[1].rows,
+                calls[1].batches,
+                calls[1].rows,
+            );
             assert!(report.outputs()[2].is_skipped());
             assert_eq!(report.outputs()[2].output_name(), "third_output");
+            assert_eq!(
+                report.outputs()[2].output_row_count(),
+                RowCount::unavailable()
+            );
+            assert_batch_shaping(
+                report.outputs()[2].batch_shaping(),
+                PhaseStatus::skipped(ReportReasonCode::PriorFailure),
+                0,
+                0,
+                0,
+                0,
+            );
             Ok(())
         }
 
@@ -1673,8 +1748,32 @@ mod tests {
             assert_eq!(report.outputs()[0].output_name(), "first_output");
             assert!(report.outputs()[1].is_failed());
             assert_eq!(report.outputs()[1].output_name(), "failing_output");
+            assert_eq!(
+                report.outputs()[1].output_row_count(),
+                RowCount::unavailable()
+            );
+            assert_batch_shaping(
+                report.outputs()[1].batch_shaping(),
+                PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+                0,
+                0,
+                0,
+                0,
+            );
             assert!(report.outputs()[2].is_skipped());
             assert_eq!(report.outputs()[2].output_name(), "third_output");
+            assert_eq!(
+                report.outputs()[2].output_row_count(),
+                RowCount::unavailable()
+            );
+            assert_batch_shaping(
+                report.outputs()[2].batch_shaping(),
+                PhaseStatus::skipped(ReportReasonCode::PriorFailure),
+                0,
+                0,
+                0,
+                0,
+            );
             Ok(())
         }
     }
