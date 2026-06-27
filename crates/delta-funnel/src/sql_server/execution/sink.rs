@@ -373,12 +373,11 @@ where
         )),
         TargetValidationMode::ValidateIfPossible | TargetValidationMode::Require => {
             let Some(output_rows) = report.output_row_count().exact_value() else {
-                return validation_unavailable_or_required_failure(
+                return missing_exact_output_rows_validation(
                     output_plan,
                     report,
-                    ReportReasonCode::MissingExactOutputRows,
                     validation_options.target_validation_mode(),
-                    "target row-count validation requires exact output rows",
+                    target_row_count_before_write,
                 );
             };
 
@@ -437,6 +436,34 @@ where
             ))
         }
     }
+}
+
+fn missing_exact_output_rows_validation(
+    output_plan: &MssqlTargetOutputPlan,
+    report: MssqlWriteReport,
+    mode: TargetValidationMode,
+    target_row_count_before_write: TargetRowCountBeforeWrite,
+) -> Result<MssqlWriteReport, DeltaFunnelError> {
+    if output_plan.load_mode() == LoadMode::AppendExisting
+        && let TargetRowCountBeforeWrite::Exact(target_rows_before) = target_row_count_before_write
+    {
+        return target_delta_validation_unavailable_or_required_failure(
+            output_plan,
+            report,
+            ReportReasonCode::MissingExactOutputRows,
+            mode,
+            "target row-count validation requires exact output rows",
+            RowCount::exact(target_rows_before),
+        );
+    }
+
+    validation_unavailable_or_required_failure(
+        output_plan,
+        report,
+        ReportReasonCode::MissingExactOutputRows,
+        mode,
+        "target row-count validation requires exact output rows",
+    )
 }
 
 async fn target_row_count_before_append_write<C>(
@@ -1604,6 +1631,58 @@ mod tests {
             report.validation_status(),
             ValidationStatus::unavailable(ReportReasonCode::MissingExactOutputRows)
         );
+        assert_eq!(logged_events(&log)?, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_missing_exact_output_rows_preserves_pre_count()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let prepared_target = MssqlPreparedTarget::from_output_plan(
+            &output_plan,
+            MssqlPreparedTargetAction::VerifiedExisting,
+        )?;
+        let report = MssqlWriteReport::from_output_plan_with_metrics(
+            &output_plan,
+            MssqlWriteReportMetrics::new(
+                RowCount::partial(3),
+                crate::MssqlBatchShapingReport::completed(1, 3, 1, 3),
+                3,
+                1,
+                0,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ),
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_count(13);
+
+        let report = validate_written_target(
+            &mut connection,
+            &output_plan,
+            &prepared_target,
+            report,
+            ValidationOptions::new(),
+            TargetRowCountBeforeWrite::Exact(10),
+        )
+        .await?;
+
+        assert_eq!(report.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(
+            report.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::unavailable(ReportReasonCode::MissingExactOutputRows)
+        );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::MissingExactOutputRows),
+        )?;
         assert_eq!(logged_events(&log)?, Vec::<String>::new());
         Ok(())
     }
