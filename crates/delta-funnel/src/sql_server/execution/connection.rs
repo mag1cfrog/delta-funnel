@@ -79,6 +79,16 @@ impl MssqlConnectedOutputClient {
         MssqlConnectedLifecycleClient::new(&self.output_plan, &mut self.client)
     }
 
+    /// Counts rows in a prepared target through the arrow-tiberius connection boundary.
+    pub(crate) async fn target_row_count(
+        &mut self,
+        prepared_target: &MssqlPreparedTarget,
+    ) -> Result<u64, arrow_tiberius::Error> {
+        self.client
+            .target_row_count(prepared_target.table_name())
+            .await
+    }
+
     /// Initializes the bulk writer after target lifecycle preparation.
     pub(crate) async fn initialize_bulk_writer(
         &mut self,
@@ -295,6 +305,15 @@ mod tests {
         assert!(source.contains("initialize_bulk_writer"));
         assert!(source.contains("initialize_mssql_bulk_writer"));
         assert!(source.contains("MssqlPreparedTarget"));
+    }
+
+    #[test]
+    fn connected_output_client_exposes_target_row_count_boundary() {
+        let _target_row_count = arrow_tiberius::ConnectedMssqlClient::target_row_count;
+        let source = include_str!("connection.rs");
+
+        assert!(source.contains("target_row_count"));
+        assert!(source.contains("prepared_target.table_name()"));
     }
 
     #[test]
