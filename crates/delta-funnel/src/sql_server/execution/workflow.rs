@@ -26,6 +26,7 @@ use super::{
 
 const OUTPUT_STREAM_SETUP_PHASE: &str = "output_stream_setup";
 const SQL_WRITE_PHASE: &str = "sql_write";
+const VALIDATION_PHASE: &str = "validation";
 
 /// Lazy stream produced only when a SQL Server output is attempted.
 pub type MssqlOutputBatchStream =
@@ -680,7 +681,7 @@ where
                 let failure = MssqlWriteFailureReport::from_error(
                     target,
                     error,
-                    output_write_phase_timings(
+                    output_write_failure_phase_timings(
                         planned_phase_timings,
                         stream_setup_timing,
                         write_timer.failed(),
@@ -716,6 +717,19 @@ fn output_write_phase_timings(
     phase_timings
 }
 
+fn output_write_failure_phase_timings(
+    mut phase_timings: Vec<PhaseTimingReport>,
+    stream_setup_timing: PhaseTimingReport,
+    write_timing: PhaseTimingReport,
+) -> Vec<PhaseTimingReport> {
+    phase_timings.extend([
+        stream_setup_timing,
+        write_timing,
+        PhaseTimingReport::not_started(VALIDATION_PHASE, ReportReasonCode::FailureBeforeValidation),
+    ]);
+    phase_timings
+}
+
 fn stream_setup_failure_phase_timings(
     mut phase_timings: Vec<PhaseTimingReport>,
     stream_setup_timing: PhaseTimingReport,
@@ -723,6 +737,7 @@ fn stream_setup_failure_phase_timings(
     phase_timings.extend([
         stream_setup_timing,
         PhaseTimingReport::not_started(SQL_WRITE_PHASE, ReportReasonCode::NotExecuted),
+        PhaseTimingReport::not_started(VALIDATION_PHASE, ReportReasonCode::FailureBeforeValidation),
     ]);
     phase_timings
 }
@@ -733,6 +748,7 @@ fn skipped_after_prior_failure_phase_timings(
     phase_timings.extend([
         PhaseTimingReport::skipped(OUTPUT_STREAM_SETUP_PHASE, ReportReasonCode::PriorFailure),
         PhaseTimingReport::skipped(SQL_WRITE_PHASE, ReportReasonCode::PriorFailure),
+        PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::PriorFailure),
     ]);
     phase_timings
 }
@@ -970,6 +986,11 @@ mod tests {
             PhaseStatus::completed(),
         )?;
         assert_phase_timing(second_status, SQL_WRITE_PHASE, PhaseStatus::failed())?;
+        assert_phase_timing(
+            second_status,
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
+        )?;
 
         Ok(())
     }
@@ -1239,6 +1260,11 @@ mod tests {
             second_status,
             SQL_WRITE_PHASE,
             PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+        )?;
+        assert_phase_timing(
+            second_status,
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
         )?;
         assert!(
             failure
@@ -1632,6 +1658,11 @@ mod tests {
         assert_phase_timing(
             status,
             SQL_WRITE_PHASE,
+            PhaseStatus::skipped(ReportReasonCode::PriorFailure),
+        )?;
+        assert_phase_timing(
+            status,
+            VALIDATION_PHASE,
             PhaseStatus::skipped(ReportReasonCode::PriorFailure),
         )?;
         Ok(())

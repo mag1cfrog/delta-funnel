@@ -29,6 +29,7 @@ const POLL_BATCH_STREAM_PHASE: &str = "poll_batch_stream";
 const VALIDATE_BATCH_SCHEMA_PHASE: &str = "validate_batch_schema";
 const WRITE_BATCH_PHASE: &str = "write_batch";
 const FINALIZE_PHASE: &str = "finalize";
+const VALIDATION_PHASE: &str = "validation";
 
 use super::{
     LoadMode, MssqlLifecycleExecutionGuardrail, MssqlPreparedTarget, MssqlPreparedTargetAction,
@@ -413,6 +414,7 @@ impl MssqlWriteLoopPhaseTimings {
             self.validate_batch_schema_completed_or_not_started(),
             self.write_batch_completed_or_not_started(),
             PhaseTimingReport::completed(FINALIZE_PHASE, finalize_elapsed),
+            PhaseTimingReport::not_started(VALIDATION_PHASE, ReportReasonCode::NotExecuted),
         ]
     }
 
@@ -422,6 +424,10 @@ impl MssqlWriteLoopPhaseTimings {
             self.validate_batch_schema_completed_or_not_started(),
             self.write_batch_completed_or_not_started(),
             PhaseTimingReport::not_started(FINALIZE_PHASE, ReportReasonCode::NotExecuted),
+            PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::FailureBeforeValidation,
+            ),
         ]
     }
 
@@ -431,6 +437,10 @@ impl MssqlWriteLoopPhaseTimings {
             PhaseTimingReport::failed(VALIDATE_BATCH_SCHEMA_PHASE, self.validate_batch_schema),
             self.write_batch_completed_or_not_started(),
             PhaseTimingReport::not_started(FINALIZE_PHASE, ReportReasonCode::NotExecuted),
+            PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::FailureBeforeValidation,
+            ),
         ]
     }
 
@@ -440,6 +450,10 @@ impl MssqlWriteLoopPhaseTimings {
             self.validate_batch_schema_completed_or_not_started(),
             PhaseTimingReport::failed(WRITE_BATCH_PHASE, self.write_batch),
             PhaseTimingReport::not_started(FINALIZE_PHASE, ReportReasonCode::NotExecuted),
+            PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::FailureBeforeValidation,
+            ),
         ]
     }
 
@@ -449,6 +463,10 @@ impl MssqlWriteLoopPhaseTimings {
             self.validate_batch_schema_completed_or_not_started(),
             self.write_batch_completed_or_not_started(),
             PhaseTimingReport::failed(FINALIZE_PHASE, finalize_elapsed),
+            PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::FailureBeforeValidation,
+            ),
         ]
     }
 
@@ -1336,6 +1354,11 @@ mod tests {
             FINALIZE_PHASE,
             PhaseStatus::completed(),
         )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+        )?;
         let debug = format!("{report:?}");
         assert!(!debug.contains("open"));
         assert!(!debug.contains("closed"));
@@ -1416,6 +1439,11 @@ mod tests {
             context.phase_timings(),
             FINALIZE_PHASE,
             PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
         )?;
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2]);
@@ -1517,6 +1545,11 @@ mod tests {
             FINALIZE_PHASE,
             PhaseStatus::not_started(ReportReasonCode::NotExecuted),
         )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
+        )?;
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 0);
@@ -1604,6 +1637,11 @@ mod tests {
             context.phase_timings(),
             FINALIZE_PHASE,
             PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
         )?;
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);

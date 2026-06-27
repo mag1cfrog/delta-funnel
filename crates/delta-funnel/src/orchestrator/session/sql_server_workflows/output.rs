@@ -5,8 +5,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlTargetOutputPlan, MssqlWriteOptions,
-    MssqlWriteReport, ResolvedMssqlTarget, plan_mssql_target_for_resolved_output,
-    report::PhaseTimer, write_output_batches_to_mssql,
+    MssqlWriteReport, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget,
+    plan_mssql_target_for_resolved_output, report::PhaseTimer, write_output_batches_to_mssql,
 };
 
 use super::super::{DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode};
@@ -14,6 +14,7 @@ use super::super::{DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunM
 pub(in crate::orchestrator::session) const OUTPUT_SCHEMA_PLANNING_PHASE: &str =
     "output_schema_planning";
 pub(in crate::orchestrator::session) const SQL_TARGET_PLANNING_PHASE: &str = "sql_target_planning";
+const VALIDATION_PHASE: &str = "validation";
 
 impl DeltaFunnelSession {
     /// Plans one lazy table as an MSSQL output without executing the table.
@@ -130,8 +131,24 @@ impl DeltaFunnelSession {
                 self.options.mssql_write_options(),
             )
             .await
+            .map(ensure_validation_phase_timing)
             .map(|report| report.with_phase_timings(phase_timings))
     }
+}
+
+fn ensure_validation_phase_timing(report: MssqlWriteReport) -> MssqlWriteReport {
+    if report
+        .phase_timings()
+        .iter()
+        .any(|timing| timing.phase_name() == VALIDATION_PHASE)
+    {
+        return report;
+    }
+
+    report.with_appended_phase_timings(vec![PhaseTimingReport::not_started(
+        VALIDATION_PHASE,
+        ReportReasonCode::NotExecuted,
+    )])
 }
 
 #[async_trait]
@@ -202,6 +219,7 @@ mod tests {
     };
     use super::{
         OUTPUT_SCHEMA_PLANNING_PHASE, OrchestratorMssqlOutputWriter, SQL_TARGET_PLANNING_PHASE,
+        VALIDATION_PHASE,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,6 +681,15 @@ mod tests {
                 .map(crate::PhaseTimingReport::phase_name)
                 .collect::<Vec<_>>(),
             vec![OUTPUT_SCHEMA_PLANNING_PHASE, SQL_TARGET_PLANNING_PHASE]
+        );
+        let validation_timing = report
+            .phase_timings()
+            .iter()
+            .find(|timing| timing.phase_name() == VALIDATION_PHASE)
+            .ok_or("expected validation phase timing")?;
+        assert_eq!(
+            validation_timing.status(),
+            crate::PhaseStatus::not_started(crate::ReportReasonCode::NotExecuted)
         );
         Ok(())
     }
