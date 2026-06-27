@@ -779,7 +779,7 @@ mod tests {
     use crate::{
         DeltaFunnelError, MssqlBatchShapingReport, MssqlConnectionConfig, MssqlConnectionSource,
         MssqlOutputFieldReport, MssqlTargetConfig, MssqlTargetTable, MssqlWriteStats, PhaseStatus,
-        PhaseTimingReport, ReportReasonCode, plan_mssql_target_for_output,
+        PhaseTimingReport, ReportReasonCode, ValidationStatus, plan_mssql_target_for_output,
     };
 
     fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
@@ -1728,6 +1728,11 @@ mod tests {
         assert_eq!(report.stats().elapsed_ms(), 125);
         assert_output_schema(report.output_schema());
         assert_eq!(report.output_row_count(), RowCount::exact(42));
+        assert_eq!(report.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::NotExecuted)
+        );
         assert_batch_shaping(
             report.batch_shaping(),
             PhaseStatus::completed(),
@@ -1809,6 +1814,11 @@ mod tests {
         assert_eq!(context.stats().batches_written(), 3);
         assert_eq!(context.stats().elapsed_ms(), 125);
         assert_eq!(context.output_row_count(), RowCount::partial(42));
+        assert_eq!(context.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::NotExecuted)
+        );
         assert_batch_shaping(context.batch_shaping(), PhaseStatus::failed(), 3, 42, 3, 42);
         assert!(context.partial_write_possible());
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
