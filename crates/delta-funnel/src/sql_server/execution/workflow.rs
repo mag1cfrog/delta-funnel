@@ -52,6 +52,7 @@ pub struct MssqlOutputWriteJob {
     schema_options: MssqlSchemaPlanOptions,
     batches: MssqlOutputBatchStreamFactory,
     write_options: MssqlWriteOptions,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl MssqlOutputWriteJob {
@@ -79,7 +80,15 @@ impl MssqlOutputWriteJob {
                 })
             }),
             write_options,
+            phase_timings: Vec::new(),
         }
+    }
+
+    /// Adds phase timings that completed before this deferred write job runs.
+    #[must_use]
+    pub fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        self.phase_timings = phase_timings;
+        self
     }
 
     /// Creates a deferred SQL Server output write job using default write options.
@@ -115,6 +124,12 @@ impl MssqlOutputWriteJob {
         self.resolved_target.summary()
     }
 
+    /// Returns phase timings that completed before this deferred write job runs.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
+    }
+
     fn into_parts(
         self,
     ) -> (
@@ -123,6 +138,7 @@ impl MssqlOutputWriteJob {
         MssqlSchemaPlanOptions,
         MssqlOutputBatchStreamFactory,
         MssqlWriteOptions,
+        Vec<PhaseTimingReport>,
     ) {
         (
             self.output_schema,
@@ -130,6 +146,7 @@ impl MssqlOutputWriteJob {
             self.schema_options,
             self.batches,
             self.write_options,
+            self.phase_timings,
         )
     }
 }
@@ -477,13 +494,17 @@ pub struct MssqlWriteSkippedReport {
 }
 
 impl MssqlWriteSkippedReport {
-    fn previous_output_failed(target: MssqlTargetSummary, failed_output_name: String) -> Self {
+    fn previous_output_failed(
+        target: MssqlTargetSummary,
+        failed_output_name: String,
+        phase_timings: Vec<PhaseTimingReport>,
+    ) -> Self {
         Self {
             target,
             reason: MssqlWriteSkippedReason::PreviousOutputFailed { failed_output_name },
             output_row_count: RowCount::unavailable(),
             batch_shaping: MssqlBatchShapingReport::skipped(ReportReasonCode::PriorFailure),
-            phase_timings: skipped_after_prior_failure_phase_timings(),
+            phase_timings: skipped_after_prior_failure_phase_timings(phase_timings),
         }
     }
 
@@ -598,16 +619,27 @@ where
 
     for job in jobs {
         let target = job.target_summary();
+        let planned_phase_timings = job.phase_timings().to_vec();
 
         if let Some(failed_output_name) = failed_output_name.as_ref() {
             statuses.push(MssqlOutputWriteStatus::Skipped(
-                MssqlWriteSkippedReport::previous_output_failed(target, failed_output_name.clone()),
+                MssqlWriteSkippedReport::previous_output_failed(
+                    target,
+                    failed_output_name.clone(),
+                    planned_phase_timings,
+                ),
             ));
             continue;
         }
 
-        let (output_schema, resolved_target, schema_options, batches, write_options) =
-            job.into_parts();
+        let (
+            output_schema,
+            resolved_target,
+            schema_options,
+            batches,
+            write_options,
+            planned_phase_timings,
+        ) = job.into_parts();
         let stream_setup_timer = PhaseTimer::start(OUTPUT_STREAM_SETUP_PHASE);
         let (batches, stream_setup_timing) = match batches().await {
             Ok(batches) => (batches, stream_setup_timer.completed()),
@@ -615,7 +647,10 @@ where
                 let failure = MssqlWriteFailureReport::from_error(
                     target,
                     error,
-                    stream_setup_failure_phase_timings(stream_setup_timer.failed()),
+                    stream_setup_failure_phase_timings(
+                        planned_phase_timings,
+                        stream_setup_timer.failed(),
+                    ),
                 );
                 failed_output_name = Some(failure.output_name().to_owned());
                 statuses.push(MssqlOutputWriteStatus::Failed(failure));
@@ -636,6 +671,7 @@ where
         {
             Ok(report) => statuses.push(MssqlOutputWriteStatus::Succeeded(
                 report.with_phase_timings(output_write_phase_timings(
+                    planned_phase_timings,
                     stream_setup_timing,
                     write_timer.completed(),
                 )),
@@ -644,7 +680,11 @@ where
                 let failure = MssqlWriteFailureReport::from_error(
                     target,
                     error,
-                    output_write_phase_timings(stream_setup_timing, write_timer.failed()),
+                    output_write_phase_timings(
+                        planned_phase_timings,
+                        stream_setup_timing,
+                        write_timer.failed(),
+                    ),
                 );
                 failed_output_name = Some(failure.output_name().to_owned());
                 statuses.push(MssqlOutputWriteStatus::Failed(failure));
@@ -668,32 +708,40 @@ fn failure_context(error: &DeltaFunnelError) -> Option<&MssqlWriteFailureContext
 }
 
 fn output_write_phase_timings(
+    mut phase_timings: Vec<PhaseTimingReport>,
     stream_setup_timing: PhaseTimingReport,
     write_timing: PhaseTimingReport,
 ) -> Vec<PhaseTimingReport> {
-    vec![stream_setup_timing, write_timing]
+    phase_timings.extend([stream_setup_timing, write_timing]);
+    phase_timings
 }
 
 fn stream_setup_failure_phase_timings(
+    mut phase_timings: Vec<PhaseTimingReport>,
     stream_setup_timing: PhaseTimingReport,
 ) -> Vec<PhaseTimingReport> {
-    vec![
+    phase_timings.extend([
         stream_setup_timing,
         PhaseTimingReport::not_started(SQL_WRITE_PHASE, ReportReasonCode::NotExecuted),
-    ]
+    ]);
+    phase_timings
 }
 
-fn skipped_after_prior_failure_phase_timings() -> Vec<PhaseTimingReport> {
-    vec![
+fn skipped_after_prior_failure_phase_timings(
+    mut phase_timings: Vec<PhaseTimingReport>,
+) -> Vec<PhaseTimingReport> {
+    phase_timings.extend([
         PhaseTimingReport::skipped(OUTPUT_STREAM_SETUP_PHASE, ReportReasonCode::PriorFailure),
         PhaseTimingReport::skipped(SQL_WRITE_PHASE, ReportReasonCode::PriorFailure),
-    ]
+    ]);
+    phase_timings
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::Duration;
 
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
@@ -703,8 +751,10 @@ mod tests {
     use crate::{
         LoadMode, MssqlConnectionConfig, MssqlTargetCleanupStatus, MssqlTargetConfig,
         MssqlTargetOutputPlan, MssqlTargetResolutionContext, MssqlTargetTable, MssqlWritePhase,
-        PhaseStatus, plan_mssql_target_for_output,
+        PhaseStatus, PhaseTimingReport, plan_mssql_target_for_output,
     };
+
+    const PLANNED_PHASE: &str = "planned_phase";
 
     #[derive(Default)]
     struct FakeWorkflowWriter {
@@ -851,6 +901,11 @@ mod tests {
             2,
             3,
         );
+        assert_phase_timing(
+            &report.outputs()[0],
+            PLANNED_PHASE,
+            PhaseStatus::completed(),
+        )?;
         assert_phase_timing(
             &report.outputs()[0],
             OUTPUT_STREAM_SETUP_PHASE,
@@ -1174,6 +1229,7 @@ mod tests {
             0,
             0,
         );
+        assert_phase_timing(second_status, PLANNED_PHASE, PhaseStatus::completed())?;
         assert_phase_timing(
             second_status,
             OUTPUT_STREAM_SETUP_PHASE,
@@ -1377,7 +1433,8 @@ mod tests {
                 }
                 async { Ok(stream::empty()) }
             },
-        ))
+        )
+        .with_phase_timings(planned_phase_timings()))
     }
 
     fn failing_factory_job(
@@ -1400,7 +1457,8 @@ mod tests {
                     )
                 }
             },
-        ))
+        )
+        .with_phase_timings(planned_phase_timings()))
     }
 
     fn polling_error_job(
@@ -1424,7 +1482,15 @@ mod tests {
                     )]))
                 }
             },
-        ))
+        )
+        .with_phase_timings(planned_phase_timings()))
+    }
+
+    fn planned_phase_timings() -> Vec<PhaseTimingReport> {
+        vec![PhaseTimingReport::completed(
+            PLANNED_PHASE,
+            Duration::from_micros(1),
+        )]
     }
 
     fn resolved_target(
@@ -1557,6 +1623,7 @@ mod tests {
             0,
             0,
         );
+        assert_phase_timing(status, PLANNED_PHASE, PhaseStatus::completed())?;
         assert_phase_timing(
             status,
             OUTPUT_STREAM_SETUP_PHASE,

@@ -120,6 +120,7 @@ impl DeltaFunnelSession {
         let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
         let batches = self.batch_stream_for_lazy_table(planned.table()).await?;
 
+        let phase_timings = planned.phase_timings().to_vec();
         writer
             .write_output(
                 output_schema,
@@ -129,6 +130,7 @@ impl DeltaFunnelSession {
                 self.options.mssql_write_options(),
             )
             .await
+            .map(|report| report.with_phase_timings(phase_timings))
     }
 }
 
@@ -653,6 +655,15 @@ mod tests {
         assert_eq!(report.stats().rows_written(), 2);
         assert_eq!(report.stats().batches_written(), call.batches);
         assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert_eq!(
+            report
+                .phase_timings()
+                .iter()
+                .take(2)
+                .map(crate::PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>(),
+            vec![OUTPUT_SCHEMA_PLANNING_PHASE, SQL_TARGET_PLANNING_PHASE]
+        );
         Ok(())
     }
 
