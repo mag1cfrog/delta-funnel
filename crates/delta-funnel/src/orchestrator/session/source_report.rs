@@ -227,6 +227,7 @@ fn delta_source_report_metadata_only(
         source.protocol().clone(),
         scheduling,
     )
+    .with_phase_timings(source.phase_timings().to_vec())
 }
 
 #[cfg(test)]
