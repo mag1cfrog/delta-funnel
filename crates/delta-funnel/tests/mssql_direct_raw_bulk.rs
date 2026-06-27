@@ -20,8 +20,8 @@ use datafusion::arrow::{
 use delta_funnel::{
     DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession, LoadMode, MssqlConnectionConfig,
     MssqlOutputTarget, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus, MssqlTargetConfig,
-    MssqlTargetResolutionContext, MssqlTargetTable, OutputWritePlan, RunMode, SessionOptions,
-    default_mssql_write_options, write_output_batches_to_mssql,
+    MssqlTargetResolutionContext, MssqlTargetTable, OutputWritePlan, RowCount, RunMode,
+    SessionOptions, ValidationStatus, default_mssql_write_options, write_output_batches_to_mssql,
 };
 use futures_util::stream;
 
@@ -210,6 +210,9 @@ async fn run_create_and_load_direct_raw_bulk_test(
             assert_eq!(report.stats().rows_written(), 3);
             assert_eq!(report.stats().batches_written(), 2);
             assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotAttempted);
+            assert_eq!(report.output_row_count(), RowCount::exact(3));
+            assert_eq!(report.target_row_count(), RowCount::exact(3));
+            assert_eq!(report.validation_status(), ValidationStatus::passed());
             Ok(())
         }
         (Err(write_error), Ok(())) => Err(write_error),
@@ -266,6 +269,9 @@ fn run_create_and_load_orchestrator_runtime_test(config: MssqlIntegrationConfig)
             assert_eq!(report.stats().rows_written(), 3);
             assert!(report.stats().batches_written() >= 1);
             assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotAttempted);
+            assert_eq!(report.output_row_count(), RowCount::exact(3));
+            assert_eq!(report.target_row_count(), RowCount::exact(3));
+            assert_eq!(report.validation_status(), ValidationStatus::passed());
             Ok(())
         }
         (Err(write_error), Ok(())) => Err(write_error),
