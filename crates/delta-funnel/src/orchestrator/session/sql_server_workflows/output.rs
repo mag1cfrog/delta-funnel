@@ -36,7 +36,7 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<PlannedMssqlOutput, DeltaFunnelError> {
-        let mut phase_timings = Vec::new();
+        let mut phase_timings = self.phase_timings_for_lazy_table(request.table())?;
 
         let schema_timer = PhaseTimer::start(OUTPUT_SCHEMA_PLANNING_PHASE);
         let schema = match self.schema_for_lazy_table(request.table()) {
@@ -374,6 +374,18 @@ mod tests {
             .create_table_sql()
             .ok_or("expected create table SQL")?;
         assert!(create_table_sql.contains("[dbo].[derived_orders]"));
+        assert_eq!(
+            planned
+                .phase_timings()
+                .iter()
+                .map(crate::PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>(),
+            vec![
+                "lazy_sql_planning",
+                OUTPUT_SCHEMA_PLANNING_PHASE,
+                SQL_TARGET_PLANNING_PHASE
+            ]
+        );
         Ok(())
     }
 
@@ -677,10 +689,14 @@ mod tests {
             report
                 .phase_timings()
                 .iter()
-                .take(2)
+                .take(3)
                 .map(crate::PhaseTimingReport::phase_name)
                 .collect::<Vec<_>>(),
-            vec![OUTPUT_SCHEMA_PLANNING_PHASE, SQL_TARGET_PLANNING_PHASE]
+            vec![
+                "lazy_sql_planning",
+                OUTPUT_SCHEMA_PLANNING_PHASE,
+                SQL_TARGET_PLANNING_PHASE
+            ]
         );
         let validation_timing = report
             .phase_timings()

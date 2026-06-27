@@ -6,13 +6,18 @@ use datafusion::{
     prelude::{DataFrame, SQLOptions},
 };
 
-use crate::{DeltaFunnelError, SqlTablePhase, table_formats::validate_table_source_names};
+use crate::{
+    DeltaFunnelError, PhaseTimingReport, SqlTablePhase, report::PhaseTimer,
+    table_formats::validate_table_source_names,
+};
 
 use super::super::{
     DeltaFunnelSession, LazyTable, LazyTableKind,
     errors::{sql_table_error, unknown_lazy_table_error},
 };
 use super::{DerivedTableLineage, RegisteredSessionSource};
+
+const LAZY_SQL_PLANNING_PHASE: &str = "lazy_sql_planning";
 
 /// Registered SQL-derived table alias tracked by a query-load session.
 #[derive(Clone, PartialEq, Eq)]
@@ -21,6 +26,7 @@ pub struct RegisteredDerivedTable {
     schema: SchemaRef,
     pub(in crate::orchestrator::session) sql_text: String,
     pub(in crate::orchestrator::session) lineage: DerivedTableLineage,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl RegisteredDerivedTable {
@@ -29,12 +35,14 @@ impl RegisteredDerivedTable {
         schema: SchemaRef,
         sql_text: String,
         lineage: DerivedTableLineage,
+        phase_timings: Vec<PhaseTimingReport>,
     ) -> Self {
         Self {
             table,
             schema,
             sql_text,
             lineage,
+            phase_timings,
         }
     }
 
@@ -69,6 +77,12 @@ impl RegisteredDerivedTable {
     pub(crate) const fn lineage(&self) -> &DerivedTableLineage {
         &self.lineage
     }
+
+    /// Returns durable phase timings captured while planning this derived table.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
+    }
 }
 
 impl fmt::Debug for RegisteredDerivedTable {
@@ -79,6 +93,7 @@ impl fmt::Debug for RegisteredDerivedTable {
             .field("schema", &self.schema)
             .field("sql_text", &"<redacted>")
             .field("lineage", &self.lineage)
+            .field("phase_timings", &self.phase_timings)
             .finish()
     }
 }
@@ -90,6 +105,7 @@ pub(in crate::orchestrator::session) struct PendingDerivedTable {
     pub(in crate::orchestrator::session) schema: SchemaRef,
     pub(in crate::orchestrator::session) sql_text: String,
     pub(in crate::orchestrator::session) lineage: DerivedTableLineage,
+    pub(in crate::orchestrator::session) phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl DeltaFunnelSession {
@@ -110,10 +126,18 @@ impl DeltaFunnelSession {
             return sql_table_error(SqlTablePhase::ValidateSql, "SQL text must not be empty");
         }
 
-        let dataframe = self.plan_read_only_sql(sql).await?;
+        let planning_timer = PhaseTimer::start(LAZY_SQL_PLANNING_PHASE);
+        let dataframe = match self.plan_read_only_sql(sql).await {
+            Ok(dataframe) => dataframe,
+            Err(error) => {
+                let _ = planning_timer.failed();
+                return Err(error);
+            }
+        };
         let schema = Arc::new(dataframe.schema().as_arrow().clone());
         let provider = dataframe.into_view();
         let lineage = self.derive_table_lineage_from_sql(sql);
+        let phase_timings = vec![planning_timer.completed()];
         let table = self.allocate_derived_sql_table();
         self.pending_derived_tables.push(PendingDerivedTable {
             table: table.clone(),
@@ -121,6 +145,7 @@ impl DeltaFunnelSession {
             schema,
             sql_text: sql.to_owned(),
             lineage,
+            phase_timings,
         });
         Ok(table)
     }
@@ -170,6 +195,7 @@ impl DeltaFunnelSession {
             pending.schema,
             pending.sql_text,
             pending.lineage,
+            pending.phase_timings,
         ));
         Ok(alias_table)
     }
@@ -203,6 +229,27 @@ impl DeltaFunnelSession {
         self.derived_tables
             .iter()
             .find(|table| table.table().id() == table_id)
+    }
+
+    pub(in crate::orchestrator::session) fn phase_timings_for_lazy_table(
+        &self,
+        table: &LazyTable,
+    ) -> Result<Vec<PhaseTimingReport>, DeltaFunnelError> {
+        if table.kind() == LazyTableKind::DeltaSource {
+            return Ok(Vec::new());
+        }
+
+        self.derived_tables
+            .iter()
+            .find(|derived| derived.table().id() == table.id())
+            .map(|derived| derived.phase_timings().to_vec())
+            .or_else(|| {
+                self.pending_derived_tables
+                    .iter()
+                    .find(|pending| pending.table.id() == table.id())
+                    .map(|pending| pending.phase_timings.clone())
+            })
+            .ok_or_else(|| unknown_lazy_table_error(table))
     }
 
     /// Resolves the session metadata for an alias that is eligible for scoped caching.
@@ -315,6 +362,7 @@ mod tests {
     use super::super::super::{
         DeltaFunnelSession, LazyTableKind, SessionOptions, test_support::DeltaLogTable,
     };
+    use super::LAZY_SQL_PLANNING_PHASE;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TableScanProofReference {
@@ -377,6 +425,24 @@ mod tests {
         assert_eq!(derived.name(), "table_1");
         assert_eq!(session.next_table_id(), 2);
         assert!(session.derived_tables().is_empty());
+        let phase_timings = session.phase_timings_for_lazy_table(&derived)?;
+        assert_eq!(
+            phase_timings
+                .iter()
+                .map(crate::PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>(),
+            vec![LAZY_SQL_PLANNING_PHASE]
+        );
+        assert!(
+            phase_timings
+                .iter()
+                .all(|timing| timing.status().is_completed())
+        );
+        assert!(
+            phase_timings
+                .iter()
+                .all(|timing| timing.elapsed_micros().is_some())
+        );
         Ok(())
     }
 
@@ -416,6 +482,10 @@ mod tests {
 
         assert_eq!(alias.id(), derived.id());
         assert_eq!(alias.name(), "recent_orders");
+        assert_eq!(
+            session.phase_timings_for_lazy_table(&alias)?,
+            session.phase_timings_for_lazy_table(&derived)?
+        );
         assert_eq!(second.id(), 2);
         assert_eq!(second.kind(), LazyTableKind::DerivedSql);
         assert_eq!(session.derived_tables().len(), 1);
