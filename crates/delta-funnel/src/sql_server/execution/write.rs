@@ -212,6 +212,8 @@ pub enum MssqlWritePhase {
     WriteBatch,
     /// Finalize the SQL Server bulk writer.
     Finalize,
+    /// Validate target-side write evidence after finalize succeeds.
+    Validation,
     /// Clean up a DeltaFunnel-created target after a later failure.
     Cleanup,
 }
@@ -226,6 +228,7 @@ impl fmt::Display for MssqlWritePhase {
             Self::ValidateBatchSchema => "validate batch schema",
             Self::WriteBatch => "write batch",
             Self::Finalize => "finalize",
+            Self::Validation => "validation",
             Self::Cleanup => "cleanup",
         })
     }
@@ -1665,6 +1668,7 @@ mod tests {
             ),
             (MssqlWritePhase::WriteBatch, "write batch"),
             (MssqlWritePhase::Finalize, "finalize"),
+            (MssqlWritePhase::Validation, "validation"),
             (MssqlWritePhase::Cleanup, "cleanup"),
         ];
 

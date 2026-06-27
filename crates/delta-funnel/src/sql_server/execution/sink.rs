@@ -15,8 +15,8 @@ use crate::{
 
 use super::{
     LoadMode, MssqlBulkLoadWriter, MssqlPreparedTarget, MssqlSchemaPlanOptions,
-    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteOptions, MssqlWriteReport,
-    ResolvedMssqlTarget,
+    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteFailureContext, MssqlWriteOptions,
+    MssqlWritePhase, MssqlWriteReport, ResolvedMssqlTarget,
 };
 use super::{
     connection::{
@@ -286,11 +286,16 @@ where
         Ok(report) => {
             let report = write_report_with_cleanup(&report, prepared_target.report().cleanup())
                 .with_phase_timings(phase_timings);
-            Ok(apply_no_sql_target_validation(
-                &output_plan,
-                report,
-                validation_options,
-            ))
+            match apply_no_sql_target_validation(&output_plan, report, validation_options) {
+                Ok(report) => Ok(report),
+                Err(error) => Err(cleanup_after_prepared_target_failure(
+                    &mut connection,
+                    &output_plan,
+                    &prepared_target,
+                    error,
+                )
+                .await),
+            }
         }
         Err(error) => Err(cleanup_after_prepared_target_failure(
             &mut connection,
@@ -306,24 +311,65 @@ fn apply_no_sql_target_validation(
     output_plan: &MssqlTargetOutputPlan,
     report: MssqlWriteReport,
     validation_options: ValidationOptions,
-) -> MssqlWriteReport {
+) -> Result<MssqlWriteReport, DeltaFunnelError> {
     match validation_options.target_validation_mode() {
-        TargetValidationMode::Disabled => report.with_target_validation(
+        TargetValidationMode::Disabled => Ok(report.with_target_validation(
             RowCount::unavailable(),
             ValidationStatus::disabled(),
             PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::ValidationDisabled),
-        ),
+        )),
         TargetValidationMode::ValidateIfPossible
             if output_plan.load_mode() != LoadMode::CreateAndLoad =>
         {
-            report.with_target_validation(
+            Ok(report.with_target_validation(
                 RowCount::unavailable(),
                 ValidationStatus::unavailable(ReportReasonCode::UnsupportedLoadMode),
                 PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
-            )
+            ))
         }
-        TargetValidationMode::ValidateIfPossible | TargetValidationMode::Require => report,
+        TargetValidationMode::Require if output_plan.load_mode() != LoadMode::CreateAndLoad => {
+            let report = report.with_target_validation(
+                RowCount::unavailable(),
+                ValidationStatus::required_but_failed(ReportReasonCode::UnsupportedLoadMode),
+                PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
+            );
+            Err(validation_error(
+                output_plan,
+                &report,
+                "target row-count validation is not implemented for this load mode",
+            ))
+        }
+        TargetValidationMode::ValidateIfPossible | TargetValidationMode::Require => Ok(report),
     }
+}
+
+fn validation_error(
+    output_plan: &MssqlTargetOutputPlan,
+    report: &MssqlWriteReport,
+    message: &str,
+) -> DeltaFunnelError {
+    DeltaFunnelError::MssqlWritePhase {
+        context: Box::new(MssqlWriteFailureContext::from_output_plan_with_metrics(
+            output_plan,
+            MssqlWritePhase::Validation,
+            report_metrics_from_report(report),
+        )),
+        message: message.to_owned(),
+    }
+}
+
+fn report_metrics_from_report(report: &MssqlWriteReport) -> MssqlWriteReportMetrics {
+    MssqlWriteReportMetrics::new(
+        report.output_row_count(),
+        report.batch_shaping(),
+        report.stats().rows_written(),
+        report.stats().batches_written(),
+        report.stats().elapsed_ms(),
+        report.partial_write_possible(),
+        report.cleanup(),
+    )
+    .with_target_validation(report.target_row_count(), report.validation_status())
+    .with_phase_timings(report.phase_timings().to_vec())
 }
 
 fn ensure_supported_output_mode(
@@ -484,6 +530,7 @@ fn context_with_cleanup(
             context.partial_write_possible(),
             cleanup,
         )
+        .with_target_validation(context.target_row_count(), context.validation_status())
         .with_phase_timings(context.phase_timings().to_vec()),
     )
 }
@@ -919,6 +966,66 @@ mod tests {
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "write 3", "finish"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_required_validation_fails_and_reports_cleanup()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log));
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Require);
+
+        let error = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            validation_options,
+            Vec::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected unsupported required validation failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected validation write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Validation);
+        assert_eq!(context.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::required_but_failed(ReportReasonCode::UnsupportedLoadMode)
+        );
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert!(message.contains("not implemented for this load mode"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::skipped(ReportReasonCode::UnsupportedLoadMode),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "initialize",
+                "write 3",
+                "finish",
+                "cleanup VerifiedExisting"
+            ]
         );
         Ok(())
     }
