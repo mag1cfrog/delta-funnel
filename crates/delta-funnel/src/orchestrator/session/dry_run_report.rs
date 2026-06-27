@@ -66,7 +66,24 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
-        observability::workflow_started(RunMode::DryRun, requests.len());
+        self.dry_run_all_to_mssql_with_tracing(requests)
+    }
+
+    fn dry_run_all_to_mssql_with_tracing(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        let output_count = requests.len();
+        observability::workflow_started(RunMode::DryRun, output_count);
+        let result = self.dry_run_all_to_mssql_without_tracing(requests);
+        observability::workflow_finished(RunMode::DryRun, output_count, &result);
+        result
+    }
+
+    fn dry_run_all_to_mssql_without_tracing(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
         let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
         let outputs = self.plan_dry_run_all_outputs(requests)?;
         let planning_timing = planning_timer.completed();
@@ -94,7 +111,27 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
-        observability::workflow_started(RunMode::DryRun, requests.len());
+        self.dry_run_all_to_mssql_with_scan_summary_with_tracing(requests)
+            .await
+    }
+
+    async fn dry_run_all_to_mssql_with_scan_summary_with_tracing(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        let output_count = requests.len();
+        observability::workflow_started(RunMode::DryRun, output_count);
+        let result = self
+            .dry_run_all_to_mssql_with_scan_summary_without_tracing(requests)
+            .await;
+        observability::workflow_finished(RunMode::DryRun, output_count, &result);
+        result
+    }
+
+    async fn dry_run_all_to_mssql_with_scan_summary_without_tracing(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
         let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
         let outputs = self.plan_dry_run_all_outputs(requests)?;
         let planning_timing = planning_timer.completed();

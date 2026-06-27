@@ -48,7 +48,37 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        observability::workflow_started(RunMode::Execute, requests.len());
+        self.write_all_with_options_and_writer_with_tracing(requests, options, writer)
+            .await
+    }
+
+    async fn write_all_with_options_and_writer_with_tracing<W>(
+        &self,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+        writer: W,
+    ) -> Result<WriteAllReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        let output_count = requests.len();
+        observability::workflow_started(RunMode::Execute, output_count);
+        let result = self
+            .write_all_with_options_and_writer_without_tracing(requests, options, writer)
+            .await;
+        observability::workflow_finished(RunMode::Execute, output_count, &result);
+        result
+    }
+
+    async fn write_all_with_options_and_writer_without_tracing<W>(
+        &self,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+        writer: W,
+    ) -> Result<WriteAllReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
         let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
         let planned_outputs = self.plan_write_all_outputs(requests)?;
         let phase_timings = vec![planning_timer.completed()];
