@@ -4,7 +4,10 @@ use std::fmt;
 
 use arrow_schema::Schema;
 
-use crate::{DeltaFunnelError, PhaseTimingReport, report::PhaseTimer};
+use crate::{
+    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, report::PhaseTimer,
+    support::sanitize_text_for_display,
+};
 
 use super::{
     LoadMode, MssqlConnectedLifecycleClient, MssqlConnectionConfig, MssqlSchemaPlanOptions,
@@ -83,10 +86,11 @@ impl MssqlConnectedOutputClient {
     pub(crate) async fn target_row_count(
         &mut self,
         prepared_target: &MssqlPreparedTarget,
-    ) -> Result<u64, arrow_tiberius::Error> {
+    ) -> Result<u64, MssqlTargetRowCountFailure> {
         self.client
             .target_row_count(prepared_target.table_name())
             .await
+            .map_err(MssqlTargetRowCountFailure::from_arrow_tiberius)
     }
 
     /// Initializes the bulk writer after target lifecycle preparation.
@@ -148,6 +152,47 @@ pub(crate) async fn connect_mssql_output_client(
         client,
         phase_timings: vec![connect_timer.completed()],
     })
+}
+
+/// Sanitized target row-count query failure for validation reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MssqlTargetRowCountFailure {
+    reason: ReportReasonCode,
+    message: String,
+}
+
+impl MssqlTargetRowCountFailure {
+    #[must_use]
+    pub(crate) fn new(reason: ReportReasonCode, message: impl AsRef<str>) -> Self {
+        Self {
+            reason,
+            message: sanitize_text_for_display(message.as_ref()),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn reason(&self) -> ReportReasonCode {
+        self.reason
+    }
+
+    #[must_use]
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn from_arrow_tiberius(error: arrow_tiberius::Error) -> Self {
+        let reason = match error {
+            arrow_tiberius::Error::TargetRowCountQuery { .. } => {
+                ReportReasonCode::PermissionUnavailable
+            }
+            arrow_tiberius::Error::TargetRowCountUnexpectedResult { .. } => {
+                ReportReasonCode::CapabilityUnavailable
+            }
+            _ => ReportReasonCode::CapabilityUnavailable,
+        };
+
+        Self::new(reason, error.to_string())
+    }
 }
 
 fn connect_error(
@@ -314,6 +359,27 @@ mod tests {
 
         assert!(source.contains("target_row_count"));
         assert!(source.contains("prepared_target.table_name()"));
+        assert!(source.contains("MssqlTargetRowCountFailure::from_arrow_tiberius"));
+    }
+
+    #[test]
+    fn target_row_count_errors_are_classified_and_sanitized() {
+        let unexpected = MssqlTargetRowCountFailure::from_arrow_tiberius(
+            arrow_tiberius::Error::TargetRowCountUnexpectedResult {
+                reason: "target row count query returned NULL".to_owned(),
+            },
+        );
+
+        assert_eq!(unexpected.reason(), ReportReasonCode::CapabilityUnavailable);
+        assert!(unexpected.message().contains("unexpected result"));
+
+        let sanitized = MssqlTargetRowCountFailure::new(
+            ReportReasonCode::PermissionUnavailable,
+            "permission denied\nretry later",
+        );
+
+        assert_eq!(sanitized.reason(), ReportReasonCode::PermissionUnavailable);
+        assert_eq!(sanitized.message(), "permission denied\\nretry later");
     }
 
     #[test]
