@@ -4,11 +4,15 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, DeltaSourceConfig, DeltaTableProviderConfig,
-    RegisteredDeltaSource, load_delta_source, preflight_delta_protocol,
-    register_delta_sources_with_scan_execution_options,
+    PhaseTimingReport, RegisteredDeltaSource, load_delta_source, preflight_delta_protocol,
+    register_delta_sources_with_scan_execution_options, report::PhaseTimer,
 };
 
 use super::super::{DeltaFunnelSession, LazyTable};
+
+const SOURCE_LOADING_PHASE: &str = "source_loading";
+const PROTOCOL_PREFLIGHT_PHASE: &str = "protocol_preflight";
+const DATAFUSION_REGISTRATION_PHASE: &str = "datafusion_registration";
 
 /// Registered Delta source tracked by a query-load session.
 #[derive(Clone, PartialEq, Eq)]
@@ -18,16 +22,22 @@ pub struct RegisteredSessionSource {
     snapshot_version: u64,
     schema: SchemaRef,
     protocol: DeltaProtocolReport,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl RegisteredSessionSource {
-    pub(super) fn from_registered(table: LazyTable, registered: RegisteredDeltaSource) -> Self {
+    pub(super) fn from_registered(
+        table: LazyTable,
+        registered: RegisteredDeltaSource,
+        phase_timings: Vec<PhaseTimingReport>,
+    ) -> Self {
         Self {
             table,
             source_uri: registered.table_uri,
             snapshot_version: registered.snapshot_version,
             schema: registered.schema,
             protocol: registered.protocol,
+            phase_timings,
         }
     }
 
@@ -66,6 +76,12 @@ impl RegisteredSessionSource {
     pub const fn protocol(&self) -> &DeltaProtocolReport {
         &self.protocol
     }
+
+    /// Returns durable phase timings captured while registering this source.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
+    }
 }
 
 impl fmt::Debug for RegisteredSessionSource {
@@ -77,6 +93,7 @@ impl fmt::Debug for RegisteredSessionSource {
             .field("snapshot_version", &self.snapshot_version)
             .field("schema", &self.schema)
             .field("protocol", &self.protocol)
+            .field("phase_timings", &self.phase_timings)
             .finish()
     }
 }
@@ -96,9 +113,34 @@ impl DeltaFunnelSession {
     /// source state is updated only after the DataFusion registration succeeds.
     pub fn delta_lake(&mut self, source: DeltaSourceConfig) -> Result<LazyTable, DeltaFunnelError> {
         self.reject_registered_alias_name(&source.name)?;
-        let planned = load_delta_source(source)?;
-        let preflight = preflight_delta_protocol(&planned)?;
-        let registered = register_delta_sources_with_scan_execution_options(
+        let mut phase_timings = Vec::new();
+
+        let source_timer = PhaseTimer::start(SOURCE_LOADING_PHASE);
+        let planned = match load_delta_source(source) {
+            Ok(planned) => {
+                phase_timings.push(source_timer.completed());
+                planned
+            }
+            Err(error) => {
+                phase_timings.push(source_timer.failed());
+                return Err(error);
+            }
+        };
+
+        let preflight_timer = PhaseTimer::start(PROTOCOL_PREFLIGHT_PHASE);
+        let preflight = match preflight_delta_protocol(&planned) {
+            Ok(preflight) => {
+                phase_timings.push(preflight_timer.completed());
+                preflight
+            }
+            Err(error) => {
+                phase_timings.push(preflight_timer.failed());
+                return Err(error);
+            }
+        };
+
+        let registration_timer = PhaseTimer::start(DATAFUSION_REGISTRATION_PHASE);
+        let registered = match register_delta_sources_with_scan_execution_options(
             &self.context,
             vec![DeltaTableProviderConfig {
                 source: planned,
@@ -106,7 +148,16 @@ impl DeltaFunnelSession {
                 scan_target_partitions: None,
             }],
             self.options.provider_scan_options(),
-        )?;
+        ) {
+            Ok(registered) => {
+                phase_timings.push(registration_timer.completed());
+                registered
+            }
+            Err(error) => {
+                phase_timings.push(registration_timer.failed());
+                return Err(error);
+            }
+        };
         let registered =
             registered
                 .sources
@@ -116,7 +167,8 @@ impl DeltaFunnelSession {
                     message: "Delta source registration returned no registered source".to_owned(),
                 })?;
         let table = self.allocate_delta_source_table(registered.name.clone());
-        let session_source = RegisteredSessionSource::from_registered(table.clone(), registered);
+        let session_source =
+            RegisteredSessionSource::from_registered(table.clone(), registered, phase_timings);
         self.sources.push(session_source);
         Ok(table)
     }
@@ -130,6 +182,7 @@ impl DeltaFunnelSession {
 
 #[cfg(test)]
 mod tests {
+    use super::{DATAFUSION_REGISTRATION_PHASE, PROTOCOL_PREFLIGHT_PHASE, SOURCE_LOADING_PHASE};
     use crate::{
         DeltaFunnelError, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
         DeltaSourceConfig, DeltaStorageOptions, QueryOptions,
@@ -189,6 +242,28 @@ mod tests {
         assert_eq!(
             report.provider_stats_reason(),
             Some(crate::ReportReasonCode::NotExecuted)
+        );
+        let phase_timings = report.phase_timings();
+        assert_eq!(
+            phase_timings
+                .iter()
+                .map(crate::PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>(),
+            vec![
+                SOURCE_LOADING_PHASE,
+                PROTOCOL_PREFLIGHT_PHASE,
+                DATAFUSION_REGISTRATION_PHASE
+            ]
+        );
+        assert!(
+            phase_timings
+                .iter()
+                .all(|timing| timing.status().is_completed())
+        );
+        assert!(
+            phase_timings
+                .iter()
+                .all(|timing| timing.elapsed_micros().is_some())
         );
 
         Ok(())

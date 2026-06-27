@@ -5,7 +5,10 @@
 //! serializable-friendly by exposing stable string codes and primitive values
 //! without adding a serialization dependency in this slice.
 
-use std::fmt;
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 
 use crate::error::DeltaFunnelError;
 
@@ -40,6 +43,12 @@ pub const fn u128_to_u64_saturating(value: u128) -> u64 {
     } else {
         value as u64
     }
+}
+
+/// Saturates a [`Duration`] into the public microsecond timing report shape.
+#[must_use]
+pub fn duration_to_micros_saturating(duration: Duration) -> u64 {
+    u128_to_u64_saturating(duration.as_micros())
 }
 
 /// Controls whether target-side validation should run when a workflow supports it.
@@ -863,6 +872,108 @@ impl fmt::Display for PhaseStatus {
     }
 }
 
+/// Timing evidence for one stable workflow phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseTimingReport {
+    phase_name: String,
+    status: PhaseStatus,
+    elapsed_micros: Option<u64>,
+}
+
+impl PhaseTimingReport {
+    /// Creates a completed phase timing report.
+    #[must_use]
+    pub fn completed(phase_name: impl Into<String>, elapsed: Duration) -> Self {
+        Self {
+            phase_name: phase_name.into(),
+            status: PhaseStatus::completed(),
+            elapsed_micros: Some(duration_to_micros_saturating(elapsed)),
+        }
+    }
+
+    /// Creates a failed phase timing report with elapsed time through failure.
+    #[must_use]
+    pub fn failed(phase_name: impl Into<String>, elapsed: Duration) -> Self {
+        Self {
+            phase_name: phase_name.into(),
+            status: PhaseStatus::failed(),
+            elapsed_micros: Some(duration_to_micros_saturating(elapsed)),
+        }
+    }
+
+    /// Creates a skipped phase timing report.
+    #[must_use]
+    pub fn skipped(phase_name: impl Into<String>, reason: ReportReasonCode) -> Self {
+        Self {
+            phase_name: phase_name.into(),
+            status: PhaseStatus::skipped(reason),
+            elapsed_micros: None,
+        }
+    }
+
+    /// Creates a not-started phase timing report.
+    #[must_use]
+    pub fn not_started(phase_name: impl Into<String>, reason: ReportReasonCode) -> Self {
+        Self {
+            phase_name: phase_name.into(),
+            status: PhaseStatus::not_started(reason),
+            elapsed_micros: None,
+        }
+    }
+
+    /// Creates an unavailable phase timing report.
+    #[must_use]
+    pub fn unavailable(phase_name: impl Into<String>, reason: ReportReasonCode) -> Self {
+        Self {
+            phase_name: phase_name.into(),
+            status: PhaseStatus::unavailable(reason),
+            elapsed_micros: None,
+        }
+    }
+
+    /// Returns the stable phase name.
+    #[must_use]
+    pub fn phase_name(&self) -> &str {
+        &self.phase_name
+    }
+
+    /// Returns the phase timing status.
+    #[must_use]
+    pub const fn status(&self) -> PhaseStatus {
+        self.status
+    }
+
+    /// Returns elapsed phase time in microseconds when measured.
+    #[must_use]
+    pub const fn elapsed_micros(&self) -> Option<u64> {
+        self.elapsed_micros
+    }
+}
+
+/// Monotonic timer used to build durable phase timing reports.
+#[derive(Debug)]
+pub(crate) struct PhaseTimer {
+    phase_name: &'static str,
+    started_at: Instant,
+}
+
+impl PhaseTimer {
+    pub(crate) fn start(phase_name: &'static str) -> Self {
+        Self {
+            phase_name,
+            started_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn completed(self) -> PhaseTimingReport {
+        PhaseTimingReport::completed(self.phase_name, self.started_at.elapsed())
+    }
+
+    pub(crate) fn failed(self) -> PhaseTimingReport {
+        PhaseTimingReport::failed(self.phase_name, self.started_at.elapsed())
+    }
+}
+
 /// Classification for an output-level workflow status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputStatusKind {
@@ -1293,11 +1404,14 @@ impl ValidationOptions {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         DryRunScanSummaryMode, FileCount, FileCountKind, OutputStatus, OutputStatusKind,
-        PhaseStatus, PhaseStatusKind, ReportReasonCode, RowCount, RowCountKind,
-        TargetValidationMode, ValidationOptions, ValidationStatus, ValidationStatusKind,
-        WorkflowStatus, WorkflowStatusKind, u128_to_u64_saturating,
+        PhaseStatus, PhaseStatusKind, PhaseTimer, PhaseTimingReport, ReportReasonCode, RowCount,
+        RowCountKind, TargetValidationMode, ValidationOptions, ValidationStatus,
+        ValidationStatusKind, WorkflowStatus, WorkflowStatusKind, duration_to_micros_saturating,
+        u128_to_u64_saturating,
     };
 
     #[test]
@@ -1708,6 +1822,65 @@ mod tests {
         assert!(debug.contains("Unavailable"));
         assert!(!debug.contains("server="));
         assert!(!debug.contains("password"));
+    }
+
+    #[test]
+    fn duration_to_micros_saturates_wide_durations() {
+        assert_eq!(duration_to_micros_saturating(Duration::from_micros(42)), 42);
+        assert_eq!(
+            duration_to_micros_saturating(Duration::new(u64::MAX, 999_999_999)),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn phase_timing_report_preserves_status_reason_and_elapsed_time() {
+        let completed =
+            PhaseTimingReport::completed("sql_target_planning", Duration::from_micros(1_234));
+        assert_eq!(completed.phase_name(), "sql_target_planning");
+        assert_eq!(completed.status(), PhaseStatus::completed());
+        assert_eq!(completed.elapsed_micros(), Some(1_234));
+
+        let failed = PhaseTimingReport::failed("sql_write", Duration::from_millis(2));
+        assert_eq!(failed.status(), PhaseStatus::failed());
+        assert_eq!(failed.elapsed_micros(), Some(2_000));
+
+        let skipped =
+            PhaseTimingReport::skipped("validation", ReportReasonCode::ValidationDisabled);
+        assert_eq!(
+            skipped.status(),
+            PhaseStatus::skipped(ReportReasonCode::ValidationDisabled)
+        );
+        assert_eq!(skipped.elapsed_micros(), None);
+
+        let not_started =
+            PhaseTimingReport::not_started("finalize", ReportReasonCode::PriorFailure);
+        assert_eq!(
+            not_started.status(),
+            PhaseStatus::not_started(ReportReasonCode::PriorFailure)
+        );
+        assert_eq!(not_started.elapsed_micros(), None);
+
+        let unavailable =
+            PhaseTimingReport::unavailable("source_loading", ReportReasonCode::NotExecuted);
+        assert_eq!(
+            unavailable.status(),
+            PhaseStatus::unavailable(ReportReasonCode::NotExecuted)
+        );
+        assert_eq!(unavailable.elapsed_micros(), None);
+    }
+
+    #[test]
+    fn phase_timer_uses_monotonic_elapsed_time() {
+        let completed = PhaseTimer::start("config_validation").completed();
+        assert_eq!(completed.phase_name(), "config_validation");
+        assert_eq!(completed.status(), PhaseStatus::completed());
+        assert!(completed.elapsed_micros().is_some());
+
+        let failed = PhaseTimer::start("source_loading").failed();
+        assert_eq!(failed.phase_name(), "source_loading");
+        assert_eq!(failed.status(), PhaseStatus::failed());
+        assert!(failed.elapsed_micros().is_some());
     }
 
     #[test]

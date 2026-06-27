@@ -72,7 +72,8 @@ impl DeltaFunnelSession {
                     planned.output_plan().schema_plan_options(),
                     batches,
                     self.options.mssql_write_options(),
-                ))
+                )
+                .with_phase_timings(planned.phase_timings().to_vec()))
             })
             .collect()
     }
@@ -108,7 +109,8 @@ impl DeltaFunnelSession {
                     planned.output_plan().schema_plan_options(),
                     batches,
                     self.options.mssql_write_options(),
-                ))
+                )
+                .with_phase_timings(planned.phase_timings().to_vec()))
             })
             .collect()
     }
@@ -265,8 +267,10 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].output_name(), "west_output");
         assert_eq!(jobs[0].target_summary().table().table(), "west_orders");
+        assert_eq!(jobs[0].phase_timings(), planned[0].phase_timings());
         assert_eq!(jobs[1].output_name(), "east_output");
         assert_eq!(jobs[1].target_summary().table().table(), "east_orders");
+        assert_eq!(jobs[1].phase_timings(), planned[1].phase_timings());
         Ok(())
     }
 }

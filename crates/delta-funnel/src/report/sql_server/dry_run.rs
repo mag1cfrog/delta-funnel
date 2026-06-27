@@ -2,8 +2,8 @@ use std::fmt;
 
 use crate::{
     DeltaSourceReport, LazyTableKind, LoadMode, MssqlDdlPlan, MssqlLifecyclePlan, MssqlSchemaPlan,
-    MssqlTargetTable, OutputStatus, PlannedMssqlOutput, ReportReasonCode, RowCount, RunMode,
-    SourceUsageStatus, ValidationStatus, WorkflowStatus,
+    MssqlTargetTable, OutputStatus, PhaseTimingReport, PlannedMssqlOutput, ReportReasonCode,
+    RowCount, RunMode, SourceUsageStatus, ValidationStatus, WorkflowStatus,
 };
 
 /// Output schema field included in an MSSQL dry-run report.
@@ -147,6 +147,7 @@ pub struct MssqlDryRunOutputReport {
     output_row_count_reason: Option<ReportReasonCode>,
     status: OutputStatus,
     validation_status: ValidationStatus,
+    phase_timings: Vec<PhaseTimingReport>,
     sql_server_contacted: bool,
     row_production_started: bool,
     table_lifecycle_started: bool,
@@ -159,6 +160,7 @@ impl MssqlDryRunOutputReport {
         sql_identity: MssqlDryRunSqlIdentityReport,
         source_usage_status: SourceUsageStatus,
         used_source_names: Vec<String>,
+        phase_timings: Vec<PhaseTimingReport>,
     ) -> Self {
         let output_schema = planned_output
             .output_plan()
@@ -177,6 +179,7 @@ impl MssqlDryRunOutputReport {
             output_row_count_reason: Some(ReportReasonCode::NotExecuted),
             status: OutputStatus::dry_run_planned(),
             validation_status: ValidationStatus::skipped(ReportReasonCode::DryRun),
+            phase_timings,
             sql_server_contacted: false,
             row_production_started: false,
             table_lifecycle_started: false,
@@ -292,6 +295,12 @@ impl MssqlDryRunOutputReport {
         self.validation_status
     }
 
+    /// Returns per-phase dry-run output timing reports.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
+    }
+
     /// Returns the dry-run action mode.
     #[must_use]
     pub const fn run_mode(&self) -> RunMode {
@@ -329,6 +338,7 @@ pub struct MssqlDryRunWorkflowReport {
     outputs: Vec<MssqlDryRunOutputReport>,
     sources: Vec<DeltaSourceReport>,
     status: WorkflowStatus,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl MssqlDryRunWorkflowReport {
@@ -346,7 +356,13 @@ impl MssqlDryRunWorkflowReport {
             outputs,
             sources,
             status,
+            phase_timings: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        self.phase_timings = phase_timings;
+        self
     }
 
     /// Returns the dry-run action mode.
@@ -383,6 +399,12 @@ impl MssqlDryRunWorkflowReport {
     #[must_use]
     pub fn sources(&self) -> &[DeltaSourceReport] {
         &self.sources
+    }
+
+    /// Returns top-level dry-run workflow phase timing reports.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
     }
 
     /// Returns whether scan metadata was exhausted for every known query-used source.

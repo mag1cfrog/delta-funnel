@@ -2,7 +2,8 @@ use std::fmt;
 
 use crate::{
     DeltaProtocolReport, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend,
-    DeltaProviderScanExecutionOptions, FileCount, QueryOptions, ReportReasonCode,
+    DeltaProviderScanExecutionOptions, FileCount, PhaseTimingReport, QueryOptions,
+    ReportReasonCode,
 };
 
 /// Conservative source usage status for a workflow report.
@@ -49,6 +50,7 @@ pub struct DeltaSourceReport {
     used_by_output_names: Vec<String>,
     provider_read_stats: Option<DeltaProviderReadStatsSnapshot>,
     provider_stats_reason: Option<ReportReasonCode>,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 /// Configured provider scheduling options included with a Delta source report.
@@ -145,7 +147,13 @@ impl DeltaSourceReport {
             used_by_output_names: Vec::new(),
             provider_read_stats: None,
             provider_stats_reason: Some(ReportReasonCode::NotExecuted),
+            phase_timings: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        self.phase_timings = phase_timings;
+        self
     }
 
     pub(crate) fn with_usage(
@@ -254,6 +262,12 @@ impl DeltaSourceReport {
     #[must_use]
     pub const fn provider_stats_reason(&self) -> Option<ReportReasonCode> {
         self.provider_stats_reason
+    }
+
+    /// Returns durable phase timings captured while registering this source.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
     }
 }
 

@@ -5,11 +5,16 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlTargetOutputPlan, MssqlWriteOptions,
-    MssqlWriteReport, ResolvedMssqlTarget, plan_mssql_target_for_resolved_output,
-    write_output_batches_to_mssql,
+    MssqlWriteReport, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget,
+    plan_mssql_target_for_resolved_output, report::PhaseTimer, write_output_batches_to_mssql,
 };
 
 use super::super::{DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode};
+
+pub(in crate::orchestrator::session) const OUTPUT_SCHEMA_PLANNING_PHASE: &str =
+    "output_schema_planning";
+pub(in crate::orchestrator::session) const SQL_TARGET_PLANNING_PHASE: &str = "sql_target_planning";
+const VALIDATION_PHASE: &str = "validation";
 
 impl DeltaFunnelSession {
     /// Plans one lazy table as an MSSQL output without executing the table.
@@ -31,25 +36,55 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<PlannedMssqlOutput, DeltaFunnelError> {
-        let schema = self.schema_for_lazy_table(request.table())?;
+        let mut phase_timings = self.phase_timings_for_lazy_table(request.table())?;
+
+        let schema_timer = PhaseTimer::start(OUTPUT_SCHEMA_PLANNING_PHASE);
+        let schema = match self.schema_for_lazy_table(request.table()) {
+            Ok(schema) => {
+                phase_timings.push(schema_timer.completed());
+                schema
+            }
+            Err(error) => {
+                phase_timings.push(schema_timer.failed());
+                return Err(error);
+            }
+        };
+
+        let target_timer = PhaseTimer::start(SQL_TARGET_PLANNING_PHASE);
         let resolved_target =
-            request
+            match request
                 .target()
                 .target()
                 .resolve(crate::MssqlTargetResolutionContext {
                     output_name: Some(request.target().output_name()),
                     default_connection: self.options.default_mssql_connection(),
-                })?;
-        let output_plan = plan_mssql_target_for_resolved_output(
+                }) {
+                Ok(resolved_target) => resolved_target,
+                Err(error) => {
+                    phase_timings.push(target_timer.failed());
+                    return Err(error);
+                }
+            };
+        let output_plan = match plan_mssql_target_for_resolved_output(
             schema.as_ref(),
             &resolved_target,
             self.options.mssql_schema_options(),
-        )?;
+        ) {
+            Ok(output_plan) => {
+                phase_timings.push(target_timer.completed());
+                output_plan
+            }
+            Err(error) => {
+                phase_timings.push(target_timer.failed());
+                return Err(error);
+            }
+        };
 
         Ok(PlannedMssqlOutput::new(
             request.clone(),
             resolved_target,
             output_plan,
+            phase_timings,
         ))
     }
 
@@ -86,6 +121,7 @@ impl DeltaFunnelSession {
         let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
         let batches = self.batch_stream_for_lazy_table(planned.table()).await?;
 
+        let phase_timings = planned.phase_timings().to_vec();
         writer
             .write_output(
                 output_schema,
@@ -95,7 +131,24 @@ impl DeltaFunnelSession {
                 self.options.mssql_write_options(),
             )
             .await
+            .map(ensure_validation_phase_timing)
+            .map(|report| report.with_phase_timings(phase_timings))
     }
+}
+
+fn ensure_validation_phase_timing(report: MssqlWriteReport) -> MssqlWriteReport {
+    if report
+        .phase_timings()
+        .iter()
+        .any(|timing| timing.phase_name() == VALIDATION_PHASE)
+    {
+        return report;
+    }
+
+    report.with_appended_phase_timings(vec![PhaseTimingReport::not_started(
+        VALIDATION_PHASE,
+        ReportReasonCode::NotExecuted,
+    )])
 }
 
 #[async_trait]
@@ -164,7 +217,10 @@ mod tests {
             override_connection, secret_connection,
         },
     };
-    use super::OrchestratorMssqlOutputWriter;
+    use super::{
+        OUTPUT_SCHEMA_PLANNING_PHASE, OrchestratorMssqlOutputWriter, SQL_TARGET_PLANNING_PHASE,
+        VALIDATION_PHASE,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeOrchestratorWriteCall {
@@ -265,6 +321,26 @@ mod tests {
             "customer_name"
         );
         assert_eq!(planned.output_plan().create_table_sql(), None);
+        assert_eq!(
+            planned
+                .phase_timings()
+                .iter()
+                .map(crate::PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>(),
+            vec![OUTPUT_SCHEMA_PLANNING_PHASE, SQL_TARGET_PLANNING_PHASE]
+        );
+        assert!(
+            planned
+                .phase_timings()
+                .iter()
+                .all(|timing| timing.status().is_completed())
+        );
+        assert!(
+            planned
+                .phase_timings()
+                .iter()
+                .all(|timing| timing.elapsed_micros().is_some())
+        );
         Ok(())
     }
 
@@ -298,6 +374,18 @@ mod tests {
             .create_table_sql()
             .ok_or("expected create table SQL")?;
         assert!(create_table_sql.contains("[dbo].[derived_orders]"));
+        assert_eq!(
+            planned
+                .phase_timings()
+                .iter()
+                .map(crate::PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>(),
+            vec![
+                "lazy_sql_planning",
+                OUTPUT_SCHEMA_PLANNING_PHASE,
+                SQL_TARGET_PLANNING_PHASE
+            ]
+        );
         Ok(())
     }
 
@@ -597,6 +685,28 @@ mod tests {
         assert_eq!(report.stats().rows_written(), 2);
         assert_eq!(report.stats().batches_written(), call.batches);
         assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert_eq!(
+            report
+                .phase_timings()
+                .iter()
+                .take(3)
+                .map(crate::PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>(),
+            vec![
+                "lazy_sql_planning",
+                OUTPUT_SCHEMA_PLANNING_PHASE,
+                SQL_TARGET_PLANNING_PHASE
+            ]
+        );
+        let validation_timing = report
+            .phase_timings()
+            .iter()
+            .find(|timing| timing.phase_name() == VALIDATION_PHASE)
+            .ok_or("expected validation phase timing")?;
+        assert_eq!(
+            validation_timing.status(),
+            crate::PhaseStatus::not_started(crate::ReportReasonCode::NotExecuted)
+        );
         Ok(())
     }
 

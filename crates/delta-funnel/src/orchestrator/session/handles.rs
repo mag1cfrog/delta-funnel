@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::{
-    MssqlTargetConfig, MssqlTargetOutputPlan, ResolvedMssqlTarget,
+    MssqlTargetConfig, MssqlTargetOutputPlan, PhaseTimingReport, ResolvedMssqlTarget,
     support::sanitize_text_for_display,
 };
 
@@ -176,6 +176,7 @@ pub struct PlannedMssqlOutput {
     request: OutputWritePlan,
     resolved_target: ResolvedMssqlTarget,
     output_plan: MssqlTargetOutputPlan,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl PlannedMssqlOutput {
@@ -183,11 +184,13 @@ impl PlannedMssqlOutput {
         request: OutputWritePlan,
         resolved_target: ResolvedMssqlTarget,
         output_plan: MssqlTargetOutputPlan,
+        phase_timings: Vec<PhaseTimingReport>,
     ) -> Self {
         Self {
             request,
             resolved_target,
             output_plan,
+            phase_timings,
         }
     }
 
@@ -219,6 +222,12 @@ impl PlannedMssqlOutput {
     #[must_use]
     pub const fn output_plan(&self) -> &MssqlTargetOutputPlan {
         &self.output_plan
+    }
+
+    /// Returns durable phase timings captured while planning this output.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
     }
 }
 

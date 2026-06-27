@@ -2,7 +2,8 @@ use std::fmt;
 
 use crate::{
     MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan, MssqlTargetTable,
-    MssqlWritePhase, PhaseStatus, ReportReasonCode, RowCount, sql_server::LoadMode,
+    MssqlWritePhase, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount,
+    sql_server::LoadMode,
 };
 
 /// Per-output SQL Server write statistics.
@@ -192,10 +193,11 @@ impl MssqlBatchShapingReport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MssqlWriteReportMetrics {
     pub(crate) output_row_count: RowCount,
     pub(crate) batch_shaping: MssqlBatchShapingReport,
+    pub(crate) phase_timings: Vec<PhaseTimingReport>,
     pub(crate) rows_written: u64,
     pub(crate) batches_written: u64,
     pub(crate) elapsed_ms: u64,
@@ -216,12 +218,18 @@ impl MssqlWriteReportMetrics {
         Self {
             output_row_count,
             batch_shaping,
+            phase_timings: Vec::new(),
             rows_written,
             batches_written,
             elapsed_ms,
             partial_write_possible,
             cleanup,
         }
+    }
+
+    pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        self.phase_timings = phase_timings;
+        self
     }
 }
 
@@ -260,6 +268,7 @@ pub struct MssqlWriteReport {
     output_schema: Vec<MssqlOutputFieldReport>,
     output_row_count: RowCount,
     batch_shaping: MssqlBatchShapingReport,
+    phase_timings: Vec<PhaseTimingReport>,
     stats: MssqlWriteStats,
     partial_write_possible: bool,
     cleanup: MssqlTargetCleanupStatus,
@@ -315,6 +324,7 @@ impl MssqlWriteReport {
             output_schema,
             output_row_count: metrics.output_row_count,
             batch_shaping: metrics.batch_shaping,
+            phase_timings: metrics.phase_timings,
             stats: MssqlWriteStats::new(
                 output_name,
                 metrics.rows_written,
@@ -324,6 +334,27 @@ impl MssqlWriteReport {
             partial_write_possible: metrics.partial_write_possible,
             cleanup: metrics.cleanup,
         }
+    }
+
+    pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        let mut existing_timings = std::mem::take(&mut self.phase_timings);
+        let mut phase_timings = phase_timings;
+        phase_timings.append(&mut existing_timings);
+        self.phase_timings = phase_timings;
+        self
+    }
+
+    pub(crate) fn with_appended_phase_timings(
+        mut self,
+        mut phase_timings: Vec<PhaseTimingReport>,
+    ) -> Self {
+        self.phase_timings.append(&mut phase_timings);
+        self
+    }
+
+    pub(crate) fn with_cleanup(mut self, cleanup: MssqlTargetCleanupStatus) -> Self {
+        self.cleanup = cleanup;
+        self
     }
 
     /// Returns the selected output name.
@@ -378,6 +409,12 @@ impl MssqlWriteReport {
     #[must_use]
     pub const fn batch_shaping(&self) -> MssqlBatchShapingReport {
         self.batch_shaping
+    }
+
+    /// Returns workflow phase timing reports for this output when available.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
     }
 
     /// Returns whether the target may contain a partial write after failure.
@@ -567,5 +604,24 @@ impl MssqlWriteFailureContext {
     #[must_use]
     pub const fn report(&self) -> &MssqlWriteReport {
         &self.report
+    }
+
+    pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        self.report = self.report.with_phase_timings(phase_timings);
+        self
+    }
+
+    pub(crate) fn with_appended_phase_timings(
+        mut self,
+        phase_timings: Vec<PhaseTimingReport>,
+    ) -> Self {
+        self.report = self.report.with_appended_phase_timings(phase_timings);
+        self
+    }
+
+    /// Returns workflow phase timing reports known at failure time.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        self.report.phase_timings()
     }
 }

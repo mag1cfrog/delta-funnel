@@ -2,7 +2,10 @@
 //!
 //! This module owns DeltaFunnel-side write defaults around `arrow-tiberius`.
 
-use std::{fmt, time::Instant};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 
 use arrow_schema::Schema;
 pub use arrow_tiberius::WriteOptions as MssqlWriteOptions;
@@ -15,12 +18,18 @@ use futures_util::{
 };
 
 use crate::{
-    DeltaFunnelError, ReportReasonCode, RowCount,
+    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount,
     report::sql_server::{
         MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
         MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
     },
 };
+
+const POLL_BATCH_STREAM_PHASE: &str = "poll_batch_stream";
+const VALIDATE_BATCH_SCHEMA_PHASE: &str = "validate_batch_schema";
+const WRITE_BATCH_PHASE: &str = "write_batch";
+const FINALIZE_PHASE: &str = "finalize";
+const VALIDATION_PHASE: &str = "validation";
 
 use super::{
     LoadMode, MssqlLifecycleExecutionGuardrail, MssqlPreparedTarget, MssqlPreparedTargetAction,
@@ -375,6 +384,112 @@ fn write_report_metrics(
     )
 }
 
+#[derive(Default)]
+struct MssqlWriteLoopPhaseTimings {
+    poll_batch_stream: Duration,
+    validate_batch_schema: Duration,
+    write_batch: Duration,
+    validation_attempted: bool,
+    write_attempted: bool,
+}
+
+impl MssqlWriteLoopPhaseTimings {
+    fn add_poll_batch_stream(&mut self, elapsed: Duration) {
+        self.poll_batch_stream = self.poll_batch_stream.saturating_add(elapsed);
+    }
+
+    fn add_validate_batch_schema(&mut self, elapsed: Duration) {
+        self.validation_attempted = true;
+        self.validate_batch_schema = self.validate_batch_schema.saturating_add(elapsed);
+    }
+
+    fn add_write_batch(&mut self, elapsed: Duration) {
+        self.write_attempted = true;
+        self.write_batch = self.write_batch.saturating_add(elapsed);
+    }
+
+    fn completed(&self, finalize_elapsed: Duration) -> Vec<PhaseTimingReport> {
+        vec![
+            PhaseTimingReport::completed(POLL_BATCH_STREAM_PHASE, self.poll_batch_stream),
+            self.validate_batch_schema_completed_or_not_started(),
+            self.write_batch_completed_or_not_started(),
+            PhaseTimingReport::completed(FINALIZE_PHASE, finalize_elapsed),
+            PhaseTimingReport::not_started(VALIDATION_PHASE, ReportReasonCode::NotExecuted),
+        ]
+    }
+
+    fn poll_batch_stream_failed(&self) -> Vec<PhaseTimingReport> {
+        vec![
+            PhaseTimingReport::failed(POLL_BATCH_STREAM_PHASE, self.poll_batch_stream),
+            self.validate_batch_schema_completed_or_not_started(),
+            self.write_batch_completed_or_not_started(),
+            PhaseTimingReport::not_started(FINALIZE_PHASE, ReportReasonCode::NotExecuted),
+            PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::FailureBeforeValidation,
+            ),
+        ]
+    }
+
+    fn validate_batch_schema_failed(&self) -> Vec<PhaseTimingReport> {
+        vec![
+            PhaseTimingReport::completed(POLL_BATCH_STREAM_PHASE, self.poll_batch_stream),
+            PhaseTimingReport::failed(VALIDATE_BATCH_SCHEMA_PHASE, self.validate_batch_schema),
+            self.write_batch_completed_or_not_started(),
+            PhaseTimingReport::not_started(FINALIZE_PHASE, ReportReasonCode::NotExecuted),
+            PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::FailureBeforeValidation,
+            ),
+        ]
+    }
+
+    fn write_batch_failed(&self) -> Vec<PhaseTimingReport> {
+        vec![
+            PhaseTimingReport::completed(POLL_BATCH_STREAM_PHASE, self.poll_batch_stream),
+            self.validate_batch_schema_completed_or_not_started(),
+            PhaseTimingReport::failed(WRITE_BATCH_PHASE, self.write_batch),
+            PhaseTimingReport::not_started(FINALIZE_PHASE, ReportReasonCode::NotExecuted),
+            PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::FailureBeforeValidation,
+            ),
+        ]
+    }
+
+    fn finalize_failed(&self, finalize_elapsed: Duration) -> Vec<PhaseTimingReport> {
+        vec![
+            PhaseTimingReport::completed(POLL_BATCH_STREAM_PHASE, self.poll_batch_stream),
+            self.validate_batch_schema_completed_or_not_started(),
+            self.write_batch_completed_or_not_started(),
+            PhaseTimingReport::failed(FINALIZE_PHASE, finalize_elapsed),
+            PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::FailureBeforeValidation,
+            ),
+        ]
+    }
+
+    fn validate_batch_schema_completed_or_not_started(&self) -> PhaseTimingReport {
+        if self.validation_attempted {
+            PhaseTimingReport::completed(VALIDATE_BATCH_SCHEMA_PHASE, self.validate_batch_schema)
+        } else {
+            PhaseTimingReport::not_started(
+                VALIDATE_BATCH_SCHEMA_PHASE,
+                ReportReasonCode::NotExecuted,
+            )
+        }
+    }
+
+    fn write_batch_completed_or_not_started(&self) -> PhaseTimingReport {
+        if self.write_attempted {
+            PhaseTimingReport::completed(WRITE_BATCH_PHASE, self.write_batch)
+        } else {
+            PhaseTimingReport::not_started(WRITE_BATCH_PHASE, ReportReasonCode::NotExecuted)
+        }
+    }
+}
+
 /// Writes one planned SQL Server output through an injected bulk-load writer.
 #[allow(dead_code)]
 pub(crate) async fn write_mssql_batches_with_writer<W, S>(
@@ -395,9 +510,17 @@ where
     let mut shaped_batches = 0_u64;
     let cleanup = MssqlTargetCleanupStatus::NotApplicable;
     let started_at = Instant::now();
+    let mut phase_timings = MssqlWriteLoopPhaseTimings::default();
     pin_mut!(batches);
 
-    while let Some(batch) = batches.next().await {
+    loop {
+        let poll_started_at = Instant::now();
+        let Some(batch) = batches.next().await else {
+            phase_timings.add_poll_batch_stream(poll_started_at.elapsed());
+            break;
+        };
+        phase_timings.add_poll_batch_stream(poll_started_at.elapsed());
+
         let batch = batch.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
             mssql_write_phase_error(
@@ -414,7 +537,8 @@ where
                     MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                     partial_write_possible(output_plan, rows_written, batches_written),
                     cleanup,
-                ),
+                )
+                .with_phase_timings(phase_timings.poll_batch_stream_failed()),
                 source.to_string(),
             )
         })?;
@@ -423,11 +547,13 @@ where
         input_rows = input_rows.saturating_add(row_count);
         input_batches = input_batches.saturating_add(1);
 
-        arrow_tiberius::validate_record_batch_schema_against_mappings(
+        let validation_started_at = Instant::now();
+        let validation_result = arrow_tiberius::validate_record_batch_schema_against_mappings(
             &batch,
             output_plan.schema_mappings(),
-        )
-        .map_err(|source| {
+        );
+        phase_timings.add_validate_batch_schema(validation_started_at.elapsed());
+        validation_result.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
             mssql_batch_schema_validation_error(
                 output_plan,
@@ -443,49 +569,22 @@ where
                     MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                     partial_write_possible(output_plan, rows_written, batches_written),
                     cleanup,
-                ),
+                )
+                .with_phase_timings(phase_timings.validate_batch_schema_failed()),
             )
         })?;
 
-        MssqlBulkLoadWriter::write_batch(&mut writer, &batch)
-            .await
-            .map_err(|source| {
-                let elapsed_ms = elapsed_ms_since(started_at);
-                mssql_write_phase_error(
-                    output_plan,
-                    MssqlWritePhase::WriteBatch,
-                    write_report_metrics(
-                        RowCount::partial(input_rows),
-                        MssqlBatchShapingReport::failed(
-                            input_batches,
-                            input_rows,
-                            shaped_batches,
-                            shaped_rows,
-                        ),
-                        MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
-                        partial_write_possible(output_plan, rows_written, batches_written),
-                        cleanup,
-                    ),
-                    source.to_string(),
-                )
-            })?;
-
-        rows_written = rows_written.saturating_add(row_count);
-        batches_written = batches_written.saturating_add(1);
-        shaped_rows = shaped_rows.saturating_add(row_count);
-        shaped_batches = shaped_batches.saturating_add(1);
-    }
-
-    MssqlBulkLoadWriter::finish(writer)
-        .await
-        .map_err(|source| {
+        let write_batch_started_at = Instant::now();
+        let write_batch_result = MssqlBulkLoadWriter::write_batch(&mut writer, &batch).await;
+        phase_timings.add_write_batch(write_batch_started_at.elapsed());
+        write_batch_result.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
             mssql_write_phase_error(
                 output_plan,
-                MssqlWritePhase::Finalize,
+                MssqlWritePhase::WriteBatch,
                 write_report_metrics(
-                    RowCount::exact(input_rows),
-                    MssqlBatchShapingReport::completed(
+                    RowCount::partial(input_rows),
+                    MssqlBatchShapingReport::failed(
                         input_batches,
                         input_rows,
                         shaped_batches,
@@ -494,10 +593,42 @@ where
                     MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                     partial_write_possible(output_plan, rows_written, batches_written),
                     cleanup,
-                ),
+                )
+                .with_phase_timings(phase_timings.write_batch_failed()),
                 source.to_string(),
             )
         })?;
+
+        rows_written = rows_written.saturating_add(row_count);
+        batches_written = batches_written.saturating_add(1);
+        shaped_rows = shaped_rows.saturating_add(row_count);
+        shaped_batches = shaped_batches.saturating_add(1);
+    }
+
+    let finalize_started_at = Instant::now();
+    let finish_result = MssqlBulkLoadWriter::finish(writer).await;
+    let finalize_elapsed = finalize_started_at.elapsed();
+    finish_result.map_err(|source| {
+        let elapsed_ms = elapsed_ms_since(started_at);
+        mssql_write_phase_error(
+            output_plan,
+            MssqlWritePhase::Finalize,
+            write_report_metrics(
+                RowCount::exact(input_rows),
+                MssqlBatchShapingReport::completed(
+                    input_batches,
+                    input_rows,
+                    shaped_batches,
+                    shaped_rows,
+                ),
+                MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
+                partial_write_possible(output_plan, rows_written, batches_written),
+                cleanup,
+            )
+            .with_phase_timings(phase_timings.finalize_failed(finalize_elapsed)),
+            source.to_string(),
+        )
+    })?;
 
     Ok(MssqlWriteReport::from_output_plan_with_metrics(
         output_plan,
@@ -512,7 +643,8 @@ where
             MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms_since(started_at)),
             false,
             cleanup,
-        ),
+        )
+        .with_phase_timings(phase_timings.completed(finalize_elapsed)),
     ))
 }
 
@@ -647,7 +779,7 @@ mod tests {
     use crate::{
         DeltaFunnelError, MssqlBatchShapingReport, MssqlConnectionConfig, MssqlConnectionSource,
         MssqlOutputFieldReport, MssqlTargetConfig, MssqlTargetTable, MssqlWriteStats, PhaseStatus,
-        plan_mssql_target_for_output,
+        PhaseTimingReport, ReportReasonCode, plan_mssql_target_for_output,
     };
 
     fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
@@ -1202,6 +1334,31 @@ mod tests {
         assert_output_schema(report.output_schema());
         assert_eq!(report.output_row_count(), RowCount::exact(3));
         assert_batch_shaping(report.batch_shaping(), PhaseStatus::completed(), 2, 3, 2, 3);
+        assert_phase_timing(
+            report.phase_timings(),
+            POLL_BATCH_STREAM_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATE_BATCH_SCHEMA_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            WRITE_BATCH_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            FINALIZE_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+        )?;
         let debug = format!("{report:?}");
         assert!(!debug.contains("open"));
         assert!(!debug.contains("closed"));
@@ -1273,6 +1430,21 @@ mod tests {
             assert_write_phase_error(error, MssqlWritePhase::PollBatchStream, 2, 1, true)?;
         assert_eq!(context.output_row_count(), RowCount::partial(2));
         assert_batch_shaping(context.batch_shaping(), PhaseStatus::failed(), 1, 2, 1, 2);
+        assert_phase_timing(
+            context.phase_timings(),
+            POLL_BATCH_STREAM_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            FINALIZE_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
+        )?;
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2]);
         assert_eq!(log.finish_count, 0);
@@ -1305,6 +1477,16 @@ mod tests {
         let context = assert_batch_schema_validation_error(error, Some((0, "order_id")))?;
         assert_eq!(context.output_row_count(), RowCount::partial(1));
         assert_batch_shaping(context.batch_shaping(), PhaseStatus::failed(), 1, 1, 0, 0);
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATE_BATCH_SCHEMA_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            WRITE_BATCH_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+        )?;
         let log = lock_fake_writer_log(&log)?;
         assert!(log.batch_rows.is_empty());
         assert_eq!(log.finish_count, 0);
@@ -1353,6 +1535,21 @@ mod tests {
         assert!(context.stats().elapsed_ms() > 0);
         assert!(context.partial_write_possible());
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert_phase_timing(
+            context.phase_timings(),
+            WRITE_BATCH_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            FINALIZE_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
+        )?;
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 0);
@@ -1436,6 +1633,16 @@ mod tests {
             2,
             3,
         );
+        assert_phase_timing(
+            context.phase_timings(),
+            FINALIZE_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
+        )?;
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 1);
@@ -1606,6 +1813,27 @@ mod tests {
         assert!(context.partial_write_possible());
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
         assert_eq!(context.report().output_name(), "orders_output");
+        Ok(())
+    }
+
+    fn assert_phase_timing(
+        timings: &[PhaseTimingReport],
+        phase_name: &str,
+        expected_status: PhaseStatus,
+    ) -> Result<(), DeltaFunnelError> {
+        let timing = timings
+            .iter()
+            .find(|timing| timing.phase_name() == phase_name)
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: format!("missing phase timing {phase_name}"),
+            })?;
+
+        assert_eq!(timing.status(), expected_status);
+        if expected_status.is_completed() || expected_status.is_failed() {
+            assert!(timing.elapsed_micros().is_some());
+        } else {
+            assert_eq!(timing.elapsed_micros(), None);
+        }
         Ok(())
     }
 
