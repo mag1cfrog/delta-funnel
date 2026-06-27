@@ -1666,6 +1666,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_existing_mismatched_target_delta_fails_validation_and_reports_counts()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_counts(vec![10, 14]);
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        let error = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            ValidationOptions::new(),
+            Vec::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected append delta validation mismatch".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected validation write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Validation);
+        assert_eq!(context.output_row_count(), RowCount::exact(3));
+        assert_eq!(context.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(context.target_row_count_after_write(), RowCount::exact(14));
+        assert_eq!(context.target_row_count(), RowCount::exact(14));
+        assert_eq!(context.validation_status(), ValidationStatus::failed());
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert!(message.contains("target row-count delta did not match"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "count target rows",
+                "initialize",
+                "write 3",
+                "finish",
+                "count target rows",
+                "cleanup VerifiedExisting"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn public_one_output_api_rejects_replace_before_connection()
     -> Result<(), DeltaFunnelError> {
         let connection = secret_connection()?;
