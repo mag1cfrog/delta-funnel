@@ -1747,6 +1747,58 @@ mod tests {
     }
 
     #[test]
+    fn write_report_records_target_validation_outcome() -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+        let report = MssqlWriteReport::from_output_plan_with_metrics(
+            &output_plan,
+            MssqlWriteReportMetrics::new(
+                RowCount::exact(42),
+                MssqlBatchShapingReport::completed(3, 42, 3, 42),
+                42,
+                3,
+                125,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            )
+            .with_phase_timings(vec![PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::NotExecuted,
+            )]),
+        );
+
+        let report = report.with_target_validation(
+            RowCount::exact(42),
+            ValidationStatus::passed(),
+            PhaseTimingReport::completed(VALIDATION_PHASE, Duration::from_micros(7)),
+        );
+
+        assert_eq!(report.target_row_count(), RowCount::exact(42));
+        assert_eq!(report.validation_status(), ValidationStatus::passed());
+        assert_eq!(
+            report
+                .phase_timings()
+                .iter()
+                .filter(|timing| timing.phase_name() == VALIDATION_PHASE)
+                .count(),
+            1
+        );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn write_report_debug_redacts_connection_secret() -> Result<(), DeltaFunnelError> {
         let connection = secret_connection()?;
         let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);

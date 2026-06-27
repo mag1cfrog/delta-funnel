@@ -235,6 +235,17 @@ impl MssqlWriteReportMetrics {
         self.phase_timings = phase_timings;
         self
     }
+
+    #[allow(dead_code)]
+    pub(crate) const fn with_target_validation(
+        mut self,
+        target_row_count: RowCount,
+        validation_status: ValidationStatus,
+    ) -> Self {
+        self.target_row_count = target_row_count;
+        self.validation_status = validation_status;
+        self
+    }
 }
 
 /// Cleanup reporting state for a SQL Server target owned by create-and-load.
@@ -362,6 +373,19 @@ impl MssqlWriteReport {
 
     pub(crate) fn with_cleanup(mut self, cleanup: MssqlTargetCleanupStatus) -> Self {
         self.cleanup = cleanup;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_target_validation(
+        mut self,
+        target_row_count: RowCount,
+        validation_status: ValidationStatus,
+        validation_timing: PhaseTimingReport,
+    ) -> Self {
+        self.target_row_count = target_row_count;
+        self.validation_status = validation_status;
+        replace_phase_timing(&mut self.phase_timings, validation_timing);
         self
     }
 
@@ -655,5 +679,17 @@ impl MssqlWriteFailureContext {
     #[must_use]
     pub fn phase_timings(&self) -> &[PhaseTimingReport] {
         self.report.phase_timings()
+    }
+}
+
+#[allow(dead_code)]
+fn replace_phase_timing(phase_timings: &mut Vec<PhaseTimingReport>, timing: PhaseTimingReport) {
+    if let Some(existing_timing) = phase_timings
+        .iter_mut()
+        .find(|existing_timing| existing_timing.phase_name() == timing.phase_name())
+    {
+        *existing_timing = timing;
+    } else {
+        phase_timings.push(timing);
     }
 }
