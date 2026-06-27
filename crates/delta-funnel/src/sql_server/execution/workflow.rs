@@ -14,7 +14,7 @@ use futures_util::Stream;
 
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationOptions,
-    ValidationStatus, report::PhaseTimer, support::sanitize_text_for_display,
+    ValidationStatus, observability, report::PhaseTimer, support::sanitize_text_for_display,
 };
 
 use super::{
@@ -715,15 +715,21 @@ where
         let planned_phase_timings = job.phase_timings().to_vec();
 
         if let Some(failed_output_name) = failed_output_name.as_ref() {
-            statuses.push(MssqlOutputWriteStatus::Skipped(
-                MssqlWriteSkippedReport::previous_output_failed(
-                    target,
-                    failed_output_name.clone(),
-                    planned_phase_timings,
-                ),
-            ));
+            let skipped = MssqlWriteSkippedReport::previous_output_failed(
+                target,
+                failed_output_name.clone(),
+                planned_phase_timings,
+            );
+            observability::output_skipped(
+                skipped.output_name(),
+                skipped.target().table(),
+                skipped.target().load_mode(),
+                "prior_failure",
+            );
+            statuses.push(MssqlOutputWriteStatus::Skipped(skipped));
             continue;
         }
+        observability::output_started(target.output_name(), target.table(), target.load_mode());
 
         let (
             output_schema,
@@ -747,6 +753,12 @@ where
                     ),
                 );
                 failed_output_name = Some(failure.output_name().to_owned());
+                observability::output_failed(
+                    failure.output_name(),
+                    failure.target().table(),
+                    failure.target().load_mode(),
+                    failure.error(),
+                );
                 statuses.push(MssqlOutputWriteStatus::Failed(failure));
                 continue;
             }
@@ -764,13 +776,19 @@ where
             )
             .await
         {
-            Ok(report) => statuses.push(MssqlOutputWriteStatus::Succeeded(
-                report.with_phase_timings(output_write_phase_timings(
+            Ok(report) => {
+                let report = report.with_phase_timings(output_write_phase_timings(
                     planned_phase_timings,
                     stream_setup_timing,
                     write_timer.completed(),
-                )),
-            )),
+                ));
+                observability::output_completed(
+                    report.output_name(),
+                    report.target_table(),
+                    report.load_mode(),
+                );
+                statuses.push(MssqlOutputWriteStatus::Succeeded(report));
+            }
             Err(error) => {
                 let failure = MssqlWriteFailureReport::from_error(
                     target,
@@ -782,6 +800,12 @@ where
                     ),
                 );
                 failed_output_name = Some(failure.output_name().to_owned());
+                observability::output_failed(
+                    failure.output_name(),
+                    failure.target().table(),
+                    failure.target().load_mode(),
+                    failure.error(),
+                );
                 statuses.push(MssqlOutputWriteStatus::Failed(failure));
             }
         }
