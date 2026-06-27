@@ -6,10 +6,14 @@ use datafusion::arrow::datatypes::SchemaRef;
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlTargetOutputPlan, MssqlWriteOptions,
     MssqlWriteReport, ResolvedMssqlTarget, plan_mssql_target_for_resolved_output,
-    write_output_batches_to_mssql,
+    report::PhaseTimer, write_output_batches_to_mssql,
 };
 
 use super::super::{DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode};
+
+pub(in crate::orchestrator::session) const OUTPUT_SCHEMA_PLANNING_PHASE: &str =
+    "output_schema_planning";
+pub(in crate::orchestrator::session) const SQL_TARGET_PLANNING_PHASE: &str = "sql_target_planning";
 
 impl DeltaFunnelSession {
     /// Plans one lazy table as an MSSQL output without executing the table.
@@ -31,25 +35,55 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<PlannedMssqlOutput, DeltaFunnelError> {
-        let schema = self.schema_for_lazy_table(request.table())?;
+        let mut phase_timings = Vec::new();
+
+        let schema_timer = PhaseTimer::start(OUTPUT_SCHEMA_PLANNING_PHASE);
+        let schema = match self.schema_for_lazy_table(request.table()) {
+            Ok(schema) => {
+                phase_timings.push(schema_timer.completed());
+                schema
+            }
+            Err(error) => {
+                phase_timings.push(schema_timer.failed());
+                return Err(error);
+            }
+        };
+
+        let target_timer = PhaseTimer::start(SQL_TARGET_PLANNING_PHASE);
         let resolved_target =
-            request
+            match request
                 .target()
                 .target()
                 .resolve(crate::MssqlTargetResolutionContext {
                     output_name: Some(request.target().output_name()),
                     default_connection: self.options.default_mssql_connection(),
-                })?;
-        let output_plan = plan_mssql_target_for_resolved_output(
+                }) {
+                Ok(resolved_target) => resolved_target,
+                Err(error) => {
+                    phase_timings.push(target_timer.failed());
+                    return Err(error);
+                }
+            };
+        let output_plan = match plan_mssql_target_for_resolved_output(
             schema.as_ref(),
             &resolved_target,
             self.options.mssql_schema_options(),
-        )?;
+        ) {
+            Ok(output_plan) => {
+                phase_timings.push(target_timer.completed());
+                output_plan
+            }
+            Err(error) => {
+                phase_timings.push(target_timer.failed());
+                return Err(error);
+            }
+        };
 
         Ok(PlannedMssqlOutput::new(
             request.clone(),
             resolved_target,
             output_plan,
+            phase_timings,
         ))
     }
 
@@ -164,7 +198,9 @@ mod tests {
             override_connection, secret_connection,
         },
     };
-    use super::OrchestratorMssqlOutputWriter;
+    use super::{
+        OUTPUT_SCHEMA_PLANNING_PHASE, OrchestratorMssqlOutputWriter, SQL_TARGET_PLANNING_PHASE,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeOrchestratorWriteCall {
@@ -265,6 +301,26 @@ mod tests {
             "customer_name"
         );
         assert_eq!(planned.output_plan().create_table_sql(), None);
+        assert_eq!(
+            planned
+                .phase_timings()
+                .iter()
+                .map(crate::PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>(),
+            vec![OUTPUT_SCHEMA_PLANNING_PHASE, SQL_TARGET_PLANNING_PHASE]
+        );
+        assert!(
+            planned
+                .phase_timings()
+                .iter()
+                .all(|timing| timing.status().is_completed())
+        );
+        assert!(
+            planned
+                .phase_timings()
+                .iter()
+                .all(|timing| timing.elapsed_micros().is_some())
+        );
         Ok(())
     }
 

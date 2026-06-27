@@ -24,7 +24,6 @@ pub(super) fn stable_sql_identity_hash(sql: &str) -> String {
     format!("{hash:016x}")
 }
 
-const SQL_TARGET_PLANNING_PHASE: &str = "sql_target_planning";
 const QUERY_EXECUTION_PHASE: &str = "query_execution";
 const BATCH_SHAPING_PHASE: &str = "batch_shaping";
 const SQL_WRITE_PHASE: &str = "sql_write";
@@ -139,11 +138,10 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
-        let planning_timer = PhaseTimer::start(SQL_TARGET_PLANNING_PHASE);
         let planned = self.plan_mssql_output(request)?;
-        let planning_timing = planning_timer.completed();
 
-        self.dry_run_output_report_for_plan(planned, dry_run_output_phase_timings(planning_timing))
+        let phase_timings = dry_run_output_phase_timings(planned.phase_timings().to_vec());
+        self.dry_run_output_report_for_plan(planned, phase_timings)
     }
 
     fn dry_run_output_report_for_plan(
@@ -202,15 +200,17 @@ impl DeltaFunnelSession {
     }
 }
 
-fn dry_run_output_phase_timings(planning_timing: PhaseTimingReport) -> Vec<PhaseTimingReport> {
-    vec![
-        planning_timing,
+fn dry_run_output_phase_timings(
+    mut planning_timings: Vec<PhaseTimingReport>,
+) -> Vec<PhaseTimingReport> {
+    planning_timings.extend([
         PhaseTimingReport::skipped(QUERY_EXECUTION_PHASE, ReportReasonCode::DryRun),
         PhaseTimingReport::skipped(BATCH_SHAPING_PHASE, ReportReasonCode::DryRun),
         PhaseTimingReport::skipped(SQL_WRITE_PHASE, ReportReasonCode::DryRun),
         PhaseTimingReport::skipped(FINALIZE_PHASE, ReportReasonCode::DryRun),
         PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::DryRun),
-    ]
+    ]);
+    planning_timings
 }
 
 fn ensure_dry_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
@@ -246,6 +246,7 @@ mod tests {
     use super::super::{
         DeltaFunnelSession, LazyTableKind, OutputWritePlan, RunMode, SessionOptions,
         SourceUsageStatus,
+        sql_server_workflows::{OUTPUT_SCHEMA_PLANNING_PHASE, SQL_TARGET_PLANNING_PHASE},
         test_support::{
             DeltaLogTable, execute_output_request, output_request, override_connection,
             scan_counting_marker_region_provider, secret_connection,
@@ -253,8 +254,7 @@ mod tests {
     };
     use super::{
         BATCH_SHAPING_PHASE, FINALIZE_PHASE, OUTPUT_PLANNING_PHASE, QUERY_EXECUTION_PHASE,
-        SOURCE_REPORTING_PHASE, SQL_TARGET_PLANNING_PHASE, SQL_WRITE_PHASE, VALIDATION_PHASE,
-        stable_sql_identity_hash,
+        SOURCE_REPORTING_PHASE, SQL_WRITE_PHASE, VALIDATION_PHASE, stable_sql_identity_hash,
     };
     use crate::MssqlDryRunSqlIdentityState;
 
@@ -371,10 +371,12 @@ mod tests {
         assert!(!report.row_production_started());
         assert!(!report.table_lifecycle_started());
         assert!(!report.bulk_writer_started());
-        assert_eq!(report.phase_timings().len(), 6);
-        let planning = phase_timing(&report, SQL_TARGET_PLANNING_PHASE)?;
-        assert!(planning.status().is_completed());
-        assert!(planning.elapsed_micros().is_some());
+        assert_eq!(report.phase_timings().len(), 7);
+        for phase_name in [OUTPUT_SCHEMA_PLANNING_PHASE, SQL_TARGET_PLANNING_PHASE] {
+            let planning = phase_timing(&report, phase_name)?;
+            assert!(planning.status().is_completed());
+            assert!(planning.elapsed_micros().is_some());
+        }
         for phase_name in [
             QUERY_EXECUTION_PHASE,
             BATCH_SHAPING_PHASE,
