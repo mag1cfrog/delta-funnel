@@ -422,6 +422,7 @@ impl MssqlWriteFailureReport {
         phase_timings: Vec<PhaseTimingReport>,
     ) -> Self {
         let context = failure_context(&error).cloned().map(Box::new);
+        let phase_timings = merged_failure_phase_timings(phase_timings, context.as_deref());
         let output_row_count = context.as_deref().map_or(
             RowCount::unavailable(),
             MssqlWriteFailureContext::output_row_count,
@@ -482,6 +483,28 @@ impl MssqlWriteFailureReport {
     pub fn phase_timings(&self) -> &[PhaseTimingReport] {
         &self.phase_timings
     }
+}
+
+fn merged_failure_phase_timings(
+    mut phase_timings: Vec<PhaseTimingReport>,
+    context: Option<&MssqlWriteFailureContext>,
+) -> Vec<PhaseTimingReport> {
+    let Some(context) = context else {
+        return phase_timings;
+    };
+
+    for timing in context.phase_timings() {
+        if let Some(existing) = phase_timings
+            .iter_mut()
+            .find(|existing| existing.phase_name() == timing.phase_name())
+        {
+            *existing = timing.clone();
+        } else {
+            phase_timings.push(timing.clone());
+        }
+    }
+
+    phase_timings
 }
 
 /// Structured report for a skipped SQL Server output.
@@ -947,15 +970,24 @@ mod tests {
         let second = output_plan("second", LoadMode::AppendExisting)?;
         let first_report =
             write_report(&first, 2, 1, false, MssqlTargetCleanupStatus::NotApplicable);
-        let failure = phase_error(
+        let failure_context = MssqlWriteFailureContext::from_output_plan(
             &second,
             MssqlWritePhase::WriteBatch,
             1,
             1,
+            0,
             true,
             MssqlTargetCleanupStatus::NotApplicable,
-            "write failed",
-        );
+        )
+        .with_phase_timings(vec![
+            PhaseTimingReport::completed("prepare_target_lifecycle", Duration::from_micros(10)),
+            PhaseTimingReport::failed("write_batch", Duration::from_micros(20)),
+            PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::FailureBeforeValidation,
+            ),
+        ]);
+        let failure = phase_error_with_context(failure_context, "write failed");
         let writer = FakeWorkflowWriter::new(vec![Ok(first_report), Err(failure)]);
 
         let report = write_mssql_outputs_with_writer(
@@ -986,11 +1018,20 @@ mod tests {
             PhaseStatus::completed(),
         )?;
         assert_phase_timing(second_status, SQL_WRITE_PHASE, PhaseStatus::failed())?;
+        assert_phase_timing(second_status, "write_batch", PhaseStatus::failed())?;
         assert_phase_timing(
             second_status,
             VALIDATION_PHASE,
             PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
         )?;
+        assert_eq!(
+            second_status
+                .phase_timings()
+                .iter()
+                .filter(|timing| timing.phase_name() == VALIDATION_PHASE)
+                .count(),
+            1
+        );
 
         Ok(())
     }
@@ -1592,8 +1633,8 @@ mod tests {
         cleanup: MssqlTargetCleanupStatus,
         message: &str,
     ) -> DeltaFunnelError {
-        DeltaFunnelError::MssqlWritePhase {
-            context: Box::new(MssqlWriteFailureContext::from_output_plan(
+        phase_error_with_context(
+            MssqlWriteFailureContext::from_output_plan(
                 output_plan,
                 phase,
                 rows_written,
@@ -1601,7 +1642,17 @@ mod tests {
                 0,
                 partial_write_possible,
                 cleanup,
-            )),
+            ),
+            message,
+        )
+    }
+
+    fn phase_error_with_context(
+        context: MssqlWriteFailureContext,
+        message: &str,
+    ) -> DeltaFunnelError {
+        DeltaFunnelError::MssqlWritePhase {
+            context: Box::new(context),
             message: message.to_owned(),
         }
     }
