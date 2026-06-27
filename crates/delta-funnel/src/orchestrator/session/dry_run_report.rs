@@ -1,5 +1,6 @@
 use crate::{
-    DeltaFunnelError, ReportReasonCode,
+    DeltaFunnelError, PhaseTimingReport, ReportReasonCode,
+    report::PhaseTimer,
     report::sql_server::{
         MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport,
     },
@@ -23,6 +24,13 @@ pub(super) fn stable_sql_identity_hash(sql: &str) -> String {
     format!("{hash:016x}")
 }
 
+const SQL_TARGET_PLANNING_PHASE: &str = "sql_target_planning";
+const QUERY_EXECUTION_PHASE: &str = "query_execution";
+const BATCH_SHAPING_PHASE: &str = "batch_shaping";
+const SQL_WRITE_PHASE: &str = "sql_write";
+const FINALIZE_PHASE: &str = "finalize";
+const VALIDATION_PHASE: &str = "validation";
+
 impl DeltaFunnelSession {
     /// Dry-runs one selected lazy table as an MSSQL output.
     ///
@@ -39,9 +47,8 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
     ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
         ensure_dry_run_mode(request.target().run_mode())?;
-        let planned = self.plan_mssql_output(request)?;
 
-        self.dry_run_output_report_for_plan(planned)
+        self.plan_dry_run_output(request)
     }
 
     /// Dry-runs multiple selected lazy tables as one MSSQL output workflow.
@@ -110,16 +117,27 @@ impl DeltaFunnelSession {
             .iter()
             .map(|request| {
                 ensure_write_all_dry_run_mode(request.target().run_mode())?;
-                let planned = self.plan_mssql_output(request)?;
 
-                self.dry_run_output_report_for_plan(planned)
+                self.plan_dry_run_output(request)
             })
             .collect()
+    }
+
+    fn plan_dry_run_output(
+        &self,
+        request: &OutputWritePlan,
+    ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
+        let planning_timer = PhaseTimer::start(SQL_TARGET_PLANNING_PHASE);
+        let planned = self.plan_mssql_output(request)?;
+        let planning_timing = planning_timer.completed();
+
+        self.dry_run_output_report_for_plan(planned, dry_run_output_phase_timings(planning_timing))
     }
 
     fn dry_run_output_report_for_plan(
         &self,
         planned_output: PlannedMssqlOutput,
+        phase_timings: Vec<PhaseTimingReport>,
     ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
         let sql_identity = self.sql_identity_for_lazy_table(planned_output.table());
         let (source_usage_status, used_source_names) =
@@ -129,6 +147,7 @@ impl DeltaFunnelSession {
             sql_identity,
             source_usage_status,
             used_source_names,
+            phase_timings,
         ))
     }
 
@@ -171,6 +190,17 @@ impl DeltaFunnelSession {
     }
 }
 
+fn dry_run_output_phase_timings(planning_timing: PhaseTimingReport) -> Vec<PhaseTimingReport> {
+    vec![
+        planning_timing,
+        PhaseTimingReport::skipped(QUERY_EXECUTION_PHASE, ReportReasonCode::DryRun),
+        PhaseTimingReport::skipped(BATCH_SHAPING_PHASE, ReportReasonCode::DryRun),
+        PhaseTimingReport::skipped(SQL_WRITE_PHASE, ReportReasonCode::DryRun),
+        PhaseTimingReport::skipped(FINALIZE_PHASE, ReportReasonCode::DryRun),
+        PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::DryRun),
+    ]
+}
+
 fn ensure_dry_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
     match run_mode {
         RunMode::DryRun => Ok(()),
@@ -209,7 +239,10 @@ mod tests {
             scan_counting_marker_region_provider, secret_connection,
         },
     };
-    use super::stable_sql_identity_hash;
+    use super::{
+        BATCH_SHAPING_PHASE, FINALIZE_PHASE, QUERY_EXECUTION_PHASE, SQL_TARGET_PLANNING_PHASE,
+        SQL_WRITE_PHASE, VALIDATION_PHASE, stable_sql_identity_hash,
+    };
     use crate::MssqlDryRunSqlIdentityState;
 
     #[test]
@@ -224,6 +257,17 @@ mod tests {
             stable_sql_identity_hash("select marker where region = 'west'"),
             "cbd6889e027b0f88"
         );
+    }
+
+    fn phase_timing<'a>(
+        report: &'a crate::MssqlDryRunOutputReport,
+        phase_name: &str,
+    ) -> Result<&'a crate::PhaseTimingReport, Box<dyn std::error::Error>> {
+        report
+            .phase_timings()
+            .iter()
+            .find(|timing| timing.phase_name() == phase_name)
+            .ok_or_else(|| format!("missing phase timing `{phase_name}`").into())
     }
 
     #[tokio::test]
@@ -303,6 +347,24 @@ mod tests {
         assert!(!report.row_production_started());
         assert!(!report.table_lifecycle_started());
         assert!(!report.bulk_writer_started());
+        assert_eq!(report.phase_timings().len(), 6);
+        let planning = phase_timing(&report, SQL_TARGET_PLANNING_PHASE)?;
+        assert!(planning.status().is_completed());
+        assert!(planning.elapsed_micros().is_some());
+        for phase_name in [
+            QUERY_EXECUTION_PHASE,
+            BATCH_SHAPING_PHASE,
+            SQL_WRITE_PHASE,
+            FINALIZE_PHASE,
+            VALIDATION_PHASE,
+        ] {
+            let timing = phase_timing(&report, phase_name)?;
+            assert_eq!(
+                timing.status(),
+                crate::PhaseStatus::skipped(ReportReasonCode::DryRun)
+            );
+            assert_eq!(timing.elapsed_micros(), None);
+        }
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
         Ok(())
     }

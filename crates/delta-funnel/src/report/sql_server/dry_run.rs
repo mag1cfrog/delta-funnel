@@ -2,8 +2,8 @@ use std::fmt;
 
 use crate::{
     DeltaSourceReport, LazyTableKind, LoadMode, MssqlDdlPlan, MssqlLifecyclePlan, MssqlSchemaPlan,
-    MssqlTargetTable, OutputStatus, PlannedMssqlOutput, ReportReasonCode, RowCount, RunMode,
-    SourceUsageStatus, ValidationStatus, WorkflowStatus,
+    MssqlTargetTable, OutputStatus, PhaseTimingReport, PlannedMssqlOutput, ReportReasonCode,
+    RowCount, RunMode, SourceUsageStatus, ValidationStatus, WorkflowStatus,
 };
 
 /// Output schema field included in an MSSQL dry-run report.
@@ -147,6 +147,7 @@ pub struct MssqlDryRunOutputReport {
     output_row_count_reason: Option<ReportReasonCode>,
     status: OutputStatus,
     validation_status: ValidationStatus,
+    phase_timings: Vec<PhaseTimingReport>,
     sql_server_contacted: bool,
     row_production_started: bool,
     table_lifecycle_started: bool,
@@ -159,6 +160,7 @@ impl MssqlDryRunOutputReport {
         sql_identity: MssqlDryRunSqlIdentityReport,
         source_usage_status: SourceUsageStatus,
         used_source_names: Vec<String>,
+        phase_timings: Vec<PhaseTimingReport>,
     ) -> Self {
         let output_schema = planned_output
             .output_plan()
@@ -177,6 +179,7 @@ impl MssqlDryRunOutputReport {
             output_row_count_reason: Some(ReportReasonCode::NotExecuted),
             status: OutputStatus::dry_run_planned(),
             validation_status: ValidationStatus::skipped(ReportReasonCode::DryRun),
+            phase_timings,
             sql_server_contacted: false,
             row_production_started: false,
             table_lifecycle_started: false,
@@ -290,6 +293,12 @@ impl MssqlDryRunOutputReport {
     #[must_use]
     pub const fn validation_status(&self) -> ValidationStatus {
         self.validation_status
+    }
+
+    /// Returns per-phase dry-run output timing reports.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
     }
 
     /// Returns the dry-run action mode.

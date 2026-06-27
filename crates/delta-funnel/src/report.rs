@@ -951,14 +951,12 @@ impl PhaseTimingReport {
 }
 
 /// Monotonic timer used to build durable phase timing reports.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct PhaseTimer {
     phase_name: &'static str,
     started_at: Instant,
 }
 
-#[allow(dead_code)]
 impl PhaseTimer {
     pub(crate) fn start(phase_name: &'static str) -> Self {
         Self {
@@ -971,6 +969,7 @@ impl PhaseTimer {
         PhaseTimingReport::completed(self.phase_name, self.started_at.elapsed())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn failed(self) -> PhaseTimingReport {
         PhaseTimingReport::failed(self.phase_name, self.started_at.elapsed())
     }
