@@ -286,7 +286,11 @@ where
         Ok(report) => {
             let report = write_report_with_cleanup(&report, prepared_target.report().cleanup())
                 .with_phase_timings(phase_timings);
-            Ok(apply_disabled_target_validation(report, validation_options))
+            Ok(apply_no_sql_target_validation(
+                &output_plan,
+                report,
+                validation_options,
+            ))
         }
         Err(error) => Err(cleanup_after_prepared_target_failure(
             &mut connection,
@@ -298,19 +302,28 @@ where
     }
 }
 
-fn apply_disabled_target_validation(
+fn apply_no_sql_target_validation(
+    output_plan: &MssqlTargetOutputPlan,
     report: MssqlWriteReport,
     validation_options: ValidationOptions,
 ) -> MssqlWriteReport {
-    if validation_options.target_validation_mode() != TargetValidationMode::Disabled {
-        return report;
+    match validation_options.target_validation_mode() {
+        TargetValidationMode::Disabled => report.with_target_validation(
+            RowCount::unavailable(),
+            ValidationStatus::disabled(),
+            PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::ValidationDisabled),
+        ),
+        TargetValidationMode::ValidateIfPossible
+            if output_plan.load_mode() != LoadMode::CreateAndLoad =>
+        {
+            report.with_target_validation(
+                RowCount::unavailable(),
+                ValidationStatus::unavailable(ReportReasonCode::UnsupportedLoadMode),
+                PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
+            )
+        }
+        TargetValidationMode::ValidateIfPossible | TargetValidationMode::Require => report,
     }
-
-    report.with_target_validation(
-        RowCount::unavailable(),
-        ValidationStatus::disabled(),
-        PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::ValidationDisabled),
-    )
 }
 
 fn ensure_supported_output_mode(
@@ -867,6 +880,41 @@ mod tests {
             report.phase_timings(),
             VALIDATION_PHASE,
             PhaseStatus::skipped(ReportReasonCode::ValidationDisabled),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "initialize", "write 3", "finish"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_validate_if_possible_reports_unsupported_validation()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log));
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        let report = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            ValidationOptions::new(),
+            Vec::new(),
+        )
+        .await?;
+
+        assert_eq!(report.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::unavailable(ReportReasonCode::UnsupportedLoadMode)
+        );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::skipped(ReportReasonCode::UnsupportedLoadMode),
         )?;
         assert_eq!(
             logged_events(&log)?,
