@@ -654,6 +654,7 @@ mod tests {
         initialize_error: Option<DeltaFunnelError>,
         cleanup_error: Option<DeltaFunnelError>,
         target_row_count: Option<u64>,
+        target_row_count_failure: Option<MssqlTargetRowCountFailure>,
         fail_write: bool,
         fail_finish: bool,
     }
@@ -690,6 +691,11 @@ mod tests {
 
         fn with_target_row_count(mut self, target_row_count: u64) -> Self {
             self.target_row_count = Some(target_row_count);
+            self
+        }
+
+        fn fail_target_row_count(mut self, failure: MssqlTargetRowCountFailure) -> Self {
+            self.target_row_count_failure = Some(failure);
             self
         }
 
@@ -805,6 +811,10 @@ mod tests {
                     error.to_string(),
                 )
             })?;
+
+            if let Some(failure) = self.target_row_count_failure.take() {
+                return Err(failure);
+            }
 
             Ok(self.target_row_count.unwrap_or(0))
         }
@@ -1127,6 +1137,111 @@ mod tests {
             context.phase_timings(),
             CLEANUP_PHASE,
             PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "initialize",
+                "write 3",
+                "finish",
+                "count target rows",
+                "cleanup CreatedTable"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validate_if_possible_records_unavailable_target_row_count()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::CreateAndLoad)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_target_row_count(
+            MssqlTargetRowCountFailure::new(
+                ReportReasonCode::PermissionUnavailable,
+                "permission denied",
+            ),
+        );
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        let report = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await?;
+
+        assert_eq!(report.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::unavailable(ReportReasonCode::PermissionUnavailable)
+        );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::PermissionUnavailable),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "initialize",
+                "write 3",
+                "finish",
+                "count target rows"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn require_validation_turns_unavailable_target_row_count_into_failure()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::CreateAndLoad)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_target_row_count(
+            MssqlTargetRowCountFailure::new(
+                ReportReasonCode::PermissionUnavailable,
+                "permission denied",
+            ),
+        );
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Require);
+
+        let error = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            validation_options,
+            Vec::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected required validation failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected validation write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Validation);
+        assert_eq!(context.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::required_but_failed(ReportReasonCode::PermissionUnavailable)
+        );
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert!(message.contains("permission denied"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::PermissionUnavailable),
         )?;
         assert_eq!(
             logged_events(&log)?,
