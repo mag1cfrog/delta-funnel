@@ -12,7 +12,10 @@ use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::Stream;
 
-use crate::{DeltaFunnelError, ReportReasonCode, RowCount, support::sanitize_text_for_display};
+use crate::{
+    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, report::PhaseTimer,
+    support::sanitize_text_for_display,
+};
 
 use super::{
     LoadMode, MssqlBatchShapingReport, MssqlConnectionSource, MssqlConnectionSummary,
@@ -20,6 +23,9 @@ use super::{
     MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_options,
     write_output_batches_to_mssql,
 };
+
+const OUTPUT_STREAM_SETUP_PHASE: &str = "output_stream_setup";
+const SQL_WRITE_PHASE: &str = "sql_write";
 
 /// Lazy stream produced only when a SQL Server output is attempted.
 pub type MssqlOutputBatchStream =
@@ -351,6 +357,16 @@ impl MssqlOutputWriteStatus {
         }
     }
 
+    /// Returns workflow phase timing reports for this output when available.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        match self {
+            Self::Succeeded(report) => report.phase_timings(),
+            Self::Failed(report) => report.phase_timings(),
+            Self::Skipped(report) => report.phase_timings(),
+        }
+    }
+
     /// Returns whether this output succeeded.
     #[must_use]
     pub const fn is_succeeded(&self) -> bool {
@@ -375,19 +391,24 @@ impl MssqlOutputWriteStatus {
 pub struct MssqlWriteFailureReport {
     target: MssqlTargetSummary,
     error: String,
-    context: Option<MssqlWriteFailureContext>,
+    context: Option<Box<MssqlWriteFailureContext>>,
     output_row_count: RowCount,
     batch_shaping: MssqlBatchShapingReport,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl MssqlWriteFailureReport {
-    fn from_error(target: MssqlTargetSummary, error: DeltaFunnelError) -> Self {
-        let context = failure_context(&error).cloned();
-        let output_row_count = context.as_ref().map_or(
+    fn from_error(
+        target: MssqlTargetSummary,
+        error: DeltaFunnelError,
+        phase_timings: Vec<PhaseTimingReport>,
+    ) -> Self {
+        let context = failure_context(&error).cloned().map(Box::new);
+        let output_row_count = context.as_deref().map_or(
             RowCount::unavailable(),
             MssqlWriteFailureContext::output_row_count,
         );
-        let batch_shaping = context.as_ref().map_or_else(
+        let batch_shaping = context.as_deref().map_or_else(
             || MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
             MssqlWriteFailureContext::batch_shaping,
         );
@@ -397,6 +418,7 @@ impl MssqlWriteFailureReport {
             context,
             output_row_count,
             batch_shaping,
+            phase_timings,
         }
     }
 
@@ -421,8 +443,8 @@ impl MssqlWriteFailureReport {
     /// Returns phase-aware write failure context when the one-output sink
     /// provided it.
     #[must_use]
-    pub const fn context(&self) -> Option<&MssqlWriteFailureContext> {
-        self.context.as_ref()
+    pub fn context(&self) -> Option<&MssqlWriteFailureContext> {
+        self.context.as_deref()
     }
 
     /// Returns query output row evidence known at failure time.
@@ -436,6 +458,12 @@ impl MssqlWriteFailureReport {
     pub const fn batch_shaping(&self) -> MssqlBatchShapingReport {
         self.batch_shaping
     }
+
+    /// Returns workflow phase timing reports for this failed output.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
+    }
 }
 
 /// Structured report for a skipped SQL Server output.
@@ -445,6 +473,7 @@ pub struct MssqlWriteSkippedReport {
     reason: MssqlWriteSkippedReason,
     output_row_count: RowCount,
     batch_shaping: MssqlBatchShapingReport,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl MssqlWriteSkippedReport {
@@ -454,6 +483,7 @@ impl MssqlWriteSkippedReport {
             reason: MssqlWriteSkippedReason::PreviousOutputFailed { failed_output_name },
             output_row_count: RowCount::unavailable(),
             batch_shaping: MssqlBatchShapingReport::skipped(ReportReasonCode::PriorFailure),
+            phase_timings: skipped_after_prior_failure_phase_timings(),
         }
     }
 
@@ -485,6 +515,12 @@ impl MssqlWriteSkippedReport {
     #[must_use]
     pub const fn batch_shaping(&self) -> MssqlBatchShapingReport {
         self.batch_shaping
+    }
+
+    /// Returns workflow phase timing reports for this skipped output.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
     }
 }
 
@@ -572,16 +608,22 @@ where
 
         let (output_schema, resolved_target, schema_options, batches, write_options) =
             job.into_parts();
-        let batches = match batches().await {
-            Ok(batches) => batches,
+        let stream_setup_timer = PhaseTimer::start(OUTPUT_STREAM_SETUP_PHASE);
+        let (batches, stream_setup_timing) = match batches().await {
+            Ok(batches) => (batches, stream_setup_timer.completed()),
             Err(error) => {
-                let failure = MssqlWriteFailureReport::from_error(target, error);
+                let failure = MssqlWriteFailureReport::from_error(
+                    target,
+                    error,
+                    stream_setup_failure_phase_timings(stream_setup_timer.failed()),
+                );
                 failed_output_name = Some(failure.output_name().to_owned());
                 statuses.push(MssqlOutputWriteStatus::Failed(failure));
                 continue;
             }
         };
 
+        let write_timer = PhaseTimer::start(SQL_WRITE_PHASE);
         match writer
             .write_output(
                 output_schema,
@@ -592,9 +634,18 @@ where
             )
             .await
         {
-            Ok(report) => statuses.push(MssqlOutputWriteStatus::Succeeded(report)),
+            Ok(report) => statuses.push(MssqlOutputWriteStatus::Succeeded(
+                report.with_phase_timings(output_write_phase_timings(
+                    stream_setup_timing,
+                    write_timer.completed(),
+                )),
+            )),
             Err(error) => {
-                let failure = MssqlWriteFailureReport::from_error(target, error);
+                let failure = MssqlWriteFailureReport::from_error(
+                    target,
+                    error,
+                    output_write_phase_timings(stream_setup_timing, write_timer.failed()),
+                );
                 failed_output_name = Some(failure.output_name().to_owned());
                 statuses.push(MssqlOutputWriteStatus::Failed(failure));
             }
@@ -614,6 +665,29 @@ fn failure_context(error: &DeltaFunnelError) -> Option<&MssqlWriteFailureContext
         | DeltaFunnelError::MssqlBatchSchemaValidation { context, .. } => Some(context.as_ref()),
         _ => None,
     }
+}
+
+fn output_write_phase_timings(
+    stream_setup_timing: PhaseTimingReport,
+    write_timing: PhaseTimingReport,
+) -> Vec<PhaseTimingReport> {
+    vec![stream_setup_timing, write_timing]
+}
+
+fn stream_setup_failure_phase_timings(
+    stream_setup_timing: PhaseTimingReport,
+) -> Vec<PhaseTimingReport> {
+    vec![
+        stream_setup_timing,
+        PhaseTimingReport::not_started(SQL_WRITE_PHASE, ReportReasonCode::NotExecuted),
+    ]
+}
+
+fn skipped_after_prior_failure_phase_timings() -> Vec<PhaseTimingReport> {
+    vec![
+        PhaseTimingReport::skipped(OUTPUT_STREAM_SETUP_PHASE, ReportReasonCode::PriorFailure),
+        PhaseTimingReport::skipped(SQL_WRITE_PHASE, ReportReasonCode::PriorFailure),
+    ]
 }
 
 #[cfg(test)]
@@ -777,6 +851,16 @@ mod tests {
             2,
             3,
         );
+        assert_phase_timing(
+            &report.outputs()[0],
+            OUTPUT_STREAM_SETUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            &report.outputs()[0],
+            SQL_WRITE_PHASE,
+            PhaseStatus::completed(),
+        )?;
         assert_eq!(
             locked(&attempted)?.as_slice(),
             ["first".to_owned(), "second".to_owned()]
@@ -825,6 +909,12 @@ mod tests {
         assert!(context.partial_write_possible());
         assert_eq!(context.stats().rows_written(), 1);
         assert_eq!(context.stats().batches_written(), 1);
+        assert_phase_timing(
+            second_status,
+            OUTPUT_STREAM_SETUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(second_status, SQL_WRITE_PHASE, PhaseStatus::failed())?;
 
         Ok(())
     }
@@ -908,6 +998,8 @@ mod tests {
         assert!(matches!(failed, MssqlOutputWriteStatus::Failed(_)));
         assert_eq!(failed.output_row_count(), RowCount::partial(0));
         assert_batch_shaping(failed.batch_shaping(), PhaseStatus::failed(), 0, 0, 0, 0);
+        assert_phase_timing(failed, OUTPUT_STREAM_SETUP_PHASE, PhaseStatus::completed())?;
+        assert_phase_timing(failed, SQL_WRITE_PHASE, PhaseStatus::failed())?;
         assert_skipped_after(skipped_second, "second", "first")?;
         assert_skipped_after(skipped_third, "third", "first")?;
 
@@ -1082,6 +1174,16 @@ mod tests {
             0,
             0,
         );
+        assert_phase_timing(
+            second_status,
+            OUTPUT_STREAM_SETUP_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            second_status,
+            SQL_WRITE_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+        )?;
         assert!(
             failure
                 .error()
@@ -1127,6 +1229,12 @@ mod tests {
             0,
             0,
         );
+        assert_phase_timing(
+            &report.outputs()[0],
+            OUTPUT_STREAM_SETUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(&report.outputs()[0], SQL_WRITE_PHASE, PhaseStatus::failed())?;
 
         Ok(())
     }
@@ -1449,6 +1557,36 @@ mod tests {
             0,
             0,
         );
+        assert_phase_timing(
+            status,
+            OUTPUT_STREAM_SETUP_PHASE,
+            PhaseStatus::skipped(ReportReasonCode::PriorFailure),
+        )?;
+        assert_phase_timing(
+            status,
+            SQL_WRITE_PHASE,
+            PhaseStatus::skipped(ReportReasonCode::PriorFailure),
+        )?;
+        Ok(())
+    }
+
+    fn assert_phase_timing(
+        status: &MssqlOutputWriteStatus,
+        phase_name: &str,
+        expected_status: PhaseStatus,
+    ) -> Result<(), DeltaFunnelError> {
+        let timing = status
+            .phase_timings()
+            .iter()
+            .find(|timing| timing.phase_name() == phase_name)
+            .ok_or_else(|| test_error(format!("missing phase timing {phase_name}")))?;
+
+        assert_eq!(timing.status(), expected_status);
+        if expected_status.is_completed() || expected_status.is_failed() {
+            assert!(timing.elapsed_micros().is_some());
+        } else {
+            assert_eq!(timing.elapsed_micros(), None);
+        }
         Ok(())
     }
 

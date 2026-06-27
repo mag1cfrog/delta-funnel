@@ -969,7 +969,6 @@ impl PhaseTimer {
         PhaseTimingReport::completed(self.phase_name, self.started_at.elapsed())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn failed(self) -> PhaseTimingReport {
         PhaseTimingReport::failed(self.phase_name, self.started_at.elapsed())
     }

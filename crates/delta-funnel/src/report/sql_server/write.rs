@@ -2,7 +2,8 @@ use std::fmt;
 
 use crate::{
     MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan, MssqlTargetTable,
-    MssqlWritePhase, PhaseStatus, ReportReasonCode, RowCount, sql_server::LoadMode,
+    MssqlWritePhase, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount,
+    sql_server::LoadMode,
 };
 
 /// Per-output SQL Server write statistics.
@@ -260,6 +261,7 @@ pub struct MssqlWriteReport {
     output_schema: Vec<MssqlOutputFieldReport>,
     output_row_count: RowCount,
     batch_shaping: MssqlBatchShapingReport,
+    phase_timings: Vec<PhaseTimingReport>,
     stats: MssqlWriteStats,
     partial_write_possible: bool,
     cleanup: MssqlTargetCleanupStatus,
@@ -315,6 +317,7 @@ impl MssqlWriteReport {
             output_schema,
             output_row_count: metrics.output_row_count,
             batch_shaping: metrics.batch_shaping,
+            phase_timings: Vec::new(),
             stats: MssqlWriteStats::new(
                 output_name,
                 metrics.rows_written,
@@ -324,6 +327,11 @@ impl MssqlWriteReport {
             partial_write_possible: metrics.partial_write_possible,
             cleanup: metrics.cleanup,
         }
+    }
+
+    pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        self.phase_timings = phase_timings;
+        self
     }
 
     /// Returns the selected output name.
@@ -378,6 +386,12 @@ impl MssqlWriteReport {
     #[must_use]
     pub const fn batch_shaping(&self) -> MssqlBatchShapingReport {
         self.batch_shaping
+    }
+
+    /// Returns workflow phase timing reports for this output when available.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
     }
 
     /// Returns whether the target may contain a partial write after failure.
