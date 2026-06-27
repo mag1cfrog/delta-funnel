@@ -1755,6 +1755,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_existing_validation_disabled_skips_pre_and_post_counts()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_counts(vec![10, 13]);
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Disabled);
+
+        let report = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            validation_options,
+            Vec::new(),
+        )
+        .await?;
+
+        assert_eq!(report.output_row_count(), RowCount::exact(3));
+        assert_eq!(
+            report.target_row_count_before_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(report.validation_status(), ValidationStatus::disabled());
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::skipped(ReportReasonCode::ValidationDisabled),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "initialize", "write 3", "finish"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn append_existing_matching_target_delta_passes_validation()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
