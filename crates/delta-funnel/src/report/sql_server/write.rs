@@ -476,12 +476,14 @@ impl MssqlWriteReport {
     }
 
     /// Returns target-side row count evidence before the SQL Server write.
+    /// For append-existing validation, concurrent target writes can affect the row-count delta.
     #[must_use]
     pub const fn target_row_count_before_write(&self) -> RowCount {
         self.target_row_count_before_write
     }
 
     /// Returns target-side row count evidence after the SQL Server write.
+    /// For append-existing validation, concurrent target writes can affect the row-count delta.
     #[must_use]
     pub const fn target_row_count_after_write(&self) -> RowCount {
         self.target_row_count

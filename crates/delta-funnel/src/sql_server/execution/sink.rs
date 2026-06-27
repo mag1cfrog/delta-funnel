@@ -372,11 +372,13 @@ where
             PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::ValidationDisabled),
         )),
         TargetValidationMode::ValidateIfPossible | TargetValidationMode::Require => {
+            let validation_required =
+                validation_options.target_validation_mode() == TargetValidationMode::Require;
             let Some(output_rows) = report.output_row_count().exact_value() else {
                 return missing_exact_output_rows_validation(
                     output_plan,
                     report,
-                    validation_options.target_validation_mode(),
+                    validation_required,
                     target_row_count_before_write,
                 );
             };
@@ -387,7 +389,7 @@ where
                     output_plan,
                     prepared_target,
                     report,
-                    validation_options.target_validation_mode(),
+                    validation_required,
                     target_row_count_before_write,
                     output_rows,
                 )
@@ -395,7 +397,7 @@ where
             }
 
             if output_plan.load_mode() != LoadMode::CreateAndLoad {
-                return unsupported_target_validation(output_plan, report, validation_options);
+                return unsupported_target_validation(output_plan, report, validation_required);
             }
 
             let validation_timer = PhaseTimer::start(VALIDATION_PHASE);
@@ -409,7 +411,7 @@ where
                         output_plan,
                         report,
                         failure.reason(),
-                        validation_options.target_validation_mode(),
+                        validation_required,
                         failure.message(),
                     );
                 }
@@ -441,7 +443,7 @@ where
 fn missing_exact_output_rows_validation(
     output_plan: &MssqlTargetOutputPlan,
     report: MssqlWriteReport,
-    mode: TargetValidationMode,
+    validation_required: bool,
     target_row_count_before_write: TargetRowCountBeforeWrite,
 ) -> Result<MssqlWriteReport, DeltaFunnelError> {
     if output_plan.load_mode() == LoadMode::AppendExisting
@@ -451,7 +453,7 @@ fn missing_exact_output_rows_validation(
             output_plan,
             report,
             ReportReasonCode::MissingExactOutputRows,
-            mode,
+            validation_required,
             "target row-count validation requires exact output rows",
             RowCount::exact(target_rows_before),
         );
@@ -461,7 +463,7 @@ fn missing_exact_output_rows_validation(
         output_plan,
         report,
         ReportReasonCode::MissingExactOutputRows,
-        mode,
+        validation_required,
         "target row-count validation requires exact output rows",
     )
 }
@@ -508,7 +510,7 @@ async fn validate_append_existing_target_delta<C>(
     output_plan: &MssqlTargetOutputPlan,
     prepared_target: &MssqlPreparedTarget,
     report: MssqlWriteReport,
-    mode: TargetValidationMode,
+    validation_required: bool,
     target_row_count_before_write: TargetRowCountBeforeWrite,
     output_rows: u64,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
@@ -522,7 +524,7 @@ where
                 output_plan,
                 report,
                 reason,
-                mode,
+                validation_required,
                 &message,
             );
         }
@@ -531,7 +533,7 @@ where
                 output_plan,
                 report,
                 ReportReasonCode::MissingTargetAccess,
-                mode,
+                validation_required,
                 "target row-count validation requires target rows before append write",
             );
         }
@@ -548,7 +550,7 @@ where
                 output_plan,
                 report,
                 failure.reason(),
-                mode,
+                validation_required,
                 failure.message(),
                 RowCount::exact(target_rows_before),
             );
@@ -583,31 +585,25 @@ where
 fn unsupported_target_validation(
     output_plan: &MssqlTargetOutputPlan,
     report: MssqlWriteReport,
-    validation_options: ValidationOptions,
+    validation_required: bool,
 ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-    match validation_options.target_validation_mode() {
-        TargetValidationMode::ValidateIfPossible => Ok(report.with_target_validation(
+    if validation_required {
+        let report = report.with_target_validation(
+            RowCount::unavailable(),
+            ValidationStatus::required_but_failed(ReportReasonCode::UnsupportedLoadMode),
+            PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
+        );
+        Err(validation_error(
+            output_plan,
+            &report,
+            "target row-count validation is not implemented for this load mode",
+        ))
+    } else {
+        Ok(report.with_target_validation(
             RowCount::unavailable(),
             ValidationStatus::unavailable(ReportReasonCode::UnsupportedLoadMode),
             PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
-        )),
-        TargetValidationMode::Require => {
-            let report = report.with_target_validation(
-                RowCount::unavailable(),
-                ValidationStatus::required_but_failed(ReportReasonCode::UnsupportedLoadMode),
-                PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
-            );
-            Err(validation_error(
-                output_plan,
-                &report,
-                "target row-count validation is not implemented for this load mode",
-            ))
-        }
-        TargetValidationMode::Disabled => Ok(report.with_target_validation(
-            RowCount::unavailable(),
-            ValidationStatus::disabled(),
-            PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::ValidationDisabled),
-        )),
+        ))
     }
 }
 
@@ -615,13 +611,13 @@ fn validation_unavailable_or_required_failure(
     output_plan: &MssqlTargetOutputPlan,
     report: MssqlWriteReport,
     reason: ReportReasonCode,
-    mode: TargetValidationMode,
+    validation_required: bool,
     message: &str,
 ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-    let validation_status = match mode {
-        TargetValidationMode::Disabled => ValidationStatus::disabled(),
-        TargetValidationMode::ValidateIfPossible => ValidationStatus::unavailable(reason),
-        TargetValidationMode::Require => ValidationStatus::required_but_failed(reason),
+    let validation_status = if validation_required {
+        ValidationStatus::required_but_failed(reason)
+    } else {
+        ValidationStatus::unavailable(reason)
     };
     let report = report.with_target_validation(
         RowCount::unavailable(),
@@ -629,7 +625,7 @@ fn validation_unavailable_or_required_failure(
         PhaseTimingReport::unavailable(VALIDATION_PHASE, reason),
     );
 
-    if mode == TargetValidationMode::Require {
+    if validation_required {
         return Err(validation_error(output_plan, &report, message));
     }
 
@@ -640,14 +636,14 @@ fn target_delta_validation_unavailable_or_required_failure(
     output_plan: &MssqlTargetOutputPlan,
     report: MssqlWriteReport,
     reason: ReportReasonCode,
-    mode: TargetValidationMode,
+    validation_required: bool,
     message: &str,
     target_row_count_before_write: RowCount,
 ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-    let validation_status = match mode {
-        TargetValidationMode::Disabled => ValidationStatus::disabled(),
-        TargetValidationMode::ValidateIfPossible => ValidationStatus::unavailable(reason),
-        TargetValidationMode::Require => ValidationStatus::required_but_failed(reason),
+    let validation_status = if validation_required {
+        ValidationStatus::required_but_failed(reason)
+    } else {
+        ValidationStatus::unavailable(reason)
     };
     let report = report.with_target_delta_validation(
         target_row_count_before_write,
@@ -656,7 +652,7 @@ fn target_delta_validation_unavailable_or_required_failure(
         PhaseTimingReport::unavailable(VALIDATION_PHASE, reason),
     );
 
-    if mode == TargetValidationMode::Require {
+    if validation_required {
         return Err(validation_error(output_plan, &report, message));
     }
 
