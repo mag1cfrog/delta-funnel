@@ -1688,6 +1688,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_existing_required_missing_exact_output_rows_fails_with_pre_count()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let prepared_target = MssqlPreparedTarget::from_output_plan(
+            &output_plan,
+            MssqlPreparedTargetAction::VerifiedExisting,
+        )?;
+        let report = MssqlWriteReport::from_output_plan_with_metrics(
+            &output_plan,
+            MssqlWriteReportMetrics::new(
+                RowCount::partial(3),
+                crate::MssqlBatchShapingReport::completed(1, 3, 1, 3),
+                3,
+                1,
+                0,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ),
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_count(13);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Require);
+
+        let error = validate_written_target(
+            &mut connection,
+            &output_plan,
+            &prepared_target,
+            report,
+            validation_options,
+            TargetRowCountBeforeWrite::Exact(10),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected required append missing exact rows validation failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected validation write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Validation);
+        assert_eq!(context.output_row_count(), RowCount::partial(3));
+        assert_eq!(context.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(
+            context.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::required_but_failed(ReportReasonCode::MissingExactOutputRows)
+        );
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert!(message.contains("exact output rows"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::MissingExactOutputRows),
+        )?;
+        assert_eq!(logged_events(&log)?, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn append_existing_matching_target_delta_passes_validation()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
