@@ -1938,6 +1938,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_existing_required_post_count_failure_reports_validation_error()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log))
+            .with_target_row_count_results(vec![
+                Ok(10),
+                Err(MssqlTargetRowCountFailure::new(
+                    ReportReasonCode::PermissionUnavailable,
+                    "permission denied",
+                )),
+            ]);
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Require);
+
+        let error = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            validation_options,
+            Vec::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected required append post-count validation failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected validation write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Validation);
+        assert_eq!(context.output_row_count(), RowCount::exact(3));
+        assert_eq!(context.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(
+            context.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::required_but_failed(ReportReasonCode::PermissionUnavailable)
+        );
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert!(message.contains("permission denied"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::PermissionUnavailable),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "count target rows",
+                "initialize",
+                "write 3",
+                "finish",
+                "count target rows",
+                "cleanup VerifiedExisting"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn public_one_output_api_rejects_replace_before_connection()
     -> Result<(), DeltaFunnelError> {
         let connection = secret_connection()?;
