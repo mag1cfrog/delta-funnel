@@ -293,9 +293,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-tiberius"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db3cae455af021448cec39ac2c346fb731eb85684ec50fae72e677107de82b95"
+checksum = "d1cd2dadc6361285514e05a28bf9351d0acad2cb1ae2445bf4e51697ce3983c9"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
