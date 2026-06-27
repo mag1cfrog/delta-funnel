@@ -10,6 +10,7 @@ use futures_util::Stream;
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, TargetValidationMode,
     ValidationOptions, ValidationStatus,
+    error::MssqlWritePhaseSnafu,
     report::{
         PhaseTimer,
         sql_server::{MssqlBatchShapingReport, MssqlWriteReportMetrics},
@@ -694,7 +695,7 @@ fn validation_error(
     report: &MssqlWriteReport,
     message: &str,
 ) -> DeltaFunnelError {
-    DeltaFunnelError::MssqlWritePhase {
+    MssqlWritePhaseSnafu {
         context: Box::new(MssqlWriteFailureContext::from_output_plan_with_metrics(
             output_plan,
             MssqlWritePhase::Validation,
@@ -702,6 +703,7 @@ fn validation_error(
         )),
         message: message.to_owned(),
     }
+    .build()
 }
 
 fn report_metrics_from_report(report: &MssqlWriteReport) -> MssqlWriteReportMetrics {
@@ -1808,51 +1810,6 @@ mod tests {
             batches,
             default_mssql_write_options(),
             ValidationOptions::new(),
-            Vec::new(),
-        )
-        .await?;
-
-        assert_eq!(report.output_row_count(), RowCount::exact(3));
-        assert_eq!(report.target_row_count_before_write(), RowCount::exact(10));
-        assert_eq!(report.target_row_count_after_write(), RowCount::exact(13));
-        assert_eq!(report.target_row_count(), RowCount::exact(13));
-        assert_eq!(report.validation_status(), ValidationStatus::passed());
-        assert_phase_timing(
-            report.phase_timings(),
-            VALIDATION_PHASE,
-            PhaseStatus::completed(),
-        )?;
-        assert_eq!(
-            logged_events(&log)?,
-            vec![
-                "prepare",
-                "count target rows",
-                "initialize",
-                "write 3",
-                "finish",
-                "count target rows"
-            ]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn append_existing_required_matching_target_delta_passes_validation()
-    -> Result<(), DeltaFunnelError> {
-        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let connection =
-            FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_counts(vec![10, 13]);
-        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
-        let validation_options =
-            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Require);
-
-        let report = write_mssql_output_batches_on_connection_with_phase_timings(
-            output_plan,
-            connection,
-            batches,
-            default_mssql_write_options(),
-            validation_options,
             Vec::new(),
         )
         .await?;

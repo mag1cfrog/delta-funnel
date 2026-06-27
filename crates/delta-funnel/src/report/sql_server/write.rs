@@ -249,7 +249,6 @@ impl MssqlWriteReportMetrics {
         self
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn with_target_delta_validation(
         mut self,
         target_row_count_before_write: RowCount,
@@ -380,7 +379,6 @@ impl MssqlWriteReport {
         self
     }
 
-    #[allow(dead_code)]
     pub(crate) fn with_target_delta_validation(
         mut self,
         target_row_count_before_write: RowCount,
