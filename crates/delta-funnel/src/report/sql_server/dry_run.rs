@@ -338,6 +338,7 @@ pub struct MssqlDryRunWorkflowReport {
     outputs: Vec<MssqlDryRunOutputReport>,
     sources: Vec<DeltaSourceReport>,
     status: WorkflowStatus,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl MssqlDryRunWorkflowReport {
@@ -355,7 +356,13 @@ impl MssqlDryRunWorkflowReport {
             outputs,
             sources,
             status,
+            phase_timings: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        self.phase_timings = phase_timings;
+        self
     }
 
     /// Returns the dry-run action mode.
@@ -392,6 +399,12 @@ impl MssqlDryRunWorkflowReport {
     #[must_use]
     pub fn sources(&self) -> &[DeltaSourceReport] {
         &self.sources
+    }
+
+    /// Returns top-level dry-run workflow phase timing reports.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
     }
 
     /// Returns whether scan metadata was exhausted for every known query-used source.
