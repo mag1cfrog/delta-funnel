@@ -2563,6 +2563,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_existing_finalize_failure_marks_partial_write_risk()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log))
+            .with_target_row_count(10)
+            .fail_finish();
+        let batches = stream::iter(vec![Ok(orders_batch(1)?)]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected append finalize failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlWritePhase finalize failure".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Finalize);
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert!(context.partial_write_possible());
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::FailureBeforeValidation)
+        );
+        assert!(message.contains("fake sink writer failed on finish"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "count target rows",
+                "initialize",
+                "write 1",
+                "finish",
+                "cleanup VerifiedExisting"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn one_output_sink_preserves_original_failure_when_cleanup_fails()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_with_load_mode(LoadMode::CreateAndLoad)?;

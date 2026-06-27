@@ -18,7 +18,7 @@ use futures_util::{
 };
 
 use crate::{
-    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount,
+    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationStatus,
     report::sql_server::{
         MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
         MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
@@ -387,6 +387,26 @@ fn write_report_metrics(
     )
 }
 
+fn write_failure_report_metrics(
+    output_row_count: RowCount,
+    batch_shaping: MssqlBatchShapingReport,
+    progress: MssqlWriteProgress,
+    partial_write_possible: bool,
+    cleanup: MssqlTargetCleanupStatus,
+) -> MssqlWriteReportMetrics {
+    write_report_metrics(
+        output_row_count,
+        batch_shaping,
+        progress,
+        partial_write_possible,
+        cleanup,
+    )
+    .with_target_validation(
+        RowCount::unavailable(),
+        ValidationStatus::skipped(ReportReasonCode::FailureBeforeValidation),
+    )
+}
+
 #[derive(Default)]
 struct MssqlWriteLoopPhaseTimings {
     poll_batch_stream: Duration,
@@ -529,7 +549,7 @@ where
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::PollBatchStream,
-                write_report_metrics(
+                write_failure_report_metrics(
                     RowCount::partial(input_rows),
                     MssqlBatchShapingReport::failed(
                         input_batches,
@@ -561,7 +581,7 @@ where
             mssql_batch_schema_validation_error(
                 output_plan,
                 source,
-                write_report_metrics(
+                write_failure_report_metrics(
                     RowCount::partial(input_rows),
                     MssqlBatchShapingReport::failed(
                         input_batches,
@@ -585,7 +605,7 @@ where
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::WriteBatch,
-                write_report_metrics(
+                write_failure_report_metrics(
                     RowCount::partial(input_rows),
                     MssqlBatchShapingReport::failed(
                         input_batches,
@@ -616,7 +636,7 @@ where
         mssql_write_phase_error(
             output_plan,
             MssqlWritePhase::Finalize,
-            write_report_metrics(
+            write_failure_report_metrics(
                 RowCount::exact(input_rows),
                 MssqlBatchShapingReport::completed(
                     input_batches,
