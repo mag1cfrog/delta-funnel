@@ -1734,6 +1734,14 @@ mod tests {
         assert_eq!(report.output_row_count(), RowCount::exact(42));
         assert_eq!(report.target_row_count(), RowCount::unavailable());
         assert_eq!(
+            report.target_row_count_before_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
             report.validation_status(),
             ValidationStatus::skipped(ReportReasonCode::NotExecuted)
         );
@@ -1785,6 +1793,11 @@ mod tests {
         );
 
         assert_eq!(report.target_row_count(), RowCount::exact(42));
+        assert_eq!(
+            report.target_row_count_before_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(report.target_row_count_after_write(), RowCount::exact(42));
         assert_eq!(report.validation_status(), ValidationStatus::passed());
         assert_eq!(
             report
@@ -1794,6 +1807,53 @@ mod tests {
                 .count(),
             1
         );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn write_report_records_target_delta_validation_counts() -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+        let report = MssqlWriteReport::from_output_plan_with_metrics(
+            &output_plan,
+            MssqlWriteReportMetrics::new(
+                RowCount::exact(3),
+                MssqlBatchShapingReport::completed(1, 3, 1, 3),
+                3,
+                1,
+                125,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            )
+            .with_phase_timings(vec![PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::NotExecuted,
+            )]),
+        );
+
+        let report = report.with_target_delta_validation(
+            RowCount::exact(10),
+            RowCount::exact(13),
+            ValidationStatus::passed(),
+            PhaseTimingReport::completed(VALIDATION_PHASE, Duration::from_micros(7)),
+        );
+
+        assert_eq!(report.target_row_count(), RowCount::exact(13));
+        assert_eq!(report.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(report.target_row_count_after_write(), RowCount::exact(13));
+        assert_eq!(report.validation_status(), ValidationStatus::passed());
         assert_phase_timing(
             report.phase_timings(),
             VALIDATION_PHASE,
