@@ -258,6 +258,8 @@ mod tests {
     };
     use crate::MssqlDryRunSqlIdentityState;
 
+    const LAZY_SQL_PLANNING_PHASE: &str = "lazy_sql_planning";
+
     #[test]
     fn sql_identity_status_and_hash_are_stable() {
         assert_eq!(MssqlDryRunSqlIdentityState::Present.as_str(), "present");
@@ -371,8 +373,12 @@ mod tests {
         assert!(!report.row_production_started());
         assert!(!report.table_lifecycle_started());
         assert!(!report.bulk_writer_started());
-        assert_eq!(report.phase_timings().len(), 7);
-        for phase_name in [OUTPUT_SCHEMA_PLANNING_PHASE, SQL_TARGET_PLANNING_PHASE] {
+        assert_eq!(report.phase_timings().len(), 8);
+        for phase_name in [
+            LAZY_SQL_PLANNING_PHASE,
+            OUTPUT_SCHEMA_PLANNING_PHASE,
+            SQL_TARGET_PLANNING_PHASE,
+        ] {
             let planning = phase_timing(&report, phase_name)?;
             assert!(planning.status().is_completed());
             assert!(planning.elapsed_micros().is_some());
