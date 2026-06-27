@@ -13,15 +13,15 @@ use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::Stream;
 
 use crate::{
-    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, report::PhaseTimer,
-    support::sanitize_text_for_display,
+    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationOptions,
+    report::PhaseTimer, support::sanitize_text_for_display,
 };
 
 use super::{
     LoadMode, MssqlBatchShapingReport, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteFailureContext,
     MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_options,
-    write_output_batches_to_mssql,
+    write_output_batches_to_mssql_with_validation_options,
 };
 
 const OUTPUT_STREAM_SETUP_PHASE: &str = "output_stream_setup";
@@ -53,6 +53,7 @@ pub struct MssqlOutputWriteJob {
     schema_options: MssqlSchemaPlanOptions,
     batches: MssqlOutputBatchStreamFactory,
     write_options: MssqlWriteOptions,
+    validation_options: ValidationOptions,
     phase_timings: Vec<PhaseTimingReport>,
 }
 
@@ -64,6 +65,7 @@ impl MssqlOutputWriteJob {
         schema_options: MssqlSchemaPlanOptions,
         batches: F,
         write_options: MssqlWriteOptions,
+        validation_options: ValidationOptions,
     ) -> Self
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -81,6 +83,7 @@ impl MssqlOutputWriteJob {
                 })
             }),
             write_options,
+            validation_options,
             phase_timings: Vec::new(),
         }
     }
@@ -110,6 +113,7 @@ impl MssqlOutputWriteJob {
             schema_options,
             batches,
             default_mssql_write_options(),
+            ValidationOptions::default(),
         )
     }
 
@@ -139,6 +143,7 @@ impl MssqlOutputWriteJob {
         MssqlSchemaPlanOptions,
         MssqlOutputBatchStreamFactory,
         MssqlWriteOptions,
+        ValidationOptions,
         Vec<PhaseTimingReport>,
     ) {
         (
@@ -147,6 +152,7 @@ impl MssqlOutputWriteJob {
             self.schema_options,
             self.batches,
             self.write_options,
+            self.validation_options,
             self.phase_timings,
         )
     }
@@ -602,6 +608,7 @@ pub(crate) trait MssqlWorkflowOutputWriter: Send {
         schema_options: MssqlSchemaPlanOptions,
         batches: MssqlOutputBatchStream,
         write_options: MssqlWriteOptions,
+        validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
@@ -616,13 +623,15 @@ impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
         schema_options: MssqlSchemaPlanOptions,
         batches: MssqlOutputBatchStream,
         write_options: MssqlWriteOptions,
+        validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql(
+        write_output_batches_to_mssql_with_validation_options(
             output_schema.as_ref(),
             resolved_target,
             schema_options,
             batches,
             write_options,
+            validation_options,
         )
         .await
     }
@@ -662,6 +671,7 @@ where
             schema_options,
             batches,
             write_options,
+            validation_options,
             planned_phase_timings,
         ) = job.into_parts();
         let stream_setup_timer = PhaseTimer::start(OUTPUT_STREAM_SETUP_PHASE);
@@ -690,6 +700,7 @@ where
                 schema_options,
                 batches,
                 write_options,
+                validation_options,
             )
             .await
         {
@@ -834,6 +845,7 @@ mod tests {
             _schema_options: MssqlSchemaPlanOptions,
             _batches: MssqlOutputBatchStream,
             _write_options: MssqlWriteOptions,
+            _validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
                 .lock()
@@ -855,6 +867,7 @@ mod tests {
             _schema_options: MssqlSchemaPlanOptions,
             mut batches: MssqlOutputBatchStream,
             _write_options: MssqlWriteOptions,
+            _validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
                 .lock()

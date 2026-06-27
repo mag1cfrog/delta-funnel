@@ -8,7 +8,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::Stream;
 
 use crate::{
-    DeltaFunnelError, PhaseTimingReport,
+    DeltaFunnelError, PhaseTimingReport, ValidationOptions,
     report::{PhaseTimer, sql_server::MssqlWriteReportMetrics},
 };
 
@@ -57,6 +57,28 @@ where
         plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
 
     write_mssql_output_connection_request(request, batches, write_options).await
+}
+
+pub(crate) async fn write_output_batches_to_mssql_with_validation_options<S>(
+    output_schema: impl AsRef<arrow_schema::Schema>,
+    resolved_target: ResolvedMssqlTarget,
+    schema_options: MssqlSchemaPlanOptions,
+    batches: S,
+    write_options: MssqlWriteOptions,
+    validation_options: ValidationOptions,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
+    let _validation_options = validation_options;
+    write_output_batches_to_mssql(
+        output_schema,
+        resolved_target,
+        schema_options,
+        batches,
+        write_options,
+    )
+    .await
 }
 
 /// Connected one-output SQL Server sink boundary.

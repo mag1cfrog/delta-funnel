@@ -5,8 +5,9 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlTargetOutputPlan, MssqlWriteOptions,
-    MssqlWriteReport, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget,
-    plan_mssql_target_for_resolved_output, report::PhaseTimer, write_output_batches_to_mssql,
+    MssqlWriteReport, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, ValidationOptions,
+    plan_mssql_target_for_resolved_output, report::PhaseTimer,
+    write_output_batches_to_mssql_with_validation_options,
 };
 
 use super::super::{DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode};
@@ -129,6 +130,7 @@ impl DeltaFunnelSession {
                 planned.resolved_target().clone(),
                 batches,
                 self.options.mssql_write_options(),
+                self.options.validation_options(),
             )
             .await
             .map(ensure_validation_phase_timing)
@@ -160,6 +162,7 @@ pub(crate) trait OrchestratorMssqlOutputWriter: Send {
         resolved_target: ResolvedMssqlTarget,
         batches: MssqlOutputBatchStream,
         write_options: MssqlWriteOptions,
+        validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
@@ -174,13 +177,15 @@ impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
         resolved_target: ResolvedMssqlTarget,
         batches: MssqlOutputBatchStream,
         write_options: MssqlWriteOptions,
+        validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql(
+        write_output_batches_to_mssql_with_validation_options(
             output_schema.as_ref(),
             resolved_target,
             output_plan.schema_plan_options(),
             batches,
             write_options,
+            validation_options,
         )
         .await
     }
@@ -207,7 +212,8 @@ mod tests {
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlConnectionSource,
         MssqlOutputBatchStream, MssqlOutputTarget, MssqlTargetCleanupStatus, MssqlTargetConfig,
         MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteOptions, MssqlWriteReport,
-        ResolvedMssqlTarget, table_formats::RealParquetDeltaTable,
+        ResolvedMssqlTarget, TargetValidationMode, ValidationOptions,
+        table_formats::RealParquetDeltaTable,
     };
 
     use super::super::super::{
@@ -230,6 +236,7 @@ mod tests {
         rows: u64,
         batches: u64,
         schema_fields: usize,
+        validation_options: ValidationOptions,
     }
 
     #[derive(Default)]
@@ -246,6 +253,7 @@ mod tests {
             resolved_target: ResolvedMssqlTarget,
             mut batches: MssqlOutputBatchStream,
             _write_options: MssqlWriteOptions,
+            validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;
             let mut batch_count = 0_u64;
@@ -267,6 +275,7 @@ mod tests {
                 rows,
                 batches: batch_count,
                 schema_fields: output_schema.fields().len(),
+                validation_options,
             });
 
             Ok(MssqlWriteReport::from_output_plan(
@@ -652,7 +661,12 @@ mod tests {
     async fn write_to_mssql_with_writer_hands_query_stream_to_one_output_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(
-            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            SessionOptions::new()
+                .with_default_mssql_connection(secret_connection()?)
+                .with_validation_options(
+                    ValidationOptions::new()
+                        .with_target_validation_mode(TargetValidationMode::Require),
+                ),
         )?;
         let derived = session
             .table_from_sql("select 1 as id union all select 2 as id")
@@ -681,6 +695,10 @@ mod tests {
         assert_eq!(call.rows, 2);
         assert!(call.batches >= 1);
         assert_eq!(call.schema_fields, 1);
+        assert_eq!(
+            call.validation_options.target_validation_mode(),
+            TargetValidationMode::Require
+        );
         assert_eq!(report.output_name(), "orders_output");
         assert_eq!(report.stats().rows_written(), 2);
         assert_eq!(report.stats().batches_written(), call.batches);
