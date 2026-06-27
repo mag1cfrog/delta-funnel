@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::Stream;
 
-use crate::{DeltaFunnelError, report::sql_server::MssqlWriteReportMetrics};
+use crate::{
+    DeltaFunnelError, PhaseTimingReport,
+    report::{PhaseTimer, sql_server::MssqlWriteReportMetrics},
+};
 
 use super::{
     LoadMode, MssqlBulkLoadWriter, MssqlPreparedTarget, MssqlSchemaPlanOptions,
@@ -22,6 +25,10 @@ use super::{
     lifecycle::{cleanup_mssql_prepared_target, prepare_mssql_target_lifecycle},
     write::write_mssql_batches_with_writer,
 };
+
+const PREPARE_TARGET_LIFECYCLE_PHASE: &str = "prepare_target_lifecycle";
+const INITIALIZE_WRITER_PHASE: &str = "initialize_writer";
+const CLEANUP_PHASE: &str = "cleanup";
 
 /// Writes one resolved output to SQL Server from an Arrow record batch stream.
 ///
@@ -99,11 +106,25 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
     where
         S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
     {
-        let writer = self
+        let initialize_timer = PhaseTimer::start(INITIALIZE_WRITER_PHASE);
+        let writer = match self
             .initialize_writer(output_plan, prepared_target, options)
-            .await?;
+            .await
+        {
+            Ok(writer) => writer,
+            Err(error) => {
+                return Err(error_with_phase_timings(
+                    error,
+                    vec![initialize_timer.failed()],
+                ));
+            }
+        };
+        let initialize_timing = initialize_timer.completed();
 
-        write_mssql_batches_with_writer(output_plan, batches, writer, options).await
+        match write_mssql_batches_with_writer(output_plan, batches, writer, options).await {
+            Ok(report) => Ok(report.with_phase_timings(vec![initialize_timing])),
+            Err(error) => Err(error_with_phase_timings(error, vec![initialize_timing])),
+        }
     }
 }
 
@@ -156,15 +177,23 @@ where
     let output_plan = request.output_plan().clone();
     ensure_supported_output_mode(&output_plan)?;
     let connection = connect_mssql_output_client(request).await?;
+    let phase_timings = connection.phase_timings().to_vec();
 
-    write_mssql_output_batches_on_connection(output_plan, connection, batches, options).await
+    write_mssql_output_batches_on_connection_with_phase_timings(
+        output_plan,
+        connection,
+        batches,
+        options,
+        phase_timings,
+    )
+    .await
 }
 
 /// Writes one planned SQL Server output through an already connected boundary.
 #[allow(dead_code)]
 pub(crate) async fn write_mssql_output_batches_on_connection<C, S>(
     output_plan: MssqlTargetOutputPlan,
-    mut connection: C,
+    connection: C,
     batches: S,
     options: MssqlWriteOptions,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
@@ -172,22 +201,51 @@ where
     C: MssqlOneOutputSinkConnection,
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
+    write_mssql_output_batches_on_connection_with_phase_timings(
+        output_plan,
+        connection,
+        batches,
+        options,
+        Vec::new(),
+    )
+    .await
+}
+
+async fn write_mssql_output_batches_on_connection_with_phase_timings<C, S>(
+    output_plan: MssqlTargetOutputPlan,
+    mut connection: C,
+    batches: S,
+    options: MssqlWriteOptions,
+    mut phase_timings: Vec<PhaseTimingReport>,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    C: MssqlOneOutputSinkConnection,
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
     ensure_supported_output_mode(&output_plan)?;
-    let prepared_target = connection.prepare_target_lifecycle(&output_plan).await?;
+    let prepare_timer = PhaseTimer::start(PREPARE_TARGET_LIFECYCLE_PHASE);
+    let prepared_target = match connection.prepare_target_lifecycle(&output_plan).await {
+        Ok(prepared_target) => prepared_target,
+        Err(error) => {
+            phase_timings.push(prepare_timer.failed());
+            return Err(error_with_phase_timings(error, phase_timings));
+        }
+    };
+    phase_timings.push(prepare_timer.completed());
 
     match connection
         .write_prepared_batches(&output_plan, &prepared_target, batches, options)
         .await
     {
-        Ok(report) => Ok(write_report_with_cleanup(
-            &report,
-            prepared_target.report().cleanup(),
-        )),
+        Ok(report) => Ok(
+            write_report_with_cleanup(&report, prepared_target.report().cleanup())
+                .with_phase_timings(phase_timings),
+        ),
         Err(error) => Err(cleanup_after_prepared_target_failure(
             &mut connection,
             &output_plan,
             &prepared_target,
-            error,
+            error_with_phase_timings(error, phase_timings),
         )
         .await),
     }
@@ -215,14 +273,19 @@ async fn cleanup_after_prepared_target_failure<C>(
 where
     C: MssqlOneOutputSinkConnection,
 {
+    let cleanup_timer = PhaseTimer::start(CLEANUP_PHASE);
     match connection
         .cleanup_prepared_target(output_plan, Some(prepared_target))
         .await
     {
-        Ok(cleanup) => error_with_cleanup(output_plan, original_error, cleanup),
-        Err(cleanup_error) => {
-            error_with_cleanup_failure(output_plan, original_error, cleanup_error)
-        }
+        Ok(cleanup) => error_with_appended_phase_timings(
+            error_with_cleanup(output_plan, original_error, cleanup),
+            vec![cleanup_timer.completed()],
+        ),
+        Err(cleanup_error) => error_with_appended_phase_timings(
+            error_with_cleanup_failure(output_plan, original_error, cleanup_error),
+            vec![cleanup_timer.failed()],
+        ),
     }
 }
 
@@ -248,6 +311,48 @@ fn error_with_cleanup(
         DeltaFunnelError::MssqlBatchSchemaValidation { context, source } => {
             DeltaFunnelError::MssqlBatchSchemaValidation {
                 context: Box::new(context_with_cleanup(output_plan, context.as_ref(), cleanup)),
+                source,
+            }
+        }
+        other => other,
+    }
+}
+
+fn error_with_phase_timings(
+    error: DeltaFunnelError,
+    phase_timings: Vec<PhaseTimingReport>,
+) -> DeltaFunnelError {
+    match error {
+        DeltaFunnelError::MssqlWritePhase { context, message } => {
+            DeltaFunnelError::MssqlWritePhase {
+                context: Box::new((*context).with_phase_timings(phase_timings)),
+                message,
+            }
+        }
+        DeltaFunnelError::MssqlBatchSchemaValidation { context, source } => {
+            DeltaFunnelError::MssqlBatchSchemaValidation {
+                context: Box::new((*context).with_phase_timings(phase_timings)),
+                source,
+            }
+        }
+        other => other,
+    }
+}
+
+fn error_with_appended_phase_timings(
+    error: DeltaFunnelError,
+    phase_timings: Vec<PhaseTimingReport>,
+) -> DeltaFunnelError {
+    match error {
+        DeltaFunnelError::MssqlWritePhase { context, message } => {
+            DeltaFunnelError::MssqlWritePhase {
+                context: Box::new((*context).with_appended_phase_timings(phase_timings)),
+                message,
+            }
+        }
+        DeltaFunnelError::MssqlBatchSchemaValidation { context, source } => {
+            DeltaFunnelError::MssqlBatchSchemaValidation {
+                context: Box::new((*context).with_appended_phase_timings(phase_timings)),
                 source,
             }
         }
@@ -324,7 +429,7 @@ mod tests {
     use crate::{
         MssqlConnectionConfig, MssqlPreparedTargetAction, MssqlTargetConfig,
         MssqlTargetResolutionContext, MssqlTargetTable, MssqlWritePhase, PhaseStatus,
-        default_mssql_write_options, plan_mssql_target_for_output,
+        PhaseTimingReport, default_mssql_write_options, plan_mssql_target_for_output,
     };
 
     #[derive(Default)]
@@ -593,6 +698,27 @@ mod tests {
             })
     }
 
+    fn assert_phase_timing(
+        timings: &[PhaseTimingReport],
+        phase_name: &str,
+        expected_status: PhaseStatus,
+    ) -> Result<(), DeltaFunnelError> {
+        let timing = timings
+            .iter()
+            .find(|timing| timing.phase_name() == phase_name)
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: format!("missing phase timing {phase_name}"),
+            })?;
+
+        assert_eq!(timing.status(), expected_status);
+        if expected_status.is_completed() || expected_status.is_failed() {
+            assert!(timing.elapsed_micros().is_some());
+        } else {
+            assert_eq!(timing.elapsed_micros(), None);
+        }
+        Ok(())
+    }
+
     fn phase_error(
         output_plan: &MssqlTargetOutputPlan,
         phase: MssqlWritePhase,
@@ -635,14 +761,21 @@ mod tests {
         assert_eq!(report.output_name(), "orders_output");
         assert_eq!(report.stats().rows_written(), 3);
         assert_eq!(report.stats().batches_written(), 2);
-        let write_batch_timing = report
-            .phase_timings()
-            .iter()
-            .find(|timing| timing.phase_name() == "write_batch")
-            .ok_or_else(|| DeltaFunnelError::Config {
-                message: "missing write_batch phase timing".to_owned(),
-            })?;
-        assert_eq!(write_batch_timing.status(), PhaseStatus::completed());
+        assert_phase_timing(
+            report.phase_timings(),
+            PREPARE_TARGET_LIFECYCLE_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            INITIALIZE_WRITER_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            "write_batch",
+            PhaseStatus::completed(),
+        )?;
         Ok(())
     }
 
@@ -729,7 +862,17 @@ mod tests {
             message: "expected lifecycle failure".to_owned(),
         })?;
 
-        assert!(error.to_string().contains("prepare failed"));
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::PrepareTargetLifecycle);
+        assert_phase_timing(
+            context.phase_timings(),
+            PREPARE_TARGET_LIFECYCLE_PHASE,
+            PhaseStatus::failed(),
+        )?;
         assert_eq!(logged_events(&log)?, vec!["prepare"]);
         Ok(())
     }
@@ -759,7 +902,28 @@ mod tests {
             message: "expected initialization failure".to_owned(),
         })?;
 
-        assert!(error.to_string().contains("initialize failed"));
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::InitializeWriter);
+        assert!(message.contains("initialize failed"));
+        assert_phase_timing(
+            context.phase_timings(),
+            PREPARE_TARGET_LIFECYCLE_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            INITIALIZE_WRITER_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "cleanup VerifiedExisting"]
@@ -800,6 +964,16 @@ mod tests {
         assert_eq!(context.phase(), MssqlWritePhase::InitializeWriter);
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
         assert!(message.contains("initialize failed"));
+        assert_phase_timing(
+            context.phase_timings(),
+            INITIALIZE_WRITER_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "cleanup CreatedTable"]
@@ -836,14 +1010,16 @@ mod tests {
         };
         assert_eq!(context.phase(), MssqlWritePhase::PollBatchStream);
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
-        let poll_timing = context
-            .phase_timings()
-            .iter()
-            .find(|timing| timing.phase_name() == "poll_batch_stream")
-            .ok_or_else(|| DeltaFunnelError::Config {
-                message: "missing poll_batch_stream phase timing".to_owned(),
-            })?;
-        assert_eq!(poll_timing.status(), PhaseStatus::failed());
+        assert_phase_timing(
+            context.phase_timings(),
+            "poll_batch_stream",
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "cleanup CreatedTable"]
@@ -997,6 +1173,11 @@ mod tests {
         };
         assert_eq!(context.phase(), MssqlWritePhase::PollBatchStream);
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Failed);
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::failed(),
+        )?;
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "cleanup CreatedTable"]

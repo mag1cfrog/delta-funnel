@@ -4,7 +4,7 @@ use std::fmt;
 
 use arrow_schema::Schema;
 
-use crate::DeltaFunnelError;
+use crate::{DeltaFunnelError, PhaseTimingReport, report::PhaseTimer};
 
 use super::{
     LoadMode, MssqlConnectedLifecycleClient, MssqlConnectionConfig, MssqlSchemaPlanOptions,
@@ -12,6 +12,8 @@ use super::{
     MssqlWritePhase, ResolvedMssqlTarget, plan_mssql_output_schema, plan_mssql_target_output,
 };
 use super::{MssqlPreparedTarget, write::initialize_mssql_bulk_writer};
+
+const SQL_SERVER_CONNECTION_PHASE: &str = "sql_server_connection";
 
 /// Private execution request for connecting one planned SQL Server output.
 pub(crate) struct MssqlOutputConnectionRequest {
@@ -50,6 +52,7 @@ impl fmt::Debug for MssqlOutputConnectionRequest {
 pub(crate) struct MssqlConnectedOutputClient {
     output_plan: MssqlTargetOutputPlan,
     client: arrow_tiberius::ConnectedMssqlClient,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl MssqlConnectedOutputClient {
@@ -63,6 +66,12 @@ impl MssqlConnectedOutputClient {
     #[must_use]
     pub(crate) fn client(&mut self) -> &mut arrow_tiberius::ConnectedMssqlClient {
         &mut self.client
+    }
+
+    /// Returns phase timings recorded while creating this connection.
+    #[must_use]
+    pub(crate) fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
     }
 
     /// Returns the lifecycle operation adapter for this output connection.
@@ -107,33 +116,49 @@ pub(crate) async fn connect_mssql_output_client(
     request: MssqlOutputConnectionRequest,
 ) -> Result<MssqlConnectedOutputClient, DeltaFunnelError> {
     let cleanup = request.cleanup_before_target_creation();
-    let client = arrow_tiberius::connect_mssql_client_from_ado_string(
+    let connect_timer = PhaseTimer::start(SQL_SERVER_CONNECTION_PHASE);
+    let connect_result = arrow_tiberius::connect_mssql_client_from_ado_string(
         request.connection.connection_string(),
     )
-    .await
-    .map_err(|source| connect_error(&request, cleanup, source))?;
+    .await;
+    let client = match connect_result {
+        Ok(client) => client,
+        Err(source) => {
+            return Err(connect_error(
+                &request,
+                cleanup,
+                connect_timer.failed(),
+                source,
+            ));
+        }
+    };
 
     Ok(MssqlConnectedOutputClient {
         output_plan: request.output_plan,
         client,
+        phase_timings: vec![connect_timer.completed()],
     })
 }
 
 fn connect_error(
     request: &MssqlOutputConnectionRequest,
     cleanup: MssqlTargetCleanupStatus,
+    timing: PhaseTimingReport,
     source: arrow_tiberius::Error,
 ) -> DeltaFunnelError {
     DeltaFunnelError::MssqlWritePhase {
-        context: Box::new(MssqlWriteFailureContext::from_output_plan(
-            request.output_plan(),
-            MssqlWritePhase::Connect,
-            0,
-            0,
-            0,
-            false,
-            cleanup,
-        )),
+        context: Box::new(
+            MssqlWriteFailureContext::from_output_plan(
+                request.output_plan(),
+                MssqlWritePhase::Connect,
+                0,
+                0,
+                0,
+                false,
+                cleanup,
+            )
+            .with_phase_timings(vec![timing]),
+        ),
         message: source.to_string(),
     }
 }
@@ -146,7 +171,7 @@ mod tests {
     use super::*;
     use crate::{
         MssqlConnectionConfig, MssqlConnectionSource, MssqlTargetConfig,
-        MssqlTargetResolutionContext, MssqlTargetTable, MssqlWriteReport,
+        MssqlTargetResolutionContext, MssqlTargetTable, MssqlWriteReport, PhaseStatus,
     };
 
     fn secret_connection(
@@ -197,6 +222,15 @@ mod tests {
             context.connection().display_label(),
             Some("warehouse-primary")
         );
+        let timing = context
+            .phase_timings()
+            .iter()
+            .find(|timing| timing.phase_name() == SQL_SERVER_CONNECTION_PHASE)
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "missing SQL Server connection phase timing".to_owned(),
+            })?;
+        assert_eq!(timing.status(), PhaseStatus::failed());
+        assert!(timing.elapsed_micros().is_some());
         Ok(message)
     }
 
@@ -412,6 +446,7 @@ mod tests {
         let error = connect_error(
             &request,
             request.cleanup_before_target_creation(),
+            PhaseTimingReport::failed(SQL_SERVER_CONNECTION_PHASE, std::time::Duration::ZERO),
             arrow_tiberius::Error::ConnectionTcpConnect {
                 source: std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,

@@ -344,6 +344,14 @@ impl MssqlWriteReport {
         self
     }
 
+    pub(crate) fn with_appended_phase_timings(
+        mut self,
+        mut phase_timings: Vec<PhaseTimingReport>,
+    ) -> Self {
+        self.phase_timings.append(&mut phase_timings);
+        self
+    }
+
     pub(crate) fn with_cleanup(mut self, cleanup: MssqlTargetCleanupStatus) -> Self {
         self.cleanup = cleanup;
         self
@@ -596,6 +604,19 @@ impl MssqlWriteFailureContext {
     #[must_use]
     pub const fn report(&self) -> &MssqlWriteReport {
         &self.report
+    }
+
+    pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        self.report = self.report.with_phase_timings(phase_timings);
+        self
+    }
+
+    pub(crate) fn with_appended_phase_timings(
+        mut self,
+        phase_timings: Vec<PhaseTimingReport>,
+    ) -> Self {
+        self.report = self.report.with_appended_phase_timings(phase_timings);
+        self
     }
 
     /// Returns workflow phase timing reports known at failure time.
