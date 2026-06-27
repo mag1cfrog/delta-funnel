@@ -266,6 +266,7 @@ mod tests {
             resolved_target: ResolvedMssqlTarget,
             mut batches: MssqlOutputBatchStream,
             _write_options: MssqlWriteOptions,
+            _validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;
             let mut batch_count = 0_u64;
@@ -309,6 +310,7 @@ mod tests {
             schema_options: crate::MssqlSchemaPlanOptions,
             batches: MssqlOutputBatchStream,
             write_options: MssqlWriteOptions,
+            validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let output_plan = crate::plan_mssql_target_for_resolved_output(
                 output_schema.as_ref(),
@@ -323,6 +325,7 @@ mod tests {
                 resolved_target,
                 batches,
                 write_options,
+                validation_options,
             )
             .await
         }

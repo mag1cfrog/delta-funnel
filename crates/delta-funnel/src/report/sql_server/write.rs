@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan, MssqlTargetTable,
-    MssqlWritePhase, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount,
+    MssqlWritePhase, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount, ValidationStatus,
     sql_server::LoadMode,
 };
 
@@ -196,6 +196,8 @@ impl MssqlBatchShapingReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MssqlWriteReportMetrics {
     pub(crate) output_row_count: RowCount,
+    pub(crate) target_row_count: RowCount,
+    pub(crate) validation_status: ValidationStatus,
     pub(crate) batch_shaping: MssqlBatchShapingReport,
     pub(crate) phase_timings: Vec<PhaseTimingReport>,
     pub(crate) rows_written: u64,
@@ -217,6 +219,8 @@ impl MssqlWriteReportMetrics {
     ) -> Self {
         Self {
             output_row_count,
+            target_row_count: RowCount::unavailable(),
+            validation_status: ValidationStatus::skipped(ReportReasonCode::NotExecuted),
             batch_shaping,
             phase_timings: Vec::new(),
             rows_written,
@@ -229,6 +233,17 @@ impl MssqlWriteReportMetrics {
 
     pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
         self.phase_timings = phase_timings;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn with_target_validation(
+        mut self,
+        target_row_count: RowCount,
+        validation_status: ValidationStatus,
+    ) -> Self {
+        self.target_row_count = target_row_count;
+        self.validation_status = validation_status;
         self
     }
 }
@@ -267,6 +282,8 @@ pub struct MssqlWriteReport {
     connection: MssqlConnectionSummary,
     output_schema: Vec<MssqlOutputFieldReport>,
     output_row_count: RowCount,
+    target_row_count: RowCount,
+    validation_status: ValidationStatus,
     batch_shaping: MssqlBatchShapingReport,
     phase_timings: Vec<PhaseTimingReport>,
     stats: MssqlWriteStats,
@@ -323,6 +340,8 @@ impl MssqlWriteReport {
             connection: output_plan.connection().clone(),
             output_schema,
             output_row_count: metrics.output_row_count,
+            target_row_count: metrics.target_row_count,
+            validation_status: metrics.validation_status,
             batch_shaping: metrics.batch_shaping,
             phase_timings: metrics.phase_timings,
             stats: MssqlWriteStats::new(
@@ -354,6 +373,19 @@ impl MssqlWriteReport {
 
     pub(crate) fn with_cleanup(mut self, cleanup: MssqlTargetCleanupStatus) -> Self {
         self.cleanup = cleanup;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_target_validation(
+        mut self,
+        target_row_count: RowCount,
+        validation_status: ValidationStatus,
+        validation_timing: PhaseTimingReport,
+    ) -> Self {
+        self.target_row_count = target_row_count;
+        self.validation_status = validation_status;
+        replace_phase_timing(&mut self.phase_timings, validation_timing);
         self
     }
 
@@ -403,6 +435,18 @@ impl MssqlWriteReport {
     #[must_use]
     pub const fn output_row_count(&self) -> RowCount {
         self.output_row_count
+    }
+
+    /// Returns target-side row count evidence after the SQL Server write.
+    #[must_use]
+    pub const fn target_row_count(&self) -> RowCount {
+        self.target_row_count
+    }
+
+    /// Returns target-side validation status for this output.
+    #[must_use]
+    pub const fn validation_status(&self) -> ValidationStatus {
+        self.validation_status
     }
 
     /// Returns identity batch-shaping counters for the selected output stream.
@@ -582,6 +626,18 @@ impl MssqlWriteFailureContext {
         self.report.output_row_count()
     }
 
+    /// Returns target-side row count evidence known at failure time.
+    #[must_use]
+    pub const fn target_row_count(&self) -> RowCount {
+        self.report.target_row_count()
+    }
+
+    /// Returns target-side validation status known at failure time.
+    #[must_use]
+    pub const fn validation_status(&self) -> ValidationStatus {
+        self.report.validation_status()
+    }
+
     /// Returns identity batch-shaping counters known at failure time.
     #[must_use]
     pub const fn batch_shaping(&self) -> MssqlBatchShapingReport {
@@ -623,5 +679,17 @@ impl MssqlWriteFailureContext {
     #[must_use]
     pub fn phase_timings(&self) -> &[PhaseTimingReport] {
         self.report.phase_timings()
+    }
+}
+
+#[allow(dead_code)]
+fn replace_phase_timing(phase_timings: &mut Vec<PhaseTimingReport>, timing: PhaseTimingReport) {
+    if let Some(existing_timing) = phase_timings
+        .iter_mut()
+        .find(|existing_timing| existing_timing.phase_name() == timing.phase_name())
+    {
+        *existing_timing = timing;
+    } else {
+        phase_timings.push(timing);
     }
 }

@@ -415,6 +415,7 @@ mod tests {
             schema_options: MssqlSchemaPlanOptions,
             mut batches: MssqlOutputBatchStream,
             _write_options: MssqlWriteOptions,
+            _validation_options: crate::ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;
             let mut batch_count = 0_u64;

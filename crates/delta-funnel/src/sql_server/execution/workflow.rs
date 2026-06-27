@@ -13,15 +13,15 @@ use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::Stream;
 
 use crate::{
-    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, report::PhaseTimer,
-    support::sanitize_text_for_display,
+    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationOptions,
+    ValidationStatus, report::PhaseTimer, support::sanitize_text_for_display,
 };
 
 use super::{
     LoadMode, MssqlBatchShapingReport, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteFailureContext,
     MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_options,
-    write_output_batches_to_mssql,
+    write_output_batches_to_mssql_with_validation_options,
 };
 
 const OUTPUT_STREAM_SETUP_PHASE: &str = "output_stream_setup";
@@ -53,6 +53,7 @@ pub struct MssqlOutputWriteJob {
     schema_options: MssqlSchemaPlanOptions,
     batches: MssqlOutputBatchStreamFactory,
     write_options: MssqlWriteOptions,
+    validation_options: ValidationOptions,
     phase_timings: Vec<PhaseTimingReport>,
 }
 
@@ -64,6 +65,7 @@ impl MssqlOutputWriteJob {
         schema_options: MssqlSchemaPlanOptions,
         batches: F,
         write_options: MssqlWriteOptions,
+        validation_options: ValidationOptions,
     ) -> Self
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -81,6 +83,7 @@ impl MssqlOutputWriteJob {
                 })
             }),
             write_options,
+            validation_options,
             phase_timings: Vec::new(),
         }
     }
@@ -110,6 +113,7 @@ impl MssqlOutputWriteJob {
             schema_options,
             batches,
             default_mssql_write_options(),
+            ValidationOptions::default(),
         )
     }
 
@@ -139,6 +143,7 @@ impl MssqlOutputWriteJob {
         MssqlSchemaPlanOptions,
         MssqlOutputBatchStreamFactory,
         MssqlWriteOptions,
+        ValidationOptions,
         Vec<PhaseTimingReport>,
     ) {
         (
@@ -147,6 +152,7 @@ impl MssqlOutputWriteJob {
             self.schema_options,
             self.batches,
             self.write_options,
+            self.validation_options,
             self.phase_timings,
         )
     }
@@ -365,6 +371,26 @@ impl MssqlOutputWriteStatus {
         }
     }
 
+    /// Returns target-side row count evidence for this output.
+    #[must_use]
+    pub fn target_row_count(&self) -> RowCount {
+        match self {
+            Self::Succeeded(report) => report.target_row_count(),
+            Self::Failed(report) => report.target_row_count(),
+            Self::Skipped(report) => report.target_row_count(),
+        }
+    }
+
+    /// Returns target-side validation status for this output.
+    #[must_use]
+    pub fn validation_status(&self) -> ValidationStatus {
+        match self {
+            Self::Succeeded(report) => report.validation_status(),
+            Self::Failed(report) => report.validation_status(),
+            Self::Skipped(report) => report.validation_status(),
+        }
+    }
+
     /// Returns batch-shaping counters for this output.
     #[must_use]
     pub fn batch_shaping(&self) -> MssqlBatchShapingReport {
@@ -411,6 +437,8 @@ pub struct MssqlWriteFailureReport {
     error: String,
     context: Option<Box<MssqlWriteFailureContext>>,
     output_row_count: RowCount,
+    target_row_count: RowCount,
+    validation_status: ValidationStatus,
     batch_shaping: MssqlBatchShapingReport,
     phase_timings: Vec<PhaseTimingReport>,
 }
@@ -427,6 +455,14 @@ impl MssqlWriteFailureReport {
             RowCount::unavailable(),
             MssqlWriteFailureContext::output_row_count,
         );
+        let target_row_count = context.as_deref().map_or(
+            RowCount::unavailable(),
+            MssqlWriteFailureContext::target_row_count,
+        );
+        let validation_status = context.as_deref().map_or(
+            ValidationStatus::skipped(ReportReasonCode::FailureBeforeValidation),
+            MssqlWriteFailureContext::validation_status,
+        );
         let batch_shaping = context.as_deref().map_or_else(
             || MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
             MssqlWriteFailureContext::batch_shaping,
@@ -436,6 +472,8 @@ impl MssqlWriteFailureReport {
             error: sanitize_text_for_display(&error.to_string()),
             context,
             output_row_count,
+            target_row_count,
+            validation_status,
             batch_shaping,
             phase_timings,
         }
@@ -470,6 +508,18 @@ impl MssqlWriteFailureReport {
     #[must_use]
     pub const fn output_row_count(&self) -> RowCount {
         self.output_row_count
+    }
+
+    /// Returns target-side row count evidence known at failure time.
+    #[must_use]
+    pub const fn target_row_count(&self) -> RowCount {
+        self.target_row_count
+    }
+
+    /// Returns target-side validation status known at failure time.
+    #[must_use]
+    pub const fn validation_status(&self) -> ValidationStatus {
+        self.validation_status
     }
 
     /// Returns batch-shaping counters known at failure time.
@@ -513,6 +563,8 @@ pub struct MssqlWriteSkippedReport {
     target: MssqlTargetSummary,
     reason: MssqlWriteSkippedReason,
     output_row_count: RowCount,
+    target_row_count: RowCount,
+    validation_status: ValidationStatus,
     batch_shaping: MssqlBatchShapingReport,
     phase_timings: Vec<PhaseTimingReport>,
 }
@@ -527,6 +579,8 @@ impl MssqlWriteSkippedReport {
             target,
             reason: MssqlWriteSkippedReason::PreviousOutputFailed { failed_output_name },
             output_row_count: RowCount::unavailable(),
+            target_row_count: RowCount::unavailable(),
+            validation_status: ValidationStatus::skipped(ReportReasonCode::PriorFailure),
             batch_shaping: MssqlBatchShapingReport::skipped(ReportReasonCode::PriorFailure),
             phase_timings: skipped_after_prior_failure_phase_timings(phase_timings),
         }
@@ -554,6 +608,18 @@ impl MssqlWriteSkippedReport {
     #[must_use]
     pub const fn output_row_count(&self) -> RowCount {
         self.output_row_count
+    }
+
+    /// Returns target-side row count evidence for this skipped output.
+    #[must_use]
+    pub const fn target_row_count(&self) -> RowCount {
+        self.target_row_count
+    }
+
+    /// Returns target-side validation status for this skipped output.
+    #[must_use]
+    pub const fn validation_status(&self) -> ValidationStatus {
+        self.validation_status
     }
 
     /// Returns batch-shaping counters for this skipped output.
@@ -602,6 +668,7 @@ pub(crate) trait MssqlWorkflowOutputWriter: Send {
         schema_options: MssqlSchemaPlanOptions,
         batches: MssqlOutputBatchStream,
         write_options: MssqlWriteOptions,
+        validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
@@ -616,13 +683,15 @@ impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
         schema_options: MssqlSchemaPlanOptions,
         batches: MssqlOutputBatchStream,
         write_options: MssqlWriteOptions,
+        validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql(
+        write_output_batches_to_mssql_with_validation_options(
             output_schema.as_ref(),
             resolved_target,
             schema_options,
             batches,
             write_options,
+            validation_options,
         )
         .await
     }
@@ -662,6 +731,7 @@ where
             schema_options,
             batches,
             write_options,
+            validation_options,
             planned_phase_timings,
         ) = job.into_parts();
         let stream_setup_timer = PhaseTimer::start(OUTPUT_STREAM_SETUP_PHASE);
@@ -690,6 +760,7 @@ where
                 schema_options,
                 batches,
                 write_options,
+                validation_options,
             )
             .await
         {
@@ -790,7 +861,8 @@ mod tests {
     use crate::{
         LoadMode, MssqlConnectionConfig, MssqlTargetCleanupStatus, MssqlTargetConfig,
         MssqlTargetOutputPlan, MssqlTargetResolutionContext, MssqlTargetTable, MssqlWritePhase,
-        PhaseStatus, PhaseTimingReport, plan_mssql_target_for_output,
+        PhaseStatus, PhaseTimingReport, ValidationStatus, plan_mssql_target_for_output,
+        report::sql_server::MssqlWriteReportMetrics,
     };
 
     const PLANNED_PHASE: &str = "planned_phase";
@@ -834,6 +906,7 @@ mod tests {
             _schema_options: MssqlSchemaPlanOptions,
             _batches: MssqlOutputBatchStream,
             _write_options: MssqlWriteOptions,
+            _validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
                 .lock()
@@ -855,6 +928,7 @@ mod tests {
             _schema_options: MssqlSchemaPlanOptions,
             mut batches: MssqlOutputBatchStream,
             _write_options: MssqlWriteOptions,
+            _validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
                 .lock()
@@ -1160,12 +1234,22 @@ mod tests {
             success.connection().display_label(),
             Some("test connection")
         );
+        assert_eq!(success.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            success.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::NotExecuted)
+        );
 
         assert!(failed.is_failed());
         assert_eq!(failed.output_name(), "second");
         assert_eq!(failed.target_table().table(), "second_orders");
         assert_eq!(failed.load_mode(), LoadMode::CreateAndLoad);
         assert_eq!(failed.connection().display_label(), Some("test connection"));
+        assert_eq!(failed.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            failed.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::NotExecuted)
+        );
 
         assert!(skipped.is_skipped());
         assert_eq!(skipped.output_name(), "third");
@@ -1175,7 +1259,60 @@ mod tests {
             skipped.connection().display_label(),
             Some("test connection")
         );
+        assert_eq!(skipped.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            skipped.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::PriorFailure)
+        );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_output_status_exposes_validation_evidence() -> Result<(), DeltaFunnelError> {
+        let output = output_plan("validation_failed", LoadMode::CreateAndLoad)?;
+        let metrics = MssqlWriteReportMetrics::new(
+            RowCount::exact(3),
+            MssqlBatchShapingReport::completed(1, 3, 1, 3),
+            3,
+            1,
+            0,
+            false,
+            MssqlTargetCleanupStatus::Succeeded,
+        )
+        .with_target_validation(RowCount::exact(4), ValidationStatus::failed())
+        .with_phase_timings(vec![PhaseTimingReport::failed(
+            VALIDATION_PHASE,
+            Duration::from_micros(5),
+        )]);
+        let failure = phase_error_with_context(
+            MssqlWriteFailureContext::from_output_plan_with_metrics(
+                &output,
+                MssqlWritePhase::Validation,
+                metrics,
+            ),
+            "target row count did not match exact output rows",
+        );
+        let writer = FakeWorkflowWriter::new(vec![Err(failure)]);
+
+        let report = write_mssql_outputs_with_writer(
+            vec![job(output)?],
+            MssqlWorkflowWriteOptions::default(),
+            writer,
+        )
+        .await?;
+
+        let [status] = report.outputs() else {
+            return Err(test_error("expected one output status"));
+        };
+        let MssqlOutputWriteStatus::Failed(failure) = status else {
+            return Err(test_error("expected failed output status"));
+        };
+        assert_eq!(failure.target_row_count(), RowCount::exact(4));
+        assert_eq!(failure.validation_status(), ValidationStatus::failed());
+        assert_eq!(status.target_row_count(), RowCount::exact(4));
+        assert_eq!(status.validation_status(), ValidationStatus::failed());
+        assert_phase_timing(status, VALIDATION_PHASE, PhaseStatus::failed())?;
         Ok(())
     }
 

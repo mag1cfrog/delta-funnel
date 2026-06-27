@@ -6,7 +6,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputWriteJob, MssqlSchemaPlanOptions,
     MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport,
-    ResolvedMssqlTarget, write_mssql_outputs_with_writer, write_output_batches_to_mssql,
+    ResolvedMssqlTarget, ValidationOptions, write_mssql_outputs_with_writer,
+    write_output_batches_to_mssql_with_validation_options,
 };
 
 use super::super::super::{
@@ -31,13 +32,15 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowPublicOutputWriter {
         schema_options: MssqlSchemaPlanOptions,
         batches: MssqlOutputBatchStream,
         write_options: MssqlWriteOptions,
+        validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql(
+        write_output_batches_to_mssql_with_validation_options(
             output_schema.as_ref(),
             resolved_target,
             schema_options,
             batches,
             write_options,
+            validation_options,
         )
         .await
     }
@@ -72,6 +75,7 @@ impl DeltaFunnelSession {
                     planned.output_plan().schema_plan_options(),
                     batches,
                     self.options.mssql_write_options(),
+                    self.options.validation_options(),
                 )
                 .with_phase_timings(planned.phase_timings().to_vec()))
             })
@@ -109,6 +113,7 @@ impl DeltaFunnelSession {
                     planned.output_plan().schema_plan_options(),
                     batches,
                     self.options.mssql_write_options(),
+                    self.options.validation_options(),
                 )
                 .with_phase_timings(planned.phase_timings().to_vec()))
             })

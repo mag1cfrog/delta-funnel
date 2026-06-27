@@ -212,6 +212,8 @@ pub enum MssqlWritePhase {
     WriteBatch,
     /// Finalize the SQL Server bulk writer.
     Finalize,
+    /// Validate target-side write evidence after finalize succeeds.
+    Validation,
     /// Clean up a DeltaFunnel-created target after a later failure.
     Cleanup,
 }
@@ -226,6 +228,7 @@ impl fmt::Display for MssqlWritePhase {
             Self::ValidateBatchSchema => "validate batch schema",
             Self::WriteBatch => "write batch",
             Self::Finalize => "finalize",
+            Self::Validation => "validation",
             Self::Cleanup => "cleanup",
         })
     }
@@ -779,7 +782,7 @@ mod tests {
     use crate::{
         DeltaFunnelError, MssqlBatchShapingReport, MssqlConnectionConfig, MssqlConnectionSource,
         MssqlOutputFieldReport, MssqlTargetConfig, MssqlTargetTable, MssqlWriteStats, PhaseStatus,
-        PhaseTimingReport, ReportReasonCode, plan_mssql_target_for_output,
+        PhaseTimingReport, ReportReasonCode, ValidationStatus, plan_mssql_target_for_output,
     };
 
     fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
@@ -1665,6 +1668,7 @@ mod tests {
             ),
             (MssqlWritePhase::WriteBatch, "write batch"),
             (MssqlWritePhase::Finalize, "finalize"),
+            (MssqlWritePhase::Validation, "validation"),
             (MssqlWritePhase::Cleanup, "cleanup"),
         ];
 
@@ -1728,6 +1732,11 @@ mod tests {
         assert_eq!(report.stats().elapsed_ms(), 125);
         assert_output_schema(report.output_schema());
         assert_eq!(report.output_row_count(), RowCount::exact(42));
+        assert_eq!(report.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::NotExecuted)
+        );
         assert_batch_shaping(
             report.batch_shaping(),
             PhaseStatus::completed(),
@@ -1738,6 +1747,58 @@ mod tests {
         );
         assert!(report.partial_write_possible());
         assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        Ok(())
+    }
+
+    #[test]
+    fn write_report_records_target_validation_outcome() -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+        let report = MssqlWriteReport::from_output_plan_with_metrics(
+            &output_plan,
+            MssqlWriteReportMetrics::new(
+                RowCount::exact(42),
+                MssqlBatchShapingReport::completed(3, 42, 3, 42),
+                42,
+                3,
+                125,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            )
+            .with_phase_timings(vec![PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::NotExecuted,
+            )]),
+        );
+
+        let report = report.with_target_validation(
+            RowCount::exact(42),
+            ValidationStatus::passed(),
+            PhaseTimingReport::completed(VALIDATION_PHASE, Duration::from_micros(7)),
+        );
+
+        assert_eq!(report.target_row_count(), RowCount::exact(42));
+        assert_eq!(report.validation_status(), ValidationStatus::passed());
+        assert_eq!(
+            report
+                .phase_timings()
+                .iter()
+                .filter(|timing| timing.phase_name() == VALIDATION_PHASE)
+                .count(),
+            1
+        );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::completed(),
+        )?;
         Ok(())
     }
 
@@ -1809,6 +1870,11 @@ mod tests {
         assert_eq!(context.stats().batches_written(), 3);
         assert_eq!(context.stats().elapsed_ms(), 125);
         assert_eq!(context.output_row_count(), RowCount::partial(42));
+        assert_eq!(context.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::NotExecuted)
+        );
         assert_batch_shaping(context.batch_shaping(), PhaseStatus::failed(), 3, 42, 3, 42);
         assert!(context.partial_write_possible());
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);

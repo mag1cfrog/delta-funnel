@@ -21,7 +21,10 @@ pub use execution::{
     validate_mssql_output_record_batch, validate_mssql_output_schema, write_mssql_outputs_to_mssql,
     write_output_batches_to_mssql,
 };
-pub(crate) use execution::{MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer};
+pub(crate) use execution::{
+    MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer,
+    write_output_batches_to_mssql_with_validation_options,
+};
 pub use planning::{
     MssqlBinaryPolicy, MssqlDate64Policy, MssqlDdlPlan, MssqlDecimal256Policy, MssqlDecimalPolicy,
     MssqlFloatPolicy, MssqlLifecycleExecutionGuardrail, MssqlLifecycleGuardrailPolicy,
