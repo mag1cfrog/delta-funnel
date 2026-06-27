@@ -193,10 +193,11 @@ impl MssqlBatchShapingReport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MssqlWriteReportMetrics {
     pub(crate) output_row_count: RowCount,
     pub(crate) batch_shaping: MssqlBatchShapingReport,
+    pub(crate) phase_timings: Vec<PhaseTimingReport>,
     pub(crate) rows_written: u64,
     pub(crate) batches_written: u64,
     pub(crate) elapsed_ms: u64,
@@ -217,12 +218,18 @@ impl MssqlWriteReportMetrics {
         Self {
             output_row_count,
             batch_shaping,
+            phase_timings: Vec::new(),
             rows_written,
             batches_written,
             elapsed_ms,
             partial_write_possible,
             cleanup,
         }
+    }
+
+    pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        self.phase_timings = phase_timings;
+        self
     }
 }
 
@@ -317,7 +324,7 @@ impl MssqlWriteReport {
             output_schema,
             output_row_count: metrics.output_row_count,
             batch_shaping: metrics.batch_shaping,
-            phase_timings: Vec::new(),
+            phase_timings: metrics.phase_timings,
             stats: MssqlWriteStats::new(
                 output_name,
                 metrics.rows_written,
@@ -330,7 +337,15 @@ impl MssqlWriteReport {
     }
 
     pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        let mut existing_timings = std::mem::take(&mut self.phase_timings);
+        let mut phase_timings = phase_timings;
+        phase_timings.append(&mut existing_timings);
         self.phase_timings = phase_timings;
+        self
+    }
+
+    pub(crate) fn with_cleanup(mut self, cleanup: MssqlTargetCleanupStatus) -> Self {
+        self.cleanup = cleanup;
         self
     }
 
@@ -581,5 +596,11 @@ impl MssqlWriteFailureContext {
     #[must_use]
     pub const fn report(&self) -> &MssqlWriteReport {
         &self.report
+    }
+
+    /// Returns workflow phase timing reports known at failure time.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        self.report.phase_timings()
     }
 }

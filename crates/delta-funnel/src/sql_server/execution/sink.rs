@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::Stream;
 
-use crate::DeltaFunnelError;
+use crate::{DeltaFunnelError, report::sql_server::MssqlWriteReportMetrics};
 
 use super::{
     LoadMode, MssqlBulkLoadWriter, MssqlPreparedTarget, MssqlSchemaPlanOptions,
@@ -180,7 +180,6 @@ where
         .await
     {
         Ok(report) => Ok(write_report_with_cleanup(
-            &output_plan,
             &report,
             prepared_target.report().cleanup(),
         )),
@@ -228,18 +227,10 @@ where
 }
 
 fn write_report_with_cleanup(
-    output_plan: &MssqlTargetOutputPlan,
     report: &MssqlWriteReport,
     cleanup: MssqlTargetCleanupStatus,
 ) -> MssqlWriteReport {
-    MssqlWriteReport::from_output_plan(
-        output_plan,
-        report.stats().rows_written(),
-        report.stats().batches_written(),
-        report.stats().elapsed_ms(),
-        report.partial_write_possible(),
-        cleanup,
-    )
+    report.clone().with_cleanup(cleanup)
 }
 
 fn error_with_cleanup(
@@ -301,14 +292,19 @@ fn context_with_cleanup(
     context: &crate::MssqlWriteFailureContext,
     cleanup: MssqlTargetCleanupStatus,
 ) -> crate::MssqlWriteFailureContext {
-    crate::MssqlWriteFailureContext::from_output_plan(
+    crate::MssqlWriteFailureContext::from_output_plan_with_metrics(
         output_plan,
         context.phase(),
-        context.stats().rows_written(),
-        context.stats().batches_written(),
-        context.stats().elapsed_ms(),
-        context.partial_write_possible(),
-        cleanup,
+        MssqlWriteReportMetrics::new(
+            context.output_row_count(),
+            context.batch_shaping(),
+            context.stats().rows_written(),
+            context.stats().batches_written(),
+            context.stats().elapsed_ms(),
+            context.partial_write_possible(),
+            cleanup,
+        )
+        .with_phase_timings(context.phase_timings().to_vec()),
     )
 }
 
@@ -327,7 +323,7 @@ mod tests {
     use super::*;
     use crate::{
         MssqlConnectionConfig, MssqlPreparedTargetAction, MssqlTargetConfig,
-        MssqlTargetResolutionContext, MssqlTargetTable, MssqlWritePhase,
+        MssqlTargetResolutionContext, MssqlTargetTable, MssqlWritePhase, PhaseStatus,
         default_mssql_write_options, plan_mssql_target_for_output,
     };
 
@@ -639,6 +635,14 @@ mod tests {
         assert_eq!(report.output_name(), "orders_output");
         assert_eq!(report.stats().rows_written(), 3);
         assert_eq!(report.stats().batches_written(), 2);
+        let write_batch_timing = report
+            .phase_timings()
+            .iter()
+            .find(|timing| timing.phase_name() == "write_batch")
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "missing write_batch phase timing".to_owned(),
+            })?;
+        assert_eq!(write_batch_timing.status(), PhaseStatus::completed());
         Ok(())
     }
 
@@ -832,6 +836,14 @@ mod tests {
         };
         assert_eq!(context.phase(), MssqlWritePhase::PollBatchStream);
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        let poll_timing = context
+            .phase_timings()
+            .iter()
+            .find(|timing| timing.phase_name() == "poll_batch_stream")
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "missing poll_batch_stream phase timing".to_owned(),
+            })?;
+        assert_eq!(poll_timing.status(), PhaseStatus::failed());
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "cleanup CreatedTable"]
