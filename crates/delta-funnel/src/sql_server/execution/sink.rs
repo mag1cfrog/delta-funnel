@@ -10,7 +10,11 @@ use futures_util::Stream;
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, TargetValidationMode,
     ValidationOptions, ValidationStatus,
-    report::{PhaseTimer, sql_server::MssqlWriteReportMetrics},
+    error::MssqlWritePhaseSnafu,
+    report::{
+        PhaseTimer,
+        sql_server::{MssqlBatchShapingReport, MssqlWriteReportMetrics},
+    },
 };
 
 use super::{
@@ -294,6 +298,26 @@ where
     };
     phase_timings.push(prepare_timer.completed());
 
+    let target_row_count_before_write = match target_row_count_before_append_write(
+        &mut connection,
+        &output_plan,
+        &prepared_target,
+        validation_options,
+    )
+    .await
+    {
+        Ok(target_row_count_before_write) => target_row_count_before_write,
+        Err(error) => {
+            return Err(cleanup_after_prepared_target_failure(
+                &mut connection,
+                &output_plan,
+                &prepared_target,
+                error_with_phase_timings(error, phase_timings),
+            )
+            .await);
+        }
+    };
+
     match connection
         .write_prepared_batches(&output_plan, &prepared_target, batches, options)
         .await
@@ -307,6 +331,7 @@ where
                 &prepared_target,
                 report,
                 validation_options,
+                target_row_count_before_write,
             )
             .await
             {
@@ -336,6 +361,7 @@ async fn validate_written_target<C>(
     prepared_target: &MssqlPreparedTarget,
     report: MssqlWriteReport,
     validation_options: ValidationOptions,
+    target_row_count_before_write: TargetRowCountBeforeWrite,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     C: MssqlOneOutputSinkConnection,
@@ -346,37 +372,35 @@ where
             ValidationStatus::disabled(),
             PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::ValidationDisabled),
         )),
-        TargetValidationMode::ValidateIfPossible
-            if output_plan.load_mode() != LoadMode::CreateAndLoad =>
-        {
-            Ok(report.with_target_validation(
-                RowCount::unavailable(),
-                ValidationStatus::unavailable(ReportReasonCode::UnsupportedLoadMode),
-                PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
-            ))
-        }
-        TargetValidationMode::Require if output_plan.load_mode() != LoadMode::CreateAndLoad => {
-            let report = report.with_target_validation(
-                RowCount::unavailable(),
-                ValidationStatus::required_but_failed(ReportReasonCode::UnsupportedLoadMode),
-                PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
-            );
-            Err(validation_error(
-                output_plan,
-                &report,
-                "target row-count validation is not implemented for this load mode",
-            ))
-        }
         TargetValidationMode::ValidateIfPossible | TargetValidationMode::Require => {
+            let validation_required =
+                validation_options.target_validation_mode() == TargetValidationMode::Require;
             let Some(output_rows) = report.output_row_count().exact_value() else {
-                return validation_unavailable_or_required_failure(
+                return missing_exact_output_rows_validation(
                     output_plan,
                     report,
-                    ReportReasonCode::MissingExactOutputRows,
-                    validation_options.target_validation_mode(),
-                    "target row-count validation requires exact output rows",
+                    validation_required,
+                    target_row_count_before_write,
                 );
             };
+
+            if output_plan.load_mode() == LoadMode::AppendExisting {
+                return validate_append_existing_target_delta(
+                    connection,
+                    output_plan,
+                    prepared_target,
+                    report,
+                    validation_required,
+                    target_row_count_before_write,
+                    output_rows,
+                )
+                .await;
+            }
+
+            if output_plan.load_mode() != LoadMode::CreateAndLoad {
+                return unsupported_target_validation(output_plan, report, validation_required);
+            }
+
             let validation_timer = PhaseTimer::start(VALIDATION_PHASE);
             let target_rows = match connection
                 .target_row_count(output_plan, prepared_target)
@@ -388,7 +412,7 @@ where
                         output_plan,
                         report,
                         failure.reason(),
-                        validation_options.target_validation_mode(),
+                        validation_required,
                         failure.message(),
                     );
                 }
@@ -417,17 +441,184 @@ where
     }
 }
 
+fn missing_exact_output_rows_validation(
+    output_plan: &MssqlTargetOutputPlan,
+    report: MssqlWriteReport,
+    validation_required: bool,
+    target_row_count_before_write: TargetRowCountBeforeWrite,
+) -> Result<MssqlWriteReport, DeltaFunnelError> {
+    if output_plan.load_mode() == LoadMode::AppendExisting
+        && let TargetRowCountBeforeWrite::Exact(target_rows_before) = target_row_count_before_write
+    {
+        return target_delta_validation_unavailable_or_required_failure(
+            output_plan,
+            report,
+            ReportReasonCode::MissingExactOutputRows,
+            validation_required,
+            "target row-count validation requires exact output rows",
+            RowCount::exact(target_rows_before),
+        );
+    }
+
+    validation_unavailable_or_required_failure(
+        output_plan,
+        report,
+        ReportReasonCode::MissingExactOutputRows,
+        validation_required,
+        "target row-count validation requires exact output rows",
+    )
+}
+
+async fn target_row_count_before_append_write<C>(
+    connection: &mut C,
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_target: &MssqlPreparedTarget,
+    validation_options: ValidationOptions,
+) -> Result<TargetRowCountBeforeWrite, DeltaFunnelError>
+where
+    C: MssqlOneOutputSinkConnection,
+{
+    if validation_options.target_validation_mode() == TargetValidationMode::Disabled
+        || output_plan.load_mode() != LoadMode::AppendExisting
+    {
+        return Ok(TargetRowCountBeforeWrite::NotRequired);
+    }
+
+    match connection
+        .target_row_count(output_plan, prepared_target)
+        .await
+    {
+        Ok(target_rows) => Ok(TargetRowCountBeforeWrite::Exact(target_rows)),
+        Err(failure)
+            if validation_options.target_validation_mode() == TargetValidationMode::Require =>
+        {
+            Err(pre_write_required_validation_error(
+                output_plan,
+                prepared_target,
+                failure.reason(),
+                failure.message(),
+            ))
+        }
+        Err(failure) => Ok(TargetRowCountBeforeWrite::Unavailable {
+            reason: failure.reason(),
+            message: failure.message().to_owned(),
+        }),
+    }
+}
+
+async fn validate_append_existing_target_delta<C>(
+    connection: &mut C,
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_target: &MssqlPreparedTarget,
+    report: MssqlWriteReport,
+    validation_required: bool,
+    target_row_count_before_write: TargetRowCountBeforeWrite,
+    output_rows: u64,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    C: MssqlOneOutputSinkConnection,
+{
+    let target_rows_before = match target_row_count_before_write {
+        TargetRowCountBeforeWrite::Exact(target_rows_before) => target_rows_before,
+        TargetRowCountBeforeWrite::Unavailable { reason, message } => {
+            return validation_unavailable_or_required_failure(
+                output_plan,
+                report,
+                reason,
+                validation_required,
+                &message,
+            );
+        }
+        TargetRowCountBeforeWrite::NotRequired => {
+            return validation_unavailable_or_required_failure(
+                output_plan,
+                report,
+                ReportReasonCode::MissingTargetAccess,
+                validation_required,
+                "target row-count validation requires target rows before append write",
+            );
+        }
+    };
+
+    let validation_timer = PhaseTimer::start(VALIDATION_PHASE);
+    let target_rows_after = match connection
+        .target_row_count(output_plan, prepared_target)
+        .await
+    {
+        Ok(target_rows_after) => target_rows_after,
+        Err(failure) => {
+            return target_delta_validation_unavailable_or_required_failure(
+                output_plan,
+                report,
+                failure.reason(),
+                validation_required,
+                failure.message(),
+                RowCount::exact(target_rows_before),
+            );
+        }
+    };
+    let target_delta = target_rows_after.checked_sub(target_rows_before);
+    let target_row_count_before_write = RowCount::exact(target_rows_before);
+    let target_row_count_after_write = RowCount::exact(target_rows_after);
+
+    if target_delta == Some(output_rows) {
+        return Ok(report.with_target_delta_validation(
+            target_row_count_before_write,
+            target_row_count_after_write,
+            ValidationStatus::passed(),
+            validation_timer.completed(),
+        ));
+    }
+
+    let report = report.with_target_delta_validation(
+        target_row_count_before_write,
+        target_row_count_after_write,
+        ValidationStatus::failed(),
+        validation_timer.failed(),
+    );
+    Err(validation_error(
+        output_plan,
+        &report,
+        "target row-count delta did not match exact output rows",
+    ))
+}
+
+fn unsupported_target_validation(
+    output_plan: &MssqlTargetOutputPlan,
+    report: MssqlWriteReport,
+    validation_required: bool,
+) -> Result<MssqlWriteReport, DeltaFunnelError> {
+    if validation_required {
+        let report = report.with_target_validation(
+            RowCount::unavailable(),
+            ValidationStatus::required_but_failed(ReportReasonCode::UnsupportedLoadMode),
+            PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
+        );
+        Err(validation_error(
+            output_plan,
+            &report,
+            "target row-count validation is not implemented for this load mode",
+        ))
+    } else {
+        Ok(report.with_target_validation(
+            RowCount::unavailable(),
+            ValidationStatus::unavailable(ReportReasonCode::UnsupportedLoadMode),
+            PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
+        ))
+    }
+}
+
 fn validation_unavailable_or_required_failure(
     output_plan: &MssqlTargetOutputPlan,
     report: MssqlWriteReport,
     reason: ReportReasonCode,
-    mode: TargetValidationMode,
+    validation_required: bool,
     message: &str,
 ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-    let validation_status = match mode {
-        TargetValidationMode::Disabled => ValidationStatus::disabled(),
-        TargetValidationMode::ValidateIfPossible => ValidationStatus::unavailable(reason),
-        TargetValidationMode::Require => ValidationStatus::required_but_failed(reason),
+    let validation_status = if validation_required {
+        ValidationStatus::required_but_failed(reason)
+    } else {
+        ValidationStatus::unavailable(reason)
     };
     let report = report.with_target_validation(
         RowCount::unavailable(),
@@ -435,11 +626,68 @@ fn validation_unavailable_or_required_failure(
         PhaseTimingReport::unavailable(VALIDATION_PHASE, reason),
     );
 
-    if mode == TargetValidationMode::Require {
+    if validation_required {
         return Err(validation_error(output_plan, &report, message));
     }
 
     Ok(report)
+}
+
+fn target_delta_validation_unavailable_or_required_failure(
+    output_plan: &MssqlTargetOutputPlan,
+    report: MssqlWriteReport,
+    reason: ReportReasonCode,
+    validation_required: bool,
+    message: &str,
+    target_row_count_before_write: RowCount,
+) -> Result<MssqlWriteReport, DeltaFunnelError> {
+    let validation_status = if validation_required {
+        ValidationStatus::required_but_failed(reason)
+    } else {
+        ValidationStatus::unavailable(reason)
+    };
+    let report = report.with_target_delta_validation(
+        target_row_count_before_write,
+        RowCount::unavailable(),
+        validation_status,
+        PhaseTimingReport::unavailable(VALIDATION_PHASE, reason),
+    );
+
+    if validation_required {
+        return Err(validation_error(output_plan, &report, message));
+    }
+
+    Ok(report)
+}
+
+fn pre_write_required_validation_error(
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_target: &MssqlPreparedTarget,
+    reason: ReportReasonCode,
+    message: &str,
+) -> DeltaFunnelError {
+    let report = MssqlWriteReport::from_output_plan_with_metrics(
+        output_plan,
+        MssqlWriteReportMetrics::new(
+            RowCount::unavailable(),
+            MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
+            0,
+            0,
+            0,
+            false,
+            prepared_target.report().cleanup(),
+        )
+        .with_target_delta_validation(
+            RowCount::unavailable(),
+            RowCount::unavailable(),
+            ValidationStatus::required_but_failed(reason),
+        )
+        .with_phase_timings(vec![PhaseTimingReport::unavailable(
+            VALIDATION_PHASE,
+            reason,
+        )]),
+    );
+    validation_error(output_plan, &report, message)
 }
 
 fn validation_error(
@@ -447,7 +695,7 @@ fn validation_error(
     report: &MssqlWriteReport,
     message: &str,
 ) -> DeltaFunnelError {
-    DeltaFunnelError::MssqlWritePhase {
+    MssqlWritePhaseSnafu {
         context: Box::new(MssqlWriteFailureContext::from_output_plan_with_metrics(
             output_plan,
             MssqlWritePhase::Validation,
@@ -455,6 +703,7 @@ fn validation_error(
         )),
         message: message.to_owned(),
     }
+    .build()
 }
 
 fn report_metrics_from_report(report: &MssqlWriteReport) -> MssqlWriteReportMetrics {
@@ -467,8 +716,22 @@ fn report_metrics_from_report(report: &MssqlWriteReport) -> MssqlWriteReportMetr
         report.partial_write_possible(),
         report.cleanup(),
     )
-    .with_target_validation(report.target_row_count(), report.validation_status())
+    .with_target_delta_validation(
+        report.target_row_count_before_write(),
+        report.target_row_count_after_write(),
+        report.validation_status(),
+    )
     .with_phase_timings(report.phase_timings().to_vec())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetRowCountBeforeWrite {
+    NotRequired,
+    Exact(u64),
+    Unavailable {
+        reason: ReportReasonCode,
+        message: String,
+    },
 }
 
 fn ensure_supported_output_mode(
@@ -629,7 +892,11 @@ fn context_with_cleanup(
             context.partial_write_possible(),
             cleanup,
         )
-        .with_target_validation(context.target_row_count(), context.validation_status())
+        .with_target_delta_validation(
+            context.target_row_count_before_write(),
+            context.target_row_count_after_write(),
+            context.validation_status(),
+        )
         .with_phase_timings(context.phase_timings().to_vec()),
     )
 }
@@ -659,8 +926,7 @@ mod tests {
         prepare_error: Option<DeltaFunnelError>,
         initialize_error: Option<DeltaFunnelError>,
         cleanup_error: Option<DeltaFunnelError>,
-        target_row_count: Option<u64>,
-        target_row_count_failure: Option<MssqlTargetRowCountFailure>,
+        target_row_count_results: Vec<Result<u64, MssqlTargetRowCountFailure>>,
         fail_write: bool,
         fail_finish: bool,
     }
@@ -696,12 +962,25 @@ mod tests {
         }
 
         fn with_target_row_count(mut self, target_row_count: u64) -> Self {
-            self.target_row_count = Some(target_row_count);
+            self.target_row_count_results = vec![Ok(target_row_count)];
+            self
+        }
+
+        fn with_target_row_counts(mut self, target_row_counts: Vec<u64>) -> Self {
+            self.target_row_count_results = target_row_counts.into_iter().map(Ok).collect();
             self
         }
 
         fn fail_target_row_count(mut self, failure: MssqlTargetRowCountFailure) -> Self {
-            self.target_row_count_failure = Some(failure);
+            self.target_row_count_results = vec![Err(failure)];
+            self
+        }
+
+        fn with_target_row_count_results(
+            mut self,
+            results: Vec<Result<u64, MssqlTargetRowCountFailure>>,
+        ) -> Self {
+            self.target_row_count_results = results;
             self
         }
 
@@ -818,11 +1097,11 @@ mod tests {
                 )
             })?;
 
-            if let Some(failure) = self.target_row_count_failure.take() {
-                return Err(failure);
+            if self.target_row_count_results.is_empty() {
+                return Ok(0);
             }
 
-            Ok(self.target_row_count.unwrap_or(0))
+            self.target_row_count_results.remove(0)
         }
     }
 
@@ -997,12 +1276,16 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let connection = FakeSinkConnection::with_log(Arc::clone(&log));
         let batches = stream::iter(vec![Ok(orders_batch(2)?), Ok(orders_batch(1)?)]);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Disabled);
 
-        let report = write_mssql_output_batches_on_connection(
+        let report = write_mssql_output_batches_on_connection_with_phase_timings(
             output_plan,
             connection,
             batches,
             default_mssql_write_options(),
+            validation_options,
+            Vec::new(),
         )
         .await?;
 
@@ -1337,6 +1620,7 @@ mod tests {
             &prepared_target,
             report,
             ValidationOptions::new(),
+            TargetRowCountBeforeWrite::NotRequired,
         )
         .await?;
 
@@ -1350,11 +1634,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_existing_validate_if_possible_reports_unsupported_validation()
+    async fn append_existing_missing_exact_output_rows_preserves_pre_count()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let prepared_target = MssqlPreparedTarget::from_output_plan(
+            &output_plan,
+            MssqlPreparedTargetAction::VerifiedExisting,
+        )?;
+        let report = MssqlWriteReport::from_output_plan_with_metrics(
+            &output_plan,
+            MssqlWriteReportMetrics::new(
+                RowCount::partial(3),
+                crate::MssqlBatchShapingReport::completed(1, 3, 1, 3),
+                3,
+                1,
+                0,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ),
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_count(13);
+
+        let report = validate_written_target(
+            &mut connection,
+            &output_plan,
+            &prepared_target,
+            report,
+            ValidationOptions::new(),
+            TargetRowCountBeforeWrite::Exact(10),
+        )
+        .await?;
+
+        assert_eq!(report.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(
+            report.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::unavailable(ReportReasonCode::MissingExactOutputRows)
+        );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::MissingExactOutputRows),
+        )?;
+        assert_eq!(logged_events(&log)?, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_required_missing_exact_output_rows_fails_with_pre_count()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let prepared_target = MssqlPreparedTarget::from_output_plan(
+            &output_plan,
+            MssqlPreparedTargetAction::VerifiedExisting,
+        )?;
+        let report = MssqlWriteReport::from_output_plan_with_metrics(
+            &output_plan,
+            MssqlWriteReportMetrics::new(
+                RowCount::partial(3),
+                crate::MssqlBatchShapingReport::completed(1, 3, 1, 3),
+                3,
+                1,
+                0,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ),
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_count(13);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Require);
+
+        let error = validate_written_target(
+            &mut connection,
+            &output_plan,
+            &prepared_target,
+            report,
+            validation_options,
+            TargetRowCountBeforeWrite::Exact(10),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected required append missing exact rows validation failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected validation write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Validation);
+        assert_eq!(context.output_row_count(), RowCount::partial(3));
+        assert_eq!(context.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(
+            context.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::required_but_failed(ReportReasonCode::MissingExactOutputRows)
+        );
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert!(message.contains("exact output rows"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::MissingExactOutputRows),
+        )?;
+        assert_eq!(logged_events(&log)?, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_validation_disabled_skips_pre_and_post_counts()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
         let log = Arc::new(Mutex::new(Vec::new()));
-        let connection = FakeSinkConnection::with_log(Arc::clone(&log));
+        let connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_counts(vec![10, 13]);
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Disabled);
+
+        let report = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            validation_options,
+            Vec::new(),
+        )
+        .await?;
+
+        assert_eq!(report.output_row_count(), RowCount::exact(3));
+        assert_eq!(
+            report.target_row_count_before_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(report.validation_status(), ValidationStatus::disabled());
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::skipped(ReportReasonCode::ValidationDisabled),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "initialize", "write 3", "finish"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_matching_target_delta_passes_validation()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_counts(vec![10, 13]);
         let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
 
         let report = write_mssql_output_batches_on_connection_with_phase_timings(
@@ -1367,29 +1814,156 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(report.target_row_count(), RowCount::unavailable());
-        assert_eq!(
-            report.validation_status(),
-            ValidationStatus::unavailable(ReportReasonCode::UnsupportedLoadMode)
-        );
+        assert_eq!(report.output_row_count(), RowCount::exact(3));
+        assert_eq!(report.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(report.target_row_count_after_write(), RowCount::exact(13));
+        assert_eq!(report.target_row_count(), RowCount::exact(13));
+        assert_eq!(report.validation_status(), ValidationStatus::passed());
         assert_phase_timing(
             report.phase_timings(),
             VALIDATION_PHASE,
-            PhaseStatus::skipped(ReportReasonCode::UnsupportedLoadMode),
+            PhaseStatus::completed(),
         )?;
         assert_eq!(
             logged_events(&log)?,
-            vec!["prepare", "initialize", "write 3", "finish"]
+            vec![
+                "prepare",
+                "count target rows",
+                "initialize",
+                "write 3",
+                "finish",
+                "count target rows"
+            ]
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn append_existing_required_validation_fails_and_reports_cleanup()
+    async fn append_existing_mismatched_target_delta_fails_validation_and_reports_counts()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
         let log = Arc::new(Mutex::new(Vec::new()));
-        let connection = FakeSinkConnection::with_log(Arc::clone(&log));
+        let connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_counts(vec![10, 14]);
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        let error = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            ValidationOptions::new(),
+            Vec::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected append delta validation mismatch".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected validation write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Validation);
+        assert_eq!(context.output_row_count(), RowCount::exact(3));
+        assert_eq!(context.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(context.target_row_count_after_write(), RowCount::exact(14));
+        assert_eq!(context.target_row_count(), RowCount::exact(14));
+        assert_eq!(context.validation_status(), ValidationStatus::failed());
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert!(message.contains("target row-count delta did not match"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "count target rows",
+                "initialize",
+                "write 3",
+                "finish",
+                "count target rows",
+                "cleanup VerifiedExisting"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_validate_if_possible_reports_unavailable_when_pre_count_fails()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_target_row_count(
+            MssqlTargetRowCountFailure::new(
+                ReportReasonCode::PermissionUnavailable,
+                "permission denied",
+            ),
+        );
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        let report = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            ValidationOptions::new(),
+            Vec::new(),
+        )
+        .await?;
+
+        assert_eq!(report.output_row_count(), RowCount::exact(3));
+        assert_eq!(
+            report.target_row_count_before_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::unavailable(ReportReasonCode::PermissionUnavailable)
+        );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::PermissionUnavailable),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "count target rows",
+                "initialize",
+                "write 3",
+                "finish"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_required_pre_count_failure_stops_before_write()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_target_row_count(
+            MssqlTargetRowCountFailure::new(
+                ReportReasonCode::PermissionUnavailable,
+                "permission denied",
+            ),
+        );
         let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
         let validation_options =
             ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Require);
@@ -1405,7 +1979,7 @@ mod tests {
         .await
         .err()
         .ok_or_else(|| DeltaFunnelError::Config {
-            message: "expected unsupported required validation failure".to_owned(),
+            message: "expected required append pre-count validation failure".to_owned(),
         })?;
 
         let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
@@ -1414,17 +1988,150 @@ mod tests {
             });
         };
         assert_eq!(context.phase(), MssqlWritePhase::Validation);
-        assert_eq!(context.target_row_count(), RowCount::unavailable());
+        assert_eq!(context.output_row_count(), RowCount::unavailable());
+        assert_eq!(
+            context.target_row_count_before_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            context.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
         assert_eq!(
             context.validation_status(),
-            ValidationStatus::required_but_failed(ReportReasonCode::UnsupportedLoadMode)
+            ValidationStatus::required_but_failed(ReportReasonCode::PermissionUnavailable)
         );
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
-        assert!(message.contains("not implemented for this load mode"));
+        assert!(message.contains("permission denied"));
+        assert_phase_timing(
+            context.phase_timings(),
+            PREPARE_TARGET_LIFECYCLE_PHASE,
+            PhaseStatus::completed(),
+        )?;
         assert_phase_timing(
             context.phase_timings(),
             VALIDATION_PHASE,
-            PhaseStatus::skipped(ReportReasonCode::UnsupportedLoadMode),
+            PhaseStatus::unavailable(ReportReasonCode::PermissionUnavailable),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "count target rows", "cleanup VerifiedExisting"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_validate_if_possible_reports_unavailable_when_post_count_fails()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log))
+            .with_target_row_count_results(vec![
+                Ok(10),
+                Err(MssqlTargetRowCountFailure::new(
+                    ReportReasonCode::PermissionUnavailable,
+                    "permission denied",
+                )),
+            ]);
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        let report = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            ValidationOptions::new(),
+            Vec::new(),
+        )
+        .await?;
+
+        assert_eq!(report.output_row_count(), RowCount::exact(3));
+        assert_eq!(report.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(
+            report.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::unavailable(ReportReasonCode::PermissionUnavailable)
+        );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::PermissionUnavailable),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "count target rows",
+                "initialize",
+                "write 3",
+                "finish",
+                "count target rows"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_required_post_count_failure_reports_validation_error()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log))
+            .with_target_row_count_results(vec![
+                Ok(10),
+                Err(MssqlTargetRowCountFailure::new(
+                    ReportReasonCode::PermissionUnavailable,
+                    "permission denied",
+                )),
+            ]);
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Require);
+
+        let error = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            validation_options,
+            Vec::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected required append post-count validation failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected validation write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Validation);
+        assert_eq!(context.output_row_count(), RowCount::exact(3));
+        assert_eq!(context.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(
+            context.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::required_but_failed(ReportReasonCode::PermissionUnavailable)
+        );
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert!(message.contains("permission denied"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::PermissionUnavailable),
         )?;
         assert_phase_timing(
             context.phase_timings(),
@@ -1435,9 +2142,11 @@ mod tests {
             logged_events(&log)?,
             vec![
                 "prepare",
+                "count target rows",
                 "initialize",
                 "write 3",
                 "finish",
+                "count target rows",
                 "cleanup VerifiedExisting"
             ]
         );
@@ -1554,12 +2263,16 @@ mod tests {
                 "initialize failed",
             ));
         let batches = stream::iter(vec![Ok(orders_batch(1)?)]);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Disabled);
 
-        let error = write_mssql_output_batches_on_connection(
+        let error = write_mssql_output_batches_on_connection_with_phase_timings(
             output_plan,
             connection,
             batches,
             default_mssql_write_options(),
+            validation_options,
+            Vec::new(),
         )
         .await
         .err()
@@ -1797,6 +2510,60 @@ mod tests {
                 "write 1",
                 "finish",
                 "cleanup CreatedTable"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_existing_finalize_failure_marks_partial_write_risk()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log))
+            .with_target_row_count(10)
+            .fail_finish();
+        let batches = stream::iter(vec![Ok(orders_batch(1)?)]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected append finalize failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlWritePhase finalize failure".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Finalize);
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert!(context.partial_write_possible());
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::skipped(ReportReasonCode::FailureBeforeValidation)
+        );
+        assert!(message.contains("fake sink writer failed on finish"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::FailureBeforeValidation),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "count target rows",
+                "initialize",
+                "write 1",
+                "finish",
+                "cleanup VerifiedExisting"
             ]
         );
         Ok(())

@@ -196,6 +196,7 @@ impl MssqlBatchShapingReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MssqlWriteReportMetrics {
     pub(crate) output_row_count: RowCount,
+    pub(crate) target_row_count_before_write: RowCount,
     pub(crate) target_row_count: RowCount,
     pub(crate) validation_status: ValidationStatus,
     pub(crate) batch_shaping: MssqlBatchShapingReport,
@@ -219,6 +220,7 @@ impl MssqlWriteReportMetrics {
     ) -> Self {
         Self {
             output_row_count,
+            target_row_count_before_write: RowCount::unavailable(),
             target_row_count: RowCount::unavailable(),
             validation_status: ValidationStatus::skipped(ReportReasonCode::NotExecuted),
             batch_shaping,
@@ -243,6 +245,18 @@ impl MssqlWriteReportMetrics {
         validation_status: ValidationStatus,
     ) -> Self {
         self.target_row_count = target_row_count;
+        self.validation_status = validation_status;
+        self
+    }
+
+    pub(crate) const fn with_target_delta_validation(
+        mut self,
+        target_row_count_before_write: RowCount,
+        target_row_count_after_write: RowCount,
+        validation_status: ValidationStatus,
+    ) -> Self {
+        self.target_row_count_before_write = target_row_count_before_write;
+        self.target_row_count = target_row_count_after_write;
         self.validation_status = validation_status;
         self
     }
@@ -282,6 +296,7 @@ pub struct MssqlWriteReport {
     connection: MssqlConnectionSummary,
     output_schema: Vec<MssqlOutputFieldReport>,
     output_row_count: RowCount,
+    target_row_count_before_write: RowCount,
     target_row_count: RowCount,
     validation_status: ValidationStatus,
     batch_shaping: MssqlBatchShapingReport,
@@ -340,6 +355,7 @@ impl MssqlWriteReport {
             connection: output_plan.connection().clone(),
             output_schema,
             output_row_count: metrics.output_row_count,
+            target_row_count_before_write: metrics.target_row_count_before_write,
             target_row_count: metrics.target_row_count,
             validation_status: metrics.validation_status,
             batch_shaping: metrics.batch_shaping,
@@ -360,6 +376,20 @@ impl MssqlWriteReport {
         let mut phase_timings = phase_timings;
         phase_timings.append(&mut existing_timings);
         self.phase_timings = phase_timings;
+        self
+    }
+
+    pub(crate) fn with_target_delta_validation(
+        mut self,
+        target_row_count_before_write: RowCount,
+        target_row_count_after_write: RowCount,
+        validation_status: ValidationStatus,
+        validation_timing: PhaseTimingReport,
+    ) -> Self {
+        self.target_row_count_before_write = target_row_count_before_write;
+        self.target_row_count = target_row_count_after_write;
+        self.validation_status = validation_status;
+        replace_phase_timing(&mut self.phase_timings, validation_timing);
         self
     }
 
@@ -440,6 +470,20 @@ impl MssqlWriteReport {
     /// Returns target-side row count evidence after the SQL Server write.
     #[must_use]
     pub const fn target_row_count(&self) -> RowCount {
+        self.target_row_count
+    }
+
+    /// Returns target-side row count evidence before the SQL Server write.
+    /// For append-existing validation, concurrent target writes can affect the row-count delta.
+    #[must_use]
+    pub const fn target_row_count_before_write(&self) -> RowCount {
+        self.target_row_count_before_write
+    }
+
+    /// Returns target-side row count evidence after the SQL Server write.
+    /// For append-existing validation, concurrent target writes can affect the row-count delta.
+    #[must_use]
+    pub const fn target_row_count_after_write(&self) -> RowCount {
         self.target_row_count
     }
 
@@ -630,6 +674,18 @@ impl MssqlWriteFailureContext {
     #[must_use]
     pub const fn target_row_count(&self) -> RowCount {
         self.report.target_row_count()
+    }
+
+    /// Returns target-side row count evidence known before the write.
+    #[must_use]
+    pub const fn target_row_count_before_write(&self) -> RowCount {
+        self.report.target_row_count_before_write()
+    }
+
+    /// Returns target-side row count evidence known after the write.
+    #[must_use]
+    pub const fn target_row_count_after_write(&self) -> RowCount {
+        self.report.target_row_count_after_write()
     }
 
     /// Returns target-side validation status known at failure time.

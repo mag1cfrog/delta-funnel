@@ -18,7 +18,7 @@ use futures_util::{
 };
 
 use crate::{
-    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount,
+    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationStatus,
     report::sql_server::{
         MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
         MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
@@ -387,6 +387,26 @@ fn write_report_metrics(
     )
 }
 
+fn write_failure_report_metrics(
+    output_row_count: RowCount,
+    batch_shaping: MssqlBatchShapingReport,
+    progress: MssqlWriteProgress,
+    partial_write_possible: bool,
+    cleanup: MssqlTargetCleanupStatus,
+) -> MssqlWriteReportMetrics {
+    write_report_metrics(
+        output_row_count,
+        batch_shaping,
+        progress,
+        partial_write_possible,
+        cleanup,
+    )
+    .with_target_validation(
+        RowCount::unavailable(),
+        ValidationStatus::skipped(ReportReasonCode::FailureBeforeValidation),
+    )
+}
+
 #[derive(Default)]
 struct MssqlWriteLoopPhaseTimings {
     poll_batch_stream: Duration,
@@ -529,7 +549,7 @@ where
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::PollBatchStream,
-                write_report_metrics(
+                write_failure_report_metrics(
                     RowCount::partial(input_rows),
                     MssqlBatchShapingReport::failed(
                         input_batches,
@@ -561,7 +581,7 @@ where
             mssql_batch_schema_validation_error(
                 output_plan,
                 source,
-                write_report_metrics(
+                write_failure_report_metrics(
                     RowCount::partial(input_rows),
                     MssqlBatchShapingReport::failed(
                         input_batches,
@@ -585,7 +605,7 @@ where
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::WriteBatch,
-                write_report_metrics(
+                write_failure_report_metrics(
                     RowCount::partial(input_rows),
                     MssqlBatchShapingReport::failed(
                         input_batches,
@@ -616,7 +636,7 @@ where
         mssql_write_phase_error(
             output_plan,
             MssqlWritePhase::Finalize,
-            write_report_metrics(
+            write_failure_report_metrics(
                 RowCount::exact(input_rows),
                 MssqlBatchShapingReport::completed(
                     input_batches,
@@ -1734,6 +1754,14 @@ mod tests {
         assert_eq!(report.output_row_count(), RowCount::exact(42));
         assert_eq!(report.target_row_count(), RowCount::unavailable());
         assert_eq!(
+            report.target_row_count_before_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
             report.validation_status(),
             ValidationStatus::skipped(ReportReasonCode::NotExecuted)
         );
@@ -1785,6 +1813,11 @@ mod tests {
         );
 
         assert_eq!(report.target_row_count(), RowCount::exact(42));
+        assert_eq!(
+            report.target_row_count_before_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(report.target_row_count_after_write(), RowCount::exact(42));
         assert_eq!(report.validation_status(), ValidationStatus::passed());
         assert_eq!(
             report
@@ -1794,6 +1827,53 @@ mod tests {
                 .count(),
             1
         );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn write_report_records_target_delta_validation_counts() -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let output_plan = plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )?;
+        let report = MssqlWriteReport::from_output_plan_with_metrics(
+            &output_plan,
+            MssqlWriteReportMetrics::new(
+                RowCount::exact(3),
+                MssqlBatchShapingReport::completed(1, 3, 1, 3),
+                3,
+                1,
+                125,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            )
+            .with_phase_timings(vec![PhaseTimingReport::not_started(
+                VALIDATION_PHASE,
+                ReportReasonCode::NotExecuted,
+            )]),
+        );
+
+        let report = report.with_target_delta_validation(
+            RowCount::exact(10),
+            RowCount::exact(13),
+            ValidationStatus::passed(),
+            PhaseTimingReport::completed(VALIDATION_PHASE, Duration::from_micros(7)),
+        );
+
+        assert_eq!(report.target_row_count(), RowCount::exact(13));
+        assert_eq!(report.target_row_count_before_write(), RowCount::exact(10));
+        assert_eq!(report.target_row_count_after_write(), RowCount::exact(13));
+        assert_eq!(report.validation_status(), ValidationStatus::passed());
         assert_phase_timing(
             report.phase_timings(),
             VALIDATION_PHASE,

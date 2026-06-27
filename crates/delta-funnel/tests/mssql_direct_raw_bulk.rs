@@ -31,6 +31,7 @@ const APPEND_EXISTING_OUTPUT_NAME: &str = "mssql_direct_raw_bulk_append_orders";
 const CREATE_AND_LOAD_OUTPUT_NAME: &str = "mssql_direct_raw_bulk_create_orders";
 const ORCHESTRATOR_OUTPUT_NAME: &str = "mssql_orchestrator_runtime_orders";
 const EXPECTED_ORDER_IDS: &[i64] = &[101, 102, 103];
+const APPEND_EXISTING_EXPECTED_ORDER_IDS: &[i64] = &[99, 101, 102, 103];
 static NEXT_TABLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 type TestError = Box<dyn Error + Send + Sync + 'static>;
@@ -150,7 +151,7 @@ async fn run_append_existing_direct_raw_bulk_test(
             APPEND_EXISTING_OUTPUT_NAME,
         )
         .await?;
-        assert_order_ids_persisted(&mut admin, &table, EXPECTED_ORDER_IDS).await?;
+        assert_order_ids_persisted(&mut admin, &table, APPEND_EXISTING_EXPECTED_ORDER_IDS).await?;
 
         Ok(report)
     }
@@ -163,6 +164,11 @@ async fn run_append_existing_direct_raw_bulk_test(
             assert_eq!(report.stats().rows_written(), 3);
             assert_eq!(report.stats().batches_written(), 2);
             assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+            assert_eq!(report.output_row_count(), RowCount::exact(3));
+            assert_eq!(report.target_row_count_before_write(), RowCount::exact(1));
+            assert_eq!(report.target_row_count_after_write(), RowCount::exact(4));
+            assert_eq!(report.target_row_count(), RowCount::exact(4));
+            assert_eq!(report.validation_status(), ValidationStatus::passed());
             Ok(())
         }
         (Err(write_error), Ok(())) => Err(write_error),
@@ -354,7 +360,10 @@ async fn create_append_existing_table(
 ) -> TestResult<()> {
     client
         .execute_statement(&format!(
-            "CREATE TABLE {} ([order_id] BIGINT NOT NULL);",
+            "\
+CREATE TABLE {} ([order_id] BIGINT NOT NULL);
+INSERT INTO {} ([order_id]) VALUES (CAST(99 AS BIGINT));",
+            table.quoted_sql(),
             table.quoted_sql()
         ))
         .await?;
