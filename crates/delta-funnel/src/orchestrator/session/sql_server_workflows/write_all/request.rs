@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
     DeltaFunnelError, MssqlWorkflowOutputWriter, PhaseTimingReport, ReportReasonCode,
+    observability,
     report::{PhaseTimer, sql_server::WriteAllReport},
     support::sanitize_text_for_display,
 };
@@ -47,6 +48,7 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
+        observability::workflow_started(RunMode::Execute, requests.len());
         let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
         let planned_outputs = self.plan_write_all_outputs(requests)?;
         let phase_timings = vec![planning_timer.completed()];

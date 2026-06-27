@@ -11,6 +11,7 @@
 //! real implementation slice needs them.
 
 pub mod error;
+mod observability;
 mod orchestrator;
 mod pipeline;
 pub(crate) mod query_engine;

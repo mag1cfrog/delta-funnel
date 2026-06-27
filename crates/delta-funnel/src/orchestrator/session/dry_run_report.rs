@@ -1,5 +1,5 @@
 use crate::{
-    DeltaFunnelError, PhaseTimingReport, ReportReasonCode,
+    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, observability,
     report::PhaseTimer,
     report::sql_server::{
         MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport,
@@ -66,6 +66,7 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        observability::workflow_started(RunMode::DryRun, requests.len());
         let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
         let outputs = self.plan_dry_run_all_outputs(requests)?;
         let planning_timing = planning_timer.completed();
@@ -93,6 +94,7 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        observability::workflow_started(RunMode::DryRun, requests.len());
         let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
         let outputs = self.plan_dry_run_all_outputs(requests)?;
         let planning_timing = planning_timer.completed();
