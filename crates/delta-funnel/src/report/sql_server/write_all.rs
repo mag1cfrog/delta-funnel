@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::{
-    DeltaSourceReport, MssqlOutputWriteStatus, MssqlWorkflowWriteReport,
+    DeltaSourceReport, MssqlOutputWriteStatus, MssqlWorkflowWriteReport, PhaseTimingReport,
     support::sanitize_text_for_display,
 };
 
@@ -16,6 +16,7 @@ pub struct WriteAllReport {
     workflow: MssqlWorkflowWriteReport,
     cache: WriteAllCacheReport,
     sources: Vec<DeltaSourceReport>,
+    phase_timings: Vec<PhaseTimingReport>,
 }
 
 impl WriteAllReport {
@@ -28,7 +29,13 @@ impl WriteAllReport {
             workflow,
             cache,
             sources,
+            phase_timings: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
+        self.phase_timings = phase_timings;
+        self
     }
 
     /// Returns the lower-level SQL Server workflow report.
@@ -47,6 +54,12 @@ impl WriteAllReport {
     #[must_use]
     pub fn sources(&self) -> &[DeltaSourceReport] {
         &self.sources
+    }
+
+    /// Returns top-level `write_all` workflow phase timing reports.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
     }
 
     /// Returns the number of selected outputs represented by this report.

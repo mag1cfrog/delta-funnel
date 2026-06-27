@@ -1,7 +1,8 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
-    DeltaFunnelError, MssqlWorkflowOutputWriter, report::sql_server::WriteAllReport,
+    DeltaFunnelError, MssqlWorkflowOutputWriter, PhaseTimingReport, ReportReasonCode,
+    report::{PhaseTimer, sql_server::WriteAllReport},
     support::sanitize_text_for_display,
 };
 
@@ -13,6 +14,11 @@ use super::{
     MssqlOutputCacheDecision, MssqlOutputCachePlan, WriteAllCacheMode, WriteAllOptions,
     cache_report, workflow::MssqlWorkflowPublicOutputWriter,
 };
+
+const OUTPUT_PLANNING_PHASE: &str = "output_planning";
+const CACHE_PLANNING_PHASE: &str = "cache_planning";
+const WORKFLOW_EXECUTION_PHASE: &str = "workflow_execution";
+const SOURCE_REPORTING_PHASE: &str = "source_reporting";
 
 impl DeltaFunnelSession {
     #[allow(dead_code)]
@@ -41,15 +47,23 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
+        let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
         let planned_outputs = self.plan_write_all_outputs(requests)?;
+        let phase_timings = vec![planning_timer.completed()];
 
         match options.cache_mode() {
             WriteAllCacheMode::Auto => {
-                self.write_all_auto_with_writer(requests, &planned_outputs, writer)
+                self.write_all_auto_with_writer(requests, &planned_outputs, writer, phase_timings)
                     .await
             }
             WriteAllCacheMode::Disabled => {
+                let mut phase_timings = phase_timings;
+                phase_timings.push(PhaseTimingReport::skipped(
+                    CACHE_PLANNING_PHASE,
+                    ReportReasonCode::NotExecuted,
+                ));
                 let provider_stats = shared_provider_read_stats();
+                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
                     .write_all_baseline_with_writer_and_provider_stats(
                         &planned_outputs,
@@ -57,15 +71,17 @@ impl DeltaFunnelSession {
                         Some(Arc::clone(&provider_stats)),
                     )
                     .await?;
+                phase_timings.push(workflow_timer.completed());
+                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     &planned_outputs,
                     provider_read_stats_snapshot(&provider_stats),
                 )?;
-                Ok(WriteAllReport::new(
-                    workflow,
-                    cache_report::disabled(),
-                    sources,
-                ))
+                phase_timings.push(source_timer.completed());
+                Ok(
+                    WriteAllReport::new(workflow, cache_report::disabled(), sources)
+                        .with_phase_timings(phase_timings),
+                )
             }
         }
     }
@@ -89,13 +105,17 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
         planned_outputs: &[PlannedMssqlOutput],
         writer: W,
+        phase_timings: Vec<PhaseTimingReport>,
     ) -> Result<WriteAllReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
+        let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
         let cache_plan = self.plan_mssql_output_cache(requests);
+        let mut phase_timings = phase_timings;
+        phase_timings.push(cache_timer.completed());
 
-        self.write_all_auto_plan_with_writer(planned_outputs, &cache_plan, writer)
+        self.write_all_auto_plan_with_writer(planned_outputs, &cache_plan, writer, phase_timings)
             .await
     }
 
@@ -105,6 +125,7 @@ impl DeltaFunnelSession {
         planned_outputs: &[PlannedMssqlOutput],
         cache_plan: &MssqlOutputCachePlan,
         writer: W,
+        mut phase_timings: Vec<PhaseTimingReport>,
     ) -> Result<WriteAllReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
@@ -113,6 +134,7 @@ impl DeltaFunnelSession {
             MssqlOutputCacheDecision::NoCache { .. } => {
                 let cache = cache_report::from_plan(cache_plan);
                 let provider_stats = shared_provider_read_stats();
+                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
                     .write_all_baseline_with_writer_and_provider_stats(
                         planned_outputs,
@@ -120,14 +142,18 @@ impl DeltaFunnelSession {
                         Some(Arc::clone(&provider_stats)),
                     )
                     .await?;
+                phase_timings.push(workflow_timer.completed());
+                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     planned_outputs,
                     provider_read_stats_snapshot(&provider_stats),
                 )?;
-                Ok(WriteAllReport::new(workflow, cache, sources))
+                phase_timings.push(source_timer.completed());
+                Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
             }
             MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
                 let provider_stats = shared_provider_read_stats();
+                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
                     .write_all_cached_with_writer_and_provider_stats(
                         planned_outputs,
@@ -136,12 +162,15 @@ impl DeltaFunnelSession {
                         Some(Arc::clone(&provider_stats)),
                     )
                     .await?;
+                phase_timings.push(workflow_timer.completed());
                 let cache = cache_report::from_executed_plan(cache_plan);
+                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     planned_outputs,
                     provider_read_stats_snapshot(&provider_stats),
                 )?;
-                Ok(WriteAllReport::new(workflow, cache, sources))
+                phase_timings.push(source_timer.completed());
+                Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
             }
         }
     }
@@ -150,21 +179,28 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
         planned_outputs: &[PlannedMssqlOutput],
+        phase_timings: Vec<PhaseTimingReport>,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
+        let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
         let cache_plan = self.plan_mssql_output_cache(requests);
+        let mut phase_timings = phase_timings;
+        phase_timings.push(cache_timer.completed());
 
-        self.write_all_auto_plan(planned_outputs, &cache_plan).await
+        self.write_all_auto_plan(planned_outputs, &cache_plan, phase_timings)
+            .await
     }
 
     async fn write_all_auto_plan(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         cache_plan: &MssqlOutputCachePlan,
+        mut phase_timings: Vec<PhaseTimingReport>,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
         match cache_plan.decision() {
             MssqlOutputCacheDecision::NoCache { .. } => {
                 let cache = cache_report::from_plan(cache_plan);
                 let provider_stats = shared_provider_read_stats();
+                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
                     .write_all_baseline_with_writer_and_provider_stats(
                         planned_outputs,
@@ -172,14 +208,18 @@ impl DeltaFunnelSession {
                         Some(Arc::clone(&provider_stats)),
                     )
                     .await?;
+                phase_timings.push(workflow_timer.completed());
+                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     planned_outputs,
                     provider_read_stats_snapshot(&provider_stats),
                 )?;
-                Ok(WriteAllReport::new(workflow, cache, sources))
+                phase_timings.push(source_timer.completed());
+                Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
             }
             MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
                 let provider_stats = shared_provider_read_stats();
+                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
                     .write_all_cached_with_writer_and_provider_stats(
                         planned_outputs,
@@ -188,12 +228,15 @@ impl DeltaFunnelSession {
                         Some(Arc::clone(&provider_stats)),
                     )
                     .await?;
+                phase_timings.push(workflow_timer.completed());
                 let cache = cache_report::from_executed_plan(cache_plan);
+                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     planned_outputs,
                     provider_read_stats_snapshot(&provider_stats),
                 )?;
-                Ok(WriteAllReport::new(workflow, cache, sources))
+                phase_timings.push(source_timer.completed());
+                Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
             }
         }
     }
@@ -234,12 +277,23 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
+        let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
         let planned_outputs = self.plan_write_all_outputs(requests)?;
+        let phase_timings = vec![planning_timer.completed()];
 
         match options.cache_mode() {
-            WriteAllCacheMode::Auto => self.write_all_auto(requests, &planned_outputs).await,
+            WriteAllCacheMode::Auto => {
+                self.write_all_auto(requests, &planned_outputs, phase_timings)
+                    .await
+            }
             WriteAllCacheMode::Disabled => {
+                let mut phase_timings = phase_timings;
+                phase_timings.push(PhaseTimingReport::skipped(
+                    CACHE_PLANNING_PHASE,
+                    ReportReasonCode::NotExecuted,
+                ));
                 let provider_stats = shared_provider_read_stats();
+                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
                     .write_all_baseline_with_writer_and_provider_stats(
                         &planned_outputs,
@@ -247,15 +301,17 @@ impl DeltaFunnelSession {
                         Some(Arc::clone(&provider_stats)),
                     )
                     .await?;
+                phase_timings.push(workflow_timer.completed());
+                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     &planned_outputs,
                     provider_read_stats_snapshot(&provider_stats),
                 )?;
-                Ok(WriteAllReport::new(
-                    workflow,
-                    cache_report::disabled(),
-                    sources,
-                ))
+                phase_timings.push(source_timer.completed());
+                Ok(
+                    WriteAllReport::new(workflow, cache_report::disabled(), sources)
+                        .with_phase_timings(phase_timings),
+                )
             }
         }
     }
@@ -309,13 +365,17 @@ mod tests {
         },
     };
     use super::super::{WriteAllCacheMode, WriteAllOptions};
+    use super::{
+        CACHE_PLANNING_PHASE, OUTPUT_PLANNING_PHASE, SOURCE_REPORTING_PHASE,
+        WORKFLOW_EXECUTION_PHASE,
+    };
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlBatchShapingReport,
         MssqlOutputBatchStream, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus,
         MssqlTargetConfig, MssqlTargetTable, MssqlWorkflowOutputWriter, MssqlWriteFailureContext,
-        MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport, PhaseStatus, ReportReasonCode,
-        ResolvedMssqlTarget, RowCount, WriteAllCacheAliasStatus, WriteAllCacheReport,
-        WriteAllNoCacheReason, plan_mssql_target_for_resolved_output,
+        MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport, PhaseStatus, PhaseTimingReport,
+        ReportReasonCode, ResolvedMssqlTarget, RowCount, WriteAllCacheAliasStatus,
+        WriteAllCacheReport, WriteAllNoCacheReason, plan_mssql_target_for_resolved_output,
         table_formats::RealParquetDeltaTable,
     };
 
@@ -434,6 +494,25 @@ mod tests {
         assert_eq!(report.input_rows(), expected_input_rows);
         assert_eq!(report.output_batches(), expected_output_batches);
         assert_eq!(report.output_rows(), expected_output_rows);
+    }
+
+    fn assert_phase_timing(
+        timings: &[PhaseTimingReport],
+        phase_name: &str,
+        expected_status: PhaseStatus,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let timing = timings
+            .iter()
+            .find(|timing| timing.phase_name() == phase_name)
+            .ok_or_else(|| format!("missing phase timing {phase_name}"))?;
+
+        assert_eq!(timing.status(), expected_status);
+        if expected_status.is_completed() || expected_status.is_failed() {
+            assert!(timing.elapsed_micros().is_some());
+        } else {
+            assert_eq!(timing.elapsed_micros(), None);
+        }
+        Ok(())
     }
 
     mod planning {
@@ -663,6 +742,26 @@ mod tests {
                 west_report.cleanup(),
                 MssqlTargetCleanupStatus::NotApplicable
             );
+            assert_phase_timing(
+                report.phase_timings(),
+                OUTPUT_PLANNING_PHASE,
+                PhaseStatus::completed(),
+            )?;
+            assert_phase_timing(
+                report.phase_timings(),
+                CACHE_PLANNING_PHASE,
+                PhaseStatus::completed(),
+            )?;
+            assert_phase_timing(
+                report.phase_timings(),
+                WORKFLOW_EXECUTION_PHASE,
+                PhaseStatus::completed(),
+            )?;
+            assert_phase_timing(
+                report.phase_timings(),
+                SOURCE_REPORTING_PHASE,
+                PhaseStatus::completed(),
+            )?;
             Ok(())
         }
 
