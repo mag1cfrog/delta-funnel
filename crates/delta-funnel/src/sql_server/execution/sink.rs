@@ -1727,6 +1727,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_existing_validate_if_possible_reports_unavailable_when_pre_count_fails()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::AppendExisting)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_target_row_count(
+            MssqlTargetRowCountFailure::new(
+                ReportReasonCode::PermissionUnavailable,
+                "permission denied",
+            ),
+        );
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        let report = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            ValidationOptions::new(),
+            Vec::new(),
+        )
+        .await?;
+
+        assert_eq!(report.output_row_count(), RowCount::exact(3));
+        assert_eq!(
+            report.target_row_count_before_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.target_row_count_after_write(),
+            RowCount::unavailable()
+        );
+        assert_eq!(
+            report.validation_status(),
+            ValidationStatus::unavailable(ReportReasonCode::PermissionUnavailable)
+        );
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::PermissionUnavailable),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "count target rows",
+                "initialize",
+                "write 3",
+                "finish"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn public_one_output_api_rejects_replace_before_connection()
     -> Result<(), DeltaFunnelError> {
         let connection = secret_connection()?;
