@@ -44,12 +44,12 @@ pub use report::{
     DeltaProtocolReport, DeltaProviderSchedulingReport, DeltaSourceReport, DryRunScanSummaryMode,
     FileCount, FileCountKind, MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport,
     MssqlDryRunSqlIdentityReport, MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
-    OutputStatus, OutputStatusKind, PhaseStatus, PhaseStatusKind, ReportReasonCode, RowCount,
-    RowCountKind, SourceUsageStatus, TargetValidationMode, ValidationOptions, ValidationStatus,
-    ValidationStatusKind, WorkflowStatus, WorkflowStatusKind, WriteAllCacheAliasReport,
-    WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
-    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport, u128_to_u64_saturating,
-    usize_to_u64_saturating,
+    OutputStatus, OutputStatusKind, PhaseStatus, PhaseStatusKind, PhaseTimingReport,
+    ReportReasonCode, RowCount, RowCountKind, SourceUsageStatus, TargetValidationMode,
+    ValidationOptions, ValidationStatus, ValidationStatusKind, WorkflowStatus, WorkflowStatusKind,
+    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
+    WriteAllCacheCandidateSkipReason, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
+    duration_to_micros_saturating, u128_to_u64_saturating, usize_to_u64_saturating,
 };
 pub use sql_server::{
     LoadMode, MssqlBatchShapingReport, MssqlBinaryPolicy, MssqlConnectionConfig,
