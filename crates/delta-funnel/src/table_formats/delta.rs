@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::{DeltaFunnelError, error::DeltaSourceSchemaSnafu};
+use crate::{DeltaFunnelError, error::DeltaSourceSchemaSnafu, observability};
 
 mod deletion_vector;
 mod kernel;
@@ -30,6 +30,7 @@ pub(crate) use kernel::{
     arrow_partition_type_to_kernel_primitive, datafusion_expr_to_kernel_predicate,
     kernel_partition_scalar_to_datafusion_scalar,
 };
+pub(crate) use protocol::preflight_delta_protocol_with_tracing;
 pub use protocol::{ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources};
 pub(crate) use read::{
     KernelDataFilePredicateEvalRequest, KernelDataFileReadRequest, KernelDataFileReader,
@@ -501,6 +502,14 @@ pub fn load_delta_source(
     load_delta_source_after_name_validation(config)
 }
 
+pub(crate) fn load_delta_source_with_tracing(
+    config: DeltaSourceConfig,
+) -> Result<PlannedDeltaSource, DeltaFunnelError> {
+    validate_table_source_names([config.name.as_str()])?;
+
+    load_delta_source_after_name_validation_with_tracing(config)
+}
+
 /// Loads configured Delta sources after validating all names.
 ///
 /// Name validation and duplicate detection run before any URI normalization,
@@ -524,6 +533,19 @@ where
         .into_iter()
         .map(load_delta_source_after_name_validation)
         .collect()
+}
+
+fn load_delta_source_after_name_validation_with_tracing(
+    config: DeltaSourceConfig,
+) -> Result<PlannedDeltaSource, DeltaFunnelError> {
+    let source_name = config.name.clone();
+    observability::source_loading_started(&source_name);
+    let result = load_delta_source_after_name_validation(config);
+    match &result {
+        Ok(source) => observability::source_loading_completed(source.name(), source.version()),
+        Err(error) => observability::source_loading_failed(&source_name, error),
+    }
+    result
 }
 
 fn load_delta_source_after_name_validation(

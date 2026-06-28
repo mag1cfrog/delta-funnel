@@ -1,7 +1,9 @@
 //! Delta protocol preflight.
 
 use crate::support::sanitize_uri_for_display;
-use crate::{DeltaFunnelError, DeltaProtocolReport, error::DeltaProtocolCompatibilitySnafu};
+use crate::{
+    DeltaFunnelError, DeltaProtocolReport, error::DeltaProtocolCompatibilitySnafu, observability,
+};
 
 use super::PlannedDeltaSource;
 use super::kernel::{
@@ -46,6 +48,25 @@ pub fn preflight_delta_protocol(
     ensure_protocol_supported(&protocol)?;
 
     Ok(ProtocolPreflight { protocol })
+}
+
+pub(crate) fn preflight_delta_protocol_with_tracing(
+    source: &PlannedDeltaSource,
+) -> Result<ProtocolPreflight, DeltaFunnelError> {
+    observability::protocol_preflight_started(source.name(), source.version());
+
+    let result = preflight_delta_protocol(source);
+    match &result {
+        Ok(preflight) => observability::protocol_preflight_completed(
+            &preflight.protocol.source_name,
+            preflight.protocol.snapshot_version,
+        ),
+        Err(error) => {
+            observability::protocol_preflight_failed(source.name(), source.version(), error)
+        }
+    }
+
+    result
 }
 
 /// Runs conservative Delta protocol preflight for loaded sources.

@@ -29,4 +29,5 @@ pub use delta::{
     DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource, ProtocolPreflight,
     load_delta_source, load_delta_sources, preflight_delta_protocol, preflight_delta_sources,
 };
+pub(crate) use delta::{load_delta_source_with_tracing, preflight_delta_protocol_with_tracing};
 pub(crate) use name::validate_table_source_names;

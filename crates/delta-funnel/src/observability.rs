@@ -9,6 +9,15 @@ const OUTPUT_FAILED_EVENT: &str = "output.failed";
 const OUTPUT_SKIPPED_EVENT: &str = "output.skipped";
 const OUTPUT_SPAN: &str = "delta_funnel.output";
 const OUTPUT_STARTED_EVENT: &str = "output.started";
+const DATAFUSION_REGISTRATION_COMPLETED_EVENT: &str = "datafusion_registration.completed";
+const DATAFUSION_REGISTRATION_FAILED_EVENT: &str = "datafusion_registration.failed";
+const DATAFUSION_REGISTRATION_STARTED_EVENT: &str = "datafusion_registration.started";
+const PROTOCOL_PREFLIGHT_COMPLETED_EVENT: &str = "protocol_preflight.completed";
+const PROTOCOL_PREFLIGHT_FAILED_EVENT: &str = "protocol_preflight.failed";
+const PROTOCOL_PREFLIGHT_STARTED_EVENT: &str = "protocol_preflight.started";
+const SOURCE_LOADING_COMPLETED_EVENT: &str = "source_loading.completed";
+const SOURCE_LOADING_FAILED_EVENT: &str = "source_loading.failed";
+const SOURCE_LOADING_STARTED_EVENT: &str = "source_loading.started";
 const WORKFLOW_COMPLETED_EVENT: &str = "workflow.completed";
 const WORKFLOW_FAILED_EVENT: &str = "workflow.failed";
 const WORKFLOW_SPAN: &str = "delta_funnel.workflow";
@@ -142,6 +151,80 @@ pub(crate) fn output_skipped(
     );
 }
 
+pub(crate) fn source_loading_started(source_name: &str) {
+    source_phase_started(SOURCE_LOADING_STARTED_EVENT, source_name);
+}
+
+pub(crate) fn source_loading_completed(source_name: &str, snapshot_version: u64) {
+    source_phase_completed(
+        SOURCE_LOADING_COMPLETED_EVENT,
+        source_name,
+        snapshot_version,
+    );
+}
+
+pub(crate) fn source_loading_failed(source_name: &str, error: &DeltaFunnelError) {
+    source_phase_failed(SOURCE_LOADING_FAILED_EVENT, source_name, error);
+}
+
+pub(crate) fn protocol_preflight_started(source_name: &str, snapshot_version: u64) {
+    source_phase_started_with_snapshot(
+        PROTOCOL_PREFLIGHT_STARTED_EVENT,
+        source_name,
+        snapshot_version,
+    );
+}
+
+pub(crate) fn protocol_preflight_completed(source_name: &str, snapshot_version: u64) {
+    source_phase_completed(
+        PROTOCOL_PREFLIGHT_COMPLETED_EVENT,
+        source_name,
+        snapshot_version,
+    );
+}
+
+pub(crate) fn protocol_preflight_failed(
+    source_name: &str,
+    snapshot_version: u64,
+    error: &DeltaFunnelError,
+) {
+    source_phase_failed_with_snapshot(
+        PROTOCOL_PREFLIGHT_FAILED_EVENT,
+        source_name,
+        snapshot_version,
+        error,
+    );
+}
+
+pub(crate) fn datafusion_registration_started(source_name: &str, snapshot_version: u64) {
+    source_phase_started_with_snapshot(
+        DATAFUSION_REGISTRATION_STARTED_EVENT,
+        source_name,
+        snapshot_version,
+    );
+}
+
+pub(crate) fn datafusion_registration_completed(source_name: &str, snapshot_version: u64) {
+    source_phase_completed(
+        DATAFUSION_REGISTRATION_COMPLETED_EVENT,
+        source_name,
+        snapshot_version,
+    );
+}
+
+pub(crate) fn datafusion_registration_failed(
+    source_name: &str,
+    snapshot_version: u64,
+    error: &DeltaFunnelError,
+) {
+    source_phase_failed_with_snapshot(
+        DATAFUSION_REGISTRATION_FAILED_EVENT,
+        source_name,
+        snapshot_version,
+        error,
+    );
+}
+
 impl RunMode {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -149,6 +232,67 @@ impl RunMode {
             Self::DryRun => "dry_run",
         }
     }
+}
+
+fn source_phase_started(telemetry_event: &str, source_name: &str) {
+    tracing::info!(
+        target: TRACING_TARGET,
+        telemetry_event,
+        source_name,
+        message = telemetry_event
+    );
+}
+
+fn source_phase_started_with_snapshot(
+    telemetry_event: &str,
+    source_name: &str,
+    snapshot_version: u64,
+) {
+    tracing::info!(
+        target: TRACING_TARGET,
+        telemetry_event,
+        source_name,
+        snapshot_version,
+        message = telemetry_event
+    );
+}
+
+fn source_phase_completed(telemetry_event: &str, source_name: &str, snapshot_version: u64) {
+    tracing::info!(
+        target: TRACING_TARGET,
+        telemetry_event,
+        source_name,
+        snapshot_version,
+        message = telemetry_event
+    );
+}
+
+fn source_phase_failed(telemetry_event: &str, source_name: &str, error: &DeltaFunnelError) {
+    tracing::info!(
+        target: TRACING_TARGET,
+        telemetry_event,
+        source_name,
+        error_category = "delta_funnel_error",
+        error_summary = %error,
+        message = telemetry_event
+    );
+}
+
+fn source_phase_failed_with_snapshot(
+    telemetry_event: &str,
+    source_name: &str,
+    snapshot_version: u64,
+    error: &DeltaFunnelError,
+) {
+    tracing::info!(
+        target: TRACING_TARGET,
+        telemetry_event,
+        source_name,
+        snapshot_version,
+        error_category = "delta_funnel_error",
+        error_summary = %error,
+        message = telemetry_event
+    );
 }
 
 const fn load_mode_as_str(load_mode: LoadMode) -> &'static str {
@@ -202,6 +346,12 @@ mod tests {
             LoadMode::AppendExisting,
             "prior_failure",
         );
+        source_loading_started("orders");
+        source_loading_completed("orders", 7);
+        protocol_preflight_started("orders", 7);
+        protocol_preflight_completed("orders", 7);
+        datafusion_registration_started("orders", 7);
+        datafusion_registration_completed("orders", 7);
         Ok(())
     }
 
@@ -217,6 +367,30 @@ mod tests {
         assert_eq!(OUTPUT_SKIPPED_EVENT, "output.skipped");
         assert_eq!(OUTPUT_SPAN, "delta_funnel.output");
         assert_eq!(OUTPUT_STARTED_EVENT, "output.started");
+        assert_eq!(SOURCE_LOADING_COMPLETED_EVENT, "source_loading.completed");
+        assert_eq!(SOURCE_LOADING_FAILED_EVENT, "source_loading.failed");
+        assert_eq!(SOURCE_LOADING_STARTED_EVENT, "source_loading.started");
+        assert_eq!(
+            PROTOCOL_PREFLIGHT_COMPLETED_EVENT,
+            "protocol_preflight.completed"
+        );
+        assert_eq!(PROTOCOL_PREFLIGHT_FAILED_EVENT, "protocol_preflight.failed");
+        assert_eq!(
+            PROTOCOL_PREFLIGHT_STARTED_EVENT,
+            "protocol_preflight.started"
+        );
+        assert_eq!(
+            DATAFUSION_REGISTRATION_COMPLETED_EVENT,
+            "datafusion_registration.completed"
+        );
+        assert_eq!(
+            DATAFUSION_REGISTRATION_FAILED_EVENT,
+            "datafusion_registration.failed"
+        );
+        assert_eq!(
+            DATAFUSION_REGISTRATION_STARTED_EVENT,
+            "datafusion_registration.started"
+        );
         assert_eq!(RunMode::Execute.as_str(), "execute");
         assert_eq!(RunMode::DryRun.as_str(), "dry_run");
         assert_eq!(
@@ -351,6 +525,50 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn scoped_capture_records_source_phase_event_fields() {
+        let events = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: events.clone(),
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            source_loading_started("orders");
+            source_loading_completed("orders", 7);
+            protocol_preflight_started("orders", 7);
+            protocol_preflight_failed(
+                "orders",
+                7,
+                &DeltaFunnelError::Config {
+                    message: "bad source".to_owned(),
+                },
+            );
+            datafusion_registration_started("orders", 7);
+            datafusion_registration_completed("orders", 7);
+        });
+
+        let events = events.events();
+        assert_eq!(events.len(), 6);
+        assert_source_phase_event(&events[0], SOURCE_LOADING_STARTED_EVENT, None);
+        assert_source_phase_event(&events[1], SOURCE_LOADING_COMPLETED_EVENT, Some("7"));
+        assert_source_phase_event(&events[2], PROTOCOL_PREFLIGHT_STARTED_EVENT, Some("7"));
+        assert_source_phase_event(&events[3], PROTOCOL_PREFLIGHT_FAILED_EVENT, Some("7"));
+        assert_eq!(
+            events[3].fields.get("error_category").map(String::as_str),
+            Some("delta_funnel_error")
+        );
+        assert_eq!(
+            events[3].fields.get("error_summary").map(String::as_str),
+            Some("configuration error: bad source")
+        );
+        assert_source_phase_event(&events[4], DATAFUSION_REGISTRATION_STARTED_EVENT, Some("7"));
+        assert_source_phase_event(
+            &events[5],
+            DATAFUSION_REGISTRATION_COMPLETED_EVENT,
+            Some("7"),
+        );
+    }
+
     fn assert_workflow_event(
         event: &CapturedEvent,
         telemetry_event: &str,
@@ -417,6 +635,27 @@ mod tests {
         assert_eq!(
             span.fields.get("load_mode").map(String::as_str),
             Some("append_existing")
+        );
+    }
+
+    fn assert_source_phase_event(
+        event: &CapturedEvent,
+        telemetry_event: &str,
+        snapshot_version: Option<&str>,
+    ) {
+        assert_eq!(event.target, TRACING_TARGET);
+        assert_eq!(event.level, Level::INFO);
+        assert_eq!(
+            event.fields.get("telemetry_event").map(String::as_str),
+            Some(telemetry_event)
+        );
+        assert_eq!(
+            event.fields.get("source_name").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            event.fields.get("snapshot_version").map(String::as_str),
+            snapshot_version
         );
     }
 
