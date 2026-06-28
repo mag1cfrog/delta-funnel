@@ -1182,11 +1182,11 @@ mod tests {
     fn source_report_json_exposes_provider_read_stats_details() -> TestResult<()> {
         let source = DeltaSourceReport::metadata_only(
             "orders",
-            "file:///tmp/orders",
+            "s3://user:password@example.com/tmp/orders?token=secret#debug",
             3,
             DeltaProtocolReport {
                 source_name: "orders".to_owned(),
-                table_uri: "file:///tmp/orders".to_owned(),
+                table_uri: "s3://example.com/tmp/orders".to_owned(),
                 snapshot_version: 3,
                 min_reader_version: 1,
                 min_writer_version: 2,
@@ -1205,6 +1205,11 @@ mod tests {
 
         let value = source.to_json_value();
 
+        assert_eq!(value["source_uri"], "s3://example.com/tmp/orders");
+        assert_eq!(
+            value["protocol"]["table_uri"],
+            "s3://example.com/tmp/orders"
+        );
         assert_eq!(
             value["file_count"],
             json!({"kind": "exact", "value": 5, "reason": null})
@@ -1222,6 +1227,7 @@ mod tests {
             2
         );
         assert_json_safe(&value)?;
+        assert_no_secret_or_raw_sql_text(&value);
 
         Ok(())
     }
