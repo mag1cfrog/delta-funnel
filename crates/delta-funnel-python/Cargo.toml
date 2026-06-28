@@ -15,5 +15,15 @@ crate-type = ["cdylib"]
 [lints]
 workspace = true
 
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.29", features = ["extension-module"] }
+delta-funnel = { path = "../delta-funnel" }
+pyo3 = "0.29"
+serde_json = "1"
+
+[dev-dependencies]
+arrow-schema = "58.3.0"
+pyo3 = { version = "0.29", features = ["auto-initialize"] }

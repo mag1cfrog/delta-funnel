@@ -1284,7 +1284,10 @@ dependencies = [
 name = "delta-funnel-python"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema",
+ "delta-funnel",
  "pyo3",
+ "serde_json",
 ]
 
 [[package]]
