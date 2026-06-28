@@ -19,6 +19,7 @@ use futures_util::{
 
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationStatus,
+    observability,
     report::sql_server::{
         MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
         MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
@@ -535,6 +536,11 @@ where
     let started_at = Instant::now();
     let mut phase_timings = MssqlWriteLoopPhaseTimings::default();
     pin_mut!(batches);
+    observability::batch_shaping_started(
+        output_plan.output_name(),
+        output_plan.target_table(),
+        output_plan.load_mode(),
+    );
 
     loop {
         let poll_started_at = Instant::now();
@@ -546,17 +552,21 @@ where
 
         let batch = batch.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
+            let batch_shaping = trace_batch_shaping_finished(
+                output_plan,
+                MssqlBatchShapingReport::failed(
+                    input_batches,
+                    input_rows,
+                    shaped_batches,
+                    shaped_rows,
+                ),
+            );
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::PollBatchStream,
                 write_failure_report_metrics(
                     RowCount::partial(input_rows),
-                    MssqlBatchShapingReport::failed(
-                        input_batches,
-                        input_rows,
-                        shaped_batches,
-                        shaped_rows,
-                    ),
+                    batch_shaping,
                     MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                     partial_write_possible(output_plan, rows_written, batches_written),
                     cleanup,
@@ -578,17 +588,21 @@ where
         phase_timings.add_validate_batch_schema(validation_started_at.elapsed());
         validation_result.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
+            let batch_shaping = trace_batch_shaping_finished(
+                output_plan,
+                MssqlBatchShapingReport::failed(
+                    input_batches,
+                    input_rows,
+                    shaped_batches,
+                    shaped_rows,
+                ),
+            );
             mssql_batch_schema_validation_error(
                 output_plan,
                 source,
                 write_failure_report_metrics(
                     RowCount::partial(input_rows),
-                    MssqlBatchShapingReport::failed(
-                        input_batches,
-                        input_rows,
-                        shaped_batches,
-                        shaped_rows,
-                    ),
+                    batch_shaping,
                     MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                     partial_write_possible(output_plan, rows_written, batches_written),
                     cleanup,
@@ -602,17 +616,21 @@ where
         phase_timings.add_write_batch(write_batch_started_at.elapsed());
         write_batch_result.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
+            let batch_shaping = trace_batch_shaping_finished(
+                output_plan,
+                MssqlBatchShapingReport::failed(
+                    input_batches,
+                    input_rows,
+                    shaped_batches,
+                    shaped_rows,
+                ),
+            );
             mssql_write_phase_error(
                 output_plan,
                 MssqlWritePhase::WriteBatch,
                 write_failure_report_metrics(
                     RowCount::partial(input_rows),
-                    MssqlBatchShapingReport::failed(
-                        input_batches,
-                        input_rows,
-                        shaped_batches,
-                        shaped_rows,
-                    ),
+                    batch_shaping,
                     MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                     partial_write_possible(output_plan, rows_written, batches_written),
                     cleanup,
@@ -633,17 +651,21 @@ where
     let finalize_elapsed = finalize_started_at.elapsed();
     finish_result.map_err(|source| {
         let elapsed_ms = elapsed_ms_since(started_at);
+        let batch_shaping = trace_batch_shaping_finished(
+            output_plan,
+            MssqlBatchShapingReport::completed(
+                input_batches,
+                input_rows,
+                shaped_batches,
+                shaped_rows,
+            ),
+        );
         mssql_write_phase_error(
             output_plan,
             MssqlWritePhase::Finalize,
             write_failure_report_metrics(
                 RowCount::exact(input_rows),
-                MssqlBatchShapingReport::completed(
-                    input_batches,
-                    input_rows,
-                    shaped_batches,
-                    shaped_rows,
-                ),
+                batch_shaping,
                 MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms),
                 partial_write_possible(output_plan, rows_written, batches_written),
                 cleanup,
@@ -657,11 +679,14 @@ where
         output_plan,
         write_report_metrics(
             RowCount::exact(input_rows),
-            MssqlBatchShapingReport::completed(
-                input_batches,
-                input_rows,
-                shaped_batches,
-                shaped_rows,
+            trace_batch_shaping_finished(
+                output_plan,
+                MssqlBatchShapingReport::completed(
+                    input_batches,
+                    input_rows,
+                    shaped_batches,
+                    shaped_rows,
+                ),
             ),
             MssqlWriteProgress::new(rows_written, batches_written, elapsed_ms_since(started_at)),
             false,
@@ -669,6 +694,19 @@ where
         )
         .with_phase_timings(phase_timings.completed(finalize_elapsed)),
     ))
+}
+
+fn trace_batch_shaping_finished(
+    output_plan: &MssqlTargetOutputPlan,
+    report: MssqlBatchShapingReport,
+) -> MssqlBatchShapingReport {
+    observability::batch_shaping_finished(
+        output_plan.output_name(),
+        output_plan.target_table(),
+        output_plan.load_mode(),
+        report,
+    );
+    report
 }
 
 fn mssql_write_phase_error(

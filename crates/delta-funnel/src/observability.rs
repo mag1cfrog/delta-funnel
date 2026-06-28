@@ -1,6 +1,9 @@
 //! Internal tracing vocabulary for DeltaFunnel workflow observability.
 
-use crate::{DeltaFunnelError, LoadMode, MssqlTargetTable, RunMode, ValidationStatus};
+use crate::{
+    DeltaFunnelError, LoadMode, MssqlBatchShapingReport, MssqlTargetTable, RunMode,
+    ValidationStatus,
+};
 
 pub(crate) const TRACING_TARGET: &str = "delta_funnel";
 
@@ -9,6 +12,9 @@ const OUTPUT_FAILED_EVENT: &str = "output.failed";
 const OUTPUT_SKIPPED_EVENT: &str = "output.skipped";
 const OUTPUT_SPAN: &str = "delta_funnel.output";
 const OUTPUT_STARTED_EVENT: &str = "output.started";
+const BATCH_SHAPING_COMPLETED_EVENT: &str = "batch_shaping.completed";
+const BATCH_SHAPING_FAILED_EVENT: &str = "batch_shaping.failed";
+const BATCH_SHAPING_STARTED_EVENT: &str = "batch_shaping.started";
 const SQL_TARGET_PLANNING_COMPLETED_EVENT: &str = "sql_target_planning.completed";
 const SQL_TARGET_PLANNING_FAILED_EVENT: &str = "sql_target_planning.failed";
 const SQL_TARGET_PLANNING_STARTED_EVENT: &str = "sql_target_planning.started";
@@ -200,6 +206,55 @@ pub(crate) fn sql_target_planning_failed(
         error_category = "delta_funnel_error",
         error_summary = %error,
         SQL_TARGET_PLANNING_FAILED_EVENT
+    );
+}
+
+pub(crate) fn batch_shaping_started(
+    output_name: &str,
+    target_table: &MssqlTargetTable,
+    load_mode: LoadMode,
+) {
+    output_target_event(
+        BATCH_SHAPING_STARTED_EVENT,
+        output_name,
+        target_table,
+        load_mode,
+    );
+}
+
+pub(crate) fn batch_shaping_finished(
+    output_name: &str,
+    target_table: &MssqlTargetTable,
+    load_mode: LoadMode,
+    report: MssqlBatchShapingReport,
+) {
+    let telemetry_event = match report.status().kind() {
+        crate::PhaseStatusKind::Completed => BATCH_SHAPING_COMPLETED_EVENT,
+        crate::PhaseStatusKind::Failed => BATCH_SHAPING_FAILED_EVENT,
+        crate::PhaseStatusKind::Skipped
+        | crate::PhaseStatusKind::NotStarted
+        | crate::PhaseStatusKind::Unavailable => BATCH_SHAPING_COMPLETED_EVENT,
+    };
+    let batch_shaping_reason = report
+        .status()
+        .reason()
+        .map(|reason| reason.as_str())
+        .unwrap_or("");
+
+    tracing::info!(
+        target: TRACING_TARGET,
+        telemetry_event,
+        output_name,
+        target_schema = target_table.schema().unwrap_or(""),
+        target_table = target_table.table(),
+        load_mode = load_mode_as_str(load_mode),
+        batch_shaping_status = report.status().kind().as_str(),
+        batch_shaping_reason,
+        input_batches = report.input_batches(),
+        input_rows = report.input_rows(),
+        output_batches = report.output_batches(),
+        output_rows = report.output_rows(),
+        message = telemetry_event
     );
 }
 
@@ -461,6 +516,13 @@ mod tests {
             LoadMode::AppendExisting,
             "prior_failure",
         );
+        batch_shaping_started("orders_output", &target_table, LoadMode::AppendExisting);
+        batch_shaping_finished(
+            "orders_output",
+            &target_table,
+            LoadMode::AppendExisting,
+            MssqlBatchShapingReport::completed(2, 5, 2, 5),
+        );
         sql_target_planning_started("orders_output", &target_table, LoadMode::AppendExisting);
         sql_target_planning_completed("orders_output", &target_table, LoadMode::AppendExisting);
         sql_target_planning_failed(
@@ -508,6 +570,9 @@ mod tests {
         assert_eq!(OUTPUT_SKIPPED_EVENT, "output.skipped");
         assert_eq!(OUTPUT_SPAN, "delta_funnel.output");
         assert_eq!(OUTPUT_STARTED_EVENT, "output.started");
+        assert_eq!(BATCH_SHAPING_COMPLETED_EVENT, "batch_shaping.completed");
+        assert_eq!(BATCH_SHAPING_FAILED_EVENT, "batch_shaping.failed");
+        assert_eq!(BATCH_SHAPING_STARTED_EVENT, "batch_shaping.started");
         assert_eq!(
             SQL_TARGET_PLANNING_COMPLETED_EVENT,
             "sql_target_planning.completed"
@@ -721,6 +786,55 @@ mod tests {
     }
 
     #[test]
+    fn scoped_capture_records_batch_shaping_event_fields() -> Result<(), DeltaFunnelError> {
+        let events = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: events.clone(),
+        });
+        let target_table = MssqlTargetTable::new("dbo", "orders")?;
+
+        tracing::subscriber::with_default(subscriber, || {
+            batch_shaping_started("orders_output", &target_table, LoadMode::AppendExisting);
+            batch_shaping_finished(
+                "orders_output",
+                &target_table,
+                LoadMode::AppendExisting,
+                MssqlBatchShapingReport::completed(2, 5, 2, 5),
+            );
+            batch_shaping_finished(
+                "orders_output",
+                &target_table,
+                LoadMode::AppendExisting,
+                MssqlBatchShapingReport::failed(3, 8, 2, 5),
+            );
+        });
+
+        let events = events.events();
+        assert_eq!(events.len(), 3);
+        assert_output_event(&events[0], BATCH_SHAPING_STARTED_EVENT);
+        assert_batch_shaping_event(
+            &events[1],
+            BATCH_SHAPING_COMPLETED_EVENT,
+            "completed",
+            "2",
+            "5",
+            "2",
+            "5",
+        );
+        assert_batch_shaping_event(
+            &events[2],
+            BATCH_SHAPING_FAILED_EVENT,
+            "failed",
+            "3",
+            "8",
+            "2",
+            "5",
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn scoped_capture_records_source_phase_event_fields() {
         let events = CapturedEvents::default();
         let subscriber = Registry::default().with(CaptureLayer {
@@ -879,6 +993,42 @@ mod tests {
         assert_eq!(
             span.fields.get("load_mode").map(String::as_str),
             Some("append_existing")
+        );
+    }
+
+    fn assert_batch_shaping_event(
+        event: &CapturedEvent,
+        telemetry_event: &str,
+        batch_shaping_status: &str,
+        input_batches: &str,
+        input_rows: &str,
+        output_batches: &str,
+        output_rows: &str,
+    ) {
+        assert_output_event(event, telemetry_event);
+        assert_eq!(
+            event.fields.get("batch_shaping_status").map(String::as_str),
+            Some(batch_shaping_status)
+        );
+        assert_eq!(
+            event.fields.get("batch_shaping_reason").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            event.fields.get("input_batches").map(String::as_str),
+            Some(input_batches)
+        );
+        assert_eq!(
+            event.fields.get("input_rows").map(String::as_str),
+            Some(input_rows)
+        );
+        assert_eq!(
+            event.fields.get("output_batches").map(String::as_str),
+            Some(output_batches)
+        );
+        assert_eq!(
+            event.fields.get("output_rows").map(String::as_str),
+            Some(output_rows)
         );
     }
 
