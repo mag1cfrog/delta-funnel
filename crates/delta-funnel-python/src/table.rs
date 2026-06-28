@@ -2,6 +2,7 @@
 
 use pyo3::prelude::*;
 
+use crate::output::PyMssqlOutputSpec;
 use crate::session::PySession;
 
 #[pyclass(name = "Table", module = "deltafunnel")]
@@ -25,6 +26,28 @@ impl PyTable {
             .borrow_mut(py)
             .register_table_alias(py, name, &self.inner)?;
         Ok(Self::from_inner(self.session.clone_ref(py), table))
+    }
+
+    /// Builds a SQL Server output spec without executing rows.
+    #[pyo3(signature = (*, schema, table, load_mode, name=None, connection_string=None))]
+    fn to_mssql(
+        &self,
+        py: Python<'_>,
+        schema: String,
+        table: String,
+        load_mode: String,
+        name: Option<String>,
+        connection_string: Option<String>,
+    ) -> PyResult<PyMssqlOutputSpec> {
+        PyMssqlOutputSpec::new(
+            py,
+            self.inner.clone(),
+            schema,
+            table,
+            load_mode,
+            name,
+            connection_string,
+        )
     }
 
     fn __repr__(&self) -> String {
