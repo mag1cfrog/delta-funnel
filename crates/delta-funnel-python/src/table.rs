@@ -42,6 +42,7 @@ impl PyTable {
     ) -> PyResult<PyMssqlOutputSpec> {
         PyMssqlOutputSpec::new(
             py,
+            self.session.clone_ref(py),
             self.inner.clone(),
             schema,
             table,
@@ -67,6 +68,7 @@ impl PyTable {
         ensure_dry_run_enabled(py, dry_run)?;
         let spec = PyMssqlOutputSpec::new(
             py,
+            self.session.clone_ref(py),
             self.inner.clone(),
             schema,
             table,

@@ -1,19 +1,24 @@
 //! Python MSSQL output specification wrapper.
 
 use pyo3::prelude::*;
+use pyo3::types::PyAnyMethods;
 
 use crate::exception::{delta_funnel_error_to_py, delta_funnel_py_error};
+use crate::session::PySession;
 
 #[pyclass(name = "MssqlOutputSpec", module = "deltafunnel")]
 pub(crate) struct PyMssqlOutputSpec {
+    session: Py<PySession>,
     table: delta_funnel::LazyTable,
     output_name: String,
     target: delta_funnel::MssqlTargetConfig,
 }
 
 impl PyMssqlOutputSpec {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         py: Python<'_>,
+        session: Py<PySession>,
         table: delta_funnel::LazyTable,
         schema: String,
         target_table: String,
@@ -36,6 +41,7 @@ impl PyMssqlOutputSpec {
         }
 
         Ok(Self {
+            session,
             table,
             output_name: name.unwrap_or(target_table),
             target,
@@ -54,6 +60,10 @@ impl PyMssqlOutputSpec {
                 run_mode,
             ),
         )
+    }
+
+    pub(crate) fn belongs_to_session(&self, py: Python<'_>, session: &Py<PySession>) -> bool {
+        self.session.bind(py).is(session.bind(py))
     }
 }
 
