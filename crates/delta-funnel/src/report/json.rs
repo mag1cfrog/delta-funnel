@@ -3,9 +3,11 @@ use serde_json::{Value, json};
 use crate::{
     DeltaProviderReaderBackend, DeltaSourceReport, FileCount, LazyTableKind, LoadMode,
     MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
-    MssqlDryRunWorkflowReport, MssqlOutputFieldReport, MssqlTargetCleanupStatus, MssqlTargetTable,
-    MssqlWriteReport, MssqlWriteStats, OutputStatus, PhaseStatus, PhaseTimingReport,
-    ReportReasonCode, RowCount, RunMode, ValidationStatus, WorkflowStatus,
+    MssqlDryRunWorkflowReport, MssqlOutputFieldReport, MssqlOutputWriteStatus,
+    MssqlTargetCleanupStatus, MssqlTargetTable, MssqlWorkflowWriteReport, MssqlWriteFailureReport,
+    MssqlWriteReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport, MssqlWriteStats,
+    OutputStatus, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount, RunMode,
+    ValidationStatus, WorkflowStatus,
 };
 
 impl RowCount {
@@ -277,6 +279,111 @@ impl MssqlWriteReport {
     }
 }
 
+impl MssqlOutputWriteStatus {
+    /// Returns one workflow output status as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        match self {
+            Self::Succeeded(report) => json!({
+                "kind": "succeeded",
+                "output_name": self.output_name(),
+                "target_table": target_table_value(self.target_table()),
+                "load_mode": load_mode(self.load_mode()),
+                "connection_source": connection_source(self.connection_source()),
+                "output_row_count": self.output_row_count().to_json_value(),
+                "target_row_count": self.target_row_count().to_json_value(),
+                "validation_status": self.validation_status().to_json_value(),
+                "batch_shaping": batch_shaping_value(self.batch_shaping()),
+                "phase_timings": phase_timings_value(self.phase_timings()),
+                "report": report.to_json_value(),
+            }),
+            Self::Failed(report) => json!({
+                "kind": "failed",
+                "output_name": self.output_name(),
+                "target_table": target_table_value(self.target_table()),
+                "load_mode": load_mode(self.load_mode()),
+                "connection_source": connection_source(self.connection_source()),
+                "output_row_count": self.output_row_count().to_json_value(),
+                "target_row_count": self.target_row_count().to_json_value(),
+                "validation_status": self.validation_status().to_json_value(),
+                "batch_shaping": batch_shaping_value(self.batch_shaping()),
+                "phase_timings": phase_timings_value(self.phase_timings()),
+                "failure": report.to_json_value(),
+            }),
+            Self::Skipped(report) => json!({
+                "kind": "skipped",
+                "output_name": self.output_name(),
+                "target_table": target_table_value(self.target_table()),
+                "load_mode": load_mode(self.load_mode()),
+                "connection_source": connection_source(self.connection_source()),
+                "output_row_count": self.output_row_count().to_json_value(),
+                "target_row_count": self.target_row_count().to_json_value(),
+                "validation_status": self.validation_status().to_json_value(),
+                "batch_shaping": batch_shaping_value(self.batch_shaping()),
+                "phase_timings": phase_timings_value(self.phase_timings()),
+                "skipped": report.to_json_value(),
+            }),
+        }
+    }
+}
+
+impl MssqlWorkflowWriteReport {
+    /// Returns the SQL Server workflow report as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "output_count": self.len(),
+            "all_succeeded": self.all_succeeded(),
+            "succeeded_count": self.succeeded_count(),
+            "failed_count": self.failed_count(),
+            "skipped_count": self.skipped_count(),
+            "outputs": self.outputs()
+                .iter()
+                .map(MssqlOutputWriteStatus::to_json_value)
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+impl MssqlWriteFailureReport {
+    /// Returns one failed workflow output report as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "output_name": self.output_name(),
+            "target_table": target_table_value(self.target().table()),
+            "load_mode": load_mode(self.target().load_mode()),
+            "connection_source": connection_source(self.target().connection_source()),
+            "error": self.error(),
+            "context_available": self.context().is_some(),
+            "output_row_count": self.output_row_count().to_json_value(),
+            "target_row_count": self.target_row_count().to_json_value(),
+            "validation_status": self.validation_status().to_json_value(),
+            "batch_shaping": batch_shaping_value(self.batch_shaping()),
+            "phase_timings": phase_timings_value(self.phase_timings()),
+        })
+    }
+}
+
+impl MssqlWriteSkippedReport {
+    /// Returns one skipped workflow output report as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "output_name": self.output_name(),
+            "target_table": target_table_value(self.target().table()),
+            "load_mode": load_mode(self.target().load_mode()),
+            "connection_source": connection_source(self.target().connection_source()),
+            "reason": skipped_reason_value(self.reason()),
+            "output_row_count": self.output_row_count().to_json_value(),
+            "target_row_count": self.target_row_count().to_json_value(),
+            "validation_status": self.validation_status().to_json_value(),
+            "batch_shaping": batch_shaping_value(self.batch_shaping()),
+            "phase_timings": phase_timings_value(self.phase_timings()),
+        })
+    }
+}
+
 fn count_value(kind: &str, value: Option<u64>) -> Value {
     json!({
         "kind": kind,
@@ -367,6 +474,15 @@ fn batch_shaping_value(report: crate::MssqlBatchShapingReport) -> Value {
         "output_batches": report.output_batches(),
         "output_rows": report.output_rows(),
     })
+}
+
+fn skipped_reason_value(reason: &MssqlWriteSkippedReason) -> Value {
+    match reason {
+        MssqlWriteSkippedReason::PreviousOutputFailed { failed_output_name } => json!({
+            "kind": "previous_output_failed",
+            "failed_output_name": failed_output_name,
+        }),
+    }
 }
 
 fn reader_backend(backend: DeltaProviderReaderBackend) -> &'static str {
@@ -614,6 +730,33 @@ mod tests {
         assert_eq!(value["write_stats"]["batches_written"], 3);
         assert_eq!(value["write_stats"]["elapsed_ms"], 125);
         assert_eq!(value["cleanup"], "not_applicable");
+        assert_json_safe(&value)?;
+        assert_no_secret_or_raw_sql_text(&value);
+
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_output_status_json_wraps_successful_write_report() -> TestResult<()> {
+        let output_plan = output_plan()?;
+        let report = MssqlWriteReport::from_output_plan(
+            &output_plan,
+            7,
+            1,
+            25,
+            false,
+            MssqlTargetCleanupStatus::NotApplicable,
+        );
+
+        let value = MssqlOutputWriteStatus::Succeeded(report).to_json_value();
+
+        assert_eq!(value["kind"], "succeeded");
+        assert_eq!(value["output_name"], "orders_output");
+        assert_eq!(
+            value["output_row_count"],
+            json!({"kind": "exact", "value": 7})
+        );
+        assert_eq!(value["report"]["write_stats"]["rows_written"], 7);
         assert_json_safe(&value)?;
         assert_no_secret_or_raw_sql_text(&value);
 
