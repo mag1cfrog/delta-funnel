@@ -247,7 +247,7 @@ mod tests {
         let error = DeltaFunnelSession::new(SessionOptions::new().with_provider_scan_options(
             DeltaProviderScanExecutionOptions {
                 reader_backend: DeltaProviderReaderBackend::OfficialKernel,
-                max_concurrent_file_reads_per_scan: 1,
+                max_concurrent_file_reads_per_scan: Some(1),
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 0,
                 native_async_prefetch_file_count_per_partition: 0,

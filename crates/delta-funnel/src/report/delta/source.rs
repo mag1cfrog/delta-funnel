@@ -75,7 +75,15 @@ impl DeltaProviderSchedulingReport {
                 .map(crate::usize_to_u64_saturating),
             reader_backend: scan_options.reader_backend,
             max_concurrent_file_reads_per_scan: crate::usize_to_u64_saturating(
-                scan_options.max_concurrent_file_reads_per_scan,
+                scan_options
+                    .max_concurrent_file_reads_per_scan
+                    .unwrap_or_else(|| {
+                        query_options
+                            .target_partitions
+                            .unwrap_or(1)
+                            .saturating_mul(scan_options.max_concurrent_file_reads_per_partition)
+                            .max(1)
+                    }),
             ),
             max_concurrent_file_reads_per_partition: crate::usize_to_u64_saturating(
                 scan_options.max_concurrent_file_reads_per_partition,

@@ -141,13 +141,14 @@ impl DeltaFunnelSession {
         };
 
         let registration_timer = PhaseTimer::start(DATAFUSION_REGISTRATION_PHASE);
+        let configs = vec![DeltaTableProviderConfig {
+            source: planned,
+            protocol: preflight,
+            scan_target_partitions: None,
+        }];
         let registered = match register_delta_sources_with_scan_execution_options(
             &self.context,
-            vec![DeltaTableProviderConfig {
-                source: planned,
-                protocol: preflight,
-                scan_target_partitions: None,
-            }],
+            configs,
             self.options.provider_scan_options(),
         ) {
             Ok(registered) => {
