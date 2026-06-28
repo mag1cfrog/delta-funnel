@@ -13,14 +13,23 @@ pub(crate) struct PySession {
 #[pymethods]
 impl PySession {
     #[new]
-    #[pyo3(signature = (*, default_mssql_connection_string=None))]
-    fn new(py: Python<'_>, default_mssql_connection_string: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (*, default_mssql_connection_string=None, target_partitions=None, output_batch_size=None))]
+    fn new(
+        py: Python<'_>,
+        default_mssql_connection_string: Option<String>,
+        target_partitions: Option<usize>,
+        output_batch_size: Option<usize>,
+    ) -> PyResult<Self> {
         let mut options = delta_funnel::SessionOptions::default();
         if let Some(connection_string) = default_mssql_connection_string {
             let connection = delta_funnel::MssqlConnectionConfig::new(connection_string)
                 .map_err(|error| rust_error_to_py(py, error))?;
             options = options.with_default_mssql_connection(connection);
         }
+        options = options.with_query_options(delta_funnel::QueryOptions {
+            target_partitions,
+            output_batch_size,
+        });
 
         let inner = delta_funnel::DeltaFunnelSession::new(options)
             .map_err(|error| rust_error_to_py(py, error))?;
@@ -48,6 +57,7 @@ fn rust_error_to_py(py: Python<'_>, error: delta_funnel::DeltaFunnelError) -> Py
 mod tests {
     use super::PySession;
     use crate::deltafunnel;
+    use pyo3::exceptions::PyAssertionError;
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule};
 
@@ -70,7 +80,7 @@ mod tests {
     #[test]
     fn default_session_constructs_with_safe_repr() -> PyResult<()> {
         Python::attach(|py| {
-            let session = Py::new(py, PySession::new(py, None)?)?;
+            let session = Py::new(py, PySession::new(py, None, None, None)?)?;
             let repr = session.bind(py).repr()?.extract::<String>()?;
 
             assert_eq!(repr, "deltafunnel.Session()");
@@ -94,6 +104,8 @@ mod tests {
                         "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token"
                             .to_owned(),
                     ),
+                    None,
+                    None,
                 )?,
             )?;
             let repr = session.bind(py).repr()?.extract::<String>()?;
@@ -109,6 +121,49 @@ mod tests {
     }
 
     #[test]
+    fn session_accepts_query_options() -> PyResult<()> {
+        Python::attach(|py| {
+            let session = Py::new(py, PySession::new(py, None, Some(3), Some(17))?)?;
+            let repr = session.bind(py).repr()?.extract::<String>()?;
+
+            assert_eq!(repr, "deltafunnel.Session()");
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn session_rejects_zero_query_options_with_config_phase() -> PyResult<()> {
+        Python::attach(|py| {
+            let cases = [
+                (Some(0), None, "target_partitions"),
+                (None, Some(0), "output_batch_size"),
+            ];
+
+            for (target_partitions, output_batch_size, option_name) in cases {
+                let error = match PySession::new(py, None, target_partitions, output_batch_size) {
+                    Ok(_) => return Err(PyAssertionError::new_err("expected zero value error")),
+                    Err(error) => error,
+                };
+
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "config"
+                );
+                assert!(
+                    error
+                        .value(py)
+                        .getattr("message")?
+                        .extract::<String>()?
+                        .contains(option_name)
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn session_constructor_accepts_connection_keyword() -> PyResult<()> {
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
@@ -118,6 +173,8 @@ mod tests {
                 "default_mssql_connection_string",
                 "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
             )?;
+            kwargs.set_item("target_partitions", 3)?;
+            kwargs.set_item("output_batch_size", 17)?;
 
             let session = module.getattr("Session")?.call((), Some(&kwargs))?;
             let repr = session.repr()?.extract::<String>()?;

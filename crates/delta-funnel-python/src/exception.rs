@@ -119,6 +119,11 @@ fn delta_funnel_error_parts(
         delta_funnel::DeltaFunnelError::DependencyCompatibility { .. } => {
             Ok(("dependency_compatibility", "dependency_compatibility", None))
         }
+        delta_funnel::DeltaFunnelError::BatchPipeline { phase, .. }
+            if *phase == delta_funnel::BatchPipelinePhase::Configuration =>
+        {
+            Ok(("config", "batch_pipeline", None))
+        }
         delta_funnel::DeltaFunnelError::BatchPipeline { .. } => {
             Ok(("batch_pipeline", "batch_pipeline", None))
         }
