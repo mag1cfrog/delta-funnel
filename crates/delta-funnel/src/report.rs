@@ -13,6 +13,7 @@ use std::{
 use crate::error::DeltaFunnelError;
 
 pub mod delta;
+mod json;
 pub mod sql_server;
 
 pub use delta::{
