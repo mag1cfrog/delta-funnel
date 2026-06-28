@@ -1,6 +1,6 @@
 //! Internal tracing vocabulary for DeltaFunnel workflow observability.
 
-use crate::{DeltaFunnelError, LoadMode, MssqlTargetTable, RunMode};
+use crate::{DeltaFunnelError, LoadMode, MssqlTargetTable, RunMode, ValidationStatus};
 
 pub(crate) const TRACING_TARGET: &str = "delta_funnel";
 
@@ -18,6 +18,10 @@ const PROTOCOL_PREFLIGHT_STARTED_EVENT: &str = "protocol_preflight.started";
 const SOURCE_LOADING_COMPLETED_EVENT: &str = "source_loading.completed";
 const SOURCE_LOADING_FAILED_EVENT: &str = "source_loading.failed";
 const SOURCE_LOADING_STARTED_EVENT: &str = "source_loading.started";
+const VALIDATION_COMPLETED_EVENT: &str = "validation.completed";
+const VALIDATION_FAILED_EVENT: &str = "validation.failed";
+const VALIDATION_SKIPPED_EVENT: &str = "validation.skipped";
+const VALIDATION_STARTED_EVENT: &str = "validation.started";
 const WORKFLOW_COMPLETED_EVENT: &str = "workflow.completed";
 const WORKFLOW_FAILED_EVENT: &str = "workflow.failed";
 const WORKFLOW_SPAN: &str = "delta_funnel.workflow";
@@ -225,6 +229,28 @@ pub(crate) fn datafusion_registration_failed(
     );
 }
 
+pub(crate) fn validation_started(target_table: &MssqlTargetTable, load_mode: LoadMode) {
+    validation_event(VALIDATION_STARTED_EVENT, target_table, load_mode, None);
+}
+
+pub(crate) fn validation_finished(
+    target_table: &MssqlTargetTable,
+    load_mode: LoadMode,
+    status: ValidationStatus,
+) {
+    let telemetry_event = match status.kind() {
+        crate::ValidationStatusKind::Passed => VALIDATION_COMPLETED_EVENT,
+        crate::ValidationStatusKind::Failed | crate::ValidationStatusKind::RequiredButFailed => {
+            VALIDATION_FAILED_EVENT
+        }
+        crate::ValidationStatusKind::Disabled
+        | crate::ValidationStatusKind::Skipped
+        | crate::ValidationStatusKind::Unavailable => VALIDATION_SKIPPED_EVENT,
+    };
+
+    validation_event(telemetry_event, target_table, load_mode, Some(status));
+}
+
 impl RunMode {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -295,6 +321,30 @@ fn source_phase_failed_with_snapshot(
     );
 }
 
+fn validation_event(
+    telemetry_event: &str,
+    target_table: &MssqlTargetTable,
+    load_mode: LoadMode,
+    status: Option<ValidationStatus>,
+) {
+    let validation_status = status.map(|status| status.kind().as_str()).unwrap_or("");
+    let validation_reason = status
+        .and_then(|status| status.reason())
+        .map(|reason| reason.as_str())
+        .unwrap_or("");
+
+    tracing::info!(
+        target: TRACING_TARGET,
+        telemetry_event,
+        target_schema = target_table.schema().unwrap_or(""),
+        target_table = target_table.table(),
+        load_mode = load_mode_as_str(load_mode),
+        validation_status,
+        validation_reason,
+        message = telemetry_event
+    );
+}
+
 const fn load_mode_as_str(load_mode: LoadMode) -> &'static str {
     match load_mode {
         LoadMode::AppendExisting => "append_existing",
@@ -352,6 +402,22 @@ mod tests {
         protocol_preflight_completed("orders", 7);
         datafusion_registration_started("orders", 7);
         datafusion_registration_completed("orders", 7);
+        validation_started(&target_table, LoadMode::AppendExisting);
+        validation_finished(
+            &target_table,
+            LoadMode::AppendExisting,
+            ValidationStatus::passed(),
+        );
+        validation_finished(
+            &target_table,
+            LoadMode::AppendExisting,
+            ValidationStatus::required_but_failed(crate::ReportReasonCode::MissingTargetAccess),
+        );
+        validation_finished(
+            &target_table,
+            LoadMode::AppendExisting,
+            ValidationStatus::disabled(),
+        );
         Ok(())
     }
 
@@ -391,6 +457,10 @@ mod tests {
             DATAFUSION_REGISTRATION_STARTED_EVENT,
             "datafusion_registration.started"
         );
+        assert_eq!(VALIDATION_COMPLETED_EVENT, "validation.completed");
+        assert_eq!(VALIDATION_FAILED_EVENT, "validation.failed");
+        assert_eq!(VALIDATION_SKIPPED_EVENT, "validation.skipped");
+        assert_eq!(VALIDATION_STARTED_EVENT, "validation.started");
         assert_eq!(RunMode::Execute.as_str(), "execute");
         assert_eq!(RunMode::DryRun.as_str(), "dry_run");
         assert_eq!(
@@ -569,6 +639,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scoped_capture_records_validation_event_fields() -> Result<(), DeltaFunnelError> {
+        let events = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: events.clone(),
+        });
+        let target_table = MssqlTargetTable::new("dbo", "orders")?;
+
+        tracing::subscriber::with_default(subscriber, || {
+            validation_started(&target_table, LoadMode::CreateAndLoad);
+            validation_finished(
+                &target_table,
+                LoadMode::CreateAndLoad,
+                ValidationStatus::passed(),
+            );
+            validation_finished(
+                &target_table,
+                LoadMode::CreateAndLoad,
+                ValidationStatus::required_but_failed(
+                    crate::ReportReasonCode::MissingExactOutputRows,
+                ),
+            );
+            validation_finished(
+                &target_table,
+                LoadMode::CreateAndLoad,
+                ValidationStatus::disabled(),
+            );
+        });
+
+        let events = events.events();
+        assert_eq!(events.len(), 4);
+        assert_validation_event(&events[0], VALIDATION_STARTED_EVENT, "", "");
+        assert_validation_event(&events[1], VALIDATION_COMPLETED_EVENT, "passed", "");
+        assert_validation_event(
+            &events[2],
+            VALIDATION_FAILED_EVENT,
+            "required_but_failed",
+            "missing_exact_output_rows",
+        );
+        assert_validation_event(
+            &events[3],
+            VALIDATION_SKIPPED_EVENT,
+            "disabled",
+            "validation_disabled",
+        );
+
+        Ok(())
+    }
+
     fn assert_workflow_event(
         event: &CapturedEvent,
         telemetry_event: &str,
@@ -656,6 +775,40 @@ mod tests {
         assert_eq!(
             event.fields.get("snapshot_version").map(String::as_str),
             snapshot_version
+        );
+    }
+
+    fn assert_validation_event(
+        event: &CapturedEvent,
+        telemetry_event: &str,
+        validation_status: &str,
+        validation_reason: &str,
+    ) {
+        assert_eq!(event.target, TRACING_TARGET);
+        assert_eq!(event.level, Level::INFO);
+        assert_eq!(
+            event.fields.get("telemetry_event").map(String::as_str),
+            Some(telemetry_event)
+        );
+        assert_eq!(
+            event.fields.get("target_schema").map(String::as_str),
+            Some("dbo")
+        );
+        assert_eq!(
+            event.fields.get("target_table").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            event.fields.get("load_mode").map(String::as_str),
+            Some("create_and_load")
+        );
+        assert_eq!(
+            event.fields.get("validation_status").map(String::as_str),
+            Some(validation_status)
+        );
+        assert_eq!(
+            event.fields.get("validation_reason").map(String::as_str),
+            Some(validation_reason)
         );
     }
 
