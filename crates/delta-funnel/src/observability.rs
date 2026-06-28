@@ -12,9 +12,9 @@ const OUTPUT_FAILED_EVENT: &str = "output.failed";
 const OUTPUT_SKIPPED_EVENT: &str = "output.skipped";
 const OUTPUT_SPAN: &str = "delta_funnel.output";
 const OUTPUT_STARTED_EVENT: &str = "output.started";
-const BATCH_SHAPING_COMPLETED_EVENT: &str = "batch_shaping.completed";
-const BATCH_SHAPING_FAILED_EVENT: &str = "batch_shaping.failed";
-const BATCH_SHAPING_STARTED_EVENT: &str = "batch_shaping.started";
+const DATAFUSION_BATCH_STREAM_COMPLETED_EVENT: &str = "datafusion_batch_stream.completed";
+const DATAFUSION_BATCH_STREAM_FAILED_EVENT: &str = "datafusion_batch_stream.failed";
+const DATAFUSION_BATCH_STREAM_STARTED_EVENT: &str = "datafusion_batch_stream.started";
 const DATAFUSION_REGISTRATION_COMPLETED_EVENT: &str = "datafusion_registration.completed";
 const DATAFUSION_REGISTRATION_FAILED_EVENT: &str = "datafusion_registration.failed";
 const DATAFUSION_REGISTRATION_STARTED_EVENT: &str = "datafusion_registration.started";
@@ -161,33 +161,33 @@ pub(crate) fn output_skipped(
     );
 }
 
-pub(crate) fn batch_shaping_started(
+pub(crate) fn datafusion_batch_stream_started(
     output_name: &str,
     target_table: &MssqlTargetTable,
     load_mode: LoadMode,
 ) {
     output_target_event(
-        BATCH_SHAPING_STARTED_EVENT,
+        DATAFUSION_BATCH_STREAM_STARTED_EVENT,
         output_name,
         target_table,
         load_mode,
     );
 }
 
-pub(crate) fn batch_shaping_finished(
+pub(crate) fn datafusion_batch_stream_finished(
     output_name: &str,
     target_table: &MssqlTargetTable,
     load_mode: LoadMode,
     report: MssqlBatchShapingReport,
 ) {
     let telemetry_event = match report.status().kind() {
-        crate::PhaseStatusKind::Completed => BATCH_SHAPING_COMPLETED_EVENT,
-        crate::PhaseStatusKind::Failed => BATCH_SHAPING_FAILED_EVENT,
+        crate::PhaseStatusKind::Completed => DATAFUSION_BATCH_STREAM_COMPLETED_EVENT,
+        crate::PhaseStatusKind::Failed => DATAFUSION_BATCH_STREAM_FAILED_EVENT,
         crate::PhaseStatusKind::Skipped
         | crate::PhaseStatusKind::NotStarted
-        | crate::PhaseStatusKind::Unavailable => BATCH_SHAPING_COMPLETED_EVENT,
+        | crate::PhaseStatusKind::Unavailable => DATAFUSION_BATCH_STREAM_COMPLETED_EVENT,
     };
-    let batch_shaping_reason = report
+    let datafusion_batch_stream_reason = report
         .status()
         .reason()
         .map(|reason| reason.as_str())
@@ -200,8 +200,8 @@ pub(crate) fn batch_shaping_finished(
         target_schema = target_table.schema().unwrap_or(""),
         target_table = target_table.table(),
         load_mode = load_mode_as_str(load_mode),
-        batch_shaping_status = report.status().kind().as_str(),
-        batch_shaping_reason,
+        datafusion_batch_stream_status = report.status().kind().as_str(),
+        datafusion_batch_stream_reason,
         input_batches = report.input_batches(),
         input_rows = report.input_rows(),
         output_batches = report.output_batches(),
@@ -468,8 +468,8 @@ mod tests {
             LoadMode::AppendExisting,
             "prior_failure",
         );
-        batch_shaping_started("orders_output", &target_table, LoadMode::AppendExisting);
-        batch_shaping_finished(
+        datafusion_batch_stream_started("orders_output", &target_table, LoadMode::AppendExisting);
+        datafusion_batch_stream_finished(
             "orders_output",
             &target_table,
             LoadMode::AppendExisting,
@@ -512,9 +512,18 @@ mod tests {
         assert_eq!(OUTPUT_SKIPPED_EVENT, "output.skipped");
         assert_eq!(OUTPUT_SPAN, "delta_funnel.output");
         assert_eq!(OUTPUT_STARTED_EVENT, "output.started");
-        assert_eq!(BATCH_SHAPING_COMPLETED_EVENT, "batch_shaping.completed");
-        assert_eq!(BATCH_SHAPING_FAILED_EVENT, "batch_shaping.failed");
-        assert_eq!(BATCH_SHAPING_STARTED_EVENT, "batch_shaping.started");
+        assert_eq!(
+            DATAFUSION_BATCH_STREAM_COMPLETED_EVENT,
+            "datafusion_batch_stream.completed"
+        );
+        assert_eq!(
+            DATAFUSION_BATCH_STREAM_FAILED_EVENT,
+            "datafusion_batch_stream.failed"
+        );
+        assert_eq!(
+            DATAFUSION_BATCH_STREAM_STARTED_EVENT,
+            "datafusion_batch_stream.started"
+        );
         assert_eq!(SOURCE_LOADING_COMPLETED_EVENT, "source_loading.completed");
         assert_eq!(SOURCE_LOADING_FAILED_EVENT, "source_loading.failed");
         assert_eq!(SOURCE_LOADING_STARTED_EVENT, "source_loading.started");
@@ -678,7 +687,8 @@ mod tests {
     }
 
     #[test]
-    fn scoped_capture_records_batch_shaping_event_fields() -> Result<(), DeltaFunnelError> {
+    fn scoped_capture_records_datafusion_batch_stream_event_fields() -> Result<(), DeltaFunnelError>
+    {
         let events = CapturedEvents::default();
         let subscriber = Registry::default().with(CaptureLayer {
             events: events.clone(),
@@ -686,14 +696,18 @@ mod tests {
         let target_table = MssqlTargetTable::new("dbo", "orders")?;
 
         tracing::subscriber::with_default(subscriber, || {
-            batch_shaping_started("orders_output", &target_table, LoadMode::AppendExisting);
-            batch_shaping_finished(
+            datafusion_batch_stream_started(
+                "orders_output",
+                &target_table,
+                LoadMode::AppendExisting,
+            );
+            datafusion_batch_stream_finished(
                 "orders_output",
                 &target_table,
                 LoadMode::AppendExisting,
                 MssqlBatchShapingReport::completed(2, 5, 2, 5),
             );
-            batch_shaping_finished(
+            datafusion_batch_stream_finished(
                 "orders_output",
                 &target_table,
                 LoadMode::AppendExisting,
@@ -703,19 +717,19 @@ mod tests {
 
         let events = events.events();
         assert_eq!(events.len(), 3);
-        assert_output_event(&events[0], BATCH_SHAPING_STARTED_EVENT);
-        assert_batch_shaping_event(
+        assert_output_event(&events[0], DATAFUSION_BATCH_STREAM_STARTED_EVENT);
+        assert_datafusion_batch_stream_event(
             &events[1],
-            BATCH_SHAPING_COMPLETED_EVENT,
+            DATAFUSION_BATCH_STREAM_COMPLETED_EVENT,
             "completed",
             "2",
             "5",
             "2",
             "5",
         );
-        assert_batch_shaping_event(
+        assert_datafusion_batch_stream_event(
             &events[2],
-            BATCH_SHAPING_FAILED_EVENT,
+            DATAFUSION_BATCH_STREAM_FAILED_EVENT,
             "failed",
             "3",
             "8",
@@ -888,10 +902,10 @@ mod tests {
         );
     }
 
-    fn assert_batch_shaping_event(
+    fn assert_datafusion_batch_stream_event(
         event: &CapturedEvent,
         telemetry_event: &str,
-        batch_shaping_status: &str,
+        datafusion_batch_stream_status: &str,
         input_batches: &str,
         input_rows: &str,
         output_batches: &str,
@@ -899,11 +913,17 @@ mod tests {
     ) {
         assert_output_event(event, telemetry_event);
         assert_eq!(
-            event.fields.get("batch_shaping_status").map(String::as_str),
-            Some(batch_shaping_status)
+            event
+                .fields
+                .get("datafusion_batch_stream_status")
+                .map(String::as_str),
+            Some(datafusion_batch_stream_status)
         );
         assert_eq!(
-            event.fields.get("batch_shaping_reason").map(String::as_str),
+            event
+                .fields
+                .get("datafusion_batch_stream_reason")
+                .map(String::as_str),
             Some("")
         );
         assert_eq!(

@@ -536,7 +536,7 @@ where
     let started_at = Instant::now();
     let mut phase_timings = MssqlWriteLoopPhaseTimings::default();
     pin_mut!(batches);
-    observability::batch_shaping_started(
+    observability::datafusion_batch_stream_started(
         output_plan.output_name(),
         output_plan.target_table(),
         output_plan.load_mode(),
@@ -552,7 +552,7 @@ where
 
         let batch = batch.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
-            let batch_shaping = trace_batch_shaping_finished(
+            let batch_shaping = trace_datafusion_batch_stream_finished(
                 output_plan,
                 MssqlBatchShapingReport::failed(
                     input_batches,
@@ -588,7 +588,7 @@ where
         phase_timings.add_validate_batch_schema(validation_started_at.elapsed());
         validation_result.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
-            let batch_shaping = trace_batch_shaping_finished(
+            let batch_shaping = trace_datafusion_batch_stream_finished(
                 output_plan,
                 MssqlBatchShapingReport::failed(
                     input_batches,
@@ -616,7 +616,7 @@ where
         phase_timings.add_write_batch(write_batch_started_at.elapsed());
         write_batch_result.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
-            let batch_shaping = trace_batch_shaping_finished(
+            let batch_shaping = trace_datafusion_batch_stream_finished(
                 output_plan,
                 MssqlBatchShapingReport::failed(
                     input_batches,
@@ -651,7 +651,7 @@ where
     let finalize_elapsed = finalize_started_at.elapsed();
     finish_result.map_err(|source| {
         let elapsed_ms = elapsed_ms_since(started_at);
-        let batch_shaping = trace_batch_shaping_finished(
+        let batch_shaping = trace_datafusion_batch_stream_finished(
             output_plan,
             MssqlBatchShapingReport::completed(
                 input_batches,
@@ -679,7 +679,7 @@ where
         output_plan,
         write_report_metrics(
             RowCount::exact(input_rows),
-            trace_batch_shaping_finished(
+            trace_datafusion_batch_stream_finished(
                 output_plan,
                 MssqlBatchShapingReport::completed(
                     input_batches,
@@ -696,11 +696,11 @@ where
     ))
 }
 
-fn trace_batch_shaping_finished(
+fn trace_datafusion_batch_stream_finished(
     output_plan: &MssqlTargetOutputPlan,
     report: MssqlBatchShapingReport,
 ) -> MssqlBatchShapingReport {
-    observability::batch_shaping_finished(
+    observability::datafusion_batch_stream_finished(
         output_plan.output_name(),
         output_plan.target_table(),
         output_plan.load_mode(),
