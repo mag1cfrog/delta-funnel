@@ -48,7 +48,7 @@ pub struct DeltaProviderScanExecutionOptions {
     ///
     /// This is the scan-wide concurrency cap shared by all DataFusion execution
     /// partitions for one provider scan.
-    pub max_concurrent_file_reads_per_scan: usize,
+    pub max_concurrent_file_reads_per_scan: Option<usize>,
 
     /// Maximum file-read handoffs that one execution partition may own at once.
     ///
@@ -140,6 +140,7 @@ impl DeltaProviderSyncReadLimiter {
         options: DeltaProviderScanExecutionOptions,
         partition_count: usize,
     ) -> Arc<Self> {
+        let options = options.with_resolved_scan_wide_capacity(partition_count);
         Arc::new(Self {
             options,
             state: Mutex::new(DeltaProviderSyncReadLimiterState {
@@ -225,7 +226,7 @@ impl DeltaProviderSyncReadLimiter {
     }
 
     fn can_acquire(&self, state: &DeltaProviderSyncReadLimiterState, partition: usize) -> bool {
-        state.active_file_reads < self.options.max_concurrent_file_reads_per_scan
+        state.active_file_reads < self.options.resolved_max_concurrent_file_reads_per_scan()
             && state.partition_active_file_reads[partition]
                 < self.options.max_concurrent_file_reads_per_partition
     }
@@ -254,9 +255,12 @@ impl DeltaProviderAsyncReadLimiter {
         options: DeltaProviderScanExecutionOptions,
         partition_count: usize,
     ) -> Arc<Self> {
+        let options = options.with_resolved_scan_wide_capacity(partition_count);
         Arc::new(Self {
             options,
-            scan_permits: Arc::new(Semaphore::new(options.max_concurrent_file_reads_per_scan)),
+            scan_permits: Arc::new(Semaphore::new(
+                options.resolved_max_concurrent_file_reads_per_scan(),
+            )),
             partition_permits: (0..partition_count)
                 .map(|_| {
                     Arc::new(Semaphore::new(
@@ -289,7 +293,7 @@ impl DeltaProviderAsyncReadLimiter {
     #[cfg(test)]
     pub(crate) fn active_file_reads(&self) -> usize {
         self.options
-            .max_concurrent_file_reads_per_scan
+            .resolved_max_concurrent_file_reads_per_scan()
             .saturating_sub(self.scan_permits.available_permits())
     }
 
@@ -390,7 +394,7 @@ impl Default for DeltaProviderScanExecutionOptions {
     fn default() -> Self {
         Self {
             reader_backend: DeltaProviderReaderBackend::NativeAsync,
-            max_concurrent_file_reads_per_scan: NATIVE_ASYNC_DEFAULT_FILE_READS_PER_PARTITION,
+            max_concurrent_file_reads_per_scan: None,
             max_concurrent_file_reads_per_partition: NATIVE_ASYNC_DEFAULT_FILE_READS_PER_PARTITION,
             output_buffer_capacity_per_partition: 1,
             native_async_prefetch_file_count_per_partition:
@@ -425,7 +429,7 @@ impl DeltaProviderScanExecutionOptions {
             );
         let options = Self {
             reader_backend,
-            max_concurrent_file_reads_per_scan,
+            max_concurrent_file_reads_per_scan: Some(max_concurrent_file_reads_per_scan),
             max_concurrent_file_reads_per_partition,
             output_buffer_capacity_per_partition: 1,
             native_async_prefetch_file_count_per_partition,
@@ -460,22 +464,36 @@ impl DeltaProviderScanExecutionOptions {
         target_partitions: usize,
     ) -> Result<Self, DeltaFunnelError> {
         validate_positive("target_partitions", target_partitions)?;
-        if self.reader_backend == DeltaProviderReaderBackend::NativeAsync {
-            self.max_concurrent_file_reads_per_scan = target_partitions
-                .saturating_mul(self.max_concurrent_file_reads_per_partition)
-                .max(1);
-        }
+        self = self.with_resolved_scan_wide_capacity(target_partitions);
         self.validate()?;
         Ok(self)
+    }
+
+    fn with_resolved_scan_wide_capacity(mut self, target_partitions: usize) -> Self {
+        if self.max_concurrent_file_reads_per_scan.is_none() {
+            self.max_concurrent_file_reads_per_scan = Some(
+                target_partitions
+                    .saturating_mul(self.max_concurrent_file_reads_per_partition)
+                    .max(1),
+            );
+        }
+        self
+    }
+
+    fn resolved_max_concurrent_file_reads_per_scan(&self) -> usize {
+        self.max_concurrent_file_reads_per_scan
+            .unwrap_or_else(|| self.max_concurrent_file_reads_per_partition.max(1))
     }
 
     /// Validates provider scan execution bounds before registration or scan execution.
     pub fn validate(&self) -> Result<(), DeltaFunnelError> {
         validate_reader_backend(self.reader_backend)?;
-        validate_positive(
-            "max_concurrent_file_reads_per_scan",
-            self.max_concurrent_file_reads_per_scan,
-        )?;
+        if let Some(max_concurrent_file_reads_per_scan) = self.max_concurrent_file_reads_per_scan {
+            validate_positive(
+                "max_concurrent_file_reads_per_scan",
+                max_concurrent_file_reads_per_scan,
+            )?;
+        }
         validate_positive(
             "max_concurrent_file_reads_per_partition",
             self.max_concurrent_file_reads_per_partition,
@@ -546,10 +564,7 @@ mod tests {
             options.reader_backend,
             DeltaProviderReaderBackend::NativeAsync
         );
-        assert_eq!(
-            options.max_concurrent_file_reads_per_scan,
-            NATIVE_ASYNC_DEFAULT_FILE_READS_PER_PARTITION
-        );
+        assert_eq!(options.max_concurrent_file_reads_per_scan, None);
         assert_eq!(
             options.max_concurrent_file_reads_per_partition,
             NATIVE_ASYNC_DEFAULT_FILE_READS_PER_PARTITION
@@ -577,7 +592,7 @@ mod tests {
             options.reader_backend,
             DeltaProviderReaderBackend::OfficialKernel
         );
-        assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
+        assert_eq!(options.max_concurrent_file_reads_per_scan, Some(2));
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
         assert_eq!(options.output_buffer_capacity_per_partition, 1);
         assert_eq!(options.native_async_prefetch_file_count_per_partition, 0);
@@ -598,7 +613,7 @@ mod tests {
             options.reader_backend,
             DeltaProviderReaderBackend::NativeAsync
         );
-        assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
+        assert_eq!(options.max_concurrent_file_reads_per_scan, Some(2));
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
         assert_eq!(options.output_buffer_capacity_per_partition, 1);
         assert_eq!(options.native_async_prefetch_file_count_per_partition, 0);
@@ -660,7 +675,7 @@ mod tests {
 
         assert_eq!(
             options.max_concurrent_file_reads_per_scan,
-            8 * NATIVE_ASYNC_DEFAULT_FILE_READS_PER_PARTITION
+            Some(8 * NATIVE_ASYNC_DEFAULT_FILE_READS_PER_PARTITION)
         );
         assert_eq!(
             options.max_concurrent_file_reads_per_partition,
@@ -671,8 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn official_kernel_default_scan_wide_capacity_resolution_is_noop()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn explicit_scan_wide_capacity_resolution_is_noop() -> Result<(), Box<dyn std::error::Error>> {
         let options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
             DeltaProviderReaderBackend::OfficialKernel,
             2,
@@ -680,7 +694,7 @@ mod tests {
         )?
         .with_default_scan_wide_capacity_for_target_partitions(8)?;
 
-        assert_eq!(options.max_concurrent_file_reads_per_scan, 2);
+        assert_eq!(options.max_concurrent_file_reads_per_scan, Some(2));
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
 
         Ok(())

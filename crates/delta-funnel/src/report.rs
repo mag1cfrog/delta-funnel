@@ -83,12 +83,24 @@ impl fmt::Display for TargetValidationMode {
 }
 
 /// Controls how much source scan metadata a dry-run report should collect.
+///
+/// This only affects dry-run source reporting. It does not allow row
+/// production, SQL Server lifecycle work, bulk writer construction, or writes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DryRunScanSummaryMode {
-    /// Use metadata available from normal planning paths.
+    /// Use source metadata already available from normal dry-run output
+    /// planning.
+    ///
+    /// This is the cheaper default. It avoids DataFusion physical scan
+    /// planning and reports source file counts as unavailable for cost
+    /// avoidance.
     #[default]
     MetadataOnly,
-    /// Exhaust scan metadata paths when callers need fuller source summaries.
+    /// Run DataFusion physical scan planning to collect provider scan stats.
+    ///
+    /// This may perform extra table metadata work so dry-run reports can expose
+    /// provider stats and exact or estimated source file counts. It still stops
+    /// before producing rows.
     ExhaustScanMetadata,
 }
 
@@ -1316,10 +1328,21 @@ impl fmt::Display for WorkflowStatus {
 /// This type carries validation intent without starting validation I/O. Target
 /// row-count validation, source scan summaries, and related reports are wired in
 /// later issue slices through these stable options.
+///
+/// Defaults are intentionally conservative: validate targets when the selected
+/// workflow supports it, use planning metadata for dry-run source summaries,
+/// and treat local planning failures as terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidationOptions {
+    /// Target-side validation behavior for workflows that can compare written
+    /// output with target evidence.
     target_validation_mode: TargetValidationMode,
+    /// Dry-run source scan summary depth. Metadata-only mode uses only normal
+    /// dry-run planning metadata. Exhaustive mode performs extra DataFusion
+    /// scan planning for provider stats without producing rows.
     dry_run_scan_summary_mode: DryRunScanSummaryMode,
+    /// Whether local planning failures should fail the workflow instead of
+    /// being reported as unavailable validation evidence.
     require_successful_planning: bool,
 }
 
