@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
+use tracing::Instrument;
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlTargetOutputPlan, MssqlWriteOptions,
     MssqlWriteReport, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, ValidationOptions,
-    plan_mssql_target_for_resolved_output, report::PhaseTimer,
+    observability, plan_mssql_target_for_resolved_output, report::PhaseTimer,
     write_output_batches_to_mssql_with_validation_options,
 };
 
@@ -105,8 +106,52 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.write_to_mssql_with_writer(request, &mut MssqlPublicOneOutputWriter)
+        self.write_to_mssql_with_writer_with_tracing(request, &mut MssqlPublicOneOutputWriter)
             .await
+    }
+
+    async fn write_to_mssql_with_writer_with_tracing<W>(
+        &self,
+        request: &OutputWritePlan,
+        writer: &mut W,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError>
+    where
+        W: OrchestratorMssqlOutputWriter,
+    {
+        ensure_execute_run_mode(request.target().run_mode())?;
+        let target = request.target();
+        let target_config = target.target();
+        let output_span = observability::output_span(
+            target.output_name(),
+            target_config.table(),
+            target_config.load_mode(),
+        );
+
+        async move {
+            observability::output_started(
+                target.output_name(),
+                target_config.table(),
+                target_config.load_mode(),
+            );
+            let result = self.write_to_mssql_with_writer(request, writer).await;
+            match &result {
+                Ok(report) => observability::output_completed(
+                    report.output_name(),
+                    report.target_table(),
+                    report.load_mode(),
+                ),
+                Err(error) => observability::output_failed(
+                    target.output_name(),
+                    target_config.table(),
+                    target_config.load_mode(),
+                    &error.to_string(),
+                ),
+            }
+
+            result
+        }
+        .instrument(output_span)
+        .await
     }
 
     pub(crate) async fn write_to_mssql_with_writer<W>(
