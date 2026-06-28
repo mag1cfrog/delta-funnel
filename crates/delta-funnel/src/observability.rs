@@ -7,6 +7,7 @@ pub(crate) const TRACING_TARGET: &str = "delta_funnel";
 const OUTPUT_COMPLETED_EVENT: &str = "output.completed";
 const OUTPUT_FAILED_EVENT: &str = "output.failed";
 const OUTPUT_SKIPPED_EVENT: &str = "output.skipped";
+const OUTPUT_SPAN: &str = "delta_funnel.output";
 const OUTPUT_STARTED_EVENT: &str = "output.started";
 const WORKFLOW_COMPLETED_EVENT: &str = "workflow.completed";
 const WORKFLOW_FAILED_EVENT: &str = "workflow.failed";
@@ -55,6 +56,21 @@ pub(crate) fn workflow_finished<T>(
             WORKFLOW_FAILED_EVENT
         ),
     }
+}
+
+pub(crate) fn output_span(
+    output_name: &str,
+    target_table: &MssqlTargetTable,
+    load_mode: LoadMode,
+) -> tracing::Span {
+    tracing::info_span!(
+        target: TRACING_TARGET,
+        OUTPUT_SPAN,
+        output_name,
+        target_schema = target_table.schema().unwrap_or(""),
+        target_table = target_table.table(),
+        load_mode = load_mode_as_str(load_mode)
+    )
 }
 
 pub(crate) fn output_started(
@@ -199,6 +215,7 @@ mod tests {
         assert_eq!(OUTPUT_COMPLETED_EVENT, "output.completed");
         assert_eq!(OUTPUT_FAILED_EVENT, "output.failed");
         assert_eq!(OUTPUT_SKIPPED_EVENT, "output.skipped");
+        assert_eq!(OUTPUT_SPAN, "delta_funnel.output");
         assert_eq!(OUTPUT_STARTED_EVENT, "output.started");
         assert_eq!(RunMode::Execute.as_str(), "execute");
         assert_eq!(RunMode::DryRun.as_str(), "dry_run");
@@ -314,6 +331,26 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn scoped_capture_records_output_span_fields() -> Result<(), DeltaFunnelError> {
+        let events = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: events.clone(),
+        });
+        let target_table = MssqlTargetTable::new("dbo", "orders")?;
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = output_span("orders_output", &target_table, LoadMode::AppendExisting);
+            let _guard = span.enter();
+            output_started("orders_output", &target_table, LoadMode::AppendExisting);
+        });
+
+        let spans = events.spans();
+        assert_eq!(spans.len(), 1);
+        assert_output_span(&spans[0]);
+        Ok(())
+    }
+
     fn assert_workflow_event(
         event: &CapturedEvent,
         telemetry_event: &str,
@@ -357,6 +394,28 @@ mod tests {
         );
         assert_eq!(
             event.fields.get("load_mode").map(String::as_str),
+            Some("append_existing")
+        );
+    }
+
+    fn assert_output_span(span: &CapturedSpan) {
+        assert_eq!(span.target, TRACING_TARGET);
+        assert_eq!(span.name, OUTPUT_SPAN);
+        assert_eq!(span.level, Level::INFO);
+        assert_eq!(
+            span.fields.get("output_name").map(String::as_str),
+            Some("orders_output")
+        );
+        assert_eq!(
+            span.fields.get("target_schema").map(String::as_str),
+            Some("dbo")
+        );
+        assert_eq!(
+            span.fields.get("target_table").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            span.fields.get("load_mode").map(String::as_str),
             Some("append_existing")
         );
     }
