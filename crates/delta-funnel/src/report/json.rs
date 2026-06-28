@@ -1,15 +1,15 @@
 use serde_json::{Value, json};
 
 use crate::{
-    DeltaProviderReaderBackend, DeltaSourceReport, FileCount, LazyTableKind, LoadMode,
-    MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
-    MssqlDryRunWorkflowReport, MssqlOutputFieldReport, MssqlOutputWriteStatus,
-    MssqlTargetCleanupStatus, MssqlTargetTable, MssqlWorkflowWriteReport, MssqlWriteFailureReport,
-    MssqlWriteReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport, MssqlWriteStats,
-    OutputStatus, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount, RunMode,
-    ValidationStatus, WorkflowStatus, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
-    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheReport,
-    WriteAllNoCacheReason, WriteAllReport,
+    DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaSourceReport, FileCount,
+    LazyTableKind, LoadMode, MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport,
+    MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport, MssqlOutputBatchValidationReport,
+    MssqlOutputFieldReport, MssqlOutputWriteStatus, MssqlTargetCleanupStatus, MssqlTargetTable,
+    MssqlWorkflowWriteReport, MssqlWriteFailureReport, MssqlWriteReport, MssqlWriteSkippedReason,
+    MssqlWriteSkippedReport, MssqlWriteStats, OutputStatus, PhaseStatus, PhaseTimingReport,
+    ReportReasonCode, RowCount, RunMode, ValidationStatus, WorkflowStatus,
+    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
+    WriteAllCacheCandidateSkipReason, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
 };
 
 impl RowCount {
@@ -113,6 +113,7 @@ impl DeltaSourceReport {
             "usage_status": self.usage_status().as_str(),
             "used_by_output_names": self.used_by_output_names(),
             "provider_read_stats_available": self.provider_read_stats().is_some(),
+            "provider_read_stats": self.provider_read_stats().map(provider_read_stats_value),
             "provider_stats_reason": reason_value(self.provider_stats_reason()),
             "phase_timings": phase_timings_value(self.phase_timings()),
         })
@@ -277,6 +278,22 @@ impl MssqlWriteReport {
             "write_stats": self.stats().to_json_value(),
             "partial_write_possible": self.partial_write_possible(),
             "cleanup": cleanup_status(self.cleanup()),
+        })
+    }
+}
+
+impl MssqlOutputBatchValidationReport {
+    /// Returns the output batch validation report as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "output_name": self.output_name(),
+            "target_table": target_table_value(self.target_table()),
+            "load_mode": load_mode(self.load_mode()),
+            "connection_source": connection_source(self.connection_source()),
+            "connection": {
+                "display_label": self.connection().display_label(),
+            },
         })
     }
 }
@@ -566,6 +583,39 @@ fn batch_shaping_value(report: crate::MssqlBatchShapingReport) -> Value {
     })
 }
 
+fn provider_read_stats_value(stats: &DeltaProviderReadStatsSnapshot) -> Value {
+    json!({
+        "source_name": stats.source_name,
+        "snapshot_version": stats.snapshot_version,
+        "reader_backend": reader_backend(stats.reader_backend),
+        "scan_metadata_exhausted": stats.scan_metadata_exhausted,
+        "scan_partitions_planned": stats.scan_partitions_planned,
+        "files_planned": stats.files_planned,
+        "estimated_rows": stats.estimated_rows,
+        "estimated_bytes": stats.estimated_bytes,
+        "datafusion_output_batch_size": stats.datafusion_output_batch_size,
+        "scan_partitions_started": stats.scan_partitions_started,
+        "scan_partitions_completed": stats.scan_partitions_completed,
+        "files_started": stats.files_started,
+        "files_completed": stats.files_completed,
+        "dynamic_partition_files_pruned": stats.dynamic_partition_files_pruned,
+        "dynamic_partition_files_kept": stats.dynamic_partition_files_kept,
+        "dynamic_filters_received": stats.dynamic_filters_received,
+        "dynamic_filters_accepted": stats.dynamic_filters_accepted,
+        "dynamic_filters_unsupported": stats.dynamic_filters_unsupported,
+        "dynamic_filter_snapshots": stats.dynamic_filter_snapshots,
+        "dynamic_partition_files_not_pruned_missing_metadata": stats.dynamic_partition_files_not_pruned_missing_metadata,
+        "dynamic_partition_files_not_pruned_unsupported_expression": stats.dynamic_partition_files_not_pruned_unsupported_expression,
+        "batches_produced": stats.batches_produced,
+        "rows_produced": stats.rows_produced,
+        "deletion_vector_payloads_loaded": stats.deletion_vector_payloads_loaded,
+        "deletion_vectors_applied": stats.deletion_vectors_applied,
+        "deletion_vector_rows_deleted": stats.deletion_vector_rows_deleted,
+        "deletion_vector_failures": stats.deletion_vector_failures,
+        "deletion_vector_rejections": stats.deletion_vector_rejections,
+    })
+}
+
 fn skipped_reason_value(reason: &MssqlWriteSkippedReason) -> Value {
     match reason {
         MssqlWriteSkippedReason::PreviousOutputFailed { failed_output_name } => json!({
@@ -636,8 +686,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        DeltaFunnelSession, DeltaSourceConfig, MssqlConnectionConfig, MssqlOutputTarget,
-        MssqlTargetConfig, MssqlTargetOutputPlan, OutputWritePlan, SessionOptions,
+        DeltaFunnelSession, DeltaProtocolReport, DeltaProviderScanExecutionOptions,
+        DeltaProviderSchedulingReport, DeltaSourceConfig, MssqlConnectionConfig, MssqlOutputTarget,
+        MssqlTargetConfig, MssqlTargetOutputPlan, OutputWritePlan, QueryOptions, SessionOptions,
         plan_mssql_target_for_output,
     };
     use arrow_schema::{DataType, Field, Schema};
@@ -868,6 +919,24 @@ mod tests {
     }
 
     #[test]
+    fn batch_validation_report_json_exposes_safe_target_context() -> TestResult<()> {
+        let value =
+            MssqlOutputBatchValidationReport::from_output_plan(&output_plan()?).to_json_value();
+
+        assert_eq!(value["output_name"], "orders_output");
+        assert_eq!(
+            value["target_table"],
+            json!({"schema": "dbo", "table": "orders"})
+        );
+        assert_eq!(value["connection_source"], "context_default");
+        assert_eq!(value["connection"]["display_label"], "warehouse");
+        assert_json_safe(&value)?;
+        assert_no_secret_or_raw_sql_text(&value);
+
+        Ok(())
+    }
+
+    #[test]
     fn workflow_output_status_json_wraps_successful_write_report() -> TestResult<()> {
         let output_plan = output_plan()?;
         let report = MssqlWriteReport::from_output_plan(
@@ -935,6 +1004,54 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn source_report_json_exposes_provider_read_stats_details() -> TestResult<()> {
+        let source = DeltaSourceReport::metadata_only(
+            "orders",
+            "file:///tmp/orders",
+            3,
+            DeltaProtocolReport {
+                source_name: "orders".to_owned(),
+                table_uri: "file:///tmp/orders".to_owned(),
+                snapshot_version: 3,
+                min_reader_version: 1,
+                min_writer_version: 2,
+                reader_features: vec!["deletionVectors".to_owned()],
+                writer_features: Vec::new(),
+            },
+            DeltaProviderSchedulingReport::from_options(
+                QueryOptions {
+                    target_partitions: Some(4),
+                    output_batch_size: Some(128),
+                },
+                DeltaProviderScanExecutionOptions::default(),
+            ),
+        )
+        .with_provider_read_stats(provider_read_stats_snapshot());
+
+        let value = source.to_json_value();
+
+        assert_eq!(
+            value["file_count"],
+            json!({"kind": "exact", "value": 5, "reason": null})
+        );
+        assert_eq!(value["provider_read_stats_available"], true);
+        assert_eq!(value["provider_stats_reason"], Value::Null);
+        assert_eq!(
+            value["provider_read_stats"]["reader_backend"],
+            "native_async"
+        );
+        assert_eq!(value["provider_read_stats"]["files_planned"], 5);
+        assert_eq!(value["provider_read_stats"]["rows_produced"], 10);
+        assert_eq!(
+            value["provider_read_stats"]["dynamic_partition_files_pruned"],
+            2
+        );
+        assert_json_safe(&value)?;
+
+        Ok(())
+    }
+
     fn session_with_default_connection() -> Result<DeltaFunnelSession, crate::DeltaFunnelError> {
         let connection = MssqlConnectionConfig::new(
             "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
@@ -964,6 +1081,39 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("region", DataType::Utf8, true),
         ])
+    }
+
+    fn provider_read_stats_snapshot() -> DeltaProviderReadStatsSnapshot {
+        DeltaProviderReadStatsSnapshot {
+            source_name: "orders".to_owned(),
+            snapshot_version: 3,
+            reader_backend: DeltaProviderReaderBackend::NativeAsync,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 4,
+            files_planned: 5,
+            estimated_rows: Some(99),
+            estimated_bytes: Some(2048),
+            datafusion_output_batch_size: Some(128),
+            scan_partitions_started: 4,
+            scan_partitions_completed: 4,
+            files_started: 5,
+            files_completed: 5,
+            dynamic_partition_files_pruned: 2,
+            dynamic_partition_files_kept: 3,
+            dynamic_filters_received: 1,
+            dynamic_filters_accepted: 1,
+            dynamic_filters_unsupported: 0,
+            dynamic_filter_snapshots: 1,
+            dynamic_partition_files_not_pruned_missing_metadata: 0,
+            dynamic_partition_files_not_pruned_unsupported_expression: 0,
+            batches_produced: 2,
+            rows_produced: 10,
+            deletion_vector_payloads_loaded: 1,
+            deletion_vectors_applied: 1,
+            deletion_vector_rows_deleted: 2,
+            deletion_vector_failures: 0,
+            deletion_vector_rejections: 0,
+        }
     }
 
     fn metadata_json() -> String {
