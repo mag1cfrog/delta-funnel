@@ -692,7 +692,7 @@ mod tests {
         MssqlNanosecondPolicy, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTimezonePolicy,
         MssqlUInt64Policy, QueryOptions, TargetValidationMode,
     };
-    use pyo3::exceptions::PyAssertionError;
+    use pyo3::exceptions::{PyAssertionError, PyTypeError};
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule};
     use std::{
@@ -838,6 +838,38 @@ mod tests {
     }
 
     #[test]
+    fn delta_lake_registers_multiple_distinct_sources() -> PyResult<()> {
+        Python::attach(|py| {
+            let orders = DeltaLogFixture::new("orders")?;
+            let customers = DeltaLogFixture::new("customers")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+
+            session
+                .bind(py)
+                .call_method("delta_lake", (orders.uri(),), Some(&kwargs))?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (customers.uri(),), None)?
+                .call_method("alias", ("customers",), None)?;
+
+            let session = session.bind(py).borrow();
+            let source_names = session
+                .inner
+                .source_reports()
+                .into_iter()
+                .map(|report| report.source_name().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                source_names,
+                vec!["orders".to_owned(), "customers".to_owned()]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn delta_lake_preserves_duplicate_alias_error() -> PyResult<()> {
         Python::attach(|py| {
             let table = DeltaLogFixture::new("orders")?;
@@ -868,6 +900,40 @@ mod tests {
                 error.value(py).getattr("kind")?.extract::<String>()?,
                 "duplicate_source_name"
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn delta_lake_rejects_invalid_alias_and_missing_uri() -> PyResult<()> {
+        Python::attach(|py| {
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "select")?;
+
+            let error =
+                match session
+                    .bind(py)
+                    .call_method("delta_lake", ("somewhere",), Some(&kwargs))
+                {
+                    Ok(_) => return Err(PyAssertionError::new_err("expected invalid alias error")),
+                    Err(error) => error,
+                };
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "source_config"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_source_name"
+            );
+
+            let error = match session.bind(py).call_method("delta_lake", (), None) {
+                Ok(_) => return Err(PyAssertionError::new_err("expected missing uri error")),
+                Err(error) => error,
+            };
+            assert!(error.value(py).is_instance_of::<PyTypeError>());
+            assert!(session.bind(py).borrow().inner.source_reports().is_empty());
             Ok(())
         })
     }
@@ -939,6 +1005,43 @@ mod tests {
                 error.value(py).getattr("kind")?.extract::<String>()?,
                 "invalid_storage_options"
             );
+            assert!(session.bind(py).borrow().inner.source_reports().is_empty());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn delta_lake_repr_and_source_config_errors_do_not_expose_source_secrets() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("orders")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let storage_options = PyDict::new(py);
+            storage_options.set_item("authorization", "super-secret-token")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("storage_options", storage_options)?;
+
+            let pending = session.bind(py).call_method(
+                "delta_lake",
+                (table.uri_with_secret_parts(),),
+                Some(&kwargs),
+            )?;
+            let pending_repr = pending.repr()?.extract::<String>()?;
+            assert!(!pending_repr.contains("super-secret"));
+            assert!(!pending_repr.contains("debug-secret"));
+
+            kwargs.set_item("name", "select")?;
+            let error = match session.bind(py).call_method(
+                "delta_lake",
+                (table.uri_with_secret_parts(),),
+                Some(&kwargs),
+            ) {
+                Ok(_) => return Err(PyAssertionError::new_err("expected invalid alias error")),
+                Err(error) => error,
+            };
+            let message = error.value(py).getattr("message")?.extract::<String>()?;
+            assert!(!message.contains("super-secret"));
+            assert!(!message.contains("debug-secret"));
             assert!(session.bind(py).borrow().inner.source_reports().is_empty());
 
             Ok(())
@@ -1654,6 +1757,13 @@ mod tests {
 
         fn uri(&self) -> String {
             self.path.to_string_lossy().to_string()
+        }
+
+        fn uri_with_secret_parts(&self) -> String {
+            format!(
+                "{}?token=super-secret-token#debug-secret",
+                self.path.to_string_lossy()
+            )
         }
     }
 
