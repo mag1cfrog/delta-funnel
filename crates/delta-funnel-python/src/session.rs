@@ -1,8 +1,9 @@
 //! Python session wrapper.
 
 use pyo3::prelude::*;
+use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
 
-use crate::exception::delta_funnel_error_to_py;
+use crate::exception::{delta_funnel_error_to_py, delta_funnel_py_error};
 
 #[pyclass(name = "Session", module = "deltafunnel")]
 pub(crate) struct PySession {
@@ -13,12 +14,13 @@ pub(crate) struct PySession {
 #[pymethods]
 impl PySession {
     #[new]
-    #[pyo3(signature = (*, default_mssql_connection_string=None, target_partitions=None, output_batch_size=None))]
+    #[pyo3(signature = (*, default_mssql_connection_string=None, target_partitions=None, output_batch_size=None, validation_options=None))]
     fn new(
         py: Python<'_>,
         default_mssql_connection_string: Option<String>,
         target_partitions: Option<usize>,
         output_batch_size: Option<usize>,
+        validation_options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let mut options = delta_funnel::SessionOptions::default();
         if let Some(connection_string) = default_mssql_connection_string {
@@ -30,6 +32,8 @@ impl PySession {
             target_partitions,
             output_batch_size,
         });
+        options =
+            options.with_validation_options(parse_validation_options(py, validation_options)?);
 
         let inner = delta_funnel::DeltaFunnelSession::new(options)
             .map_err(|error| rust_error_to_py(py, error))?;
@@ -53,10 +57,118 @@ fn rust_error_to_py(py: Python<'_>, error: delta_funnel::DeltaFunnelError) -> Py
     }
 }
 
+fn parse_validation_options(
+    py: Python<'_>,
+    validation_options: Option<&Bound<'_, PyDict>>,
+) -> PyResult<delta_funnel::ValidationOptions> {
+    let mut options = delta_funnel::ValidationOptions::default();
+    let Some(validation_options) = validation_options else {
+        return Ok(options);
+    };
+
+    for (key, value) in validation_options.iter() {
+        let key = key.extract::<String>().map_err(|_| {
+            config_py_error(
+                py,
+                "invalid_option_name",
+                "option names must be strings".to_owned(),
+            )
+        })?;
+        match key.as_str() {
+            "target_validation_mode" => {
+                options = options.with_target_validation_mode(parse_target_validation_mode(
+                    py,
+                    &value,
+                    key.as_str(),
+                )?);
+            }
+            "dry_run_scan_summary_mode" => {
+                options = options.with_dry_run_scan_summary_mode(parse_dry_run_scan_summary_mode(
+                    py,
+                    &value,
+                    key.as_str(),
+                )?);
+            }
+            "require_successful_planning" => {
+                let value = value.extract::<bool>().map_err(|_| {
+                    config_py_error(
+                        py,
+                        "invalid_option_value",
+                        "`require_successful_planning` must be a bool".to_owned(),
+                    )
+                })?;
+                options = options.with_require_successful_planning(value);
+            }
+            _ => {
+                return Err(config_py_error(
+                    py,
+                    "unknown_option",
+                    format!("unknown validation option `{key}`"),
+                ));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
+fn parse_target_validation_mode(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::TargetValidationMode> {
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "disabled" => Ok(delta_funnel::TargetValidationMode::Disabled),
+        "validate_if_possible" => Ok(delta_funnel::TargetValidationMode::ValidateIfPossible),
+        "require" => Ok(delta_funnel::TargetValidationMode::Require),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn parse_dry_run_scan_summary_mode(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::DryRunScanSummaryMode> {
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "metadata_only" => Ok(delta_funnel::DryRunScanSummaryMode::MetadataOnly),
+        "exhaust_scan_metadata" => Ok(delta_funnel::DryRunScanSummaryMode::ExhaustScanMetadata),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn option_string(py: Python<'_>, value: &Bound<'_, PyAny>, option_name: &str) -> PyResult<String> {
+    value.extract::<String>().map_err(|_| {
+        config_py_error(
+            py,
+            "invalid_option_value",
+            format!("`{option_name}` must be a string"),
+        )
+    })
+}
+
+fn config_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr {
+    match delta_funnel_py_error(py, "config", kind, message, None) {
+        Ok(error) => error,
+        Err(error) => error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::PySession;
     use crate::deltafunnel;
+    use delta_funnel::{DryRunScanSummaryMode, QueryOptions, TargetValidationMode};
     use pyo3::exceptions::PyAssertionError;
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule};
@@ -80,7 +192,7 @@ mod tests {
     #[test]
     fn default_session_constructs_with_safe_repr() -> PyResult<()> {
         Python::attach(|py| {
-            let session = Py::new(py, PySession::new(py, None, None, None)?)?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None)?)?;
             let repr = session.bind(py).repr()?.extract::<String>()?;
 
             assert_eq!(repr, "deltafunnel.Session()");
@@ -106,6 +218,7 @@ mod tests {
                     ),
                     None,
                     None,
+                    None,
                 )?,
             )?;
             let repr = session.bind(py).repr()?.extract::<String>()?;
@@ -123,10 +236,15 @@ mod tests {
     #[test]
     fn session_accepts_query_options() -> PyResult<()> {
         Python::attach(|py| {
-            let session = Py::new(py, PySession::new(py, None, Some(3), Some(17))?)?;
-            let repr = session.bind(py).repr()?.extract::<String>()?;
+            let session = PySession::new(py, None, Some(3), Some(17), None)?;
 
-            assert_eq!(repr, "deltafunnel.Session()");
+            assert_eq!(
+                session.inner.options().query_options(),
+                QueryOptions {
+                    target_partitions: Some(3),
+                    output_batch_size: Some(17),
+                }
+            );
 
             Ok(())
         })
@@ -141,10 +259,13 @@ mod tests {
             ];
 
             for (target_partitions, output_batch_size, option_name) in cases {
-                let error = match PySession::new(py, None, target_partitions, output_batch_size) {
-                    Ok(_) => return Err(PyAssertionError::new_err("expected zero value error")),
-                    Err(error) => error,
-                };
+                let error =
+                    match PySession::new(py, None, target_partitions, output_batch_size, None) {
+                        Ok(_) => {
+                            return Err(PyAssertionError::new_err("expected zero value error"));
+                        }
+                        Err(error) => error,
+                    };
 
                 assert_eq!(
                     error.value(py).getattr("phase")?.extract::<String>()?,
@@ -164,6 +285,103 @@ mod tests {
     }
 
     #[test]
+    fn session_accepts_validation_options() -> PyResult<()> {
+        Python::attach(|py| {
+            let target_validation_modes = [
+                ("disabled", TargetValidationMode::Disabled),
+                (
+                    "validate_if_possible",
+                    TargetValidationMode::ValidateIfPossible,
+                ),
+                ("require", TargetValidationMode::Require),
+            ];
+            for (value, expected) in target_validation_modes {
+                let validation_options = PyDict::new(py);
+                validation_options.set_item("target_validation_mode", value)?;
+
+                let session = PySession::new(py, None, None, None, Some(&validation_options))?;
+
+                assert_eq!(
+                    session
+                        .inner
+                        .options()
+                        .validation_options()
+                        .target_validation_mode(),
+                    expected
+                );
+            }
+
+            let dry_run_scan_summary_modes = [
+                ("metadata_only", DryRunScanSummaryMode::MetadataOnly),
+                (
+                    "exhaust_scan_metadata",
+                    DryRunScanSummaryMode::ExhaustScanMetadata,
+                ),
+            ];
+            for (value, expected) in dry_run_scan_summary_modes {
+                let validation_options = PyDict::new(py);
+                validation_options.set_item("dry_run_scan_summary_mode", value)?;
+
+                let session = PySession::new(py, None, None, None, Some(&validation_options))?;
+
+                assert_eq!(
+                    session
+                        .inner
+                        .options()
+                        .validation_options()
+                        .dry_run_scan_summary_mode(),
+                    expected
+                );
+            }
+
+            let validation_options = PyDict::new(py);
+            validation_options.set_item("require_successful_planning", false)?;
+            let session = PySession::new(py, None, None, None, Some(&validation_options))?;
+
+            assert!(
+                !session
+                    .inner
+                    .options()
+                    .validation_options()
+                    .require_successful_planning()
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn session_rejects_bad_validation_options_with_config_phase() -> PyResult<()> {
+        Python::attach(|py| {
+            let cases = [
+                ("unknown_option", "value"),
+                ("target_validation_mode", "sometimes"),
+                ("dry_run_scan_summary_mode", "full"),
+            ];
+
+            for (key, value) in cases {
+                let validation_options = PyDict::new(py);
+                validation_options.set_item(key, value)?;
+                let error = match PySession::new(py, None, None, None, Some(&validation_options)) {
+                    Ok(_) => {
+                        return Err(PyAssertionError::new_err(
+                            "expected validation option error",
+                        ));
+                    }
+                    Err(error) => error,
+                };
+
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "config"
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn session_constructor_accepts_connection_keyword() -> PyResult<()> {
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
@@ -175,6 +393,9 @@ mod tests {
             )?;
             kwargs.set_item("target_partitions", 3)?;
             kwargs.set_item("output_batch_size", 17)?;
+            let validation_options = PyDict::new(py);
+            validation_options.set_item("target_validation_mode", "disabled")?;
+            kwargs.set_item("validation_options", validation_options)?;
 
             let session = module.getattr("Session")?.call((), Some(&kwargs))?;
             let repr = session.repr()?.extract::<String>()?;
