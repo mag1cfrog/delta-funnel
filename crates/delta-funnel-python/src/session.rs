@@ -9,6 +9,7 @@ use crate::table::PyTable;
 #[pyclass(name = "Session", module = "deltafunnel")]
 pub(crate) struct PySession {
     inner: delta_funnel::DeltaFunnelSession,
+    runtime: delta_funnel::DeltaFunnelRuntime,
 }
 
 #[pymethods]
@@ -46,8 +47,10 @@ impl PySession {
 
         let inner = delta_funnel::DeltaFunnelSession::new(options)
             .map_err(|error| rust_error_to_py(py, error))?;
+        let runtime =
+            delta_funnel::DeltaFunnelRuntime::new().map_err(|error| rust_error_to_py(py, error))?;
 
-        Ok(Self { inner })
+        Ok(Self { inner, runtime })
     }
 
     fn __repr__(&self) -> String {
@@ -74,6 +77,14 @@ impl PySession {
         };
 
         Py::new(py, source).map(Py::into_any)
+    }
+
+    /// Builds a lazy SQL-derived table without executing rows.
+    fn table_from_sql(&mut self, py: Python<'_>, sql: String) -> PyResult<PyTable> {
+        self.runtime
+            .table_from_sql(&mut self.inner, sql.as_str())
+            .map(PyTable::from_inner)
+            .map_err(|error| rust_error_to_py(py, error))
     }
 }
 
@@ -1044,6 +1055,57 @@ mod tests {
             assert!(!message.contains("debug-secret"));
             assert!(session.bind(py).borrow().inner.source_reports().is_empty());
 
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_from_sql_returns_lazy_table_over_registered_source() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("orders")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+
+            let derived =
+                session
+                    .bind(py)
+                    .call_method("table_from_sql", ("select id from orders",), None)?;
+
+            assert_eq!(
+                derived.repr()?.extract::<String>()?,
+                "deltafunnel.Table(name=\"table_1\")"
+            );
+            assert!(!derived.repr()?.extract::<String>()?.contains("select id"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_from_sql_rejects_empty_sql() -> PyResult<()> {
+        Python::attach(|py| {
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+
+            let error = match session
+                .bind(py)
+                .call_method("table_from_sql", ("   ",), None)
+            {
+                Ok(_) => return Err(PyAssertionError::new_err("expected empty SQL error")),
+                Err(error) => error,
+            };
+
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "sql_table"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "sql_table"
+            );
+            assert!(!error.value(py).str()?.to_string().contains("select"));
             Ok(())
         })
     }
