@@ -15,6 +15,7 @@ use super::{
     MssqlOutputCacheDecision, MssqlOutputCachePlan, WriteAllCacheMode, WriteAllOptions,
     cache_report, workflow::MssqlWorkflowPublicOutputWriter,
 };
+use tracing::Instrument;
 
 const OUTPUT_PLANNING_PHASE: &str = "output_planning";
 const CACHE_PLANNING_PHASE: &str = "cache_planning";
@@ -62,12 +63,16 @@ impl DeltaFunnelSession {
         W: MssqlWorkflowOutputWriter,
     {
         let output_count = requests.len();
-        observability::workflow_started(RunMode::Execute, output_count);
-        let result = self
-            .write_all_with_options_and_writer_without_tracing(requests, options, writer)
-            .await;
-        observability::workflow_finished(RunMode::Execute, output_count, &result);
-        result
+        async move {
+            observability::workflow_started(RunMode::Execute, output_count);
+            let result = self
+                .write_all_with_options_and_writer_without_tracing(requests, options, writer)
+                .await;
+            observability::workflow_finished(RunMode::Execute, output_count, &result);
+            result
+        }
+        .instrument(observability::workflow_span(RunMode::Execute, output_count))
+        .await
     }
 
     async fn write_all_with_options_and_writer_without_tracing<W>(

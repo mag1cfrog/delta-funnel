@@ -10,7 +10,17 @@ const OUTPUT_SKIPPED_EVENT: &str = "output.skipped";
 const OUTPUT_STARTED_EVENT: &str = "output.started";
 const WORKFLOW_COMPLETED_EVENT: &str = "workflow.completed";
 const WORKFLOW_FAILED_EVENT: &str = "workflow.failed";
+const WORKFLOW_SPAN: &str = "delta_funnel.workflow";
 const WORKFLOW_STARTED_EVENT: &str = "workflow.started";
+
+pub(crate) fn workflow_span(run_mode: RunMode, output_count: usize) -> tracing::Span {
+    tracing::info_span!(
+        target: TRACING_TARGET,
+        WORKFLOW_SPAN,
+        run_mode = run_mode.as_str(),
+        output_count
+    )
+}
 
 pub(crate) fn workflow_started(run_mode: RunMode, output_count: usize) {
     tracing::info!(
@@ -145,6 +155,7 @@ mod tests {
     use tracing::{
         Event, Level, Subscriber,
         field::{Field, Visit},
+        span::{Attributes, Id},
     };
     use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*};
 
@@ -183,6 +194,7 @@ mod tests {
         assert_eq!(TRACING_TARGET, "delta_funnel");
         assert_eq!(WORKFLOW_COMPLETED_EVENT, "workflow.completed");
         assert_eq!(WORKFLOW_FAILED_EVENT, "workflow.failed");
+        assert_eq!(WORKFLOW_SPAN, "delta_funnel.workflow");
         assert_eq!(WORKFLOW_STARTED_EVENT, "workflow.started");
         assert_eq!(OUTPUT_COMPLETED_EVENT, "output.completed");
         assert_eq!(OUTPUT_FAILED_EVENT, "output.failed");
@@ -229,6 +241,34 @@ mod tests {
         assert_eq!(
             events[2].fields.get("error_summary").map(String::as_str),
             Some("configuration error: missing option")
+        );
+    }
+
+    #[test]
+    fn scoped_capture_records_workflow_span_fields() {
+        let events = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: events.clone(),
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = workflow_span(RunMode::Execute, 2);
+            let _guard = span.enter();
+            workflow_started(RunMode::Execute, 2);
+        });
+
+        let spans = events.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].target, TRACING_TARGET);
+        assert_eq!(spans[0].name, WORKFLOW_SPAN);
+        assert_eq!(spans[0].level, Level::INFO);
+        assert_eq!(
+            spans[0].fields.get("run_mode").map(String::as_str),
+            Some("execute")
+        );
+        assert_eq!(
+            spans[0].fields.get("output_count").map(String::as_str),
+            Some("2")
         );
     }
 
@@ -328,15 +368,31 @@ mod tests {
         fields: BTreeMap<String, String>,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CapturedSpan {
+        target: &'static str,
+        name: &'static str,
+        level: Level,
+        fields: BTreeMap<String, String>,
+    }
+
     #[derive(Clone, Default)]
     struct CapturedEvents {
         events: Arc<Mutex<Vec<CapturedEvent>>>,
+        spans: Arc<Mutex<Vec<CapturedSpan>>>,
     }
 
     impl CapturedEvents {
         fn events(&self) -> Vec<CapturedEvent> {
             match self.events.lock() {
                 Ok(events) => events.clone(),
+                Err(_) => Vec::new(),
+            }
+        }
+
+        fn spans(&self) -> Vec<CapturedSpan> {
+            match self.spans.lock() {
+                Ok(spans) => spans.clone(),
                 Err(_) => Vec::new(),
             }
         }
@@ -350,6 +406,21 @@ mod tests {
     where
         S: Subscriber,
     {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            attrs.record(&mut visitor);
+            let captured = CapturedSpan {
+                target: attrs.metadata().target(),
+                name: attrs.metadata().name(),
+                level: *attrs.metadata().level(),
+                fields: visitor.fields,
+            };
+
+            if let Ok(mut spans) = self.events.spans.lock() {
+                spans.push(captured);
+            }
+        }
+
         fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
             let mut visitor = FieldVisitor::default();
             event.record(&mut visitor);

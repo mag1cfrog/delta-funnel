@@ -10,6 +10,7 @@ use super::{
     DeltaFunnelSession, LazyTable, LazyTableKind, OutputWritePlan, PlannedMssqlOutput, RunMode,
     SourceUsageStatus, sql_server_workflows::ensure_unique_write_all_output_names,
 };
+use tracing::Instrument;
 
 pub(super) fn stable_sql_identity_hash(sql: &str) -> String {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -74,6 +75,8 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
         let output_count = requests.len();
+        let span = observability::workflow_span(RunMode::DryRun, output_count);
+        let _guard = span.enter();
         observability::workflow_started(RunMode::DryRun, output_count);
         let result = self.dry_run_all_to_mssql_without_tracing(requests);
         observability::workflow_finished(RunMode::DryRun, output_count, &result);
@@ -120,12 +123,16 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
         let output_count = requests.len();
-        observability::workflow_started(RunMode::DryRun, output_count);
-        let result = self
-            .dry_run_all_to_mssql_with_scan_summary_without_tracing(requests)
-            .await;
-        observability::workflow_finished(RunMode::DryRun, output_count, &result);
-        result
+        async move {
+            observability::workflow_started(RunMode::DryRun, output_count);
+            let result = self
+                .dry_run_all_to_mssql_with_scan_summary_without_tracing(requests)
+                .await;
+            observability::workflow_finished(RunMode::DryRun, output_count, &result);
+            result
+        }
+        .instrument(observability::workflow_span(RunMode::DryRun, output_count))
+        .await
     }
 
     async fn dry_run_all_to_mssql_with_scan_summary_without_tracing(
