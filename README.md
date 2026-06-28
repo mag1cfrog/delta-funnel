@@ -23,5 +23,9 @@ The Delta DataFusion scan partition target policy is documented in
 The dynamic partition pruning investigation is documented in
 [`docs/dynamic-partition-pruning-investigation.md`](docs/dynamic-partition-pruning-investigation.md).
 
+Failure-report collection, validation limits, and safe tracing setup are
+documented in
+[`docs/failure-reports-and-tracing.md`](docs/failure-reports-and-tracing.md).
+
 The scan partition target benchmark runner and its synthetic mode are documented in
 [`docs/scan-partition-benchmark.md`](docs/scan-partition-benchmark.md).

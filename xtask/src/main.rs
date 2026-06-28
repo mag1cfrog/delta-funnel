@@ -267,7 +267,7 @@ impl fmt::Display for XtaskError {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::{ffi::OsString, fs, path::PathBuf};
 
     use super::{SqlServerTestOptions, connection_string_with_database};
 
@@ -312,5 +312,64 @@ mod tests {
             connection_string_with_database("server=tcp:127.0.0.1,1433;database=df_it", "other");
 
         assert_eq!(connection, "server=tcp:127.0.0.1,1433;database=df_it");
+    }
+
+    #[test]
+    fn failure_report_docs_are_linked_and_match_stable_terms() -> Result<(), std::io::Error> {
+        let readme = read_repo_file("README.md")?;
+        let docs = read_repo_file("docs/failure-reports-and-tracing.md")?;
+
+        assert!(readme.contains("[`docs/failure-reports-and-tracing.md`]"));
+        assert!(repo_file("docs/failure-reports-and-tracing.md").is_file());
+
+        for term in [
+            "delta_funnel",
+            "arrow_tiberius",
+            "tiberius_raw_bulk::protocol",
+            "TargetValidationMode",
+            "disabled",
+            "validate_if_possible",
+            "require",
+            "required_but_failed",
+        ] {
+            assert!(docs.contains(term), "missing doc term `{term}`");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn failure_report_docs_do_not_include_secret_like_examples() -> Result<(), std::io::Error> {
+        let docs = read_repo_file("docs/failure-reports-and-tracing.md")?;
+
+        for forbidden in [
+            "password=",
+            "secret-token",
+            "example-password",
+            "server=tcp",
+            "user:password",
+            "?token=",
+            "access_key=",
+            "secret_key=",
+            "AKIA",
+            "BEGIN PRIVATE",
+        ] {
+            assert!(
+                !docs.contains(forbidden),
+                "doc contains forbidden secret-like pattern `{forbidden}`"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn read_repo_file(path: &str) -> Result<String, std::io::Error> {
+        fs::read_to_string(repo_file(path))
+    }
+
+    fn repo_file(path: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(path)
     }
 }
