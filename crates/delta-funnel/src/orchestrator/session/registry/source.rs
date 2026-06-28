@@ -4,8 +4,9 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, DeltaSourceConfig, DeltaTableProviderConfig,
-    PhaseTimingReport, RegisteredDeltaSource, load_delta_source, preflight_delta_protocol,
-    register_delta_sources_with_scan_execution_options, report::PhaseTimer,
+    PhaseTimingReport, RegisteredDeltaSource, register_delta_sources_with_scan_execution_options,
+    report::PhaseTimer,
+    table_formats::{load_delta_source_with_tracing, preflight_delta_protocol_with_tracing},
 };
 
 use super::super::{DeltaFunnelSession, LazyTable};
@@ -116,7 +117,7 @@ impl DeltaFunnelSession {
         let mut phase_timings = Vec::new();
 
         let source_timer = PhaseTimer::start(SOURCE_LOADING_PHASE);
-        let planned = match load_delta_source(source) {
+        let planned = match load_delta_source_with_tracing(source) {
             Ok(planned) => {
                 phase_timings.push(source_timer.completed());
                 planned
@@ -128,7 +129,7 @@ impl DeltaFunnelSession {
         };
 
         let preflight_timer = PhaseTimer::start(PROTOCOL_PREFLIGHT_PHASE);
-        let preflight = match preflight_delta_protocol(&planned) {
+        let preflight = match preflight_delta_protocol_with_tracing(&planned) {
             Ok(preflight) => {
                 phase_timings.push(preflight_timer.completed());
                 preflight

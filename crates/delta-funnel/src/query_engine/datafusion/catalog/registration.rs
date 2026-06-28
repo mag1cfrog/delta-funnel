@@ -8,7 +8,7 @@ use datafusion::prelude::SessionContext;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
-    error::DataFusionRegistrationSnafu, support::sanitize_uri_for_display,
+    error::DataFusionRegistrationSnafu, observability, support::sanitize_uri_for_display,
     table_formats::validate_table_source_names,
 };
 
@@ -175,6 +175,26 @@ fn register_delta_provider(
     Ok(registered)
 }
 
+fn register_delta_provider_with_tracing(
+    ctx: &SessionContext,
+    provider: DeltaTableProvider,
+) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
+    let source_name = provider.source_name().to_owned();
+    let snapshot_version = provider.snapshot_version();
+    observability::datafusion_registration_started(&source_name, snapshot_version);
+
+    let result = register_delta_provider(ctx, provider);
+    match &result {
+        Ok(registered) => {
+            observability::datafusion_registration_completed(&registered.name, snapshot_version);
+        }
+        Err(error) => {
+            observability::datafusion_registration_failed(&source_name, snapshot_version, error);
+        }
+    }
+    result
+}
+
 fn register_delta_providers(
     ctx: &SessionContext,
     providers: Vec<DeltaTableProvider>,
@@ -183,7 +203,7 @@ fn register_delta_providers(
     let mut registered_names = Vec::with_capacity(providers.len());
 
     for provider in providers {
-        let registered = match register_delta_provider(ctx, provider) {
+        let registered = match register_delta_provider_with_tracing(ctx, provider) {
             Ok(registered) => registered,
             Err(error) => {
                 rollback_registered_delta_sources(ctx, &registered_names);

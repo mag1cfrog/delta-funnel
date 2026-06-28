@@ -11,10 +11,11 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::Stream;
+use tracing::Instrument;
 
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationOptions,
-    ValidationStatus, report::PhaseTimer, support::sanitize_text_for_display,
+    ValidationStatus, observability, report::PhaseTimer, support::sanitize_text_for_display,
 };
 
 use super::{
@@ -711,83 +712,160 @@ where
     let mut failed_output_name = None::<String>;
 
     for job in jobs {
-        let target = job.target_summary();
-        let planned_phase_timings = job.phase_timings().to_vec();
-
         if let Some(failed_output_name) = failed_output_name.as_ref() {
-            statuses.push(MssqlOutputWriteStatus::Skipped(
-                MssqlWriteSkippedReport::previous_output_failed(
-                    target,
-                    failed_output_name.clone(),
-                    planned_phase_timings,
-                ),
+            statuses.push(skipped_output_status_with_tracing(
+                job.target_summary(),
+                failed_output_name.clone(),
+                job.phase_timings().to_vec(),
             ));
             continue;
         }
 
-        let (
+        let status = write_mssql_output_job_with_tracing(job, &mut writer).await;
+        if let MssqlOutputWriteStatus::Failed(failure) = &status {
+            failed_output_name = Some(failure.output_name().to_owned());
+        }
+        statuses.push(status);
+    }
+
+    Ok(MssqlWorkflowWriteReport::new(statuses))
+}
+
+fn skipped_output_status_with_tracing(
+    target: MssqlTargetSummary,
+    failed_output_name: String,
+    planned_phase_timings: Vec<PhaseTimingReport>,
+) -> MssqlOutputWriteStatus {
+    let output_span =
+        observability::output_span(target.output_name(), target.table(), target.load_mode());
+    output_span.in_scope(|| {
+        let skipped = skipped_output_status(target, failed_output_name, planned_phase_timings);
+        observability::output_skipped(
+            skipped.output_name(),
+            skipped.target().table(),
+            skipped.target().load_mode(),
+            "prior_failure",
+        );
+        MssqlOutputWriteStatus::Skipped(skipped)
+    })
+}
+
+fn skipped_output_status(
+    target: MssqlTargetSummary,
+    failed_output_name: String,
+    planned_phase_timings: Vec<PhaseTimingReport>,
+) -> MssqlWriteSkippedReport {
+    MssqlWriteSkippedReport::previous_output_failed(
+        target,
+        failed_output_name,
+        planned_phase_timings,
+    )
+}
+
+async fn write_mssql_output_job_with_tracing<W>(
+    job: MssqlOutputWriteJob,
+    writer: &mut W,
+) -> MssqlOutputWriteStatus
+where
+    W: MssqlWorkflowOutputWriter,
+{
+    let target = job.target_summary();
+    let output_span =
+        observability::output_span(target.output_name(), target.table(), target.load_mode());
+
+    async move {
+        observability::output_started(target.output_name(), target.table(), target.load_mode());
+        let status = write_mssql_output_job(job, writer).await;
+        match &status {
+            MssqlOutputWriteStatus::Succeeded(report) => {
+                observability::output_completed(
+                    report.output_name(),
+                    report.target_table(),
+                    report.load_mode(),
+                );
+            }
+            MssqlOutputWriteStatus::Failed(failure) => {
+                observability::output_failed(
+                    failure.output_name(),
+                    failure.target().table(),
+                    failure.target().load_mode(),
+                    failure.error(),
+                );
+            }
+            MssqlOutputWriteStatus::Skipped(_) => {}
+        }
+        status
+    }
+    .instrument(output_span)
+    .await
+}
+
+async fn write_mssql_output_job<W>(
+    job: MssqlOutputWriteJob,
+    writer: &mut W,
+) -> MssqlOutputWriteStatus
+where
+    W: MssqlWorkflowOutputWriter,
+{
+    let target = job.target_summary();
+    let (
+        output_schema,
+        resolved_target,
+        schema_options,
+        batches,
+        write_options,
+        validation_options,
+        planned_phase_timings,
+    ) = job.into_parts();
+    let stream_setup_timer = PhaseTimer::start(OUTPUT_STREAM_SETUP_PHASE);
+    let (batches, stream_setup_timing) = match batches().await {
+        Ok(batches) => (batches, stream_setup_timer.completed()),
+        Err(error) => {
+            let failure = MssqlWriteFailureReport::from_error(
+                target,
+                error,
+                stream_setup_failure_phase_timings(
+                    planned_phase_timings,
+                    stream_setup_timer.failed(),
+                ),
+            );
+            return MssqlOutputWriteStatus::Failed(failure);
+        }
+    };
+
+    let write_timer = PhaseTimer::start(SQL_WRITE_PHASE);
+    match writer
+        .write_output(
             output_schema,
             resolved_target,
             schema_options,
             batches,
             write_options,
             validation_options,
-            planned_phase_timings,
-        ) = job.into_parts();
-        let stream_setup_timer = PhaseTimer::start(OUTPUT_STREAM_SETUP_PHASE);
-        let (batches, stream_setup_timing) = match batches().await {
-            Ok(batches) => (batches, stream_setup_timer.completed()),
-            Err(error) => {
-                let failure = MssqlWriteFailureReport::from_error(
-                    target,
-                    error,
-                    stream_setup_failure_phase_timings(
-                        planned_phase_timings,
-                        stream_setup_timer.failed(),
-                    ),
-                );
-                failed_output_name = Some(failure.output_name().to_owned());
-                statuses.push(MssqlOutputWriteStatus::Failed(failure));
-                continue;
-            }
-        };
-
-        let write_timer = PhaseTimer::start(SQL_WRITE_PHASE);
-        match writer
-            .write_output(
-                output_schema,
-                resolved_target,
-                schema_options,
-                batches,
-                write_options,
-                validation_options,
-            )
-            .await
-        {
-            Ok(report) => statuses.push(MssqlOutputWriteStatus::Succeeded(
-                report.with_phase_timings(output_write_phase_timings(
+        )
+        .await
+    {
+        Ok(report) => {
+            let report = report.with_phase_timings(output_write_phase_timings(
+                planned_phase_timings,
+                stream_setup_timing,
+                write_timer.completed(),
+            ));
+            MssqlOutputWriteStatus::Succeeded(report)
+        }
+        Err(error) => {
+            let failure = MssqlWriteFailureReport::from_error(
+                target,
+                error,
+                output_write_failure_phase_timings(
                     planned_phase_timings,
                     stream_setup_timing,
-                    write_timer.completed(),
-                )),
-            )),
-            Err(error) => {
-                let failure = MssqlWriteFailureReport::from_error(
-                    target,
-                    error,
-                    output_write_failure_phase_timings(
-                        planned_phase_timings,
-                        stream_setup_timing,
-                        write_timer.failed(),
-                    ),
-                );
-                failed_output_name = Some(failure.output_name().to_owned());
-                statuses.push(MssqlOutputWriteStatus::Failed(failure));
-            }
+                    write_timer.failed(),
+                ),
+            );
+            MssqlOutputWriteStatus::Failed(failure)
         }
     }
-
-    Ok(MssqlWorkflowWriteReport::new(statuses))
 }
 
 fn ensure_sequential_options(options: MssqlWorkflowWriteOptions) -> Result<(), DeltaFunnelError> {

@@ -1,5 +1,5 @@
 use crate::{
-    DeltaFunnelError, PhaseTimingReport, ReportReasonCode,
+    DeltaFunnelError, PhaseTimingReport, ReportReasonCode, observability,
     report::PhaseTimer,
     report::sql_server::{
         MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport,
@@ -10,6 +10,7 @@ use super::{
     DeltaFunnelSession, LazyTable, LazyTableKind, OutputWritePlan, PlannedMssqlOutput, RunMode,
     SourceUsageStatus, sql_server_workflows::ensure_unique_write_all_output_names,
 };
+use tracing::Instrument;
 
 pub(super) fn stable_sql_identity_hash(sql: &str) -> String {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -77,6 +78,24 @@ impl DeltaFunnelSession {
             .with_phase_timings(vec![planning_timing, source_timing]))
     }
 
+    /// Runs [`Self::dry_run_all_to_mssql`] inside a DeltaFunnel workflow tracing span.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as [`Self::dry_run_all_to_mssql`].
+    pub fn dry_run_all_to_mssql_with_tracing(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        let output_count = requests.len();
+        let span = observability::workflow_span(RunMode::DryRun, output_count);
+        let _guard = span.enter();
+        observability::workflow_started(RunMode::DryRun, output_count);
+        let result = self.dry_run_all_to_mssql(requests);
+        observability::workflow_finished(RunMode::DryRun, output_count, &result);
+        result
+    }
+
     /// Dry-runs multiple selected lazy tables and honors source scan-summary options.
     ///
     /// This method is async because
@@ -118,6 +137,26 @@ impl DeltaFunnelSession {
             .with_phase_timings(vec![planning_timing, source_timing]))
     }
 
+    /// Runs [`Self::dry_run_all_to_mssql_with_scan_summary`] inside a workflow tracing span.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as [`Self::dry_run_all_to_mssql_with_scan_summary`].
+    pub async fn dry_run_all_to_mssql_with_scan_summary_with_tracing(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        let output_count = requests.len();
+        async move {
+            observability::workflow_started(RunMode::DryRun, output_count);
+            let result = self.dry_run_all_to_mssql_with_scan_summary(requests).await;
+            observability::workflow_finished(RunMode::DryRun, output_count, &result);
+            result
+        }
+        .instrument(observability::workflow_span(RunMode::DryRun, output_count))
+        .await
+    }
+
     fn plan_dry_run_all_outputs(
         &self,
         requests: &[OutputWritePlan],
@@ -135,6 +174,41 @@ impl DeltaFunnelSession {
     }
 
     fn plan_dry_run_output(
+        &self,
+        request: &OutputWritePlan,
+    ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
+        let target = request.target();
+        let target_config = target.target();
+        let output_span = observability::output_span(
+            target.output_name(),
+            target_config.table(),
+            target_config.load_mode(),
+        );
+        let _guard = output_span.enter();
+        observability::output_started(
+            target.output_name(),
+            target_config.table(),
+            target_config.load_mode(),
+        );
+        let result = self.plan_dry_run_output_report(request);
+        match &result {
+            Ok(_) => observability::output_completed(
+                target.output_name(),
+                target_config.table(),
+                target_config.load_mode(),
+            ),
+            Err(error) => observability::output_failed(
+                target.output_name(),
+                target_config.table(),
+                target_config.load_mode(),
+                &error.to_string(),
+            ),
+        }
+
+        result
+    }
+
+    fn plan_dry_run_output_report(
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {

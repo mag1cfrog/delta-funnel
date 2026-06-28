@@ -11,6 +11,7 @@ use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, TargetValidationMode,
     ValidationOptions, ValidationStatus,
     error::MssqlWritePhaseSnafu,
+    observability,
     report::{
         PhaseTimer,
         sql_server::{MssqlBatchShapingReport, MssqlWriteReportMetrics},
@@ -367,10 +368,13 @@ where
     C: MssqlOneOutputSinkConnection,
 {
     match validation_options.target_validation_mode() {
-        TargetValidationMode::Disabled => Ok(report.with_target_validation(
-            RowCount::unavailable(),
-            ValidationStatus::disabled(),
-            PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::ValidationDisabled),
+        TargetValidationMode::Disabled => Ok(finish_validation_report(
+            output_plan,
+            report.with_target_validation(
+                RowCount::unavailable(),
+                ValidationStatus::disabled(),
+                PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::ValidationDisabled),
+            ),
         )),
         TargetValidationMode::ValidateIfPossible | TargetValidationMode::Require => {
             let validation_required =
@@ -401,6 +405,7 @@ where
                 return unsupported_target_validation(output_plan, report, validation_required);
             }
 
+            observability::validation_started(output_plan.target_table(), output_plan.load_mode());
             let validation_timer = PhaseTimer::start(VALIDATION_PHASE);
             let target_rows = match connection
                 .target_row_count(output_plan, prepared_target)
@@ -420,10 +425,13 @@ where
             let target_row_count = RowCount::exact(target_rows);
 
             if target_rows == output_rows {
-                return Ok(report.with_target_validation(
-                    target_row_count,
-                    ValidationStatus::passed(),
-                    validation_timer.completed(),
+                return Ok(finish_validation_report(
+                    output_plan,
+                    report.with_target_validation(
+                        target_row_count,
+                        ValidationStatus::passed(),
+                        validation_timer.completed(),
+                    ),
                 ));
             }
 
@@ -540,6 +548,7 @@ where
         }
     };
 
+    observability::validation_started(output_plan.target_table(), output_plan.load_mode());
     let validation_timer = PhaseTimer::start(VALIDATION_PHASE);
     let target_rows_after = match connection
         .target_row_count(output_plan, prepared_target)
@@ -562,11 +571,14 @@ where
     let target_row_count_after_write = RowCount::exact(target_rows_after);
 
     if target_delta == Some(output_rows) {
-        return Ok(report.with_target_delta_validation(
-            target_row_count_before_write,
-            target_row_count_after_write,
-            ValidationStatus::passed(),
-            validation_timer.completed(),
+        return Ok(finish_validation_report(
+            output_plan,
+            report.with_target_delta_validation(
+                target_row_count_before_write,
+                target_row_count_after_write,
+                ValidationStatus::passed(),
+                validation_timer.completed(),
+            ),
         ));
     }
 
@@ -600,10 +612,13 @@ fn unsupported_target_validation(
             "target row-count validation is not implemented for this load mode",
         ))
     } else {
-        Ok(report.with_target_validation(
-            RowCount::unavailable(),
-            ValidationStatus::unavailable(ReportReasonCode::UnsupportedLoadMode),
-            PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
+        Ok(finish_validation_report(
+            output_plan,
+            report.with_target_validation(
+                RowCount::unavailable(),
+                ValidationStatus::unavailable(ReportReasonCode::UnsupportedLoadMode),
+                PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::UnsupportedLoadMode),
+            ),
         ))
     }
 }
@@ -630,7 +645,7 @@ fn validation_unavailable_or_required_failure(
         return Err(validation_error(output_plan, &report, message));
     }
 
-    Ok(report)
+    Ok(finish_validation_report(output_plan, report))
 }
 
 fn target_delta_validation_unavailable_or_required_failure(
@@ -657,7 +672,7 @@ fn target_delta_validation_unavailable_or_required_failure(
         return Err(validation_error(output_plan, &report, message));
     }
 
-    Ok(report)
+    Ok(finish_validation_report(output_plan, report))
 }
 
 fn pre_write_required_validation_error(
@@ -695,6 +710,12 @@ fn validation_error(
     report: &MssqlWriteReport,
     message: &str,
 ) -> DeltaFunnelError {
+    observability::validation_finished(
+        output_plan.target_table(),
+        output_plan.load_mode(),
+        report.validation_status(),
+    );
+
     MssqlWritePhaseSnafu {
         context: Box::new(MssqlWriteFailureContext::from_output_plan_with_metrics(
             output_plan,
@@ -704,6 +725,18 @@ fn validation_error(
         message: message.to_owned(),
     }
     .build()
+}
+
+fn finish_validation_report(
+    output_plan: &MssqlTargetOutputPlan,
+    report: MssqlWriteReport,
+) -> MssqlWriteReport {
+    observability::validation_finished(
+        output_plan.target_table(),
+        output_plan.load_mode(),
+        report.validation_status(),
+    );
+    report
 }
 
 fn report_metrics_from_report(report: &MssqlWriteReport) -> MssqlWriteReportMetrics {
