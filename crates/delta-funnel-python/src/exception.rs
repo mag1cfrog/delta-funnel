@@ -317,6 +317,52 @@ mod tests {
     }
 
     #[test]
+    fn converted_dry_run_report_does_not_expose_retained_sql_or_row_literals() -> PyResult<()> {
+        Python::attach(|py| {
+            let runtime =
+                delta_funnel::DeltaFunnelRuntime::new().map_err(|error| py_error(py, error))?;
+            let connection = delta_funnel::MssqlConnectionConfig::new(
+                "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+            )
+            .map_err(|error| py_error(py, error))?
+            .with_display_label("warehouse-primary");
+            let mut session = delta_funnel::DeltaFunnelSession::new(
+                delta_funnel::SessionOptions::new().with_default_mssql_connection(connection),
+            )
+            .map_err(|error| py_error(py, error))?;
+            let table = runtime
+                .table_from_sql(&mut session, "select 'raw-row-secret' as marker, 1 as id")
+                .map_err(|error| py_error(py, error))?;
+            let target = delta_funnel::MssqlTargetConfig::new(
+                delta_funnel::MssqlTargetTable::new("dbo", "orders")
+                    .map_err(|error| py_error(py, error))?,
+            )
+            .with_load_mode(delta_funnel::LoadMode::AppendExisting);
+            let request = delta_funnel::OutputWritePlan::new(
+                table,
+                delta_funnel::MssqlOutputTarget::new(
+                    "orders_output",
+                    target,
+                    delta_funnel::RunMode::DryRun,
+                ),
+            );
+            let report = runtime
+                .dry_run_to_mssql(&session, &request)
+                .map_err(|error| py_error(py, error))?;
+
+            let object = json_value_to_py(py, &report.to_json_value())?;
+            let report_text = object.bind(py).repr()?.extract::<String>()?;
+            assert!(!report_text.contains("select"));
+            assert!(!report_text.contains("raw-row-secret"));
+            assert!(!report_text.contains("server=tcp"));
+            assert!(!report_text.contains("password"));
+            assert!(!report_text.contains("secret-token"));
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn rust_error_mapping_exposes_stable_attributes() -> PyResult<()> {
         Python::attach(|py| {
             let error = delta_funnel_error_to_py(
@@ -341,6 +387,47 @@ mod tests {
                 error.value(py).to_string()
             );
             assert!(error.value(py).getattr("context")?.is_none());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn rust_error_mapping_does_not_expose_dependency_diagnostics() -> PyResult<()> {
+        Python::attach(|py| {
+            let connection = delta_funnel::MssqlConnectionConfig::new(
+                "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+            )
+            .map_err(|error| py_error(py, error))?;
+            let target_config = delta_funnel::MssqlTargetConfig::new(
+                delta_funnel::MssqlTargetTable::new("dbo", "orders")
+                    .map_err(|error| py_error(py, error))?,
+            );
+            let schema = Schema::new(vec![Field::new(
+                "dependency_debug_field",
+                DataType::new_list(DataType::Int64, true),
+                true,
+            )]);
+            let error = match delta_funnel::plan_mssql_target_for_output(
+                schema,
+                "orders_output",
+                &target_config,
+                Some(&connection),
+                delta_funnel::MssqlSchemaPlanOptions::default(),
+            ) {
+                Ok(_) => {
+                    return Err(pyo3::exceptions::PyAssertionError::new_err(
+                        "expected schema planning error",
+                    ));
+                }
+                Err(error) => delta_funnel_error_to_py(py, error)?,
+            };
+
+            let message = error.value(py).getattr("message")?.extract::<String>()?;
+            assert!(message.contains("returned 1 diagnostic(s)"));
+            assert!(!message.contains("dependency_debug_field"));
+            assert!(!message.contains("nested"));
+            assert!(!message.contains("Diagnostic"));
 
             Ok(())
         })
