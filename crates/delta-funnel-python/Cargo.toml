@@ -20,6 +20,7 @@ default = []
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
+delta-funnel = { path = "../delta-funnel" }
 pyo3 = "0.29"
 serde_json = "1"
 
