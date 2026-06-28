@@ -6,7 +6,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlTargetOutputPlan, MssqlWriteOptions,
     MssqlWriteReport, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, ValidationOptions,
-    plan_mssql_target_for_resolved_output, report::PhaseTimer,
+    observability, plan_mssql_target_for_resolved_output, report::PhaseTimer,
     write_output_batches_to_mssql_with_validation_options,
 };
 
@@ -52,6 +52,13 @@ impl DeltaFunnelSession {
         };
 
         let target_timer = PhaseTimer::start(SQL_TARGET_PLANNING_PHASE);
+        let output_name = request.target().output_name();
+        let target_config = request.target().target();
+        observability::sql_target_planning_started(
+            output_name,
+            target_config.table(),
+            target_config.load_mode(),
+        );
         let resolved_target =
             match request
                 .target()
@@ -63,6 +70,12 @@ impl DeltaFunnelSession {
                 Ok(resolved_target) => resolved_target,
                 Err(error) => {
                     phase_timings.push(target_timer.failed());
+                    observability::sql_target_planning_failed(
+                        output_name,
+                        target_config.table(),
+                        target_config.load_mode(),
+                        &error,
+                    );
                     return Err(error);
                 }
             };
@@ -73,10 +86,21 @@ impl DeltaFunnelSession {
         ) {
             Ok(output_plan) => {
                 phase_timings.push(target_timer.completed());
+                observability::sql_target_planning_completed(
+                    output_plan.output_name(),
+                    output_plan.target_table(),
+                    output_plan.load_mode(),
+                );
                 output_plan
             }
             Err(error) => {
                 phase_timings.push(target_timer.failed());
+                observability::sql_target_planning_failed(
+                    output_name,
+                    target_config.table(),
+                    target_config.load_mode(),
+                    &error,
+                );
                 return Err(error);
             }
         };
