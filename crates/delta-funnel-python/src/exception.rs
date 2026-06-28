@@ -39,6 +39,17 @@ pub(crate) fn delta_funnel_py_error(
     Ok(error)
 }
 
+pub(crate) fn python_conversion_py_error(
+    py: Python<'_>,
+    kind: &'static str,
+    message: String,
+) -> PyErr {
+    match delta_funnel_py_error(py, "python_conversion", kind, message, None) {
+        Ok(error) => error,
+        Err(error) => error,
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn delta_funnel_error_to_py(
     py: Python<'_>,
