@@ -1134,6 +1134,50 @@ mod tests {
     }
 
     #[test]
+    fn table_alias_preserves_alias_validation_errors() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("orders")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+
+            let derived =
+                session
+                    .bind(py)
+                    .call_method("table_from_sql", ("select id from orders",), None)?;
+            let invalid = match derived.call_method("alias", ("select",), None) {
+                Ok(_) => return Err(PyAssertionError::new_err("expected invalid alias error")),
+                Err(error) => error,
+            };
+            assert_eq!(
+                invalid.value(py).getattr("phase")?.extract::<String>()?,
+                "source_config"
+            );
+            assert_eq!(
+                invalid.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_source_name"
+            );
+
+            let duplicate = match derived.call_method("alias", ("orders",), None) {
+                Ok(_) => return Err(PyAssertionError::new_err("expected duplicate alias error")),
+                Err(error) => error,
+            };
+            assert_eq!(
+                duplicate.value(py).getattr("phase")?.extract::<String>()?,
+                "source_config"
+            );
+            assert_eq!(
+                duplicate.value(py).getattr("kind")?.extract::<String>()?,
+                "duplicate_source_name"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn table_from_sql_rejects_empty_sql() -> PyResult<()> {
         Python::attach(|py| {
             let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
