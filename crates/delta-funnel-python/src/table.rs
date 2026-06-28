@@ -2,19 +2,31 @@
 
 use pyo3::prelude::*;
 
+use crate::session::PySession;
+
 #[pyclass(name = "Table", module = "deltafunnel")]
 pub(crate) struct PyTable {
+    session: Py<PySession>,
     pub(crate) inner: delta_funnel::LazyTable,
 }
 
 impl PyTable {
-    pub(crate) const fn from_inner(inner: delta_funnel::LazyTable) -> Self {
-        Self { inner }
+    pub(crate) const fn from_inner(session: Py<PySession>, inner: delta_funnel::LazyTable) -> Self {
+        Self { session, inner }
     }
 }
 
 #[pymethods]
 impl PyTable {
+    /// Registers this pending SQL-derived table under `name` and returns a `Table`.
+    fn alias(&self, py: Python<'_>, name: String) -> PyResult<Self> {
+        let table = self
+            .session
+            .borrow_mut(py)
+            .register_table_alias(py, name, &self.inner)?;
+        Ok(Self::from_inner(self.session.clone_ref(py), table))
+    }
+
     fn __repr__(&self) -> String {
         format!("deltafunnel.Table(name={:?})", self.inner.name())
     }

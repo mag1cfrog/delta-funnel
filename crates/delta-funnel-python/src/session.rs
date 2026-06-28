@@ -9,6 +9,7 @@ use crate::table::PyTable;
 #[pyclass(name = "Session", module = "deltafunnel")]
 pub(crate) struct PySession {
     inner: delta_funnel::DeltaFunnelSession,
+    runtime: delta_funnel::DeltaFunnelRuntime,
 }
 
 #[pymethods]
@@ -46,8 +47,10 @@ impl PySession {
 
         let inner = delta_funnel::DeltaFunnelSession::new(options)
             .map_err(|error| rust_error_to_py(py, error))?;
+        let runtime =
+            delta_funnel::DeltaFunnelRuntime::new().map_err(|error| rust_error_to_py(py, error))?;
 
-        Ok(Self { inner })
+        Ok(Self { inner, runtime })
     }
 
     fn __repr__(&self) -> String {
@@ -75,6 +78,18 @@ impl PySession {
 
         Py::new(py, source).map(Py::into_any)
     }
+
+    /// Builds a lazy SQL-derived table without executing rows.
+    fn table_from_sql(slf: Py<Self>, py: Python<'_>, sql: String) -> PyResult<PyTable> {
+        let table = {
+            let mut session = slf.borrow_mut(py);
+            let PySession { inner, runtime } = &mut *session;
+            runtime
+                .table_from_sql(inner, sql.as_str())
+                .map_err(|error| rust_error_to_py(py, error))?
+        };
+        Ok(PyTable::from_inner(slf, table))
+    }
 }
 
 impl PySession {
@@ -85,12 +100,22 @@ impl PySession {
         source_uri: String,
         version: Option<u64>,
         storage_options: delta_funnel::DeltaStorageOptions,
-    ) -> PyResult<PyTable> {
+    ) -> PyResult<delta_funnel::LazyTable> {
         let source = delta_source_config(name, source_uri, version, storage_options);
 
         self.inner
             .delta_lake(source)
-            .map(PyTable::from_inner)
+            .map_err(|error| rust_error_to_py(py, error))
+    }
+
+    pub(crate) fn register_table_alias(
+        &mut self,
+        py: Python<'_>,
+        name: String,
+        table: &delta_funnel::LazyTable,
+    ) -> PyResult<delta_funnel::LazyTable> {
+        self.inner
+            .register_alias(name, table)
             .map_err(|error| rust_error_to_py(py, error))
     }
 }
@@ -125,13 +150,14 @@ impl PendingDeltaSource {
     }
 
     fn register_alias(&self, py: Python<'_>, name: String) -> PyResult<PyTable> {
-        self.session.borrow_mut(py).register_delta_source(
+        let table = self.session.borrow_mut(py).register_delta_source(
             py,
             name,
             self.source_uri.clone(),
             self.version,
             self.storage_options.clone(),
-        )
+        )?;
+        Ok(PyTable::from_inner(self.session.clone_ref(py), table))
     }
 }
 
@@ -1043,6 +1069,178 @@ mod tests {
             assert!(!message.contains("super-secret"));
             assert!(!message.contains("debug-secret"));
             assert!(session.bind(py).borrow().inner.source_reports().is_empty());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_from_sql_returns_lazy_table_over_registered_source() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("orders")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+
+            let derived =
+                session
+                    .bind(py)
+                    .call_method("table_from_sql", ("select id from orders",), None)?;
+
+            assert_eq!(
+                derived.repr()?.extract::<String>()?,
+                "deltafunnel.Table(name=\"table_1\")"
+            );
+            assert!(!derived.repr()?.extract::<String>()?.contains("select id"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_alias_registers_derived_table_for_later_sql() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("orders")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+
+            let derived =
+                session
+                    .bind(py)
+                    .call_method("table_from_sql", ("select id from orders",), None)?;
+            let aliased = derived.call_method("alias", ("recent_orders",), None)?;
+            let downstream = session.bind(py).call_method(
+                "table_from_sql",
+                ("select id from recent_orders",),
+                None,
+            )?;
+
+            assert_eq!(
+                aliased.repr()?.extract::<String>()?,
+                "deltafunnel.Table(name=\"recent_orders\")"
+            );
+            assert_eq!(
+                downstream.repr()?.extract::<String>()?,
+                "deltafunnel.Table(name=\"table_2\")"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_alias_preserves_alias_validation_errors() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("orders")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+
+            let derived =
+                session
+                    .bind(py)
+                    .call_method("table_from_sql", ("select id from orders",), None)?;
+            let invalid = match derived.call_method("alias", ("select",), None) {
+                Ok(_) => return Err(PyAssertionError::new_err("expected invalid alias error")),
+                Err(error) => error,
+            };
+            assert_eq!(
+                invalid.value(py).getattr("phase")?.extract::<String>()?,
+                "source_config"
+            );
+            assert_eq!(
+                invalid.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_source_name"
+            );
+
+            let duplicate = match derived.call_method("alias", ("orders",), None) {
+                Ok(_) => return Err(PyAssertionError::new_err("expected duplicate alias error")),
+                Err(error) => error,
+            };
+            assert_eq!(
+                duplicate.value(py).getattr("phase")?.extract::<String>()?,
+                "source_config"
+            );
+            assert_eq!(
+                duplicate.value(py).getattr("kind")?.extract::<String>()?,
+                "duplicate_source_name"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_from_sql_rejects_empty_sql() -> PyResult<()> {
+        Python::attach(|py| {
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+
+            let error = match session
+                .bind(py)
+                .call_method("table_from_sql", ("   ",), None)
+            {
+                Ok(_) => return Err(PyAssertionError::new_err("expected empty SQL error")),
+                Err(error) => error,
+            };
+
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "sql_table"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "sql_table"
+            );
+            assert!(!error.value(py).str()?.to_string().contains("select"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_from_sql_rejects_invalid_sql_without_exposing_raw_sql() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("orders")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+
+            for sql in [
+                "select id from orders; select id from orders",
+                "create table raw_sql_secret as select id from orders",
+                "insert into orders select id from orders",
+                "select raw_sql_secret from missing_orders",
+            ] {
+                let error = match session.bind(py).call_method("table_from_sql", (sql,), None) {
+                    Ok(_) => return Err(PyAssertionError::new_err("expected SQL error")),
+                    Err(error) => error,
+                };
+
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "sql_table"
+                );
+                assert_eq!(
+                    error.value(py).getattr("kind")?.extract::<String>()?,
+                    "sql_table"
+                );
+                assert!(
+                    !error
+                        .value(py)
+                        .str()?
+                        .to_string()
+                        .contains("raw_sql_secret")
+                );
+            }
 
             Ok(())
         })
