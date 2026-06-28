@@ -4,7 +4,13 @@ use pyo3::prelude::*;
 
 #[pyclass(name = "Table", module = "deltafunnel")]
 pub(crate) struct PyTable {
-    inner: delta_funnel::LazyTable,
+    pub(crate) inner: delta_funnel::LazyTable,
+}
+
+impl PyTable {
+    pub(crate) const fn from_inner(inner: delta_funnel::LazyTable) -> Self {
+        Self { inner }
+    }
 }
 
 #[pymethods]
