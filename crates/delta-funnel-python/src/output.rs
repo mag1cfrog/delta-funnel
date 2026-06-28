@@ -314,6 +314,30 @@ mod tests {
     }
 
     #[test]
+    fn table_write_to_mssql_dry_run_rejects_missing_connection() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = sql_table(py)?;
+            let kwargs = mssql_kwargs(py, "dbo", "orders", "append_existing")?;
+            kwargs.set_item("dry_run", true)?;
+
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .unwrap_err();
+
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "mssql_target_config"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "missing_mssql_connection"
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn table_write_to_mssql_rejects_execute_mode_until_write_slice() -> PyResult<()> {
         Python::attach(|py| {
             let table = sql_table(py)?;

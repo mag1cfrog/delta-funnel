@@ -808,6 +808,23 @@ mod tests {
     }
 
     #[test]
+    fn module_does_not_expose_duplicate_dry_run_methods() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+
+            let session_type = module.getattr("Session")?;
+            let table_type = module.getattr("Table")?;
+
+            assert!(session_type.getattr("dry_run_all").is_err());
+            assert!(session_type.getattr("dry_run_all_to_mssql").is_err());
+            assert!(table_type.getattr("dry_run_to_mssql").is_err());
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn delta_lake_docstrings_describe_pending_alias_semantics() -> PyResult<()> {
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
@@ -1307,6 +1324,82 @@ mod tests {
     }
 
     #[test]
+    fn write_all_dry_run_report_includes_source_phase_and_validation_facts() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("orders")?;
+            let session = Py::new(
+                py,
+                PySession::new(
+                    py,
+                    Some("server=tcp:sql.example.com;password=secret-token".to_owned()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?,
+            )?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+            let derived =
+                session
+                    .bind(py)
+                    .call_method("table_from_sql", ("select id from orders",), None)?;
+            let spec =
+                derived.call_method("to_mssql", (), Some(&mssql_kwargs(py, "orders_sink")?))?;
+            let outputs = PyList::new(py, [&spec])?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("dry_run", true)?;
+
+            let report = session
+                .bind(py)
+                .call_method("write_all", (outputs,), Some(&kwargs))?;
+            let report = report.cast::<PyDict>()?;
+            let sources = required_item(report, "sources")?;
+            let sources = sources.cast::<PyList>()?;
+            let outputs = required_item(report, "outputs")?;
+            let outputs = outputs.cast::<PyList>()?;
+            let output = outputs.get_item(0)?;
+            let output = output.cast::<PyDict>()?;
+            let validation_status = required_item(output, "validation_status")?;
+            let validation_status = validation_status.cast::<PyDict>()?;
+            let phase_timings = required_item(output, "phase_timings")?;
+            let phase_timings = phase_timings.cast::<PyList>()?;
+            let target_table = required_item(output, "target_table")?;
+            let target_table = target_table.cast::<PyDict>()?;
+
+            assert_eq!(sources.len(), 1);
+            assert_eq!(
+                required_item(sources.get_item(0)?.cast::<PyDict>()?, "source_name")?
+                    .extract::<String>()?,
+                "orders"
+            );
+            assert_eq!(
+                required_item(output, "source_usage_status")?.extract::<String>()?,
+                "used"
+            );
+            assert_eq!(
+                required_item(target_table, "table")?.extract::<String>()?,
+                "orders_sink"
+            );
+            assert_eq!(
+                required_item(validation_status, "kind")?.extract::<String>()?,
+                "skipped"
+            );
+            assert_eq!(
+                required_item(validation_status, "reason")?.extract::<String>()?,
+                "dry_run"
+            );
+            assert!(!phase_timings.is_empty());
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn write_all_rejects_execute_mode_until_write_all_slice() -> PyResult<()> {
         Python::attach(|py| {
             let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
@@ -1330,6 +1423,37 @@ mod tests {
                 .call_method("write_all", (&outputs,), Some(&kwargs))
                 .unwrap_err();
             assert_execute_mode_error(py, &error)?;
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_dry_run_rejects_missing_connection() -> PyResult<()> {
+        Python::attach(|py| {
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let table =
+                session
+                    .bind(py)
+                    .call_method("table_from_sql", ("select 1 as id",), None)?;
+            let spec = table.call_method("to_mssql", (), Some(&mssql_kwargs(py, "orders")?))?;
+            let outputs = PyList::new(py, [&spec])?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("dry_run", true)?;
+
+            let error = session
+                .bind(py)
+                .call_method("write_all", (outputs,), Some(&kwargs))
+                .unwrap_err();
+
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "mssql_target_config"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "missing_mssql_connection"
+            );
 
             Ok(())
         })
