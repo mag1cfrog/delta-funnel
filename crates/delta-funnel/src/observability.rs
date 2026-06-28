@@ -15,9 +15,6 @@ const OUTPUT_STARTED_EVENT: &str = "output.started";
 const BATCH_SHAPING_COMPLETED_EVENT: &str = "batch_shaping.completed";
 const BATCH_SHAPING_FAILED_EVENT: &str = "batch_shaping.failed";
 const BATCH_SHAPING_STARTED_EVENT: &str = "batch_shaping.started";
-const SQL_TARGET_PLANNING_COMPLETED_EVENT: &str = "sql_target_planning.completed";
-const SQL_TARGET_PLANNING_FAILED_EVENT: &str = "sql_target_planning.failed";
-const SQL_TARGET_PLANNING_STARTED_EVENT: &str = "sql_target_planning.started";
 const DATAFUSION_REGISTRATION_COMPLETED_EVENT: &str = "datafusion_registration.completed";
 const DATAFUSION_REGISTRATION_FAILED_EVENT: &str = "datafusion_registration.failed";
 const DATAFUSION_REGISTRATION_STARTED_EVENT: &str = "datafusion_registration.started";
@@ -161,51 +158,6 @@ pub(crate) fn output_skipped(
         load_mode = load_mode_as_str(load_mode),
         skipped_reason,
         OUTPUT_SKIPPED_EVENT
-    );
-}
-
-pub(crate) fn sql_target_planning_started(
-    output_name: &str,
-    target_table: &MssqlTargetTable,
-    load_mode: LoadMode,
-) {
-    output_target_event(
-        SQL_TARGET_PLANNING_STARTED_EVENT,
-        output_name,
-        target_table,
-        load_mode,
-    );
-}
-
-pub(crate) fn sql_target_planning_completed(
-    output_name: &str,
-    target_table: &MssqlTargetTable,
-    load_mode: LoadMode,
-) {
-    output_target_event(
-        SQL_TARGET_PLANNING_COMPLETED_EVENT,
-        output_name,
-        target_table,
-        load_mode,
-    );
-}
-
-pub(crate) fn sql_target_planning_failed(
-    output_name: &str,
-    target_table: &MssqlTargetTable,
-    load_mode: LoadMode,
-    error: &DeltaFunnelError,
-) {
-    tracing::info!(
-        target: TRACING_TARGET,
-        telemetry_event = SQL_TARGET_PLANNING_FAILED_EVENT,
-        output_name,
-        target_schema = target_table.schema().unwrap_or(""),
-        target_table = target_table.table(),
-        load_mode = load_mode_as_str(load_mode),
-        error_category = "delta_funnel_error",
-        error_summary = %error,
-        SQL_TARGET_PLANNING_FAILED_EVENT
     );
 }
 
@@ -523,16 +475,6 @@ mod tests {
             LoadMode::AppendExisting,
             MssqlBatchShapingReport::completed(2, 5, 2, 5),
         );
-        sql_target_planning_started("orders_output", &target_table, LoadMode::AppendExisting);
-        sql_target_planning_completed("orders_output", &target_table, LoadMode::AppendExisting);
-        sql_target_planning_failed(
-            "orders_output",
-            &target_table,
-            LoadMode::AppendExisting,
-            &DeltaFunnelError::Config {
-                message: "bad target".to_owned(),
-            },
-        );
         source_loading_started("orders");
         source_loading_completed("orders", 7);
         protocol_preflight_started("orders", 7);
@@ -573,18 +515,6 @@ mod tests {
         assert_eq!(BATCH_SHAPING_COMPLETED_EVENT, "batch_shaping.completed");
         assert_eq!(BATCH_SHAPING_FAILED_EVENT, "batch_shaping.failed");
         assert_eq!(BATCH_SHAPING_STARTED_EVENT, "batch_shaping.started");
-        assert_eq!(
-            SQL_TARGET_PLANNING_COMPLETED_EVENT,
-            "sql_target_planning.completed"
-        );
-        assert_eq!(
-            SQL_TARGET_PLANNING_FAILED_EVENT,
-            "sql_target_planning.failed"
-        );
-        assert_eq!(
-            SQL_TARGET_PLANNING_STARTED_EVENT,
-            "sql_target_planning.started"
-        );
         assert_eq!(SOURCE_LOADING_COMPLETED_EVENT, "source_loading.completed");
         assert_eq!(SOURCE_LOADING_FAILED_EVENT, "source_loading.failed");
         assert_eq!(SOURCE_LOADING_STARTED_EVENT, "source_loading.started");
@@ -744,44 +674,6 @@ mod tests {
         let spans = events.spans();
         assert_eq!(spans.len(), 1);
         assert_output_span(&spans[0]);
-        Ok(())
-    }
-
-    #[test]
-    fn scoped_capture_records_sql_target_planning_event_fields() -> Result<(), DeltaFunnelError> {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
-        let target_table = MssqlTargetTable::new("dbo", "orders")?;
-
-        tracing::subscriber::with_default(subscriber, || {
-            sql_target_planning_started("orders_output", &target_table, LoadMode::AppendExisting);
-            sql_target_planning_completed("orders_output", &target_table, LoadMode::AppendExisting);
-            sql_target_planning_failed(
-                "orders_output",
-                &target_table,
-                LoadMode::AppendExisting,
-                &DeltaFunnelError::Config {
-                    message: "bad target".to_owned(),
-                },
-            );
-        });
-
-        let events = events.events();
-        assert_eq!(events.len(), 3);
-        assert_output_event(&events[0], SQL_TARGET_PLANNING_STARTED_EVENT);
-        assert_output_event(&events[1], SQL_TARGET_PLANNING_COMPLETED_EVENT);
-        assert_output_event(&events[2], SQL_TARGET_PLANNING_FAILED_EVENT);
-        assert_eq!(
-            events[2].fields.get("error_category").map(String::as_str),
-            Some("delta_funnel_error")
-        );
-        assert_eq!(
-            events[2].fields.get("error_summary").map(String::as_str),
-            Some("configuration error: bad target")
-        );
-
         Ok(())
     }
 
