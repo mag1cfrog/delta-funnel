@@ -439,7 +439,7 @@ mod tests {
         field::{Field, Visit},
         span::{Attributes, Id},
     };
-    use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*};
+    use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*, registry::LookupSpan};
 
     #[test]
     fn observability_event_helpers_do_not_require_subscriber() -> Result<(), DeltaFunnelError> {
@@ -683,6 +683,34 @@ mod tests {
         let spans = events.spans();
         assert_eq!(spans.len(), 1);
         assert_output_span(&spans[0]);
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_capture_records_nested_downstream_event_scope() -> Result<(), DeltaFunnelError> {
+        let events = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: events.clone(),
+        });
+        let target_table = MssqlTargetTable::new("dbo", "orders")?;
+
+        tracing::subscriber::with_default(subscriber, || {
+            let workflow_span = workflow_span(RunMode::Execute, 1);
+            let _workflow_guard = workflow_span.enter();
+            let output_span = output_span("orders_output", &target_table, LoadMode::CreateAndLoad);
+            let _output_guard = output_span.enter();
+
+            tracing::info!(
+                target: "arrow_tiberius",
+                telemetry_event = "batch_write.completed",
+                "batch_write.completed"
+            );
+        });
+
+        let events = events.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target, "arrow_tiberius");
+        assert_eq!(events[0].span_names, vec![WORKFLOW_SPAN, OUTPUT_SPAN]);
         Ok(())
     }
 
@@ -1004,6 +1032,7 @@ mod tests {
         target: &'static str,
         level: Level,
         fields: BTreeMap<String, String>,
+        span_names: Vec<&'static str>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1042,7 +1071,7 @@ mod tests {
 
     impl<S> Layer<S> for CaptureLayer
     where
-        S: Subscriber,
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
     {
         fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
             let mut visitor = FieldVisitor::default();
@@ -1059,13 +1088,23 @@ mod tests {
             }
         }
 
-        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
             let mut visitor = FieldVisitor::default();
             event.record(&mut visitor);
+            let span_names = ctx
+                .event_scope(event)
+                .map(|scope| {
+                    scope
+                        .from_root()
+                        .map(|span| span.metadata().name())
+                        .collect()
+                })
+                .unwrap_or_default();
             let captured = CapturedEvent {
                 target: event.metadata().target(),
                 level: *event.metadata().level(),
                 fields: visitor.fields,
+                span_names,
             };
 
             if let Ok(mut events) = self.events.events.lock() {
