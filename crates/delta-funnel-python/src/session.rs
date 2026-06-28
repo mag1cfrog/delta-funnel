@@ -54,23 +54,39 @@ impl PySession {
         "deltafunnel.Session()".to_owned()
     }
 
+    /// Registers a named Delta source, or returns a pending source that cannot be referenced by SQL.
+    ///
+    /// A pending source is not registered in the session SQL catalog and cannot
+    /// be referenced by SQL until `alias(name)` is called.
     #[pyo3(signature = (source_uri, *, version=None, storage_options=None, name=None))]
     fn delta_lake(
-        &mut self,
+        slf: Py<Self>,
         py: Python<'_>,
         source_uri: String,
         version: Option<&Bound<'_, PyAny>>,
         storage_options: Option<&Bound<'_, PyDict>>,
         name: Option<String>,
-    ) -> PyResult<PyTable> {
-        let Some(name) = name else {
-            return Err(source_config_py_error(
-                py,
-                "missing_source_name",
-                "`name` is required until alias support lands".to_owned(),
-            ));
+    ) -> PyResult<Py<PyAny>> {
+        let source =
+            PendingDeltaSource::new(py, slf.clone_ref(py), source_uri, version, storage_options)?;
+        if let Some(name) = name {
+            return Py::new(py, source.register_alias(py, name)?).map(Py::into_any);
         };
-        let source = delta_source_config(py, name, source_uri, version, storage_options)?;
+
+        Py::new(py, source).map(Py::into_any)
+    }
+}
+
+impl PySession {
+    fn register_delta_source(
+        &mut self,
+        py: Python<'_>,
+        name: String,
+        source_uri: String,
+        version: Option<u64>,
+        storage_options: delta_funnel::DeltaStorageOptions,
+    ) -> PyResult<PyTable> {
+        let source = delta_source_config(name, source_uri, version, storage_options);
 
         self.inner
             .delta_lake(source)
@@ -79,8 +95,61 @@ impl PySession {
     }
 }
 
+/// Unregistered Delta source returned by `Session.delta_lake(...)` without `name`.
+///
+/// Call `alias(name)` to register it and receive a `Table`. A pending source
+/// cannot be referenced by SQL.
+#[pyclass(name = "PendingDeltaSource", module = "deltafunnel")]
+struct PendingDeltaSource {
+    session: Py<PySession>,
+    source_uri: String,
+    version: Option<u64>,
+    storage_options: delta_funnel::DeltaStorageOptions,
+}
+
+impl PendingDeltaSource {
+    fn new(
+        py: Python<'_>,
+        session: Py<PySession>,
+        source_uri: String,
+        version: Option<&Bound<'_, PyAny>>,
+        storage_options: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        validate_source_uri(py, &source_uri)?;
+        Ok(Self {
+            session,
+            source_uri,
+            version: parse_delta_version(py, version)?,
+            storage_options: parse_storage_options(py, storage_options)?,
+        })
+    }
+
+    fn register_alias(&self, py: Python<'_>, name: String) -> PyResult<PyTable> {
+        self.session.borrow_mut(py).register_delta_source(
+            py,
+            name,
+            self.source_uri.clone(),
+            self.version,
+            self.storage_options.clone(),
+        )
+    }
+}
+
+#[pymethods]
+impl PendingDeltaSource {
+    /// Registers this pending Delta source under `name` and returns a `Table`.
+    fn alias(&self, py: Python<'_>, name: String) -> PyResult<PyTable> {
+        self.register_alias(py, name)
+    }
+
+    fn __repr__(&self) -> String {
+        "deltafunnel.PendingDeltaSource()".to_owned()
+    }
+}
+
 pub(crate) fn add_session(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PySession>()
+    module.add_class::<PySession>()?;
+    module.add_class::<PendingDeltaSource>()
 }
 
 fn rust_error_to_py(py: Python<'_>, error: delta_funnel::DeltaFunnelError) -> PyErr {
@@ -91,12 +160,17 @@ fn rust_error_to_py(py: Python<'_>, error: delta_funnel::DeltaFunnelError) -> Py
 }
 
 fn delta_source_config(
-    py: Python<'_>,
     name: String,
     source_uri: String,
-    version: Option<&Bound<'_, PyAny>>,
-    storage_options: Option<&Bound<'_, PyDict>>,
-) -> PyResult<delta_funnel::DeltaSourceConfig> {
+    version: Option<u64>,
+    storage_options: delta_funnel::DeltaStorageOptions,
+) -> delta_funnel::DeltaSourceConfig {
+    delta_funnel::DeltaSourceConfig::new(name, source_uri)
+        .with_version(version)
+        .with_storage_options(storage_options)
+}
+
+fn validate_source_uri(py: Python<'_>, source_uri: &str) -> PyResult<()> {
     if source_uri.is_empty() {
         return Err(source_config_py_error(
             py,
@@ -104,10 +178,7 @@ fn delta_source_config(
             "`source_uri` must not be empty".to_owned(),
         ));
     }
-
-    Ok(delta_funnel::DeltaSourceConfig::new(name, source_uri)
-        .with_version(parse_delta_version(py, version)?)
-        .with_storage_options(parse_storage_options(py, storage_options)?))
+    Ok(())
 }
 
 fn parse_delta_version(
@@ -647,6 +718,34 @@ mod tests {
     }
 
     #[test]
+    fn delta_lake_docstrings_describe_pending_alias_semantics() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+
+            let session_type = module.getattr("Session")?;
+            let delta_lake_doc = session_type
+                .getattr("delta_lake")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(delta_lake_doc.contains("pending source"));
+            assert!(delta_lake_doc.contains("cannot be referenced by SQL"));
+
+            let pending_type = module.getattr("PendingDeltaSource")?;
+            let pending_doc = pending_type.getattr("__doc__")?.extract::<String>()?;
+            assert!(pending_doc.contains("Unregistered Delta source"));
+
+            let alias_doc = pending_type
+                .getattr("alias")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(alias_doc.contains("returns a `Table`"));
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn default_session_constructs_with_safe_repr() -> PyResult<()> {
         Python::attach(|py| {
             let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
@@ -666,15 +765,53 @@ mod tests {
     fn delta_lake_registers_named_source_and_returns_table() -> PyResult<()> {
         Python::attach(|py| {
             let table = DeltaLogFixture::new("orders")?;
-            let mut session = PySession::new(py, None, None, None, None, None, None)?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
 
-            let lazy =
-                session.delta_lake(py, table.uri(), None, None, Some("orders".to_owned()))?;
+            let lazy = session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
 
-            assert_eq!(lazy.inner.name(), "orders");
-            assert_eq!(lazy.inner.kind(), delta_funnel::LazyTableKind::DeltaSource);
+            assert_eq!(
+                lazy.repr()?.extract::<String>()?,
+                "deltafunnel.Table(name=\"orders\")"
+            );
+            let session = session.bind(py).borrow();
             assert_eq!(session.inner.source_reports().len(), 1);
             assert_eq!(session.inner.source_reports()[0].source_name(), "orders");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn delta_lake_pending_source_alias_registers_source() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("orders")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("version", 0)?;
+
+            let pending =
+                session
+                    .bind(py)
+                    .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+
+            assert_eq!(
+                pending.repr()?.extract::<String>()?,
+                "deltafunnel.PendingDeltaSource()"
+            );
+            assert!(session.bind(py).borrow().inner.source_reports().is_empty());
+
+            let lazy = pending.call_method("alias", ("orders",), None)?;
+
+            assert_eq!(
+                lazy.repr()?.extract::<String>()?,
+                "deltafunnel.Table(name=\"orders\")"
+            );
+            let session = session.bind(py).borrow();
+            assert_eq!(session.inner.source_reports().len(), 1);
+            assert_eq!(session.inner.source_reports()[0].snapshot_version(), 0);
             Ok(())
         })
     }
@@ -683,18 +820,19 @@ mod tests {
     fn delta_lake_maps_fixed_version() -> PyResult<()> {
         Python::attach(|py| {
             let table = DeltaLogFixture::new("orders")?;
-            let mut session = PySession::new(py, None, None, None, None, None, None)?;
-            let version = 0i64.into_pyobject(py)?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            kwargs.set_item("version", 0)?;
 
-            session.delta_lake(
-                py,
-                table.uri(),
-                Some(version.as_any()),
-                None,
-                Some("orders".to_owned()),
-            )?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
 
-            assert_eq!(session.inner.source_reports()[0].snapshot_version(), 0);
+            assert_eq!(
+                session.bind(py).borrow().inner.source_reports()[0].snapshot_version(),
+                0
+            );
             Ok(())
         })
     }
@@ -703,11 +841,19 @@ mod tests {
     fn delta_lake_preserves_duplicate_alias_error() -> PyResult<()> {
         Python::attach(|py| {
             let table = DeltaLogFixture::new("orders")?;
-            let mut session = PySession::new(py, None, None, None, None, None, None)?;
-            session.delta_lake(py, table.uri(), None, None, Some("orders".to_owned()))?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+            kwargs.set_item("name", "ORDERS")?;
 
             let error =
-                match session.delta_lake(py, table.uri(), None, None, Some("ORDERS".to_owned())) {
+                match session
+                    .bind(py)
+                    .call_method("delta_lake", (table.uri(),), Some(&kwargs))
+                {
                     Ok(_) => {
                         return Err(PyAssertionError::new_err("expected duplicate alias error"));
                     }
@@ -729,7 +875,7 @@ mod tests {
     #[test]
     fn delta_lake_rejects_invalid_source_args_before_loading() -> PyResult<()> {
         Python::attach(|py| {
-            let mut session = PySession::new(py, None, None, None, None, None, None)?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
 
             let cases = vec![
                 ("", None, "invalid_source_uri"),
@@ -745,12 +891,15 @@ mod tests {
                 ),
             ];
             for (uri, version, expected_kind) in cases {
-                let error = match session.delta_lake(
-                    py,
-                    uri.to_owned(),
-                    version.as_ref().map(Bound::as_any),
-                    None,
-                    Some("orders".to_owned()),
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("name", "orders")?;
+                if let Some(version) = version {
+                    kwargs.set_item("version", version)?;
+                }
+                let error = match session.bind(py).call_method(
+                    "delta_lake",
+                    (uri.to_owned(),),
+                    Some(&kwargs),
                 ) {
                     Ok(_) => return Err(PyAssertionError::new_err("expected source arg error")),
                     Err(error) => error,
@@ -764,21 +913,24 @@ mod tests {
                     error.value(py).getattr("kind")?.extract::<String>()?,
                     expected_kind
                 );
-                assert!(session.inner.source_reports().is_empty());
+                assert!(session.bind(py).borrow().inner.source_reports().is_empty());
             }
 
             let storage_options = PyDict::new(py);
             storage_options.set_item("token", 7)?;
-            let error = match session.delta_lake(
-                py,
-                "somewhere".to_owned(),
-                None,
-                Some(&storage_options),
-                Some("orders".to_owned()),
-            ) {
-                Ok(_) => return Err(PyAssertionError::new_err("expected storage option error")),
-                Err(error) => error,
-            };
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            kwargs.set_item("storage_options", storage_options)?;
+            let error =
+                match session
+                    .bind(py)
+                    .call_method("delta_lake", ("somewhere",), Some(&kwargs))
+                {
+                    Ok(_) => {
+                        return Err(PyAssertionError::new_err("expected storage option error"));
+                    }
+                    Err(error) => error,
+                };
             assert_eq!(
                 error.value(py).getattr("phase")?.extract::<String>()?,
                 "source_config"
@@ -787,7 +939,7 @@ mod tests {
                 error.value(py).getattr("kind")?.extract::<String>()?,
                 "invalid_storage_options"
             );
-            assert!(session.inner.source_reports().is_empty());
+            assert!(session.bind(py).borrow().inner.source_reports().is_empty());
 
             Ok(())
         })
