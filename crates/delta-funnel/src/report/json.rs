@@ -7,7 +7,9 @@ use crate::{
     MssqlTargetCleanupStatus, MssqlTargetTable, MssqlWorkflowWriteReport, MssqlWriteFailureReport,
     MssqlWriteReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport, MssqlWriteStats,
     OutputStatus, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount, RunMode,
-    ValidationStatus, WorkflowStatus,
+    ValidationStatus, WorkflowStatus, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
+    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheReport,
+    WriteAllNoCacheReason, WriteAllReport,
 };
 
 impl RowCount {
@@ -384,6 +386,94 @@ impl MssqlWriteSkippedReport {
     }
 }
 
+impl WriteAllReport {
+    /// Returns the write-all report as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "workflow": self.workflow().to_json_value(),
+            "cache": self.cache().to_json_value(),
+            "sources": self.sources()
+                .iter()
+                .map(DeltaSourceReport::to_json_value)
+                .collect::<Vec<_>>(),
+            "phase_timings": phase_timings_value(self.phase_timings()),
+            "output_count": self.len(),
+            "all_succeeded": self.all_succeeded(),
+            "succeeded_count": self.succeeded_count(),
+            "failed_count": self.failed_count(),
+            "skipped_count": self.skipped_count(),
+        })
+    }
+}
+
+impl WriteAllCacheReport {
+    /// Returns write-all cache metadata as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        match self {
+            Self::Disabled => json!({
+                "kind": "disabled",
+                "reason": null,
+                "aliases": [],
+                "skipped_candidates": [],
+            }),
+            Self::NoCache {
+                reason,
+                skipped_candidates,
+            } => json!({
+                "kind": "no_cache",
+                "reason": no_cache_reason(*reason),
+                "aliases": [],
+                "skipped_candidates": skipped_candidates
+                    .iter()
+                    .map(WriteAllCacheCandidateSkip::to_json_value)
+                    .collect::<Vec<_>>(),
+            }),
+            Self::CacheAliases {
+                aliases,
+                skipped_candidates,
+            } => json!({
+                "kind": "cache_aliases",
+                "reason": null,
+                "aliases": aliases
+                    .iter()
+                    .map(WriteAllCacheAliasReport::to_json_value)
+                    .collect::<Vec<_>>(),
+                "skipped_candidates": skipped_candidates
+                    .iter()
+                    .map(WriteAllCacheCandidateSkip::to_json_value)
+                    .collect::<Vec<_>>(),
+            }),
+        }
+    }
+}
+
+impl WriteAllCacheAliasReport {
+    /// Returns one selected write-all cache alias as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "table_id": self.table_id(),
+            "alias": self.alias(),
+            "output_indexes": self.output_indexes(),
+            "status": cache_alias_status(self.status()),
+        })
+    }
+}
+
+impl WriteAllCacheCandidateSkip {
+    /// Returns one skipped write-all cache candidate as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "table_id": self.table_id(),
+            "alias": self.alias(),
+            "reason": cache_candidate_skip_reason(self.reason()),
+        })
+    }
+}
+
 fn count_value(kind: &str, value: Option<u64>) -> Value {
     json!({
         "kind": kind,
@@ -489,6 +579,47 @@ fn reader_backend(backend: DeltaProviderReaderBackend) -> &'static str {
     match backend {
         DeltaProviderReaderBackend::OfficialKernel => "official_kernel",
         DeltaProviderReaderBackend::NativeAsync => "native_async",
+    }
+}
+
+fn no_cache_reason(reason: WriteAllNoCacheReason) -> &'static str {
+    match reason {
+        WriteAllNoCacheReason::FewerThanTwoOutputs => "fewer_than_two_outputs",
+        WriteAllNoCacheReason::NoSharedRegisteredDerivedAlias => {
+            "no_shared_registered_derived_alias"
+        }
+        WriteAllNoCacheReason::AmbiguousSharedDerivedAlias => "ambiguous_shared_derived_alias",
+    }
+}
+
+fn cache_alias_status(status: WriteAllCacheAliasStatus) -> &'static str {
+    match status {
+        WriteAllCacheAliasStatus::Selected => "selected",
+        WriteAllCacheAliasStatus::MaterializedAndRestored => "materialized_and_restored",
+    }
+}
+
+fn cache_candidate_skip_reason(reason: &WriteAllCacheCandidateSkipReason) -> Value {
+    match reason {
+        WriteAllCacheCandidateSkipReason::NotShared { output_count } => json!({
+            "kind": "not_shared",
+            "output_count": output_count,
+        }),
+        WriteAllCacheCandidateSkipReason::MissingSqlText => json!({
+            "kind": "missing_sql_text",
+        }),
+        WriteAllCacheCandidateSkipReason::IncompleteLineage => json!({
+            "kind": "incomplete_lineage",
+        }),
+        WriteAllCacheCandidateSkipReason::CoveredByDeeperSharedAlias { selected_table_id } => {
+            json!({
+                "kind": "covered_by_deeper_shared_alias",
+                "selected_table_id": selected_table_id,
+            })
+        }
+        WriteAllCacheCandidateSkipReason::AmbiguousDepth => json!({
+            "kind": "ambiguous_depth",
+        }),
     }
 }
 
@@ -757,6 +888,47 @@ mod tests {
             json!({"kind": "exact", "value": 7})
         );
         assert_eq!(value["report"]["write_stats"]["rows_written"], 7);
+        assert_json_safe(&value)?;
+        assert_no_secret_or_raw_sql_text(&value);
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_all_cache_json_preserves_decision_aliases_and_skip_reasons() -> TestResult<()> {
+        let value = WriteAllCacheReport::CacheAliases {
+            aliases: vec![WriteAllCacheAliasReport::new(
+                9,
+                "shared_orders",
+                vec![0, 2],
+                WriteAllCacheAliasStatus::MaterializedAndRestored,
+            )],
+            skipped_candidates: vec![
+                WriteAllCacheCandidateSkip::new(
+                    7,
+                    "lonely_orders",
+                    WriteAllCacheCandidateSkipReason::NotShared { output_count: 1 },
+                ),
+                WriteAllCacheCandidateSkip::new(
+                    8,
+                    "missing_sql_orders",
+                    WriteAllCacheCandidateSkipReason::MissingSqlText,
+                ),
+            ],
+        }
+        .to_json_value();
+
+        assert_eq!(value["kind"], "cache_aliases");
+        assert_eq!(value["aliases"][0]["alias"], "shared_orders");
+        assert_eq!(value["aliases"][0]["status"], "materialized_and_restored");
+        assert_eq!(
+            value["skipped_candidates"][0]["reason"],
+            json!({"kind": "not_shared", "output_count": 1})
+        );
+        assert_eq!(
+            value["skipped_candidates"][1]["reason"],
+            json!({"kind": "missing_sql_text"})
+        );
         assert_json_safe(&value)?;
         assert_no_secret_or_raw_sql_text(&value);
 
