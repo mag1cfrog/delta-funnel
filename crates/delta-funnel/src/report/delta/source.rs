@@ -3,7 +3,7 @@ use std::fmt;
 use crate::{
     DeltaProtocolReport, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend,
     DeltaProviderScanExecutionOptions, FileCount, PhaseTimingReport, QueryOptions,
-    ReportReasonCode,
+    ReportReasonCode, support::sanitize_uri_for_display,
 };
 
 /// Conservative source usage status for a workflow report.
@@ -136,7 +136,7 @@ impl DeltaSourceReport {
     ) -> Self {
         Self {
             source_name: source_name.into(),
-            source_uri: source_uri.into(),
+            source_uri: sanitize_uri_for_display(&source_uri.into()),
             snapshot_version,
             protocol,
             scheduling,

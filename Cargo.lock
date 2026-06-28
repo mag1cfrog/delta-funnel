@@ -1272,6 +1272,7 @@ dependencies = [
  "libc",
  "object_store",
  "parquet",
+ "serde_json",
  "snafu",
  "tokio",
  "tracing",

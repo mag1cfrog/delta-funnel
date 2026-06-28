@@ -2,8 +2,8 @@
 //!
 //! This module owns the vocabulary that later dry-run, execution, validation,
 //! timing, tracing, Rust, and Python report slices reuse. The types are kept
-//! serializable-friendly by exposing stable string codes and primitive values
-//! without adding a serialization dependency in this slice.
+//! serializable-friendly by exposing stable string codes and primitive values,
+//! with JSON adapters isolated in the report JSON module.
 
 use std::{
     fmt,
@@ -13,6 +13,7 @@ use std::{
 use crate::error::DeltaFunnelError;
 
 pub mod delta;
+mod json;
 pub mod sql_server;
 
 pub use delta::{
