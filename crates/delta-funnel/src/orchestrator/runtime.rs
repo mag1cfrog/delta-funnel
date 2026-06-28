@@ -87,7 +87,7 @@ impl DeltaFunnelRuntime {
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
         reject_nested_runtime()?;
-        session.dry_run_all_to_mssql(requests)
+        session.dry_run_all_to_mssql_with_tracing(requests)
     }
 
     /// Runs a multi-output dry run with source scan-summary options.
@@ -103,7 +103,7 @@ impl DeltaFunnelRuntime {
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
         reject_nested_runtime()?;
         self.runtime
-            .block_on(session.dry_run_all_to_mssql_with_scan_summary(requests))
+            .block_on(session.dry_run_all_to_mssql_with_scan_summary_with_tracing(requests))
     }
 
     /// Blocks on one selected output write.

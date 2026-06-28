@@ -67,26 +67,6 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
-        self.dry_run_all_to_mssql_with_tracing(requests)
-    }
-
-    fn dry_run_all_to_mssql_with_tracing(
-        &self,
-        requests: &[OutputWritePlan],
-    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
-        let output_count = requests.len();
-        let span = observability::workflow_span(RunMode::DryRun, output_count);
-        let _guard = span.enter();
-        observability::workflow_started(RunMode::DryRun, output_count);
-        let result = self.dry_run_all_to_mssql_without_tracing(requests);
-        observability::workflow_finished(RunMode::DryRun, output_count, &result);
-        result
-    }
-
-    fn dry_run_all_to_mssql_without_tracing(
-        &self,
-        requests: &[OutputWritePlan],
-    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
         let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
         let outputs = self.plan_dry_run_all_outputs(requests)?;
         let planning_timing = planning_timer.completed();
@@ -96,6 +76,24 @@ impl DeltaFunnelSession {
 
         Ok(MssqlDryRunWorkflowReport::new(outputs, sources)
             .with_phase_timings(vec![planning_timing, source_timing]))
+    }
+
+    /// Runs [`Self::dry_run_all_to_mssql`] inside a DeltaFunnel workflow tracing span.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as [`Self::dry_run_all_to_mssql`].
+    pub fn dry_run_all_to_mssql_with_tracing(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        let output_count = requests.len();
+        let span = observability::workflow_span(RunMode::DryRun, output_count);
+        let _guard = span.enter();
+        observability::workflow_started(RunMode::DryRun, output_count);
+        let result = self.dry_run_all_to_mssql(requests);
+        observability::workflow_finished(RunMode::DryRun, output_count, &result);
+        result
     }
 
     /// Dry-runs multiple selected lazy tables and honors source scan-summary options.
@@ -111,31 +109,6 @@ impl DeltaFunnelSession {
     /// Returns the first duplicate-output, run-mode, output-planning, or
     /// DataFusion physical-planning error.
     pub async fn dry_run_all_to_mssql_with_scan_summary(
-        &self,
-        requests: &[OutputWritePlan],
-    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
-        self.dry_run_all_to_mssql_with_scan_summary_with_tracing(requests)
-            .await
-    }
-
-    async fn dry_run_all_to_mssql_with_scan_summary_with_tracing(
-        &self,
-        requests: &[OutputWritePlan],
-    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
-        let output_count = requests.len();
-        async move {
-            observability::workflow_started(RunMode::DryRun, output_count);
-            let result = self
-                .dry_run_all_to_mssql_with_scan_summary_without_tracing(requests)
-                .await;
-            observability::workflow_finished(RunMode::DryRun, output_count, &result);
-            result
-        }
-        .instrument(observability::workflow_span(RunMode::DryRun, output_count))
-        .await
-    }
-
-    async fn dry_run_all_to_mssql_with_scan_summary_without_tracing(
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
@@ -162,6 +135,26 @@ impl DeltaFunnelSession {
 
         Ok(MssqlDryRunWorkflowReport::new(outputs, sources)
             .with_phase_timings(vec![planning_timing, source_timing]))
+    }
+
+    /// Runs [`Self::dry_run_all_to_mssql_with_scan_summary`] inside a workflow tracing span.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as [`Self::dry_run_all_to_mssql_with_scan_summary`].
+    pub async fn dry_run_all_to_mssql_with_scan_summary_with_tracing(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        let output_count = requests.len();
+        async move {
+            observability::workflow_started(RunMode::DryRun, output_count);
+            let result = self.dry_run_all_to_mssql_with_scan_summary(requests).await;
+            observability::workflow_finished(RunMode::DryRun, output_count, &result);
+            result
+        }
+        .instrument(observability::workflow_span(RunMode::DryRun, output_count))
+        .await
     }
 
     fn plan_dry_run_all_outputs(

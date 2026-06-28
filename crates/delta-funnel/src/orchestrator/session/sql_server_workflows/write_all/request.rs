@@ -49,41 +49,6 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        self.write_all_with_options_and_writer_with_tracing(requests, options, writer)
-            .await
-    }
-
-    async fn write_all_with_options_and_writer_with_tracing<W>(
-        &self,
-        requests: &[OutputWritePlan],
-        options: WriteAllOptions,
-        writer: W,
-    ) -> Result<WriteAllReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        let output_count = requests.len();
-        async move {
-            observability::workflow_started(RunMode::Execute, output_count);
-            let result = self
-                .write_all_with_options_and_writer_without_tracing(requests, options, writer)
-                .await;
-            observability::workflow_finished(RunMode::Execute, output_count, &result);
-            result
-        }
-        .instrument(observability::workflow_span(RunMode::Execute, output_count))
-        .await
-    }
-
-    async fn write_all_with_options_and_writer_without_tracing<W>(
-        &self,
-        requests: &[OutputWritePlan],
-        options: WriteAllOptions,
-        writer: W,
-    ) -> Result<WriteAllReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
         let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
         let planned_outputs = self.plan_write_all_outputs(requests)?;
         let phase_timings = vec![planning_timer.completed()];
@@ -123,6 +88,28 @@ impl DeltaFunnelSession {
         }
     }
 
+    pub(crate) async fn write_all_with_options_and_writer_with_tracing<W>(
+        &self,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+        writer: W,
+    ) -> Result<WriteAllReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        let output_count = requests.len();
+        async move {
+            observability::workflow_started(RunMode::Execute, output_count);
+            let result = self
+                .write_all_with_options_and_writer(requests, options, writer)
+                .await;
+            observability::workflow_finished(RunMode::Execute, output_count, &result);
+            result
+        }
+        .instrument(observability::workflow_span(RunMode::Execute, output_count))
+        .await
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn write_all_with_writer<W>(
         &self,
@@ -132,8 +119,12 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        self.write_all_with_options_and_writer(requests, WriteAllOptions::default(), writer)
-            .await
+        self.write_all_with_options_and_writer_with_tracing(
+            requests,
+            WriteAllOptions::default(),
+            writer,
+        )
+        .await
     }
 
     #[allow(dead_code)]
