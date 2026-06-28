@@ -3,7 +3,8 @@ use serde_json::{Value, json};
 use crate::{
     DeltaProviderReaderBackend, DeltaSourceReport, FileCount, LazyTableKind, LoadMode,
     MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
-    MssqlDryRunWorkflowReport, MssqlTargetTable, OutputStatus, PhaseStatus, PhaseTimingReport,
+    MssqlDryRunWorkflowReport, MssqlOutputFieldReport, MssqlTargetCleanupStatus, MssqlTargetTable,
+    MssqlWriteReport, MssqlWriteStats, OutputStatus, PhaseStatus, PhaseTimingReport,
     ReportReasonCode, RowCount, RunMode, ValidationStatus, WorkflowStatus,
 };
 
@@ -218,6 +219,64 @@ impl MssqlDryRunWorkflowReport {
     }
 }
 
+impl MssqlOutputFieldReport {
+    /// Returns the execute output field report as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "index": self.index(),
+            "name": self.name(),
+            "arrow_type": self.arrow_type(),
+            "nullable": self.nullable(),
+        })
+    }
+}
+
+impl MssqlWriteStats {
+    /// Returns SQL Server write stats as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "output_name": self.output_name(),
+            "rows_written": self.rows_written(),
+            "batches_written": self.batches_written(),
+            "elapsed_ms": self.elapsed_ms(),
+        })
+    }
+}
+
+impl MssqlWriteReport {
+    /// Returns the execute output report as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "output_name": self.output_name(),
+            "run_mode": run_mode(RunMode::Execute),
+            "status": OutputStatus::succeeded().to_json_value(),
+            "target_table": target_table_value(self.target_table()),
+            "load_mode": load_mode(self.load_mode()),
+            "connection_source": connection_source(self.connection_source()),
+            "connection": {
+                "display_label": self.connection().display_label(),
+            },
+            "output_schema": self.output_schema()
+                .iter()
+                .map(MssqlOutputFieldReport::to_json_value)
+                .collect::<Vec<_>>(),
+            "output_row_count": self.output_row_count().to_json_value(),
+            "target_row_count_before_write": self.target_row_count_before_write().to_json_value(),
+            "target_row_count_after_write": self.target_row_count_after_write().to_json_value(),
+            "target_row_count": self.target_row_count().to_json_value(),
+            "validation_status": self.validation_status().to_json_value(),
+            "batch_shaping": batch_shaping_value(self.batch_shaping()),
+            "phase_timings": phase_timings_value(self.phase_timings()),
+            "write_stats": self.stats().to_json_value(),
+            "partial_write_possible": self.partial_write_possible(),
+            "cleanup": cleanup_status(self.cleanup()),
+        })
+    }
+}
+
 fn count_value(kind: &str, value: Option<u64>) -> Value {
     json!({
         "kind": kind,
@@ -284,6 +343,32 @@ fn target_table_value(table: &MssqlTargetTable) -> Value {
     })
 }
 
+fn connection_source(source: crate::MssqlConnectionSource) -> &'static str {
+    match source {
+        crate::MssqlConnectionSource::TargetOverride => "target_override",
+        crate::MssqlConnectionSource::ContextDefault => "context_default",
+    }
+}
+
+fn cleanup_status(status: MssqlTargetCleanupStatus) -> &'static str {
+    match status {
+        MssqlTargetCleanupStatus::NotApplicable => "not_applicable",
+        MssqlTargetCleanupStatus::NotAttempted => "not_attempted",
+        MssqlTargetCleanupStatus::Succeeded => "succeeded",
+        MssqlTargetCleanupStatus::Failed => "failed",
+    }
+}
+
+fn batch_shaping_value(report: crate::MssqlBatchShapingReport) -> Value {
+    json!({
+        "status": report.status().to_json_value(),
+        "input_batches": report.input_batches(),
+        "input_rows": report.input_rows(),
+        "output_batches": report.output_batches(),
+        "output_rows": report.output_rows(),
+    })
+}
+
 fn reader_backend(backend: DeltaProviderReaderBackend) -> &'static str {
     match backend {
         DeltaProviderReaderBackend::OfficialKernel => "official_kernel",
@@ -305,8 +390,11 @@ mod tests {
     use super::*;
     use crate::{
         DeltaFunnelSession, DeltaSourceConfig, MssqlConnectionConfig, MssqlOutputTarget,
-        MssqlTargetConfig, OutputWritePlan, SessionOptions,
+        MssqlTargetConfig, MssqlTargetOutputPlan, OutputWritePlan, SessionOptions,
+        plan_mssql_target_for_output,
     };
+    use arrow_schema::{DataType, Field, Schema};
+    use arrow_tiberius::PlanOptions;
 
     type TestResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
@@ -476,12 +564,91 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn execute_write_report_json_exposes_stats_counts_and_validation() -> TestResult<()> {
+        let output_plan = output_plan()?;
+        let report = MssqlWriteReport::from_output_plan(
+            &output_plan,
+            42,
+            3,
+            125,
+            false,
+            MssqlTargetCleanupStatus::NotApplicable,
+        )
+        .with_target_delta_validation(
+            RowCount::exact(10),
+            RowCount::exact(52),
+            ValidationStatus::passed(),
+            PhaseTimingReport::completed("mssql_target_validation", Duration::from_micros(7)),
+        );
+
+        let value = report.to_json_value();
+
+        assert_eq!(value["run_mode"], "execute");
+        assert_eq!(value["status"]["kind"], "succeeded");
+        assert_eq!(value["output_name"], "orders_output");
+        assert_eq!(value["target_table"]["schema"], "dbo");
+        assert_eq!(value["target_table"]["table"], "orders");
+        assert_eq!(value["connection_source"], "context_default");
+        assert_eq!(value["connection"]["display_label"], "warehouse");
+        assert_eq!(value["output_schema"][0]["name"], "id");
+        assert_eq!(
+            value["output_row_count"],
+            json!({"kind": "exact", "value": 42})
+        );
+        assert_eq!(
+            value["target_row_count_before_write"],
+            json!({"kind": "exact", "value": 10})
+        );
+        assert_eq!(
+            value["target_row_count_after_write"],
+            json!({"kind": "exact", "value": 52})
+        );
+        assert_eq!(
+            value["validation_status"],
+            json!({"kind": "passed", "reason": null})
+        );
+        assert_eq!(value["batch_shaping"]["input_batches"], 3);
+        assert_eq!(value["batch_shaping"]["input_rows"], 42);
+        assert_eq!(value["write_stats"]["rows_written"], 42);
+        assert_eq!(value["write_stats"]["batches_written"], 3);
+        assert_eq!(value["write_stats"]["elapsed_ms"], 125);
+        assert_eq!(value["cleanup"], "not_applicable");
+        assert_json_safe(&value)?;
+        assert_no_secret_or_raw_sql_text(&value);
+
+        Ok(())
+    }
+
     fn session_with_default_connection() -> Result<DeltaFunnelSession, crate::DeltaFunnelError> {
         let connection = MssqlConnectionConfig::new(
             "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
         )?
         .with_display_label("warehouse");
         DeltaFunnelSession::new(SessionOptions::new().with_default_mssql_connection(connection))
+    }
+
+    fn output_plan() -> Result<MssqlTargetOutputPlan, crate::DeltaFunnelError> {
+        let connection = MssqlConnectionConfig::new(
+            "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+        )?
+        .with_display_label("warehouse");
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+
+        plan_mssql_target_for_output(
+            orders_schema(),
+            "orders_output",
+            &target_config,
+            Some(&connection),
+            PlanOptions::default(),
+        )
+    }
+
+    fn orders_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ])
     }
 
     fn metadata_json() -> String {
