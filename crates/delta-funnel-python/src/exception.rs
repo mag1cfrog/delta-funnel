@@ -181,7 +181,10 @@ fn mssql_write_phase(phase: delta_funnel::MssqlWritePhase) -> &'static str {
 mod tests {
     use super::{DeltaFunnelError, delta_funnel_error_to_py, delta_funnel_py_error};
     use crate::deltafunnel;
+    use crate::json::json_value_to_py;
+    use arrow_schema::{DataType, Field, Schema};
     use pyo3::IntoPyObjectExt;
+    use pyo3::exceptions::PyKeyError;
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule};
 
@@ -254,6 +257,55 @@ mod tests {
     }
 
     #[test]
+    fn converted_sanitized_report_fixture_does_not_expose_connection_secrets() -> PyResult<()> {
+        Python::attach(|py| {
+            let connection = delta_funnel::MssqlConnectionConfig::new(
+                "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+            )
+            .map_err(|error| py_error(py, error))?
+            .with_display_label("warehouse-primary");
+            let target_config = delta_funnel::MssqlTargetConfig::new(
+                delta_funnel::MssqlTargetTable::new("dbo", "orders")
+                    .map_err(|error| py_error(py, error))?,
+            );
+            let output_plan = delta_funnel::plan_mssql_target_for_output(
+                Schema::new(vec![Field::new("order_id", DataType::Int64, false)]),
+                "orders_output",
+                &target_config,
+                Some(&connection),
+                delta_funnel::MssqlSchemaPlanOptions::default(),
+            )
+            .map_err(|error| py_error(py, error))?;
+            let context = delta_funnel::MssqlWriteFailureContext::from_output_plan(
+                &output_plan,
+                delta_funnel::MssqlWritePhase::WriteBatch,
+                42,
+                3,
+                125,
+                true,
+                delta_funnel::MssqlTargetCleanupStatus::NotApplicable,
+            );
+
+            let object = json_value_to_py(py, &context.to_json_value())?;
+            let report = object.bind(py).cast::<PyDict>()?;
+            let connection = required_item(report, "connection")?;
+            let connection = connection.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(connection, "display_label")?.extract::<String>()?,
+                "warehouse-primary"
+            );
+
+            let report_text = object.bind(py).repr()?.extract::<String>()?;
+            assert!(!report_text.contains("server=tcp"));
+            assert!(!report_text.contains("admin"));
+            assert!(!report_text.contains("password"));
+            assert!(!report_text.contains("secret-token"));
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn rust_error_mapping_exposes_stable_attributes() -> PyResult<()> {
         Python::attach(|py| {
             let error = delta_funnel_error_to_py(
@@ -309,5 +361,17 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    fn py_error(py: Python<'_>, error: delta_funnel::DeltaFunnelError) -> PyErr {
+        match delta_funnel_error_to_py(py, error) {
+            Ok(error) => error,
+            Err(error) => error,
+        }
+    }
+
+    fn required_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+        dict.get_item(key)?
+            .ok_or_else(|| PyKeyError::new_err(key.to_owned()))
     }
 }
