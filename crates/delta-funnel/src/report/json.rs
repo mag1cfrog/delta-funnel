@@ -718,25 +718,64 @@ fn cache_candidate_skip_reason(reason: &WriteAllCacheCandidateSkipReason) -> Val
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         error::Error,
         fs,
         path::PathBuf,
+        sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    use async_trait::async_trait;
+    use futures_util::stream;
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::MssqlWorkflowOutputWriter;
     use crate::{
         DeltaFunnelSession, DeltaProtocolReport, DeltaProviderScanExecutionOptions,
-        DeltaProviderSchedulingReport, DeltaSourceConfig, MssqlConnectionConfig, MssqlOutputTarget,
-        MssqlTargetConfig, MssqlTargetOutputPlan, OutputWritePlan, QueryOptions, SessionOptions,
-        plan_mssql_target_for_output,
+        DeltaProviderSchedulingReport, DeltaSourceConfig, MssqlConnectionConfig,
+        MssqlOutputBatchStream, MssqlOutputTarget, MssqlOutputWriteJob, MssqlSchemaPlanOptions,
+        MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetResolutionContext,
+        MssqlWorkflowWriteOptions, MssqlWriteOptions, OutputWritePlan, QueryOptions,
+        ResolvedMssqlTarget, SessionOptions, ValidationOptions, plan_mssql_target_for_output,
+        write_mssql_outputs_with_writer,
     };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use arrow_tiberius::PlanOptions;
 
     type TestResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
+
+    struct FakeWorkflowWriter {
+        outcomes: VecDeque<Result<MssqlWriteReport, crate::DeltaFunnelError>>,
+    }
+
+    impl FakeWorkflowWriter {
+        fn new(outcomes: Vec<Result<MssqlWriteReport, crate::DeltaFunnelError>>) -> Self {
+            Self {
+                outcomes: outcomes.into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MssqlWorkflowOutputWriter for FakeWorkflowWriter {
+        async fn write_output(
+            &mut self,
+            _output_schema: SchemaRef,
+            _resolved_target: ResolvedMssqlTarget,
+            _schema_options: MssqlSchemaPlanOptions,
+            _batches: MssqlOutputBatchStream,
+            _write_options: MssqlWriteOptions,
+            _validation_options: ValidationOptions,
+        ) -> Result<MssqlWriteReport, crate::DeltaFunnelError> {
+            self.outcomes.pop_front().ok_or_else(|| {
+                crate::DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: "missing fake writer outcome".to_owned(),
+                }
+            })?
+        }
+    }
 
     struct DeltaLogFixture {
         path: PathBuf,
@@ -1034,6 +1073,70 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn workflow_json_covers_real_failed_and_skipped_statuses() -> TestResult<()> {
+        let first = output_plan_named("first_output")?;
+        let second = output_plan_named("second_output")?;
+        let third = output_plan_named("third_output")?;
+        let first_report = MssqlWriteReport::from_output_plan(
+            &first,
+            7,
+            1,
+            25,
+            false,
+            MssqlTargetCleanupStatus::NotApplicable,
+        );
+        let failure_context = MssqlWriteFailureContext::from_output_plan(
+            &second,
+            MssqlWritePhase::WriteBatch,
+            4,
+            1,
+            25,
+            true,
+            MssqlTargetCleanupStatus::NotApplicable,
+        );
+        let failure = crate::DeltaFunnelError::MssqlWritePhase {
+            context: Box::new(failure_context),
+            message: "failed to write output".to_owned(),
+        };
+        let writer = FakeWorkflowWriter::new(vec![Ok(first_report), Err(failure)]);
+
+        let report = write_mssql_outputs_with_writer(
+            vec![job(first)?, job(second)?, job(third)?],
+            MssqlWorkflowWriteOptions::default(),
+            writer,
+        )
+        .await?;
+
+        let value = report.to_json_value();
+
+        assert_eq!(value["succeeded_count"], 1);
+        assert_eq!(value["failed_count"], 1);
+        assert_eq!(value["skipped_count"], 1);
+        assert_eq!(value["outputs"][0]["kind"], "succeeded");
+        assert_eq!(value["outputs"][1]["kind"], "failed");
+        assert_eq!(
+            value["outputs"][1]["failure"]["context"]["phase"],
+            "write_batch"
+        );
+        assert_eq!(
+            value["outputs"][1]["failure"]["context"]["output_row_count"],
+            json!({"kind": "partial", "value": 4})
+        );
+        assert_eq!(value["outputs"][2]["kind"], "skipped");
+        assert_eq!(
+            value["outputs"][2]["skipped"]["reason"],
+            json!({
+                "kind": "previous_output_failed",
+                "failed_output_name": "second_output"
+            })
+        );
+        assert_json_safe(&value)?;
+        assert_no_secret_or_raw_sql_text(&value);
+
+        Ok(())
+    }
+
     #[test]
     fn write_all_cache_json_preserves_decision_aliases_and_skip_reasons() -> TestResult<()> {
         let value = WriteAllCacheReport::CacheAliases {
@@ -1132,19 +1235,63 @@ mod tests {
     }
 
     fn output_plan() -> Result<MssqlTargetOutputPlan, crate::DeltaFunnelError> {
+        output_plan_with_table("orders_output", "orders")
+    }
+
+    fn output_plan_named(
+        output_name: &str,
+    ) -> Result<MssqlTargetOutputPlan, crate::DeltaFunnelError> {
+        output_plan_with_table(output_name, format!("{output_name}_orders"))
+    }
+
+    fn output_plan_with_table(
+        output_name: &str,
+        table_name: impl Into<String>,
+    ) -> Result<MssqlTargetOutputPlan, crate::DeltaFunnelError> {
         let connection = MssqlConnectionConfig::new(
             "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
         )?
         .with_display_label("warehouse");
-        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
+        let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", table_name)?);
 
         plan_mssql_target_for_output(
             orders_schema(),
-            "orders_output",
+            output_name,
             &target_config,
             Some(&connection),
             PlanOptions::default(),
         )
+    }
+
+    fn job(
+        output_plan: MssqlTargetOutputPlan,
+    ) -> Result<MssqlOutputWriteJob, crate::DeltaFunnelError> {
+        Ok(MssqlOutputWriteJob::with_default_write_options(
+            orders_schema_ref(),
+            resolved_target(output_plan)?,
+            MssqlSchemaPlanOptions::default(),
+            || async { Ok(stream::empty()) },
+        ))
+    }
+
+    fn resolved_target(
+        output_plan: MssqlTargetOutputPlan,
+    ) -> Result<ResolvedMssqlTarget, crate::DeltaFunnelError> {
+        let connection = MssqlConnectionConfig::new(
+            "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+        )?
+        .with_display_label("warehouse");
+
+        MssqlTargetConfig::new(output_plan.target_table().clone())
+            .with_load_mode(output_plan.load_mode())
+            .resolve(MssqlTargetResolutionContext {
+                output_name: Some(output_plan.output_name()),
+                default_connection: Some(&connection),
+            })
+    }
+
+    fn orders_schema_ref() -> SchemaRef {
+        Arc::new(orders_schema())
     }
 
     fn orders_schema() -> Schema {
