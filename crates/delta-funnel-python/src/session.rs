@@ -1160,6 +1160,49 @@ mod tests {
     }
 
     #[test]
+    fn table_from_sql_rejects_invalid_sql_without_exposing_raw_sql() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("orders")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+
+            for sql in [
+                "select id from orders; select id from orders",
+                "create table raw_sql_secret as select id from orders",
+                "insert into orders select id from orders",
+                "select raw_sql_secret from missing_orders",
+            ] {
+                let error = match session.bind(py).call_method("table_from_sql", (sql,), None) {
+                    Ok(_) => return Err(PyAssertionError::new_err("expected SQL error")),
+                    Err(error) => error,
+                };
+
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "sql_table"
+                );
+                assert_eq!(
+                    error.value(py).getattr("kind")?.extract::<String>()?,
+                    "sql_table"
+                );
+                assert!(
+                    !error
+                        .value(py)
+                        .str()?
+                        .to_string()
+                        .contains("raw_sql_secret")
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn session_accepts_default_mssql_connection_string() -> PyResult<()> {
         Python::attach(|py| {
             let session = Py::new(
