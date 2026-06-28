@@ -79,6 +79,41 @@ Validation currently proves row-count facts reported by the workflow. It is not
 full data equality validation, checksum validation, ordering validation, or a
 SQL Server performance profile.
 
+## Report Field Reference
+
+Counts carry both a `kind` and a `value`. Do not read `value` without checking
+`kind`.
+
+| Field family | Kinds | How to read it |
+| --- | --- | --- |
+| `RowCount` | `exact`, `estimated`, `partial`, `unavailable` | `exact` proves the count for that scope. `estimated` comes from metadata or planning. `partial` is an observed prefix from a failed or incomplete path. `unavailable` has no numeric value. |
+| `FileCount` | `exact`, `estimated`, `unavailable`, `skipped`, `not_executed` | `skipped` means DeltaFunnel intentionally avoided the count. `not_executed` means the workflow step that would count files never ran. |
+
+Statuses also carry stable `kind` strings and optional `reason` strings:
+
+| Status | Kinds | Notes |
+| --- | --- | --- |
+| `WorkflowStatus` | `success`, `partial_success`, `failure`, `skipped`, `no_op` | Dry-run workflow reports use this shape. Execute multi-output reports expose workflow counts and per-output status instead. |
+| `OutputStatus` | `planned`, `succeeded`, `failed`, `skipped`, `dry_run_planned`, `validation_failed` | A validation failure nests a `validation` status. |
+| `PhaseStatus` | `completed`, `failed`, `skipped`, `not_started`, `unavailable` | Phase timings include `elapsed_micros` only when measured. |
+| `ValidationStatus` | `disabled`, `passed`, `failed`, `skipped`, `unavailable`, `required_but_failed` | `required_but_failed` means the caller required validation and DeltaFunnel could not prove a pass. |
+
+Common reason strings include `validation_disabled`, `dry_run`,
+`capability_unavailable`, `permission_unavailable`, `prior_failure`,
+`unsupported_load_mode`, `missing_target_access`,
+`missing_exact_output_rows`, `cost_avoidance`, `not_executed`, and
+`failure_before_validation`.
+
+Source reports contain sanitized `source_uri` and `protocol.table_uri` fields.
+They also report source usage, file-count evidence, provider scheduling, and
+provider read stats. Provider stats can be absent when the report stayed on the
+metadata-only path, when a provider capability was unavailable, or when the
+workflow failed before scan metadata could be collected.
+
+Batch shaping reports compare input batches/rows from the selected output stream
+with output batches/rows after DeltaFunnel shapes data for SQL Server. Write
+stats report rows and batches accepted by the SQL Server write path.
+
 ## Read The Failure Report
 
 When a workflow fails, start at the highest-level report and then drill down:
