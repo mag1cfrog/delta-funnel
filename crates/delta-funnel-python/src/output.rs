@@ -41,6 +41,20 @@ impl PyMssqlOutputSpec {
             target,
         })
     }
+
+    pub(crate) fn write_plan(
+        &self,
+        run_mode: delta_funnel::RunMode,
+    ) -> delta_funnel::OutputWritePlan {
+        delta_funnel::OutputWritePlan::new(
+            self.table.clone(),
+            delta_funnel::MssqlOutputTarget::new(
+                self.output_name.clone(),
+                self.target.clone(),
+                run_mode,
+            ),
+        )
+    }
 }
 
 #[pymethods]
@@ -109,6 +123,7 @@ mod tests {
     use super::PyMssqlOutputSpec;
     use crate::deltafunnel;
     use delta_funnel::LoadMode;
+    use pyo3::exceptions::PyKeyError;
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule};
 
@@ -237,6 +252,78 @@ mod tests {
         })
     }
 
+    #[test]
+    fn table_write_to_mssql_dry_run_returns_report_dict() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = sql_table(py)?;
+            let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
+            kwargs.set_item(
+                "connection_string",
+                "server=tcp:sql.example.com;password=secret-token",
+            )?;
+            kwargs.set_item("dry_run", true)?;
+
+            let report = table.call_method("write_to_mssql", (), Some(&kwargs))?;
+            let report_repr = report.repr()?.extract::<String>()?;
+            assert!(!report_repr.contains("secret-token"));
+            assert!(!report_repr.contains("password=secret-token"));
+
+            let report = report.cast::<PyDict>()?;
+            let dry_run = required_item(report, "dry_run")?;
+            let dry_run = dry_run.cast::<PyDict>()?;
+            let target_table = required_item(report, "target_table")?;
+            let target_table = target_table.cast::<PyDict>()?;
+
+            assert_eq!(
+                required_item(report, "output_name")?.extract::<String>()?,
+                "orders"
+            );
+            assert_eq!(
+                required_item(report, "run_mode")?.extract::<String>()?,
+                "dry_run"
+            );
+            assert_eq!(
+                required_item(report, "load_mode")?.extract::<String>()?,
+                "create_and_load"
+            );
+            assert_eq!(
+                required_item(target_table, "schema")?.extract::<String>()?,
+                "dbo"
+            );
+            assert_eq!(
+                required_item(target_table, "table")?.extract::<String>()?,
+                "orders"
+            );
+            assert!(!required_item(dry_run, "sql_server_contacted")?.extract::<bool>()?);
+            assert!(!required_item(dry_run, "row_production_started")?.extract::<bool>()?);
+            assert!(!required_item(dry_run, "table_lifecycle_started")?.extract::<bool>()?);
+            assert!(!required_item(dry_run, "bulk_writer_started")?.extract::<bool>()?);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_write_to_mssql_rejects_execute_mode_until_write_slice() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = sql_table(py)?;
+            let kwargs = mssql_kwargs(py, "dbo", "orders", "append_existing")?;
+
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .unwrap_err();
+            assert_execute_mode_error(py, &error)?;
+
+            kwargs.set_item("dry_run", false)?;
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .unwrap_err();
+            assert_execute_mode_error(py, &error)?;
+
+            Ok(())
+        })
+    }
+
     fn sql_table(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         let module = PyModule::new(py, "deltafunnel")?;
         deltafunnel(&module)?;
@@ -255,5 +342,22 @@ mod tests {
         kwargs.set_item("table", table)?;
         kwargs.set_item("load_mode", load_mode)?;
         Ok(kwargs)
+    }
+
+    fn required_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+        dict.get_item(key)?
+            .ok_or_else(|| PyKeyError::new_err(key.to_owned()))
+    }
+
+    fn assert_execute_mode_error(py: Python<'_>, error: &PyErr) -> PyResult<()> {
+        assert_eq!(
+            error.value(py).getattr("phase")?.extract::<String>()?,
+            "config"
+        );
+        assert_eq!(
+            error.value(py).getattr("kind")?.extract::<String>()?,
+            "execute_mode_not_enabled"
+        );
+        Ok(())
     }
 }

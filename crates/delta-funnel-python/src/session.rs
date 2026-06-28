@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 
 use crate::exception::{delta_funnel_error_to_py, delta_funnel_py_error};
+use crate::json::json_value_to_py;
 use crate::table::PyTable;
 
 #[pyclass(name = "Session", module = "deltafunnel")]
@@ -117,6 +118,18 @@ impl PySession {
         self.inner
             .register_alias(name, table)
             .map_err(|error| rust_error_to_py(py, error))
+    }
+
+    pub(crate) fn dry_run_to_mssql(
+        &self,
+        py: Python<'_>,
+        request: &delta_funnel::OutputWritePlan,
+    ) -> PyResult<Py<PyAny>> {
+        let report = self
+            .runtime
+            .dry_run_to_mssql(&self.inner, request)
+            .map_err(|error| rust_error_to_py(py, error))?;
+        json_value_to_py(py, &report.to_json_value())
     }
 }
 
