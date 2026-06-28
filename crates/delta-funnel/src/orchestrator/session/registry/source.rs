@@ -185,6 +185,7 @@ impl DeltaFunnelSession {
 #[cfg(test)]
 mod tests {
     use super::{DATAFUSION_REGISTRATION_PHASE, PROTOCOL_PREFLIGHT_PHASE, SOURCE_LOADING_PHASE};
+
     use crate::{
         DeltaFunnelError, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
         DeltaSourceConfig, DeltaStorageOptions, QueryOptions,
@@ -231,6 +232,10 @@ mod tests {
         assert_eq!(
             report.scheduling().reader_backend(),
             DeltaProviderReaderBackend::NativeAsync
+        );
+        assert_eq!(
+            report.scheduling().max_concurrent_file_reads_per_scan(),
+            None
         );
         assert_eq!(report.file_count(), crate::FileCount::unavailable());
         assert_eq!(
@@ -462,7 +467,7 @@ mod tests {
             scheduling.reader_backend(),
             DeltaProviderReaderBackend::OfficialKernel
         );
-        assert_eq!(scheduling.max_concurrent_file_reads_per_scan(), 2);
+        assert_eq!(scheduling.max_concurrent_file_reads_per_scan(), Some(2));
         assert_eq!(scheduling.max_concurrent_file_reads_per_partition(), 1);
         assert_eq!(scheduling.output_buffer_capacity_per_partition(), 3);
         assert_eq!(

@@ -13,8 +13,11 @@ use crate::pipeline::{BatchPipelinePhase, validate_nonzero_usize_option};
 pub struct QueryOptions {
     /// Optional DataFusion execution partition target.
     ///
-    /// This controls query and scan parallelism. It does not set per-batch row
-    /// counts and should be reported separately from `output_batch_size`.
+    /// When set, this is passed to DataFusion as the session target partition
+    /// count before query planning. When unset, DataFusion's session default
+    /// remains in effect. Provider scans treat the DataFusion target as a cap
+    /// while deriving their own conservative physical scan partition target;
+    /// automatic scan-wide read capacity is resolved from that derived target.
     pub target_partitions: Option<usize>,
 
     /// Optional DataFusion execution batch size.
