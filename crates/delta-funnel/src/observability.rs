@@ -3,6 +3,7 @@
 use crate::{
     DeltaFunnelError, LoadMode, MssqlBatchShapingReport, MssqlTargetTable, RunMode,
     ValidationStatus,
+    support::{sanitize_text_for_display, sanitize_uri_for_display},
 };
 
 pub(crate) const TRACING_TARGET: &str = "delta_funnel";
@@ -71,7 +72,7 @@ pub(crate) fn workflow_finished<T>(
             run_mode = run_mode.as_str(),
             output_count,
             error_category = "delta_funnel_error",
-            error_summary = %error,
+            error_summary = sanitize_error_summary(error),
             WORKFLOW_FAILED_EVENT
         ),
     }
@@ -130,6 +131,7 @@ pub(crate) fn output_failed(
     load_mode: LoadMode,
     error_summary: &str,
 ) {
+    let error_summary = sanitize_observability_summary(error_summary);
     tracing::info!(
         target: TRACING_TARGET,
         telemetry_event = OUTPUT_FAILED_EVENT,
@@ -371,7 +373,7 @@ fn source_phase_failed(telemetry_event: &str, source_name: &str, error: &DeltaFu
         telemetry_event,
         source_name,
         error_category = "delta_funnel_error",
-        error_summary = %error,
+        error_summary = sanitize_error_summary(error),
         message = telemetry_event
     );
 }
@@ -388,7 +390,7 @@ fn source_phase_failed_with_snapshot(
         source_name,
         snapshot_version,
         error_category = "delta_funnel_error",
-        error_summary = %error,
+        error_summary = sanitize_error_summary(error),
         message = telemetry_event
     );
 }
@@ -423,6 +425,60 @@ const fn load_mode_as_str(load_mode: LoadMode) -> &'static str {
         LoadMode::CreateAndLoad => "create_and_load",
         LoadMode::Replace => "replace",
     }
+}
+
+fn sanitize_error_summary(error: &DeltaFunnelError) -> String {
+    sanitize_observability_summary(&error.to_string())
+}
+
+fn sanitize_observability_summary(summary: &str) -> String {
+    let summary = sanitize_text_for_display(summary);
+    if looks_like_raw_sql(&summary) {
+        return "<redacted>".to_owned();
+    }
+
+    summary
+        .split_whitespace()
+        .map(sanitize_observability_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sanitize_observability_token(token: &str) -> String {
+    let sanitized = if token.contains("://") {
+        sanitize_uri_for_display(token)
+    } else {
+        token.to_owned()
+    };
+
+    if contains_secret_marker(&sanitized) {
+        "<redacted>".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn contains_secret_marker(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "access_key",
+        "accesskey",
+        "credential",
+        "password",
+        "pwd=",
+        "secret",
+        "session_token",
+        "token=",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
+}
+
+fn looks_like_raw_sql(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    ["select ", "insert ", "update ", "delete ", "merge "]
+        .iter()
+        .any(|marker| value.contains(marker))
 }
 
 #[cfg(test)]
@@ -861,6 +917,56 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn scoped_capture_redacts_sensitive_error_summary_text() -> Result<(), DeltaFunnelError> {
+        let events = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: events.clone(),
+        });
+        let target_table = MssqlTargetTable::new("dbo", "orders")?;
+
+        tracing::subscriber::with_default(subscriber, || {
+            workflow_finished::<()>(
+                RunMode::Execute,
+                1,
+                &Err(DeltaFunnelError::Config {
+                    message: concat!(
+                        "connection server=tcp:sql.example.com;user=admin;password=secret-token ",
+                        "uses access_key=AKIASECRET"
+                    )
+                    .to_owned(),
+                }),
+            );
+            output_failed(
+                "orders_output",
+                &target_table,
+                LoadMode::CreateAndLoad,
+                "select * from dbo.customers where email = 'alice@example.com'",
+            );
+            source_loading_failed(
+                "orders",
+                &DeltaFunnelError::DataFusionRegistration {
+                    source_name: "orders".to_owned(),
+                    table_uri: "s3://user:password@example.com/table?token=secret".to_owned(),
+                    reason: "credential token=secret".to_owned(),
+                },
+            );
+        });
+
+        let events = events.events();
+        assert_eq!(events.len(), 3);
+        assert_no_forbidden_tracing_text(&events);
+        for event in events {
+            assert_eq!(
+                event.fields.get("error_category").map(String::as_str),
+                Some("delta_funnel_error")
+            );
+            assert!(event.fields.contains_key("error_summary"));
+        }
+
+        Ok(())
+    }
+
     fn assert_workflow_event(
         event: &CapturedEvent,
         telemetry_event: &str,
@@ -1025,6 +1131,30 @@ mod tests {
             event.fields.get("validation_reason").map(String::as_str),
             Some(validation_reason)
         );
+    }
+
+    fn assert_no_forbidden_tracing_text(events: &[CapturedEvent]) {
+        let forbidden = [
+            "AKIASECRET",
+            "access_key",
+            "alice@example.com",
+            "password",
+            "secret",
+            "select *",
+            "token=",
+            "user:password",
+        ];
+
+        for event in events {
+            for value in event.fields.values() {
+                for forbidden_text in forbidden {
+                    assert!(
+                        !value.contains(forbidden_text),
+                        "tracing field leaked forbidden text `{forbidden_text}` in `{value}`"
+                    );
+                }
+            }
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
