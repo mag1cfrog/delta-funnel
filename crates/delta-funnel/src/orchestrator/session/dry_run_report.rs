@@ -177,6 +177,41 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
+        let target = request.target();
+        let target_config = target.target();
+        let output_span = observability::output_span(
+            target.output_name(),
+            target_config.table(),
+            target_config.load_mode(),
+        );
+        let _guard = output_span.enter();
+        observability::output_started(
+            target.output_name(),
+            target_config.table(),
+            target_config.load_mode(),
+        );
+        let result = self.plan_dry_run_output_report(request);
+        match &result {
+            Ok(_) => observability::output_completed(
+                target.output_name(),
+                target_config.table(),
+                target_config.load_mode(),
+            ),
+            Err(error) => observability::output_failed(
+                target.output_name(),
+                target_config.table(),
+                target_config.load_mode(),
+                &error.to_string(),
+            ),
+        }
+
+        result
+    }
+
+    fn plan_dry_run_output_report(
+        &self,
+        request: &OutputWritePlan,
+    ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
         let planned = self.plan_mssql_output(request)?;
 
         let phase_timings = dry_run_output_phase_timings(planned.phase_timings().to_vec());
