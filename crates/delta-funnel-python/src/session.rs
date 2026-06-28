@@ -1,7 +1,7 @@
 //! Python session wrapper.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
+use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 
 use crate::exception::{delta_funnel_error_to_py, delta_funnel_py_error};
 
@@ -18,8 +18,8 @@ impl PySession {
     fn new(
         py: Python<'_>,
         default_mssql_connection_string: Option<String>,
-        target_partitions: Option<usize>,
-        output_batch_size: Option<usize>,
+        #[pyo3(from_py_with = parse_target_partitions_arg)] target_partitions: Option<usize>,
+        #[pyo3(from_py_with = parse_output_batch_size_arg)] output_batch_size: Option<usize>,
         provider_scan_options: Option<&Bound<'_, PyDict>>,
         validation_options: Option<&Bound<'_, PyDict>>,
         schema_options: Option<&Bound<'_, PyDict>>,
@@ -63,6 +63,22 @@ fn rust_error_to_py(py: Python<'_>, error: delta_funnel::DeltaFunnelError) -> Py
     match delta_funnel_error_to_py(py, error) {
         Ok(error) => error,
         Err(error) => error,
+    }
+}
+
+fn parse_target_partitions_arg(value: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+    optional_usize_arg(value, "target_partitions")
+}
+
+fn parse_output_batch_size_arg(value: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+    optional_usize_arg(value, "output_batch_size")
+}
+
+fn optional_usize_arg(value: &Bound<'_, PyAny>, option_name: &str) -> PyResult<Option<usize>> {
+    if value.is_none() {
+        Ok(None)
+    } else {
+        usize_option(value.py(), value, option_name).map(Some)
     }
 }
 
@@ -454,6 +470,14 @@ fn option_name(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
 }
 
 fn usize_option(py: Python<'_>, value: &Bound<'_, PyAny>, option_name: &str) -> PyResult<usize> {
+    if value.is_instance_of::<PyBool>() {
+        return Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("`{option_name}` must be a non-negative integer"),
+        ));
+    }
+
     value.extract::<usize>().map_err(|_| {
         config_py_error(
             py,
@@ -623,6 +647,70 @@ mod tests {
                         .contains(option_name)
                 );
             }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn session_rejects_bool_numeric_options_with_config_phase() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            for option_name in ["target_partitions", "output_batch_size"] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item(option_name, true)?;
+
+                let error = match module.getattr("Session")?.call((), Some(&kwargs)) {
+                    Ok(_) => return Err(PyAssertionError::new_err("expected bool option error")),
+                    Err(error) => error,
+                };
+
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "config"
+                );
+                assert!(
+                    error
+                        .value(py)
+                        .getattr("message")?
+                        .extract::<String>()?
+                        .contains(option_name)
+                );
+            }
+
+            let provider_scan_options = PyDict::new(py);
+            provider_scan_options.set_item("max_concurrent_file_reads_per_partition", true)?;
+            let error = match PySession::new(
+                py,
+                None,
+                None,
+                None,
+                Some(&provider_scan_options),
+                None,
+                None,
+            ) {
+                Ok(_) => return Err(PyAssertionError::new_err("expected bool option error")),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
+
+            let string_policy = PyDict::new(py);
+            string_policy.set_item("nvarchar", true)?;
+            let schema_options = PyDict::new(py);
+            schema_options.set_item("string_policy", string_policy)?;
+            let error =
+                match PySession::new(py, None, None, None, None, None, Some(&schema_options)) {
+                    Ok(_) => return Err(PyAssertionError::new_err("expected bool option error")),
+                    Err(error) => error,
+                };
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
 
             Ok(())
         })
