@@ -5,11 +5,12 @@ use crate::{
     LazyTableKind, LoadMode, MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport,
     MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport, MssqlOutputBatchValidationReport,
     MssqlOutputFieldReport, MssqlOutputWriteStatus, MssqlTargetCleanupStatus, MssqlTargetTable,
-    MssqlWorkflowWriteReport, MssqlWriteFailureReport, MssqlWriteReport, MssqlWriteSkippedReason,
-    MssqlWriteSkippedReport, MssqlWriteStats, OutputStatus, PhaseStatus, PhaseTimingReport,
-    ReportReasonCode, RowCount, RunMode, ValidationStatus, WorkflowStatus,
-    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
-    WriteAllCacheCandidateSkipReason, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
+    MssqlWorkflowWriteReport, MssqlWriteFailureContext, MssqlWriteFailureReport, MssqlWritePhase,
+    MssqlWriteReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport, MssqlWriteStats,
+    OutputStatus, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount, RunMode,
+    ValidationStatus, WorkflowStatus, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
+    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheReport,
+    WriteAllNoCacheReason, WriteAllReport,
 };
 
 impl RowCount {
@@ -373,12 +374,40 @@ impl MssqlWriteFailureReport {
             "load_mode": load_mode(self.target().load_mode()),
             "connection_source": connection_source(self.target().connection_source()),
             "error": self.error(),
-            "context_available": self.context().is_some(),
+            "context": self.context().map(MssqlWriteFailureContext::to_json_value),
             "output_row_count": self.output_row_count().to_json_value(),
             "target_row_count": self.target_row_count().to_json_value(),
             "validation_status": self.validation_status().to_json_value(),
             "batch_shaping": batch_shaping_value(self.batch_shaping()),
             "phase_timings": phase_timings_value(self.phase_timings()),
+        })
+    }
+}
+
+impl MssqlWriteFailureContext {
+    /// Returns phase-aware write failure context as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "phase": write_phase(self.phase()),
+            "output_name": self.output_name(),
+            "target_table": target_table_value(self.target_table()),
+            "load_mode": load_mode(self.load_mode()),
+            "connection_source": connection_source(self.connection_source()),
+            "connection": {
+                "display_label": self.connection().display_label(),
+            },
+            "write_stats": self.stats().to_json_value(),
+            "output_row_count": self.output_row_count().to_json_value(),
+            "target_row_count_before_write": self.target_row_count_before_write().to_json_value(),
+            "target_row_count_after_write": self.target_row_count_after_write().to_json_value(),
+            "target_row_count": self.target_row_count().to_json_value(),
+            "validation_status": self.validation_status().to_json_value(),
+            "batch_shaping": batch_shaping_value(self.batch_shaping()),
+            "partial_write_possible": self.partial_write_possible(),
+            "cleanup": cleanup_status(self.cleanup()),
+            "phase_timings": phase_timings_value(self.phase_timings()),
+            "report": self.report().to_json_value(),
         })
     }
 }
@@ -569,6 +598,20 @@ fn cleanup_status(status: MssqlTargetCleanupStatus) -> &'static str {
         MssqlTargetCleanupStatus::NotAttempted => "not_attempted",
         MssqlTargetCleanupStatus::Succeeded => "succeeded",
         MssqlTargetCleanupStatus::Failed => "failed",
+    }
+}
+
+fn write_phase(phase: MssqlWritePhase) -> &'static str {
+    match phase {
+        MssqlWritePhase::Connect => "connect",
+        MssqlWritePhase::PrepareTargetLifecycle => "prepare_target_lifecycle",
+        MssqlWritePhase::InitializeWriter => "initialize_writer",
+        MssqlWritePhase::PollBatchStream => "poll_batch_stream",
+        MssqlWritePhase::ValidateBatchSchema => "validate_batch_schema",
+        MssqlWritePhase::WriteBatch => "write_batch",
+        MssqlWritePhase::Finalize => "finalize",
+        MssqlWritePhase::Validation => "validation",
+        MssqlWritePhase::Cleanup => "cleanup",
     }
 }
 
@@ -956,6 +999,35 @@ mod tests {
             json!({"kind": "exact", "value": 7})
         );
         assert_eq!(value["report"]["write_stats"]["rows_written"], 7);
+        assert_json_safe(&value)?;
+        assert_no_secret_or_raw_sql_text(&value);
+
+        Ok(())
+    }
+
+    #[test]
+    fn failure_context_json_exposes_structured_context_without_success_status() -> TestResult<()> {
+        let output_plan = output_plan()?;
+        let context = MssqlWriteFailureContext::from_output_plan(
+            &output_plan,
+            MssqlWritePhase::WriteBatch,
+            4,
+            1,
+            25,
+            true,
+            MssqlTargetCleanupStatus::Failed,
+        );
+
+        let value = context.to_json_value();
+
+        assert_eq!(value["phase"], "write_batch");
+        assert_eq!(
+            value["output_row_count"],
+            json!({"kind": "partial", "value": 4})
+        );
+        assert_eq!(value["partial_write_possible"], true);
+        assert_eq!(value["cleanup"], "failed");
+        assert!(value["report"].get("status").is_none());
         assert_json_safe(&value)?;
         assert_no_secret_or_raw_sql_text(&value);
 
