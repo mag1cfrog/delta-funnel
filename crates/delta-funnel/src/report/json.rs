@@ -257,7 +257,6 @@ impl MssqlWriteReport {
         json!({
             "output_name": self.output_name(),
             "run_mode": run_mode(RunMode::Execute),
-            "status": OutputStatus::succeeded().to_json_value(),
             "target_table": target_table_value(self.target_table()),
             "load_mode": load_mode(self.load_mode()),
             "connection_source": connection_source(self.connection_source()),
@@ -883,7 +882,7 @@ mod tests {
         let value = report.to_json_value();
 
         assert_eq!(value["run_mode"], "execute");
-        assert_eq!(value["status"]["kind"], "succeeded");
+        assert!(value.get("status").is_none());
         assert_eq!(value["output_name"], "orders_output");
         assert_eq!(value["target_table"]["schema"], "dbo");
         assert_eq!(value["target_table"]["table"], "orders");
