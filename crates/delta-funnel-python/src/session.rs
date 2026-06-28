@@ -14,7 +14,7 @@ pub(crate) struct PySession {
 #[pymethods]
 impl PySession {
     #[new]
-    #[pyo3(signature = (*, default_mssql_connection_string=None, target_partitions=None, output_batch_size=None, provider_scan_options=None, validation_options=None))]
+    #[pyo3(signature = (*, default_mssql_connection_string=None, target_partitions=None, output_batch_size=None, provider_scan_options=None, validation_options=None, schema_options=None))]
     fn new(
         py: Python<'_>,
         default_mssql_connection_string: Option<String>,
@@ -22,6 +22,7 @@ impl PySession {
         output_batch_size: Option<usize>,
         provider_scan_options: Option<&Bound<'_, PyDict>>,
         validation_options: Option<&Bound<'_, PyDict>>,
+        schema_options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let mut options = delta_funnel::SessionOptions::default();
         if let Some(connection_string) = default_mssql_connection_string {
@@ -39,6 +40,9 @@ impl PySession {
         }
         options =
             options.with_validation_options(parse_validation_options(py, validation_options)?);
+        if let Some(schema_options) = parse_schema_options(py, schema_options)? {
+            options = options.with_mssql_schema_options(schema_options);
+        }
 
         let inner = delta_funnel::DeltaFunnelSession::new(options)
             .map_err(|error| rust_error_to_py(py, error))?;
@@ -152,6 +156,58 @@ fn parse_validation_options(
     Ok(options)
 }
 
+fn parse_schema_options(
+    py: Python<'_>,
+    schema_options: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<delta_funnel::MssqlSchemaPlanOptions>> {
+    let mut options = delta_funnel::MssqlSchemaPlanOptions::default();
+    let Some(schema_options) = schema_options else {
+        return Ok(None);
+    };
+
+    for (key, value) in schema_options.iter() {
+        let key = option_name(py, &key)?;
+        match key.as_str() {
+            "string_policy" => {
+                options.string_policy = parse_string_policy(py, &value, key.as_str())?;
+            }
+            "binary_policy" => {
+                options.binary_policy = parse_binary_policy(py, &value, key.as_str())?;
+            }
+            "timezone_policy" => {
+                options.timezone_policy = parse_timezone_policy(py, &value, key.as_str())?;
+            }
+            "nanosecond_policy" => {
+                options.nanosecond_policy = parse_nanosecond_policy(py, &value, key.as_str())?;
+            }
+            "uint64_policy" => {
+                options.uint64_policy = parse_uint64_policy(py, &value, key.as_str())?;
+            }
+            "decimal_policy" => {
+                options.decimal_policy = parse_decimal_policy(py, &value, key.as_str())?;
+            }
+            "decimal256_policy" => {
+                options.decimal256_policy = parse_decimal256_policy(py, &value, key.as_str())?;
+            }
+            "float_policy" => {
+                options.float_policy = parse_float_policy(py, &value, key.as_str())?;
+            }
+            "date64_policy" => {
+                options.date64_policy = parse_date64_policy(py, &value, key.as_str())?;
+            }
+            _ => {
+                return Err(config_py_error(
+                    py,
+                    "unknown_option",
+                    format!("unknown schema option `{key}`"),
+                ));
+            }
+        }
+    }
+
+    Ok(Some(options))
+}
+
 fn parse_target_validation_mode(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
@@ -185,6 +241,206 @@ fn parse_dry_run_scan_summary_mode(
             format!("invalid `{option_name}` value `{value}`"),
         )),
     }
+}
+
+fn parse_string_policy(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::MssqlStringPolicy> {
+    if let Ok(value) = value.cast::<PyDict>() {
+        return Ok(delta_funnel::MssqlStringPolicy::NVarChar(
+            single_positive_usize_entry(py, value, option_name, "nvarchar")?,
+        ));
+    }
+
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "nvarchar_max" => Ok(delta_funnel::MssqlStringPolicy::NVarCharMax),
+        "observed_nvarchar" => Ok(delta_funnel::MssqlStringPolicy::ObservedNVarChar),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn parse_binary_policy(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::MssqlBinaryPolicy> {
+    if let Ok(value) = value.cast::<PyDict>() {
+        return Ok(delta_funnel::MssqlBinaryPolicy::VarBinary(
+            single_positive_usize_entry(py, value, option_name, "varbinary")?,
+        ));
+    }
+
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "varbinary_max" => Ok(delta_funnel::MssqlBinaryPolicy::VarBinaryMax),
+        "observed_varbinary" => Ok(delta_funnel::MssqlBinaryPolicy::ObservedVarBinary),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn parse_timezone_policy(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::MssqlTimezonePolicy> {
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "reject" => Ok(delta_funnel::MssqlTimezonePolicy::Reject),
+        "datetimeoffset" => Ok(delta_funnel::MssqlTimezonePolicy::DateTimeOffset),
+        "normalize_utc_datetime2" => Ok(delta_funnel::MssqlTimezonePolicy::NormalizeUtcDateTime2),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn parse_nanosecond_policy(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::MssqlNanosecondPolicy> {
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "reject_non_100ns" => Ok(delta_funnel::MssqlNanosecondPolicy::RejectNon100ns),
+        "round_to_100ns" => Ok(delta_funnel::MssqlNanosecondPolicy::RoundTo100ns),
+        "truncate_to_100ns" => Ok(delta_funnel::MssqlNanosecondPolicy::TruncateTo100ns),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn parse_uint64_policy(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::MssqlUInt64Policy> {
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "reject" => Ok(delta_funnel::MssqlUInt64Policy::Reject),
+        "decimal20_0" => Ok(delta_funnel::MssqlUInt64Policy::Decimal20_0),
+        "checked_bigint" => Ok(delta_funnel::MssqlUInt64Policy::CheckedBigInt),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn parse_decimal_policy(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::MssqlDecimalPolicy> {
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "reject_negative_scale" => Ok(delta_funnel::MssqlDecimalPolicy::RejectNegativeScale),
+        "normalize_negative_scale" => Ok(delta_funnel::MssqlDecimalPolicy::NormalizeNegativeScale),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn parse_decimal256_policy(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::MssqlDecimal256Policy> {
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "checked_downcast" => Ok(delta_funnel::MssqlDecimal256Policy::CheckedDowncast),
+        "reject" => Ok(delta_funnel::MssqlDecimal256Policy::Reject),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn parse_float_policy(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::MssqlFloatPolicy> {
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "reject_non_finite" => Ok(delta_funnel::MssqlFloatPolicy::RejectNonFinite),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn parse_date64_policy(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::MssqlDate64Policy> {
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "reject_non_midnight" => Ok(delta_funnel::MssqlDate64Policy::RejectNonMidnight),
+        "timestamp_datetime2" => Ok(delta_funnel::MssqlDate64Policy::TimestampDateTime2),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn single_positive_usize_entry(
+    py: Python<'_>,
+    value: &Bound<'_, PyDict>,
+    option_name: &str,
+    variant_name: &str,
+) -> PyResult<usize> {
+    if value.len() != 1 {
+        return Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("`{option_name}` must contain exactly one policy entry"),
+        ));
+    }
+
+    let Some(raw_value) = value.get_item(variant_name)? else {
+        return Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` variant"),
+        ));
+    };
+    let value = usize_option(py, &raw_value, option_name)?;
+    if value == 0 {
+        return Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("`{option_name}` bounded length must be at least 1"),
+        ));
+    }
+
+    Ok(value)
 }
 
 fn option_name(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -229,8 +485,10 @@ mod tests {
     use super::PySession;
     use crate::deltafunnel;
     use delta_funnel::{
-        DeltaProviderScanExecutionOptions, DryRunScanSummaryMode, QueryOptions,
-        TargetValidationMode,
+        DeltaProviderScanExecutionOptions, DryRunScanSummaryMode, MssqlBinaryPolicy,
+        MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy, MssqlFloatPolicy,
+        MssqlNanosecondPolicy, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTimezonePolicy,
+        MssqlUInt64Policy, QueryOptions, TargetValidationMode,
     };
     use pyo3::exceptions::PyAssertionError;
     use pyo3::prelude::*;
@@ -255,7 +513,7 @@ mod tests {
     #[test]
     fn default_session_constructs_with_safe_repr() -> PyResult<()> {
         Python::attach(|py| {
-            let session = Py::new(py, PySession::new(py, None, None, None, None, None)?)?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
             let repr = session.bind(py).repr()?.extract::<String>()?;
 
             assert_eq!(repr, "deltafunnel.Session()");
@@ -283,6 +541,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )?,
             )?;
             let repr = session.bind(py).repr()?.extract::<String>()?;
@@ -300,7 +559,7 @@ mod tests {
     #[test]
     fn session_accepts_query_options() -> PyResult<()> {
         Python::attach(|py| {
-            let session = PySession::new(py, None, Some(3), Some(17), None, None)?;
+            let session = PySession::new(py, None, Some(3), Some(17), None, None, None)?;
 
             assert_eq!(
                 session.inner.options().query_options(),
@@ -308,6 +567,20 @@ mod tests {
                     target_partitions: Some(3),
                     output_batch_size: Some(17),
                 }
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn omitted_schema_options_preserve_rust_defaults() -> PyResult<()> {
+        Python::attach(|py| {
+            let session = PySession::new(py, None, None, None, None, None, None)?;
+
+            assert_eq!(
+                session.inner.options().mssql_schema_options(),
+                MssqlSchemaPlanOptions::default()
             );
 
             Ok(())
@@ -328,6 +601,7 @@ mod tests {
                     None,
                     target_partitions,
                     output_batch_size,
+                    None,
                     None,
                     None,
                 ) {
@@ -363,7 +637,15 @@ mod tests {
             provider_scan_options.set_item("output_buffer_capacity_per_partition", 4)?;
             provider_scan_options.set_item("native_async_prefetch_file_count_per_partition", 1)?;
 
-            let session = PySession::new(py, None, None, None, Some(&provider_scan_options), None)?;
+            let session = PySession::new(
+                py,
+                None,
+                None,
+                None,
+                Some(&provider_scan_options),
+                None,
+                None,
+            )?;
 
             assert_eq!(
                 session.inner.options().provider_scan_options(),
@@ -386,7 +668,15 @@ mod tests {
             let provider_scan_options = PyDict::new(py);
             provider_scan_options.set_item("max_concurrent_file_reads_per_partition", 2)?;
 
-            let session = PySession::new(py, None, None, None, Some(&provider_scan_options), None)?;
+            let session = PySession::new(
+                py,
+                None,
+                None,
+                None,
+                Some(&provider_scan_options),
+                None,
+                None,
+            )?;
 
             assert_eq!(
                 session
@@ -429,6 +719,7 @@ mod tests {
                     None,
                     Some(&provider_scan_options),
                     None,
+                    None,
                 ) {
                     Ok(_) => {
                         return Err(PyAssertionError::new_err(
@@ -464,7 +755,7 @@ mod tests {
                 validation_options.set_item("target_validation_mode", value)?;
 
                 let session =
-                    PySession::new(py, None, None, None, None, Some(&validation_options))?;
+                    PySession::new(py, None, None, None, None, Some(&validation_options), None)?;
 
                 assert_eq!(
                     session
@@ -488,7 +779,7 @@ mod tests {
                 validation_options.set_item("dry_run_scan_summary_mode", value)?;
 
                 let session =
-                    PySession::new(py, None, None, None, None, Some(&validation_options))?;
+                    PySession::new(py, None, None, None, None, Some(&validation_options), None)?;
 
                 assert_eq!(
                     session
@@ -502,7 +793,8 @@ mod tests {
 
             let validation_options = PyDict::new(py);
             validation_options.set_item("require_successful_planning", false)?;
-            let session = PySession::new(py, None, None, None, None, Some(&validation_options))?;
+            let session =
+                PySession::new(py, None, None, None, None, Some(&validation_options), None)?;
 
             assert!(
                 !session
@@ -528,12 +820,255 @@ mod tests {
             for (key, value) in cases {
                 let validation_options = PyDict::new(py);
                 validation_options.set_item(key, value)?;
+                let error = match PySession::new(
+                    py,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&validation_options),
+                    None,
+                ) {
+                    Ok(_) => {
+                        return Err(PyAssertionError::new_err(
+                            "expected validation option error",
+                        ));
+                    }
+                    Err(error) => error,
+                };
+
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "config"
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn session_accepts_schema_options() -> PyResult<()> {
+        Python::attach(|py| {
+            let string_policies = [
+                ("nvarchar_max", MssqlStringPolicy::NVarCharMax),
+                ("observed_nvarchar", MssqlStringPolicy::ObservedNVarChar),
+            ];
+            for (value, expected) in string_policies {
+                let schema_options = PyDict::new(py);
+                schema_options.set_item("string_policy", value)?;
+
+                let session =
+                    PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+
+                assert_eq!(
+                    session.inner.options().mssql_schema_options().string_policy,
+                    expected
+                );
+            }
+
+            let string_policy = PyDict::new(py);
+            string_policy.set_item("nvarchar", 128)?;
+            let schema_options = PyDict::new(py);
+            schema_options.set_item("string_policy", string_policy)?;
+            let session = PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+            assert_eq!(
+                session.inner.options().mssql_schema_options().string_policy,
+                MssqlStringPolicy::NVarChar(128)
+            );
+
+            let binary_policies = [
+                ("varbinary_max", MssqlBinaryPolicy::VarBinaryMax),
+                ("observed_varbinary", MssqlBinaryPolicy::ObservedVarBinary),
+            ];
+            for (value, expected) in binary_policies {
+                let schema_options = PyDict::new(py);
+                schema_options.set_item("binary_policy", value)?;
+
+                let session =
+                    PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+
+                assert_eq!(
+                    session.inner.options().mssql_schema_options().binary_policy,
+                    expected
+                );
+            }
+
+            let binary_policy = PyDict::new(py);
+            binary_policy.set_item("varbinary", 256)?;
+            let schema_options = PyDict::new(py);
+            schema_options.set_item("binary_policy", binary_policy)?;
+            let session = PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+            assert_eq!(
+                session.inner.options().mssql_schema_options().binary_policy,
+                MssqlBinaryPolicy::VarBinary(256)
+            );
+
+            let timezone_policies = [
+                ("reject", MssqlTimezonePolicy::Reject),
+                ("datetimeoffset", MssqlTimezonePolicy::DateTimeOffset),
+                (
+                    "normalize_utc_datetime2",
+                    MssqlTimezonePolicy::NormalizeUtcDateTime2,
+                ),
+            ];
+            for (value, expected) in timezone_policies {
+                let schema_options = PyDict::new(py);
+                schema_options.set_item("timezone_policy", value)?;
+
+                let session =
+                    PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+
+                assert_eq!(
+                    session
+                        .inner
+                        .options()
+                        .mssql_schema_options()
+                        .timezone_policy,
+                    expected
+                );
+            }
+
+            let nanosecond_policies = [
+                ("reject_non_100ns", MssqlNanosecondPolicy::RejectNon100ns),
+                ("round_to_100ns", MssqlNanosecondPolicy::RoundTo100ns),
+                ("truncate_to_100ns", MssqlNanosecondPolicy::TruncateTo100ns),
+            ];
+            for (value, expected) in nanosecond_policies {
+                let schema_options = PyDict::new(py);
+                schema_options.set_item("nanosecond_policy", value)?;
+
+                let session =
+                    PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+
+                assert_eq!(
+                    session
+                        .inner
+                        .options()
+                        .mssql_schema_options()
+                        .nanosecond_policy,
+                    expected
+                );
+            }
+
+            let uint64_policies = [
+                ("reject", MssqlUInt64Policy::Reject),
+                ("decimal20_0", MssqlUInt64Policy::Decimal20_0),
+                ("checked_bigint", MssqlUInt64Policy::CheckedBigInt),
+            ];
+            for (value, expected) in uint64_policies {
+                let schema_options = PyDict::new(py);
+                schema_options.set_item("uint64_policy", value)?;
+
+                let session =
+                    PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+
+                assert_eq!(
+                    session.inner.options().mssql_schema_options().uint64_policy,
+                    expected
+                );
+            }
+
+            let decimal_policies = [
+                (
+                    "reject_negative_scale",
+                    MssqlDecimalPolicy::RejectNegativeScale,
+                ),
+                (
+                    "normalize_negative_scale",
+                    MssqlDecimalPolicy::NormalizeNegativeScale,
+                ),
+            ];
+            for (value, expected) in decimal_policies {
+                let schema_options = PyDict::new(py);
+                schema_options.set_item("decimal_policy", value)?;
+
+                let session =
+                    PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+
+                assert_eq!(
+                    session
+                        .inner
+                        .options()
+                        .mssql_schema_options()
+                        .decimal_policy,
+                    expected
+                );
+            }
+
+            let decimal256_policies = [
+                ("checked_downcast", MssqlDecimal256Policy::CheckedDowncast),
+                ("reject", MssqlDecimal256Policy::Reject),
+            ];
+            for (value, expected) in decimal256_policies {
+                let schema_options = PyDict::new(py);
+                schema_options.set_item("decimal256_policy", value)?;
+
+                let session =
+                    PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+
+                assert_eq!(
+                    session
+                        .inner
+                        .options()
+                        .mssql_schema_options()
+                        .decimal256_policy,
+                    expected
+                );
+            }
+
+            let schema_options = PyDict::new(py);
+            schema_options.set_item("float_policy", "reject_non_finite")?;
+            let session = PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+            assert_eq!(
+                session.inner.options().mssql_schema_options().float_policy,
+                MssqlFloatPolicy::RejectNonFinite
+            );
+
+            let date64_policies = [
+                ("reject_non_midnight", MssqlDate64Policy::RejectNonMidnight),
+                ("timestamp_datetime2", MssqlDate64Policy::TimestampDateTime2),
+            ];
+            for (value, expected) in date64_policies {
+                let schema_options = PyDict::new(py);
+                schema_options.set_item("date64_policy", value)?;
+
+                let session =
+                    PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+
+                assert_eq!(
+                    session.inner.options().mssql_schema_options().date64_policy,
+                    expected
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn session_rejects_bad_schema_options_with_config_phase() -> PyResult<()> {
+        Python::attach(|py| {
+            let cases = [
+                ("unknown_option", "value"),
+                ("string_policy", "nvarchar"),
+                ("binary_policy", "varbinary"),
+                ("timezone_policy", "sometimes"),
+                ("nanosecond_policy", "round"),
+                ("uint64_policy", "decimal"),
+                ("decimal_policy", "normalize"),
+                ("decimal256_policy", "checked"),
+                ("float_policy", "allow_non_finite"),
+                ("date64_policy", "datetime2"),
+            ];
+
+            for (key, value) in cases {
+                let schema_options = PyDict::new(py);
+                schema_options.set_item(key, value)?;
                 let error =
-                    match PySession::new(py, None, None, None, None, Some(&validation_options)) {
+                    match PySession::new(py, None, None, None, None, None, Some(&schema_options)) {
                         Ok(_) => {
-                            return Err(PyAssertionError::new_err(
-                                "expected validation option error",
-                            ));
+                            return Err(PyAssertionError::new_err("expected schema option error"));
                         }
                         Err(error) => error,
                     };
@@ -543,6 +1078,34 @@ mod tests {
                     "config"
                 );
             }
+
+            let bad_string_policy = PyDict::new(py);
+            bad_string_policy.set_item("nvarchar", 0)?;
+            let schema_options = PyDict::new(py);
+            schema_options.set_item("string_policy", bad_string_policy)?;
+            let error =
+                match PySession::new(py, None, None, None, None, None, Some(&schema_options)) {
+                    Ok(_) => return Err(PyAssertionError::new_err("expected schema option error")),
+                    Err(error) => error,
+                };
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
+
+            let bad_binary_policy = PyDict::new(py);
+            bad_binary_policy.set_item("varbinary", 0)?;
+            let schema_options = PyDict::new(py);
+            schema_options.set_item("binary_policy", bad_binary_policy)?;
+            let error =
+                match PySession::new(py, None, None, None, None, None, Some(&schema_options)) {
+                    Ok(_) => return Err(PyAssertionError::new_err("expected schema option error")),
+                    Err(error) => error,
+                };
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
 
             Ok(())
         })
@@ -566,6 +1129,9 @@ mod tests {
             let validation_options = PyDict::new(py);
             validation_options.set_item("target_validation_mode", "disabled")?;
             kwargs.set_item("validation_options", validation_options)?;
+            let schema_options = PyDict::new(py);
+            schema_options.set_item("uint64_policy", "decimal20_0")?;
+            kwargs.set_item("schema_options", schema_options)?;
 
             let session = module.getattr("Session")?.call((), Some(&kwargs))?;
             let repr = session.repr()?.extract::<String>()?;
