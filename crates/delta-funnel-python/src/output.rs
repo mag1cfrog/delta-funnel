@@ -509,11 +509,16 @@ union all select cast(202 as bigint) as order_id",),
                 "create_and_load",
             )?;
             kwargs.set_item("connection_string", config.connection_string.as_str())?;
+            kwargs.set_item("name", "orders_override")?;
 
             let report = source.call_method("write_to_mssql", (), Some(&kwargs))?;
             let report_repr = report.repr()?.extract::<String>()?;
             assert!(!report_repr.contains(config.connection_string.as_str()));
             let report = report.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(report, "output_name")?.extract::<String>()?,
+                "orders_override"
+            );
             assert_eq!(
                 required_item(report, "connection_source")?.extract::<String>()?,
                 "target_override"
@@ -526,6 +531,10 @@ union all select cast(202 as bigint) as order_id",),
             );
             let write_stats = required_item(report, "write_stats")?;
             let write_stats = write_stats.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(write_stats, "output_name")?.extract::<String>()?,
+                "orders_override"
+            );
             assert_eq!(
                 required_item(write_stats, "rows_written")?.extract::<u64>()?,
                 2
