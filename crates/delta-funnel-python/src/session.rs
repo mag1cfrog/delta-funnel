@@ -61,7 +61,19 @@ impl PySession {
     }
 
     fn __repr__(&self) -> String {
-        "deltafunnel.Session()".to_owned()
+        let sources = self
+            .inner
+            .sources()
+            .iter()
+            .map(delta_funnel::RegisteredSessionSource::name)
+            .collect::<Vec<_>>();
+        let derived_tables = self
+            .inner
+            .derived_tables()
+            .iter()
+            .map(delta_funnel::RegisteredDerivedTable::name)
+            .collect::<Vec<_>>();
+        format!("deltafunnel.Session(sources={sources:?}, derived_tables={derived_tables:?})")
     }
 
     /// Registers a named Delta source, or returns a pending source that cannot be referenced by SQL.
@@ -1051,7 +1063,7 @@ mod tests {
             let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
             let repr = session.bind(py).repr()?.extract::<String>()?;
 
-            assert_eq!(repr, "deltafunnel.Session()");
+            assert_eq!(repr, "deltafunnel.Session(sources=[], derived_tables=[])");
             assert!(!repr.contains("server=tcp"));
             assert!(!repr.contains("password"));
             assert!(!repr.contains("token"));
@@ -1414,6 +1426,10 @@ mod tests {
             assert_eq!(
                 downstream.repr()?.extract::<String>()?,
                 "deltafunnel.Table(id=2, kind=\"derived_sql\", name=\"table_2\")"
+            );
+            assert_eq!(
+                session.bind(py).repr()?.extract::<String>()?,
+                "deltafunnel.Session(sources=[\"orders\"], derived_tables=[\"recent_orders\"])"
             );
             Ok(())
         })
@@ -2186,7 +2202,7 @@ union all select cast(302 as bigint) as order_id",),
             )?;
             let repr = session.bind(py).repr()?.extract::<String>()?;
 
-            assert_eq!(repr, "deltafunnel.Session()");
+            assert_eq!(repr, "deltafunnel.Session(sources=[], derived_tables=[])");
             assert!(!repr.contains("server=tcp"));
             assert!(!repr.contains("admin"));
             assert!(!repr.contains("password"));
@@ -2840,7 +2856,7 @@ union all select cast(302 as bigint) as order_id",),
             let session = module.getattr("Session")?.call((), Some(&kwargs))?;
             let repr = session.repr()?.extract::<String>()?;
 
-            assert_eq!(repr, "deltafunnel.Session()");
+            assert_eq!(repr, "deltafunnel.Session(sources=[], derived_tables=[])");
             assert!(!repr.contains("server=tcp"));
             assert!(!repr.contains("admin"));
             assert!(!repr.contains("password"));
