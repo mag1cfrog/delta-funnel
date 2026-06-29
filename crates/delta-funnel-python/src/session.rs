@@ -93,7 +93,7 @@ impl PySession {
         Ok(PyTable::from_inner(slf, table))
     }
 
-    /// Runs a multi-output SQL Server dry-run plan without executing rows.
+    /// Writes multiple SQL Server outputs, or runs a dry-run plan when requested.
     #[pyo3(signature = (outputs, *, dry_run=None))]
     fn write_all(
         slf: Py<Self>,
@@ -101,7 +101,6 @@ impl PySession {
         outputs: Vec<PyRef<'_, PyMssqlOutputSpec>>,
         dry_run: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
-        ensure_write_all_dry_run_enabled(py, dry_run)?;
         for output in &outputs {
             if !output.belongs_to_session(py, &slf) {
                 return Err(config_py_error(
@@ -113,10 +112,20 @@ impl PySession {
         }
         let requests = outputs
             .iter()
-            .map(|output| output.write_plan(delta_funnel::RunMode::DryRun))
+            .map(|output| {
+                output.write_plan(if dry_run == Some(true) {
+                    delta_funnel::RunMode::DryRun
+                } else {
+                    delta_funnel::RunMode::Execute
+                })
+            })
             .collect::<Vec<_>>();
 
-        slf.borrow(py).dry_run_all_to_mssql(py, &requests)
+        if dry_run == Some(true) {
+            return slf.borrow(py).dry_run_all_to_mssql(py, &requests);
+        }
+
+        slf.borrow(py).execute_write_all(py, &requests)
     }
 }
 
@@ -178,6 +187,17 @@ impl PySession {
         let report = self
             .runtime
             .dry_run_all_to_mssql(&self.inner, requests)
+            .map_err(|error| rust_error_to_py(py, error))?;
+        json_value_to_py(py, &report.to_json_value())
+    }
+
+    fn execute_write_all(
+        &self,
+        py: Python<'_>,
+        requests: &[delta_funnel::OutputWritePlan],
+    ) -> PyResult<Py<PyAny>> {
+        let report = py
+            .detach(|| self.runtime.write_all(&self.inner, requests))
             .map_err(|error| rust_error_to_py(py, error))?;
         json_value_to_py(py, &report.to_json_value())
     }
@@ -769,18 +789,6 @@ fn source_config_py_error(py: Python<'_>, kind: &'static str, message: String) -
         Ok(error) => error,
         Err(error) => error,
     }
-}
-
-fn ensure_write_all_dry_run_enabled(py: Python<'_>, dry_run: Option<bool>) -> PyResult<()> {
-    if dry_run == Some(true) {
-        return Ok(());
-    }
-
-    Err(config_py_error(
-        py,
-        "execute_mode_not_enabled",
-        "write_all execute mode is not enabled yet; pass `dry_run=True`".to_owned(),
-    ))
 }
 
 #[cfg(test)]
@@ -1442,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn write_all_rejects_execute_mode_until_write_all_slice() -> PyResult<()> {
+    fn write_all_execute_mode_uses_rust_missing_connection_guard() -> PyResult<()> {
         Python::attach(|py| {
             let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
             let table =
@@ -1457,14 +1465,14 @@ mod tests {
                 .bind(py)
                 .call_method("write_all", (&outputs,), Some(&kwargs))
                 .unwrap_err();
-            assert_execute_mode_error(py, &error)?;
+            assert_missing_connection_error(py, &error)?;
 
             kwargs.set_item("dry_run", false)?;
             let error = session
                 .bind(py)
                 .call_method("write_all", (&outputs,), Some(&kwargs))
                 .unwrap_err();
-            assert_execute_mode_error(py, &error)?;
+            assert_missing_connection_error(py, &error)?;
 
             Ok(())
         })
@@ -2357,14 +2365,14 @@ mod tests {
             .ok_or_else(|| PyKeyError::new_err(key.to_owned()))
     }
 
-    fn assert_execute_mode_error(py: Python<'_>, error: &PyErr) -> PyResult<()> {
+    fn assert_missing_connection_error(py: Python<'_>, error: &PyErr) -> PyResult<()> {
         assert_eq!(
             error.value(py).getattr("phase")?.extract::<String>()?,
-            "config"
+            "mssql_target_config"
         );
         assert_eq!(
             error.value(py).getattr("kind")?.extract::<String>()?,
-            "execute_mode_not_enabled"
+            "missing_mssql_connection"
         );
         Ok(())
     }
