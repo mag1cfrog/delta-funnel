@@ -94,11 +94,12 @@ impl PySession {
     }
 
     /// Writes multiple SQL Server outputs, or runs a dry-run plan when requested.
-    #[pyo3(signature = (outputs, *, dry_run=None))]
+    #[pyo3(signature = (outputs, *, options=None, dry_run=None))]
     fn write_all(
         slf: Py<Self>,
         py: Python<'_>,
         outputs: Vec<PyRef<'_, PyMssqlOutputSpec>>,
+        options: Option<&Bound<'_, PyDict>>,
         dry_run: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
         for output in &outputs {
@@ -122,10 +123,18 @@ impl PySession {
             .collect::<Vec<_>>();
 
         if dry_run == Some(true) {
+            if options.is_some() {
+                return Err(config_py_error(
+                    py,
+                    "invalid_option_value",
+                    "`options` is only supported for execute `write_all` calls".to_owned(),
+                ));
+            }
             return slf.borrow(py).dry_run_all_to_mssql(py, &requests);
         }
 
-        slf.borrow(py).execute_write_all(py, &requests)
+        let options = parse_write_all_options(py, options)?;
+        slf.borrow(py).execute_write_all(py, &requests, options)
     }
 }
 
@@ -195,9 +204,13 @@ impl PySession {
         &self,
         py: Python<'_>,
         requests: &[delta_funnel::OutputWritePlan],
+        options: delta_funnel::WriteAllOptions,
     ) -> PyResult<Py<PyAny>> {
         let report = py
-            .detach(|| self.runtime.write_all(&self.inner, requests))
+            .detach(|| {
+                self.runtime
+                    .write_all_with_options(&self.inner, requests, options)
+            })
             .map_err(|error| rust_error_to_py(py, error))?;
         json_value_to_py(py, &report.to_json_value())
     }
@@ -452,6 +465,35 @@ fn parse_validation_options(
     Ok(options)
 }
 
+fn parse_write_all_options(
+    py: Python<'_>,
+    write_all_options: Option<&Bound<'_, PyDict>>,
+) -> PyResult<delta_funnel::WriteAllOptions> {
+    let mut options = delta_funnel::WriteAllOptions::default();
+    let Some(write_all_options) = write_all_options else {
+        return Ok(options);
+    };
+
+    for (key, value) in write_all_options.iter() {
+        let key = option_name(py, &key)?;
+        match key.as_str() {
+            "cache_mode" => {
+                options =
+                    options.with_cache_mode(parse_write_all_cache_mode(py, &value, key.as_str())?);
+            }
+            _ => {
+                return Err(config_py_error(
+                    py,
+                    "unknown_option",
+                    format!("unknown write_all option `{key}`"),
+                ));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
 fn parse_schema_options(
     py: Python<'_>,
     schema_options: Option<&Bound<'_, PyDict>>,
@@ -518,6 +560,22 @@ fn parse_target_validation_mode(
             py,
             "invalid_option_value",
             format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
+fn parse_write_all_cache_mode(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::WriteAllCacheMode> {
+    match option_string(py, value, option_name)?.as_str() {
+        "auto" => Ok(delta_funnel::WriteAllCacheMode::Auto),
+        "disabled" => Ok(delta_funnel::WriteAllCacheMode::Disabled),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value"),
         )),
     }
 }
@@ -1688,7 +1746,10 @@ union all select cast(302 as bigint) as order_id",),
             skipped_kwargs.set_item("name", "skipped_output")?;
             let skipped_spec = skipped.call_method("to_mssql", (), Some(&skipped_kwargs))?;
             let outputs = PyList::new(py, [&first_spec, &failing_spec, &skipped_spec])?;
+            let options = PyDict::new(py);
+            options.set_item("cache_mode", "disabled")?;
             let kwargs = PyDict::new(py);
+            kwargs.set_item("options", options)?;
             kwargs.set_item("dry_run", false)?;
 
             let report = session.call_method("write_all", (outputs,), Some(&kwargs))?;
@@ -1701,6 +1762,12 @@ union all select cast(302 as bigint) as order_id",),
             );
             assert_eq!(required_item(report, "failed_count")?.extract::<u64>()?, 1);
             assert_eq!(required_item(report, "skipped_count")?.extract::<u64>()?, 1);
+            let cache = required_item(report, "cache")?;
+            let cache = cache.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(cache, "kind")?.extract::<String>()?,
+                "disabled"
+            );
 
             let workflow = required_item(report, "workflow")?;
             let workflow = workflow.cast::<PyDict>()?;
@@ -1848,6 +1915,65 @@ union all select cast(302 as bigint) as order_id",),
                         .contains("duplicate output name")
                 );
             }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_rejects_bad_options_with_config_phase() -> PyResult<()> {
+        Python::attach(|py| {
+            let session = Py::new(
+                py,
+                PySession::new(
+                    py,
+                    Some("server=tcp:sql.example.com;password=secret-token".to_owned()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?,
+            )?;
+            let table =
+                session
+                    .bind(py)
+                    .call_method("table_from_sql", ("select 1 as id",), None)?;
+            let spec = table.call_method("to_mssql", (), Some(&mssql_kwargs(py, "orders")?))?;
+
+            let options = PyDict::new(py);
+            options.set_item("bogus", "disabled")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("options", options)?;
+            let outputs = PyList::new(py, [&spec])?;
+            let error = session
+                .bind(py)
+                .call_method("write_all", (outputs,), Some(&kwargs))
+                .unwrap_err();
+            assert_config_error(py, &error, "unknown_option")?;
+
+            let options = PyDict::new(py);
+            options.set_item("cache_mode", "sometimes")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("options", options)?;
+            let outputs = PyList::new(py, [&spec])?;
+            let error = session
+                .bind(py)
+                .call_method("write_all", (outputs,), Some(&kwargs))
+                .unwrap_err();
+            assert_config_error(py, &error, "invalid_option_value")?;
+
+            let options = PyDict::new(py);
+            options.set_item("cache_mode", "disabled")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("options", options)?;
+            kwargs.set_item("dry_run", true)?;
+            let outputs = PyList::new(py, [&spec])?;
+            let error = session
+                .bind(py)
+                .call_method("write_all", (outputs,), Some(&kwargs))
+                .unwrap_err();
+            assert_config_error(py, &error, "invalid_option_value")?;
 
             Ok(())
         })
@@ -2696,6 +2822,15 @@ union all select cast(302 as bigint) as order_id",),
             error.value(py).getattr("kind")?.extract::<String>()?,
             "missing_mssql_connection"
         );
+        Ok(())
+    }
+
+    fn assert_config_error(py: Python<'_>, error: &PyErr, kind: &str) -> PyResult<()> {
+        assert_eq!(
+            error.value(py).getattr("phase")?.extract::<String>()?,
+            "config"
+        );
+        assert_eq!(error.value(py).getattr("kind")?.extract::<String>()?, kind);
         Ok(())
     }
 
