@@ -426,8 +426,7 @@ fn parse_provider_scan_options(
         return Ok(None);
     };
 
-    for (key, value) in provider_scan_options.iter() {
-        let key = option_name(py, &key)?;
+    for (key, value) in option_entries(py, provider_scan_options)? {
         let value = usize_option(py, &value, key.as_str())?;
         match key.as_str() {
             "max_concurrent_file_reads_per_scan" => {
@@ -443,11 +442,7 @@ fn parse_provider_scan_options(
                 options.native_async_prefetch_file_count_per_partition = value;
             }
             _ => {
-                return Err(config_py_error(
-                    py,
-                    "unknown_option",
-                    format!("unknown provider scan option `{key}`"),
-                ));
+                return Err(unknown_option_error(py, "provider scan", key.as_str()));
             }
         }
     }
@@ -467,8 +462,7 @@ fn parse_validation_options(
         return Ok(options);
     };
 
-    for (key, value) in validation_options.iter() {
-        let key = option_name(py, &key)?;
+    for (key, value) in option_entries(py, validation_options)? {
         match key.as_str() {
             "target_validation_mode" => {
                 options = options.with_target_validation_mode(parse_target_validation_mode(
@@ -485,21 +479,11 @@ fn parse_validation_options(
                 )?);
             }
             "require_successful_planning" => {
-                let value = value.extract::<bool>().map_err(|_| {
-                    config_py_error(
-                        py,
-                        "invalid_option_value",
-                        "`require_successful_planning` must be a bool".to_owned(),
-                    )
-                })?;
+                let value = bool_option(py, &value, key.as_str())?;
                 options = options.with_require_successful_planning(value);
             }
             _ => {
-                return Err(config_py_error(
-                    py,
-                    "unknown_option",
-                    format!("unknown validation option `{key}`"),
-                ));
+                return Err(unknown_option_error(py, "validation", key.as_str()));
             }
         }
     }
@@ -516,19 +500,14 @@ fn parse_write_all_options(
         return Ok(options);
     };
 
-    for (key, value) in write_all_options.iter() {
-        let key = option_name(py, &key)?;
+    for (key, value) in option_entries(py, write_all_options)? {
         match key.as_str() {
             "cache_mode" => {
                 options =
                     options.with_cache_mode(parse_write_all_cache_mode(py, &value, key.as_str())?);
             }
             _ => {
-                return Err(config_py_error(
-                    py,
-                    "unknown_option",
-                    format!("unknown write_all option `{key}`"),
-                ));
+                return Err(unknown_option_error(py, "write_all", key.as_str()));
             }
         }
     }
@@ -545,8 +524,7 @@ fn parse_schema_options(
         return Ok(None);
     };
 
-    for (key, value) in schema_options.iter() {
-        let key = option_name(py, &key)?;
+    for (key, value) in option_entries(py, schema_options)? {
         match key.as_str() {
             "string_policy" => {
                 options.string_policy = parse_string_policy(py, &value, key.as_str())?;
@@ -576,11 +554,7 @@ fn parse_schema_options(
                 options.date64_policy = parse_date64_policy(py, &value, key.as_str())?;
             }
             _ => {
-                return Err(config_py_error(
-                    py,
-                    "unknown_option",
-                    format!("unknown schema option `{key}`"),
-                ));
+                return Err(unknown_option_error(py, "schema", key.as_str()));
             }
         }
     }
@@ -849,6 +823,27 @@ fn option_name(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
     })
 }
 
+fn option_entries<'py>(
+    py: Python<'py>,
+    options: &Bound<'py, PyDict>,
+) -> PyResult<Vec<(String, Bound<'py, PyAny>)>> {
+    let mut entries = Vec::with_capacity(options.len());
+    for (key, value) in options.iter() {
+        entries.push((option_name(py, &key)?, value));
+    }
+    Ok(entries)
+}
+
+fn bool_option(py: Python<'_>, value: &Bound<'_, PyAny>, option_name: &str) -> PyResult<bool> {
+    value.extract::<bool>().map_err(|_| {
+        config_py_error(
+            py,
+            "invalid_option_value",
+            format!("`{option_name}` must be a bool"),
+        )
+    })
+}
+
 fn usize_option(py: Python<'_>, value: &Bound<'_, PyAny>, option_name: &str) -> PyResult<usize> {
     if value.is_instance_of::<PyBool>() {
         return Err(config_py_error(
@@ -875,6 +870,14 @@ fn option_string(py: Python<'_>, value: &Bound<'_, PyAny>, option_name: &str) ->
             format!("`{option_name}` must be a string"),
         )
     })
+}
+
+fn unknown_option_error(py: Python<'_>, group: &str, key: &str) -> PyErr {
+    config_py_error(
+        py,
+        "unknown_option",
+        format!("unknown {group} option `{key}`"),
+    )
 }
 
 fn config_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr {
