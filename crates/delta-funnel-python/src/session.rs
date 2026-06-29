@@ -1635,7 +1635,7 @@ union all select cast(302 as bigint) as order_id",),
     }
 
     #[test]
-    fn write_all_dry_run_rejects_duplicate_output_names() -> PyResult<()> {
+    fn write_all_rejects_duplicate_output_names_before_stream_setup() -> PyResult<()> {
         Python::attach(|py| {
             let session = Py::new(
                 py,
@@ -1661,30 +1661,33 @@ union all select cast(302 as bigint) as order_id",),
                 first.call_method("to_mssql", (), Some(&mssql_kwargs(py, "orders")?))?;
             let second_spec =
                 second.call_method("to_mssql", (), Some(&mssql_kwargs(py, "orders")?))?;
-            let outputs = PyList::new(py, [&first_spec, &second_spec])?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("dry_run", true)?;
 
-            let error = session
-                .bind(py)
-                .call_method("write_all", (outputs,), Some(&kwargs))
-                .unwrap_err();
+            for dry_run in [true, false] {
+                let outputs = PyList::new(py, [&first_spec, &second_spec])?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("dry_run", dry_run)?;
 
-            assert_eq!(
-                error.value(py).getattr("phase")?.extract::<String>()?,
-                "mssql_workflow_planning"
-            );
-            assert_eq!(
-                error.value(py).getattr("kind")?.extract::<String>()?,
-                "mssql_workflow_planning"
-            );
-            assert!(
-                error
-                    .value(py)
-                    .getattr("message")?
-                    .extract::<String>()?
-                    .contains("duplicate output name")
-            );
+                let error = session
+                    .bind(py)
+                    .call_method("write_all", (outputs,), Some(&kwargs))
+                    .unwrap_err();
+
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "mssql_workflow_planning"
+                );
+                assert_eq!(
+                    error.value(py).getattr("kind")?.extract::<String>()?,
+                    "mssql_workflow_planning"
+                );
+                assert!(
+                    error
+                        .value(py)
+                        .getattr("message")?
+                        .extract::<String>()?
+                        .contains("duplicate output name")
+                );
+            }
 
             Ok(())
         })
