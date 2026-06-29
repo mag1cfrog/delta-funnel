@@ -78,11 +78,12 @@ impl PyMssqlOutputSpec {
         let table = self.target.table();
         let schema = table.schema().unwrap_or("");
         format!(
-            "deltafunnel.MssqlOutputSpec(name={:?}, source_table={:?}, schema={:?}, table={:?})",
+            "deltafunnel.MssqlOutputSpec(name={:?}, source_table={:?}, schema={:?}, table={:?}, load_mode={:?})",
             self.output_name,
             self.table.name(),
             schema,
-            table.table()
+            table.table(),
+            load_mode_name(self.target.load_mode())
         )
     }
 }
@@ -101,6 +102,14 @@ fn parse_load_mode(py: Python<'_>, value: &str) -> PyResult<delta_funnel::LoadMo
             "invalid_load_mode",
             format!("invalid `load_mode` value `{value}`"),
         )),
+    }
+}
+
+const fn load_mode_name(load_mode: delta_funnel::LoadMode) -> &'static str {
+    match load_mode {
+        delta_funnel::LoadMode::AppendExisting => "append_existing",
+        delta_funnel::LoadMode::CreateAndLoad => "create_and_load",
+        delta_funnel::LoadMode::Replace => "replace",
     }
 }
 
@@ -179,7 +188,7 @@ mod tests {
             let spec = table.call_method("to_mssql", (), Some(&kwargs))?;
             assert_eq!(
                 spec.repr()?.extract::<String>()?,
-                "deltafunnel.MssqlOutputSpec(name=\"orders\", source_table=\"table_0\", schema=\"dbo\", table=\"orders\")"
+                "deltafunnel.MssqlOutputSpec(name=\"orders\", source_table=\"table_0\", schema=\"dbo\", table=\"orders\", load_mode=\"create_and_load\")"
             );
             let spec = spec.extract::<PyRef<'_, PyMssqlOutputSpec>>()?;
 

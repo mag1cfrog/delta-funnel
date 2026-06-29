@@ -96,8 +96,25 @@ impl PyTable {
             .write_to_mssql(py, &spec.write_plan(delta_funnel::RunMode::Execute))
     }
 
-    fn __repr__(&self) -> String {
-        format!("deltafunnel.Table(name={:?})", self.inner.name())
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let kind = match self.inner.kind() {
+            delta_funnel::LazyTableKind::DeltaSource => "delta_source",
+            delta_funnel::LazyTableKind::DerivedSql => "derived_sql",
+        };
+        if let Some((source_uri, snapshot_version)) =
+            self.session.borrow(py).source_repr_details(&self.inner)
+        {
+            return format!(
+                "deltafunnel.Table(id={}, kind={kind:?}, name={:?}, source_uri={source_uri:?}, snapshot_version={snapshot_version})",
+                self.inner.id(),
+                self.inner.name()
+            );
+        }
+        format!(
+            "deltafunnel.Table(id={}, kind={kind:?}, name={:?})",
+            self.inner.id(),
+            self.inner.name()
+        )
     }
 }
 

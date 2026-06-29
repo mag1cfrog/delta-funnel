@@ -148,6 +148,18 @@ impl PySession {
 }
 
 impl PySession {
+    pub(crate) fn source_repr_details(
+        &self,
+        table: &delta_funnel::LazyTable,
+    ) -> Option<(&str, u64)> {
+        if table.kind() != delta_funnel::LazyTableKind::DeltaSource {
+            return None;
+        }
+        self.inner
+            .registered_source(table.name())
+            .map(|source| (source.source_uri(), source.snapshot_version()))
+    }
+
     fn register_delta_source(
         &mut self,
         py: Python<'_>,
@@ -274,7 +286,16 @@ impl PendingDeltaSource {
     }
 
     fn __repr__(&self) -> String {
-        "deltafunnel.PendingDeltaSource()".to_owned()
+        match self.version {
+            Some(version) => format!(
+                "deltafunnel.PendingDeltaSource(source_uri={:?}, snapshot_version={version})",
+                delta_funnel::sanitize_uri_for_display(&self.source_uri),
+            ),
+            None => format!(
+                "deltafunnel.PendingDeltaSource(source_uri={:?}, snapshot_version=None)",
+                delta_funnel::sanitize_uri_for_display(&self.source_uri),
+            ),
+        }
     }
 }
 
@@ -1052,13 +1073,17 @@ mod tests {
                 .bind(py)
                 .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
 
-            assert_eq!(
-                lazy.repr()?.extract::<String>()?,
-                "deltafunnel.Table(name=\"orders\")"
-            );
             let session = session.bind(py).borrow();
             assert_eq!(session.inner.source_reports().len(), 1);
             assert_eq!(session.inner.source_reports()[0].source_name(), "orders");
+            let source_uri = session.inner.source_reports()[0].source_uri().to_owned();
+            let snapshot_version = session.inner.source_reports()[0].snapshot_version();
+            assert_eq!(
+                lazy.repr()?.extract::<String>()?,
+                format!(
+                    "deltafunnel.Table(id=0, kind=\"delta_source\", name=\"orders\", source_uri={source_uri:?}, snapshot_version={snapshot_version})"
+                )
+            );
             Ok(())
         })
     }
@@ -1078,19 +1103,25 @@ mod tests {
 
             assert_eq!(
                 pending.repr()?.extract::<String>()?,
-                "deltafunnel.PendingDeltaSource()"
+                format!(
+                    "deltafunnel.PendingDeltaSource(source_uri={:?}, snapshot_version=0)",
+                    table.uri()
+                )
             );
             assert!(session.bind(py).borrow().inner.source_reports().is_empty());
 
             let lazy = pending.call_method("alias", ("orders",), None)?;
 
-            assert_eq!(
-                lazy.repr()?.extract::<String>()?,
-                "deltafunnel.Table(name=\"orders\")"
-            );
             let session = session.bind(py).borrow();
             assert_eq!(session.inner.source_reports().len(), 1);
             assert_eq!(session.inner.source_reports()[0].snapshot_version(), 0);
+            let source_uri = session.inner.source_reports()[0].source_uri().to_owned();
+            assert_eq!(
+                lazy.repr()?.extract::<String>()?,
+                format!(
+                    "deltafunnel.Table(id=0, kind=\"delta_source\", name=\"orders\", source_uri={source_uri:?}, snapshot_version=0)"
+                )
+            );
             Ok(())
         })
     }
@@ -1306,8 +1337,10 @@ mod tests {
                 Some(&kwargs),
             )?;
             let pending_repr = pending.repr()?.extract::<String>()?;
+            assert!(pending_repr.contains(table.uri().as_str()));
             assert!(!pending_repr.contains("super-secret"));
             assert!(!pending_repr.contains("debug-secret"));
+            assert!(!pending_repr.contains("?token="));
 
             kwargs.set_item("name", "select")?;
             let error = match session.bind(py).call_method(
@@ -1345,7 +1378,7 @@ mod tests {
 
             assert_eq!(
                 derived.repr()?.extract::<String>()?,
-                "deltafunnel.Table(name=\"table_1\")"
+                "deltafunnel.Table(id=1, kind=\"derived_sql\", name=\"table_1\")"
             );
             assert!(!derived.repr()?.extract::<String>()?.contains("select id"));
             Ok(())
@@ -1376,11 +1409,11 @@ mod tests {
 
             assert_eq!(
                 aliased.repr()?.extract::<String>()?,
-                "deltafunnel.Table(name=\"recent_orders\")"
+                "deltafunnel.Table(id=1, kind=\"derived_sql\", name=\"recent_orders\")"
             );
             assert_eq!(
                 downstream.repr()?.extract::<String>()?,
-                "deltafunnel.Table(name=\"table_2\")"
+                "deltafunnel.Table(id=2, kind=\"derived_sql\", name=\"table_2\")"
             );
             Ok(())
         })

@@ -77,6 +77,7 @@ pub(crate) use sql_server::{
     MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer,
     write_output_batches_to_mssql_with_validation_options,
 };
+pub use support::sanitize_uri_for_display;
 pub use table_formats::{
     DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource, ProtocolPreflight,
     load_delta_source, load_delta_sources, preflight_delta_protocol, preflight_delta_sources,

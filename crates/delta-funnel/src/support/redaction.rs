@@ -8,7 +8,7 @@ pub(crate) fn sanitize_text_for_display(text: &str) -> String {
 
 /// Sanitizes a URI for display in logs, errors, and reports.
 #[must_use]
-pub(crate) fn sanitize_uri_for_display(uri: &str) -> String {
+pub fn sanitize_uri_for_display(uri: &str) -> String {
     let uri = strip_fragment_and_query(uri);
     let uri = strip_userinfo(uri);
 
