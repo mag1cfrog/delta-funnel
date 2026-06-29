@@ -1493,8 +1493,8 @@ mod tests {
 
     #[test]
     #[ignore = "runs through cargo xtask sqlserver-test"]
-    fn write_all_execute_writes_multiple_outputs_with_default_connection_when_configured()
-    -> TestResult<()> {
+    fn write_all_execute_writes_default_and_override_connections_when_configured() -> TestResult<()>
+    {
         let Some(config) = MssqlIntegrationConfig::from_env() else {
             return Ok(());
         };
@@ -1538,6 +1538,7 @@ union all select cast(302 as bigint) as order_id",),
             east_kwargs.set_item("table", east_table.table().as_str())?;
             east_kwargs.set_item("load_mode", "create_and_load")?;
             east_kwargs.set_item("name", "east_orders")?;
+            east_kwargs.set_item("connection_string", config.connection_string.as_str())?;
             let east_spec = east.call_method("to_mssql", (), Some(&east_kwargs))?;
             let outputs = PyList::new(py, [&west_spec, &east_spec])?;
 
@@ -1578,10 +1579,15 @@ union all select cast(302 as bigint) as order_id",),
 
             let west_output = outputs.get_item(0)?;
             let west_output = west_output.cast::<PyDict>()?;
-            assert_succeeded_output(west_output, west_table.table().as_str(), 2)?;
+            assert_succeeded_output(
+                west_output,
+                west_table.table().as_str(),
+                "context_default",
+                2,
+            )?;
             let east_output = outputs.get_item(1)?;
             let east_output = east_output.cast::<PyDict>()?;
-            assert_succeeded_output(east_output, "east_orders", 1)?;
+            assert_succeeded_output(east_output, "east_orders", "target_override", 1)?;
 
             Ok::<(), PyErr>(())
         });
@@ -2487,6 +2493,7 @@ union all select cast(302 as bigint) as order_id",),
     fn assert_succeeded_output(
         output: &Bound<'_, PyDict>,
         output_name: &str,
+        connection_source: &str,
         row_count: u64,
     ) -> PyResult<()> {
         assert_eq!(
@@ -2499,7 +2506,7 @@ union all select cast(302 as bigint) as order_id",),
         );
         assert_eq!(
             required_item(output, "connection_source")?.extract::<String>()?,
-            "context_default"
+            connection_source
         );
         let output_row_count = required_item(output, "output_row_count")?;
         let output_row_count = output_row_count.cast::<PyDict>()?;
