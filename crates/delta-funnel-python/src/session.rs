@@ -159,6 +159,17 @@ impl PySession {
         json_value_to_py(py, &report.to_json_value())
     }
 
+    pub(crate) fn write_to_mssql(
+        &self,
+        py: Python<'_>,
+        request: &delta_funnel::OutputWritePlan,
+    ) -> PyResult<Py<PyAny>> {
+        let report = py
+            .detach(|| self.runtime.write_to_mssql(&self.inner, request))
+            .map_err(|error| rust_error_to_py(py, error))?;
+        json_value_to_py(py, &report.to_json_value())
+    }
+
     fn dry_run_all_to_mssql(
         &self,
         py: Python<'_>,

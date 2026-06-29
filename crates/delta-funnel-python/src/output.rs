@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn table_write_to_mssql_rejects_execute_mode_until_write_slice() -> PyResult<()> {
+    fn table_write_to_mssql_execute_mode_uses_rust_missing_connection_guard() -> PyResult<()> {
         Python::attach(|py| {
             let table = sql_table(py)?;
             let kwargs = mssql_kwargs(py, "dbo", "orders", "append_existing")?;
@@ -346,13 +346,13 @@ mod tests {
             let error = table
                 .call_method("write_to_mssql", (), Some(&kwargs))
                 .unwrap_err();
-            assert_execute_mode_error(py, &error)?;
+            assert_missing_connection_error(py, &error)?;
 
             kwargs.set_item("dry_run", false)?;
             let error = table
                 .call_method("write_to_mssql", (), Some(&kwargs))
                 .unwrap_err();
-            assert_execute_mode_error(py, &error)?;
+            assert_missing_connection_error(py, &error)?;
 
             Ok(())
         })
@@ -383,14 +383,14 @@ mod tests {
             .ok_or_else(|| PyKeyError::new_err(key.to_owned()))
     }
 
-    fn assert_execute_mode_error(py: Python<'_>, error: &PyErr) -> PyResult<()> {
+    fn assert_missing_connection_error(py: Python<'_>, error: &PyErr) -> PyResult<()> {
         assert_eq!(
             error.value(py).getattr("phase")?.extract::<String>()?,
-            "config"
+            "mssql_target_config"
         );
         assert_eq!(
             error.value(py).getattr("kind")?.extract::<String>()?,
-            "execute_mode_not_enabled"
+            "missing_mssql_connection"
         );
         Ok(())
     }

@@ -2,7 +2,6 @@
 
 use pyo3::prelude::*;
 
-use crate::exception::delta_funnel_py_error;
 use crate::output::PyMssqlOutputSpec;
 use crate::session::PySession;
 
@@ -52,7 +51,7 @@ impl PyTable {
         )
     }
 
-    /// Runs a SQL Server dry-run plan without executing rows.
+    /// Writes this table to SQL Server, or runs a dry-run plan when requested.
     #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(
@@ -65,7 +64,6 @@ impl PyTable {
         name: Option<String>,
         connection_string: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        ensure_dry_run_enabled(py, dry_run)?;
         let spec = PyMssqlOutputSpec::new(
             py,
             self.session.clone_ref(py),
@@ -76,9 +74,16 @@ impl PyTable {
             name,
             connection_string,
         )?;
+        if dry_run == Some(true) {
+            return self
+                .session
+                .borrow(py)
+                .dry_run_to_mssql(py, &spec.write_plan(delta_funnel::RunMode::DryRun));
+        }
+
         self.session
             .borrow(py)
-            .dry_run_to_mssql(py, &spec.write_plan(delta_funnel::RunMode::DryRun))
+            .write_to_mssql(py, &spec.write_plan(delta_funnel::RunMode::Execute))
     }
 
     fn __repr__(&self) -> String {
@@ -88,25 +93,6 @@ impl PyTable {
 
 pub(crate) fn add_table(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTable>()
-}
-
-fn ensure_dry_run_enabled(py: Python<'_>, dry_run: Option<bool>) -> PyResult<()> {
-    if dry_run == Some(true) {
-        return Ok(());
-    }
-
-    Err(config_py_error(
-        py,
-        "execute_mode_not_enabled",
-        "write_to_mssql execute mode is not enabled yet; pass `dry_run=True`".to_owned(),
-    ))
-}
-
-fn config_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr {
-    match delta_funnel_py_error(py, "config", kind, message, None) {
-        Ok(error) => error,
-        Err(error) => error,
-    }
 }
 
 #[cfg(test)]
