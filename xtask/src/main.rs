@@ -3,8 +3,10 @@
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod sqlserver;
 
@@ -34,6 +36,15 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), XtaskError> {
 
             let options = SqlServerTestOptions::parse(&args[1..])?;
             run_sqlserver_tests(&options)
+        }
+        Some("python-package-check") => {
+            if args[1..].iter().any(|arg| arg == "-h" || arg == "--help") {
+                print_python_package_check_help();
+                return Ok(());
+            }
+
+            let options = PythonPackageCheckOptions::parse(&args[1..])?;
+            run_python_package_check(&options)
         }
         Some(command) => Err(XtaskError::UnknownCommand(command.to_owned())),
     }
@@ -120,15 +131,100 @@ fn run_sqlserver_tests(options: &SqlServerTestOptions) -> Result<(), XtaskError>
     Ok(())
 }
 
+fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), XtaskError> {
+    println!("python-package-check");
+    println!("  python: {}", options.python.display());
+
+    let repo_root = repo_root();
+    let python_crate = repo_root.join("crates").join("delta-funnel-python");
+    let temp_parent = repo_root.join("target").join("xtask");
+    let temp_dir = TempDir::create_in(&temp_parent, "python-package-check")?;
+    let tool_tmp = temp_dir.path().join("tmp");
+    let wheels_dir = temp_dir.path().join("wheels");
+    fs::create_dir_all(&tool_tmp).map_err(|source| XtaskError::TempDir {
+        path: tool_tmp.clone(),
+        source,
+    })?;
+    fs::create_dir_all(&wheels_dir).map_err(|source| XtaskError::TempDir {
+        path: wheels_dir.clone(),
+        source,
+    })?;
+    println!("  work dir: {}", temp_dir.path().display());
+
+    let mut command = Command::new("maturin");
+    command
+        .arg("build")
+        .arg("--skip-auditwheel")
+        .arg("--out")
+        .arg(&wheels_dir)
+        .current_dir(&python_crate)
+        .env("TMPDIR", &tool_tmp);
+
+    run_command(
+        &mut command,
+        "run maturin build --skip-auditwheel for the Python package",
+    )?;
+
+    let wheel = single_wheel_in(&wheels_dir)?;
+    println!("  wheel: {}", wheel.display());
+
+    let mut command = Command::new(&options.python);
+    command
+        .arg("-c")
+        .arg(WHEEL_CONTENT_CHECK)
+        .arg(&wheel)
+        .current_dir(&repo_root)
+        .env("TMPDIR", &tool_tmp);
+    run_command(&mut command, "verify Python wheel typing metadata")?;
+
+    let venv_dir = temp_dir.path().join("venv");
+    let mut command = Command::new(&options.python);
+    command
+        .arg("-m")
+        .arg("venv")
+        .arg(&venv_dir)
+        .env("TMPDIR", &tool_tmp);
+    run_command(&mut command, "create clean Python virtualenv")?;
+
+    let venv_python = venv_python(&venv_dir);
+    let pip_cache = temp_dir.path().join("pip-cache");
+
+    let mut command = Command::new(&venv_python);
+    command
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("--no-cache-dir")
+        .arg(&wheel)
+        .env("PIP_CACHE_DIR", &pip_cache)
+        .env("TMPDIR", &tool_tmp);
+    run_command(&mut command, "install Python wheel into clean virtualenv")?;
+
+    let mut command = Command::new(&venv_python);
+    command
+        .arg("-c")
+        .arg(PYTHON_IMPORT_SMOKE)
+        .env("TMPDIR", &tool_tmp);
+    run_command(&mut command, "import deltafunnel and construct Session()")?;
+
+    Ok(())
+}
+
 fn print_top_level_help() {
     println!(
-        "Usage:\n  cargo xtask <COMMAND> [OPTIONS]\n\nCommands:\n  sqlserver-test    Run SQL Server integration tests\n\nRun `cargo xtask <COMMAND> --help` for command-specific options."
+        "Usage:\n  cargo xtask <COMMAND> [OPTIONS]\n\nCommands:\n  python-package-check    Build, install, and smoke-test the Python wheel\n  sqlserver-test          Run SQL Server integration tests\n\nRun `cargo xtask <COMMAND> --help` for command-specific options."
     );
 }
 
 fn print_sqlserver_test_help() {
     println!(
         "Usage:\n  cargo xtask sqlserver-test [OPTIONS]\n\nOptions:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Test database name\n  --schema <NAME>             Test schema name [default: dbo]\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
+    );
+}
+
+fn print_python_package_check_help() {
+    println!(
+        "Usage:\n  cargo xtask python-package-check [OPTIONS]\n\nOptions:\n  --python <PATH>  Python executable used for venv and smoke checks [default: python3]\n  -h, --help       Print help"
     );
 }
 
@@ -200,6 +296,48 @@ impl SqlServerTestOptions {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PythonPackageCheckOptions {
+    python: PathBuf,
+}
+
+impl Default for PythonPackageCheckOptions {
+    fn default() -> Self {
+        Self {
+            python: PathBuf::from("python3"),
+        }
+    }
+}
+
+impl PythonPackageCheckOptions {
+    fn parse(args: &[OsString]) -> Result<Self, XtaskError> {
+        let mut options = Self::default();
+        let mut index = 0;
+
+        while index < args.len() {
+            let arg = args[index]
+                .to_str()
+                .ok_or_else(|| XtaskError::InvalidUtf8Argument(args[index].clone()))?;
+
+            match arg {
+                "-h" | "--help" => {
+                    print_python_package_check_help();
+                    return Ok(options);
+                }
+                "--python" => {
+                    options.python = PathBuf::from(required_value(args, index)?);
+                    index += 1;
+                }
+                other => return Err(XtaskError::UnknownOption(other.to_owned())),
+            }
+
+            index += 1;
+        }
+
+        Ok(options)
+    }
+}
+
 fn required_value(args: &[OsString], index: usize) -> Result<String, XtaskError> {
     let value = args
         .get(index + 1)
@@ -216,6 +354,84 @@ fn option_name(args: &[OsString], index: usize) -> String {
         .and_then(|arg| arg.to_str())
         .unwrap_or("<unknown>")
         .to_owned()
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
+}
+
+fn single_wheel_in(wheels_dir: &Path) -> Result<PathBuf, XtaskError> {
+    let mut wheels = fs::read_dir(wheels_dir)
+        .map_err(|source| XtaskError::ReadDir {
+            path: wheels_dir.to_path_buf(),
+            source,
+        })?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("whl"))
+        .collect::<Vec<_>>();
+    wheels.sort();
+
+    match wheels.as_slice() {
+        [wheel] => Ok(wheel.clone()),
+        [] => Err(XtaskError::WheelCount {
+            dir: wheels_dir.to_path_buf(),
+            count: 0,
+        }),
+        wheels => Err(XtaskError::WheelCount {
+            dir: wheels_dir.to_path_buf(),
+            count: wheels.len(),
+        }),
+    }
+}
+
+fn venv_python(venv_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv_dir.join("Scripts").join("python.exe")
+    } else {
+        venv_dir.join("bin").join("python")
+    }
+}
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn create_in(parent: &Path, prefix: &str) -> Result<Self, XtaskError> {
+        fs::create_dir_all(parent).map_err(|source| XtaskError::TempDir {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let path = parent.join(format!("{prefix}-{}", unique_suffix()));
+        fs::create_dir_all(&path).map_err(|source| XtaskError::TempDir {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            eprintln!(
+                "failed to clean up temp dir `{}`: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+fn unique_suffix() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("{}-{millis}", std::process::id())
 }
 
 fn run_command(command: &mut Command, description: &'static str) -> Result<(), XtaskError> {
@@ -264,6 +480,18 @@ enum XtaskError {
     UnknownOption(String),
     MissingOptionValue(String),
     InvalidUtf8Argument(OsString),
+    ReadDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    TempDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    WheelCount {
+        dir: PathBuf,
+        count: usize,
+    },
     CommandSpawn {
         description: &'static str,
         source: std::io::Error,
@@ -282,6 +510,23 @@ impl fmt::Display for XtaskError {
             Self::UnknownOption(option) => write!(f, "unknown option `{option}`"),
             Self::MissingOptionValue(option) => write!(f, "missing value for `{option}`"),
             Self::InvalidUtf8Argument(arg) => write!(f, "argument is not valid UTF-8: {arg:?}"),
+            Self::ReadDir { path, source } => {
+                write!(f, "failed to read directory `{}`: {source}", path.display())
+            }
+            Self::TempDir { path, source } => {
+                write!(
+                    f,
+                    "failed to create temp dir `{}`: {source}",
+                    path.display()
+                )
+            }
+            Self::WheelCount { dir, count } => {
+                write!(
+                    f,
+                    "expected exactly one wheel in `{}`, found {count}",
+                    dir.display()
+                )
+            }
             Self::CommandSpawn {
                 description,
                 source,
@@ -299,11 +544,31 @@ impl fmt::Display for XtaskError {
     }
 }
 
+const WHEEL_CONTENT_CHECK: &str = r#"
+import sys
+import zipfile
+
+required = {"deltafunnel/__init__.pyi", "deltafunnel/py.typed"}
+with zipfile.ZipFile(sys.argv[1]) as wheel:
+    names = set(wheel.namelist())
+missing = sorted(required - names)
+if missing:
+    raise SystemExit("missing wheel entries: " + ", ".join(missing))
+"#;
+
+const PYTHON_IMPORT_SMOKE: &str = r#"
+import deltafunnel
+
+session = deltafunnel.Session()
+assert repr(session).startswith("deltafunnel.Session(")
+print(deltafunnel.__version__)
+"#;
+
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsString, fs, path::PathBuf};
 
-    use super::{SqlServerTestOptions, connection_string_with_database};
+    use super::{PythonPackageCheckOptions, SqlServerTestOptions, connection_string_with_database};
 
     #[test]
     fn parses_sqlserver_test_options() -> Result<(), String> {
@@ -327,6 +592,26 @@ mod tests {
         assert_eq!(options.schema, "dbo");
         assert!(options.connection.keep_container);
         Ok(())
+    }
+
+    #[test]
+    fn parses_python_package_check_options() -> Result<(), String> {
+        let args = [OsString::from("--python"), OsString::from("python")];
+
+        let options = match PythonPackageCheckOptions::parse(&args) {
+            Ok(options) => options,
+            Err(error) => return Err(format!("expected options to parse: {error}")),
+        };
+
+        assert_eq!(options.python, PathBuf::from("python"));
+        Ok(())
+    }
+
+    #[test]
+    fn python_package_check_defaults_to_python3() {
+        let options = PythonPackageCheckOptions::default();
+
+        assert_eq!(options.python, PathBuf::from("python3"));
     }
 
     #[test]

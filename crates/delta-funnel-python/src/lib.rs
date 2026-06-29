@@ -28,6 +28,7 @@ mod tests {
         assert!(README.contains("write_to_mssql("));
         assert!(README.contains("write_all(outputs, dry_run=True)"));
         assert!(README.contains("options={\"cache_mode\": \"disabled\"}"));
+        assert!(README.contains("cargo xtask python-package-check"));
         assert!(README.contains("docs/failure-reports-and-tracing.md"));
         assert!(README.contains("does not include persistent `cache`, `persist`,"));
         assert!(!README.contains("dry_run_to_mssql"));

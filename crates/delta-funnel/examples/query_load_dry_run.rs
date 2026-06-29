@@ -1,7 +1,7 @@
 //! Minimal Rust backing flow for a Delta-to-MSSQL dry run.
 //!
-//! This example is a how-to for Rust integrators who want to see the same
-//! public API shape that a future Python `Session` wrapper will call.
+//! This example is a how-to for Rust integrators who want to see the backing
+//! API shape used by the Python `Session` workflow.
 //!
 //! Run it with a local Delta table path:
 //!

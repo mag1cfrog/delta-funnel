@@ -8,8 +8,7 @@ package named `deltafunnel`.
 
 > [!NOTE]
 > DeltaFunnel is early project code. The Python package can be built and used
-> locally, but PyPI publishing and final package verification are tracked
-> separately.
+> locally, but PyPI publishing is not yet configured.
 
 ## What It Does
 
@@ -30,12 +29,7 @@ workflow API directly and does not add a pure Python wrapper layer.
 Build and install a local wheel:
 
 ```bash
-cd crates/delta-funnel-python
-maturin build --skip-auditwheel
-python -m venv .venv
-. .venv/bin/activate
-python -m pip install ../../target/wheels/deltafunnel-*.whl
-python -c "import deltafunnel; print(deltafunnel.__version__)"
+cargo xtask python-package-check
 ```
 
 Create a session with a default SQL Server connection string. `Session()` uses
@@ -173,6 +167,13 @@ Build the Python wheel:
 ```bash
 cd crates/delta-funnel-python
 maturin build --skip-auditwheel
+```
+
+Build, install, and smoke-test the Python wheel in a clean temporary
+virtualenv:
+
+```bash
+cargo xtask python-package-check
 ```
 
 SQL Server integration tests are opt-in:
