@@ -132,10 +132,22 @@ fn config_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr
 mod tests {
     use super::PyMssqlOutputSpec;
     use crate::deltafunnel;
-    use delta_funnel::LoadMode;
+    use delta_funnel::{LoadMode, MssqlTableName, connect_mssql_client_from_ado_string};
     use pyo3::exceptions::PyKeyError;
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule};
+    use std::{
+        env,
+        error::Error,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    const MSSQL_CONNECTION_STRING_ENV: &str = "DELTA_FUNNEL_MSSQL_TEST_CONNECTION_STRING";
+    const MSSQL_SCHEMA_ENV: &str = "DELTA_FUNNEL_MSSQL_TEST_SCHEMA";
+    static NEXT_TABLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    type TestResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
     #[test]
     fn module_exports_mssql_output_spec_type() -> PyResult<()> {
@@ -358,6 +370,113 @@ mod tests {
         })
     }
 
+    #[test]
+    fn table_write_to_mssql_execute_writes_with_default_connection_when_configured()
+    -> TestResult<()> {
+        let Some(config) = MssqlIntegrationConfig::from_env() else {
+            return Ok(());
+        };
+        let table = unique_table_name(&config.schema)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        runtime.block_on(drop_table(&config, &table))?;
+        let write_result = Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session_kwargs = PyDict::new(py);
+            session_kwargs.set_item(
+                "default_mssql_connection_string",
+                config.connection_string.as_str(),
+            )?;
+            let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+            let source = session.call_method(
+                "table_from_sql",
+                ("\
+select cast(101 as bigint) as order_id
+union all select cast(102 as bigint) as order_id
+union all select cast(103 as bigint) as order_id",),
+                None,
+            )?;
+            let kwargs = mssql_kwargs(
+                py,
+                &config.schema,
+                table.table().as_str(),
+                "create_and_load",
+            )?;
+
+            let report = source.call_method("write_to_mssql", (), Some(&kwargs))?;
+            let report_repr = report.repr()?.extract::<String>()?;
+            assert!(!report_repr.contains(config.connection_string.as_str()));
+            let report = report.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(report, "output_name")?.extract::<String>()?,
+                table.table().as_str()
+            );
+            assert_eq!(
+                required_item(report, "run_mode")?.extract::<String>()?,
+                "execute"
+            );
+            assert_eq!(
+                required_item(report, "connection_source")?.extract::<String>()?,
+                "context_default"
+            );
+            assert_eq!(
+                required_item(report, "cleanup")?.extract::<String>()?,
+                "not_attempted"
+            );
+            assert!(!required_item(report, "partial_write_possible")?.extract::<bool>()?);
+
+            let output_row_count = required_item(report, "output_row_count")?;
+            let output_row_count = output_row_count.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(output_row_count, "kind")?.extract::<String>()?,
+                "exact"
+            );
+            assert_eq!(
+                required_item(output_row_count, "value")?.extract::<u64>()?,
+                3
+            );
+            let target_row_count = required_item(report, "target_row_count")?;
+            let target_row_count = target_row_count.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(target_row_count, "kind")?.extract::<String>()?,
+                "exact"
+            );
+            assert_eq!(
+                required_item(target_row_count, "value")?.extract::<u64>()?,
+                3
+            );
+
+            let validation = required_item(report, "validation_status")?;
+            let validation = validation.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(validation, "kind")?.extract::<String>()?,
+                "passed"
+            );
+            let write_stats = required_item(report, "write_stats")?;
+            let write_stats = write_stats.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(write_stats, "rows_written")?.extract::<u64>()?,
+                3
+            );
+            assert!(required_item(write_stats, "batches_written")?.extract::<u64>()? >= 1);
+
+            Ok::<(), PyErr>(())
+        });
+        let cleanup_result = runtime.block_on(drop_table(&config, &table));
+
+        match (write_result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_error), Ok(())) => Err(Box::new(write_error)),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(write_error), Err(cleanup_error)) => {
+                Err(format!("write failed: {write_error}; cleanup failed: {cleanup_error}").into())
+            }
+        }
+    }
+
     fn sql_table(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         let module = PyModule::new(py, "deltafunnel")?;
         deltafunnel(&module)?;
@@ -393,5 +512,62 @@ mod tests {
             "missing_mssql_connection"
         );
         Ok(())
+    }
+
+    struct MssqlIntegrationConfig {
+        connection_string: String,
+        schema: String,
+    }
+
+    impl MssqlIntegrationConfig {
+        fn from_env() -> Option<Self> {
+            let connection_string = env::var(MSSQL_CONNECTION_STRING_ENV)
+                .ok()
+                .and_then(non_empty_value);
+            let schema = env::var(MSSQL_SCHEMA_ENV).ok().and_then(non_empty_value);
+
+            match (connection_string, schema) {
+                (Some(connection_string), Some(schema)) => Some(Self {
+                    connection_string,
+                    schema,
+                }),
+                _ => {
+                    eprintln!(
+                        "skipping Python MSSQL integration test; missing {} or {}",
+                        MSSQL_CONNECTION_STRING_ENV, MSSQL_SCHEMA_ENV
+                    );
+                    None
+                }
+            }
+        }
+    }
+
+    async fn drop_table(config: &MssqlIntegrationConfig, table: &MssqlTableName) -> TestResult<()> {
+        let mut client = connect_mssql_client_from_ado_string(&config.connection_string).await?;
+        client
+            .execute_statement(&format!("DROP TABLE IF EXISTS {};", table.quoted_sql()))
+            .await?;
+
+        Ok(())
+    }
+
+    fn unique_table_name(schema: &str) -> TestResult<MssqlTableName> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sequence = NEXT_TABLE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+
+        Ok(MssqlTableName::new(
+            schema.to_owned(),
+            format!(
+                "df_python_mssql_it_{}_{}_{}",
+                std::process::id(),
+                timestamp,
+                sequence
+            ),
+        )?)
+    }
+
+    fn non_empty_value(value: String) -> Option<String> {
+        let value = value.trim().to_owned();
+        (!value.is_empty()).then_some(value)
     }
 }
