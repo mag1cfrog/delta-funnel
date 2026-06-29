@@ -8,6 +8,7 @@ mod execution;
 mod planning;
 mod target;
 
+pub use arrow_tiberius::{TableName as MssqlTableName, connect_mssql_client_from_ado_string};
 pub(crate) use execution::MssqlBulkLoadWriter;
 pub(crate) use execution::table_name_from_target;
 pub use execution::{

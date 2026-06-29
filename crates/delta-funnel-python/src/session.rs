@@ -159,6 +159,17 @@ impl PySession {
         json_value_to_py(py, &report.to_json_value())
     }
 
+    pub(crate) fn write_to_mssql(
+        &self,
+        py: Python<'_>,
+        request: &delta_funnel::OutputWritePlan,
+    ) -> PyResult<Py<PyAny>> {
+        let report = py
+            .detach(|| self.runtime.write_to_mssql(&self.inner, request))
+            .map_err(|error| rust_error_to_py(py, error))?;
+        json_value_to_py(py, &report.to_json_value())
+    }
+
     fn dry_run_all_to_mssql(
         &self,
         py: Python<'_>,
@@ -788,6 +799,9 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
+        sync::{Arc, Barrier, mpsc},
+        thread,
+        time::Duration,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -819,6 +833,34 @@ mod tests {
             assert!(session_type.getattr("dry_run_all").is_err());
             assert!(session_type.getattr("dry_run_all_to_mssql").is_err());
             assert!(table_type.getattr("dry_run_to_mssql").is_err());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pyo3_detach_allows_another_thread_to_run_python() -> PyResult<()> {
+        Python::attach(|py| {
+            let barrier = Arc::new(Barrier::new(2));
+            let worker_barrier = Arc::clone(&barrier);
+            let (sender, receiver) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                worker_barrier.wait();
+                Python::attach(|py| -> PyResult<()> {
+                    let result = py.eval(c"40 + 2", None, None)?.extract::<i32>()?;
+                    sender.send(result).expect("send Python worker result");
+                    Ok(())
+                })
+            });
+
+            let result = py.detach(move || {
+                barrier.wait();
+                receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("Python worker should run while GIL is detached")
+            });
+            assert_eq!(result, 42);
+            worker.join().expect("join Python worker")?;
 
             Ok(())
         })

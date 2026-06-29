@@ -1288,6 +1288,7 @@ dependencies = [
  "delta-funnel",
  "pyo3",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
