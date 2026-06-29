@@ -2956,8 +2956,7 @@ union all select cast(302 as bigint) as order_id",),
                 }),
                 _ => {
                     eprintln!(
-                        "skipping Python MSSQL integration test; missing {} or {}",
-                        MSSQL_CONNECTION_STRING_ENV, MSSQL_SCHEMA_ENV
+                        "skipping Python MSSQL integration test; missing {MSSQL_CONNECTION_STRING_ENV} or {MSSQL_SCHEMA_ENV}"
                     );
                     None
                 }
