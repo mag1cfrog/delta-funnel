@@ -12,7 +12,7 @@ create_exception!(
     deltafunnel,
     DeltaFunnelError,
     PyException,
-    "DeltaFunnel operation failed."
+    "DeltaFunnel operation failed.\n\nThe exception exposes `phase`, `kind`, `message`, and `context` attributes."
 );
 
 pub(crate) fn add_exception(module: &Bound<'_, PyModule>) -> PyResult<()> {

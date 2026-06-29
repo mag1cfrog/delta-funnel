@@ -8,6 +8,11 @@ use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
 use crate::table::PyTable;
 
+/// DeltaFunnel workflow session.
+///
+/// `Session()` uses Rust defaults unless options are supplied. Register Delta
+/// sources, build lazy SQL tables, and execute or dry-run SQL Server outputs
+/// from this object.
 #[pyclass(name = "Session", module = "deltafunnel")]
 pub(crate) struct PySession {
     inner: delta_funnel::DeltaFunnelSession,
@@ -56,7 +61,19 @@ impl PySession {
     }
 
     fn __repr__(&self) -> String {
-        "deltafunnel.Session()".to_owned()
+        let sources = self
+            .inner
+            .sources()
+            .iter()
+            .map(delta_funnel::RegisteredSessionSource::name)
+            .collect::<Vec<_>>();
+        let derived_tables = self
+            .inner
+            .derived_tables()
+            .iter()
+            .map(delta_funnel::RegisteredDerivedTable::name)
+            .collect::<Vec<_>>();
+        format!("deltafunnel.Session(sources={sources:?}, derived_tables={derived_tables:?})")
     }
 
     /// Registers a named Delta source, or returns a pending source that cannot be referenced by SQL.
@@ -94,6 +111,10 @@ impl PySession {
     }
 
     /// Writes multiple SQL Server outputs, or runs a dry-run plan when requested.
+    ///
+    /// Pass `dry_run=True` to plan without writing. Execute calls accept
+    /// `options={"cache_mode": "auto"}` or `options={"cache_mode": "disabled"}`.
+    /// Returns a plain Python `dict` report.
     #[pyo3(signature = (outputs, *, options=None, dry_run=None))]
     fn write_all(
         slf: Py<Self>,
@@ -139,6 +160,18 @@ impl PySession {
 }
 
 impl PySession {
+    pub(crate) fn source_repr_details(
+        &self,
+        table: &delta_funnel::LazyTable,
+    ) -> Option<(&str, u64)> {
+        if table.kind() != delta_funnel::LazyTableKind::DeltaSource {
+            return None;
+        }
+        self.inner
+            .registered_source(table.name())
+            .map(|source| (source.source_uri(), source.snapshot_version()))
+    }
+
     fn register_delta_source(
         &mut self,
         py: Python<'_>,
@@ -265,7 +298,16 @@ impl PendingDeltaSource {
     }
 
     fn __repr__(&self) -> String {
-        "deltafunnel.PendingDeltaSource()".to_owned()
+        match self.version {
+            Some(version) => format!(
+                "deltafunnel.PendingDeltaSource(source_uri={:?}, snapshot_version={version})",
+                delta_funnel::sanitize_uri_for_display(&self.source_uri),
+            ),
+            None => format!(
+                "deltafunnel.PendingDeltaSource(source_uri={:?}, snapshot_version=None)",
+                delta_funnel::sanitize_uri_for_display(&self.source_uri),
+            ),
+        }
     }
 }
 
@@ -952,6 +994,10 @@ mod tests {
             deltafunnel(&module)?;
 
             let session_type = module.getattr("Session")?;
+            let session_doc = session_type.getattr("__doc__")?.extract::<String>()?;
+            assert!(session_doc.contains("uses Rust defaults"));
+            assert!(session_doc.contains("execute or dry-run SQL Server outputs"));
+
             let delta_lake_doc = session_type
                 .getattr("delta_lake")?
                 .getattr("__doc__")?
@@ -969,6 +1015,44 @@ mod tests {
                 .extract::<String>()?;
             assert!(alias_doc.contains("returns a `Table`"));
 
+            let write_all_doc = session_type
+                .getattr("write_all")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(write_all_doc.contains("dry_run=True"));
+            assert!(write_all_doc.contains("cache_mode"));
+            assert!(write_all_doc.contains("plain Python `dict` report"));
+
+            let table_type = module.getattr("Table")?;
+            let table_doc = table_type.getattr("__doc__")?.extract::<String>()?;
+            assert!(table_doc.contains("Lazy DeltaFunnel table"));
+
+            let to_mssql_doc = table_type
+                .getattr("to_mssql")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(to_mssql_doc.contains("default output name"));
+
+            let write_to_mssql_doc = table_type
+                .getattr("write_to_mssql")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(write_to_mssql_doc.contains("dry_run=True"));
+            assert!(write_to_mssql_doc.contains("plain Python"));
+
+            let output_doc = module
+                .getattr("MssqlOutputSpec")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(output_doc.contains("Opaque SQL Server output spec"));
+
+            let error_doc = module
+                .getattr("DeltaFunnelError")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(error_doc.contains("phase"));
+            assert!(error_doc.contains("kind"));
+
             Ok(())
         })
     }
@@ -979,7 +1063,7 @@ mod tests {
             let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
             let repr = session.bind(py).repr()?.extract::<String>()?;
 
-            assert_eq!(repr, "deltafunnel.Session()");
+            assert_eq!(repr, "deltafunnel.Session(sources=[], derived_tables=[])");
             assert!(!repr.contains("server=tcp"));
             assert!(!repr.contains("password"));
             assert!(!repr.contains("token"));
@@ -1001,13 +1085,17 @@ mod tests {
                 .bind(py)
                 .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
 
-            assert_eq!(
-                lazy.repr()?.extract::<String>()?,
-                "deltafunnel.Table(name=\"orders\")"
-            );
             let session = session.bind(py).borrow();
             assert_eq!(session.inner.source_reports().len(), 1);
             assert_eq!(session.inner.source_reports()[0].source_name(), "orders");
+            let source_uri = session.inner.source_reports()[0].source_uri().to_owned();
+            let snapshot_version = session.inner.source_reports()[0].snapshot_version();
+            assert_eq!(
+                lazy.repr()?.extract::<String>()?,
+                format!(
+                    "deltafunnel.Table(id=0, kind=\"delta_source\", name=\"orders\", source_uri={source_uri:?}, snapshot_version={snapshot_version})"
+                )
+            );
             Ok(())
         })
     }
@@ -1027,19 +1115,25 @@ mod tests {
 
             assert_eq!(
                 pending.repr()?.extract::<String>()?,
-                "deltafunnel.PendingDeltaSource()"
+                format!(
+                    "deltafunnel.PendingDeltaSource(source_uri={:?}, snapshot_version=0)",
+                    table.uri()
+                )
             );
             assert!(session.bind(py).borrow().inner.source_reports().is_empty());
 
             let lazy = pending.call_method("alias", ("orders",), None)?;
 
-            assert_eq!(
-                lazy.repr()?.extract::<String>()?,
-                "deltafunnel.Table(name=\"orders\")"
-            );
             let session = session.bind(py).borrow();
             assert_eq!(session.inner.source_reports().len(), 1);
             assert_eq!(session.inner.source_reports()[0].snapshot_version(), 0);
+            let source_uri = session.inner.source_reports()[0].source_uri().to_owned();
+            assert_eq!(
+                lazy.repr()?.extract::<String>()?,
+                format!(
+                    "deltafunnel.Table(id=0, kind=\"delta_source\", name=\"orders\", source_uri={source_uri:?}, snapshot_version=0)"
+                )
+            );
             Ok(())
         })
     }
@@ -1255,8 +1349,10 @@ mod tests {
                 Some(&kwargs),
             )?;
             let pending_repr = pending.repr()?.extract::<String>()?;
+            assert!(pending_repr.contains(table.uri().as_str()));
             assert!(!pending_repr.contains("super-secret"));
             assert!(!pending_repr.contains("debug-secret"));
+            assert!(!pending_repr.contains("?token="));
 
             kwargs.set_item("name", "select")?;
             let error = match session.bind(py).call_method(
@@ -1294,7 +1390,7 @@ mod tests {
 
             assert_eq!(
                 derived.repr()?.extract::<String>()?,
-                "deltafunnel.Table(name=\"table_1\")"
+                "deltafunnel.Table(id=1, kind=\"derived_sql\", name=\"table_1\")"
             );
             assert!(!derived.repr()?.extract::<String>()?.contains("select id"));
             Ok(())
@@ -1325,11 +1421,15 @@ mod tests {
 
             assert_eq!(
                 aliased.repr()?.extract::<String>()?,
-                "deltafunnel.Table(name=\"recent_orders\")"
+                "deltafunnel.Table(id=1, kind=\"derived_sql\", name=\"recent_orders\")"
             );
             assert_eq!(
                 downstream.repr()?.extract::<String>()?,
-                "deltafunnel.Table(name=\"table_2\")"
+                "deltafunnel.Table(id=2, kind=\"derived_sql\", name=\"table_2\")"
+            );
+            assert_eq!(
+                session.bind(py).repr()?.extract::<String>()?,
+                "deltafunnel.Session(sources=[\"orders\"], derived_tables=[\"recent_orders\"])"
             );
             Ok(())
         })
@@ -2102,7 +2202,7 @@ union all select cast(302 as bigint) as order_id",),
             )?;
             let repr = session.bind(py).repr()?.extract::<String>()?;
 
-            assert_eq!(repr, "deltafunnel.Session()");
+            assert_eq!(repr, "deltafunnel.Session(sources=[], derived_tables=[])");
             assert!(!repr.contains("server=tcp"));
             assert!(!repr.contains("admin"));
             assert!(!repr.contains("password"));
@@ -2756,7 +2856,7 @@ union all select cast(302 as bigint) as order_id",),
             let session = module.getattr("Session")?.call((), Some(&kwargs))?;
             let repr = session.repr()?.extract::<String>()?;
 
-            assert_eq!(repr, "deltafunnel.Session()");
+            assert_eq!(repr, "deltafunnel.Session(sources=[], derived_tables=[])");
             assert!(!repr.contains("server=tcp"));
             assert!(!repr.contains("admin"));
             assert!(!repr.contains("password"));

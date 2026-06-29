@@ -5,6 +5,10 @@ use pyo3::prelude::*;
 use crate::output::PyMssqlOutputSpec;
 use crate::session::PySession;
 
+/// Lazy DeltaFunnel table.
+///
+/// A `Table` can be aliased for later SQL, converted to a `MssqlOutputSpec`,
+/// or written directly to SQL Server.
 #[pyclass(name = "Table", module = "deltafunnel")]
 pub(crate) struct PyTable {
     session: Py<PySession>,
@@ -29,6 +33,9 @@ impl PyTable {
     }
 
     /// Builds a SQL Server output spec without executing rows.
+    ///
+    /// The default output name is the target `table`; pass `name` to override
+    /// the report/output identity.
     #[pyo3(signature = (*, schema, table, load_mode, name=None, connection_string=None))]
     fn to_mssql(
         &self,
@@ -52,6 +59,9 @@ impl PyTable {
     }
 
     /// Writes this table to SQL Server, or runs a dry-run plan when requested.
+    ///
+    /// Pass `dry_run=True` to plan without writing. Returns a plain Python
+    /// `dict` report.
     #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(
@@ -86,8 +96,25 @@ impl PyTable {
             .write_to_mssql(py, &spec.write_plan(delta_funnel::RunMode::Execute))
     }
 
-    fn __repr__(&self) -> String {
-        format!("deltafunnel.Table(name={:?})", self.inner.name())
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let kind = match self.inner.kind() {
+            delta_funnel::LazyTableKind::DeltaSource => "delta_source",
+            delta_funnel::LazyTableKind::DerivedSql => "derived_sql",
+        };
+        if let Some((source_uri, snapshot_version)) =
+            self.session.borrow(py).source_repr_details(&self.inner)
+        {
+            return format!(
+                "deltafunnel.Table(id={}, kind={kind:?}, name={:?}, source_uri={source_uri:?}, snapshot_version={snapshot_version})",
+                self.inner.id(),
+                self.inner.name()
+            );
+        }
+        format!(
+            "deltafunnel.Table(id={}, kind={kind:?}, name={:?})",
+            self.inner.id(),
+            self.inner.name()
+        )
     }
 }
 
