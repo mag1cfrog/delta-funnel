@@ -100,6 +100,23 @@ fn run_sqlserver_tests(options: &SqlServerTestOptions) -> Result<(), XtaskError>
         &mut command,
         "cargo test -p delta-funnel-python table_write_to_mssql_execute_writes -- --ignored",
     )?;
+
+    let mut command = Command::new("cargo");
+    command
+        .arg("test")
+        .arg("-p")
+        .arg("delta-funnel-python")
+        .arg("write_all_execute_writes")
+        .arg("--")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(sqlserver::CONNECTION_STRING_ENV, &test_connection_string)
+        .env(sqlserver::TEST_SCHEMA_ENV, &options.schema);
+
+    run_command(
+        &mut command,
+        "cargo test -p delta-funnel-python write_all_execute_writes -- --ignored",
+    )?;
     Ok(())
 }
 
