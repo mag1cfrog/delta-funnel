@@ -1604,6 +1604,139 @@ union all select cast(302 as bigint) as order_id",),
     }
 
     #[test]
+    #[ignore = "runs through cargo xtask sqlserver-test"]
+    fn write_all_execute_writes_reports_failed_and_skipped_outputs_when_configured()
+    -> TestResult<()> {
+        let Some(config) = MssqlIntegrationConfig::from_env() else {
+            return Ok(());
+        };
+        let first_table = unique_mssql_table_name(&config.schema)?;
+        let failing_table = unique_mssql_table_name(&config.schema)?;
+        let skipped_table = unique_mssql_table_name(&config.schema)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let tables = [&first_table, &failing_table, &skipped_table];
+
+        runtime.block_on(drop_tables(&config, &tables))?;
+        let write_result = Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session_kwargs = PyDict::new(py);
+            session_kwargs.set_item(
+                "default_mssql_connection_string",
+                config.connection_string.as_str(),
+            )?;
+            let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+            let first = session.call_method(
+                "table_from_sql",
+                ("select cast(501 as bigint) as id",),
+                None,
+            )?;
+            let failing = session.call_method(
+                "table_from_sql",
+                ("select cast(601 as bigint) as id",),
+                None,
+            )?;
+            let skipped = session.call_method(
+                "table_from_sql",
+                ("select cast(701 as bigint) as id",),
+                None,
+            )?;
+
+            let first_kwargs = PyDict::new(py);
+            first_kwargs.set_item("schema", config.schema.as_str())?;
+            first_kwargs.set_item("table", first_table.table().as_str())?;
+            first_kwargs.set_item("load_mode", "create_and_load")?;
+            first_kwargs.set_item("name", "first_output")?;
+            let first_spec = first.call_method("to_mssql", (), Some(&first_kwargs))?;
+            let failing_kwargs = PyDict::new(py);
+            failing_kwargs.set_item("schema", config.schema.as_str())?;
+            failing_kwargs.set_item("table", failing_table.table().as_str())?;
+            failing_kwargs.set_item("load_mode", "append_existing")?;
+            failing_kwargs.set_item("name", "failing_output")?;
+            let failing_spec = failing.call_method("to_mssql", (), Some(&failing_kwargs))?;
+            let skipped_kwargs = PyDict::new(py);
+            skipped_kwargs.set_item("schema", config.schema.as_str())?;
+            skipped_kwargs.set_item("table", skipped_table.table().as_str())?;
+            skipped_kwargs.set_item("load_mode", "create_and_load")?;
+            skipped_kwargs.set_item("name", "skipped_output")?;
+            let skipped_spec = skipped.call_method("to_mssql", (), Some(&skipped_kwargs))?;
+            let outputs = PyList::new(py, [&first_spec, &failing_spec, &skipped_spec])?;
+
+            let report = session.call_method("write_all", (outputs,), None)?;
+            let report = report.cast::<PyDict>()?;
+            assert_eq!(required_item(report, "output_count")?.extract::<u64>()?, 3);
+            assert!(!required_item(report, "all_succeeded")?.extract::<bool>()?);
+            assert_eq!(
+                required_item(report, "succeeded_count")?.extract::<u64>()?,
+                1
+            );
+            assert_eq!(required_item(report, "failed_count")?.extract::<u64>()?, 1);
+            assert_eq!(required_item(report, "skipped_count")?.extract::<u64>()?, 1);
+
+            let workflow = required_item(report, "workflow")?;
+            let workflow = workflow.cast::<PyDict>()?;
+            let outputs = required_item(workflow, "outputs")?;
+            let outputs = outputs.cast::<PyList>()?;
+            assert_eq!(outputs.len(), 3);
+            assert_succeeded_output(
+                outputs.get_item(0)?.cast::<PyDict>()?,
+                "first_output",
+                "context_default",
+                1,
+            )?;
+
+            let failed = outputs.get_item(1)?;
+            let failed = failed.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(failed, "kind")?.extract::<String>()?,
+                "failed"
+            );
+            assert_eq!(
+                required_item(failed, "output_name")?.extract::<String>()?,
+                "failing_output"
+            );
+            required_item(failed, "failure")?;
+
+            let skipped = outputs.get_item(2)?;
+            let skipped = skipped.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(skipped, "kind")?.extract::<String>()?,
+                "skipped"
+            );
+            assert_eq!(
+                required_item(skipped, "output_name")?.extract::<String>()?,
+                "skipped_output"
+            );
+            let skipped_report = required_item(skipped, "skipped")?;
+            let skipped_report = skipped_report.cast::<PyDict>()?;
+            let reason = required_item(skipped_report, "reason")?;
+            let reason = reason.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(reason, "kind")?.extract::<String>()?,
+                "previous_output_failed"
+            );
+            assert_eq!(
+                required_item(reason, "failed_output_name")?.extract::<String>()?,
+                "failing_output"
+            );
+
+            Ok::<(), PyErr>(())
+        });
+        let cleanup_result = runtime.block_on(drop_tables(&config, &tables));
+
+        match (write_result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_error), Ok(())) => Err(Box::new(write_error)),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(write_error), Err(cleanup_error)) => {
+                Err(format!("write failed: {write_error}; cleanup failed: {cleanup_error}").into())
+            }
+        }
+    }
+
+    #[test]
     fn write_all_dry_run_rejects_missing_connection() -> PyResult<()> {
         Python::attach(|py| {
             let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
