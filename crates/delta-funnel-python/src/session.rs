@@ -798,20 +798,33 @@ mod tests {
     use delta_funnel::{
         DeltaProviderScanExecutionOptions, DryRunScanSummaryMode, MssqlBinaryPolicy,
         MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy, MssqlFloatPolicy,
-        MssqlNanosecondPolicy, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTimezonePolicy,
-        MssqlUInt64Policy, QueryOptions, TargetValidationMode,
+        MssqlNanosecondPolicy, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTableName,
+        MssqlTimezonePolicy, MssqlUInt64Policy, QueryOptions, TargetValidationMode,
+        connect_mssql_client_from_ado_string,
     };
     use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError};
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
     use std::{
+        env,
+        error::Error,
         fs,
         path::PathBuf,
-        sync::{Arc, Barrier, mpsc},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
         thread,
         time::Duration,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    const MSSQL_CONNECTION_STRING_ENV: &str = "DELTA_FUNNEL_MSSQL_TEST_CONNECTION_STRING";
+    const MSSQL_SCHEMA_ENV: &str = "DELTA_FUNNEL_MSSQL_TEST_SCHEMA";
+    static NEXT_MSSQL_TABLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    type TestResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
     #[test]
     fn module_exports_session_type() -> PyResult<()> {
@@ -1476,6 +1489,112 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    #[test]
+    #[ignore = "runs through cargo xtask sqlserver-test"]
+    fn write_all_execute_writes_multiple_outputs_with_default_connection_when_configured()
+    -> TestResult<()> {
+        let Some(config) = MssqlIntegrationConfig::from_env() else {
+            return Ok(());
+        };
+        let west_table = unique_mssql_table_name(&config.schema)?;
+        let east_table = unique_mssql_table_name(&config.schema)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let tables = [&west_table, &east_table];
+
+        runtime.block_on(drop_tables(&config, &tables))?;
+        let write_result = Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session_kwargs = PyDict::new(py);
+            session_kwargs.set_item(
+                "default_mssql_connection_string",
+                config.connection_string.as_str(),
+            )?;
+            let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+            let west = session.call_method(
+                "table_from_sql",
+                ("\
+select cast(301 as bigint) as order_id
+union all select cast(302 as bigint) as order_id",),
+                None,
+            )?;
+            let east = session.call_method(
+                "table_from_sql",
+                ("select cast(401 as bigint) as order_id",),
+                None,
+            )?;
+
+            let west_kwargs = PyDict::new(py);
+            west_kwargs.set_item("schema", config.schema.as_str())?;
+            west_kwargs.set_item("table", west_table.table().as_str())?;
+            west_kwargs.set_item("load_mode", "create_and_load")?;
+            let west_spec = west.call_method("to_mssql", (), Some(&west_kwargs))?;
+            let east_kwargs = PyDict::new(py);
+            east_kwargs.set_item("schema", config.schema.as_str())?;
+            east_kwargs.set_item("table", east_table.table().as_str())?;
+            east_kwargs.set_item("load_mode", "create_and_load")?;
+            east_kwargs.set_item("name", "east_orders")?;
+            let east_spec = east.call_method("to_mssql", (), Some(&east_kwargs))?;
+            let outputs = PyList::new(py, [&west_spec, &east_spec])?;
+
+            let report = session.call_method("write_all", (outputs,), None)?;
+            let report_repr = report.repr()?.extract::<String>()?;
+            assert!(!report_repr.contains(config.connection_string.as_str()));
+            let report = report.cast::<PyDict>()?;
+            assert_eq!(required_item(report, "output_count")?.extract::<u64>()?, 2);
+            assert!(required_item(report, "all_succeeded")?.extract::<bool>()?);
+            assert_eq!(
+                required_item(report, "succeeded_count")?.extract::<u64>()?,
+                2
+            );
+            assert_eq!(required_item(report, "failed_count")?.extract::<u64>()?, 0);
+            assert_eq!(required_item(report, "skipped_count")?.extract::<u64>()?, 0);
+            assert!(
+                !required_item(report, "phase_timings")?
+                    .cast::<PyList>()?
+                    .is_empty()
+            );
+            assert!(
+                required_item(report, "sources")?
+                    .cast::<PyList>()?
+                    .is_empty()
+            );
+            required_item(required_item(report, "cache")?.cast::<PyDict>()?, "kind")?;
+
+            let workflow = required_item(report, "workflow")?;
+            let workflow = workflow.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(workflow, "output_count")?.extract::<u64>()?,
+                2
+            );
+            assert!(required_item(workflow, "all_succeeded")?.extract::<bool>()?);
+            let outputs = required_item(workflow, "outputs")?;
+            let outputs = outputs.cast::<PyList>()?;
+            assert_eq!(outputs.len(), 2);
+
+            let west_output = outputs.get_item(0)?;
+            let west_output = west_output.cast::<PyDict>()?;
+            assert_succeeded_output(west_output, west_table.table().as_str(), 2)?;
+            let east_output = outputs.get_item(1)?;
+            let east_output = east_output.cast::<PyDict>()?;
+            assert_succeeded_output(east_output, "east_orders", 1)?;
+
+            Ok::<(), PyErr>(())
+        });
+        let cleanup_result = runtime.block_on(drop_tables(&config, &tables));
+
+        match (write_result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_error), Ok(())) => Err(Box::new(write_error)),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(write_error), Err(cleanup_error)) => {
+                Err(format!("write failed: {write_error}; cleanup failed: {cleanup_error}").into())
+            }
+        }
     }
 
     #[test]
@@ -2365,6 +2484,39 @@ mod tests {
             .ok_or_else(|| PyKeyError::new_err(key.to_owned()))
     }
 
+    fn assert_succeeded_output(
+        output: &Bound<'_, PyDict>,
+        output_name: &str,
+        row_count: u64,
+    ) -> PyResult<()> {
+        assert_eq!(
+            required_item(output, "kind")?.extract::<String>()?,
+            "succeeded"
+        );
+        assert_eq!(
+            required_item(output, "output_name")?.extract::<String>()?,
+            output_name
+        );
+        assert_eq!(
+            required_item(output, "connection_source")?.extract::<String>()?,
+            "context_default"
+        );
+        let output_row_count = required_item(output, "output_row_count")?;
+        let output_row_count = output_row_count.cast::<PyDict>()?;
+        assert_eq!(
+            required_item(output_row_count, "value")?.extract::<u64>()?,
+            row_count
+        );
+        let validation = required_item(output, "validation_status")?;
+        let validation = validation.cast::<PyDict>()?;
+        assert_eq!(
+            required_item(validation, "kind")?.extract::<String>()?,
+            "passed"
+        );
+
+        Ok(())
+    }
+
     fn assert_missing_connection_error(py: Python<'_>, error: &PyErr) -> PyResult<()> {
         assert_eq!(
             error.value(py).getattr("phase")?.extract::<String>()?,
@@ -2375,6 +2527,68 @@ mod tests {
             "missing_mssql_connection"
         );
         Ok(())
+    }
+
+    struct MssqlIntegrationConfig {
+        connection_string: String,
+        schema: String,
+    }
+
+    impl MssqlIntegrationConfig {
+        fn from_env() -> Option<Self> {
+            let connection_string = env::var(MSSQL_CONNECTION_STRING_ENV)
+                .ok()
+                .and_then(non_empty_value);
+            let schema = env::var(MSSQL_SCHEMA_ENV).ok().and_then(non_empty_value);
+
+            match (connection_string, schema) {
+                (Some(connection_string), Some(schema)) => Some(Self {
+                    connection_string,
+                    schema,
+                }),
+                _ => {
+                    eprintln!(
+                        "skipping Python MSSQL integration test; missing {} or {}",
+                        MSSQL_CONNECTION_STRING_ENV, MSSQL_SCHEMA_ENV
+                    );
+                    None
+                }
+            }
+        }
+    }
+
+    async fn drop_tables(
+        config: &MssqlIntegrationConfig,
+        tables: &[&MssqlTableName],
+    ) -> TestResult<()> {
+        let mut client = connect_mssql_client_from_ado_string(&config.connection_string).await?;
+        for table in tables {
+            client
+                .execute_statement(&format!("DROP TABLE IF EXISTS {};", table.quoted_sql()))
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    fn unique_mssql_table_name(schema: &str) -> TestResult<MssqlTableName> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sequence = NEXT_MSSQL_TABLE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+
+        Ok(MssqlTableName::new(
+            schema.to_owned(),
+            format!(
+                "df_python_write_all_it_{}_{}_{}",
+                std::process::id(),
+                timestamp,
+                sequence
+            ),
+        )?)
+    }
+
+    fn non_empty_value(value: String) -> Option<String> {
+        let value = value.trim().to_owned();
+        (!value.is_empty()).then_some(value)
     }
 
     struct DeltaLogFixture {
