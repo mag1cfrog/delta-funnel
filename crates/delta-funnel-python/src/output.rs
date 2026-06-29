@@ -6,6 +6,11 @@ use pyo3::types::PyAnyMethods;
 use crate::exception::{delta_funnel_error_to_py, delta_funnel_py_error};
 use crate::session::PySession;
 
+/// Opaque SQL Server output spec for `Session.write_all(...)`.
+///
+/// Build values with `Table.to_mssql(...)`. The spec carries its owning
+/// session, lazy source table, output name, target table, load mode, and
+/// optional connection override.
 #[pyclass(name = "MssqlOutputSpec", module = "deltafunnel")]
 pub(crate) struct PyMssqlOutputSpec {
     session: Py<PySession>,

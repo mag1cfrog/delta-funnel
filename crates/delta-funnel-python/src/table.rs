@@ -5,6 +5,10 @@ use pyo3::prelude::*;
 use crate::output::PyMssqlOutputSpec;
 use crate::session::PySession;
 
+/// Lazy DeltaFunnel table.
+///
+/// A `Table` can be aliased for later SQL, converted to a `MssqlOutputSpec`,
+/// or written directly to SQL Server.
 #[pyclass(name = "Table", module = "deltafunnel")]
 pub(crate) struct PyTable {
     session: Py<PySession>,
@@ -29,6 +33,9 @@ impl PyTable {
     }
 
     /// Builds a SQL Server output spec without executing rows.
+    ///
+    /// The default output name is the target `table`; pass `name` to override
+    /// the report/output identity.
     #[pyo3(signature = (*, schema, table, load_mode, name=None, connection_string=None))]
     fn to_mssql(
         &self,
@@ -52,6 +59,9 @@ impl PyTable {
     }
 
     /// Writes this table to SQL Server, or runs a dry-run plan when requested.
+    ///
+    /// Pass `dry_run=True` to plan without writing. Returns a plain Python
+    /// `dict` report.
     #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(

@@ -8,6 +8,11 @@ use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
 use crate::table::PyTable;
 
+/// DeltaFunnel workflow session.
+///
+/// `Session()` uses Rust defaults unless options are supplied. Register Delta
+/// sources, build lazy SQL tables, and execute or dry-run SQL Server outputs
+/// from this object.
 #[pyclass(name = "Session", module = "deltafunnel")]
 pub(crate) struct PySession {
     inner: delta_funnel::DeltaFunnelSession,
@@ -94,6 +99,10 @@ impl PySession {
     }
 
     /// Writes multiple SQL Server outputs, or runs a dry-run plan when requested.
+    ///
+    /// Pass `dry_run=True` to plan without writing. Execute calls accept
+    /// `options={"cache_mode": "auto"}` or `options={"cache_mode": "disabled"}`.
+    /// Returns a plain Python `dict` report.
     #[pyo3(signature = (outputs, *, options=None, dry_run=None))]
     fn write_all(
         slf: Py<Self>,
@@ -952,6 +961,10 @@ mod tests {
             deltafunnel(&module)?;
 
             let session_type = module.getattr("Session")?;
+            let session_doc = session_type.getattr("__doc__")?.extract::<String>()?;
+            assert!(session_doc.contains("uses Rust defaults"));
+            assert!(session_doc.contains("execute or dry-run SQL Server outputs"));
+
             let delta_lake_doc = session_type
                 .getattr("delta_lake")?
                 .getattr("__doc__")?
@@ -968,6 +981,44 @@ mod tests {
                 .getattr("__doc__")?
                 .extract::<String>()?;
             assert!(alias_doc.contains("returns a `Table`"));
+
+            let write_all_doc = session_type
+                .getattr("write_all")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(write_all_doc.contains("dry_run=True"));
+            assert!(write_all_doc.contains("cache_mode"));
+            assert!(write_all_doc.contains("plain Python `dict` report"));
+
+            let table_type = module.getattr("Table")?;
+            let table_doc = table_type.getattr("__doc__")?.extract::<String>()?;
+            assert!(table_doc.contains("Lazy DeltaFunnel table"));
+
+            let to_mssql_doc = table_type
+                .getattr("to_mssql")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(to_mssql_doc.contains("default output name"));
+
+            let write_to_mssql_doc = table_type
+                .getattr("write_to_mssql")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(write_to_mssql_doc.contains("dry_run=True"));
+            assert!(write_to_mssql_doc.contains("plain Python"));
+
+            let output_doc = module
+                .getattr("MssqlOutputSpec")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(output_doc.contains("Opaque SQL Server output spec"));
+
+            let error_doc = module
+                .getattr("DeltaFunnelError")?
+                .getattr("__doc__")?
+                .extract::<String>()?;
+            assert!(error_doc.contains("phase"));
+            assert!(error_doc.contains("kind"));
 
             Ok(())
         })
