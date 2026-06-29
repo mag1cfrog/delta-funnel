@@ -141,6 +141,7 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         options: MssqlWriteOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>
     where
+        Self: 'static,
         S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
     {
         let initialize_timer = PhaseTimer::start(INITIALIZE_WRITER_PHASE);
@@ -262,7 +263,7 @@ pub(crate) async fn write_mssql_output_batches_on_connection<C, S>(
     options: MssqlWriteOptions,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
-    C: MssqlOneOutputSinkConnection,
+    C: MssqlOneOutputSinkConnection + 'static,
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
     write_mssql_output_batches_on_connection_with_phase_timings(
@@ -285,7 +286,7 @@ async fn write_mssql_output_batches_on_connection_with_phase_timings<C, S>(
     mut phase_timings: Vec<PhaseTimingReport>,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
-    C: MssqlOneOutputSinkConnection,
+    C: MssqlOneOutputSinkConnection + 'static,
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
     ensure_supported_output_mode(&output_plan)?;
