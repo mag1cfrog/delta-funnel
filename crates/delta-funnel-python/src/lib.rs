@@ -31,8 +31,10 @@ mod tests {
         assert!(README.contains("cargo xtask python-package-check"));
         assert!(README.contains("docs/failure-reports-and-tracing.md"));
         assert!(README.contains("does not include persistent `cache`, `persist`,"));
+        assert!(README.contains("native TDS driver"));
         assert!(!README.contains("dry_run_to_mssql"));
         assert!(!README.contains("dry_run_all"));
+        assert!(!README.contains("ODBC Driver"));
         assert!(!README.contains("password=secret"));
         assert!(!README.contains("token="));
         assert!(!README.contains("AWS_SECRET_ACCESS_KEY"));

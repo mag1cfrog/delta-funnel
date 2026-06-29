@@ -1,12 +1,12 @@
 # Delta Funnel
 
 <h3 align="center">
-  <strong>Move Delta Lake data into SQL Server without running Spark.</strong>
+  <strong>Move Delta Lake data into SQL Server without Spark or ODBC.</strong>
 </h3>
 
 <p align="center">
   A lightweight Rust and Python toolkit for reading Delta Lake tables,<br/>
-  transforming them with SQL, and bulk-loading results into Microsoft SQL Server.
+  transforming them with SQL, and bulk-loading through a native TDS driver.
 </p>
 
 <p align="center">
@@ -24,6 +24,7 @@ Use Delta Funnel when you need to:
 - Read Delta Lake tables from local paths or object-store URIs.
 - Transform rows with DataFusion SQL.
 - Load one or more results into Microsoft SQL Server.
+- Use native TDS bulk writes designed to be significantly faster than ODBC-based loads.
 - Run the workflow from Rust or from a PyO3 native extension module in Python.
 - Avoid standing up Spark for a focused Delta Lake to SQL Server pipeline.
 
@@ -48,11 +49,11 @@ cargo check --workspace
 from deltafunnel import Session
 
 connection_string = (
-    "Driver={ODBC Driver 18 for SQL Server};"
-    "Server=localhost;"
-    "Database=warehouse;"
-    "Trusted_Connection=yes;"
-    "Encrypt=yes;"
+    "server=tcp:localhost,1433;"
+    "database=warehouse;"
+    "user id=etl_user;"
+    "password=REPLACE_ME;"
+    "encrypt=true;"
     "TrustServerCertificate=yes"
 )
 
