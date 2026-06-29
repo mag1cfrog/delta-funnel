@@ -1515,16 +1515,22 @@ mod tests {
                 config.connection_string.as_str(),
             )?;
             let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
-            let west = session.call_method(
+            let big = session.call_method(
                 "table_from_sql",
                 ("\
 select cast(301 as bigint) as order_id
 union all select cast(302 as bigint) as order_id",),
                 None,
             )?;
+            let _big = big.call_method("alias", ("big_orders",), None)?;
+            let west = session.call_method(
+                "table_from_sql",
+                ("select order_id from big_orders where order_id = 301",),
+                None,
+            )?;
             let east = session.call_method(
                 "table_from_sql",
-                ("select cast(401 as bigint) as order_id",),
+                ("select order_id from big_orders where order_id = 302",),
                 None,
             )?;
 
@@ -1564,7 +1570,26 @@ union all select cast(302 as bigint) as order_id",),
                     .cast::<PyList>()?
                     .is_empty()
             );
-            required_item(required_item(report, "cache")?.cast::<PyDict>()?, "kind")?;
+            let cache = required_item(report, "cache")?;
+            let cache = cache.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(cache, "kind")?.extract::<String>()?,
+                "cache_aliases"
+            );
+            let aliases = required_item(cache, "aliases")?;
+            let aliases = aliases.cast::<PyList>()?;
+            assert_eq!(aliases.len(), 1);
+            let alias = aliases.get_item(0)?;
+            let alias = alias.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(alias, "alias")?.extract::<String>()?,
+                "big_orders"
+            );
+            let output_indexes = required_item(alias, "output_indexes")?;
+            let output_indexes = output_indexes.cast::<PyList>()?;
+            assert_eq!(output_indexes.len(), 2);
+            assert_eq!(output_indexes.get_item(0)?.extract::<u64>()?, 0);
+            assert_eq!(output_indexes.get_item(1)?.extract::<u64>()?, 1);
 
             let workflow = required_item(report, "workflow")?;
             let workflow = workflow.cast::<PyDict>()?;
@@ -1583,7 +1608,7 @@ union all select cast(302 as bigint) as order_id",),
                 west_output,
                 west_table.table().as_str(),
                 "context_default",
-                2,
+                1,
             )?;
             let east_output = outputs.get_item(1)?;
             let east_output = east_output.cast::<PyDict>()?;
