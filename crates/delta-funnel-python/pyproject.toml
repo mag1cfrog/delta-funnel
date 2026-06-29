@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "deltafunnel"
 version = "0.1.0"
-description = "Python bindings for DeltaFunnel"
+description = "Python bindings for Delta Funnel"
 readme = "../../README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

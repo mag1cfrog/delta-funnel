@@ -1,39 +1,48 @@
-# DeltaFunnel
+# Delta Funnel
 
-DeltaFunnel loads Delta Lake query results into Microsoft SQL Server.
+<h3 align="center">
+  <strong>Move Delta Lake data into SQL Server without running Spark.</strong>
+</h3>
 
-It combines Delta metadata scanning, DataFusion SQL planning, Arrow batch
-handoff, and SQL Server bulk writes behind a Rust API and a PyO3 native Python
-package named `deltafunnel`.
+<p align="center">
+  A lightweight Rust and Python toolkit for reading Delta Lake tables,<br/>
+  transforming them with SQL, and bulk-loading results into Microsoft SQL Server.
+</p>
+
+<p align="center">
+  Built in Rust. Python API included. Local builds available today.
+</p>
 
 > [!NOTE]
-> DeltaFunnel is early project code. The Python package can be built and used
-> locally, but PyPI publishing is not yet configured.
+> Delta Funnel is early project code. Local Rust and Python builds work, but
+> PyPI and crates.io publishing are not configured yet.
 
-## What It Does
+## When To Use It
 
-- Registers Delta Lake sources from local paths or object-store URIs.
-- Builds lazy SQL-derived tables with DataFusion.
-- Plans and executes one or many SQL Server outputs.
-- Supports dry-run reports that plan sources, schemas, targets, and validation
-  without writing rows.
-- Produces JSON-safe report dictionaries for Python users and report values for
-  Rust users.
-- Provides an opt-in SQL Server integration test runner through `cargo xtask`.
+Use Delta Funnel when you need to:
 
-## Python quickstart
+- Read Delta Lake tables from local paths or object-store URIs.
+- Transform rows with DataFusion SQL.
+- Load one or more results into Microsoft SQL Server.
+- Run the workflow from Rust or from a PyO3 native extension module in Python.
+- Avoid standing up Spark for a focused Delta Lake to SQL Server pipeline.
 
-The Python package is a PyO3 native extension module. It exposes the Rust
-workflow API directly and does not add a pure Python wrapper layer.
+## Install Or Build
 
-Build and install a local wheel:
+Until package publishing is configured, build and smoke-test the Python wheel
+for the `deltafunnel` package from the repository:
 
 ```bash
 cargo xtask python-package-check
 ```
 
-Create a session with a default SQL Server connection string. `Session()` uses
-Rust defaults unless options are supplied.
+For Rust, use the `delta-funnel` workspace crate directly:
+
+```bash
+cargo check --workspace
+```
+
+## Python Quickstart
 
 ```python
 from deltafunnel import Session
@@ -46,10 +55,9 @@ connection_string = (
     "Encrypt=yes;"
     "TrustServerCertificate=yes"
 )
-source_uri = "file:///path/to/local/delta-table"
 
 session = Session(default_mssql_connection_string=connection_string)
-orders = session.delta_lake(source_uri, name="orders")
+orders = session.delta_lake("file:///path/to/orders-delta", name="orders")
 
 daily_orders = session.table_from_sql("""
     select customer_id, order_date, total_amount
@@ -68,7 +76,16 @@ report = daily_orders.write_to_mssql(
 `session.delta_lake(...)` without `name` returns a pending source; call
 `.alias("orders")` before SQL references it.
 
-Use `dry_run=True` on the same action methods to plan without writing:
+Reports are plain Python `dict` values converted from Rust report types. Report
+formatting is designed to avoid exposing connection strings, credentials, and
+raw row values. See
+[`docs/failure-reports-and-tracing.md`](docs/failure-reports-and-tracing.md)
+for the failure-report and tracing rules.
+
+## Dry Runs
+
+Use `dry_run=True` on the same write methods to validate the plan without
+writing rows:
 
 ```python
 dry_run_report = daily_orders.write_to_mssql(
@@ -81,11 +98,10 @@ dry_run_report = daily_orders.write_to_mssql(
 
 There are no public Python `dry_run_*` methods.
 
-## Multi-output Python writes
+## Multi-output Writes
 
 `Table.to_mssql(...)` creates an output spec without writing. `Session.write_all`
-writes the specs in one workflow. The default output name is the target `table`;
-pass `name=...` to override it for reports and duplicate-name checks.
+writes the specs in one workflow.
 
 ```python
 active_orders = session.table_from_sql("""
@@ -117,7 +133,7 @@ outputs = [
 ]
 
 dry_run_report = session.write_all(outputs, dry_run=True)
-report = session.write_all(outputs, options={"cache_mode": "auto"})
+report = session.write_all(outputs, options={"cache_mode": "disabled"})
 ```
 
 `options={"cache_mode": "auto"}` is the default execute behavior. It may cache
@@ -127,8 +143,7 @@ shared lazy SQL aliases during one `write_all` call. Use
 > [!IMPORTANT]
 > `options` is only accepted for execute `write_all` calls, not dry runs.
 
-Reports are plain Python `dict` values converted from Rust JSON-safe report
-shapes. The first Python surface does not include persistent `cache`, `persist`,
+The first Python surface does not include persistent `cache`, `persist`,
 or `materialize` APIs.
 
 ## Rust API
@@ -153,27 +168,11 @@ Core Rust entry points include:
 
 ## Build And Test
 
-Build and test the workspace:
-
 ```bash
 cargo fmt --all --check
 cargo check --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-```
-
-Build the Python wheel:
-
-```bash
-cd crates/delta-funnel-python
-maturin build --skip-auditwheel
-```
-
-Build, install, and smoke-test the Python wheel in a clean temporary
-virtualenv:
-
-```bash
-cargo xtask python-package-check
 ```
 
 SQL Server integration tests are opt-in:
@@ -185,12 +184,3 @@ cargo xtask sqlserver-test
 The xtask runner can start a local SQL Server container, run Rust and Python
 write tests, and remove the container when it exits. See
 [`docs/mssql-integration-tests.md`](docs/mssql-integration-tests.md).
-
-## Documentation
-
-The Delta DataFusion scan partition target policy is documented in
-[`docs/scan-partition-target-policy.md`](docs/scan-partition-target-policy.md).
-
-Failure-report collection, validation limits, and safe tracing setup are
-documented in
-[`docs/failure-reports-and-tracing.md`](docs/failure-reports-and-tracing.md).
