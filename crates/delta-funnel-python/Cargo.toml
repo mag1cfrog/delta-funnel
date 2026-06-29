@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Python bindings for DeltaFunnel"
+description = "Python bindings for Delta Funnel"
 
 [lib]
 name = "deltafunnel"
