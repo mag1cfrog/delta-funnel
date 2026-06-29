@@ -371,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "runs through cargo xtask sqlserver-test"]
     fn table_write_to_mssql_execute_writes_with_default_connection_when_configured()
     -> TestResult<()> {
         let Some(config) = MssqlIntegrationConfig::from_env() else {
@@ -462,6 +463,73 @@ union all select cast(103 as bigint) as order_id",),
                 3
             );
             assert!(required_item(write_stats, "batches_written")?.extract::<u64>()? >= 1);
+
+            Ok::<(), PyErr>(())
+        });
+        let cleanup_result = runtime.block_on(drop_table(&config, &table));
+
+        match (write_result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_error), Ok(())) => Err(Box::new(write_error)),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(write_error), Err(cleanup_error)) => {
+                Err(format!("write failed: {write_error}; cleanup failed: {cleanup_error}").into())
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "runs through cargo xtask sqlserver-test"]
+    fn table_write_to_mssql_execute_writes_with_connection_override_when_configured()
+    -> TestResult<()> {
+        let Some(config) = MssqlIntegrationConfig::from_env() else {
+            return Ok(());
+        };
+        let table = unique_table_name(&config.schema)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        runtime.block_on(drop_table(&config, &table))?;
+        let write_result = Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let source = session.call_method(
+                "table_from_sql",
+                ("\
+select cast(201 as bigint) as order_id
+union all select cast(202 as bigint) as order_id",),
+                None,
+            )?;
+            let kwargs = mssql_kwargs(
+                py,
+                &config.schema,
+                table.table().as_str(),
+                "create_and_load",
+            )?;
+            kwargs.set_item("connection_string", config.connection_string.as_str())?;
+
+            let report = source.call_method("write_to_mssql", (), Some(&kwargs))?;
+            let report_repr = report.repr()?.extract::<String>()?;
+            assert!(!report_repr.contains(config.connection_string.as_str()));
+            let report = report.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(report, "connection_source")?.extract::<String>()?,
+                "target_override"
+            );
+            let output_row_count = required_item(report, "output_row_count")?;
+            let output_row_count = output_row_count.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(output_row_count, "value")?.extract::<u64>()?,
+                2
+            );
+            let write_stats = required_item(report, "write_stats")?;
+            let write_stats = write_stats.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(write_stats, "rows_written")?.extract::<u64>()?,
+                2
+            );
 
             Ok::<(), PyErr>(())
         });
