@@ -1663,8 +1663,10 @@ union all select cast(302 as bigint) as order_id",),
             skipped_kwargs.set_item("name", "skipped_output")?;
             let skipped_spec = skipped.call_method("to_mssql", (), Some(&skipped_kwargs))?;
             let outputs = PyList::new(py, [&first_spec, &failing_spec, &skipped_spec])?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("dry_run", false)?;
 
-            let report = session.call_method("write_all", (outputs,), None)?;
+            let report = session.call_method("write_all", (outputs,), Some(&kwargs))?;
             let report = report.cast::<PyDict>()?;
             assert_eq!(required_item(report, "output_count")?.extract::<u64>()?, 3);
             assert!(!required_item(report, "all_succeeded")?.extract::<bool>()?);
