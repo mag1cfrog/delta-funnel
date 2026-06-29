@@ -10,6 +10,10 @@ readme = "../../README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 
+[project.urls]
+Homepage = "https://github.com/mag1cfrog/delta-funnel"
+Repository = "https://github.com/mag1cfrog/delta-funnel"
+
 [tool.maturin]
 bindings = "pyo3"
 module-name = "deltafunnel"
