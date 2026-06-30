@@ -1,0 +1,64 @@
+name: SQL Server Integration
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/delta-funnel/src/sql_server/**"
+      - "crates/delta-funnel/src/orchestrator/session/sql_server_workflows/**"
+      - "crates/delta-funnel/tests/mssql_direct_raw_bulk.rs"
+      - "crates/delta-funnel-python/src/exception.rs"
+      - "crates/delta-funnel-python/src/output.rs"
+      - "crates/delta-funnel-python/src/session.rs"
+      - "xtask/**"
+      - ".github/workflows/sqlserver-integration.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sqlserver-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sqlserver:
+    name: SQL Server Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read Rust version
+        id: rust-version
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "${{ steps.rust-version.outputs.version }}" --profile minimal
+          rustup default "${{ steps.rust-version.outputs.version }}"
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sqlserver-integration
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run SQL Server integration tests
+        run: cargo xtask sqlserver-test --container-runtime docker
