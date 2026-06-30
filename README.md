@@ -15,7 +15,7 @@
 
 > [!NOTE]
 > Delta Funnel is early project code. Local Rust and Python builds work, but
-> PyPI and crates.io publishing are not configured yet.
+> PyPI, crates.io, and hosted documentation publishing are not configured yet.
 
 ## When To Use It
 
