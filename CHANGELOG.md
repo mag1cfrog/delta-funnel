@@ -1,3 +1,811 @@
 # Changelog
 
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0](https://github.com/mag1cfrog/delta-funnel/releases/tag/v0.1.0) - 2026-06-30
+
+### Added
+
+- accept Python session provider scan options
+- accept Python session validation options
+- complete json report coverage
+- expose write-all reports as json
+- expose mssql workflow reports as json
+- expose mssql write reports as json
+- expose dry-run reports as json
+- add json-safe report primitives
+- trace single-output writes
+- trace dry-run output planning
+- trace batch shaping outcomes
+- trace sql target planning
+- trace validation outcomes
+- trace source registration phases
+- add output tracing spans
+- add workflow tracing span
+- trace mssql output statuses
+- trace workflow completion
+- add workflow tracing entrypoint
+- validate append mssql row deltas
+- add mssql target delta count report fields
+- expose mssql workflow validation evidence
+- handle missing exact mssql validation rows
+- validate create load mssql target row counts
+- fail required unsupported mssql validation
+- report unsupported mssql target validation mode
+- honor disabled mssql target validation
+- pass mssql validation options to sink
+- classify mssql target row count failures
+- add mssql target validation report updater
+- add mssql target validation report fields
+- expose target row count connection boundary
+- record lazy sql planning phase timings
+- add validation phase timing slots
+- propagate planned output phase timings
+- split output planning phase timings
+- record source registration phase timings
+- record dry-run workflow phase timings
+- record write-all workflow phase timings
+- record sql server sink phase timings
+- record write loop phase timings
+- record execute workflow phase timings
+- record dry-run output phase timings
+- add phase timing report primitive
+- report dry run output row count
+- report dry run output source usage
+- expose dry run target plan
+- report dry run scan summary state
+- report dry run sql identity
+- report dry run table identity
+- report dry run statuses
+- report dry run output schema
+- expose scan summary dry run runtime
+- exhaust dry run source scan metadata
+- capture executed source provider stats
+- include source reports in write all
+- report delta source scheduling options
+- enrich source reports from provider plans
+- report dry run source usage
+- include source reports in dry run workflows
+- add delta source report shape
+- define workflow report status
+- define output report status
+- define workflow phase status
+- define validation report status
+- define report reason codes
+- define report count primitives
+- define validation report options
+- add blocking orchestrator runtime
+- add multi-output dry-run report
+- add one-output dry-run report
+- report write_all cache alias status
+- add write_all cache report metadata
+- execute write_all auto cache path
+- route write_all auto through cache planning
+- add write_all cache mode options
+- expose baseline write_all
+- run write_all jobs through workflow
+- build write_all workflow jobs
+- plan write_all outputs before execution
+- replan cached dependency stream factories
+- build cached output stream factory shell
+- classify cached output stream routes
+- make workflow stream factories async
+- add scoped cache alias replacement
+- select independent mssql cache aliases
+- model mssql cache aliases frontier
+- prefer deepest mssql cache candidate
+- count shared derived cache candidates
+- add mssql cache plan shell
+- check derived lineage candidates
+- resolve transitive derived lineage
+- track direct derived table lineage
+- retain derived SQL text ([#262](https://github.com/mag1cfrog/delta-funnel/pull/262))
+- add orchestrator single output execution
+- plan MSSQL outputs from session tables
+- add lazy SQL table aliases
+- register Delta sources through session
+- add MSSQL workflow report counters
+- expose MSSQL workflow status context
+- add MSSQL sequential workflow reports
+- expose MSSQL one-output batch sink
+- clean up MSSQL one-output sink failures
+- add MSSQL one-output sink orchestration
+- expose MSSQL connected writer initialization
+- add MSSQL bulk writer initialization adapter
+- route MSSQL target lifecycle preparation
+- clean up MSSQL prepared targets
+- prepare MSSQL create-and-load targets
+- prepare MSSQL append-existing targets
+- add MSSQL lifecycle client boundary
+- add MSSQL prepared target shapes
+- add MSSQL output connection entrypoint
+- add MSSQL batch write loop
+- add fakeable MSSQL bulk writer boundary
+- add MSSQL output schema validation
+- add MSSQL write failure context
+- preserve MSSQL schema plan options for writes
+- add MSSQL write report shape
+- add MSSQL write reporting vocabulary
+- add MSSQL write options defaults
+- expose MSSQL target output report fields
+- add MSSQL per-output target planning API
+- add MSSQL target output planning
+- add MSSQL lifecycle execution guardrails
+- add MSSQL lifecycle planning
+- add MSSQL create table DDL planning ([#207](https://github.com/mag1cfrog/delta-funnel/pull/207))
+- export MSSQL schema planning policies
+- add MSSQL schema diagnostic reports
+- add MSSQL schema planning
+- add MSSQL target configuration ([#205](https://github.com/mag1cfrog/delta-funnel/pull/205))
+- hand off merged query output
+- adapt bulk writer to batch handoff
+- expose merged DataFusion output streams
+- add pull-driven batch handoff
+- apply DataFusion batch size to native reads
+- record DataFusion output batch size
+- add query execution options
+- add batch handoff foundation ([#197](https://github.com/mag1cfrog/delta-funnel/pull/197))
+- default delta scans to native async
+- default native async to bounded prefetch
+- benchmark native async prefetch
+- benchmark delayed provider storage
+- expose provider read stats for benchmarks
+- benchmark provider scheduling profiles
+- benchmark sparse deletion vectors
+- add provider execution benchmark mode
+- *(delta)* store sparse deletion vector indexes
+- *(delta)* support native nested map key schema matching
+- *(delta)* support native map list key schema matching
+- *(delta)* support native map struct key schema matching
+- *(delta)* support native map value column mapping
+- *(delta)* support native map value schema matching
+- *(delta)* support native list struct schema matching
+- *(delta)* add native nested struct schema matching
+- *(delta)* thread storage options through readers
+- *(delta)* thread storage options through scan planning
+- *(delta)* add source storage option config
+- *(datafusion)* enforce native data predicates
+- *(datafusion)* enable native filter pushdown
+- *(datafusion)* prune native row groups
+- *(datafusion)* apply native row predicates
+- *(datafusion)* gate dv predicates by reader backend
+- *(datafusion)* record native async deletion vector stats
+- *(datafusion)* filter native async reads with deletion vectors
+- *(datafusion)* add native async row index plumbing
+- *(datafusion)* match native async schemas
+- *(datafusion)* transform native async batches
+- *(datafusion)* route native async scans through scheduler
+- *(datafusion)* read native async parquet files
+- *(datafusion)* add native object store reader context
+- *(datafusion)* add native async backend option
+- *(datafusion)* add lazy async read scheduler
+- *(datafusion)* add async read limiter
+- *(datafusion)* expose selected reader backend in stats
+- *(datafusion)* add provider reader backend boundary
+- *(datafusion)* add provider reader backend option
+- *(datafusion)* expose read stats snapshot internally
+- *(datafusion)* record DV read error stats
+- *(datafusion)* record DV read stats
+- *(datafusion)* record read progress stats
+- *(datafusion)* attach read stats to scan exec
+- *(datafusion)* add provider read stats
+- *(datafusion)* gate DV read predicates
+- *(datafusion)* expose scan execution read caps
+- *(datafusion)* bound sync file read permits
+- *(datafusion)* add provider execution options
+- *(datafusion)* allow column mapping scan execution
+- *(datafusion)* include transform schema context
+- *(datafusion)* allow deletion vector scan execution
+- *(datafusion)* stream sequential delta scan files
+- *(datafusion)* handle initial delta scan execution boundaries
+- *(datafusion)* expose file read iterator handoff
+- *(datafusion)* apply file-level scan transforms
+- *(datafusion)* apply file-level deletion vectors
+- *(datafusion)* add file-level delta reader baseline
+- *(delta)* add deletion-vector selection adapter ([#147](https://github.com/mag1cfrog/delta-funnel/pull/147))
+- add delta kernel read adapter ([#146](https://github.com/mag1cfrog/delta-funnel/pull/146))
+- add opt-in host local io probe
+- add host scheduler benchmark probe
+- add host probe profile output
+- add benchmark mode selection
+- expand benchmark fixed target cases
+- cap benchmark aggregate bandwidth
+- bound benchmark scan parallelism
+- model benchmark partition scheduling overhead
+- wire scan target override into provider
+- cover scan benchmark fallback cases
+- add scan benchmark strategy baselines
+- seed scan benchmark jitter
+- add scan benchmark seed option
+- add scan benchmark throughput metrics
+- add scan benchmark grouping metrics
+- add skewed scan benchmark workload
+- add mixed scan benchmark workload
+- add scan benchmark workload cases
+- label scan benchmark workload case
+- record scan benchmark host metadata
+- add scan benchmark csv output option
+- sweep scan benchmark policy candidates
+- expand scan benchmark policy matrix
+- drive scan benchmark with target policy
+- simulate partitioned scan work
+- add synthetic scan work profiles
+- generate synthetic scan benchmark files
+- add synthetic scan benchmark shape
+- expose scan target diagnostic policy
+- cap scan target policy with datafusion target
+- add execution environment scan target caps
+- use scan partition target policy in provider
+- add scan partition target policy
+- integrate scan partition planning
+- *(delta)* bridge scan metadata to partition plans
+- *(delta)* add scan file task partition planner
+- *(delta)* add delta scan file task model
+- *(delta)* expand provider scan metadata with context
+- *(delta)* add kernel scan metadata expansion adapter
+- support binary null-count stats pushdown
+- support bounded floating stats pushdown
+- support string data stats pushdown
+- support decimal data stats pushdown
+- support temporal data stats pushdown
+- support boolean null-count stats pushdown
+- support top-level and stats extraction
+- support integer stats operators
+- support integer stats widths
+- add int32 stats pushdown path
+- admit conservative timestamp_ntz predicates
+- convert timestamp_ntz kernel literals
+- admit conservative timestamp predicates
+- convert timestamp kernel literals
+- admit conservative binary predicates
+- convert binary kernel literals
+- admit conservative floating predicates
+- admit decimal partition predicates
+- admit date partition predicates
+- restore boolean partition pushdown planning
+- accept kernel string null partition pruning
+- pass exact partition predicates to kernel scan
+- narrow partition pushdown to kernel string subset
+- expose kernel partition predicate scan state
+- support timestamp ntz partition filters
+- support timestamp ntz metadata values
+- allow timestamp ntz reader feature
+- support binary partition equality
+- support binary partition null checks
+- support timestamp partition ranges
+- support timestamp partition equality
+- support timestamp partition null checks
+- support finite floating partition ordering
+- support finite floating partition equality
+- support floating partition null checks
+- support decimal partition ranges
+- support decimal partition equality
+- support decimal partition null checks
+- support date partition range pushdown
+- support date partition equality pushdown
+- support date partition null checks
+- support boolean partition shorthand filters
+- support boolean partition equality filters
+- add boolean partition metadata value kind
+- promote integer partition ranges
+- promote integer partition comparisons
+- promote integer partition equality pushdown
+- promote integer partition null checks
+- promote partition between filters
+- promote partition range comparisons
+- promote negated partition filters
+- promote partition null filters
+- apply partition metadata filter to scan files
+- attach partition metadata filter to scan plan
+- support delta partition metadata in
+- add delta partition metadata evaluator
+- support exact partition in pushdown
+- enable exact partition equality pushdown
+- wire exact partition filters into delta scans
+- add partition equality filter planner
+- expand delta kernel predicate adapter coverage
+- connect filter analysis to kernel predicate adapter
+- add delta kernel predicate adapter
+- add delta filter pushdown analysis
+- add delta kernel predicate boundary
+- add delta provider filter planning contract
+- wire delta provider scan planning
+- add kernel-backed delta scan projection plan
+- add delta datafusion provider registration
+- add multi-source protocol preflight
+- add delta protocol preflight
+- expose loaded snapshots internally
+- load delta sources after name preflight
+- load named delta sources
+- load delta table snapshots
+- normalize delta table URIs
+- validate delta source names
+
+### Fixed
+
+- report auto provider scan capacity as unresolved
+- sanitize source report uri json
+- expose write failure context in json
+- keep write report json outcome-neutral
+- trace public write-all entrypoint
+- redact tracing error summaries
+- simplify mssql validation helpers
+- mark mssql write validation unreachable
+- preserve append mssql missing-row evidence
+- preserve append mssql pre-count evidence
+- preserve failure phase timings
+- reject nested blocking runtime calls
+- point dry-run run-mode errors at dry-run APIs
+- defer cached stream setup failures
+- setup workflow streams before writer side effects
+- reject ambiguous mssql cache frontier
+- require execute mode for mssql writes
+- remove session batch shaping options
+- track MSSQL write elapsed time
+- accept pinned MSSQL batch streams
+- clean up MSSQL targets after writer init failure
+- record dynamic partition evaluator stats
+- record dynamic filter hook stats
+- apply dynamic partition pruning during execution
+- add dynamic partition evaluator
+- retain delta dynamic physical filters
+- classify delta dynamic scan filters
+- prepare delta scan exec for dynamic filters
+- restore workspace validation for delta benchmarks ([#179](https://github.com/mag1cfrog/delta-funnel/pull/179))
+- *(delta)* preserve dv exhaustion diagnostic
+- *(datafusion)* sign extend decimal row group stats
+- *(datafusion)* reject unsafe exact dv predicates
+- *(datafusion)* gate unsupported native schemas
+- *(datafusion)* stream native async parquet batches
+- *(datafusion)* keep native async filters residual
+- keep benchmark imbalance metric scoped
+- balance zero byte scan partitions
+- preserve non-finite floating partition metadata
+- guard decimal exponent parsing overflow
+- parse exponent decimal partition metadata
+- harden datafusion registration consistency
+- respect datafusion default catalog config
+- make datafusion registration two phase
+- reject duplicate datafusion registrations
+- sanitize protocol report URI
+- harden delta source validation
+
+### Other
+
+- prepare crate publish metadata ([#346](https://github.com/mag1cfrog/delta-funnel/pull/346))
+- add MkDocs site scaffold
+- add core pull request workflow
+- highlight native TDS SQL Server writes ([#343](https://github.com/mag1cfrog/delta-funnel/pull/343))
+- share package version from workspace
+- polish README first-use flow
+- close Python package audit gaps
+- add Python package verification task
+- enrich Python object reprs
+- document Python SQL load API
+- cover Python MSSQL default connection write
+- add failure report tracing guide
+- update report json module docs
+- cover failed workflow json statuses
+- verify nested tracing scope
+- clarify datafusion stream tracing
+- remove duplicate mssql tracing events
+- separate tracing workflow wrappers
+- capture workflow tracing fields
+- simplify append validation tests
+- validate append mssql row delta integration
+- cover disabled append mssql validation
+- cover required append mssql missing rows
+- cover required append mssql post-count failure
+- cover required append mssql pre-count failure
+- cover append mssql pre-count unavailable
+- cover append mssql row delta mismatch
+- assert mssql create load validation reports
+- cover unsupported mssql target count validation
+- cover unavailable mssql target row validation
+- bump arrow-tiberius to 0.1.4
+- update dry-run phase timing expectation
+- move report shapes into report modules
+- Feat/279 output row batch metrics ([#294](https://github.com/mag1cfrog/delta-funnel/pull/294))
+- Refactor/session domain modules ([#293](https://github.com/mag1cfrog/delta-funnel/pull/293))
+- Refactor/session modules ([#292](https://github.com/mag1cfrog/delta-funnel/pull/292))
+- cover dry run report public getters
+- keep source row stats separate
+- cover source reports through public api
+- align arrow-tiberius observability dependency ([#288](https://github.com/mag1cfrog/delta-funnel/pull/288))
+- cover orchestrator sqlserver integration
+- execute orchestrator delta fixtures
+- cover orchestrator dry-run e2e
+- add query load dry-run example
+- drive blocking runtime write_all with fake writer
+- drive blocking runtime write with fake writer
+- cover dry-run planning failures
+- cover broken write_all cache restore path
+- preserve write_all cache restore errors
+- preserve write_all workflow report details
+- clarify write_all cache report lifecycle
+- preserve cache report after write_all failures
+- cover multi-alias write_all cache report
+- cover write_all report redaction
+- cover write_all auto unrelated output path
+- cover write_all auto stream setup failure
+- cover write_all auto partial cache cleanup
+- cover write_all auto cache materialization failure
+- cover write_all auto cache failure cleanup
+- cover write_all multi alias auto cache
+- isolate write_all baseline path
+- cover write_all error redaction
+- cover write_all stream setup failure
+- cover write_all skip after failure
+- cover mixed cached stream factories
+- cover multi-cache dependency stream replan
+- distinguish workflow stream polling failures
+- cover scoped cache restore without cached alias
+- cover scoped cache alias cleanup
+- guard scoped cache alias inputs
+- clarify independent cache frontier case
+- cover cyclic mssql cache candidates
+- prepare mssql cache frontier selection
+- cover independent mssql cache candidates
+- cover missing sql cache candidate
+- cover conservative mssql cache candidates
+- add orchestrator session facade
+- group pipeline handoff module
+- move redaction helpers under support
+- wire sql server execution facade
+- group sql server execution modules
+- group sql server planning modules
+- cover derived lineage edge cases
+- prove sql ast lineage capture ([#260](https://github.com/mag1cfrog/delta-funnel/pull/260))
+- prove planned alias lineage behavior ([#258](https://github.com/mag1cfrog/delta-funnel/pull/258))
+- prove replanned cached alias behavior ([#248](https://github.com/mag1cfrog/delta-funnel/pull/248))
+- prove cached alias replacement behavior ([#246](https://github.com/mag1cfrog/delta-funnel/pull/246))
+- cover orchestrator mssql writer handoff
+- cover MSSQL output target identifier planning
+- harden SQL alias registration
+- redact session Delta protocol failures
+- harden session Delta source registration
+- Merge pull request #239 from mag1cfrog/feat/229-session-model
+- harden MSSQL workflow failure reporting
+- surface MSSQL cleanup failures with write stats
+- assert MSSQL DirectRawBulk persisted rows
+- add MSSQL DirectRawBulk xtask integration
+- cover MSSQL sink cleanup failure paths
+- guard MSSQL sink source boundary
+- harden MSSQL target lifecycle cleanup
+- guard MSSQL connection boundaries
+- cover MSSQL connection request guardrails
+- cover create-and-load write failure risk
+- cover empty MSSQL batch stream
+- cover MSSQL finalize failure
+- cover MSSQL batch write failure
+- cover MSSQL batch schema guard
+- cover MSSQL stream failure reporting
+- cover MSSQL output schema aliases
+- cover MSSQL output schema validation failures
+- cover MSSQL output planning errors
+- cover independent MSSQL output planning
+- cover MSSQL schema planning SchemaRef input
+- harden batch handoff semantics
+- cover dynamic filter plan diagnostics
+- document dynamic pruning spark parity
+- clarify async scheduler admission stats
+- remove stale dynamic pruning note
+- cover late dynamic pruning
+- cover dynamic pruning null membership
+- cover dynamic pruning stream drop
+- cover dynamic pruning unsupported snapshot
+- cover dynamic pruning residual filter
+- cover dynamic pruning null metadata boundary
+- cover dynamic pruning null partition
+- cover dynamic pruning multi-column disjunction
+- cover dynamic pruning multi-column conjunction
+- cover dynamic pruning matching-none snapshot
+- cover dynamic pruning deletion vectors
+- cover join-driven dynamic partition pruning
+- cover dynamic pruning real file execution
+- expose dynamic evaluator benchmark stats
+- expose dynamic filter hook benchmark stats
+- expose dynamic pruning benchmark stats
+- cover delta dynamic filter hook edges
+- investigate dynamic partition pruning ([#181](https://github.com/mag1cfrog/delta-funnel/pull/181))
+- clarify provider execution comments
+- remove stale provider read wording
+- clarify native async prefetch loop
+- clarify native async prefetch scheduling
+- assert native async permit release
+- *(delta)* cover sparse dv row indexes
+- *(delta)* use cursor for sparse dv row lookup
+- *(delta)* cover native complex map key matching
+- *(delta)* cover native map key column mapping
+- *(delta)* prepare native map key schema plans
+- *(delta)* address native async clippy cleanup
+- *(delta)* address map schema clippy warning
+- *(delta)* cover native map value schema matching
+- *(delta)* cover native list column mapping
+- *(delta)* cover native list struct schema matching
+- *(delta)* cover nested struct projection and evolution
+- *(delta)* cover native nested struct equivalence
+- *(delta)* cover source storage option propagation
+- *(datafusion)* cover native dv predicate non-overlap
+- *(datafusion)* preserve native metadata residuals
+- *(datafusion)* cover empty native dv predicates
+- *(datafusion)* cover native async dv row groups
+- *(datafusion)* cover native async dv payload failures
+- *(datafusion)* cover native async dv cancellation stats
+- *(datafusion)* cover native async deletion vector edges
+- *(datafusion)* cover native async name fallback
+- *(datafusion)* cover native async missing required columns
+- *(datafusion)* cover native async missing nullable columns
+- *(datafusion)* cover native async supported types
+- *(datafusion)* cover native async transform equivalence
+- *(datafusion)* cover native async object store access
+- *(datafusion)* cover native async backpressure
+- *(datafusion)* cover native async cancellation
+- *(datafusion)* cover native async missing file errors
+- *(datafusion)* cover native async ordering
+- *(datafusion)* stabilize async scheduling validation
+- *(datafusion)* cover async scheduler guards
+- *(datafusion)* group read stats initialization
+- *(datafusion)* cover provider reader backend selection
+- *(datafusion)* stabilize cancellation read stats
+- *(datafusion)* cover empty scan read stats
+- *(datafusion)* cover multi-partition read stats
+- *(datafusion)* cover DV residual projection
+- *(datafusion)* document DV predicate handoff
+- *(datafusion)* cover DV predicate gate
+- *(datafusion)* cover DV large file oracle
+- *(delta)* add DV row-index oracle
+- *(datafusion)* document read scheduling bounds
+- *(datafusion)* cover stream drop scheduling
+- *(datafusion)* cover sync read permit caps
+- *(datafusion)* assert required scan transforms
+- *(datafusion)* cover deletion vectors with transforms
+- *(datafusion)* cover partition value transforms
+- *(datafusion)* assert scan runtime boundaries
+- *(datafusion)* cover incremental scan streaming
+- *(datafusion)* cover grouped partition scan execution
+- *(datafusion)* cover projection and residual scan execution
+- *(datafusion)* organize module layout
+- *(datafusion)* cover transform error context
+- *(datafusion)* cover multi-batch deletion vector masking
+- align provider zero byte partitions
+- document scan partition target policy
+- document scan partition benchmark
+- avoid panic in scan metadata error guard
+- clarify scan execution stub scope
+- harden scan planning error guards
+- document scan partition handoff contract
+- cover pruned scan partition planning
+- use snafu fail for partition planning errors
+- use snafu selectors for errors
+- *(delta)* harden file task partition grouping
+- *(delta)* sanitize file task planning errors
+- *(delta)* keep file tasks delta-aware
+- *(delta)* preserve dv and transform file task metadata
+- *(delta)* cover empty provider scan metadata expansion
+- *(delta)* cover provider scan metadata ordering
+- *(delta)* harden kernel scan metadata adapter contract
+- cover delta limit plan boundaries
+- pin delta limit scan planning policy
+- pin unsupported stats matrix reasons
+- reject unsupported stats matrix at scan
+- document stats pushdown type matrix
+- reject binary stats comparators at scan
+- cover binary stats residual projection
+- cover binary null-count scan pruning
+- characterize binary data stats pruning
+- place floating rejection reason assertion
+- correct floating rejection reason coverage
+- align mixed extraction with floating stats support
+- pin floating stats rejection reason
+- cover sql floating stats residuals
+- cover mixed floating stats pruning
+- cover floating stats projection safety
+- cover floating stats provider scans
+- characterize floating data stats pruning
+- align stats expectations for strings
+- characterize non-ascii string stats pruning
+- cover partial string stats pruning
+- cover mixed string stats pruning
+- cover string stats projection safety
+- cover string stats provider scans
+- characterize string data stats pruning
+- move provider tests to sidecar module
+- cover mixed decimal stats pruning
+- cover decimal stats residual projection
+- cover decimal stats scan pruning
+- characterize decimal data stats pruning
+- cover mixed temporal stats pruning
+- cover temporal stats residual projection
+- cover temporal stats scan pruning
+- characterize timestamp data stats pruning
+- characterize date data stats pruning
+- harden unsupported boolean stats filters
+- cover mixed boolean stats pruning
+- cover boolean stats residual projection
+- characterize boolean data stats pruning
+- cover dv stats preflight rejection
+- guard against dv payload loading
+- cover dv stats pruning metadata boundary
+- cover stats and data residual pruning
+- cover composed stats residual projection
+- cover unsafe mixed stats boolean policy
+- update stats pushdown expectations
+- cover partition and stats pruning combination
+- cover not equals stats boundaries
+- cover data stats projection safety
+- cover invalid integer stats uncertainty
+- cover partial integer stats uncertainty
+- cover integer stats operator pruning
+- clean stats helper borrow
+- cover predicated stats metadata boundary
+- characterize kernel data stats pruning
+- expose kernel stats scan metadata
+- keep partition planning DV-free
+- cover DV metadata partition boundary
+- remove stale dead code allow
+- drop pseudo composition admission
+- remove stale filter diagnostics
+- update partition admission wording
+- thin kernel partition admission policy
+- remove typed restore pending policy
+- remove stale metadata evaluator wording
+- delete provider partition metadata evaluator
+- remove partition metadata scan filter
+- cover timestamp_ntz mixed and pruning
+- characterize timestamp_ntz partition pruning
+- cover timestamp timezone literals
+- cover timestamp mixed pruning
+- characterize timestamp partition pruning
+- cover binary mixed pruning
+- characterize binary partition pruning
+- keep floating validation warning clean
+- cover floating mixed and pruning
+- verify floating provider pushdown
+- characterize floating partition pruning
+- reject unsafe decimal pushdown shapes
+- verify decimal mixed and pushdown
+- verify decimal provider pushdown
+- characterize decimal partition pruning
+- verify sql date pushdown
+- verify date provider pushdown
+- characterize date partition pruning
+- cover SQL boolean kernel pushdown
+- assert boolean provider kernel pruning
+- characterize boolean kernel partition pruning
+- Avoid panic in integer kernel characterization
+- Cover SQL integer predicate shapes
+- Assert integer kernel scan pruning in provider
+- Characterize integer kernel scan pruning
+- Restore integer partition pushdown planning
+- Audit kernel predicate scalar adapter boundary
+- Document kernel partition type policy
+- Cover mixed AND string null pruning
+- Cover mixed AND execution stub contract
+- Cover mixed AND SQL residual contract
+- Add kernel mixed AND filter extraction
+- Unify exact partition kernel filter planning
+- Support empty string partition in-lists safely
+- Support string partition operator families
+- Restore exact string partition operators
+- update provider filter normalization comment
+- align filter planning comment with kernel predicates
+- keep timestamp SQL predicates residual
+- reject direct timestamp partition pushdown
+- keep floating SQL predicates residual
+- reject direct floating partition pushdown
+- keep decimal SQL predicates residual
+- reject direct decimal partition pushdown
+- keep binary SQL predicates residual
+- reject direct binary partition pushdown
+- keep date SQL predicates residual
+- reject direct date partition pushdown
+- keep boolean SQL predicates residual
+- reject direct boolean partition pushdown
+- keep integer SQL predicates residual
+- reject direct integer partition pushdown
+- keep unsupported string operators residual
+- align mixed filters with kernel pushdown boundary
+- cover kernel string SQL pushdown guards
+- cover provider kernel string scan path
+- characterize kernel partition null semantics
+- characterize kernel partition scan path
+- Test column mapping feature rejection
+- Test SQL partition edge optimizer paths
+- Test ambiguous partition scan references
+- Test exact partition scan edge semantics
+- Clarify filter analysis naming
+- Reject unsafe mixed shorthand residuals
+- Harden mixed residual filter safety
+- Prove mixed partition SQL residual support
+- Test mixed and exact partition pruning
+- Test mixed partition SQL residual projection
+- Rename filter analysis diagnostics
+- Check projected inexact residual columns
+- Accept inexact mixed AND provider scans
+- Add mixed AND partition extraction planning
+- cover timestamp ntz sql range pruning
+- cover timestamp ntz sql equality pruning
+- cover timestamp ntz provider pruning
+- cover binary partition composition
+- add binary partition metadata boundaries
+- reject non utc timestamp literals
+- cover timestamp partition composition
+- add timestamp partition boundary coverage
+- cover floating partition sql residuals
+- cover floating partition unsafe operands
+- cover floating partition composition
+- document floating partition metadata boundary
+- harden decimal partition metadata coverage
+- document decimal partition metadata boundary
+- cover date partition pushdown boundaries
+- cover date partition unsupported boundary
+- clarify partition operator capability wording
+- cover boolean partition boundary gaps
+- keep boolean partition ordering unsupported
+- cover boolean partition null checks
+- generalize partition type policy wording
+- clarify provider partition pruning path
+- refresh partition metadata test names
+- refresh partition metadata wording
+- refresh integer partition pushdown wording
+- cover integer partition width bounds for ranges
+- harden integer partition unsafe boundaries
+- cover integer partition predicate composition
+- type partition metadata values
+- document integer partition pushdown boundary
+- split delta partition metadata predicate
+- cover contradictory partition ranges
+- clarify scan file metadata filtering
+- guard partition metadata filter policy
+- baseline partition null semantics
+- harden mixed partition boolean pushdown
+- probe partition in edge rewrites
+- define partition operator pushdown baseline
+- cover combined delta kernel predicates
+- clarify provider filter planning names
+- centralize provider filter planning
+- align qualified partition scan filters
+- harden exact partition pushdown coverage
+- split datafusion filter analysis module
+- harden delta predicate pushdown boundaries
+- cover delta predicate literal boundaries
+- split datafusion provider modules ([#31](https://github.com/mag1cfrog/delta-funnel/pull/31))
+- tighten lint configuration
+- keep filter lookup helper panic-free
+- cover deep nested filter references
+- cover qualified filter references
+- cover scalar function filter planning
+- harden delta provider filter planning contract
+- harden delta scan pushdown boundaries
+- harden delta provider scan contracts
+- preserve residual filter inputs in delta scans
+- harden delta scan projection planning
+- lock delta scan stub behavior
+- inspect registered datafusion provider schema
+- harden delta provider schema handling
+- cover delta source sql analysis
+- add datafusion api smoke test
+- harden delta protocol preflight
+- clarify delta protocol policy
+- make delta reader feature policy explicit
+- harden delta source failure coverage
+- group delta source modules
+- narrow delta source public API
+- clarify relative delta URI normalization
+- guard delta source dependencies
+- cover delta kernel source loading APIs
+- simplify public error type
+- Document foundation dependency alignment
+- Add Delta kernel adapter smoke tests
+- Add minimal SNAFU error pattern
+- Add foundation dependencies
+- Initial workspace scaffold
+# Changelog
+
 Release notes are managed by release-plz.
