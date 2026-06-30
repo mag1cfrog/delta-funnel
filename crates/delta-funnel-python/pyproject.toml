@@ -5,14 +5,25 @@ build-backend = "maturin"
 [project]
 name = "deltafunnel"
 dynamic = ["version"]
-description = "Python bindings for Delta Funnel"
+description = "Read Delta Lake tables, transform with SQL, and load into SQL Server"
 readme = "../../README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
+keywords = ["delta-lake", "sql-server", "datafusion", "tds", "arrow"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 
 [project.urls]
 Homepage = "https://github.com/mag1cfrog/delta-funnel"
 Repository = "https://github.com/mag1cfrog/delta-funnel"
+Issues = "https://github.com/mag1cfrog/delta-funnel/issues"
 
 [tool.maturin]
 bindings = "pyo3"
