@@ -1,0 +1,7 @@
+[workspace]
+release = false
+
+[[package]]
+name = "delta-funnel"
+release = true
+changelog_path = "CHANGELOG.md"
