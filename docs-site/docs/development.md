@@ -23,6 +23,10 @@ Run SQL Server integration tests only when SQL Server behavior changes:
 cargo xtask sqlserver-test
 ```
 
+The `SQL Server Integration` GitHub Actions workflow runs the same command on a
+GitHub-hosted Linux runner. Run it manually before a release, and use the pull
+request trigger to validate changes to the SQL Server write path.
+
 Build the docs site with:
 
 ```bash
