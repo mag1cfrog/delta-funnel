@@ -545,15 +545,38 @@ impl fmt::Display for XtaskError {
 }
 
 const WHEEL_CONTENT_CHECK: &str = r#"
+import email.parser
 import sys
 import zipfile
+from pathlib import Path
 
 required = {"deltafunnel/__init__.pyi", "deltafunnel/py.typed"}
-with zipfile.ZipFile(sys.argv[1]) as wheel:
+wheel_path = Path(sys.argv[1])
+expected_version = wheel_path.name.split("-")[1]
+
+with zipfile.ZipFile(wheel_path) as wheel:
     names = set(wheel.namelist())
+    metadata_files = [name for name in names if name.endswith(".dist-info/METADATA")]
+    native_modules = [
+        name
+        for name in names
+        if name.startswith("deltafunnel/") and name.endswith((".so", ".pyd"))
+    ]
+
 missing = sorted(required - names)
 if missing:
     raise SystemExit("missing wheel entries: " + ", ".join(missing))
+if len(metadata_files) != 1:
+    raise SystemExit("expected exactly one METADATA file")
+if not native_modules:
+    raise SystemExit("missing native extension module")
+
+with zipfile.ZipFile(wheel_path) as wheel:
+    metadata = email.parser.Parser().parsestr(wheel.read(metadata_files[0]).decode())
+if metadata["Name"] != "deltafunnel":
+    raise SystemExit(f"unexpected package name: {metadata['Name']}")
+if metadata["Version"] != expected_version:
+    raise SystemExit(f"unexpected package version: {metadata['Version']}")
 "#;
 
 const PYTHON_IMPORT_SMOKE: &str = r#"
