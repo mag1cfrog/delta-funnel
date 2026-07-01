@@ -56,9 +56,10 @@ Repository setup:
 
 - Allow GitHub Actions to create pull requests.
 - Create the `crates-io-release` GitHub environment.
-- Add a `RELEASE_PLZ_TOKEN` secret before enabling automatic follow-up
-  workflows such as PyPI publishing. Releases created with `GITHUB_TOKEN` do
-  not trigger another workflow.
+- Install the `release-plz-bot-mag1cfrog` GitHub App on this repository.
+- Add `APP_ID` and `APP_PRIVATE_KEY` secrets for the release-plz GitHub App.
+  Releases created with `GITHUB_TOKEN` do not trigger follow-up workflows such
+  as PyPI publishing.
 - Set the `RELEASE_PLZ_PR_ENABLED` repository variable to `true` after the first
   manual crates.io publish.
 
