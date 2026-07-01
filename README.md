@@ -1,5 +1,7 @@
 # Delta Funnel
 
+![Surreal banner showing Delta Lake data flowing through a Rust-orange funnel into a database barrel.](assets/delta-funnel-banner.jpg)
+
 <h3 align="center">
   <strong>Move Delta Lake data into SQL Server without Spark or ODBC.</strong>
 </h3>
