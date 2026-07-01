@@ -1,6 +1,6 @@
 # Delta Funnel
 
-![Surreal banner showing Delta Lake data flowing through a Rust-orange funnel into a database barrel.](assets/delta-funnel-banner.jpg)
+![Surreal banner showing Delta Lake data flowing through a Rust-orange funnel into a database barrel.](https://raw.githubusercontent.com/mag1cfrog/delta-funnel/main/assets/delta-funnel-banner.jpg)
 
 <h3 align="center">
   <strong>Move Delta Lake data into SQL Server without Spark or ODBC.</strong>
@@ -12,12 +12,12 @@
 </p>
 
 <p align="center">
-  Built in Rust. Python API included. Local builds available today.
+  Built in Rust. Python API included.
 </p>
 
 > [!NOTE]
-> Delta Funnel is early project code. Local Rust and Python builds work, but
-> PyPI, crates.io, and hosted documentation publishing are not configured yet.
+> Delta Funnel is early project code. The Rust crate is available on crates.io,
+> and the Python package is available on PyPI.
 
 ## When To Use It
 
@@ -32,17 +32,16 @@ Use Delta Funnel when you need to:
 
 ## Install Or Build
 
-Until package publishing is configured, build and smoke-test the Python wheel
-for the `deltafunnel` package from the repository:
+For Rust, add the `delta-funnel` crate:
 
 ```bash
-cargo xtask python-package-check
+cargo add delta-funnel
 ```
 
-For Rust, use the `delta-funnel` workspace crate directly:
+For Python, add the `deltafunnel` package:
 
 ```bash
-cargo check --workspace
+uv add deltafunnel
 ```
 
 ## Python Quickstart

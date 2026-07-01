@@ -1,7 +1,8 @@
 # Python API Walkthrough
 
-This walkthrough shows the Python API shape without requiring package publishing.
-Build the local wheel first with `cargo xtask python-package-check`.
+This walkthrough uses the `deltafunnel` package. Install it from PyPI, or build
+the local wheel first with `cargo xtask python-package-check` when developing
+the repository.
 
 ## Create a session
 

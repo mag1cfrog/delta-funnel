@@ -1,7 +1,6 @@
 # Installation And Local Build
 
-Delta Funnel is not published to PyPI or crates.io yet. Build it from the
-repository.
+Install the Rust crate from crates.io or the Python package from PyPI.
 
 ## Prerequisites
 
@@ -9,7 +8,31 @@ repository.
 - Python 3.10 or newer for the Python extension
 - `maturin` when building the Python wheel
 
-## Get the source
+## Rust crate
+
+```bash
+cargo add delta-funnel
+```
+
+## Python package
+
+For Python projects managed by uv, add the `deltafunnel` package:
+
+```bash
+uv add deltafunnel
+```
+
+For an existing Python environment, install it with pip:
+
+```bash
+python -m pip install deltafunnel
+```
+
+## Local build
+
+Use a local build when developing Delta Funnel itself.
+
+Get the source:
 
 ```bash
 git clone https://github.com/mag1cfrog/delta-funnel.git
@@ -24,7 +47,7 @@ Install `maturin` if it is not already available:
 python -m pip install "maturin>=1.11,<2"
 ```
 
-## Build the Rust workspace
+## Check the Rust workspace
 
 ```bash
 cargo check --workspace

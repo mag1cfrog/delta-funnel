@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/mag1cfrog/delta-funnel"
-homepage = "https://github.com/mag1cfrog/delta-funnel"
+homepage = "https://mag1cfrog.github.io/delta-funnel/"
 
 [workspace.lints.rust]
 missing_docs = "deny"
