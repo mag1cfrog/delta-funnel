@@ -1203,6 +1203,13 @@ mod tests {
     where
         S: Subscriber + for<'lookup> LookupSpan<'lookup>,
     {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
         fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
             let mut visitor = FieldVisitor::default();
             attrs.record(&mut visitor);
