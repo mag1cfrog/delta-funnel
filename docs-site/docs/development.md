@@ -58,6 +58,8 @@ Repository setup:
 - Create the `crates-io-release` GitHub environment.
 - Add a `RELEASE_PLZ_TOKEN` secret if release-plz PRs need to trigger required
   pull request checks automatically.
+- Set the `RELEASE_PLZ_PR_ENABLED` repository variable to `true` after the first
+  manual crates.io publish.
 
 Normal Rust release flow:
 

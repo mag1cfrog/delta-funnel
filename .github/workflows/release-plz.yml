@@ -12,7 +12,7 @@ permissions:
 jobs:
   release-pr:
     name: Release-plz PR
-    if: github.event_name == 'push' && github.repository_owner == 'mag1cfrog'
+    if: github.event_name == 'push' && github.repository_owner == 'mag1cfrog' && vars.RELEASE_PLZ_PR_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
