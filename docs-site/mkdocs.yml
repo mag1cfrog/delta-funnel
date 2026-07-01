@@ -6,7 +6,6 @@ repo_url: https://github.com/mag1cfrog/delta-funnel
 theme:
   name: material
   features:
-    - navigation.tabs
     - navigation.sections
     - content.code.copy
     - search.suggest
@@ -24,14 +23,14 @@ markdown_extensions:
       anchor_linenums: true
 
 nav:
-  - Overview: index.md
-  - Installation: install.md
-  - Python API walkthrough: python-api-walkthrough.md
-  - Concepts: concepts.md
-  - SQL Server: sql-server.md
-  - Dry runs and reports: dry-runs-reports.md
+  - User guide:
+      - Overview: index.md
+      - Installation: install.md
+      - Python API walkthrough: python-api-walkthrough.md
+      - Concepts: concepts.md
+      - SQL Server: sql-server.md
+      - Dry runs and reports: dry-runs-reports.md
   - Internals:
       - DataFusion and Delta: internals/datafusion-delta.md
-  - Development: development.md
   - Reference:
       - API references: reference/api.md
