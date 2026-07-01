@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use crate::output::PyMssqlOutputSpec;
 use crate::session::PySession;
 
-/// Lazy DeltaFunnel table.
+/// Lazy Delta Funnel table.
 ///
 /// A `Table` can be aliased for later SQL, converted to a `MssqlOutputSpec`,
 /// or written directly to SQL Server.

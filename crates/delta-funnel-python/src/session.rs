@@ -8,7 +8,7 @@ use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
 use crate::table::PyTable;
 
-/// DeltaFunnel workflow session.
+/// Delta Funnel workflow session.
 ///
 /// `Session()` uses Rust defaults unless options are supplied. Register Delta
 /// sources, build lazy SQL tables, and execute or dry-run SQL Server outputs
@@ -1028,7 +1028,7 @@ mod tests {
 
             let table_type = module.getattr("Table")?;
             let table_doc = table_type.getattr("__doc__")?.extract::<String>()?;
-            assert!(table_doc.contains("Lazy DeltaFunnel table"));
+            assert!(table_doc.contains("Lazy Delta Funnel table"));
 
             let to_mssql_doc = table_type
                 .getattr("to_mssql")?

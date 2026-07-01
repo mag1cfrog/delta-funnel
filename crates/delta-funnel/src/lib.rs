@@ -1,4 +1,4 @@
-//! Core library for DeltaFunnel.
+//! Core library for Delta Funnel.
 //!
 //! This crate will own the high-level export orchestration from table formats
 //! such as Delta Lake into Microsoft SQL Server. Low-level Arrow to TDS bulk
