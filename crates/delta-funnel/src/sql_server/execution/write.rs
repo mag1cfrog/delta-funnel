@@ -1,6 +1,6 @@
 //! SQL Server write options.
 //!
-//! This module owns DeltaFunnel-side write defaults around `arrow-tiberius`.
+//! This module owns Delta Funnel write defaults around `arrow-tiberius`.
 
 use std::{
     fmt,
@@ -215,7 +215,7 @@ pub enum MssqlWritePhase {
     Finalize,
     /// Validate target-side write evidence after finalize succeeds.
     Validation,
-    /// Clean up a DeltaFunnel-created target after a later failure.
+    /// Clean up a Delta Funnel-created target after a later failure.
     Cleanup,
 }
 
@@ -235,7 +235,7 @@ impl fmt::Display for MssqlWritePhase {
     }
 }
 
-/// Returns DeltaFunnel's default SQL Server write options.
+/// Returns Delta Funnel's default SQL Server write options.
 #[must_use]
 pub fn default_mssql_write_options() -> MssqlWriteOptions {
     MssqlWriteOptions {
@@ -298,7 +298,7 @@ where
 
 /// Validates a runtime Arrow schema against a planned SQL Server output.
 ///
-/// DeltaFunnel owns the output context and redacted report shape, while the
+/// Delta Funnel owns the output context and redacted report shape, while the
 /// schema contract comparison is delegated to `arrow-tiberius`.
 pub fn validate_mssql_output_schema(
     output_plan: &MssqlTargetOutputPlan,

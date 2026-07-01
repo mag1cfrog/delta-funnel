@@ -16,7 +16,7 @@ use crate::{
     MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, WriteAllOptions, WriteAllReport,
 };
 
-/// Blocking runtime boundary for high-level DeltaFunnel session actions.
+/// Blocking runtime boundary for high-level Delta Funnel session actions.
 ///
 /// This type is intended to be owned by synchronous host bindings. Constructing
 /// it only creates a Tokio runtime; it does not register sources, plan SQL,
