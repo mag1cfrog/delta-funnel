@@ -2,8 +2,9 @@
 
 ## Rust
 
-The Rust crate owns the workflow implementation and public report types. After
-publication, the Rust API reference will live on docs.rs.
+The Rust crate owns the workflow implementation and public report types. The
+published Rust API reference lives on
+[docs.rs/delta-funnel](https://docs.rs/delta-funnel).
 
 For local API docs, run:
 

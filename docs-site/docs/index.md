@@ -1,14 +1,40 @@
 # Delta Funnel
 
-Delta Funnel moves Delta Lake data into SQL Server without Spark or ODBC.
+![Surreal banner showing Delta Lake data flowing through a Rust-orange funnel into a database barrel.](https://raw.githubusercontent.com/mag1cfrog/delta-funnel/main/assets/delta-funnel-banner.jpg)
 
-Use it when you need a focused single-node pipeline that can read Delta Lake
-tables, transform rows with SQL, and bulk-load results into Microsoft SQL
-Server through a native TDS driver.
+<h3 align="center">
+  <strong>Move Delta Lake data into SQL Server without Spark or ODBC.</strong>
+</h3>
+
+<p align="center">
+  A lightweight Rust and Python toolkit for reading Delta Lake tables,<br/>
+  transforming them with SQL, and bulk-loading through a native TDS driver.
+</p>
+
+<p align="center">
+  <a href="https://docs.rs/delta-funnel"><img alt="Rust docs" src="https://docs.rs/delta-funnel/badge.svg"></a>
+  <a href="https://crates.io/crates/delta-funnel"><img alt="crates.io" src="https://img.shields.io/crates/v/delta-funnel.svg"></a>
+  <a href="https://pypi.org/project/deltafunnel/"><img alt="PyPI" src="https://img.shields.io/pypi/v/deltafunnel.svg"></a>
+  <a href="https://pypi.org/project/deltafunnel/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-blue.svg"></a>
+</p>
 
 !!! note "Project status"
     Delta Funnel is early project code. The Rust crate is available on
     crates.io, and the Python package is available on PyPI.
+
+## Install
+
+For Rust:
+
+```bash
+cargo add delta-funnel
+```
+
+For Python:
+
+```bash
+uv add deltafunnel
+```
 
 ## Start here
 

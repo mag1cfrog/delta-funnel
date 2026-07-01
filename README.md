@@ -15,6 +15,13 @@
   Built in Rust. Python API included.
 </p>
 
+<p align="center">
+  <a href="https://docs.rs/delta-funnel"><img alt="Rust docs" src="https://docs.rs/delta-funnel/badge.svg"></a>
+  <a href="https://crates.io/crates/delta-funnel"><img alt="crates.io" src="https://img.shields.io/crates/v/delta-funnel.svg"></a>
+  <a href="https://pypi.org/project/deltafunnel/"><img alt="PyPI" src="https://img.shields.io/pypi/v/deltafunnel.svg"></a>
+  <a href="https://pypi.org/project/deltafunnel/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-blue.svg"></a>
+</p>
+
 > [!NOTE]
 > Delta Funnel is early project code. The Rust crate is available on crates.io,
 > and the Python package is available on PyPI.
