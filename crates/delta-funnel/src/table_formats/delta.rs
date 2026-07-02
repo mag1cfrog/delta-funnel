@@ -1,8 +1,9 @@
 //! Delta table-format source loading.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{DeltaFunnelError, error::DeltaSourceSchemaSnafu, observability};
+use delta_kernel::object_store::aws::AmazonS3ConfigKey;
 
 mod deletion_vector;
 mod kernel;
@@ -171,7 +172,7 @@ pub(crate) struct KernelPhysicalToLogicalTransformHandle {
     transform: kernel::ExpressionRef,
 }
 
-/// Caller-provided storage options for one Delta source.
+/// Storage options for one Delta source.
 pub type DeltaStorageOptions = BTreeMap<String, String>;
 
 /// Caller-provided configuration for one named Delta source.
@@ -394,7 +395,7 @@ impl PlannedDeltaSource {
         &self.requested_table_uri
     }
 
-    /// Source-local options forwarded to Delta Kernel object-store construction.
+    /// Effective source-local options forwarded to object-store construction.
     #[must_use]
     pub fn storage_options(&self) -> &DeltaStorageOptions {
         &self.storage_options
@@ -499,7 +500,7 @@ pub fn load_delta_source(
 ) -> Result<PlannedDeltaSource, DeltaFunnelError> {
     validate_table_source_names([config.name.as_str()])?;
 
-    load_delta_source_after_name_validation(config)
+    load_delta_source_after_name_validation(config, false)
 }
 
 pub(crate) fn load_delta_source_with_tracing(
@@ -507,7 +508,7 @@ pub(crate) fn load_delta_source_with_tracing(
 ) -> Result<PlannedDeltaSource, DeltaFunnelError> {
     validate_table_source_names([config.name.as_str()])?;
 
-    load_delta_source_after_name_validation_with_tracing(config)
+    load_delta_source_after_name_validation(config, true)
 }
 
 /// Loads configured Delta sources after validating all names.
@@ -531,39 +532,29 @@ where
 
     configs
         .into_iter()
-        .map(load_delta_source_after_name_validation)
+        .map(|config| load_delta_source_after_name_validation(config, false))
         .collect()
 }
 
-fn load_delta_source_after_name_validation_with_tracing(
-    config: DeltaSourceConfig,
+fn load_delta_source_after_name_validation(
+    mut config: DeltaSourceConfig,
+    emit_tracing: bool,
 ) -> Result<PlannedDeltaSource, DeltaFunnelError> {
+    config.storage_options = effective_storage_options_for_source_from_env(
+        &config.table_uri,
+        config.storage_options,
+        std::env::vars(),
+    );
     let source_name = config.name.clone();
     let s3_auth_mode_hint =
         s3_auth_mode_hint_for_source(&config.table_uri, &config.storage_options);
-    observability::source_loading_started(
-        &source_name,
-        s3_auth_mode_hint.map(|hint| hint.as_str()),
-    );
-    let result = load_delta_source_after_name_validation(config);
-    match &result {
-        Ok(source) => observability::source_loading_completed(
-            source.name(),
-            source.version(),
-            s3_auth_mode_hint.map(|hint| hint.as_str()),
-        ),
-        Err(error) => observability::source_loading_failed(
+    if emit_tracing {
+        observability::source_loading_started(
             &source_name,
-            error,
             s3_auth_mode_hint.map(|hint| hint.as_str()),
-        ),
+        );
     }
-    result
-}
 
-fn load_delta_source_after_name_validation(
-    config: DeltaSourceConfig,
-) -> Result<PlannedDeltaSource, DeltaFunnelError> {
     let DeltaSourceConfig {
         name,
         table_uri,
@@ -571,13 +562,66 @@ fn load_delta_source_after_name_validation(
         storage_options,
     } = config;
 
-    let snapshot = load_delta_table_snapshot(&table_uri, version, &storage_options)?;
+    let result = load_delta_table_snapshot(&table_uri, version, &storage_options).map(|snapshot| {
+        PlannedDeltaSource {
+            name,
+            requested_table_uri: table_uri,
+            storage_options,
+            snapshot,
+        }
+    });
 
-    Ok(PlannedDeltaSource {
-        name,
-        requested_table_uri: table_uri,
-        storage_options,
-        snapshot,
+    if emit_tracing {
+        match &result {
+            Ok(source) => observability::source_loading_completed(
+                source.name(),
+                source.version(),
+                s3_auth_mode_hint.map(|hint| hint.as_str()),
+            ),
+            Err(error) => observability::source_loading_failed(
+                &source_name,
+                error,
+                s3_auth_mode_hint.map(|hint| hint.as_str()),
+            ),
+        }
+    }
+
+    result
+}
+
+fn effective_storage_options_for_source_from_env<I>(
+    table_uri: &str,
+    storage_options: DeltaStorageOptions,
+    env: I,
+) -> DeltaStorageOptions
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    if s3_auth_mode_hint_for_source(table_uri, &storage_options).is_none() {
+        return storage_options;
+    }
+
+    let caller_s3_keys = storage_options
+        .keys()
+        .filter_map(|key| s3_option_precedence_key(key))
+        .collect::<HashSet<_>>();
+    let mut effective = env
+        .into_iter()
+        .filter(|(key, _)| key.starts_with("AWS_"))
+        .filter(|(key, _)| match s3_option_precedence_key(key) {
+            Some(key) => !caller_s3_keys.contains(&key),
+            None => true,
+        })
+        .collect::<DeltaStorageOptions>();
+    effective.extend(storage_options);
+    effective
+}
+
+fn s3_option_precedence_key(key: &str) -> Option<String> {
+    let key = key.to_ascii_lowercase().parse::<AmazonS3ConfigKey>().ok()?;
+    Some(match key {
+        AmazonS3ConfigKey::DefaultRegion | AmazonS3ConfigKey::Region => "aws_region".to_owned(),
+        _ => key.as_ref().to_owned(),
     })
 }
 
@@ -604,7 +648,8 @@ mod tests {
         DeltaKernelPredicate, DeltaSourceConfig, DeltaStorageOptions, KernelDataFileReader,
         KernelDataFileReaderConfig, KernelDeletionVectorReader, KernelDeletionVectorReaderConfig,
         ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
-        datafusion_expr_to_kernel_predicate, load_delta_source, load_delta_sources,
+        datafusion_expr_to_kernel_predicate, effective_storage_options_for_source_from_env,
+        load_delta_source, load_delta_sources, load_delta_table_snapshot,
     };
     use crate::DeltaFunnelError;
 
@@ -1008,6 +1053,13 @@ mod tests {
     type CapturedStorageOptions = Arc<Mutex<Vec<DeltaStorageOptions>>>;
 
     fn storage_options(entries: &[(&str, &str)]) -> DeltaStorageOptions {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn env_vars(entries: &[(&str, &str)]) -> Vec<(String, String)> {
         entries
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
@@ -6425,6 +6477,138 @@ mod tests {
     }
 
     #[test]
+    fn s3_effective_storage_options_merge_aws_env_when_absent() {
+        for table_uri in [
+            "s3://bucket/root",
+            "s3a://bucket/root",
+            "https://s3.us-east-1.amazonaws.com/bucket/root",
+            "https://bucket.s3.us-east-1.amazonaws.com/root",
+            "https://ACCOUNT_ID.r2.cloudflarestorage.com/bucket/root",
+        ] {
+            let effective = effective_storage_options_for_source_from_env(
+                table_uri,
+                DeltaStorageOptions::default(),
+                env_vars(&[
+                    ("AWS_ACCESS_KEY_ID", "env-access"),
+                    ("AWS_SECRET_ACCESS_KEY", "env-secret"),
+                    ("AWS_REGION", "us-east-1"),
+                    ("AWS_CUSTOM_FUTURE_OPTION", "future"),
+                    ("NOT_AWS", "ignored"),
+                ]),
+            );
+
+            assert_eq!(
+                effective.get("AWS_ACCESS_KEY_ID").map(String::as_str),
+                Some("env-access"),
+                "{table_uri}"
+            );
+            assert_eq!(
+                effective.get("AWS_SECRET_ACCESS_KEY").map(String::as_str),
+                Some("env-secret"),
+                "{table_uri}"
+            );
+            assert_eq!(
+                effective.get("AWS_REGION").map(String::as_str),
+                Some("us-east-1"),
+                "{table_uri}"
+            );
+            assert_eq!(
+                effective
+                    .get("AWS_CUSTOM_FUTURE_OPTION")
+                    .map(String::as_str),
+                Some("future"),
+                "{table_uri}"
+            );
+            assert!(!effective.contains_key("NOT_AWS"), "{table_uri}");
+        }
+    }
+
+    #[test]
+    fn s3_effective_storage_options_prefer_explicit_caller_options() {
+        let caller_options = storage_options(&[
+            ("aws_access_key_id", "caller-access"),
+            ("AWS_SECRET_ACCESS_KEY", "caller-secret"),
+            ("region", "caller-region"),
+        ]);
+        let effective = effective_storage_options_for_source_from_env(
+            "s3://bucket/root",
+            caller_options,
+            env_vars(&[
+                ("AWS_ACCESS_KEY_ID", "env-access"),
+                ("AWS_SECRET_ACCESS_KEY", "env-secret"),
+                ("AWS_REGION", "env-region"),
+                ("AWS_CUSTOM_FUTURE_OPTION", "future"),
+            ]),
+        );
+
+        assert_eq!(
+            effective.get("aws_access_key_id").map(String::as_str),
+            Some("caller-access")
+        );
+        assert_eq!(
+            effective.get("AWS_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("caller-secret")
+        );
+        assert_eq!(
+            effective.get("region").map(String::as_str),
+            Some("caller-region")
+        );
+        assert_eq!(
+            effective
+                .get("AWS_CUSTOM_FUTURE_OPTION")
+                .map(String::as_str),
+            Some("future")
+        );
+        assert!(!effective.contains_key("AWS_ACCESS_KEY_ID"));
+        assert!(!effective.contains_key("AWS_REGION"));
+    }
+
+    #[test]
+    fn non_s3_effective_storage_options_do_not_merge_aws_env() {
+        let caller_options = storage_options(&[("authorization", "caller-token")]);
+        let effective = effective_storage_options_for_source_from_env(
+            "file:///tmp/table",
+            caller_options.clone(),
+            env_vars(&[
+                ("AWS_ACCESS_KEY_ID", "env-access"),
+                ("AWS_SECRET_ACCESS_KEY", "env-secret"),
+                ("AWS_REGION", "us-east-1"),
+            ]),
+        );
+
+        assert_eq!(effective, caller_options);
+    }
+
+    #[test]
+    fn s3_effective_storage_options_are_resolved_before_source_load() {
+        let storage_options = effective_storage_options_for_source_from_env(
+            "s3://bucket/root",
+            storage_options(&[("region", "caller-region")]),
+            env_vars(&[
+                ("AWS_ACCESS_KEY_ID", "env-access"),
+                ("AWS_SECRET_ACCESS_KEY", "env-secret"),
+                ("AWS_REGION", "env-region"),
+            ]),
+        );
+
+        assert_eq!(
+            storage_options.get("AWS_ACCESS_KEY_ID").map(String::as_str),
+            Some("env-access")
+        );
+        assert_eq!(
+            storage_options
+                .get("AWS_SECRET_ACCESS_KEY")
+                .map(String::as_str),
+            Some("env-secret")
+        );
+        assert_eq!(
+            storage_options.get("region").map(String::as_str),
+            Some("caller-region")
+        );
+        assert!(!storage_options.contains_key("AWS_REGION"));
+    }
+
+    #[test]
     fn s3_storage_options_accept_documented_credential_keys() {
         for (option_key, config_key, expected_value) in [
             (
@@ -6622,6 +6806,46 @@ mod tests {
     }
 
     #[test]
+    fn reader_construction_passes_effective_s3_storage_options_to_each_store_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = unique_storage_scheme("readereffectiveoptions")?;
+        let captured = CapturedStorageOptions::default();
+        register_capturing_storage_handler(&scheme, Arc::clone(&captured))?;
+        let table_uri = format!("{scheme}://table/root/");
+        let effective = effective_storage_options_for_source_from_env(
+            "s3://bucket/root",
+            storage_options(&[("region", "caller-region")]),
+            env_vars(&[
+                ("AWS_ACCESS_KEY_ID", "env-access"),
+                ("AWS_SECRET_ACCESS_KEY", "env-secret"),
+                ("AWS_REGION", "env-region"),
+            ]),
+        );
+
+        let _data_reader = KernelDataFileReader::try_new(KernelDataFileReaderConfig {
+            source_name: "orders",
+            table_uri: &table_uri,
+            snapshot_version: 42,
+            storage_options: &effective,
+        })?;
+        let _dv_reader = KernelDeletionVectorReader::try_new(KernelDeletionVectorReaderConfig {
+            source_name: "orders",
+            table_uri: &table_uri,
+            snapshot_version: 42,
+            storage_options: &effective,
+        })?;
+        let captured_options = captured_storage_options(&captured);
+        assert_eq!(captured_options.len(), 2);
+        assert!(
+            captured_options
+                .iter()
+                .all(|captured| captured == &effective)
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn storage_option_values_are_not_exposed_when_store_construction_fails()
     -> Result<(), Box<dyn std::error::Error>> {
         for secret_key in [
@@ -6652,6 +6876,58 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn merged_s3_env_storage_option_values_are_not_exposed_when_store_construction_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = unique_storage_scheme("redacteds3envoptions")?;
+        let captured = CapturedStorageOptions::default();
+        let secret_value = "super-secret-env-token-value";
+        register_failing_storage_handler(&scheme, Arc::clone(&captured), secret_value)?;
+        let effective = effective_storage_options_for_source_from_env(
+            "s3://bucket/root",
+            DeltaStorageOptions::default(),
+            env_vars(&[
+                ("AWS_ACCESS_KEY_ID", "env-access"),
+                ("AWS_SECRET_ACCESS_KEY", secret_value),
+                ("AWS_REGION", "us-east-1"),
+            ]),
+        );
+
+        let result = load_delta_source(
+            DeltaSourceConfig::new("orders", format!("{scheme}://table/root"))
+                .with_storage_options(effective.clone()),
+        );
+        let error = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+
+        assert_eq!(captured_storage_options(&captured), vec![effective]);
+        assert!(!error.contains(secret_value));
+        assert!(!error.contains("AWS_SECRET_ACCESS_KEY"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_recognized_s3_aws_env_values_fail_store_construction() {
+        let storage_options = effective_storage_options_for_source_from_env(
+            "s3://bucket/root",
+            DeltaStorageOptions::default(),
+            env_vars(&[
+                ("AWS_ALLOW_HTTP", "not-a-bool"),
+                ("AWS_REGION", "us-east-1"),
+            ]),
+        );
+
+        let result = load_delta_table_snapshot("s3://bucket/root", None, &storage_options);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaSourceEngine { .. })
+        ));
     }
 
     #[test]
