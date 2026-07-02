@@ -585,7 +585,8 @@ union all select cast(202 as bigint) as order_id",),
 
     #[test]
     #[ignore = "runs through cargo xtask sqlserver-test"]
-    fn table_write_to_mssql_replace_swaps_existing_target_when_configured() -> TestResult<()> {
+    fn table_write_to_mssql_execute_writes_replace_existing_target_when_configured()
+    -> TestResult<()> {
         let Some(config) = MssqlIntegrationConfig::from_env() else {
             return Ok(());
         };

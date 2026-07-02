@@ -404,14 +404,22 @@ where
     C: MssqlOneOutputSinkConnection,
 {
     match validation_options.target_validation_mode() {
-        TargetValidationMode::Disabled => Ok(finish_validation_report(
-            output_plan,
-            report.with_target_validation(
+        TargetValidationMode::Disabled => {
+            let report = report.with_target_validation(
                 RowCount::unavailable(),
                 ValidationStatus::disabled(),
                 PhaseTimingReport::skipped(VALIDATION_PHASE, ReportReasonCode::ValidationDisabled),
-            ),
-        )),
+            );
+            if output_plan.load_mode() == LoadMode::Replace {
+                return Err(validation_error(
+                    output_plan,
+                    &report,
+                    "replace target swap requires target validation",
+                ));
+            }
+
+            Ok(finish_validation_report(output_plan, report))
+        }
         TargetValidationMode::ValidateIfPossible | TargetValidationMode::Require => {
             let validation_required =
                 validation_options.target_validation_mode() == TargetValidationMode::Require;
@@ -499,6 +507,14 @@ where
 {
     if output_plan.load_mode() != LoadMode::Replace {
         return Ok(report);
+    }
+
+    if report.validation_status() != ValidationStatus::passed() {
+        return Err(validation_error(
+            output_plan,
+            &report,
+            "replace target swap requires passed staging validation",
+        ));
     }
 
     let swap_timer = PhaseTimer::start(SWAP_TARGET_PHASE);
@@ -706,7 +722,7 @@ fn validation_unavailable_or_required_failure(
         PhaseTimingReport::unavailable(VALIDATION_PHASE, reason),
     );
 
-    if validation_required {
+    if validation_required || output_plan.load_mode() == LoadMode::Replace {
         return Err(validation_error(output_plan, &report, message));
     }
 
@@ -1601,6 +1617,127 @@ mod tests {
             context.phase_timings(),
             VALIDATION_PHASE,
             PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "initialize",
+                "write 3",
+                "finish",
+                "count target rows",
+                "cleanup CreatedStagingTable"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_validation_disabled_cleans_up_staging_without_swap()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::Replace)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_count(3);
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+        let validation_options =
+            ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Disabled);
+
+        let error = write_mssql_output_batches_on_connection_with_phase_timings(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+            validation_options,
+            Vec::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected replace disabled validation failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected validation write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Validation);
+        assert_eq!(context.output_row_count(), RowCount::exact(3));
+        assert_eq!(context.target_row_count(), RowCount::unavailable());
+        assert_eq!(context.validation_status(), ValidationStatus::disabled());
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert!(message.contains("requires target validation"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::skipped(ReportReasonCode::ValidationDisabled),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "initialize",
+                "write 3",
+                "finish",
+                "cleanup CreatedStagingTable"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_unavailable_validation_cleans_up_staging_without_swap()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::Replace)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_target_row_count(
+            MssqlTargetRowCountFailure::new(
+                ReportReasonCode::PermissionUnavailable,
+                "permission denied",
+            ),
+        );
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected replace unavailable validation failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected validation write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Validation);
+        assert_eq!(context.output_row_count(), RowCount::exact(3));
+        assert_eq!(context.target_row_count(), RowCount::unavailable());
+        assert_eq!(
+            context.validation_status(),
+            ValidationStatus::unavailable(ReportReasonCode::PermissionUnavailable)
+        );
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert!(message.contains("permission denied"));
+        assert_phase_timing(
+            context.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::unavailable(ReportReasonCode::PermissionUnavailable),
         )?;
         assert_phase_timing(
             context.phase_timings(),

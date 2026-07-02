@@ -2004,7 +2004,7 @@ union all select cast(302 as bigint) as order_id",),
 
     #[test]
     #[ignore = "runs through cargo xtask sqlserver-test"]
-    fn write_all_execute_accepts_replace_output_when_configured() -> TestResult<()> {
+    fn write_all_execute_writes_replace_output_when_configured() -> TestResult<()> {
         let Some(config) = MssqlIntegrationConfig::from_env() else {
             return Ok(());
         };
