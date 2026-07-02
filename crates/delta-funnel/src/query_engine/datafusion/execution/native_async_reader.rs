@@ -1156,25 +1156,7 @@ fn build_matched_map_field_plan(
 
     let key_path = format!("{path}.key");
     let parquet_key = parquet_map_key_field(parquet_field, path)?;
-    let key_plan = match (provider_key.data_type(), file_key.data_type()) {
-        (
-            DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _),
-            DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _),
-        ) => build_matched_field_plan(provider_key, file_key, parquet_key, &key_path)?,
-        _ if file_key
-            .data_type()
-            .equals_datatype(provider_key.data_type()) =>
-        {
-            NativeAsyncFieldPlan::Identity
-        }
-        _ => {
-            return Err(delta_kernel::Error::generic(format!(
-                "provider field '{key_path}' expected Parquet type {} but found {}",
-                provider_key.data_type(),
-                file_key.data_type()
-            )));
-        }
-    };
+    let key_plan = build_matched_field_plan(provider_key, file_key, parquet_key, &key_path)?;
 
     let value_path = format!("{path}.value");
     let parquet_value = parquet_map_value_field(parquet_field, path)?;
@@ -1796,7 +1778,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::arrow::array::{
-        Array, ArrayRef, Decimal128Array, Int32Array, ListArray, MapArray, StringArray,
+        Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
         StructArray, TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use datafusion::arrow::buffer::NullBuffer;
@@ -2275,6 +2257,169 @@ mod tests {
         assert_eq!(timestamps.timezone(), Some("UTC"));
         assert_eq!(timestamps.value(0), 1_704_153_600_000_000);
         assert!(timestamps.is_null(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_casts_list_struct_leaf() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let provider_element = Field::new(
+            "element",
+            DataType::Struct(
+                vec![
+                    Field::new("city", DataType::Utf8, true),
+                    Field::new("zip", DataType::Int64, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let provider_schema = Arc::new(Schema::new(vec![Field::new(
+            "addresses",
+            DataType::List(Arc::new(provider_element)),
+            true,
+        )]));
+        let file_address_fields = vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ];
+        let file_element = Field::new(
+            "element",
+            DataType::Struct(file_address_fields.clone().into()),
+            true,
+        );
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "addresses",
+            DataType::List(Arc::new(file_element.clone())),
+            true,
+        )]));
+        let values = struct_array(
+            file_address_fields,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("san francisco"),
+                    Some("new york"),
+                    Some("chicago"),
+                ])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![
+                    Some(94110),
+                    Some(10001),
+                    Some(60601),
+                ])) as ArrayRef,
+            ],
+        );
+        let addresses = list_array(
+            file_element,
+            vec![0, 2, 2, 3],
+            values,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "list-struct-leaf-cast-schema-match",
+            file_schema,
+            vec![addresses],
+            provider_schema,
+        )?;
+        let addresses = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or("expected addresses ListArray")?;
+        let values = addresses
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected StructArray list values")?;
+        let cities = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected city StringArray")?;
+        let zips = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("expected Int64Array zip values")?;
+
+        assert_eq!(addresses.value_offsets(), &[0, 2, 2, 3]);
+        assert!(addresses.is_valid(0));
+        assert!(addresses.is_null(1));
+        assert!(addresses.is_valid(2));
+        assert_eq!(values.fields()[0].name(), "city");
+        assert_eq!(values.fields()[1].name(), "zip");
+        assert_eq!(cities.value(0), "san francisco");
+        assert_eq!(cities.value(2), "chicago");
+        assert_eq!(zips.values(), &[94110, 10001, 60601]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_casts_map_key_leaf() -> Result<(), Box<dyn std::error::Error>> {
+        let provider_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new("key", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+            true,
+        )]));
+        let file_key = Field::new("key", DataType::Int32, false);
+        let file_value = Field::new("value", DataType::Utf8, true);
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "attributes",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(vec![file_key.clone(), file_value.clone()].into()),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        )]));
+        let attributes = map_array(
+            file_key,
+            file_value,
+            vec![0, 2, 2, 3],
+            Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("home"),
+                Some("work"),
+                Some("mailing"),
+            ])) as ArrayRef,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "map-key-leaf-cast-schema-match",
+            file_schema,
+            vec![attributes],
+            provider_schema,
+        )?;
+        let attributes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or("expected attributes MapArray")?;
+        let keys = attributes
+            .keys()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("expected Int64Array map keys")?;
+        let values = attributes
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected StringArray map values")?;
+
+        assert_eq!(attributes.value_offsets(), &[0, 2, 2, 3]);
+        assert!(attributes.is_valid(0));
+        assert!(attributes.is_null(1));
+        assert!(attributes.is_valid(2));
+        assert_eq!(keys.values(), &[10, 20, 30]);
+        assert_eq!(values.value(0), "home");
+        assert_eq!(values.value(2), "mailing");
 
         Ok(())
     }
