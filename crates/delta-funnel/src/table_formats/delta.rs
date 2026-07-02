@@ -36,7 +36,7 @@ pub(crate) use read::{
     KernelDataFilePredicateEvalRequest, KernelDataFileReadRequest, KernelDataFileReader,
     KernelDataFileReaderConfig, KernelDataFileTransformRequest, KernelScanReadSchema,
 };
-use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot};
+use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot, s3_auth_mode_hint_for_source};
 
 /// Metadata-only expansion of one kernel scan.
 ///
@@ -539,11 +539,24 @@ fn load_delta_source_after_name_validation_with_tracing(
     config: DeltaSourceConfig,
 ) -> Result<PlannedDeltaSource, DeltaFunnelError> {
     let source_name = config.name.clone();
-    observability::source_loading_started(&source_name);
+    let s3_auth_mode_hint =
+        s3_auth_mode_hint_for_source(&config.table_uri, &config.storage_options);
+    observability::source_loading_started(
+        &source_name,
+        s3_auth_mode_hint.map(|hint| hint.as_str()),
+    );
     let result = load_delta_source_after_name_validation(config);
     match &result {
-        Ok(source) => observability::source_loading_completed(source.name(), source.version()),
-        Err(error) => observability::source_loading_failed(&source_name, error),
+        Ok(source) => observability::source_loading_completed(
+            source.name(),
+            source.version(),
+            s3_auth_mode_hint.map(|hint| hint.as_str()),
+        ),
+        Err(error) => observability::source_loading_failed(
+            &source_name,
+            error,
+            s3_auth_mode_hint.map(|hint| hint.as_str()),
+        ),
     }
     result
 }

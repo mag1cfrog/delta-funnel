@@ -212,20 +212,48 @@ pub(crate) fn datafusion_batch_stream_finished(
     );
 }
 
-pub(crate) fn source_loading_started(source_name: &str) {
-    source_phase_started(SOURCE_LOADING_STARTED_EVENT, source_name);
-}
-
-pub(crate) fn source_loading_completed(source_name: &str, snapshot_version: u64) {
-    source_phase_completed(
-        SOURCE_LOADING_COMPLETED_EVENT,
+pub(crate) fn source_loading_started(source_name: &str, derived_s3_auth_mode: Option<&str>) {
+    let derived_s3_auth_mode = derived_s3_auth_mode.unwrap_or("");
+    tracing::info!(
+        target: TRACING_TARGET,
+        telemetry_event = SOURCE_LOADING_STARTED_EVENT,
         source_name,
-        snapshot_version,
+        derived_s3_auth_mode,
+        message = SOURCE_LOADING_STARTED_EVENT
     );
 }
 
-pub(crate) fn source_loading_failed(source_name: &str, error: &DeltaFunnelError) {
-    source_phase_failed(SOURCE_LOADING_FAILED_EVENT, source_name, error);
+pub(crate) fn source_loading_completed(
+    source_name: &str,
+    snapshot_version: u64,
+    derived_s3_auth_mode: Option<&str>,
+) {
+    let derived_s3_auth_mode = derived_s3_auth_mode.unwrap_or("");
+    tracing::info!(
+        target: TRACING_TARGET,
+        telemetry_event = SOURCE_LOADING_COMPLETED_EVENT,
+        source_name,
+        snapshot_version,
+        derived_s3_auth_mode,
+        message = SOURCE_LOADING_COMPLETED_EVENT
+    );
+}
+
+pub(crate) fn source_loading_failed(
+    source_name: &str,
+    error: &DeltaFunnelError,
+    derived_s3_auth_mode: Option<&str>,
+) {
+    let derived_s3_auth_mode = derived_s3_auth_mode.unwrap_or("");
+    tracing::info!(
+        target: TRACING_TARGET,
+        telemetry_event = SOURCE_LOADING_FAILED_EVENT,
+        source_name,
+        derived_s3_auth_mode,
+        error_category = "delta_funnel_error",
+        error_summary = sanitize_error_summary(error),
+        message = SOURCE_LOADING_FAILED_EVENT
+    );
 }
 
 pub(crate) fn protocol_preflight_started(source_name: &str, snapshot_version: u64) {
@@ -317,15 +345,6 @@ impl RunMode {
     }
 }
 
-fn source_phase_started(telemetry_event: &str, source_name: &str) {
-    tracing::info!(
-        target: TRACING_TARGET,
-        telemetry_event,
-        source_name,
-        message = telemetry_event
-    );
-}
-
 fn output_target_event(
     telemetry_event: &str,
     output_name: &str,
@@ -363,17 +382,6 @@ fn source_phase_completed(telemetry_event: &str, source_name: &str, snapshot_ver
         telemetry_event,
         source_name,
         snapshot_version,
-        message = telemetry_event
-    );
-}
-
-fn source_phase_failed(telemetry_event: &str, source_name: &str, error: &DeltaFunnelError) {
-    tracing::info!(
-        target: TRACING_TARGET,
-        telemetry_event,
-        source_name,
-        error_category = "delta_funnel_error",
-        error_summary = sanitize_error_summary(error),
         message = telemetry_event
     );
 }
@@ -531,8 +539,8 @@ mod tests {
             LoadMode::AppendExisting,
             MssqlBatchShapingReport::completed(2, 5, 2, 5),
         );
-        source_loading_started("orders");
-        source_loading_completed("orders", 7);
+        source_loading_started("orders", None);
+        source_loading_completed("orders", 7, None);
         protocol_preflight_started("orders", 7);
         protocol_preflight_completed("orders", 7);
         datafusion_registration_started("orders", 7);
@@ -832,8 +840,8 @@ mod tests {
         });
 
         tracing::subscriber::with_default(subscriber, || {
-            source_loading_started("orders");
-            source_loading_completed("orders", 7);
+            source_loading_started("orders", None);
+            source_loading_completed("orders", 7, None);
             protocol_preflight_started("orders", 7);
             protocol_preflight_failed(
                 "orders",
@@ -866,6 +874,42 @@ mod tests {
             DATAFUSION_REGISTRATION_COMPLETED_EVENT,
             Some("7"),
         );
+    }
+
+    #[test]
+    fn scoped_capture_records_source_loading_s3_auth_mode_hint() {
+        let events = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: events.clone(),
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            source_loading_started("orders", Some("implicit_provider_chain"));
+            source_loading_completed("orders", 7, Some("implicit_provider_chain"));
+            source_loading_failed(
+                "orders",
+                &DeltaFunnelError::DeltaSnapshotLoad {
+                    reason: concat!(
+                        "snapshot could not be loaded: missing credentials. ",
+                        "S3 credential hint: no explicit S3 credentials were supplied through ",
+                        "storage_options; local shells may need explicit AWS_ACCESS_KEY_ID, ",
+                        "AWS_SECRET_ACCESS_KEY, optional AWS_SESSION_TOKEN, and AWS_REGION."
+                    )
+                    .to_owned(),
+                },
+                Some("implicit_provider_chain"),
+            );
+        });
+
+        let events = events.events();
+        assert_eq!(events.len(), 3);
+        for event in &events {
+            assert_eq!(
+                event.fields.get("derived_s3_auth_mode").map(String::as_str),
+                Some("implicit_provider_chain")
+            );
+        }
+        assert_no_forbidden_tracing_text(&events);
     }
 
     #[test]
@@ -950,6 +994,7 @@ mod tests {
                     table_uri: "s3://user:password@example.com/table?token=secret".to_owned(),
                     reason: "credential token=secret".to_owned(),
                 },
+                None,
             );
         });
 
