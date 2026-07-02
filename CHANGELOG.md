@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.1.1...delta-funnel-v0.1.2) - 2026-07-02
+
+### Added
+
+- load AWS env for S3 sources ([#393](https://github.com/mag1cfrog/delta-funnel/pull/393))
+- implement SQL Server replace mode
+
+### Fixed
+
+- add S3 credential diagnostics ([#389](https://github.com/mag1cfrog/delta-funnel/pull/389))
+- support native async leaf casts
+
+### Other
+
+- lock down S3 storage options contract ([#385](https://github.com/mag1cfrog/delta-funnel/pull/385))
+- clarify Python S3 credential contract ([#384](https://github.com/mag1cfrog/delta-funnel/pull/384))
+- Seo/search indexing ([#376](https://github.com/mag1cfrog/delta-funnel/pull/376))
+
 ## [0.1.1](https://github.com/mag1cfrog/delta-funnel/compare/v0.1.0...v0.1.1) - 2026-07-02
 
 ### Added
