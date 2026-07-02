@@ -178,7 +178,9 @@ fn classify_s3_auth_mode(storage_options: &DeltaStorageOptions) -> S3AuthModeHin
     let mut has_secret_access_key = false;
     let mut has_web_identity_token_file = false;
     let mut has_role_arn = false;
-    let mut has_container_credentials_uri = false;
+    let mut has_container_credentials_relative_uri = false;
+    let mut has_container_credentials_full_uri = false;
+    let mut has_container_authorization_token_file = false;
     let mut has_auth_related_option = false;
 
     for key in storage_options.keys() {
@@ -208,15 +210,24 @@ fn classify_s3_auth_mode(storage_options: &DeltaStorageOptions) -> S3AuthModeHin
             | "endpoint_url_sts" => {
                 has_auth_related_option = true;
             }
-            "aws_container_credentials_relative_uri"
-            | "container_credentials_relative_uri"
-            | "aws_container_credentials_full_uri"
-            | "container_credentials_full_uri" => {
-                has_container_credentials_uri = true;
+            "aws_container_credentials_relative_uri" | "container_credentials_relative_uri" => {
+                has_container_credentials_relative_uri = true;
                 has_auth_related_option = true;
             }
-            "aws_container_authorization_token_file"
-            | "container_authorization_token_file"
+            "aws_container_credentials_full_uri" | "container_credentials_full_uri" => {
+                has_container_credentials_full_uri = true;
+                has_auth_related_option = true;
+            }
+            "aws_container_authorization_token_file" | "container_authorization_token_file" => {
+                has_container_authorization_token_file = true;
+                has_auth_related_option = true;
+            }
+            "aws_imdsv1_fallback"
+            | "imdsv1_fallback"
+            | "aws_metadata_endpoint"
+            | "metadata_endpoint"
+            | "aws_unsigned_payload"
+            | "unsigned_payload"
             | "aws_skip_signature"
             | "skip_signature" => {
                 has_auth_related_option = true;
@@ -229,7 +240,9 @@ fn classify_s3_auth_mode(storage_options: &DeltaStorageOptions) -> S3AuthModeHin
         S3AuthModeHint::ExplicitStatic
     } else if has_web_identity_token_file && has_role_arn {
         S3AuthModeHint::ExplicitWebIdentity
-    } else if has_container_credentials_uri {
+    } else if has_container_credentials_relative_uri
+        || (has_container_credentials_full_uri && has_container_authorization_token_file)
+    {
         S3AuthModeHint::ExplicitContainer
     } else if has_auth_related_option {
         S3AuthModeHint::OtherExplicit
@@ -480,6 +493,21 @@ mod tests {
             (
                 storage_options(&[("aws_container_credentials_relative_uri", "/credentials")]),
                 S3AuthModeHint::ExplicitContainer,
+            ),
+            (
+                storage_options(&[
+                    ("aws_container_credentials_full_uri", "http://example.com"),
+                    ("aws_container_authorization_token_file", "/token"),
+                ]),
+                S3AuthModeHint::ExplicitContainer,
+            ),
+            (
+                storage_options(&[("aws_container_credentials_full_uri", "http://example.com")]),
+                S3AuthModeHint::OtherExplicit,
+            ),
+            (
+                storage_options(&[("AWS_METADATA_ENDPOINT", "http://169.254.169.254")]),
+                S3AuthModeHint::OtherExplicit,
             ),
             (
                 storage_options(&[("AWS_SESSION_TOKEN", "partial")]),
