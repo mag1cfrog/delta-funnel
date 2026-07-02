@@ -11,7 +11,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Int64Array, ListArray, MapArray, StructArray, new_null_array,
 };
-use datafusion::arrow::compute::filter_record_batch;
+use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Fields, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -746,6 +746,10 @@ enum NativeAsyncProviderColumn {
 #[derive(Clone)]
 enum NativeAsyncFieldPlan {
     Identity,
+    #[allow(dead_code)]
+    Cast {
+        target_type: DataType,
+    },
     Struct {
         children: Vec<NativeAsyncStructChild>,
     },
@@ -789,6 +793,8 @@ impl NativeAsyncSchemaMatch {
     /// Reordering or renaming existing columns is cheap because the Arrow arrays
     /// are shared by `Arc`. Missing nullable fields allocate all-null arrays to
     /// represent older Parquet files that predate a Delta schema evolution.
+    /// Cast-compatible leaf mismatches allocate a new array for the casted
+    /// column.
     fn reshape_batch_to_provider_schema(
         &self,
         batch: RecordBatch,
@@ -1415,6 +1421,9 @@ fn reshape_array_to_provider_field(
 ) -> Result<ArrayRef, delta_kernel::Error> {
     match field_plan {
         NativeAsyncFieldPlan::Identity => Ok(array),
+        NativeAsyncFieldPlan::Cast { target_type } => {
+            cast(array.as_ref(), target_type).map_err(delta_kernel::Error::from)
+        }
         NativeAsyncFieldPlan::Struct { children } => {
             let DataType::Struct(provider_fields) = provider_field.data_type() else {
                 return Err(delta_kernel::Error::generic(format!(
@@ -1736,7 +1745,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::arrow::array::{
-        Array, ArrayRef, Decimal128Array, Int32Array, ListArray, MapArray, StringArray, StructArray,
+        Array, ArrayRef, Decimal128Array, Int32Array, ListArray, MapArray, StringArray,
+        StructArray, TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use datafusion::arrow::buffer::NullBuffer;
     use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -1936,6 +1946,17 @@ mod tests {
         Field::new(name, DataType::Struct(fields.into()), nullable)
     }
 
+    fn timestamp_us_utc_field(name: &str, nullable: bool) -> Field {
+        Field::new(
+            name,
+            DataType::Timestamp(
+                datafusion::arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            nullable,
+        )
+    }
+
     fn struct_array(fields: Vec<Field>, columns: Vec<ArrayRef>) -> ArrayRef {
         struct_array_with_nulls(fields, columns, None)
     }
@@ -2058,6 +2079,82 @@ mod tests {
             KernelColumnMetadataKey::ParquetFieldId.as_ref().to_owned(),
             KernelMetadataValue::Number(field_id),
         )]
+    }
+
+    #[test]
+    fn native_async_reshape_casts_top_level_timestamp_leaf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_field = timestamp_us_utc_field("event_ts", true);
+        let array = Arc::new(TimestampNanosecondArray::from(vec![
+            Some(1_704_067_200_000_000_000),
+            None,
+        ])) as ArrayRef;
+
+        let reshaped = super::reshape_array_to_provider_field(
+            array,
+            &provider_field,
+            &super::NativeAsyncFieldPlan::Cast {
+                target_type: provider_field.data_type().clone(),
+            },
+        )?;
+        let timestamps = reshaped
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or("expected TimestampMicrosecondArray")?;
+
+        assert_eq!(timestamps.timezone(), Some("UTC"));
+        assert_eq!(timestamps.value(0), 1_704_067_200_000_000);
+        assert!(timestamps.is_null(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_reshape_casts_nested_struct_timestamp_leaf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_child = timestamp_us_utc_field("event_ts", true);
+        let provider_field = struct_field("payload", vec![provider_child.clone()], true);
+        let file_child = Field::new(
+            "event_ts",
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        );
+        let array = struct_array(
+            vec![file_child],
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                Some(1_704_153_600_000_000_000),
+                None,
+            ])) as ArrayRef],
+        );
+
+        let reshaped = super::reshape_array_to_provider_field(
+            array,
+            &provider_field,
+            &super::NativeAsyncFieldPlan::Struct {
+                children: vec![super::NativeAsyncStructChild::ProjectedChild {
+                    child_index: 0,
+                    field_plan: super::NativeAsyncFieldPlan::Cast {
+                        target_type: provider_child.data_type().clone(),
+                    },
+                }],
+            },
+        )?;
+        let payload = reshaped
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected StructArray")?;
+        let timestamps = payload
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or("expected TimestampMicrosecondArray")?;
+
+        assert_eq!(payload.fields()[0].name(), "event_ts");
+        assert_eq!(timestamps.timezone(), Some("UTC"));
+        assert_eq!(timestamps.value(0), 1_704_153_600_000_000);
+        assert!(timestamps.is_null(1));
+
+        Ok(())
     }
 
     #[test]
