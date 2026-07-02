@@ -32,6 +32,7 @@ const TWO_PARTITION_COLUMN_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-fun
 const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"},"createdTime":1587968585495}}"#;
 const SUPPORTED_TYPES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"active\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}},{\"name\":\"score_f32\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"score_f64\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"level\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const NESTED_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+const NESTED_TIMESTAMP_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const MISSING_NULLABLE_NESTED_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"loyalty_tier\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const MISSING_NON_NULLABLE_NESTED_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"required_code\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const NESTED_COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":4,\"delta.columnMapping.physicalName\":\"phys_first_name\"}},{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":\"phys_age\"}}]},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"phys_profile\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"5"},"createdTime":1587968585495}}"#;
@@ -451,6 +452,46 @@ impl RealParquetDeltaTable {
                 RealParquetDataFile {
                     path: "part-00001.parquet".to_owned(),
                     batches: vec![supported_types_batch_with_nanosecond_event_ts(Some("UTC"))?],
+                    stats: AddStats {
+                        rows: 3,
+                        max_id: 6,
+                        min_customer: "carol".to_owned(),
+                        max_customer: "dylan".to_owned(),
+                        customer_null_count: 1,
+                    },
+                    partition_values_json: "{}".to_owned(),
+                    deletion_vector: None,
+                },
+            ],
+        )
+    }
+
+    /// Creates a local Delta table whose nested timestamp leaf is stored with
+    /// different physical timestamp types across Parquet files.
+    pub(crate) fn new_with_mixed_nested_timestamp_physical_types(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            NESTED_TIMESTAMP_PROFILE_METADATA_JSON,
+            vec![
+                RealParquetDataFile {
+                    path: DATA_FILE.to_owned(),
+                    batches: vec![nested_timestamp_profile_batch()?],
+                    stats: AddStats {
+                        rows: 3,
+                        max_id: 3,
+                        min_customer: "alice".to_owned(),
+                        max_customer: "bob".to_owned(),
+                        customer_null_count: 1,
+                    },
+                    partition_values_json: "{}".to_owned(),
+                    deletion_vector: None,
+                },
+                RealParquetDataFile {
+                    path: "part-00001.parquet".to_owned(),
+                    batches: vec![nested_timestamp_profile_batch_with_nanosecond_event_ts()?],
                     stats: AddStats {
                         rows: 3,
                         max_id: 6,
@@ -1105,6 +1146,18 @@ fn nested_profile_schema() -> Arc<Schema> {
     ]))
 }
 
+fn nested_timestamp_profile_schema_with_event_ts(event_ts_type: DataType) -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("customer_name", DataType::Utf8, true),
+        Field::new(
+            "profile",
+            DataType::Struct(vec![Field::new("event_ts", event_ts_type, true)].into()),
+            true,
+        ),
+    ]))
+}
+
 fn nested_column_mapping_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("phys_id", DataType::Int32, false).with_metadata(field_id_metadata(1)),
@@ -1479,6 +1532,61 @@ fn reordered_nested_profile_batch() -> Result<kernel::RecordBatch, Box<dyn std::
 
     Ok(kernel::RecordBatch::try_new(
         nested_profile_schema(),
+        columns,
+    )?)
+}
+
+fn nested_timestamp_profile_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    nested_timestamp_profile_batch_with_event_ts(
+        [1, 2, 3],
+        [Some("alice"), Some("bob"), None],
+        Arc::new(
+            TimestampMicrosecondArray::from(vec![
+                Some(1_704_067_200_000_000),
+                Some(1_704_153_600_000_000),
+                None,
+            ])
+            .with_timezone("UTC"),
+        ) as ArrayRef,
+    )
+}
+
+fn nested_timestamp_profile_batch_with_nanosecond_event_ts()
+-> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    nested_timestamp_profile_batch_with_event_ts(
+        [4, 5, 6],
+        [Some("carol"), Some("dylan"), None],
+        Arc::new(TimestampNanosecondArray::from(vec![
+            Some(1_704_240_000_000_000_000),
+            Some(1_704_326_400_000_000_000),
+            None,
+        ])) as ArrayRef,
+    )
+}
+
+fn nested_timestamp_profile_batch_with_event_ts(
+    ids: [i32; 3],
+    customer_names: [Option<&str>; 3],
+    event_ts: ArrayRef,
+) -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let event_ts_type = event_ts.data_type().clone();
+    let profile = StructArray::from(vec![(
+        Arc::new(Field::new("event_ts", event_ts_type.clone(), true)),
+        event_ts,
+    )]);
+    let columns = vec![
+        Arc::new(Int32Array::from(ids.to_vec())) as Arc<dyn Array>,
+        Arc::new(StringArray::from(
+            customer_names
+                .into_iter()
+                .map(|name| name.map(str::to_owned))
+                .collect::<Vec<_>>(),
+        )) as Arc<dyn Array>,
+        Arc::new(profile) as Arc<dyn Array>,
+    ];
+
+    Ok(kernel::RecordBatch::try_new(
+        nested_timestamp_profile_schema_with_event_ts(event_ts_type),
         columns,
     )?)
 }
