@@ -1337,6 +1337,43 @@ mod tests {
     }
 
     #[test]
+    fn delta_lake_snapshot_load_error_exposes_cause_context() -> PyResult<()> {
+        Python::attach(|py| {
+            let dir = env_unique_path("empty-delta-table")?;
+            fs::create_dir_all(&dir).map_err(io_py_error)?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+
+            let error = match session.bind(py).call_method(
+                "delta_lake",
+                (dir.to_string_lossy().to_string(),),
+                Some(&kwargs),
+            ) {
+                Ok(_) => return Err(PyAssertionError::new_err("expected snapshot load error")),
+                Err(error) => error,
+            };
+            let _ = fs::remove_dir_all(&dir);
+
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "delta_source"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "delta_snapshot_load"
+            );
+            let message = error.value(py).getattr("message")?.extract::<String>()?;
+            assert!(message.contains("snapshot could not be loaded"));
+            let context = error.value(py).getattr("context")?;
+            let cause = context.get_item("cause")?.extract::<String>()?;
+            assert!(cause.contains("snapshot could not be loaded"));
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn delta_lake_repr_and_source_config_errors_do_not_expose_source_secrets() -> PyResult<()> {
         Python::attach(|py| {
             let table = DeltaLogFixture::new("orders")?;

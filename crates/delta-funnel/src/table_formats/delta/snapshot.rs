@@ -3,6 +3,7 @@
 use crate::{
     DeltaFunnelError,
     error::{DeltaSnapshotLoadSnafu, DeltaSourceEngineSnafu, InvalidSourceUriSnafu},
+    support::{sanitize_text_for_display, sanitize_uri_for_display},
 };
 
 use super::DeltaStorageOptions;
@@ -112,9 +113,9 @@ pub(crate) fn load_delta_table_snapshot(
 
     let snapshot = match builder.build(engine.as_kernel_engine()) {
         Ok(snapshot) => snapshot,
-        Err(_) => {
+        Err(error) => {
             return DeltaSnapshotLoadSnafu {
-                reason: SNAPSHOT_LOAD_FAILED,
+                reason: snapshot_load_failed_reason(&error.to_string()),
             }
             .fail();
         }
@@ -126,13 +127,37 @@ pub(crate) fn load_delta_table_snapshot(
     })
 }
 
+fn snapshot_load_failed_reason(cause: &str) -> String {
+    format!(
+        "{SNAPSHOT_LOAD_FAILED}: {}",
+        sanitize_snapshot_load_cause(cause)
+    )
+}
+
+fn sanitize_snapshot_load_cause(cause: &str) -> String {
+    cause
+        .split_whitespace()
+        .map(|token| {
+            if token.contains("://") {
+                sanitize_uri_for_display(token)
+            } else {
+                sanitize_text_for_display(token)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{DeltaStorageOptions, load_delta_table_snapshot};
+    use super::{
+        DeltaStorageOptions, SNAPSHOT_LOAD_FAILED, load_delta_table_snapshot,
+        snapshot_load_failed_reason,
+    };
     use crate::DeltaFunnelError;
 
     struct DeltaLogTable {
@@ -250,6 +275,37 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[test]
+    fn snapshot_load_error_includes_dependency_cause() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TestDir::new("empty-table-cause")?;
+        let result =
+            load_delta_table_snapshot(dir.path.to_string_lossy(), None, &empty_storage_options());
+        let reason = match result {
+            Err(DeltaFunnelError::DeltaSnapshotLoad { reason }) => reason,
+            _ => return Err("expected snapshot load error".into()),
+        };
+
+        assert!(reason.starts_with(&format!("{SNAPSHOT_LOAD_FAILED}: ")));
+        assert_ne!(reason, SNAPSHOT_LOAD_FAILED);
+        assert!(!reason.contains('\n'));
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_load_cause_redacts_secret_bearing_uris() {
+        let reason = snapshot_load_failed_reason(
+            "failed to read s3://user:password@example.com/table?token=secret#debug\nretry",
+        );
+
+        assert!(reason.contains("s3://example.com/table"));
+        assert!(!reason.contains("user"));
+        assert!(!reason.contains("password"));
+        assert!(!reason.contains("token"));
+        assert!(!reason.contains("secret"));
+        assert!(!reason.contains('\n'));
     }
 
     #[test]
