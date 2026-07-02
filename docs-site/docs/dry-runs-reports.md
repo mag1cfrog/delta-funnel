@@ -72,7 +72,29 @@ deltafunnel.init_logging()
 ```
 
 Use `DELTAFUNNEL_LOG` or an explicit filter string such as
-`delta_funnel=debug,delta_kernel=debug` when you need more detail. DeltaFunnel
-does not configure handlers or exporters; existing Datadog, OpenTelemetry, JSON
-logging, file logging, pytest capture, and framework integrations continue to
-own Python logging output.
+`delta_funnel=debug,delta_kernel=debug,object_store=debug` when you need more
+detail. DeltaFunnel does not configure handlers or exporters; existing Datadog,
+OpenTelemetry, JSON logging, file logging, pytest capture, and framework
+integrations continue to own Python logging output.
+
+For private S3 Delta sources, look for `object_store` messages that show which
+credential-provider path was selected.
+
+## Private S3 source troubleshooting
+
+If a private S3 Delta table fails in `deltafunnel` from a local shell, but the
+same table works in `deltalake`, the likely cause is a credential-discovery
+path mismatch rather than a Delta snapshot or protocol problem.
+
+Start with the explicit `storage_options` example in the
+[Python API walkthrough](python-api-walkthrough.md#read-a-private-s3-delta-table-from-a-local-shell).
+Then rerun with:
+
+```python
+deltafunnel.init_logging(
+    "delta_funnel=debug,delta_kernel=debug,object_store=debug"
+)
+```
+
+On the current S3 path, Delta Funnel does not auto-load shell `AWS_*`
+variables, `AWS_PROFILE`, or shared AWS config and credentials files.

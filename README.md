@@ -86,6 +86,12 @@ report = daily_orders.write_to_mssql(
 `session.delta_lake(...)` without `name` returns a pending source; call
 `.alias("orders")` before SQL references it.
 
+For private S3 Delta sources in Python, see the
+[`docs-site/docs/python-api-walkthrough.md`](docs-site/docs/python-api-walkthrough.md)
+guide. The current S3 path expects explicit `storage_options` credentials for
+local shell usage and can behave differently from `deltalake` if the two
+libraries resolve AWS credentials differently.
+
 Reports are plain Python `dict` values converted from Rust report types. Report
 formatting is designed to avoid exposing connection strings, credentials, and
 raw row values. See
