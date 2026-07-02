@@ -3491,6 +3491,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_matches_official_kernel_for_mixed_timestamp_physical_types()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_mixed_timestamp_physical_types(
+            "native-async-mixed-timestamp-physical-types",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "\
+            select \
+                id, \
+                customer_name, \
+                event_ts \
+            from orders \
+            order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_matches_official_kernel_for_mixed_timestamp_physical_types_with_utc_nanoseconds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table =
+            RealParquetDeltaTable::new_with_mixed_timestamp_physical_types_with_utc_nanoseconds(
+                "native-async-mixed-timestamp-physical-types-with-utc-nanoseconds",
+            )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "\
+            select \
+                id, \
+                customer_name, \
+                event_ts \
+            from orders \
+            order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_matches_official_kernel_for_mixed_nested_timestamp_physical_types()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_mixed_nested_timestamp_physical_types(
+            "native-async-mixed-nested-timestamp-physical-types",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "\
+            select \
+                id, \
+                profile \
+            from orders \
+            order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_matches_official_kernel_for_nested_struct_name_fallback()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_reordered_nested_struct_fields(
@@ -3699,6 +3795,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_matches_official_kernel_for_array_struct_leaf_cast()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_array_struct_long_zip_leaf_cast(
+            "native-async-array-struct-leaf-cast",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select addresses, id from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_rejects_missing_non_nullable_array_struct_field_before_rows()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
@@ -3898,6 +4020,32 @@ mod tests {
         assert_eq!(read_stats.files_completed, 0);
         assert_eq!(read_stats.batches_produced, 0);
         assert_eq!(read_stats.rows_produced, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_matches_official_kernel_for_map_key_leaf_cast()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_map_long_key_leaf_cast(
+            "native-async-map-key-leaf-cast",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select attributes, id from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
 
         Ok(())
     }

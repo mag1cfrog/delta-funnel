@@ -11,7 +11,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Int64Array, ListArray, MapArray, StructArray, new_null_array,
 };
-use datafusion::arrow::compute::filter_record_batch;
+use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Fields, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -746,6 +746,10 @@ enum NativeAsyncProviderColumn {
 #[derive(Clone)]
 enum NativeAsyncFieldPlan {
     Identity,
+    #[allow(dead_code)]
+    Cast {
+        target_type: DataType,
+    },
     Struct {
         children: Vec<NativeAsyncStructChild>,
     },
@@ -789,6 +793,8 @@ impl NativeAsyncSchemaMatch {
     /// Reordering or renaming existing columns is cheap because the Arrow arrays
     /// are shared by `Arc`. Missing nullable fields allocate all-null arrays to
     /// represent older Parquet files that predate a Delta schema evolution.
+    /// Cast-compatible leaf mismatches allocate a new array for the casted
+    /// column.
     fn reshape_batch_to_provider_schema(
         &self,
         batch: RecordBatch,
@@ -1072,18 +1078,69 @@ fn build_matched_field_plan(
                 path,
             )
         }
-        _ if file_field
-            .data_type()
-            .equals_datatype(provider_field.data_type()) =>
-        {
-            Ok(NativeAsyncFieldPlan::Identity)
+        _ => {
+            match native_async_leaf_cast_plan(provider_field.data_type(), file_field.data_type()) {
+                Ok(None) => Ok(NativeAsyncFieldPlan::Identity),
+                Ok(Some(target_type)) => Ok(NativeAsyncFieldPlan::Cast { target_type }),
+                Err(()) => Err(delta_kernel::Error::generic(format!(
+                    "provider field '{path}' expected Parquet type {} but found {}",
+                    provider_field.data_type(),
+                    file_field.data_type()
+                ))),
+            }
         }
-        _ => Err(delta_kernel::Error::generic(format!(
-            "provider field '{path}' expected Parquet type {} but found {}",
-            provider_field.data_type(),
-            file_field.data_type()
-        ))),
     }
+}
+
+fn native_async_leaf_cast_plan(
+    provider_type: &DataType,
+    file_type: &DataType,
+) -> Result<Option<DataType>, ()> {
+    use DataType::{Date32, Decimal128, Float32, Float64, Int8, Int16, Int32, Int64, Timestamp};
+
+    if file_type.equals_datatype(provider_type) {
+        return Ok(None);
+    }
+
+    match (file_type, provider_type) {
+        (Timestamp(_, _), Timestamp(_, _)) => Ok(Some(provider_type.clone())),
+        (Int8, Int16 | Int32 | Int64 | Float64) => Ok(Some(provider_type.clone())),
+        (Int16, Int32 | Int64 | Float64) => Ok(Some(provider_type.clone())),
+        (Int32, Int64 | Float64) => Ok(Some(provider_type.clone())),
+        (Float32, Float64) => Ok(Some(provider_type.clone())),
+        (source_type, Decimal128(precision, scale))
+            if native_async_can_upcast_to_decimal(source_type, *precision, *scale) =>
+        {
+            Ok(Some(provider_type.clone()))
+        }
+        (Date32, Timestamp(_, None)) => Ok(Some(provider_type.clone())),
+        (Int32, Date32) => Ok(Some(provider_type.clone())),
+        (Int64, Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, _)) => {
+            Ok(Some(provider_type.clone()))
+        }
+        _ => Err(()),
+    }
+}
+
+fn native_async_can_upcast_to_decimal(
+    source_type: &DataType,
+    target_precision: u8,
+    target_scale: i8,
+) -> bool {
+    use DataType::{Decimal128, Int8, Int16, Int32, Int64};
+
+    let (source_precision, source_scale) = match source_type {
+        Decimal128(precision, scale) => (*precision, *scale),
+        Int8 => (3u8, 0i8),
+        Int16 => (5u8, 0i8),
+        Int32 => (10u8, 0i8),
+        Int64 => (20u8, 0i8),
+        _ => return false,
+    };
+
+    target_precision >= source_precision
+        && target_scale >= source_scale
+        && target_precision - source_precision >= (target_scale - source_scale) as u8
 }
 
 fn build_matched_map_field_plan(
@@ -1099,25 +1156,7 @@ fn build_matched_map_field_plan(
 
     let key_path = format!("{path}.key");
     let parquet_key = parquet_map_key_field(parquet_field, path)?;
-    let key_plan = match (provider_key.data_type(), file_key.data_type()) {
-        (
-            DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _),
-            DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _),
-        ) => build_matched_field_plan(provider_key, file_key, parquet_key, &key_path)?,
-        _ if file_key
-            .data_type()
-            .equals_datatype(provider_key.data_type()) =>
-        {
-            NativeAsyncFieldPlan::Identity
-        }
-        _ => {
-            return Err(delta_kernel::Error::generic(format!(
-                "provider field '{key_path}' expected Parquet type {} but found {}",
-                provider_key.data_type(),
-                file_key.data_type()
-            )));
-        }
-    };
+    let key_plan = build_matched_field_plan(provider_key, file_key, parquet_key, &key_path)?;
 
     let value_path = format!("{path}.value");
     let parquet_value = parquet_map_value_field(parquet_field, path)?;
@@ -1233,6 +1272,13 @@ fn build_matched_list_field_plan(
         parquet_element,
         &element_path,
     )?;
+    if matches!(element_plan, NativeAsyncFieldPlan::Cast { .. }) {
+        return Err(delta_kernel::Error::generic(format!(
+            "provider field '{element_path}' expected Parquet type {} but found {}",
+            provider_element.data_type(),
+            file_element.data_type()
+        )));
+    }
 
     let needs_reshape =
         file_field.data_type() != provider_field.data_type() || !element_plan.is_identity();
@@ -1415,6 +1461,9 @@ fn reshape_array_to_provider_field(
 ) -> Result<ArrayRef, delta_kernel::Error> {
     match field_plan {
         NativeAsyncFieldPlan::Identity => Ok(array),
+        NativeAsyncFieldPlan::Cast { target_type } => {
+            cast(array.as_ref(), target_type).map_err(delta_kernel::Error::from)
+        }
         NativeAsyncFieldPlan::Struct { children } => {
             let DataType::Struct(provider_fields) = provider_field.data_type() else {
                 return Err(delta_kernel::Error::generic(format!(
@@ -1736,7 +1785,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::arrow::array::{
-        Array, ArrayRef, Decimal128Array, Int32Array, ListArray, MapArray, StringArray, StructArray,
+        Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+        StructArray, TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use datafusion::arrow::buffer::NullBuffer;
     use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -1936,6 +1986,17 @@ mod tests {
         Field::new(name, DataType::Struct(fields.into()), nullable)
     }
 
+    fn timestamp_us_utc_field(name: &str, nullable: bool) -> Field {
+        Field::new(
+            name,
+            DataType::Timestamp(
+                datafusion::arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            nullable,
+        )
+    }
+
     fn struct_array(fields: Vec<Field>, columns: Vec<ArrayRef>) -> ArrayRef {
         struct_array_with_nulls(fields, columns, None)
     }
@@ -2058,6 +2119,361 @@ mod tests {
             KernelColumnMetadataKey::ParquetFieldId.as_ref().to_owned(),
             KernelMetadataValue::Number(field_id),
         )]
+    }
+
+    #[test]
+    fn native_async_leaf_cast_plan_matches_timestamp_compatibility()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into()),
+        );
+
+        assert_eq!(
+            super::native_async_leaf_cast_plan(
+                &target,
+                &DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None)
+            ),
+            Ok(Some(target.clone()))
+        );
+        assert_eq!(
+            super::native_async_leaf_cast_plan(
+                &target,
+                &DataType::Timestamp(
+                    datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+                    Some("UTC".into())
+                )
+            ),
+            Ok(Some(target))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_leaf_cast_plan_rejects_incompatible_primitive_types()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            super::native_async_leaf_cast_plan(&DataType::Int32, &DataType::Utf8),
+            Err(())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_casts_top_level_timestamp_leaf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_schema = Arc::new(Schema::new(vec![timestamp_us_utc_field("event_ts", true)]));
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "event_ts",
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let batch = project_parquet_batch_to_provider_schema(
+            "top-level-timestamp-leaf-cast",
+            file_schema,
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                Some(1_704_067_200_000_000_000),
+                None,
+            ])) as ArrayRef],
+            provider_schema,
+        )?;
+        let timestamps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or("expected TimestampMicrosecondArray")?;
+
+        assert_eq!(timestamps.timezone(), Some("UTC"));
+        assert_eq!(timestamps.value(0), 1_704_067_200_000_000);
+        assert!(timestamps.is_null(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_reshape_casts_top_level_timestamp_leaf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_field = timestamp_us_utc_field("event_ts", true);
+        let array = Arc::new(TimestampNanosecondArray::from(vec![
+            Some(1_704_067_200_000_000_000),
+            None,
+        ])) as ArrayRef;
+
+        let reshaped = super::reshape_array_to_provider_field(
+            array,
+            &provider_field,
+            &super::NativeAsyncFieldPlan::Cast {
+                target_type: provider_field.data_type().clone(),
+            },
+        )?;
+        let timestamps = reshaped
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or("expected TimestampMicrosecondArray")?;
+
+        assert_eq!(timestamps.timezone(), Some("UTC"));
+        assert_eq!(timestamps.value(0), 1_704_067_200_000_000);
+        assert!(timestamps.is_null(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_reshape_casts_nested_struct_timestamp_leaf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_child = timestamp_us_utc_field("event_ts", true);
+        let provider_field = struct_field("payload", vec![provider_child.clone()], true);
+        let file_child = Field::new(
+            "event_ts",
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        );
+        let array = struct_array(
+            vec![file_child],
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                Some(1_704_153_600_000_000_000),
+                None,
+            ])) as ArrayRef],
+        );
+
+        let reshaped = super::reshape_array_to_provider_field(
+            array,
+            &provider_field,
+            &super::NativeAsyncFieldPlan::Struct {
+                children: vec![super::NativeAsyncStructChild::ProjectedChild {
+                    child_index: 0,
+                    field_plan: super::NativeAsyncFieldPlan::Cast {
+                        target_type: provider_child.data_type().clone(),
+                    },
+                }],
+            },
+        )?;
+        let payload = reshaped
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected StructArray")?;
+        let timestamps = payload
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or("expected TimestampMicrosecondArray")?;
+
+        assert_eq!(payload.fields()[0].name(), "event_ts");
+        assert_eq!(timestamps.timezone(), Some("UTC"));
+        assert_eq!(timestamps.value(0), 1_704_153_600_000_000);
+        assert!(timestamps.is_null(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_casts_list_struct_leaf() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let provider_element = Field::new(
+            "element",
+            DataType::Struct(
+                vec![
+                    Field::new("city", DataType::Utf8, true),
+                    Field::new("zip", DataType::Int64, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let provider_schema = Arc::new(Schema::new(vec![Field::new(
+            "addresses",
+            DataType::List(Arc::new(provider_element)),
+            true,
+        )]));
+        let file_address_fields = vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ];
+        let file_element = Field::new(
+            "element",
+            DataType::Struct(file_address_fields.clone().into()),
+            true,
+        );
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "addresses",
+            DataType::List(Arc::new(file_element.clone())),
+            true,
+        )]));
+        let values = struct_array(
+            file_address_fields,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("san francisco"),
+                    Some("new york"),
+                    Some("chicago"),
+                ])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![
+                    Some(94110),
+                    Some(10001),
+                    Some(60601),
+                ])) as ArrayRef,
+            ],
+        );
+        let addresses = list_array(
+            file_element,
+            vec![0, 2, 2, 3],
+            values,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "list-struct-leaf-cast-schema-match",
+            file_schema,
+            vec![addresses],
+            provider_schema,
+        )?;
+        let addresses = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or("expected addresses ListArray")?;
+        let values = addresses
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected StructArray list values")?;
+        let cities = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected city StringArray")?;
+        let zips = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("expected Int64Array zip values")?;
+
+        assert_eq!(addresses.value_offsets(), &[0, 2, 2, 3]);
+        assert!(addresses.is_valid(0));
+        assert!(addresses.is_null(1));
+        assert!(addresses.is_valid(2));
+        assert_eq!(values.fields()[0].name(), "city");
+        assert_eq!(values.fields()[1].name(), "zip");
+        assert_eq!(cities.value(0), "san francisco");
+        assert_eq!(cities.value(2), "chicago");
+        assert_eq!(zips.values(), &[94110, 10001, 60601]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_rejects_list_primitive_leaf_cast()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("element", DataType::Int64, true))),
+                true,
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let file_element = Field::new("element", DataType::Int32, true);
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("customer_name", DataType::Utf8, true),
+            Field::new("tags", DataType::List(Arc::new(file_element.clone())), true),
+        ]));
+        let tags = list_array(
+            file_element,
+            vec![0, 2, 2, 3],
+            Arc::new(Int32Array::from(vec![Some(7), Some(11), None])) as ArrayRef,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let error = match project_parquet_batch_to_provider_schema(
+            "list-primitive-leaf-cast-schema-match",
+            file_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as ArrayRef,
+                tags,
+            ],
+            provider_schema,
+        ) {
+            Ok(_) => return Err("primitive list element cast must fail".into()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("tags.element"), "{error}");
+        assert!(error.contains("expected Parquet type Int64"), "{error}");
+        assert!(error.contains("found Int32"), "{error}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_casts_map_key_leaf() -> Result<(), Box<dyn std::error::Error>> {
+        let provider_schema = Arc::new(Schema::new(vec![map_field(
+            "attributes",
+            Field::new("key", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+            true,
+        )]));
+        let file_key = Field::new("key", DataType::Int32, false);
+        let file_value = Field::new("value", DataType::Utf8, true);
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "attributes",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(vec![file_key.clone(), file_value.clone()].into()),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        )]));
+        let attributes = map_array(
+            file_key,
+            file_value,
+            vec![0, 2, 2, 3],
+            Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("home"),
+                Some("work"),
+                Some("mailing"),
+            ])) as ArrayRef,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let batch = project_parquet_batch_to_provider_schema(
+            "map-key-leaf-cast-schema-match",
+            file_schema,
+            vec![attributes],
+            provider_schema,
+        )?;
+        let attributes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or("expected attributes MapArray")?;
+        let keys = attributes
+            .keys()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("expected Int64Array map keys")?;
+        let values = attributes
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected StringArray map values")?;
+
+        assert_eq!(attributes.value_offsets(), &[0, 2, 2, 3]);
+        assert!(attributes.is_valid(0));
+        assert!(attributes.is_null(1));
+        assert!(attributes.is_valid(2));
+        assert_eq!(keys.values(), &[10, 20, 30]);
+        assert_eq!(values.value(0), "home");
+        assert_eq!(values.value(2), "mailing");
+
+        Ok(())
     }
 
     #[test]
