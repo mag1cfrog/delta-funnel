@@ -151,7 +151,7 @@ mod tests {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
 
-    use super::{PythonLoggingLayer, python_log_level};
+    use super::{DEFAULT_FILTER, PythonLoggingLayer, python_log_level};
     use crate::deltafunnel;
 
     #[test]
@@ -171,8 +171,15 @@ mod tests {
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
             deltafunnel(&module)?;
+            let logging = py.import("logging")?;
+            let logger = logging.call_method1("getLogger", ("deltafunnel.test.global",))?;
+            let null_handler = logging.getattr("NullHandler")?.call0()?;
+            logger.setattr("propagate", false)?;
+            logger.call_method1("addHandler", (&null_handler,))?;
 
-            let _first = module.call_method0("init_logging")?.extract::<bool>()?;
+            let _first = module
+                .call_method1("init_logging", (DEFAULT_FILTER, "deltafunnel.test.global"))?
+                .extract::<bool>()?;
             let second = module.call_method0("init_logging")?.extract::<bool>()?;
 
             assert!(!second);
