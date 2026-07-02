@@ -4,7 +4,7 @@
 //! target before writer construction. Actual SQL Server probes and DDL
 //! execution land in later slices.
 
-use arrow_tiberius::{SqlExecutionOutcome, TableName};
+use arrow_tiberius::{SqlExecutionOutcome, TableName, create_table_sql_from_mappings};
 use async_trait::async_trait;
 
 use crate::DeltaFunnelError;
@@ -95,11 +95,7 @@ where
     match output_plan.load_mode() {
         LoadMode::AppendExisting => prepare_mssql_append_existing_target(output_plan, client).await,
         LoadMode::CreateAndLoad => prepare_mssql_create_and_load_target(output_plan, client).await,
-        LoadMode::Replace => Err(DeltaFunnelError::MssqlLifecyclePlanning {
-            output_name: output_plan.output_name().to_owned(),
-            message: "replace load mode is reserved and cannot prepare a target lifecycle"
-                .to_owned(),
-        }),
+        LoadMode::Replace => prepare_mssql_replace_target(output_plan, client).await,
     }
 }
 
@@ -182,6 +178,55 @@ where
     MssqlPreparedTarget::from_output_plan(output_plan, MssqlPreparedTargetAction::CreatedTable)
 }
 
+/// Prepares a replace SQL Server target by creating a private staging table.
+pub(crate) async fn prepare_mssql_replace_target<C>(
+    output_plan: &MssqlTargetOutputPlan,
+    client: &mut C,
+) -> Result<MssqlPreparedTarget, DeltaFunnelError>
+where
+    C: MssqlTargetLifecycleClient + ?Sized,
+{
+    ensure_replace_output(output_plan)?;
+    ensure_lifecycle_guardrail(
+        output_plan,
+        MssqlLifecycleExecutionGuardrail::TargetTableExistenceProbe,
+    )?;
+    ensure_lifecycle_guardrail(
+        output_plan,
+        MssqlLifecycleExecutionGuardrail::CreateTableDdlExecution,
+    )?;
+    let final_table_name =
+        table_name_from_target(output_plan.output_name(), output_plan.target_table())?;
+    let final_exists = client
+        .table_exists(&final_table_name)
+        .await
+        .map_err(|source| prepare_target_lifecycle_error(output_plan, source.to_string()))?;
+
+    if !final_exists {
+        return Err(prepare_target_lifecycle_error(
+            output_plan,
+            format!(
+                "replace target table {} does not exist",
+                final_table_name.quoted_sql()
+            ),
+        ));
+    }
+
+    let staging_table_name = available_replace_staging_table(output_plan, client).await?;
+    let create_table_sql =
+        create_table_sql_from_mappings(&staging_table_name, output_plan.schema_mappings());
+    client
+        .execute_statement(&create_table_sql)
+        .await
+        .map_err(|source| prepare_target_lifecycle_error(output_plan, source.to_string()))?;
+
+    MssqlPreparedTarget::from_table_name(
+        output_plan,
+        staging_table_name,
+        MssqlPreparedTargetAction::CreatedStagingTable,
+    )
+}
+
 /// Cleans up a DeltaFunnel-created SQL Server target after a later failure.
 #[allow(dead_code)]
 pub(crate) async fn cleanup_mssql_prepared_target<C>(
@@ -199,7 +244,8 @@ where
 
     match prepared_target.report().action() {
         MssqlPreparedTargetAction::VerifiedExisting => Ok(MssqlTargetCleanupStatus::NotApplicable),
-        MssqlPreparedTargetAction::CreatedTable => {
+        MssqlPreparedTargetAction::CreatedTable
+        | MssqlPreparedTargetAction::CreatedStagingTable => {
             let drop_table_sql = format!("DROP TABLE {}", prepared_target.quoted_table_sql());
             client
                 .execute_statement(&drop_table_sql)
@@ -218,13 +264,17 @@ pub enum MssqlPreparedTargetAction {
     VerifiedExisting,
     /// A create-and-load target table was created by DeltaFunnel.
     CreatedTable,
+    /// A replace staging table was created by DeltaFunnel.
+    CreatedStagingTable,
 }
 
 impl MssqlPreparedTargetAction {
     const fn cleanup_status(self) -> MssqlTargetCleanupStatus {
         match self {
             Self::VerifiedExisting => MssqlTargetCleanupStatus::NotApplicable,
-            Self::CreatedTable => MssqlTargetCleanupStatus::NotAttempted,
+            Self::CreatedTable | Self::CreatedStagingTable => {
+                MssqlTargetCleanupStatus::NotAttempted
+            }
         }
     }
 }
@@ -326,6 +376,14 @@ impl MssqlPreparedTarget {
     ) -> Result<Self, DeltaFunnelError> {
         let table_name =
             table_name_from_target(output_plan.output_name(), output_plan.target_table())?;
+        Self::from_table_name(output_plan, table_name, action)
+    }
+
+    pub(crate) fn from_table_name(
+        output_plan: &MssqlTargetOutputPlan,
+        table_name: TableName,
+        action: MssqlPreparedTargetAction,
+    ) -> Result<Self, DeltaFunnelError> {
         let report = MssqlPreparedTargetReport::from_output_plan(output_plan, action)?;
 
         Ok(Self { table_name, report })
@@ -376,6 +434,9 @@ fn ensure_action_matches_load_mode(
         ) | (
             LoadMode::CreateAndLoad,
             MssqlPreparedTargetAction::CreatedTable
+        ) | (
+            LoadMode::Replace,
+            MssqlPreparedTargetAction::CreatedStagingTable
         )
     );
 
@@ -414,6 +475,18 @@ fn ensure_create_and_load_output(
     Err(DeltaFunnelError::MssqlLifecyclePlanning {
         output_name: output_plan.output_name().to_owned(),
         message: "create-and-load target preparation requires create-and-load load mode".to_owned(),
+    })
+}
+
+#[allow(dead_code)]
+fn ensure_replace_output(output_plan: &MssqlTargetOutputPlan) -> Result<(), DeltaFunnelError> {
+    if output_plan.load_mode() == LoadMode::Replace {
+        return Ok(());
+    }
+
+    Err(DeltaFunnelError::MssqlLifecyclePlanning {
+        output_name: output_plan.output_name().to_owned(),
+        message: "replace target preparation requires replace load mode".to_owned(),
     })
 }
 
@@ -505,6 +578,55 @@ fn cleanup_before_target_creation(output_plan: &MssqlTargetOutputPlan) -> MssqlT
     }
 }
 
+async fn available_replace_staging_table<C>(
+    output_plan: &MssqlTargetOutputPlan,
+    client: &mut C,
+) -> Result<TableName, DeltaFunnelError>
+where
+    C: MssqlTargetLifecycleClient + ?Sized,
+{
+    for attempt in 0..100_u8 {
+        let table_name = replace_staging_table_name(output_plan, attempt)?;
+        let exists = client
+            .table_exists(&table_name)
+            .await
+            .map_err(|source| prepare_target_lifecycle_error(output_plan, source.to_string()))?;
+        if !exists {
+            return Ok(table_name);
+        }
+    }
+
+    Err(prepare_target_lifecycle_error(
+        output_plan,
+        "could not find an available replace staging table name",
+    ))
+}
+
+fn replace_staging_table_name(
+    output_plan: &MssqlTargetOutputPlan,
+    attempt: u8,
+) -> Result<TableName, DeltaFunnelError> {
+    const MAX_IDENTIFIER_CHARS: usize = 128;
+    let suffix = format!("__df_replace_{attempt}");
+    let max_base_chars = MAX_IDENTIFIER_CHARS.saturating_sub(suffix.chars().count());
+    let base = output_plan
+        .target_table()
+        .table()
+        .chars()
+        .take(max_base_chars)
+        .collect::<String>();
+    let table_name = format!("{base}{suffix}");
+
+    match output_plan.target_table().schema() {
+        Some(schema) => TableName::new(schema, table_name),
+        None => TableName::unqualified(table_name),
+    }
+    .map_err(|source| DeltaFunnelError::MssqlDdlTargetIdentifier {
+        output_name: output_plan.output_name().to_owned(),
+        source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
@@ -549,6 +671,7 @@ mod tests {
     struct RecordingLifecycleClient {
         calls: Vec<String>,
         exists: bool,
+        existence_results: Vec<bool>,
         rows_affected: Vec<u64>,
         table_exists_error: Option<String>,
         execute_statement_error: Option<String>,
@@ -560,6 +683,10 @@ mod tests {
             self.calls.push(format!("probe {}", table.quoted_sql()));
             if let Some(reason) = self.table_exists_error.take() {
                 return Err(arrow_tiberius::Error::TableExistsUnexpectedResult { reason });
+            }
+
+            if !self.existence_results.is_empty() {
+                return Ok(self.existence_results.remove(0));
             }
 
             Ok(self.exists)
@@ -660,6 +787,37 @@ mod tests {
         assert_eq!(client.calls.len(), 2);
         assert_eq!(client.calls[0], "probe [dbo].[orders]");
         assert!(client.calls[1].starts_with("execute CREATE TABLE [dbo].[orders]"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn target_lifecycle_preparation_dispatches_replace_to_staging()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::Replace,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            existence_results: vec![true, false],
+            ..RecordingLifecycleClient::default()
+        };
+
+        let prepared = prepare_mssql_target_lifecycle(&output_plan, &mut client).await?;
+
+        assert_eq!(prepared.quoted_table_sql(), "[dbo].[orders__df_replace_0]");
+        assert_eq!(
+            prepared.report().action(),
+            MssqlPreparedTargetAction::CreatedStagingTable
+        );
+        assert_eq!(
+            prepared.report().cleanup(),
+            MssqlTargetCleanupStatus::NotAttempted
+        );
+        assert_eq!(client.calls.len(), 3);
+        assert_eq!(client.calls[0], "probe [dbo].[orders]");
+        assert_eq!(client.calls[1], "probe [dbo].[orders__df_replace_0]");
+        assert!(client.calls[2].starts_with("execute CREATE TABLE [dbo].[orders__df_replace_0]"));
         Ok(())
     }
 
@@ -942,6 +1100,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replace_preparation_creates_available_staging_target() -> Result<(), DeltaFunnelError>
+    {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::Replace,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            existence_results: vec![true, false],
+            rows_affected: vec![0],
+            ..RecordingLifecycleClient::default()
+        };
+
+        let prepared = prepare_mssql_replace_target(&output_plan, &mut client).await?;
+
+        assert_eq!(prepared.quoted_table_sql(), "[dbo].[orders__df_replace_0]");
+        assert_eq!(
+            prepared.report().action(),
+            MssqlPreparedTargetAction::CreatedStagingTable
+        );
+        assert_eq!(client.calls.len(), 3);
+        assert_eq!(client.calls[0], "probe [dbo].[orders]");
+        assert_eq!(client.calls[1], "probe [dbo].[orders__df_replace_0]");
+        assert!(client.calls[2].starts_with("execute CREATE TABLE [dbo].[orders__df_replace_0]"));
+        assert!(client.calls[2].contains("[order_id] bigint NOT NULL"));
+        assert!(client.calls[2].contains("[status] nvarchar(max) NULL"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_preparation_fails_when_final_target_is_absent() -> Result<(), DeltaFunnelError>
+    {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::Replace,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            existence_results: vec![false],
+            ..RecordingLifecycleClient::default()
+        };
+
+        let error = prepare_mssql_replace_target(&output_plan, &mut client)
+            .await
+            .err()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected absent replace target error".to_owned(),
+            })?;
+
+        assert_prepare_target_lifecycle_error(
+            error,
+            "replace target table [dbo].[orders] does not exist",
+            MssqlTargetCleanupStatus::NotAttempted,
+        )?;
+        assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_preparation_skips_existing_staging_name() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::Replace,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            existence_results: vec![true, true, false],
+            ..RecordingLifecycleClient::default()
+        };
+
+        let prepared = prepare_mssql_replace_target(&output_plan, &mut client).await?;
+
+        assert_eq!(prepared.quoted_table_sql(), "[dbo].[orders__df_replace_1]");
+        assert_eq!(client.calls.len(), 4);
+        assert_eq!(
+            &client.calls[..3],
+            [
+                "probe [dbo].[orders]",
+                "probe [dbo].[orders__df_replace_0]",
+                "probe [dbo].[orders__df_replace_1]",
+            ]
+        );
+        assert!(client.calls[3].starts_with("execute CREATE TABLE [dbo].[orders__df_replace_1]"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_preparation_rejects_create_and_load_before_probe()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::CreateAndLoad,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let mut client = RecordingLifecycleClient {
+            exists: true,
+            ..RecordingLifecycleClient::default()
+        };
+
+        let error = prepare_mssql_replace_target(&output_plan, &mut client)
+            .await
+            .err()
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected replace preparation mode error".to_owned(),
+            })?;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::MssqlLifecyclePlanning { .. }
+        ));
+        assert!(error.to_string().contains("requires replace"));
+        assert!(client.calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cleanup_returns_not_applicable_without_append_existing_target_creation()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan(
@@ -1001,6 +1275,37 @@ mod tests {
         assert_eq!(
             client.calls,
             vec!["execute DROP TABLE [dbo.part].[target]]part]".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_drops_deltafunnel_created_replace_staging_target()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::Replace,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let staging_table = TableName::new("dbo", "orders__df_replace_0").map_err(|error| {
+            DeltaFunnelError::Config {
+                message: error.to_string(),
+            }
+        })?;
+        let prepared = MssqlPreparedTarget::from_table_name(
+            &output_plan,
+            staging_table,
+            MssqlPreparedTargetAction::CreatedStagingTable,
+        )?;
+        let mut client = RecordingLifecycleClient::default();
+
+        let cleanup =
+            cleanup_mssql_prepared_target(&output_plan, Some(&prepared), &mut client).await?;
+
+        assert_eq!(cleanup, MssqlTargetCleanupStatus::Succeeded);
+        assert_eq!(
+            client.calls,
+            vec!["execute DROP TABLE [dbo].[orders__df_replace_0]".to_owned()]
         );
         Ok(())
     }
@@ -1156,6 +1461,41 @@ mod tests {
             MssqlTargetTableState::Absent
         );
         assert_eq!(report.action(), MssqlPreparedTargetAction::CreatedTable);
+        assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotAttempted);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_prepared_target_reports_created_staging_table() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan(
+            "orders_output",
+            LoadMode::Replace,
+            MssqlTargetTable::unqualified("orders")?,
+        )?;
+        let staging_table = TableName::unqualified("orders__df_replace_0").map_err(|error| {
+            DeltaFunnelError::Config {
+                message: error.to_string(),
+            }
+        })?;
+
+        let prepared = MssqlPreparedTarget::from_table_name(
+            &output_plan,
+            staging_table,
+            MssqlPreparedTargetAction::CreatedStagingTable,
+        )?;
+        let report = prepared.report();
+
+        assert_eq!(prepared.table_name().quoted_sql(), "[orders__df_replace_0]");
+        assert_eq!(report.target_table().table(), "orders");
+        assert_eq!(report.load_mode(), LoadMode::Replace);
+        assert_eq!(
+            report.expected_target_state(),
+            MssqlTargetTableState::Exists
+        );
+        assert_eq!(
+            report.action(),
+            MssqlPreparedTargetAction::CreatedStagingTable
+        );
         assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotAttempted);
         Ok(())
     }

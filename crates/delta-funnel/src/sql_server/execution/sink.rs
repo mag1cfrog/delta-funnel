@@ -1115,7 +1115,10 @@ mod tests {
                 MssqlPreparedTargetAction::VerifiedExisting => {
                     MssqlTargetCleanupStatus::NotApplicable
                 }
-                MssqlPreparedTargetAction::CreatedTable => MssqlTargetCleanupStatus::Succeeded,
+                MssqlPreparedTargetAction::CreatedTable
+                | MssqlPreparedTargetAction::CreatedStagingTable => {
+                    MssqlTargetCleanupStatus::Succeeded
+                }
             })
         }
 
