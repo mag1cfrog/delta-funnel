@@ -896,7 +896,7 @@ fn source_config_py_error(py: Python<'_>, kind: &'static str, message: String) -
 
 #[cfg(test)]
 mod tests {
-    use super::PySession;
+    use super::{PySession, parse_storage_options};
     use crate::deltafunnel;
     use delta_funnel::{
         DeltaProviderScanExecutionOptions, DryRunScanSummaryMode, MssqlBinaryPolicy,
@@ -928,6 +928,38 @@ mod tests {
     static NEXT_MSSQL_TABLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     type TestResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
+
+    #[test]
+    fn parse_storage_options_preserves_string_keys_and_values() -> PyResult<()> {
+        Python::attach(|py| {
+            let cases = [
+                ("AWS_ACCESS_KEY_ID", "upper-access"),
+                ("aws_access_key_id", "lower-access"),
+                ("AWS_SECRET_ACCESS_KEY", "upper-secret"),
+                ("aws_secret_access_key", "lower-secret"),
+                ("AWS_SESSION_TOKEN", "upper-token"),
+                ("aws_session_token", "lower-token"),
+                ("AWS_REGION", "upper-region"),
+                ("aws_region", "lower-region"),
+                ("region", "short-region"),
+                ("AWS_DEFAULT_REGION", "upper-default-region"),
+                ("aws_default_region", "lower-default-region"),
+            ];
+            let storage_options = PyDict::new(py);
+            for (key, value) in cases {
+                storage_options.set_item(key, value)?;
+            }
+
+            let parsed = parse_storage_options(py, Some(&storage_options))?;
+
+            assert_eq!(parsed.len(), cases.len());
+            for (key, value) in cases {
+                assert_eq!(parsed.get(key).map(String::as_str), Some(value), "{key}");
+            }
+
+            Ok(())
+        })
+    }
 
     #[test]
     fn module_exports_session_type() -> PyResult<()> {
