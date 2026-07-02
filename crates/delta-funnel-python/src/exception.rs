@@ -77,9 +77,14 @@ fn delta_funnel_error_parts(
         delta_funnel::DeltaFunnelError::DeltaSourceEngine { .. } => {
             Ok(("delta_source", "delta_source_engine", None))
         }
-        delta_funnel::DeltaFunnelError::DeltaSnapshotLoad { .. } => {
-            Ok(("delta_source", "delta_snapshot_load", None))
-        }
+        delta_funnel::DeltaFunnelError::DeltaSnapshotLoad { reason } => Ok((
+            "delta_source",
+            "delta_snapshot_load",
+            Some(json_value_to_py(
+                py,
+                &serde_json::json!({ "cause": reason }),
+            )?),
+        )),
         delta_funnel::DeltaFunnelError::DeltaProtocolCompatibility { .. } => {
             Ok(("delta_protocol", "delta_protocol_compatibility", None))
         }
@@ -392,6 +397,34 @@ mod tests {
                 error.value(py).to_string()
             );
             assert!(error.value(py).getattr("context")?.is_none());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn rust_snapshot_load_error_mapping_exposes_cause_context() -> PyResult<()> {
+        Python::attach(|py| {
+            let cause = "snapshot could not be loaded: missing _delta_log";
+            let error = delta_funnel_error_to_py(
+                py,
+                delta_funnel::DeltaFunnelError::DeltaSnapshotLoad {
+                    reason: cause.to_owned(),
+                },
+            )?;
+
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "delta_source"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "delta_snapshot_load"
+            );
+            let message = error.value(py).getattr("message")?.extract::<String>()?;
+            assert!(message.contains(cause));
+            let context = error.value(py).getattr("context")?;
+            assert_eq!(context.get_item("cause")?.extract::<String>()?, cause);
 
             Ok(())
         })
