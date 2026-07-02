@@ -19,6 +19,8 @@ jobs:
       !contains(github.event.head_commit.message, 'chore: release v')
     runs-on: ubuntu-latest
     env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/release-plz
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
     permissions:
@@ -59,6 +61,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-plz
+          workspaces: |
+            . -> target/release-plz
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -81,6 +85,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: crates-io-release
     env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/release-plz
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
     permissions:
@@ -119,6 +125,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-plz
+          workspaces: |
+            . -> target/release-plz
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
