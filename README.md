@@ -12,7 +12,8 @@
 </p>
 
 <p align="center">
-  Built in Rust. Python API included.
+  Built in Rust. Python API included.<br/>
+  <a href="https://mag1cfrog.github.io/delta-funnel/">Read the Delta Funnel documentation</a>.
 </p>
 
 <p align="center">
