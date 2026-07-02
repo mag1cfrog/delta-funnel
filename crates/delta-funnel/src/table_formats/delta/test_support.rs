@@ -31,7 +31,6 @@ const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-
 const TWO_PARTITION_COLUMN_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region","event_date"],"configuration":{},"createdTime":1587968585495}}"#;
 const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"},"createdTime":1587968585495}}"#;
 const SUPPORTED_TYPES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"active\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}},{\"name\":\"payload\",\"type\":\"binary\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}},{\"name\":\"score_f32\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}},{\"name\":\"score_f64\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"level\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
-const ARRAY_LONG_TAGS_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"long\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const NESTED_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const NESTED_TIMESTAMP_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 const MISSING_NULLABLE_NESTED_PROFILE_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-funnel-real-parquet-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"loyalty_tier\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
@@ -711,31 +710,6 @@ impl RealParquetDeltaTable {
         )
     }
 
-    /// Creates a local Delta table whose array element is stored as `integer`
-    /// in Parquet but read as `long` from the Delta schema.
-    pub(crate) fn new_with_array_long_tags_leaf_cast(
-        name: &str,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_protocol_metadata_file_batches(
-            name,
-            PROTOCOL_JSON,
-            ARRAY_LONG_TAGS_METADATA_JSON,
-            vec![RealParquetDataFile {
-                path: DATA_FILE.to_owned(),
-                batches: vec![array_tags_batch()?],
-                stats: AddStats {
-                    rows: 3,
-                    max_id: 3,
-                    min_customer: "alice".to_owned(),
-                    max_customer: "bob".to_owned(),
-                    customer_null_count: 1,
-                },
-                partition_values_json: "{}".to_owned(),
-                deletion_vector: None,
-            }],
-        )
-    }
-
     /// Creates a local Delta table whose array element struct leaf `zip` is
     /// stored as `integer` in Parquet but read as `long` from the Delta schema.
     pub(crate) fn new_with_array_struct_long_zip_leaf_cast(
@@ -1279,18 +1253,6 @@ fn array_addresses_schema() -> Arc<Schema> {
     ]))
 }
 
-fn array_tags_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("customer_name", DataType::Utf8, true),
-        Field::new(
-            "tags",
-            DataType::List(Arc::new(Field::new("element", DataType::Int32, true))),
-            true,
-        ),
-    ]))
-}
-
 fn array_column_mapping_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("phys_id", DataType::Int32, false).with_metadata(field_id_metadata(1)),
@@ -1773,22 +1735,6 @@ fn array_addresses_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Er
         array_addresses_schema(),
         columns,
     )?)
-}
-
-fn array_tags_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
-    let tags = ListArray::try_new(
-        Arc::new(Field::new("element", DataType::Int32, true)),
-        OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 3])),
-        Arc::new(Int32Array::from(vec![Some(7), Some(11), None])) as ArrayRef,
-        Some(NullBuffer::from(vec![true, false, true])),
-    )?;
-    let columns = vec![
-        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
-        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
-        Arc::new(tags) as Arc<dyn Array>,
-    ];
-
-    Ok(kernel::RecordBatch::try_new(array_tags_schema(), columns)?)
 }
 
 fn array_column_mapping_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
