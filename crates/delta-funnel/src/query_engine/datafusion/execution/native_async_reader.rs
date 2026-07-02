@@ -1078,18 +1078,69 @@ fn build_matched_field_plan(
                 path,
             )
         }
-        _ if file_field
-            .data_type()
-            .equals_datatype(provider_field.data_type()) =>
-        {
-            Ok(NativeAsyncFieldPlan::Identity)
+        _ => {
+            match native_async_leaf_cast_plan(provider_field.data_type(), file_field.data_type()) {
+                Ok(None) => Ok(NativeAsyncFieldPlan::Identity),
+                Ok(Some(target_type)) => Ok(NativeAsyncFieldPlan::Cast { target_type }),
+                Err(()) => Err(delta_kernel::Error::generic(format!(
+                    "provider field '{path}' expected Parquet type {} but found {}",
+                    provider_field.data_type(),
+                    file_field.data_type()
+                ))),
+            }
         }
-        _ => Err(delta_kernel::Error::generic(format!(
-            "provider field '{path}' expected Parquet type {} but found {}",
-            provider_field.data_type(),
-            file_field.data_type()
-        ))),
     }
+}
+
+fn native_async_leaf_cast_plan(
+    provider_type: &DataType,
+    file_type: &DataType,
+) -> Result<Option<DataType>, ()> {
+    use DataType::{Date32, Decimal128, Float32, Float64, Int8, Int16, Int32, Int64, Timestamp};
+
+    if file_type.equals_datatype(provider_type) {
+        return Ok(None);
+    }
+
+    match (file_type, provider_type) {
+        (Timestamp(_, _), Timestamp(_, _)) => Ok(Some(provider_type.clone())),
+        (Int8, Int16 | Int32 | Int64 | Float64) => Ok(Some(provider_type.clone())),
+        (Int16, Int32 | Int64 | Float64) => Ok(Some(provider_type.clone())),
+        (Int32, Int64 | Float64) => Ok(Some(provider_type.clone())),
+        (Float32, Float64) => Ok(Some(provider_type.clone())),
+        (source_type, Decimal128(precision, scale))
+            if native_async_can_upcast_to_decimal(source_type, *precision, *scale) =>
+        {
+            Ok(Some(provider_type.clone()))
+        }
+        (Date32, Timestamp(_, None)) => Ok(Some(provider_type.clone())),
+        (Int32, Date32) => Ok(Some(provider_type.clone())),
+        (Int64, Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, _)) => {
+            Ok(Some(provider_type.clone()))
+        }
+        _ => Err(()),
+    }
+}
+
+fn native_async_can_upcast_to_decimal(
+    source_type: &DataType,
+    target_precision: u8,
+    target_scale: i8,
+) -> bool {
+    use DataType::{Decimal128, Int8, Int16, Int32, Int64};
+
+    let (source_precision, source_scale) = match source_type {
+        Decimal128(precision, scale) => (*precision, *scale),
+        Int8 => (3u8, 0i8),
+        Int16 => (5u8, 0i8),
+        Int32 => (10u8, 0i8),
+        Int64 => (20u8, 0i8),
+        _ => return false,
+    };
+
+    target_precision >= source_precision
+        && target_scale >= source_scale
+        && target_precision - source_precision >= (target_scale - source_scale) as u8
 }
 
 fn build_matched_map_field_plan(
@@ -2079,6 +2130,77 @@ mod tests {
             KernelColumnMetadataKey::ParquetFieldId.as_ref().to_owned(),
             KernelMetadataValue::Number(field_id),
         )]
+    }
+
+    #[test]
+    fn native_async_leaf_cast_plan_matches_timestamp_compatibility()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into()),
+        );
+
+        assert_eq!(
+            super::native_async_leaf_cast_plan(
+                &target,
+                &DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None)
+            ),
+            Ok(Some(target.clone()))
+        );
+        assert_eq!(
+            super::native_async_leaf_cast_plan(
+                &target,
+                &DataType::Timestamp(
+                    datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+                    Some("UTC".into())
+                )
+            ),
+            Ok(Some(target))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_leaf_cast_plan_rejects_incompatible_primitive_types()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            super::native_async_leaf_cast_plan(&DataType::Int32, &DataType::Utf8),
+            Err(())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_casts_top_level_timestamp_leaf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_schema = Arc::new(Schema::new(vec![timestamp_us_utc_field("event_ts", true)]));
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "event_ts",
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let batch = project_parquet_batch_to_provider_schema(
+            "top-level-timestamp-leaf-cast",
+            file_schema,
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                Some(1_704_067_200_000_000_000),
+                None,
+            ])) as ArrayRef],
+            provider_schema,
+        )?;
+        let timestamps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or("expected TimestampMicrosecondArray")?;
+
+        assert_eq!(timestamps.timezone(), Some("UTC"));
+        assert_eq!(timestamps.value(0), 1_704_067_200_000_000);
+        assert!(timestamps.is_null(1));
+
+        Ok(())
     }
 
     #[test]
