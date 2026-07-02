@@ -8,6 +8,9 @@ Report: TypeAlias = dict[str, object]
 Options: TypeAlias = Mapping[str, object]
 
 
+def init_logging(filter: str | None = None, logger: str = "deltafunnel") -> bool: ...
+
+
 class DeltaFunnelError(Exception):
     phase: str
     kind: str
