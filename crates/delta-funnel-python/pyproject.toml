@@ -21,9 +21,13 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mag1cfrog/delta-funnel"
+Homepage = "https://mag1cfrog.github.io/delta-funnel/"
+Documentation = "https://mag1cfrog.github.io/delta-funnel/"
 Repository = "https://github.com/mag1cfrog/delta-funnel"
 Issues = "https://github.com/mag1cfrog/delta-funnel/issues"
+Changelog = "https://github.com/mag1cfrog/delta-funnel/blob/main/CHANGELOG.md"
+"Release Notes" = "https://github.com/mag1cfrog/delta-funnel/releases"
+PyPI = "https://pypi.org/project/deltafunnel/"
 
 [tool.maturin]
 bindings = "pyo3"
