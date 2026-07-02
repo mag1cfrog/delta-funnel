@@ -163,12 +163,18 @@ external exporters; the application keeps owning normal Python logging setup.
 Use a filter string or `DELTAFUNNEL_LOG` for deeper diagnostics:
 
 ```python
-deltafunnel.init_logging("delta_funnel=debug,delta_kernel=debug,arrow_tiberius=debug")
+deltafunnel.init_logging(
+    "delta_funnel=debug,delta_kernel=debug,object_store=debug,arrow_tiberius=debug"
+)
 ```
 
 Datadog, OpenTelemetry, JSON logging, file logging, pytest capture, notebooks,
 and framework logging work through their normal Python `logging` integration
 when the application has configured them.
+
+For private S3 Delta sources, `object_store=debug` is useful for local
+debugging because it can show which credential-provider path was selected. Keep
+those logs in a restricted location and sanitize them before sharing.
 
 For Rust, enable tracing in the application or test harness that calls
 DeltaFunnel. Use target filters that include DeltaFunnel workflow events, Arrow
@@ -195,6 +201,7 @@ The tracing targets are:
 
 - `delta_funnel` for DeltaFunnel workflow, source, output, validation, and
   DataFusion batch-stream events
+- `object_store` for object-store builder and credential-provider debug events
 - `arrow_tiberius` for Arrow-to-SQL Server writer lifecycle events
 - `tiberius_raw_bulk::protocol` for sanitized raw bulk protocol events
 

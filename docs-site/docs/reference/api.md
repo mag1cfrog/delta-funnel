@@ -27,3 +27,9 @@ Core Python entry points:
 - `Table`
 - `MssqlOutputSpec`
 - `DeltaFunnelError`
+
+For Delta sources, `Session.delta_lake(..., storage_options=...)` accepts a
+mapping of string keys and values and forwards them to the underlying
+object-store builder used by Delta Funnel. For private S3 tables, see the
+[Python API walkthrough](../python-api-walkthrough.md) for the exact
+documented AWS keys, examples, and troubleshooting guidance.
