@@ -82,6 +82,11 @@ report = daily_orders.write_to_mssql(
 )
 ```
 
+Use `replace` only for existing targets. DeltaFunnel writes a staging table,
+validates it, then swaps it into the final target name. Table metadata such as
+indexes, constraints, triggers, permissions, and extended properties is not
+preserved.
+
 `session.delta_lake(..., name="orders")` registers a Delta source immediately.
 `session.delta_lake(...)` without `name` returns a pending source; call
 `.alias("orders")` before SQL references it.

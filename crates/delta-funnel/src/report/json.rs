@@ -170,7 +170,7 @@ impl MssqlDryRunOutputReport {
                 "diagnostic_count": self.target_schema_plan().diagnostic_reports().len(),
             },
             "target_ddl_plan": {
-                "create_table_sql_present": self.target_ddl_plan().create_table_sql().is_some(),
+                "create_table_sql_present": self.target_ddl_plan().create_table_sql_present(),
             },
             "target_lifecycle_plan": {
                 "create_table_sql_required": self.target_lifecycle_plan().create_table_sql_required(),
@@ -611,6 +611,7 @@ fn write_phase(phase: MssqlWritePhase) -> &'static str {
         MssqlWritePhase::WriteBatch => "write_batch",
         MssqlWritePhase::Finalize => "finalize",
         MssqlWritePhase::Validation => "validation",
+        MssqlWritePhase::SwapTarget => "swap_target",
         MssqlWritePhase::Cleanup => "cleanup",
     }
 }

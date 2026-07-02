@@ -116,6 +116,16 @@ const CREATE_AND_LOAD_EXECUTION_GUARDRAILS: &[MssqlLifecycleExecutionGuardrail] 
     MssqlLifecycleExecutionGuardrail::RecordBatchHandoffPolling,
 ];
 
+const REPLACE_EXECUTION_GUARDRAILS: &[MssqlLifecycleExecutionGuardrail] = &[
+    MssqlLifecycleExecutionGuardrail::SqlServerConnectionAttempt,
+    MssqlLifecycleExecutionGuardrail::TargetTableExistenceProbe,
+    MssqlLifecycleExecutionGuardrail::CreateTableDdlExecution,
+    MssqlLifecycleExecutionGuardrail::BulkWriterConstruction,
+    MssqlLifecycleExecutionGuardrail::DeltaSourceScanExecution,
+    MssqlLifecycleExecutionGuardrail::DataFusionPhysicalPlanExecution,
+    MssqlLifecycleExecutionGuardrail::RecordBatchHandoffPolling,
+];
+
 /// Plans lifecycle behavior for one selected output.
 ///
 /// This function is deterministic and performs no I/O or execution. Errors return no
@@ -134,10 +144,7 @@ pub fn plan_mssql_lifecycle(
     match target.load_mode() {
         LoadMode::AppendExisting => plan_append_existing_lifecycle(target, ddl_plan),
         LoadMode::CreateAndLoad => plan_create_and_load_lifecycle(target, ddl_plan),
-        LoadMode::Replace => Err(lifecycle_error(
-            target,
-            "replace load mode is reserved and cannot be planned for execution",
-        )),
+        LoadMode::Replace => plan_replace_lifecycle(target, ddl_plan),
     }
 }
 
@@ -183,6 +190,31 @@ fn plan_create_and_load_lifecycle(
         executable_in_mvp: true,
         guardrail_policy: MssqlLifecycleGuardrailPolicy::AllowedAfterPlanning,
         execution_guardrails: CREATE_AND_LOAD_EXECUTION_GUARDRAILS,
+    })
+}
+
+fn plan_replace_lifecycle(
+    target: &MssqlTargetSummary,
+    ddl_plan: Option<&MssqlDdlPlan>,
+) -> Result<MssqlLifecyclePlan, DeltaFunnelError> {
+    let create_table_sql_present = ddl_plan
+        .map(MssqlDdlPlan::create_table_sql_present)
+        .unwrap_or(false);
+    if !create_table_sql_present {
+        return Err(lifecycle_error(
+            target,
+            "replace lifecycle requires planned create-table SQL",
+        ));
+    }
+
+    Ok(MssqlLifecyclePlan {
+        target: target.clone(),
+        expected_target_state: MssqlTargetTableState::Exists,
+        create_table_sql_required: true,
+        create_table_sql_present,
+        executable_in_mvp: true,
+        guardrail_policy: MssqlLifecycleGuardrailPolicy::AllowedAfterPlanning,
+        execution_guardrails: REPLACE_EXECUTION_GUARDRAILS,
     })
 }
 
@@ -380,7 +412,36 @@ mod tests {
     }
 
     #[test]
-    fn replace_is_rejected_without_lifecycle_artifact() -> Result<(), DeltaFunnelError> {
+    fn replace_reports_expected_existing_target_and_create_sql() -> Result<(), DeltaFunnelError> {
+        let schema_plan = schema_plan(
+            "orders_output",
+            LoadMode::Replace,
+            MssqlTargetTable::new("dbo", "orders")?,
+        )?;
+        let ddl_plan = plan_mssql_create_table_ddl(&schema_plan)?;
+
+        let lifecycle = plan_mssql_lifecycle(&schema_plan, Some(&ddl_plan))?;
+
+        assert_eq!(
+            lifecycle.expected_target_state(),
+            MssqlTargetTableState::Exists
+        );
+        assert!(lifecycle.create_table_sql_required());
+        assert!(lifecycle.create_table_sql_present());
+        assert!(lifecycle.executable_in_mvp());
+        assert_eq!(
+            lifecycle.guardrail_policy(),
+            MssqlLifecycleGuardrailPolicy::AllowedAfterPlanning
+        );
+        assert_eq!(
+            lifecycle.execution_guardrails(),
+            REPLACE_EXECUTION_GUARDRAILS
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_requires_planned_create_table_sql() -> Result<(), DeltaFunnelError> {
         let schema_plan = schema_plan(
             "orders_output",
             LoadMode::Replace,
@@ -390,24 +451,23 @@ mod tests {
         let error = plan_mssql_lifecycle(&schema_plan, None)
             .err()
             .ok_or_else(|| DeltaFunnelError::Config {
-                message: "expected replace lifecycle error".to_owned(),
+                message: "expected missing replace create-table SQL error".to_owned(),
             })?;
 
         assert!(matches!(
             error,
             DeltaFunnelError::MssqlLifecyclePlanning { .. }
         ));
-        assert!(error.to_string().contains("replace load mode is reserved"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires planned create-table SQL")
+        );
         Ok(())
     }
 
     #[test]
     fn lifecycle_failures_block_guarded_execution() -> Result<(), DeltaFunnelError> {
-        let replace_plan = schema_plan(
-            "orders_output",
-            LoadMode::Replace,
-            MssqlTargetTable::new("dbo", "orders")?,
-        )?;
         let missing_create_sql_plan = schema_plan(
             "create_output",
             LoadMode::CreateAndLoad,
@@ -426,7 +486,6 @@ mod tests {
         let contradictory_ddl_plan = plan_mssql_create_table_ddl(&create_plan)?;
 
         let cases = [
-            ("replace mode", plan_mssql_lifecycle(&replace_plan, None)),
             (
                 "missing create-table SQL",
                 plan_mssql_lifecycle(&missing_create_sql_plan, None),
@@ -520,18 +579,8 @@ mod tests {
         )?;
         let ddl_plan = plan_mssql_create_table_ddl(&create_schema_plan)?;
         let lifecycle = plan_mssql_lifecycle(&create_schema_plan, Some(&ddl_plan))?;
-        let replace_plan = schema_plan(
-            "replace_output",
-            LoadMode::Replace,
-            MssqlTargetTable::new("dbo", "orders")?,
-        )?;
-        let error = plan_mssql_lifecycle(&replace_plan, None)
-            .err()
-            .ok_or_else(|| DeltaFunnelError::Config {
-                message: "expected replace lifecycle error".to_owned(),
-            })?;
 
-        let combined = format!("{lifecycle:?}\n{error}");
+        let combined = format!("{lifecycle:?}");
         assert!(!combined.contains("secret-token"));
         assert!(!combined.contains("password"));
         assert!(!combined.contains("server=tcp"));

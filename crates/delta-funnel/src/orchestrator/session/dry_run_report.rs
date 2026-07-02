@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(report.target_table().table(), "west_orders");
         assert_eq!(report.load_mode(), LoadMode::CreateAndLoad);
         assert_eq!(report.target_schema_plan().mappings().len(), 1);
-        assert!(report.target_ddl_plan().create_table_sql().is_some());
+        assert!(report.target_ddl_plan().create_table_sql_present());
         assert!(report.target_lifecycle_plan().create_table_sql_required());
         assert_eq!(
             report.target_lifecycle_plan().expected_target_state(),
@@ -865,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_to_mssql_rejects_replace_before_side_effects()
+    fn dry_run_to_mssql_accepts_replace_before_side_effects()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
@@ -874,13 +874,22 @@ mod tests {
         let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
         let request = output_request(source, "orders_output", "orders_sink", LoadMode::Replace)?;
 
-        let error = session.dry_run_to_mssql(&request);
+        let report = session.dry_run_to_mssql(&request)?;
 
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::MssqlLifecyclePlanning { output_name, message })
-                if output_name == "orders_output" && message.contains("replace load mode")
-        ));
+        assert_eq!(report.output_name(), "orders_output");
+        assert_eq!(report.load_mode(), LoadMode::Replace);
+        assert_eq!(report.target_table().table(), "orders_sink");
+        assert!(report.target_ddl_plan().create_table_sql_present());
+        assert_eq!(report.target_ddl_plan().create_table_sql(), None);
+        assert!(report.target_lifecycle_plan().create_table_sql_required());
+        assert_eq!(
+            report.target_lifecycle_plan().expected_target_state(),
+            crate::MssqlTargetTableState::Exists
+        );
+        assert!(!report.sql_server_contacted());
+        assert!(!report.row_production_started());
+        assert!(!report.table_lifecycle_started());
+        assert!(!report.bulk_writer_started());
         Ok(())
     }
 

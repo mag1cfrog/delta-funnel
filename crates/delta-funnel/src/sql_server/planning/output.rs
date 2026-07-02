@@ -88,7 +88,7 @@ impl MssqlTargetOutputPlan {
         &self.ddl_plan
     }
 
-    /// Returns planned `CREATE TABLE` SQL when required by the lifecycle mode.
+    /// Returns concrete planned `CREATE TABLE` SQL when the target name is known at planning time.
     #[must_use]
     pub fn create_table_sql(&self) -> Option<&str> {
         self.ddl_plan.create_table_sql()
@@ -144,15 +144,6 @@ pub fn plan_mssql_target_for_resolved_output(
 pub fn plan_mssql_target_output(
     schema_plan: MssqlSchemaPlan,
 ) -> Result<MssqlTargetOutputPlan, DeltaFunnelError> {
-    if schema_plan.target().load_mode() == LoadMode::Replace {
-        plan_mssql_lifecycle(&schema_plan, None)?;
-        return Err(DeltaFunnelError::MssqlLifecyclePlanning {
-            output_name: schema_plan.target().output_name().to_owned(),
-            message: "replace load mode is reserved and cannot produce a target output plan"
-                .to_owned(),
-        });
-    }
-
     let ddl_plan = plan_mssql_create_table_ddl(&schema_plan)?;
     let lifecycle_plan = plan_mssql_lifecycle(&schema_plan, Some(&ddl_plan))?;
 
@@ -541,6 +532,7 @@ mod tests {
             output_plan.schema_plan().target().output_name(),
             "orders_output"
         );
+        assert!(!output_plan.ddl_plan().create_table_sql_present());
         assert_eq!(output_plan.ddl_plan().create_table_sql(), None);
         assert_eq!(
             output_plan.lifecycle_plan().expected_target_state(),
@@ -561,6 +553,7 @@ mod tests {
 
         let output_plan = plan_mssql_target_output(schema_plan)?;
 
+        assert!(output_plan.ddl_plan().create_table_sql_present());
         assert!(
             output_plan
                 .ddl_plan()
@@ -582,25 +575,23 @@ mod tests {
     }
 
     #[test]
-    fn replace_is_rejected_by_lifecycle_before_target_output_plan() -> Result<(), DeltaFunnelError>
-    {
+    fn replace_output_plan_includes_ddl_and_lifecycle_report() -> Result<(), DeltaFunnelError> {
         let schema_plan = schema_plan(
             "orders_output",
             LoadMode::Replace,
             MssqlTargetTable::new("dbo", "orders")?,
         )?;
 
-        let error = plan_mssql_target_output(schema_plan).err().ok_or_else(|| {
-            DeltaFunnelError::Config {
-                message: "expected replace output planning error".to_owned(),
-            }
-        })?;
+        let output_plan = plan_mssql_target_output(schema_plan)?;
 
-        assert!(matches!(
-            error,
-            DeltaFunnelError::MssqlLifecyclePlanning { .. }
-        ));
-        assert!(error.to_string().contains("replace load mode is reserved"));
+        assert_eq!(output_plan.load_mode(), LoadMode::Replace);
+        assert!(output_plan.ddl_plan().create_table_sql_present());
+        assert_eq!(output_plan.ddl_plan().create_table_sql(), None);
+        assert_eq!(
+            output_plan.lifecycle_plan().expected_target_state(),
+            MssqlTargetTableState::Exists
+        );
+        assert!(output_plan.lifecycle_plan().create_table_sql_required());
         Ok(())
     }
 

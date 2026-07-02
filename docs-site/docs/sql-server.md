@@ -24,15 +24,20 @@ targets. Otherwise, set `default_mssql_connection_string` on `Session`.
 
 ## Load modes
 
-Python currently accepts these load modes:
+Python accepts these load modes:
 
 - `append_existing`
 - `create_and_load`
 - `replace`
 
 Choose `create_and_load` for a first load into a new table, `append_existing`
-for appending to an existing table, and `replace` when the target should be
-recreated.
+for appending to an existing table, and `replace` for an existing target that
+should be rebuilt from the output rows.
+
+`replace` writes to a staging table, validates that staging table, then swaps
+it into the final target name. The replacement table is recreated from the
+DeltaFunnel-planned SQL Server schema, so table metadata such as indexes,
+constraints, triggers, permissions, and extended properties is not preserved.
 
 ## Integration tests
 

@@ -549,7 +549,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn plan_write_all_outputs_rejects_replace_before_execution()
+        async fn plan_write_all_outputs_accepts_replace_before_execution()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -565,14 +565,17 @@ mod tests {
             let east =
                 execute_output_request(east, "east_output", "east_orders", LoadMode::Replace)?;
 
-            let error = session.plan_write_all_outputs(&[west, east]);
+            let planned = session.plan_write_all_outputs(&[west, east])?;
 
-            assert!(matches!(
-                error,
-                Err(DeltaFunnelError::MssqlLifecyclePlanning { output_name, message })
-                    if output_name == "east_output"
-                        && message.contains("replace load mode is reserved")
-            ));
+            assert_eq!(planned.len(), 2);
+            assert_eq!(planned[1].output_plan().output_name(), "east_output");
+            assert_eq!(planned[1].output_plan().load_mode(), LoadMode::Replace);
+            assert!(
+                planned[1]
+                    .output_plan()
+                    .lifecycle_plan()
+                    .create_table_sql_required()
+            );
             Ok(())
         }
 

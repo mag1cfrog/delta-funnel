@@ -147,7 +147,7 @@ mod tests {
     use super::PyMssqlOutputSpec;
     use crate::deltafunnel;
     use delta_funnel::{LoadMode, MssqlTableName, connect_mssql_client_from_ado_string};
-    use pyo3::exceptions::PyKeyError;
+    use pyo3::exceptions::{PyAssertionError, PyKeyError};
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule};
     use std::{
@@ -215,6 +215,21 @@ mod tests {
             assert_eq!(spec.output_name, "orders_output");
             assert_eq!(spec.target.table().schema(), Some("reporting"));
             assert_eq!(spec.target.load_mode(), LoadMode::AppendExisting);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_to_mssql_accepts_replace_load_mode() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = sql_table(py)?;
+            let kwargs = mssql_kwargs(py, "dbo", "orders", "replace")?;
+
+            let spec = table.call_method("to_mssql", (), Some(&kwargs))?;
+            let spec = spec.extract::<PyRef<'_, PyMssqlOutputSpec>>()?;
+
+            assert_eq!(spec.target.load_mode(), LoadMode::Replace);
 
             Ok(())
         })
@@ -568,6 +583,160 @@ union all select cast(202 as bigint) as order_id",),
         }
     }
 
+    #[test]
+    #[ignore = "runs through cargo xtask sqlserver-test"]
+    fn table_write_to_mssql_execute_writes_replace_existing_target_when_configured()
+    -> TestResult<()> {
+        let Some(config) = MssqlIntegrationConfig::from_env() else {
+            return Ok(());
+        };
+        let table = unique_table_name(&config.schema)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        runtime.block_on(seed_replace_target(&config, &table))?;
+        let write_result = Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session_kwargs = PyDict::new(py);
+            session_kwargs.set_item(
+                "default_mssql_connection_string",
+                config.connection_string.as_str(),
+            )?;
+            let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+            let source = session.call_method(
+                "table_from_sql",
+                ("\
+select cast(801 as bigint) as order_id
+union all select cast(802 as bigint) as order_id",),
+                None,
+            )?;
+            let kwargs = mssql_kwargs(py, &config.schema, table.table().as_str(), "replace")?;
+
+            let report = source.call_method("write_to_mssql", (), Some(&kwargs))?;
+            let report = report.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(report, "load_mode")?.extract::<String>()?,
+                "replace"
+            );
+            assert!(!required_item(report, "partial_write_possible")?.extract::<bool>()?);
+            let validation = required_item(report, "validation_status")?;
+            let validation = validation.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(validation, "kind")?.extract::<String>()?,
+                "passed"
+            );
+            let target_row_count = required_item(report, "target_row_count")?;
+            let target_row_count = target_row_count.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(target_row_count, "value")?.extract::<u64>()?,
+                2
+            );
+
+            Ok::<(), PyErr>(())
+        });
+        let result = match write_result {
+            Ok(()) => runtime.block_on(assert_replace_target_rows(&config, &table, 801, 802)),
+            Err(write_error) => Err(Box::new(write_error) as Box<dyn Error + Send + Sync>),
+        };
+        let cleanup_result = runtime.block_on(drop_table(&config, &table));
+
+        match (result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_error), Ok(())) => Err(write_error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(write_error), Err(cleanup_error)) => {
+                Err(format!("write failed: {write_error}; cleanup failed: {cleanup_error}").into())
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "runs through cargo xtask sqlserver-test"]
+    fn table_write_to_mssql_execute_writes_replace_validation_failure_keeps_existing_target()
+    -> TestResult<()> {
+        let Some(config) = MssqlIntegrationConfig::from_env() else {
+            return Ok(());
+        };
+        let table = unique_table_name(&config.schema)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        runtime.block_on(seed_replace_target(&config, &table))?;
+        let write_result = Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let validation_options = PyDict::new(py);
+            validation_options.set_item("target_validation_mode", "disabled")?;
+            let session_kwargs = PyDict::new(py);
+            session_kwargs.set_item(
+                "default_mssql_connection_string",
+                config.connection_string.as_str(),
+            )?;
+            session_kwargs.set_item("validation_options", validation_options)?;
+            let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+            let source = session.call_method(
+                "table_from_sql",
+                ("\
+select cast(811 as bigint) as order_id
+union all select cast(812 as bigint) as order_id",),
+                None,
+            )?;
+            let kwargs = mssql_kwargs(py, &config.schema, table.table().as_str(), "replace")?;
+
+            let error = source
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .err()
+                .ok_or_else(|| PyAssertionError::new_err("expected replace validation error"))?;
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "validation"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "mssql_write_phase"
+            );
+            assert!(
+                error
+                    .value(py)
+                    .getattr("message")?
+                    .extract::<String>()?
+                    .contains("requires target validation")
+            );
+            let context = error.value(py).getattr("context")?;
+            let context = context.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(context, "cleanup")?.extract::<String>()?,
+                "succeeded"
+            );
+            assert!(!required_item(context, "partial_write_possible")?.extract::<bool>()?);
+            let validation = required_item(context, "validation_status")?;
+            let validation = validation.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(validation, "kind")?.extract::<String>()?,
+                "disabled"
+            );
+
+            Ok::<(), PyErr>(())
+        });
+        let result = match write_result {
+            Ok(()) => runtime.block_on(assert_replace_target_rows(&config, &table, 700, 701)),
+            Err(write_error) => Err(Box::new(write_error) as Box<dyn Error + Send + Sync>),
+        };
+        let cleanup_result = runtime.block_on(drop_table(&config, &table));
+
+        match (result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_error), Ok(())) => Err(write_error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(write_error), Err(cleanup_error)) => {
+                Err(format!("write failed: {write_error}; cleanup failed: {cleanup_error}").into())
+            }
+        }
+    }
+
     fn sql_table(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         let module = PyModule::new(py, "deltafunnel")?;
         deltafunnel(&module)?;
@@ -636,6 +805,49 @@ union all select cast(202 as bigint) as order_id",),
         let mut client = connect_mssql_client_from_ado_string(&config.connection_string).await?;
         client
             .execute_statement(&format!("DROP TABLE IF EXISTS {};", table.quoted_sql()))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn seed_replace_target(
+        config: &MssqlIntegrationConfig,
+        table: &MssqlTableName,
+    ) -> TestResult<()> {
+        let mut client = connect_mssql_client_from_ado_string(&config.connection_string).await?;
+        client
+            .execute_statement(&format!(
+                "\
+DROP TABLE IF EXISTS {table};
+CREATE TABLE {table} ([order_id] BIGINT NOT NULL);
+INSERT INTO {table} ([order_id]) VALUES (700), (701);",
+                table = table.quoted_sql(),
+            ))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn assert_replace_target_rows(
+        config: &MssqlIntegrationConfig,
+        table: &MssqlTableName,
+        first_id: i64,
+        second_id: i64,
+    ) -> TestResult<()> {
+        let mut client = connect_mssql_client_from_ado_string(&config.connection_string).await?;
+        client
+            .execute_statement(&format!(
+                "\
+IF (SELECT COUNT(*) FROM {table}) <> 2
+    THROW 51010, 'replace target row count mismatch', 1;
+IF NOT EXISTS (SELECT 1 FROM {table} WHERE [order_id] = {first_id})
+    THROW 51011, 'replace target first row missing', 1;
+IF NOT EXISTS (SELECT 1 FROM {table} WHERE [order_id] = {second_id})
+    THROW 51012, 'replace target second row missing', 1;
+IF EXISTS (SELECT 1 FROM {table} WHERE [order_id] NOT IN ({first_id}, {second_id}))
+    THROW 51013, 'replace target kept unexpected rows', 1;",
+                table = table.quoted_sql(),
+            ))
             .await?;
 
         Ok(())
