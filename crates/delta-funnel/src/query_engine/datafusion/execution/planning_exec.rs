@@ -3523,6 +3523,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_matches_official_kernel_for_mixed_timestamp_physical_types_with_utc_nanoseconds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table =
+            RealParquetDeltaTable::new_with_mixed_timestamp_physical_types_with_utc_nanoseconds(
+                "native-async-mixed-timestamp-physical-types-with-utc-nanoseconds",
+            )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "\
+            select \
+                id, \
+                customer_name, \
+                event_ts \
+            from orders \
+            order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await?;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await?;
+
+        assert_eq!(native, official);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_matches_official_kernel_for_nested_struct_name_fallback()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_reordered_nested_struct_fields(

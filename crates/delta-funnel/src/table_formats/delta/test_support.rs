@@ -409,7 +409,48 @@ impl RealParquetDeltaTable {
                 },
                 RealParquetDataFile {
                     path: "part-00001.parquet".to_owned(),
-                    batches: vec![supported_types_batch_with_nanosecond_event_ts()?],
+                    batches: vec![supported_types_batch_with_nanosecond_event_ts(None)?],
+                    stats: AddStats {
+                        rows: 3,
+                        max_id: 6,
+                        min_customer: "carol".to_owned(),
+                        max_customer: "dylan".to_owned(),
+                        customer_null_count: 1,
+                    },
+                    partition_values_json: "{}".to_owned(),
+                    deletion_vector: None,
+                },
+            ],
+        )
+    }
+
+    /// Creates a local Delta table whose logical timestamp column is stored
+    /// with different physical timestamp units across Parquet files while both
+    /// files carry the UTC timezone.
+    pub(crate) fn new_with_mixed_timestamp_physical_types_with_utc_nanoseconds(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            SUPPORTED_TYPES_METADATA_JSON,
+            vec![
+                RealParquetDataFile {
+                    path: DATA_FILE.to_owned(),
+                    batches: vec![supported_types_batch()?],
+                    stats: AddStats {
+                        rows: 3,
+                        max_id: 3,
+                        min_customer: "alice".to_owned(),
+                        max_customer: "bob".to_owned(),
+                        customer_null_count: 1,
+                    },
+                    partition_values_json: "{}".to_owned(),
+                    deletion_vector: None,
+                },
+                RealParquetDataFile {
+                    path: "part-00001.parquet".to_owned(),
+                    batches: vec![supported_types_batch_with_nanosecond_event_ts(Some("UTC"))?],
                     stats: AddStats {
                         rows: 3,
                         max_id: 6,
@@ -1983,17 +2024,26 @@ fn supported_types_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Er
     )
 }
 
-fn supported_types_batch_with_nanosecond_event_ts()
--> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
-    supported_types_batch_with_event_ts(
-        [4, 5, 6],
-        [Some("carol"), Some("dylan"), None],
-        Arc::new(TimestampNanosecondArray::from(vec![
+fn supported_types_batch_with_nanosecond_event_ts(
+    timezone: Option<&str>,
+) -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    let event_ts = match timezone {
+        Some(timezone) => Arc::new(
+            TimestampNanosecondArray::from(vec![
+                Some(1_704_240_000_000_000_000),
+                Some(1_704_326_400_000_000_000),
+                None,
+            ])
+            .with_timezone(timezone),
+        ) as ArrayRef,
+        None => Arc::new(TimestampNanosecondArray::from(vec![
             Some(1_704_240_000_000_000_000),
             Some(1_704_326_400_000_000_000),
             None,
         ])) as ArrayRef,
-    )
+    };
+
+    supported_types_batch_with_event_ts([4, 5, 6], [Some("carol"), Some("dylan"), None], event_ts)
 }
 
 fn supported_types_batch_with_event_ts(
