@@ -18,6 +18,12 @@
   <a href="https://pypi.org/project/deltafunnel/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-blue.svg"></a>
 </p>
 
+Project links: [Delta Funnel GitHub repository](https://github.com/mag1cfrog/delta-funnel),
+[deltafunnel Python package on PyPI](https://pypi.org/project/deltafunnel/),
+[delta-funnel Rust crate on crates.io](https://crates.io/crates/delta-funnel),
+[delta-funnel Rust API documentation on docs.rs](https://docs.rs/delta-funnel),
+and [Delta Funnel release notes](https://github.com/mag1cfrog/delta-funnel/releases).
+
 !!! note "Project status"
     Delta Funnel is early project code. The Rust crate is available on
     crates.io, and the Python package is available on PyPI.
