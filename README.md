@@ -3,16 +3,17 @@
 ![Surreal banner showing Delta Lake data flowing through a Rust-orange funnel into a database barrel.](https://raw.githubusercontent.com/mag1cfrog/delta-funnel/main/assets/delta-funnel-banner.jpg)
 
 <h3 align="center">
-  <strong>Move Delta Lake data into SQL Server without Spark or ODBC.</strong>
+  <strong>Fast, lightweight Delta Lake to SQL Server loads without Spark or ODBC.</strong>
 </h3>
 
 <p align="center">
   A lightweight Rust and Python toolkit for reading Delta Lake tables,<br/>
-  transforming them with SQL, and bulk-loading through a native TDS driver.
+  transforming them with DataFusion SQL, and writing through native TDS bulk loads.
 </p>
 
 <p align="center">
-  Built in Rust. Python API included.
+  Built in Rust. Python API included.<br/>
+  <a href="https://mag1cfrog.github.io/delta-funnel/">Read the Delta Funnel documentation</a>.
 </p>
 
 <p align="center">

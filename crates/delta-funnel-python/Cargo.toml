@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Python bindings for Delta Funnel"
+description = "Python bindings for lightweight, fast Delta Lake to SQL Server loads"
 publish = false
 
 [lib]

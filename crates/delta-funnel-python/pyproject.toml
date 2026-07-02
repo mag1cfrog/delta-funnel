@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "deltafunnel"
 dynamic = ["version"]
-description = "Read Delta Lake tables, transform with SQL, and load into SQL Server"
+description = "Lightweight, fast Delta Lake to SQL Server loads with DataFusion SQL and native TDS, without Spark or ODBC"
 readme = "../../README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -21,9 +21,13 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mag1cfrog/delta-funnel"
+Homepage = "https://mag1cfrog.github.io/delta-funnel/"
+Documentation = "https://mag1cfrog.github.io/delta-funnel/"
 Repository = "https://github.com/mag1cfrog/delta-funnel"
 Issues = "https://github.com/mag1cfrog/delta-funnel/issues"
+Changelog = "https://github.com/mag1cfrog/delta-funnel/blob/main/CHANGELOG.md"
+"Release Notes" = "https://github.com/mag1cfrog/delta-funnel/releases"
+PyPI = "https://pypi.org/project/deltafunnel/"
 
 [tool.maturin]
 bindings = "pyo3"
