@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "delta-funnel"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow-schema",
  "arrow-tiberius",
@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "delta-funnel-python"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow-schema",
  "delta-funnel",
