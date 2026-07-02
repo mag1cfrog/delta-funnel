@@ -134,6 +134,10 @@ impl Visit for FieldVisitor {
         self.record_value(field, value.to_string());
     }
 
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.record_value(field, value.to_string());
+    }
+
     fn record_bool(&mut self, field: &Field, value: bool) {
         self.record_value(field, value.to_string());
     }
@@ -142,7 +146,9 @@ impl Visit for FieldVisitor {
 #[cfg(test)]
 mod tests {
     use pyo3::prelude::*;
-    use pyo3::types::{PyAnyMethods, PyDict, PyList, PyModule};
+    use pyo3::types::{PyAny, PyAnyMethods, PyDict, PyList, PyModule};
+    use tracing::Level;
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
 
     use super::{PythonLoggingLayer, python_log_level};
@@ -222,37 +228,8 @@ mod tests {
     #[test]
     fn scoped_logging_layer_forwards_events_to_python_logging() -> PyResult<()> {
         Python::attach(|py| {
-            let records = PyList::empty(py);
-            let logging = py.import("logging")?;
-            let locals = PyDict::new(py);
-            locals.set_item("records", records.clone())?;
-            py.run(
-                c"
-import logging
-
-class CaptureHandler(logging.Handler):
-    def __init__(self):
-        super().__init__()
-        self.records = records
-
-    def emit(self, record):
-        self.records.append(record)
-",
-                Some(&locals),
-                Some(&locals),
-            )?;
-            let handler_type = locals
-                .get_item("CaptureHandler")?
-                .ok_or_else(|| pyo3::exceptions::PyAssertionError::new_err("missing handler"))?;
-            let handler = handler_type.call0()?;
-            let logger = logging.call_method1("getLogger", ("deltafunnel.test",))?;
-            logger.setattr("propagate", false)?;
-            logger.call_method1("setLevel", (10,))?;
-            logger.call_method1("addHandler", (&handler,))?;
-
-            let subscriber = tracing_subscriber::registry().with(PythonLoggingLayer {
-                logger_name: "deltafunnel.test".to_owned(),
-            });
+            let (logger, handler, records) = install_capture_handler(py, "deltafunnel.test.basic")?;
+            let subscriber = logging_subscriber("deltafunnel.test.basic");
             tracing::subscriber::with_default(subscriber, || {
                 tracing::info!(
                     target: "delta_funnel",
@@ -263,11 +240,10 @@ class CaptureHandler(logging.Handler):
             });
 
             logger.call_method1("removeHandler", (&handler,))?;
-            assert_eq!(records.len(), 1);
-            let record = records.get_item(0)?;
+            let record = only_record(&records)?;
             assert_eq!(
                 record.getattr("name")?.extract::<String>()?,
-                "deltafunnel.test"
+                "deltafunnel.test.basic"
             );
             assert_eq!(record.getattr("levelno")?.extract::<u8>()?, 20);
             assert_eq!(record.getattr("msg")?.extract::<String>()?, "test.event");
@@ -286,5 +262,196 @@ class CaptureHandler(logging.Handler):
 
             Ok(())
         })
+    }
+
+    #[test]
+    fn scoped_logging_layer_preserves_span_names_and_typed_fields() -> PyResult<()> {
+        Python::attach(|py| {
+            let (logger, handler, records) =
+                install_capture_handler(py, "deltafunnel.test.fields")?;
+            let subscriber = logging_subscriber("deltafunnel.test.fields");
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!(
+                    target: "delta_funnel",
+                    "delta_funnel.workflow"
+                );
+                let _guard = span.enter();
+                tracing::info!(
+                    target: "delta_funnel",
+                    telemetry_event = "typed.event",
+                    signed = -7_i64,
+                    unsigned = 7_u64,
+                    ratio = 1.5_f64,
+                    enabled = true,
+                    debug_value = ?["north", "south"],
+                    "typed.event"
+                );
+            });
+
+            logger.call_method1("removeHandler", (&handler,))?;
+            let record = only_record(&records)?;
+            assert_eq!(
+                record.getattr("deltafunnel_spans")?.extract::<String>()?,
+                "delta_funnel.workflow"
+            );
+            assert_eq!(
+                record.getattr("deltafunnel_signed")?.extract::<String>()?,
+                "-7"
+            );
+            assert_eq!(
+                record
+                    .getattr("deltafunnel_unsigned")?
+                    .extract::<String>()?,
+                "7"
+            );
+            assert_eq!(
+                record.getattr("deltafunnel_ratio")?.extract::<String>()?,
+                "1.5"
+            );
+            assert_eq!(
+                record.getattr("deltafunnel_enabled")?.extract::<String>()?,
+                "true"
+            );
+            assert_eq!(
+                record
+                    .getattr("deltafunnel_debug_value")?
+                    .extract::<String>()?,
+                "[\"north\", \"south\"]"
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn scoped_logging_layer_uses_telemetry_event_when_message_is_absent() -> PyResult<()> {
+        Python::attach(|py| {
+            let (logger, handler, records) =
+                install_capture_handler(py, "deltafunnel.test.fallback")?;
+            let subscriber = logging_subscriber("deltafunnel.test.fallback");
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::event!(
+                    target: "delta_funnel",
+                    Level::INFO,
+                    telemetry_event = "fallback.event"
+                );
+            });
+
+            logger.call_method1("removeHandler", (&handler,))?;
+            let record = only_record(&records)?;
+            assert_eq!(
+                record.getattr("msg")?.extract::<String>()?,
+                "fallback.event"
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn scoped_logging_layer_respects_env_filter() -> PyResult<()> {
+        Python::attach(|py| {
+            let (logger, handler, records) =
+                install_capture_handler(py, "deltafunnel.test.filter")?;
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new("delta_funnel=warn"))
+                .with(PythonLoggingLayer {
+                    logger_name: "deltafunnel.test.filter".to_owned(),
+                });
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "delta_funnel", "filtered.info");
+                tracing::warn!(target: "delta_funnel", "kept.warn");
+                tracing::error!(target: "other_target", "filtered.error");
+            });
+
+            logger.call_method1("removeHandler", (&handler,))?;
+            let record = only_record(&records)?;
+            assert_eq!(record.getattr("levelno")?.extract::<u8>()?, 30);
+            assert_eq!(record.getattr("msg")?.extract::<String>()?, "kept.warn");
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn scoped_logging_layer_ignores_python_handler_failures() -> PyResult<()> {
+        Python::attach(|py| {
+            let logging = py.import("logging")?;
+            let locals = PyDict::new(py);
+            py.run(
+                c"
+import logging
+
+class FailingHandler(logging.Handler):
+    def emit(self, record):
+        raise RuntimeError('handler failed')
+",
+                Some(&locals),
+                Some(&locals),
+            )?;
+            let handler_type = locals
+                .get_item("FailingHandler")?
+                .ok_or_else(|| pyo3::exceptions::PyAssertionError::new_err("missing handler"))?;
+            let handler = handler_type.call0()?;
+            let logger = logging.call_method1("getLogger", ("deltafunnel.test.failure",))?;
+            logger.setattr("propagate", false)?;
+            logger.call_method1("setLevel", (10,))?;
+            logger.call_method1("addHandler", (&handler,))?;
+
+            let subscriber = logging_subscriber("deltafunnel.test.failure");
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "delta_funnel", "handler.failure");
+            });
+
+            logger.call_method1("removeHandler", (&handler,))?;
+
+            Ok(())
+        })
+    }
+
+    fn logging_subscriber(logger_name: &str) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::registry().with(PythonLoggingLayer {
+            logger_name: logger_name.to_owned(),
+        })
+    }
+
+    fn install_capture_handler<'py>(
+        py: Python<'py>,
+        logger_name: &str,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyList>)> {
+        let records = PyList::empty(py);
+        let logging = py.import("logging")?;
+        let locals = PyDict::new(py);
+        locals.set_item("records", records.clone())?;
+        py.run(
+            c"
+import logging
+
+class CaptureHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = records
+
+    def emit(self, record):
+        self.records.append(record)
+",
+            Some(&locals),
+            Some(&locals),
+        )?;
+        let handler_type = locals
+            .get_item("CaptureHandler")?
+            .ok_or_else(|| pyo3::exceptions::PyAssertionError::new_err("missing handler"))?;
+        let handler = handler_type.call0()?;
+        let logger = logging.call_method1("getLogger", (logger_name,))?;
+        logger.setattr("propagate", false)?;
+        logger.call_method1("setLevel", (10,))?;
+        logger.call_method1("addHandler", (&handler,))?;
+
+        Ok((logger, handler, records))
+    }
+
+    fn only_record<'py>(records: &Bound<'py, PyList>) -> PyResult<Bound<'py, PyAny>> {
+        assert_eq!(records.len(), 1);
+        records.get_item(0)
     }
 }
