@@ -1,5 +1,6 @@
 site_name: Delta Funnel
 site_url: https://mag1cfrog.github.io/delta-funnel/
+site_description: Lightweight Rust and Python toolkit for fast Delta Lake to SQL Server loads with DataFusion SQL and native TDS bulk writes, without Spark or ODBC.
 repo_name: mag1cfrog/delta-funnel
 repo_url: https://github.com/mag1cfrog/delta-funnel
 

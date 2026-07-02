@@ -1,14 +1,18 @@
+---
+description: Lightweight Rust and Python toolkit for fast Delta Lake to SQL Server loads with DataFusion SQL and native TDS bulk writes, without Spark or ODBC.
+---
+
 # Delta Funnel
 
 ![Surreal banner showing Delta Lake data flowing through a Rust-orange funnel into a database barrel.](https://raw.githubusercontent.com/mag1cfrog/delta-funnel/main/assets/delta-funnel-banner.jpg)
 
 <h3 align="center">
-  <strong>Move Delta Lake data into SQL Server without Spark or ODBC.</strong>
+  <strong>Fast, lightweight Delta Lake to SQL Server loads without Spark or ODBC.</strong>
 </h3>
 
 <p align="center">
   A lightweight Rust and Python toolkit for reading Delta Lake tables,<br/>
-  transforming them with SQL, and bulk-loading through a native TDS driver.
+  transforming them with DataFusion SQL, and writing through native TDS bulk loads.
 </p>
 
 <p align="center">
