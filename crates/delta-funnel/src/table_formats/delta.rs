@@ -580,7 +580,11 @@ mod tests {
     use datafusion::logical_expr::{Expr, col, lit};
     use delta_kernel::arrow::array::{Array, StructArray};
     use delta_kernel::arrow::record_batch::RecordBatch;
-    use delta_kernel::object_store::{memory::InMemory, path::Path as ObjectStorePath};
+    use delta_kernel::object_store::{
+        aws::{AmazonS3Builder, AmazonS3ConfigKey},
+        memory::InMemory,
+        path::Path as ObjectStorePath,
+    };
 
     use super::kernel::{ColumnName, Expression, Predicate, Scalar};
     use super::{
@@ -995,6 +999,16 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    fn s3_builder_from_storage_options(options: &DeltaStorageOptions) -> AmazonS3Builder {
+        options.iter().fold(
+            AmazonS3Builder::new().with_url("s3://bucket/root"),
+            |builder, (key, value)| match key.to_ascii_lowercase().parse::<AmazonS3ConfigKey>() {
+                Ok(key) => builder.with_config(key, value.as_str()),
+                Err(_) => builder,
+            },
+        )
     }
 
     fn unique_storage_scheme(name: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -6398,6 +6412,149 @@ mod tests {
     }
 
     #[test]
+    fn s3_storage_options_accept_documented_credential_keys() {
+        for (option_key, config_key, expected_value) in [
+            (
+                "AWS_ACCESS_KEY_ID",
+                AmazonS3ConfigKey::AccessKeyId,
+                "upper-access",
+            ),
+            (
+                "aws_access_key_id",
+                AmazonS3ConfigKey::AccessKeyId,
+                "lower-access",
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                AmazonS3ConfigKey::SecretAccessKey,
+                "upper-secret",
+            ),
+            (
+                "aws_secret_access_key",
+                AmazonS3ConfigKey::SecretAccessKey,
+                "lower-secret",
+            ),
+            ("AWS_SESSION_TOKEN", AmazonS3ConfigKey::Token, "upper-token"),
+            ("aws_session_token", AmazonS3ConfigKey::Token, "lower-token"),
+        ] {
+            let options = storage_options(&[(option_key, expected_value)]);
+            let builder = s3_builder_from_storage_options(&options);
+
+            assert_eq!(
+                builder.get_config_value(&config_key).as_deref(),
+                Some(expected_value),
+                "{option_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_storage_options_accept_documented_region_keys() {
+        for option_key in ["AWS_REGION", "aws_region", "region"] {
+            let options = storage_options(&[(option_key, "explicit-region")]);
+            let builder = s3_builder_from_storage_options(&options);
+
+            assert_eq!(
+                builder
+                    .get_config_value(&AmazonS3ConfigKey::Region)
+                    .as_deref(),
+                Some("explicit-region"),
+                "{option_key}"
+            );
+        }
+
+        for option_key in ["AWS_DEFAULT_REGION", "aws_default_region"] {
+            let options = storage_options(&[(option_key, "fallback-region")]);
+            let builder = s3_builder_from_storage_options(&options);
+
+            assert_eq!(
+                builder
+                    .get_config_value(&AmazonS3ConfigKey::Region)
+                    .as_deref(),
+                Some("fallback-region"),
+                "{option_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_default_region_only_applies_without_explicit_region() {
+        for default_key in ["AWS_DEFAULT_REGION", "aws_default_region"] {
+            for explicit_key in ["AWS_REGION", "aws_region", "region"] {
+                let options = storage_options(&[
+                    (default_key, "fallback-region"),
+                    (explicit_key, "explicit-region"),
+                ]);
+                let builder = s3_builder_from_storage_options(&options);
+
+                assert_eq!(
+                    builder
+                        .get_config_value(&AmazonS3ConfigKey::Region)
+                        .as_deref(),
+                    Some("explicit-region"),
+                    "{default_key} with {explicit_key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn s3_store_construction_accepts_documented_storage_option_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_REGION",
+            ),
+            (
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+                "aws_region",
+            ),
+            (
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+                "region",
+            ),
+            (
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+                "AWS_DEFAULT_REGION",
+            ),
+            (
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+                "aws_default_region",
+            ),
+        ];
+        let table_url = super::kernel::try_parse_uri("s3://bucket/root")?;
+
+        for (access_key, secret_key, token_key, region_key) in cases {
+            let options = storage_options(&[
+                (access_key, "access"),
+                (secret_key, "secret"),
+                (token_key, "token"),
+                (region_key, "us-east-1"),
+            ]);
+
+            let _store = super::kernel::store_from_url_opts(
+                &table_url,
+                options
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn source_loading_passes_storage_options_to_kernel_store_construction()
     -> Result<(), Box<dyn std::error::Error>> {
         let scheme = unique_storage_scheme("sourceoptions")?;
@@ -6454,24 +6611,32 @@ mod tests {
     #[test]
     fn storage_option_values_are_not_exposed_when_store_construction_fails()
     -> Result<(), Box<dyn std::error::Error>> {
-        let scheme = unique_storage_scheme("redactedoptions")?;
-        let captured = CapturedStorageOptions::default();
-        let secret_value = "super-secret-token-value";
-        register_failing_storage_handler(&scheme, Arc::clone(&captured), secret_value)?;
-        let options = storage_options(&[("authorization", secret_value), ("region", "us-west-2")]);
+        for secret_key in [
+            "AWS_SECRET_ACCESS_KEY",
+            "aws_secret_access_key",
+            "AWS_SESSION_TOKEN",
+            "aws_session_token",
+        ] {
+            let scheme = unique_storage_scheme("redactedoptions")?;
+            let captured = CapturedStorageOptions::default();
+            let secret_value = "super-secret-token-value";
+            register_failing_storage_handler(&scheme, Arc::clone(&captured), secret_value)?;
+            let options =
+                storage_options(&[(secret_key, secret_value), ("AWS_REGION", "us-west-2")]);
 
-        let result = load_delta_source(
-            DeltaSourceConfig::new("orders", format!("{scheme}://table/root"))
-                .with_storage_options(options.clone()),
-        );
-        let error = result
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+            let result = load_delta_source(
+                DeltaSourceConfig::new("orders", format!("{scheme}://table/root"))
+                    .with_storage_options(options.clone()),
+            );
+            let error = result
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
 
-        assert_eq!(captured_storage_options(&captured), vec![options]);
-        assert!(!error.contains(secret_value));
-        assert!(!error.contains("authorization"));
+            assert_eq!(captured_storage_options(&captured), vec![options]);
+            assert!(!error.contains(secret_value), "{secret_key}");
+            assert!(!error.contains(secret_key), "{secret_key}");
+        }
 
         Ok(())
     }
