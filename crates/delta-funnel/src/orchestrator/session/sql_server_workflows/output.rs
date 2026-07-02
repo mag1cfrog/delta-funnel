@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mssql_output_rejects_replace_before_side_effects()
+    fn plan_mssql_output_accepts_replace_before_side_effects()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
@@ -543,13 +543,16 @@ mod tests {
         let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
         let request = output_request(source, "orders_output", "orders_sink", LoadMode::Replace)?;
 
-        let error = session.plan_mssql_output(&request);
+        let planned = session.plan_mssql_output(&request)?;
 
-        assert!(matches!(
-            error,
-            Err(DeltaFunnelError::MssqlLifecyclePlanning { output_name, message })
-                if output_name == "orders_output" && message.contains("replace load mode")
-        ));
+        assert_eq!(planned.output_plan().load_mode(), LoadMode::Replace);
+        assert_eq!(planned.output_plan().target_table().table(), "orders_sink");
+        assert!(
+            planned
+                .output_plan()
+                .lifecycle_plan()
+                .create_table_sql_required()
+        );
         Ok(())
     }
 

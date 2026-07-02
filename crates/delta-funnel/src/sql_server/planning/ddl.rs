@@ -37,7 +37,7 @@ pub fn plan_mssql_create_table_ddl(
     let target = schema_plan.target();
     let create_table_sql = match target.load_mode() {
         LoadMode::AppendExisting => None,
-        LoadMode::CreateAndLoad => {
+        LoadMode::CreateAndLoad | LoadMode::Replace => {
             if schema_plan.mappings().is_empty() {
                 return Err(DeltaFunnelError::MssqlDdlPlanning {
                     output_name: target.output_name().to_owned(),
@@ -50,12 +50,6 @@ pub fn plan_mssql_create_table_ddl(
                 &table,
                 schema_plan.mappings(),
             ))
-        }
-        LoadMode::Replace => {
-            return Err(DeltaFunnelError::MssqlDdlPlanning {
-                output_name: target.output_name().to_owned(),
-                message: "create-table DDL is not supported for replace load mode".to_owned(),
-            });
         }
     };
 
@@ -205,21 +199,21 @@ mod tests {
     }
 
     #[test]
-    fn replace_load_mode_rejects_create_table_planning() -> Result<(), DeltaFunnelError> {
+    fn replace_load_mode_plans_create_table_shape() -> Result<(), DeltaFunnelError> {
         let schema_plan = schema_plan(
             LoadMode::Replace,
             MssqlTargetTable::new("dbo", "orders")?,
             orders_schema(),
         )?;
 
-        let error = plan_mssql_create_table_ddl(&schema_plan)
-            .err()
-            .ok_or_else(|| DeltaFunnelError::Config {
-                message: "expected replace DDL planning error".to_owned(),
-            })?;
+        let ddl_plan = plan_mssql_create_table_ddl(&schema_plan)?;
 
-        assert!(matches!(error, DeltaFunnelError::MssqlDdlPlanning { .. }));
-        assert!(error.to_string().contains("replace load mode"));
+        assert_eq!(
+            ddl_plan.create_table_sql(),
+            Some(
+                "CREATE TABLE [dbo].[orders] (\n    [order_id] bigint NOT NULL,\n    [status] nvarchar(max) NULL\n);"
+            )
+        );
         Ok(())
     }
 
