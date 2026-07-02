@@ -2055,7 +2055,9 @@ union all select cast(902 as bigint) as order_id",),
                 required_item(output, "load_mode")?.extract::<String>()?,
                 "replace"
             );
-            assert!(!required_item(output, "partial_write_possible")?.extract::<bool>()?);
+            let output_report = required_item(output, "report")?;
+            let output_report = output_report.cast::<PyDict>()?;
+            assert!(!required_item(output_report, "partial_write_possible")?.extract::<bool>()?);
 
             Ok::<(), PyErr>(())
         });

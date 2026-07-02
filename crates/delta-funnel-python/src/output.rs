@@ -147,7 +147,7 @@ mod tests {
     use super::PyMssqlOutputSpec;
     use crate::deltafunnel;
     use delta_funnel::{LoadMode, MssqlTableName, connect_mssql_client_from_ado_string};
-    use pyo3::exceptions::PyKeyError;
+    use pyo3::exceptions::{PyAssertionError, PyKeyError};
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule};
     use std::{
@@ -638,6 +638,91 @@ union all select cast(802 as bigint) as order_id",),
         });
         let result = match write_result {
             Ok(()) => runtime.block_on(assert_replace_target_rows(&config, &table, 801, 802)),
+            Err(write_error) => Err(Box::new(write_error) as Box<dyn Error + Send + Sync>),
+        };
+        let cleanup_result = runtime.block_on(drop_table(&config, &table));
+
+        match (result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_error), Ok(())) => Err(write_error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(write_error), Err(cleanup_error)) => {
+                Err(format!("write failed: {write_error}; cleanup failed: {cleanup_error}").into())
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "runs through cargo xtask sqlserver-test"]
+    fn table_write_to_mssql_execute_writes_replace_validation_failure_keeps_existing_target()
+    -> TestResult<()> {
+        let Some(config) = MssqlIntegrationConfig::from_env() else {
+            return Ok(());
+        };
+        let table = unique_table_name(&config.schema)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        runtime.block_on(seed_replace_target(&config, &table))?;
+        let write_result = Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let validation_options = PyDict::new(py);
+            validation_options.set_item("target_validation_mode", "disabled")?;
+            let session_kwargs = PyDict::new(py);
+            session_kwargs.set_item(
+                "default_mssql_connection_string",
+                config.connection_string.as_str(),
+            )?;
+            session_kwargs.set_item("validation_options", validation_options)?;
+            let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+            let source = session.call_method(
+                "table_from_sql",
+                ("\
+select cast(811 as bigint) as order_id
+union all select cast(812 as bigint) as order_id",),
+                None,
+            )?;
+            let kwargs = mssql_kwargs(py, &config.schema, table.table().as_str(), "replace")?;
+
+            let error = source
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .err()
+                .ok_or_else(|| PyAssertionError::new_err("expected replace validation error"))?;
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "validation"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "mssql_write_phase"
+            );
+            assert!(
+                error
+                    .value(py)
+                    .getattr("message")?
+                    .extract::<String>()?
+                    .contains("requires target validation")
+            );
+            let context = error.value(py).getattr("context")?;
+            let context = context.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(context, "cleanup")?.extract::<String>()?,
+                "succeeded"
+            );
+            assert!(!required_item(context, "partial_write_possible")?.extract::<bool>()?);
+            let validation = required_item(context, "validation_status")?;
+            let validation = validation.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(validation, "kind")?.extract::<String>()?,
+                "disabled"
+            );
+
+            Ok::<(), PyErr>(())
+        });
+        let result = match write_result {
+            Ok(()) => runtime.block_on(assert_replace_target_rows(&config, &table, 700, 701)),
             Err(write_error) => Err(Box::new(write_error) as Box<dyn Error + Send + Sync>),
         };
         let cleanup_result = runtime.block_on(drop_table(&config, &table));
