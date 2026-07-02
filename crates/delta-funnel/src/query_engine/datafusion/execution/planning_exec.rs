@@ -3821,6 +3821,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_async_rejects_array_primitive_leaf_cast_like_official_kernel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_array_long_tags_leaf_cast(
+            "native-async-array-primitive-leaf-cast",
+        )?;
+        let table_uri = table.path().to_string_lossy().to_string();
+        let sql = "select tags, id from orders order by id";
+        let official = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::OfficialKernel,
+            sql,
+        )
+        .await;
+        let native = collect_sql_with_reader_backend(
+            &table_uri,
+            DeltaProviderReaderBackend::NativeAsync,
+            sql,
+        )
+        .await;
+
+        assert!(official.is_err(), "OfficialKernel must reject this fixture");
+        assert!(native.is_err(), "NativeAsync must reject this fixture");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_async_rejects_missing_non_nullable_array_struct_field_before_rows()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();

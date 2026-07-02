@@ -1272,6 +1272,13 @@ fn build_matched_list_field_plan(
         parquet_element,
         &element_path,
     )?;
+    if matches!(element_plan, NativeAsyncFieldPlan::Cast { .. }) {
+        return Err(delta_kernel::Error::generic(format!(
+            "provider field '{element_path}' expected Parquet type {} but found {}",
+            provider_element.data_type(),
+            file_element.data_type()
+        )));
+    }
 
     let needs_reshape =
         file_field.data_type() != provider_field.data_type() || !element_plan.is_identity();
@@ -2352,6 +2359,51 @@ mod tests {
         assert_eq!(cities.value(0), "san francisco");
         assert_eq!(cities.value(2), "chicago");
         assert_eq!(zips.values(), &[94110, 10001, 60601]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_async_schema_match_rejects_list_primitive_leaf_cast()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("element", DataType::Int64, true))),
+                true,
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let file_element = Field::new("element", DataType::Int32, true);
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("customer_name", DataType::Utf8, true),
+            Field::new("tags", DataType::List(Arc::new(file_element.clone())), true),
+        ]));
+        let tags = list_array(
+            file_element,
+            vec![0, 2, 2, 3],
+            Arc::new(Int32Array::from(vec![Some(7), Some(11), None])) as ArrayRef,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )?;
+
+        let error = match project_parquet_batch_to_provider_schema(
+            "list-primitive-leaf-cast-schema-match",
+            file_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as ArrayRef,
+                tags,
+            ],
+            provider_schema,
+        ) {
+            Ok(_) => return Err("primitive list element cast must fail".into()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("tags.element"), "{error}");
+        assert!(error.contains("expected Parquet type Int64"), "{error}");
+        assert!(error.contains("found Int32"), "{error}");
 
         Ok(())
     }
