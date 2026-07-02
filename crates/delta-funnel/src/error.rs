@@ -137,7 +137,7 @@ pub enum DeltaFunnelError {
     #[snafu(display("Delta snapshot load error: {reason}"))]
     DeltaSnapshotLoad {
         /// Sanitized reason for the snapshot load failure.
-        reason: &'static str,
+        reason: String,
     },
 
     /// A Delta source requires an unsupported reader protocol.
@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn snapshot_load_error_has_sanitized_display() {
         let error = DeltaFunnelError::DeltaSnapshotLoad {
-            reason: "snapshot could not be loaded",
+            reason: "snapshot could not be loaded".to_owned(),
         };
 
         assert_eq!(
