@@ -18,12 +18,15 @@ jobs:
       vars.RELEASE_PLZ_PR_ENABLED == 'true' &&
       !contains(github.event.head_commit.message, 'chore: release v')
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     permissions:
       contents: write
       pull-requests: write
     concurrency:
       group: release-plz-pr-${{ github.ref }}
-      cancel-in-progress: false
+      cancel-in-progress: true
 
     steps:
       - name: Generate GitHub token
@@ -52,6 +55,14 @@ jobs:
           rustup toolchain install "${{ steps.rust-version.outputs.version }}" --profile minimal
           rustup default "${{ steps.rust-version.outputs.version }}"
 
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-plz
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Run release-plz
         uses: release-plz/action@v0.5
         with:
@@ -69,6 +80,9 @@ jobs:
       )
     runs-on: ubuntu-latest
     environment: crates-io-release
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     permissions:
       contents: write
       pull-requests: read
@@ -100,6 +114,14 @@ jobs:
         run: |
           rustup toolchain install "${{ steps.rust-version.outputs.version }}" --profile minimal
           rustup default "${{ steps.rust-version.outputs.version }}"
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-plz
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Run release-plz
         uses: release-plz/action@v0.5
