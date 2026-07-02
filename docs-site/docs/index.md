@@ -1,4 +1,5 @@
 ---
+title: "Delta Funnel: Delta Lake to SQL Server"
 description: Lightweight Rust and Python toolkit for fast Delta Lake to SQL Server loads with DataFusion SQL and native TDS bulk writes, without Spark or ODBC.
 ---
 
