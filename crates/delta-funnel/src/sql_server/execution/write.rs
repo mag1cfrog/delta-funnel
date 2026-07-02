@@ -215,6 +215,8 @@ pub enum MssqlWritePhase {
     Finalize,
     /// Validate target-side write evidence after finalize succeeds.
     Validation,
+    /// Atomically swap a staged replace table into the final target name.
+    SwapTarget,
     /// Clean up a Delta Funnel-created target after a later failure.
     Cleanup,
 }
@@ -230,6 +232,7 @@ impl fmt::Display for MssqlWritePhase {
             Self::WriteBatch => "write batch",
             Self::Finalize => "finalize",
             Self::Validation => "validation",
+            Self::SwapTarget => "swap target",
             Self::Cleanup => "cleanup",
         })
     }
@@ -1727,6 +1730,7 @@ mod tests {
             (MssqlWritePhase::WriteBatch, "write batch"),
             (MssqlWritePhase::Finalize, "finalize"),
             (MssqlWritePhase::Validation, "validation"),
+            (MssqlWritePhase::SwapTarget, "swap target"),
             (MssqlWritePhase::Cleanup, "cleanup"),
         ];
 

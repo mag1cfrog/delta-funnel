@@ -611,6 +611,7 @@ fn write_phase(phase: MssqlWritePhase) -> &'static str {
         MssqlWritePhase::WriteBatch => "write_batch",
         MssqlWritePhase::Finalize => "finalize",
         MssqlWritePhase::Validation => "validation",
+        MssqlWritePhase::SwapTarget => "swap_target",
         MssqlWritePhase::Cleanup => "cleanup",
     }
 }

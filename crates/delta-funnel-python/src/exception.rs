@@ -194,6 +194,7 @@ fn mssql_write_phase(phase: delta_funnel::MssqlWritePhase) -> &'static str {
         delta_funnel::MssqlWritePhase::WriteBatch => "write_batch",
         delta_funnel::MssqlWritePhase::Finalize => "finalize",
         delta_funnel::MssqlWritePhase::Validation => "validation",
+        delta_funnel::MssqlWritePhase::SwapTarget => "swap_target",
         delta_funnel::MssqlWritePhase::Cleanup => "cleanup",
     }
 }
