@@ -25,18 +25,26 @@ pub(crate) fn add_logging(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(signature = (filter=None, logger=DEFAULT_LOGGER.to_owned()))]
 fn init_logging(py: Python<'_>, filter: Option<String>, logger: String) -> PyResult<bool> {
-    let filter = filter
-        .or_else(|| env::var(LOG_FILTER_ENV).ok())
-        .filter(|filter| !filter.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_FILTER.to_owned());
-    let filter = EnvFilter::try_new(filter).map_err(|error| {
-        invalid_logging_filter_py_error(py, format!("invalid DeltaFunnel logging filter: {error}"))
-    })?;
+    let filter = parse_logging_filter(py, filter, env::var(LOG_FILTER_ENV).ok())?;
     let subscriber = Registry::default().with(filter).with(PythonLoggingLayer {
         logger_name: logger,
     });
 
     Ok(tracing::subscriber::set_global_default(subscriber).is_ok())
+}
+
+fn parse_logging_filter(
+    py: Python<'_>,
+    filter: Option<String>,
+    env_filter: Option<String>,
+) -> PyResult<EnvFilter> {
+    let filter = filter
+        .or(env_filter)
+        .filter(|filter| !filter.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_FILTER.to_owned());
+    EnvFilter::try_new(filter).map_err(|error| {
+        invalid_logging_filter_py_error(py, format!("invalid DeltaFunnel logging filter: {error}"))
+    })
 }
 
 fn invalid_logging_filter_py_error(py: Python<'_>, message: String) -> PyErr {
@@ -71,7 +79,7 @@ where
                 .join(",")
         });
 
-        let _ = Python::attach(|py| {
+        let _ = Python::try_attach(|py| {
             let logging = py.import("logging")?;
             let logger = logging.call_method1("getLogger", (&self.logger_name,))?;
             let extra = PyDict::new(py);
@@ -151,7 +159,7 @@ mod tests {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
 
-    use super::{DEFAULT_FILTER, PythonLoggingLayer, python_log_level};
+    use super::{DEFAULT_FILTER, PythonLoggingLayer, parse_logging_filter, python_log_level};
     use crate::deltafunnel;
 
     #[test]
@@ -218,6 +226,58 @@ mod tests {
                 "invalid_logging_filter"
             );
             assert!(error.value(py).getattr("context")?.is_none());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn logging_filter_uses_deltafunnel_log_value_when_filter_is_none() -> PyResult<()> {
+        Python::attach(|py| {
+            let (logger, handler, records) = install_capture_handler(py, "deltafunnel.test.env")?;
+            let filter = parse_logging_filter(py, None, Some("delta_funnel=warn".to_owned()))?;
+            let subscriber = tracing_subscriber::registry()
+                .with(filter)
+                .with(PythonLoggingLayer {
+                    logger_name: "deltafunnel.test.env".to_owned(),
+                });
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "delta_funnel", "filtered.info");
+                tracing::warn!(target: "delta_funnel", "kept.warn");
+            });
+
+            logger.call_method1("removeHandler", (&handler,))?;
+            let record = only_record(&records)?;
+            assert_eq!(record.getattr("levelno")?.extract::<u8>()?, 30);
+            assert_eq!(record.getattr("msg")?.extract::<String>()?, "kept.warn");
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn explicit_logging_filter_wins_over_deltafunnel_log_value() -> PyResult<()> {
+        Python::attach(|py| {
+            let (logger, handler, records) =
+                install_capture_handler(py, "deltafunnel.test.explicit_filter")?;
+            let filter = parse_logging_filter(
+                py,
+                Some("delta_funnel=info".to_owned()),
+                Some("delta_funnel=error".to_owned()),
+            )?;
+            let subscriber = tracing_subscriber::registry()
+                .with(filter)
+                .with(PythonLoggingLayer {
+                    logger_name: "deltafunnel.test.explicit_filter".to_owned(),
+                });
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "delta_funnel", "explicit.info");
+            });
+
+            logger.call_method1("removeHandler", (&handler,))?;
+            let record = only_record(&records)?;
+            assert_eq!(record.getattr("levelno")?.extract::<u8>()?, 20);
+            assert_eq!(record.getattr("msg")?.extract::<String>()?, "explicit.info");
 
             Ok(())
         })
