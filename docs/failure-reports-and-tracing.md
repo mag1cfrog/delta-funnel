@@ -125,7 +125,7 @@ When a workflow fails, start at the highest-level report and then drill down:
 - `failure.context.phase` identifies the write phase that failed, such as
   `connect`, `prepare_target_lifecycle`, `initialize_writer`,
   `poll_batch_stream`, `validate_batch_schema`, `write_batch`, `finalize`,
-  `validation`, or `cleanup`.
+  `validation`, `swap_target`, or `cleanup`.
 - `partial_write_possible` means DeltaFunnel cannot claim the target table is
   unchanged. Treat the target as needing operator review before retrying.
 - `cleanup` reports whether cleanup was not applicable, not attempted,
