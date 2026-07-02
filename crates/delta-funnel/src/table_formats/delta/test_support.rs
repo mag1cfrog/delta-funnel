@@ -13,10 +13,10 @@ use delta_kernel::actions::deletion_vector_writer::{
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int32Array, ListArray, MapArray, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use delta_kernel::arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
+use delta_kernel::arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::file::properties::WriterProperties;
 
@@ -381,6 +381,46 @@ impl RealParquetDeltaTable {
                 partition_values_json: "{}".to_owned(),
                 deletion_vector: None,
             }],
+        )
+    }
+
+    /// Creates a local Delta table whose logical timestamp column is stored
+    /// with different physical timestamp leaf types across Parquet files.
+    pub(crate) fn new_with_mixed_timestamp_physical_types(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_protocol_metadata_file_batches(
+            name,
+            PROTOCOL_JSON,
+            SUPPORTED_TYPES_METADATA_JSON,
+            vec![
+                RealParquetDataFile {
+                    path: DATA_FILE.to_owned(),
+                    batches: vec![supported_types_batch()?],
+                    stats: AddStats {
+                        rows: 3,
+                        max_id: 3,
+                        min_customer: "alice".to_owned(),
+                        max_customer: "bob".to_owned(),
+                        customer_null_count: 1,
+                    },
+                    partition_values_json: "{}".to_owned(),
+                    deletion_vector: None,
+                },
+                RealParquetDataFile {
+                    path: "part-00001.parquet".to_owned(),
+                    batches: vec![supported_types_batch_with_nanosecond_event_ts()?],
+                    stats: AddStats {
+                        rows: 3,
+                        max_id: 6,
+                        min_customer: "carol".to_owned(),
+                        max_customer: "dylan".to_owned(),
+                        customer_null_count: 1,
+                    },
+                    partition_values_json: "{}".to_owned(),
+                    deletion_vector: None,
+                },
+            ],
         )
     }
 
@@ -1328,18 +1368,14 @@ fn reordered_physical_columns_schema() -> Arc<Schema> {
     ]))
 }
 
-fn supported_types_schema() -> Arc<Schema> {
+fn supported_types_schema_with_event_ts(event_ts_type: DataType) -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("customer_name", DataType::Utf8, true),
         Field::new("active", DataType::Boolean, true),
         Field::new("payload", DataType::Binary, true),
         Field::new("event_date", DataType::Date32, true),
-        Field::new(
-            "event_ts",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            true,
-        ),
+        Field::new("event_ts", event_ts_type, true),
         Field::new("amount", DataType::Decimal128(10, 2), true),
         Field::new("score_f32", DataType::Float32, true),
         Field::new("score_f64", DataType::Float64, true),
@@ -1933,6 +1969,38 @@ fn reordered_physical_columns_batch() -> Result<kernel::RecordBatch, Box<dyn std
 }
 
 fn supported_types_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    supported_types_batch_with_event_ts(
+        [1, 2, 3],
+        [Some("alice"), Some("bob"), None],
+        Arc::new(
+            TimestampMicrosecondArray::from(vec![
+                Some(1_704_067_200_000_000),
+                Some(1_704_153_600_000_000),
+                None,
+            ])
+            .with_timezone("UTC"),
+        ) as ArrayRef,
+    )
+}
+
+fn supported_types_batch_with_nanosecond_event_ts()
+-> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
+    supported_types_batch_with_event_ts(
+        [4, 5, 6],
+        [Some("carol"), Some("dylan"), None],
+        Arc::new(TimestampNanosecondArray::from(vec![
+            Some(1_704_240_000_000_000_000),
+            Some(1_704_326_400_000_000_000),
+            None,
+        ])) as ArrayRef,
+    )
+}
+
+fn supported_types_batch_with_event_ts(
+    ids: [i32; 3],
+    customer_names: [Option<&str>; 3],
+    event_ts: ArrayRef,
+) -> Result<kernel::RecordBatch, Box<dyn std::error::Error>> {
     let attributes = StructArray::from(vec![
         (
             Arc::new(Field::new("level", DataType::Int32, true)),
@@ -1948,9 +2016,15 @@ fn supported_types_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Er
         Some(vec![Some(30)]),
         None,
     ]);
+    let event_ts_type = event_ts.data_type().clone();
     let columns = vec![
-        Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
-        Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])) as Arc<dyn Array>,
+        Arc::new(Int32Array::from(ids.to_vec())) as Arc<dyn Array>,
+        Arc::new(StringArray::from(
+            customer_names
+                .into_iter()
+                .map(|name| name.map(str::to_owned))
+                .collect::<Vec<_>>(),
+        )) as Arc<dyn Array>,
         Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as Arc<dyn Array>,
         Arc::new(BinaryArray::from(vec![
             Some(b"alpha".as_ref()),
@@ -1958,14 +2032,7 @@ fn supported_types_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Er
             None,
         ])) as Arc<dyn Array>,
         Arc::new(Date32Array::from(vec![Some(19_723), Some(19_724), None])) as Arc<dyn Array>,
-        Arc::new(
-            TimestampMicrosecondArray::from(vec![
-                Some(1_704_067_200_000_000),
-                Some(1_704_153_600_000_000),
-                None,
-            ])
-            .with_timezone("UTC"),
-        ) as Arc<dyn Array>,
+        event_ts,
         Arc::new(
             Decimal128Array::from(vec![Some(12_345), Some(-6_789), None])
                 .with_precision_and_scale(10, 2)?,
@@ -1977,7 +2044,7 @@ fn supported_types_batch() -> Result<kernel::RecordBatch, Box<dyn std::error::Er
     ];
 
     Ok(kernel::RecordBatch::try_new(
-        supported_types_schema(),
+        supported_types_schema_with_event_ts(event_ts_type),
         columns,
     )?)
 }
