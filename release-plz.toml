@@ -6,3 +6,14 @@ name = "delta-funnel"
 release = true
 changelog_path = "CHANGELOG.md"
 changelog_include = ["delta-funnel-python"]
+
+[[package]]
+name = "delta-funnel-python"
+release = true
+publish = false
+git_only = true
+git_tag_name = "v{{ version }}"
+git_tag_enable = false
+git_release_enable = false
+changelog_update = false
+semver_check = false
