@@ -4,8 +4,8 @@ Use this guide when a real DeltaFunnel workload fails and you need to collect
 diagnostics without exposing credentials, raw SQL, or row values.
 
 DeltaFunnel library code emits reports and tracing spans/events. It does not
-install a global tracing subscriber. Applications, tests, and future language
-bindings own subscriber setup.
+install diagnostics automatically. Applications, tests, and language bindings
+own subscriber or logging setup.
 
 ## Run A Dry-Run Preflight
 
@@ -143,9 +143,36 @@ phase timings, and cleanup status.
 
 ## Enable Safe Tracing
 
-Enable tracing in the application or test harness that calls DeltaFunnel. Use
-target filters that include DeltaFunnel workflow events, Arrow writer events,
-and raw bulk protocol events:
+For Python, route DeltaFunnel tracing into standard-library `logging` before
+running the workflow:
+
+```python
+import logging
+import deltafunnel
+
+logging.basicConfig(level=logging.INFO)
+deltafunnel.init_logging()
+```
+
+`init_logging()` installs a process-global bridge from Rust `tracing` events to
+`logging.getLogger("deltafunnel")`. It returns `True` when it installs the
+bridge and `False` when another global Rust tracing subscriber is already
+installed. It does not configure Python handlers, formatters, levels, files, or
+external exporters; the application keeps owning normal Python logging setup.
+
+Use a filter string or `DELTAFUNNEL_LOG` for deeper diagnostics:
+
+```python
+deltafunnel.init_logging("delta_funnel=debug,delta_kernel=debug,arrow_tiberius=debug")
+```
+
+Datadog, OpenTelemetry, JSON logging, file logging, pytest capture, notebooks,
+and framework logging work through their normal Python `logging` integration
+when the application has configured them.
+
+For Rust, enable tracing in the application or test harness that calls
+DeltaFunnel. Use target filters that include DeltaFunnel workflow events, Arrow
+writer events, and raw bulk protocol events:
 
 ```rust
 use tracing_subscriber::{EnvFilter, fmt};
