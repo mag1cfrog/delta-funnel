@@ -18,7 +18,7 @@ pub enum LoadMode {
     AppendExisting,
     /// Plan a target table definition and then load rows into the new table.
     CreateAndLoad,
-    /// Reserved for a later destructive lifecycle implementation.
+    /// Write rows to a staging table, validate them, then swap it into the target name.
     Replace,
 }
 

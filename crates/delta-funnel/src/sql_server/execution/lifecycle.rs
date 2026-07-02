@@ -790,10 +790,30 @@ fn replace_swap_sql(
 }
 
 fn replace_lock_resource(final_table: &TableName) -> String {
-    format!("delta-funnel:replace:{}", final_table.quoted_sql())
-        .chars()
-        .take(255)
-        .collect()
+    const MAX_RESOURCE_CHARS: usize = 255;
+    const HASH_CHARS: usize = 16;
+    const SEPARATOR_CHARS: usize = 1;
+
+    let resource = format!("delta-funnel:replace:{}", final_table.quoted_sql());
+    if resource.chars().count() <= MAX_RESOURCE_CHARS {
+        return resource;
+    }
+
+    let prefix_chars = MAX_RESOURCE_CHARS - HASH_CHARS - SEPARATOR_CHARS;
+    let prefix = resource.chars().take(prefix_chars).collect::<String>();
+    format!("{prefix}:{:016x}", stable_resource_hash(&resource))
+}
+
+fn stable_resource_hash(value: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 fn sql_nvarchar_literal(value: &str) -> String {
@@ -1716,6 +1736,22 @@ mod tests {
             sql_nvarchar_literal("tenant's.orders"),
             "N'tenant''s.orders'"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_lock_resource_keeps_long_target_names_distinct() -> Result<(), DeltaFunnelError> {
+        let schema = "s".repeat(128);
+        let table_prefix = "t".repeat(127);
+        let first_table = test_table_name(&schema, &format!("{table_prefix}a"))?;
+        let second_table = test_table_name(&schema, &format!("{table_prefix}b"))?;
+
+        let first_lock = replace_lock_resource(&first_table);
+        let second_lock = replace_lock_resource(&second_table);
+
+        assert_eq!(first_lock.chars().count(), 255);
+        assert_eq!(second_lock.chars().count(), 255);
+        assert_ne!(first_lock, second_lock);
         Ok(())
     }
 

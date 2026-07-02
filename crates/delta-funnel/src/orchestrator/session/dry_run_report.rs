@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(report.target_table().table(), "west_orders");
         assert_eq!(report.load_mode(), LoadMode::CreateAndLoad);
         assert_eq!(report.target_schema_plan().mappings().len(), 1);
-        assert!(report.target_ddl_plan().create_table_sql().is_some());
+        assert!(report.target_ddl_plan().create_table_sql_present());
         assert!(report.target_lifecycle_plan().create_table_sql_required());
         assert_eq!(
             report.target_lifecycle_plan().expected_target_state(),
@@ -879,7 +879,8 @@ mod tests {
         assert_eq!(report.output_name(), "orders_output");
         assert_eq!(report.load_mode(), LoadMode::Replace);
         assert_eq!(report.target_table().table(), "orders_sink");
-        assert!(report.target_ddl_plan().create_table_sql().is_some());
+        assert!(report.target_ddl_plan().create_table_sql_present());
+        assert_eq!(report.target_ddl_plan().create_table_sql(), None);
         assert!(report.target_lifecycle_plan().create_table_sql_required());
         assert_eq!(
             report.target_lifecycle_plan().expected_target_state(),

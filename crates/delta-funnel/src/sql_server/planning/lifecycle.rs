@@ -197,7 +197,9 @@ fn plan_replace_lifecycle(
     target: &MssqlTargetSummary,
     ddl_plan: Option<&MssqlDdlPlan>,
 ) -> Result<MssqlLifecyclePlan, DeltaFunnelError> {
-    let create_table_sql_present = ddl_plan.and_then(MssqlDdlPlan::create_table_sql).is_some();
+    let create_table_sql_present = ddl_plan
+        .map(MssqlDdlPlan::create_table_sql_present)
+        .unwrap_or(false);
     if !create_table_sql_present {
         return Err(lifecycle_error(
             target,

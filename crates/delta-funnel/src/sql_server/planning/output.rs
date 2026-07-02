@@ -88,7 +88,7 @@ impl MssqlTargetOutputPlan {
         &self.ddl_plan
     }
 
-    /// Returns planned `CREATE TABLE` SQL when required by the lifecycle mode.
+    /// Returns concrete planned `CREATE TABLE` SQL when the target name is known at planning time.
     #[must_use]
     pub fn create_table_sql(&self) -> Option<&str> {
         self.ddl_plan.create_table_sql()
@@ -532,6 +532,7 @@ mod tests {
             output_plan.schema_plan().target().output_name(),
             "orders_output"
         );
+        assert!(!output_plan.ddl_plan().create_table_sql_present());
         assert_eq!(output_plan.ddl_plan().create_table_sql(), None);
         assert_eq!(
             output_plan.lifecycle_plan().expected_target_state(),
@@ -552,6 +553,7 @@ mod tests {
 
         let output_plan = plan_mssql_target_output(schema_plan)?;
 
+        assert!(output_plan.ddl_plan().create_table_sql_present());
         assert!(
             output_plan
                 .ddl_plan()
@@ -583,13 +585,8 @@ mod tests {
         let output_plan = plan_mssql_target_output(schema_plan)?;
 
         assert_eq!(output_plan.load_mode(), LoadMode::Replace);
-        assert!(
-            output_plan
-                .ddl_plan()
-                .create_table_sql()
-                .unwrap_or_default()
-                .starts_with("CREATE TABLE [dbo].[orders]")
-        );
+        assert!(output_plan.ddl_plan().create_table_sql_present());
+        assert_eq!(output_plan.ddl_plan().create_table_sql(), None);
         assert_eq!(
             output_plan.lifecycle_plan().expected_target_state(),
             MssqlTargetTableState::Exists
