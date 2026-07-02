@@ -5,3 +5,4 @@ release = false
 name = "delta-funnel"
 release = true
 changelog_path = "CHANGELOG.md"
+changelog_include = ["delta-funnel-python"]
