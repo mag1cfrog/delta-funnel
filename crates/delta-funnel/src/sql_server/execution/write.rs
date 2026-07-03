@@ -851,7 +851,7 @@ mod tests {
         WriteOptions,
     };
     use datafusion::arrow::{
-        array::{Int64Array, StringArray},
+        array::{Int64Array, StringArray, StringViewArray},
         record_batch::RecordBatch,
     };
     use futures_util::stream;
@@ -1054,6 +1054,24 @@ mod tests {
             vec![
                 Arc::new(datafusion::arrow::array::Int32Array::from(vec![1_i32])),
                 Arc::new(StringArray::from(vec![Some("open")])),
+            ],
+        )
+        .map_err(|error| DeltaFunnelError::Config {
+            message: error.to_string(),
+        })
+    }
+
+    fn orders_batch_with_utf8_view_status() -> Result<RecordBatch, DeltaFunnelError> {
+        let schema = Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("status", DataType::Utf8View, true),
+        ]);
+
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(StringViewArray::from(vec![Some("open"), None])),
             ],
         )
         .map_err(|error| DeltaFunnelError::Config {
@@ -1460,6 +1478,29 @@ mod tests {
 
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
+        assert_eq!(log.finish_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_loop_accepts_utf8_view_for_planned_utf8() -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let log = Arc::new(Mutex::new(FakeBulkLoadWriterLog::default()));
+        let writer = FakeBulkLoadWriter::with_log(Arc::clone(&log));
+        let batches = stream::iter(vec![Ok(orders_batch_with_utf8_view_status()?)]);
+
+        let report = write_mssql_batches_with_writer(
+            &output_plan,
+            batches,
+            writer,
+            default_mssql_write_options(),
+        )
+        .await?;
+
+        assert_eq!(report.stats().rows_written(), 2);
+        assert_eq!(report.stats().batches_written(), 1);
+        let log = lock_fake_writer_log(&log)?;
+        assert_eq!(log.batch_rows, vec![2]);
         assert_eq!(log.finish_count, 1);
         Ok(())
     }
@@ -2165,6 +2206,20 @@ mod tests {
             Some("warehouse-primary")
         );
         assert!(!format!("{report:?}").contains("secret-token"));
+        Ok(())
+    }
+
+    #[test]
+    fn output_record_batch_validation_accepts_utf8_view_for_planned_utf8()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let batch = orders_batch_with_utf8_view_status()?;
+
+        let report = validate_mssql_output_record_batch(&output_plan, &batch)?;
+
+        assert_eq!(report.output_name(), "orders_output");
+        assert_eq!(report.target_table().schema(), Some("dbo"));
+        assert_eq!(report.target_table().table(), "orders");
         Ok(())
     }
 
