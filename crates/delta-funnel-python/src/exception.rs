@@ -473,6 +473,77 @@ mod tests {
     }
 
     #[test]
+    fn rust_batch_schema_validation_error_mapping_exposes_diagnostics() -> PyResult<()> {
+        Python::attach(|py| {
+            let connection = delta_funnel::MssqlConnectionConfig::new(
+                "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+            )
+            .map_err(|error| py_error(py, error))?;
+            let target_config = delta_funnel::MssqlTargetConfig::new(
+                delta_funnel::MssqlTargetTable::new("dbo", "orders")
+                    .map_err(|error| py_error(py, error))?,
+            );
+            let output_plan = delta_funnel::plan_mssql_target_for_output(
+                Schema::new(vec![Field::new("order_id", DataType::Int64, false)]),
+                "orders_output",
+                &target_config,
+                Some(&connection),
+                delta_funnel::MssqlSchemaPlanOptions::default(),
+            )
+            .map_err(|error| py_error(py, error))?;
+            let runtime_schema = Schema::new(vec![Field::new("order_id", DataType::Int32, false)]);
+            let error =
+                match delta_funnel::validate_mssql_output_schema(&output_plan, &runtime_schema) {
+                    Ok(_) => {
+                        return Err(pyo3::exceptions::PyAssertionError::new_err(
+                            "expected batch schema validation error",
+                        ));
+                    }
+                    Err(error) => delta_funnel_error_to_py(py, error)?,
+                };
+
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "validate_batch_schema"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "mssql_batch_schema_validation"
+            );
+            let context = error.value(py).getattr("context")?;
+            let context = context.cast::<PyDict>()?;
+            assert!(required_item(context, "cleanup_error")?.is_none());
+            let diagnostics = required_item(context, "diagnostics")?;
+            assert_eq!(diagnostics.len()?, 1);
+            let diagnostic = diagnostics.get_item(0)?;
+            let diagnostic = diagnostic.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(diagnostic, "severity")?.extract::<String>()?,
+                "error"
+            );
+            assert_eq!(
+                required_item(diagnostic, "code")?.extract::<String>()?,
+                "schema_mismatch"
+            );
+            assert!(
+                required_item(diagnostic, "message")?
+                    .extract::<String>()?
+                    .contains("does not match")
+            );
+            let field = required_item(diagnostic, "field")?;
+            let field = field.cast::<PyDict>()?;
+            assert_eq!(required_item(field, "index")?.extract::<u64>()?, 0);
+            assert_eq!(
+                required_item(field, "name")?.extract::<String>()?,
+                "order_id"
+            );
+            assert!(required_item(diagnostic, "row")?.is_none());
+
+            Ok(())
+        })
+    }
+
+    #[test]
     fn rust_error_mapping_preserves_sanitized_display() -> PyResult<()> {
         Python::attach(|py| {
             let error = delta_funnel_error_to_py(

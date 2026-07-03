@@ -3,7 +3,7 @@ use std::fmt;
 use crate::{
     MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan, MssqlTargetTable,
     MssqlWritePhase, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount, ValidationStatus,
-    sql_server::LoadMode,
+    sql_server::LoadMode, support::sanitize_text_for_display,
 };
 
 /// Per-output SQL Server write statistics.
@@ -98,6 +98,72 @@ impl MssqlOutputFieldReport {
     #[must_use]
     pub const fn nullable(&self) -> bool {
         self.nullable
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MssqlWriteDiagnosticField {
+    index: u64,
+    name: String,
+}
+
+impl MssqlWriteDiagnosticField {
+    fn from_arrow_tiberius(field: &arrow_tiberius::FieldRef) -> Self {
+        Self {
+            index: crate::usize_to_u64_saturating(field.index()),
+            name: field.name().to_owned(),
+        }
+    }
+
+    pub(crate) const fn index(&self) -> u64 {
+        self.index
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MssqlWriteDiagnostic {
+    severity: arrow_tiberius::DiagnosticSeverity,
+    code: arrow_tiberius::DiagnosticCode,
+    message: String,
+    field: Option<MssqlWriteDiagnosticField>,
+    row: Option<u64>,
+}
+
+impl MssqlWriteDiagnostic {
+    pub(crate) fn from_arrow_tiberius(diagnostic: &arrow_tiberius::Diagnostic) -> Self {
+        Self {
+            severity: diagnostic.severity(),
+            code: diagnostic.code(),
+            message: sanitize_text_for_display(diagnostic.message()),
+            field: diagnostic
+                .field()
+                .map(MssqlWriteDiagnosticField::from_arrow_tiberius),
+            row: diagnostic.row().map(crate::usize_to_u64_saturating),
+        }
+    }
+
+    pub(crate) const fn severity(&self) -> arrow_tiberius::DiagnosticSeverity {
+        self.severity
+    }
+
+    pub(crate) const fn code(&self) -> arrow_tiberius::DiagnosticCode {
+        self.code
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn field(&self) -> Option<&MssqlWriteDiagnosticField> {
+        self.field.as_ref()
+    }
+
+    pub(crate) const fn row(&self) -> Option<u64> {
+        self.row
     }
 }
 
@@ -577,6 +643,8 @@ impl MssqlOutputBatchValidationReport {
 pub struct MssqlWriteFailureContext {
     phase: MssqlWritePhase,
     report: MssqlWriteReport,
+    diagnostics: Vec<MssqlWriteDiagnostic>,
+    cleanup_error: Option<String>,
 }
 
 impl MssqlWriteFailureContext {
@@ -619,6 +687,8 @@ impl MssqlWriteFailureContext {
         Self {
             phase,
             report: MssqlWriteReport::from_output_plan_with_metrics(output_plan, metrics),
+            diagnostics: Vec::new(),
+            cleanup_error: None,
         }
     }
 
@@ -716,6 +786,24 @@ impl MssqlWriteFailureContext {
     #[must_use]
     pub const fn report(&self) -> &MssqlWriteReport {
         &self.report
+    }
+
+    pub(crate) fn diagnostics(&self) -> &[MssqlWriteDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub(crate) fn cleanup_error(&self) -> Option<&str> {
+        self.cleanup_error.as_deref()
+    }
+
+    pub(crate) fn with_diagnostics(mut self, diagnostics: Vec<MssqlWriteDiagnostic>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    pub(crate) fn with_cleanup_error(mut self, cleanup_error: impl AsRef<str>) -> Self {
+        self.cleanup_error = Some(sanitize_text_for_display(cleanup_error.as_ref()));
+        self
     }
 
     pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {

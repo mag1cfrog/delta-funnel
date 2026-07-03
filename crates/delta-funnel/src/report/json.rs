@@ -406,6 +406,11 @@ impl MssqlWriteFailureContext {
             "batch_shaping": batch_shaping_value(self.batch_shaping()),
             "partial_write_possible": self.partial_write_possible(),
             "cleanup": cleanup_status(self.cleanup()),
+            "cleanup_error": self.cleanup_error(),
+            "diagnostics": self.diagnostics()
+                .iter()
+                .map(write_diagnostic_value)
+                .collect::<Vec<_>>(),
             "phase_timings": phase_timings_value(self.phase_timings()),
             "report": self.report().to_json_value(),
         })
@@ -613,6 +618,68 @@ fn write_phase(phase: MssqlWritePhase) -> &'static str {
         MssqlWritePhase::Validation => "validation",
         MssqlWritePhase::SwapTarget => "swap_target",
         MssqlWritePhase::Cleanup => "cleanup",
+    }
+}
+
+fn write_diagnostic_value(
+    diagnostic: &crate::report::sql_server::write::MssqlWriteDiagnostic,
+) -> Value {
+    json!({
+        "severity": diagnostic_severity(diagnostic.severity()),
+        "code": diagnostic_code(diagnostic.code()),
+        "message": diagnostic.message(),
+        "field": diagnostic.field().map(|field| json!({
+            "index": field.index(),
+            "name": field.name(),
+        })),
+        "row": diagnostic.row(),
+    })
+}
+
+fn diagnostic_severity(severity: arrow_tiberius::DiagnosticSeverity) -> &'static str {
+    match severity {
+        arrow_tiberius::DiagnosticSeverity::Warning => "warning",
+        arrow_tiberius::DiagnosticSeverity::Error => "error",
+    }
+}
+
+fn diagnostic_code(code: arrow_tiberius::DiagnosticCode) -> &'static str {
+    match code {
+        arrow_tiberius::DiagnosticCode::UnsupportedArrowType => "unsupported_arrow_type",
+        arrow_tiberius::DiagnosticCode::LossyConversionRequiresPolicy => {
+            "lossy_conversion_requires_policy"
+        }
+        arrow_tiberius::DiagnosticCode::PolicyApplied => "policy_applied",
+        arrow_tiberius::DiagnosticCode::IdentifierInvalid => "identifier_invalid",
+        arrow_tiberius::DiagnosticCode::IdentifierTooLong => "identifier_too_long",
+        arrow_tiberius::DiagnosticCode::DecimalOutOfRange => "decimal_out_of_range",
+        arrow_tiberius::DiagnosticCode::IntegerOutOfRange => "integer_out_of_range",
+        arrow_tiberius::DiagnosticCode::TimestampOutOfRange => "timestamp_out_of_range",
+        arrow_tiberius::DiagnosticCode::TimezoneUnsupported => "timezone_unsupported",
+        arrow_tiberius::DiagnosticCode::SchemaMismatch => "schema_mismatch",
+        arrow_tiberius::DiagnosticCode::BackendUnavailable => "backend_unavailable",
+        arrow_tiberius::DiagnosticCode::ProfileDependentConversion => {
+            "profile_dependent_conversion"
+        }
+        arrow_tiberius::DiagnosticCode::ObservedDataRequired => "observed_data_required",
+        arrow_tiberius::DiagnosticCode::ValueConversionUnsupported => {
+            "value_conversion_unsupported"
+        }
+        arrow_tiberius::DiagnosticCode::ValueTypeMismatch => "value_type_mismatch",
+        arrow_tiberius::DiagnosticCode::NullInNonNullableColumn => "null_in_non_nullable_column",
+        arrow_tiberius::DiagnosticCode::NonFiniteFloat => "non_finite_float",
+        arrow_tiberius::DiagnosticCode::ValueTooLong => "value_too_long",
+        arrow_tiberius::DiagnosticCode::RowIndexOutOfBounds => "row_index_out_of_bounds",
+        arrow_tiberius::DiagnosticCode::DirectEncodingInvalidPayload => {
+            "direct_encoding_invalid_payload"
+        }
+        arrow_tiberius::DiagnosticCode::DirectEncodingUnsupportedMapping => {
+            "direct_encoding_unsupported_mapping"
+        }
+        arrow_tiberius::DiagnosticCode::DirectEncodingUnsupportedBatch => {
+            "direct_encoding_unsupported_batch"
+        }
+        _ => "unknown",
     }
 }
 
