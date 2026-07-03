@@ -303,11 +303,11 @@ mod tests {
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlBatchShapingReport,
         MssqlOutputBatchStream, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus,
-        MssqlTargetConfig, MssqlTargetTable, MssqlWorkflowOutputWriter, MssqlWriteFailureContext,
-        MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport, PhaseStatus, PhaseTimingReport,
-        ReportReasonCode, ResolvedMssqlTarget, RowCount, WriteAllCacheAliasStatus,
-        WriteAllCacheReport, WriteAllNoCacheReason, plan_mssql_target_for_resolved_output,
-        table_formats::RealParquetDeltaTable,
+        MssqlTargetConfig, MssqlTargetTable, MssqlTargetTableState, MssqlWorkflowOutputWriter,
+        MssqlWriteFailureContext, MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport,
+        PhaseStatus, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, RowCount,
+        WriteAllCacheAliasStatus, WriteAllCacheReport, WriteAllNoCacheReason,
+        plan_mssql_target_for_resolved_output, table_formats::RealParquetDeltaTable,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,6 +570,13 @@ mod tests {
             assert_eq!(planned.len(), 2);
             assert_eq!(planned[1].output_plan().output_name(), "east_output");
             assert_eq!(planned[1].output_plan().load_mode(), LoadMode::Replace);
+            assert_eq!(
+                planned[1]
+                    .output_plan()
+                    .lifecycle_plan()
+                    .expected_target_state(),
+                MssqlTargetTableState::ExistsOrAbsent
+            );
             assert!(
                 planned[1]
                     .output_plan()

@@ -589,7 +589,7 @@ mod tests {
         assert_eq!(output_plan.ddl_plan().create_table_sql(), None);
         assert_eq!(
             output_plan.lifecycle_plan().expected_target_state(),
-            MssqlTargetTableState::Exists
+            MssqlTargetTableState::ExistsOrAbsent
         );
         assert!(output_plan.lifecycle_plan().create_table_sql_required());
         Ok(())

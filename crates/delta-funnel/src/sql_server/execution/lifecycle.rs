@@ -1700,7 +1700,7 @@ mod tests {
         assert_eq!(report.load_mode(), LoadMode::Replace);
         assert_eq!(
             report.expected_target_state(),
-            MssqlTargetTableState::Exists
+            MssqlTargetTableState::ExistsOrAbsent
         );
         assert_eq!(
             report.action(),

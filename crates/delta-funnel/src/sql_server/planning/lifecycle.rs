@@ -11,6 +11,8 @@ pub enum MssqlTargetTableState {
     Exists,
     /// Target table should not exist before loading and should be created.
     Absent,
+    /// Target table may already exist or may be created by this lifecycle.
+    ExistsOrAbsent,
 }
 
 /// Whether guarded execution may proceed after lifecycle planning.
@@ -209,7 +211,7 @@ fn plan_replace_lifecycle(
 
     Ok(MssqlLifecyclePlan {
         target: target.clone(),
-        expected_target_state: MssqlTargetTableState::Exists,
+        expected_target_state: MssqlTargetTableState::ExistsOrAbsent,
         create_table_sql_required: true,
         create_table_sql_present,
         executable_in_mvp: true,
@@ -412,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_reports_expected_existing_target_and_create_sql() -> Result<(), DeltaFunnelError> {
+    fn replace_reports_flexible_target_state_and_create_sql() -> Result<(), DeltaFunnelError> {
         let schema_plan = schema_plan(
             "orders_output",
             LoadMode::Replace,
@@ -424,7 +426,7 @@ mod tests {
 
         assert_eq!(
             lifecycle.expected_target_state(),
-            MssqlTargetTableState::Exists
+            MssqlTargetTableState::ExistsOrAbsent
         );
         assert!(lifecycle.create_table_sql_required());
         assert!(lifecycle.create_table_sql_present());
