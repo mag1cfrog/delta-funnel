@@ -37,6 +37,12 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.name }} wheel
+    if: >-
+      github.event_name != 'push' ||
+      (
+        !contains(github.event.head_commit.message, 'chore: release v') &&
+        !contains(github.event.head_commit.message, 'release-plz-')
+      )
     runs-on: ${{ matrix.os }}
     defaults:
       run:
