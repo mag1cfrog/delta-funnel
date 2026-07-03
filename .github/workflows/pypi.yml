@@ -4,6 +4,17 @@ on:
   release:
     types:
       - published
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/pypi.yml"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/delta-funnel/**"
+      - "crates/delta-funnel-python/**"
+      - "xtask/Cargo.toml"
   workflow_dispatch:
     inputs:
       publish_to:
@@ -39,30 +50,35 @@ jobs:
             manylinux: "2_28"
             interpreter: python3.10
             artifact: deltafunnel-linux-x86_64-wheel
-            sccache: "false"
+            maturin_sccache: "true"
+            host_sccache: "false"
           - name: Windows x86_64
             os: windows-latest
             manylinux: "off"
             interpreter: python
             artifact: deltafunnel-windows-x86_64-wheel
-            sccache: "true"
+            maturin_sccache: "false"
+            host_sccache: "true"
           - name: macOS arm64
             os: macos-latest
             manylinux: "off"
             interpreter: python
             artifact: deltafunnel-macos-arm64-wheel
-            sccache: "true"
+            maturin_sccache: "false"
+            host_sccache: "true"
           - name: macOS x86_64
             os: macos-15-intel
             manylinux: "off"
             interpreter: python
             artifact: deltafunnel-macos-x86_64-wheel
-            sccache: "true"
+            maturin_sccache: "false"
+            host_sccache: "true"
     env:
       PUBLISH_TO: ${{ github.event_name == 'release' && 'pypi' || inputs.publish_to || 'none' }}
       RELEASE_VERSION: ${{ inputs.version || github.event.release.tag_name || github.ref_name }}
+      CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: ${{ matrix.sccache == 'true' && 'sccache' || '' }}
+      RUSTC_WRAPPER: ${{ matrix.host_sccache == 'true' && 'sccache' || '' }}
 
     steps:
       - name: Checkout
@@ -112,7 +128,7 @@ jobs:
           shared-key: pypi-${{ matrix.artifact }}
 
       - name: Set up sccache
-        if: matrix.sccache == 'true'
+        if: matrix.host_sccache == 'true'
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Build wheels
@@ -121,6 +137,7 @@ jobs:
           command: build
           rust-toolchain: ${{ steps.rust-version.outputs.version }}
           manylinux: ${{ matrix.manylinux }}
+          sccache: ${{ matrix.maturin_sccache }}
           before-script-linux: dnf install -y openssl-devel
           args: >-
             --release
@@ -129,6 +146,14 @@ jobs:
             --features extension-module
             --compatibility pypi
             -i ${{ matrix.interpreter }}
+
+      - name: Reset Linux cache ownership
+        if: matrix.maturin_sccache == 'true'
+        run: |
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          if [ -d target ]; then
+            sudo chown -R "$USER:$(id -gn)" target
+          fi
 
       - name: Set up smoke-test Python
         uses: actions/setup-python@v6
