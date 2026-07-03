@@ -750,17 +750,23 @@ fn replace_swap_sql(
             "@LockTimeout = 0;\n",
             "    IF @delta_funnel_lock_result < 0\n",
             "        THROW 51000, 'DeltaFunnel replace lock was not acquired', 1;\n",
-            "    IF OBJECT_ID({final_object}, N'U') IS NULL\n",
-            "        THROW 51001, 'DeltaFunnel replace target table is missing', 1;\n",
             "    IF OBJECT_ID({staging_object}, N'U') IS NULL\n",
             "        THROW 51002, 'DeltaFunnel replace staging table is missing', 1;\n",
             "    IF OBJECT_ID({backup_object}, N'U') IS NOT NULL\n",
             "        THROW 51003, 'DeltaFunnel replace backup table already exists', 1;\n",
-            "    EXEC sys.sp_rename @objname = {final_object}, ",
+            "    IF OBJECT_ID({final_object}, N'U') IS NOT NULL\n",
+            "    BEGIN\n",
+            "        EXEC sys.sp_rename @objname = {final_object}, ",
             "@newname = {backup_table_name}, @objtype = 'OBJECT';\n",
-            "    EXEC sys.sp_rename @objname = {staging_object}, ",
+            "        EXEC sys.sp_rename @objname = {staging_object}, ",
             "@newname = {final_table_name}, @objtype = 'OBJECT';\n",
-            "    DROP TABLE {backup_table};\n",
+            "        DROP TABLE {backup_table};\n",
+            "    END\n",
+            "    ELSE\n",
+            "    BEGIN\n",
+            "        EXEC sys.sp_rename @objname = {staging_object}, ",
+            "@newname = {final_table_name}, @objtype = 'OBJECT';\n",
+            "    END\n",
             "    COMMIT TRANSACTION;\n",
             "END TRY\n",
             "BEGIN CATCH\n",
@@ -1718,6 +1724,9 @@ mod tests {
         assert!(sql.contains("@LockOwner = 'Transaction'"));
         assert!(sql.contains("@LockTimeout = 0"));
         assert!(sql.contains("ROLLBACK TRANSACTION;"));
+        assert!(!sql.contains("replace target table is missing"));
+        assert!(sql.contains("IF OBJECT_ID(N'[dbo].[orders]', N'U') IS NOT NULL"));
+        assert!(sql.contains("ELSE"));
         assert!(sql.contains(
             "EXEC sys.sp_rename @objname = N'[dbo].[orders]', @newname = N'orders__df_backup_0', @objtype = 'OBJECT';"
         ));
