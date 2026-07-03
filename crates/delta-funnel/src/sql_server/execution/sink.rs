@@ -1589,6 +1589,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replace_empty_stream_swaps_after_zero_row_validation() -> Result<(), DeltaFunnelError>
+    {
+        let output_plan = output_plan_with_load_mode(LoadMode::Replace)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_count(0);
+        let batches = stream::empty::<Result<RecordBatch, DeltaFunnelError>>();
+
+        let report = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await?;
+
+        assert_eq!(report.load_mode(), LoadMode::Replace);
+        assert_eq!(report.output_row_count(), RowCount::exact(0));
+        assert_eq!(report.target_row_count(), RowCount::exact(0));
+        assert_eq!(report.stats().rows_written(), 0);
+        assert_eq!(report.stats().batches_written(), 0);
+        assert_eq!(report.validation_status(), ValidationStatus::passed());
+        assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotAttempted);
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATION_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            SWAP_TARGET_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "initialize",
+                "finish",
+                "count target rows",
+                "swap"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn replace_validation_failure_cleans_up_staging_without_swap()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_with_load_mode(LoadMode::Replace)?;

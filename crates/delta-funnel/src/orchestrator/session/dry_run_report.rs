@@ -884,7 +884,7 @@ mod tests {
         assert!(report.target_lifecycle_plan().create_table_sql_required());
         assert_eq!(
             report.target_lifecycle_plan().expected_target_state(),
-            crate::MssqlTargetTableState::Exists
+            crate::MssqlTargetTableState::ExistsOrAbsent
         );
         assert!(!report.sql_server_contacted());
         assert!(!report.row_production_started());

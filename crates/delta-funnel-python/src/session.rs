@@ -2078,6 +2078,76 @@ union all select cast(902 as bigint) as order_id",),
     }
 
     #[test]
+    #[ignore = "runs through cargo xtask sqlserver-test"]
+    fn write_all_execute_writes_replace_empty_output_to_missing_target() -> TestResult<()> {
+        let Some(config) = MssqlIntegrationConfig::from_env() else {
+            return Ok(());
+        };
+        let table = unique_mssql_table_name(&config.schema)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let tables = [&table];
+
+        runtime.block_on(drop_tables(&config, &tables))?;
+        let write_result = Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session_kwargs = PyDict::new(py);
+            session_kwargs.set_item(
+                "default_mssql_connection_string",
+                config.connection_string.as_str(),
+            )?;
+            let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+            let source = session.call_method(
+                "table_from_sql",
+                ("select cast(901 as bigint) as order_id where 1 = 0",),
+                None,
+            )?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("schema", config.schema.as_str())?;
+            kwargs.set_item("table", table.table().as_str())?;
+            kwargs.set_item("load_mode", "replace")?;
+            kwargs.set_item("name", "empty_replace_output")?;
+            let spec = source.call_method("to_mssql", (), Some(&kwargs))?;
+            let outputs = PyList::new(py, [&spec])?;
+
+            let report = session.call_method("write_all", (outputs,), None)?;
+            let report = report.cast::<PyDict>()?;
+            assert!(required_item(report, "all_succeeded")?.extract::<bool>()?);
+
+            let workflow = required_item(report, "workflow")?;
+            let workflow = workflow.cast::<PyDict>()?;
+            let outputs = required_item(workflow, "outputs")?;
+            let outputs = outputs.cast::<PyList>()?;
+            assert_eq!(outputs.len(), 1);
+            let output = outputs.get_item(0)?;
+            let output = output.cast::<PyDict>()?;
+            assert_succeeded_output(output, "empty_replace_output", "context_default", 0)?;
+            assert_eq!(
+                required_item(output, "load_mode")?.extract::<String>()?,
+                "replace"
+            );
+
+            Ok::<(), PyErr>(())
+        });
+        let result = match write_result {
+            Ok(()) => runtime.block_on(assert_target_exists_with_zero_rows(&config, &table)),
+            Err(write_error) => Err(Box::new(write_error) as Box<dyn Error + Send + Sync>),
+        };
+        let cleanup_result = runtime.block_on(drop_tables(&config, &tables));
+
+        match (result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_error), Ok(())) => Err(write_error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(write_error), Err(cleanup_error)) => {
+                Err(format!("write failed: {write_error}; cleanup failed: {cleanup_error}").into())
+            }
+        }
+    }
+
+    #[test]
     fn write_all_dry_run_rejects_missing_connection() -> PyResult<()> {
         Python::attach(|py| {
             let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
@@ -3158,6 +3228,25 @@ IF NOT EXISTS (SELECT 1 FROM {table} WHERE [order_id] = {second_id})
     THROW 51012, 'replace target second row missing', 1;
 IF EXISTS (SELECT 1 FROM {table} WHERE [order_id] NOT IN ({first_id}, {second_id}))
     THROW 51013, 'replace target kept unexpected rows', 1;",
+                table = table.quoted_sql(),
+            ))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn assert_target_exists_with_zero_rows(
+        config: &MssqlIntegrationConfig,
+        table: &MssqlTableName,
+    ) -> TestResult<()> {
+        let mut client = connect_mssql_client_from_ado_string(&config.connection_string).await?;
+        client
+            .execute_statement(&format!(
+                "\
+IF OBJECT_ID(N'{table}', N'U') IS NULL
+    THROW 51014, 'replace target table was not created', 1;
+IF (SELECT COUNT(*) FROM {table}) <> 0
+    THROW 51015, 'replace target row count mismatch', 1;",
                 table = table.quoted_sql(),
             ))
             .await?;

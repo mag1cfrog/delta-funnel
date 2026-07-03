@@ -197,20 +197,10 @@ where
     )?;
     let final_table_name =
         table_name_from_target(output_plan.output_name(), output_plan.target_table())?;
-    let final_exists = client
+    client
         .table_exists(&final_table_name)
         .await
         .map_err(|source| prepare_target_lifecycle_error(output_plan, source.to_string()))?;
-
-    if !final_exists {
-        return Err(prepare_target_lifecycle_error(
-            output_plan,
-            format!(
-                "replace target table {} does not exist",
-                final_table_name.quoted_sql()
-            ),
-        ));
-    }
 
     let staging_table_name = available_replace_staging_table(output_plan, client).await?;
     let create_table_sql =
@@ -760,17 +750,23 @@ fn replace_swap_sql(
             "@LockTimeout = 0;\n",
             "    IF @delta_funnel_lock_result < 0\n",
             "        THROW 51000, 'DeltaFunnel replace lock was not acquired', 1;\n",
-            "    IF OBJECT_ID({final_object}, N'U') IS NULL\n",
-            "        THROW 51001, 'DeltaFunnel replace target table is missing', 1;\n",
             "    IF OBJECT_ID({staging_object}, N'U') IS NULL\n",
             "        THROW 51002, 'DeltaFunnel replace staging table is missing', 1;\n",
             "    IF OBJECT_ID({backup_object}, N'U') IS NOT NULL\n",
             "        THROW 51003, 'DeltaFunnel replace backup table already exists', 1;\n",
-            "    EXEC sys.sp_rename @objname = {final_object}, ",
+            "    IF OBJECT_ID({final_object}, N'U') IS NOT NULL\n",
+            "    BEGIN\n",
+            "        EXEC sys.sp_rename @objname = {final_object}, ",
             "@newname = {backup_table_name}, @objtype = 'OBJECT';\n",
-            "    EXEC sys.sp_rename @objname = {staging_object}, ",
+            "        EXEC sys.sp_rename @objname = {staging_object}, ",
             "@newname = {final_table_name}, @objtype = 'OBJECT';\n",
-            "    DROP TABLE {backup_table};\n",
+            "        DROP TABLE {backup_table};\n",
+            "    END\n",
+            "    ELSE\n",
+            "    BEGIN\n",
+            "        EXEC sys.sp_rename @objname = {staging_object}, ",
+            "@newname = {final_table_name}, @objtype = 'OBJECT';\n",
+            "    END\n",
             "    COMMIT TRANSACTION;\n",
             "END TRY\n",
             "BEGIN CATCH\n",
@@ -1340,31 +1336,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_preparation_fails_when_final_target_is_absent() -> Result<(), DeltaFunnelError>
-    {
+    async fn replace_preparation_creates_staging_when_final_target_is_absent()
+    -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan(
             "orders_output",
             LoadMode::Replace,
             MssqlTargetTable::new("dbo", "orders")?,
         )?;
         let mut client = RecordingLifecycleClient {
-            existence_results: vec![false],
+            existence_results: vec![false, false],
+            rows_affected: vec![0],
             ..RecordingLifecycleClient::default()
         };
 
-        let error = prepare_mssql_replace_target(&output_plan, &mut client)
-            .await
-            .err()
-            .ok_or_else(|| DeltaFunnelError::Config {
-                message: "expected absent replace target error".to_owned(),
-            })?;
+        let prepared = prepare_mssql_replace_target(&output_plan, &mut client).await?;
 
-        assert_prepare_target_lifecycle_error(
-            error,
-            "replace target table [dbo].[orders] does not exist",
-            MssqlTargetCleanupStatus::NotAttempted,
-        )?;
-        assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
+        assert_eq!(prepared.quoted_table_sql(), "[dbo].[orders__df_replace_0]");
+        assert_eq!(
+            prepared.report().action(),
+            MssqlPreparedTargetAction::CreatedStagingTable
+        );
+        assert_eq!(
+            client.calls,
+            vec![
+                "probe [dbo].[orders]",
+                "probe [dbo].[orders__df_replace_0]",
+                "execute CREATE TABLE [dbo].[orders__df_replace_0] (\n    [order_id] bigint NOT NULL,\n    [status] nvarchar(max) NULL\n);"
+            ]
+        );
         Ok(())
     }
 
@@ -1700,7 +1699,7 @@ mod tests {
         assert_eq!(report.load_mode(), LoadMode::Replace);
         assert_eq!(
             report.expected_target_state(),
-            MssqlTargetTableState::Exists
+            MssqlTargetTableState::ExistsOrAbsent
         );
         assert_eq!(
             report.action(),
@@ -1725,6 +1724,9 @@ mod tests {
         assert!(sql.contains("@LockOwner = 'Transaction'"));
         assert!(sql.contains("@LockTimeout = 0"));
         assert!(sql.contains("ROLLBACK TRANSACTION;"));
+        assert!(!sql.contains("replace target table is missing"));
+        assert!(sql.contains("IF OBJECT_ID(N'[dbo].[orders]', N'U') IS NOT NULL"));
+        assert!(sql.contains("ELSE"));
         assert!(sql.contains(
             "EXEC sys.sp_rename @objname = N'[dbo].[orders]', @newname = N'orders__df_backup_0', @objtype = 'OBJECT';"
         ));
