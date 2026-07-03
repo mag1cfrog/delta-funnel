@@ -12,7 +12,9 @@ name = "delta-funnel-python"
 release = true
 publish = false
 git_only = true
-git_tag_name = "v{{ version }}"
+# The Python bindings are not published or tagged separately. Use the real
+# crate tag family so release-plz starts from the latest crate release.
+git_tag_name = "delta-funnel-v{{ version }}"
 git_tag_enable = false
 git_release_enable = false
 changelog_update = false
