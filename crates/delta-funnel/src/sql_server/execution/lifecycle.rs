@@ -197,20 +197,10 @@ where
     )?;
     let final_table_name =
         table_name_from_target(output_plan.output_name(), output_plan.target_table())?;
-    let final_exists = client
+    client
         .table_exists(&final_table_name)
         .await
         .map_err(|source| prepare_target_lifecycle_error(output_plan, source.to_string()))?;
-
-    if !final_exists {
-        return Err(prepare_target_lifecycle_error(
-            output_plan,
-            format!(
-                "replace target table {} does not exist",
-                final_table_name.quoted_sql()
-            ),
-        ));
-    }
 
     let staging_table_name = available_replace_staging_table(output_plan, client).await?;
     let create_table_sql =
@@ -1340,31 +1330,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_preparation_fails_when_final_target_is_absent() -> Result<(), DeltaFunnelError>
-    {
+    async fn replace_preparation_creates_staging_when_final_target_is_absent()
+    -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan(
             "orders_output",
             LoadMode::Replace,
             MssqlTargetTable::new("dbo", "orders")?,
         )?;
         let mut client = RecordingLifecycleClient {
-            existence_results: vec![false],
+            existence_results: vec![false, false],
+            rows_affected: vec![0],
             ..RecordingLifecycleClient::default()
         };
 
-        let error = prepare_mssql_replace_target(&output_plan, &mut client)
-            .await
-            .err()
-            .ok_or_else(|| DeltaFunnelError::Config {
-                message: "expected absent replace target error".to_owned(),
-            })?;
+        let prepared = prepare_mssql_replace_target(&output_plan, &mut client).await?;
 
-        assert_prepare_target_lifecycle_error(
-            error,
-            "replace target table [dbo].[orders] does not exist",
-            MssqlTargetCleanupStatus::NotAttempted,
-        )?;
-        assert_eq!(client.calls, vec!["probe [dbo].[orders]".to_owned()]);
+        assert_eq!(prepared.quoted_table_sql(), "[dbo].[orders__df_replace_0]");
+        assert_eq!(
+            prepared.report().action(),
+            MssqlPreparedTargetAction::CreatedStagingTable
+        );
+        assert_eq!(
+            client.calls,
+            vec![
+                "probe [dbo].[orders]",
+                "probe [dbo].[orders__df_replace_0]",
+                "execute CREATE TABLE [dbo].[orders__df_replace_0] (\n    [order_id] bigint NOT NULL,\n    [status] nvarchar(max) NULL\n);"
+            ]
+        );
         Ok(())
     }
 
