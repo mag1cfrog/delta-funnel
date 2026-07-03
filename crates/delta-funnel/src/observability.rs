@@ -494,7 +494,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fmt,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, MutexGuard},
     };
 
     use super::*;
@@ -505,8 +505,42 @@ mod tests {
     };
     use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*, registry::LookupSpan};
 
+    static TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TracingTestGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for TracingTestGuard {
+        fn drop(&mut self) {
+            tracing::callsite::rebuild_interest_cache();
+        }
+    }
+
+    fn tracing_test_guard() -> TracingTestGuard {
+        let guard = match TRACING_TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tracing::callsite::rebuild_interest_cache();
+        TracingTestGuard { _guard: guard }
+    }
+
+    fn capture_events(run: impl FnOnce()) -> CapturedEvents {
+        let _guard = tracing_test_guard();
+        let events = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: events.clone(),
+        });
+
+        tracing::subscriber::with_default(subscriber, run);
+
+        events
+    }
+
     #[test]
     fn observability_event_helpers_do_not_require_subscriber() -> Result<(), DeltaFunnelError> {
+        let _guard = tracing_test_guard();
         workflow_started(RunMode::Execute, 2);
         workflow_started(RunMode::DryRun, 0);
         workflow_finished(RunMode::Execute, 2, &Ok(()));
@@ -628,12 +662,7 @@ mod tests {
 
     #[test]
     fn scoped_capture_records_workflow_event_fields() {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
-
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_events(|| {
             workflow_started(RunMode::Execute, 2);
             workflow_finished(RunMode::Execute, 2, &Ok(()));
             workflow_finished::<()>(
@@ -662,12 +691,7 @@ mod tests {
 
     #[test]
     fn scoped_capture_records_workflow_span_fields() {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
-
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_events(|| {
             let span = workflow_span(RunMode::Execute, 2);
             let _guard = span.enter();
             workflow_started(RunMode::Execute, 2);
@@ -690,13 +714,9 @@ mod tests {
 
     #[test]
     fn scoped_capture_records_output_event_fields() -> Result<(), DeltaFunnelError> {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
         let target_table = MssqlTargetTable::new("dbo", "orders")?;
 
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_events(|| {
             output_started("orders_output", &target_table, LoadMode::AppendExisting);
             output_completed("orders_output", &target_table, LoadMode::AppendExisting);
             output_failed(
@@ -732,13 +752,9 @@ mod tests {
 
     #[test]
     fn scoped_capture_records_output_span_fields() -> Result<(), DeltaFunnelError> {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
         let target_table = MssqlTargetTable::new("dbo", "orders")?;
 
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_events(|| {
             let span = output_span("orders_output", &target_table, LoadMode::AppendExisting);
             let _guard = span.enter();
             output_started("orders_output", &target_table, LoadMode::AppendExisting);
@@ -752,13 +768,9 @@ mod tests {
 
     #[test]
     fn scoped_capture_records_nested_downstream_event_scope() -> Result<(), DeltaFunnelError> {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
         let target_table = MssqlTargetTable::new("dbo", "orders")?;
 
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_events(|| {
             let workflow_span = workflow_span(RunMode::Execute, 1);
             let _workflow_guard = workflow_span.enter();
             let output_span = output_span("orders_output", &target_table, LoadMode::CreateAndLoad);
@@ -781,13 +793,9 @@ mod tests {
     #[test]
     fn scoped_capture_records_datafusion_batch_stream_event_fields() -> Result<(), DeltaFunnelError>
     {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
         let target_table = MssqlTargetTable::new("dbo", "orders")?;
 
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_events(|| {
             datafusion_batch_stream_started(
                 "orders_output",
                 &target_table,
@@ -834,12 +842,7 @@ mod tests {
 
     #[test]
     fn scoped_capture_records_source_phase_event_fields() {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
-
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_events(|| {
             source_loading_started("orders", None);
             source_loading_completed("orders", 7, None);
             protocol_preflight_started("orders", 7);
@@ -878,12 +881,7 @@ mod tests {
 
     #[test]
     fn scoped_capture_records_source_loading_s3_auth_mode_hint() {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
-
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_events(|| {
             source_loading_started("orders", Some("implicit_provider_chain"));
             source_loading_completed("orders", 7, Some("implicit_provider_chain"));
             source_loading_failed(
@@ -914,13 +912,9 @@ mod tests {
 
     #[test]
     fn scoped_capture_records_validation_event_fields() -> Result<(), DeltaFunnelError> {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
         let target_table = MssqlTargetTable::new("dbo", "orders")?;
 
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_events(|| {
             validation_started(&target_table, LoadMode::CreateAndLoad);
             validation_finished(
                 &target_table,
@@ -963,13 +957,9 @@ mod tests {
 
     #[test]
     fn scoped_capture_redacts_sensitive_error_summary_text() -> Result<(), DeltaFunnelError> {
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
         let target_table = MssqlTargetTable::new("dbo", "orders")?;
 
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_events(|| {
             workflow_finished::<()>(
                 RunMode::Execute,
                 1,
