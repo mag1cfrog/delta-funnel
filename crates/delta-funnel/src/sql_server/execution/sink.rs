@@ -979,27 +979,32 @@ fn error_with_cleanup_failure(
     error: DeltaFunnelError,
     cleanup_error: DeltaFunnelError,
 ) -> DeltaFunnelError {
+    let cleanup_message = cleanup_error.to_string();
     match error {
         DeltaFunnelError::MssqlWritePhase { context, message } => {
             DeltaFunnelError::MssqlWritePhase {
-                context: Box::new(context_with_cleanup(
-                    output_plan,
-                    context.as_ref(),
-                    MssqlTargetCleanupStatus::Failed,
-                )),
-                message: format!("{message}; cleanup failed: {cleanup_error}"),
+                context: Box::new(
+                    context_with_cleanup(
+                        output_plan,
+                        context.as_ref(),
+                        MssqlTargetCleanupStatus::Failed,
+                    )
+                    .with_cleanup_error(&cleanup_message),
+                ),
+                message: format!("{message}; cleanup failed: {cleanup_message}"),
             }
         }
         DeltaFunnelError::MssqlBatchSchemaValidation { context, source } => {
-            DeltaFunnelError::MssqlWritePhase {
-                context: Box::new(context_with_cleanup(
-                    output_plan,
-                    context.as_ref(),
-                    MssqlTargetCleanupStatus::Failed,
-                )),
-                message: format!(
-                    "batch schema validation failed: {source}; cleanup failed: {cleanup_error}"
+            DeltaFunnelError::MssqlBatchSchemaValidation {
+                context: Box::new(
+                    context_with_cleanup(
+                        output_plan,
+                        context.as_ref(),
+                        MssqlTargetCleanupStatus::Failed,
+                    )
+                    .with_cleanup_error(cleanup_message),
                 ),
+                source,
             }
         }
         other => other,
@@ -1030,6 +1035,7 @@ fn context_with_cleanup(
         )
         .with_phase_timings(context.phase_timings().to_vec()),
     )
+    .with_diagnostics(context.diagnostics().to_vec())
 }
 
 #[cfg(test)]
@@ -2833,6 +2839,56 @@ mod tests {
         };
         assert_eq!(context.phase(), MssqlWritePhase::ValidateBatchSchema);
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert_eq!(
+            logged_events(&log)?,
+            vec!["prepare", "initialize", "cleanup CreatedTable"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_validation_failure_stays_primary_when_cleanup_fails()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::CreateAndLoad)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_cleanup(phase_error(
+            &output_plan,
+            MssqlWritePhase::Cleanup,
+            "cleanup failed",
+        ));
+        let batches = stream::iter(vec![Ok(invalid_orders_batch(1)?)]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_options(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected schema validation failure".to_owned(),
+        })?;
+        let display = error.to_string();
+
+        assert!(display.contains("validate batch schema"));
+        assert!(!display.contains("cleanup failed"));
+        let DeltaFunnelError::MssqlBatchSchemaValidation { context, .. } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MssqlBatchSchemaValidation error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::ValidateBatchSchema);
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Failed);
+        let cleanup_error = context.cleanup_error().unwrap_or_default();
+        assert!(cleanup_error.contains("cleanup failed"));
+        assert!(cleanup_error.contains("during cleanup"));
+        assert_eq!(context.diagnostics().len(), 1);
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::failed(),
+        )?;
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "cleanup CreatedTable"]

@@ -23,6 +23,7 @@ use crate::{
     report::sql_server::{
         MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
         MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
+        write::MssqlWriteDiagnostic,
     },
 };
 
@@ -363,13 +364,28 @@ fn mssql_batch_schema_validation_error(
     source: arrow_tiberius::Error,
     metrics: MssqlWriteReportMetrics,
 ) -> DeltaFunnelError {
+    let diagnostics = batch_validation_diagnostics(&source);
     DeltaFunnelError::MssqlBatchSchemaValidation {
-        context: Box::new(MssqlWriteFailureContext::from_output_plan_with_metrics(
-            output_plan,
-            MssqlWritePhase::ValidateBatchSchema,
-            metrics,
-        )),
+        context: Box::new(
+            MssqlWriteFailureContext::from_output_plan_with_metrics(
+                output_plan,
+                MssqlWritePhase::ValidateBatchSchema,
+                metrics,
+            )
+            .with_diagnostics(diagnostics),
+        ),
         source,
+    }
+}
+
+fn batch_validation_diagnostics(source: &arrow_tiberius::Error) -> Vec<MssqlWriteDiagnostic> {
+    match source {
+        arrow_tiberius::Error::ValueConversion { diagnostics } => diagnostics
+            .all()
+            .iter()
+            .map(MssqlWriteDiagnostic::from_arrow_tiberius)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -831,7 +847,8 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
     use arrow_tiberius::{
-        DiagnosticCode, PlanOptions, SchemaCheck, StringPolicy, WriteBackend, WriteOptions,
+        DiagnosticCode, DiagnosticSeverity, PlanOptions, SchemaCheck, StringPolicy, WriteBackend,
+        WriteOptions,
     };
     use datafusion::arrow::{
         array::{Int64Array, StringArray},
@@ -1115,6 +1132,20 @@ mod tests {
                 .map(|field| (field.index(), field.name())),
             expected_field
         );
+        assert_eq!(context.diagnostics().len(), 1);
+        let context_diagnostic = &context.diagnostics()[0];
+        assert_eq!(context_diagnostic.severity(), DiagnosticSeverity::Error);
+        assert_eq!(context_diagnostic.code(), DiagnosticCode::SchemaMismatch);
+        assert_eq!(
+            context_diagnostic
+                .field()
+                .map(|field| (field.index(), field.name())),
+            expected_field.map(|(index, name)| (u64::try_from(index).unwrap_or(u64::MAX), name))
+        );
+        let value = context.to_json_value();
+        assert_eq!(value["diagnostics"][0]["severity"], "error");
+        assert_eq!(value["diagnostics"][0]["code"], "schema_mismatch");
+        assert_eq!(value["cleanup_error"], serde_json::Value::Null);
         Ok(context)
     }
 
