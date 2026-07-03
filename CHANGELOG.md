@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.1.4...delta-funnel-v0.1.5) - 2026-07-03
+
+### Fixed
+
+- allow SQL Server replace writes to create missing targets
+
 ## [0.1.4](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.1.3...delta-funnel-v0.1.4) - 2026-07-03
 
 ### Fixed
