@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.1.2...delta-funnel-v0.1.3) - 2026-07-03
+
+### Fixed
+
+- expose SQL Server batch validation diagnostics in Python errors and reports
+
 ## [0.1.2](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.1.1...delta-funnel-v0.1.2) - 2026-07-02
 
 ### Added
