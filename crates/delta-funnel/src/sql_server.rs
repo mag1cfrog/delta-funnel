@@ -31,9 +31,10 @@ pub use planning::{
     MssqlFloatPolicy, MssqlLifecycleExecutionGuardrail, MssqlLifecycleGuardrailPolicy,
     MssqlLifecyclePlan, MssqlNanosecondPolicy, MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField,
     MssqlSchemaPlan, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTargetOutputPlan,
-    MssqlTargetTableState, MssqlTimezonePolicy, MssqlUInt64Policy, mssql_schema_diagnostic_reports,
-    plan_mssql_create_table_ddl, plan_mssql_lifecycle, plan_mssql_output_schema,
-    plan_mssql_target_for_output, plan_mssql_target_for_resolved_output, plan_mssql_target_output,
+    MssqlTargetTableState, MssqlTimestampPolicy, MssqlTimezonePolicy, MssqlUInt64Policy,
+    mssql_schema_diagnostic_reports, plan_mssql_create_table_ddl, plan_mssql_lifecycle,
+    plan_mssql_output_schema, plan_mssql_target_for_output, plan_mssql_target_for_resolved_output,
+    plan_mssql_target_output,
 };
 pub use target::{
     LoadMode, MssqlConnectionConfig, MssqlConnectionSource, MssqlConnectionSummary,
