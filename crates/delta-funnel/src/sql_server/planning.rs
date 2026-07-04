@@ -17,8 +17,9 @@ pub use output::{
 pub use schema::{
     MssqlBinaryPolicy, MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy,
     MssqlFloatPolicy, MssqlNanosecondPolicy, MssqlSchemaDiagnostic, MssqlSchemaDiagnosticField,
-    MssqlSchemaPlan, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTimezonePolicy,
-    MssqlUInt64Policy, mssql_schema_diagnostic_reports, plan_mssql_output_schema,
+    MssqlSchemaPlan, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTimestampPolicy,
+    MssqlTimezonePolicy, MssqlUInt64Policy, mssql_schema_diagnostic_reports,
+    plan_mssql_output_schema,
 };
 
 pub(super) use super::{

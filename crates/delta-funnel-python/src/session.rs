@@ -535,6 +535,9 @@ fn parse_schema_options(
             "timezone_policy" => {
                 options.timezone_policy = parse_timezone_policy(py, &value, key.as_str())?;
             }
+            "timestamp_policy" => {
+                options.timestamp_policy = parse_timestamp_policy(py, &value, key.as_str())?;
+            }
             "nanosecond_policy" => {
                 options.nanosecond_policy = parse_nanosecond_policy(py, &value, key.as_str())?;
             }
@@ -695,6 +698,42 @@ fn parse_nanosecond_policy(
     }
 }
 
+fn parse_timestamp_policy(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::MssqlTimestampPolicy> {
+    if let Ok(value) = value.cast::<PyDict>() {
+        let precision = single_usize_entry(py, value, option_name, "datetime2")?;
+        let precision = u8::try_from(precision).map_err(|_| {
+            config_py_error(
+                py,
+                "invalid_option_value",
+                format!("`{option_name}` datetime2 precision must be in 0..=7"),
+            )
+        })?;
+        if precision > 7 {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                format!("`{option_name}` datetime2 precision must be in 0..=7"),
+            ));
+        }
+        return Ok(delta_funnel::MssqlTimestampPolicy::DateTime2 { precision });
+    }
+
+    let value = option_string(py, value, option_name)?;
+    match value.as_str() {
+        "datetime" => Ok(delta_funnel::MssqlTimestampPolicy::DateTime),
+        "datetime2" => Ok(delta_funnel::MssqlTimestampPolicy::DateTime2 { precision: 7 }),
+        _ => Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("invalid `{option_name}` value `{value}`"),
+        )),
+    }
+}
+
 fn parse_uint64_policy(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
@@ -786,6 +825,24 @@ fn single_positive_usize_entry(
     option_name: &str,
     variant_name: &str,
 ) -> PyResult<usize> {
+    let value = single_usize_entry(py, value, option_name, variant_name)?;
+    if value == 0 {
+        return Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("`{option_name}` bounded length must be at least 1"),
+        ));
+    }
+
+    Ok(value)
+}
+
+fn single_usize_entry(
+    py: Python<'_>,
+    value: &Bound<'_, PyDict>,
+    option_name: &str,
+    variant_name: &str,
+) -> PyResult<usize> {
     if value.len() != 1 {
         return Err(config_py_error(
             py,
@@ -801,16 +858,7 @@ fn single_positive_usize_entry(
             format!("invalid `{option_name}` variant"),
         ));
     };
-    let value = usize_option(py, &raw_value, option_name)?;
-    if value == 0 {
-        return Err(config_py_error(
-            py,
-            "invalid_option_value",
-            format!("`{option_name}` bounded length must be at least 1"),
-        ));
-    }
-
-    Ok(value)
+    usize_option(py, &raw_value, option_name)
 }
 
 fn option_name(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -902,8 +950,8 @@ mod tests {
         DeltaProviderScanExecutionOptions, DryRunScanSummaryMode, MssqlBinaryPolicy,
         MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy, MssqlFloatPolicy,
         MssqlNanosecondPolicy, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTableName,
-        MssqlTimezonePolicy, MssqlUInt64Policy, QueryOptions, TargetValidationMode,
-        connect_mssql_client_from_ado_string,
+        MssqlTimestampPolicy, MssqlTimezonePolicy, MssqlUInt64Policy, QueryOptions,
+        TargetValidationMode, connect_mssql_client_from_ado_string,
     };
     use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError};
     use pyo3::prelude::*;
@@ -2866,6 +2914,44 @@ union all select cast(902 as bigint) as order_id",),
                 );
             }
 
+            let timestamp_policies = [
+                ("datetime", MssqlTimestampPolicy::DateTime),
+                (
+                    "datetime2",
+                    MssqlTimestampPolicy::DateTime2 { precision: 7 },
+                ),
+            ];
+            for (value, expected) in timestamp_policies {
+                let schema_options = PyDict::new(py);
+                schema_options.set_item("timestamp_policy", value)?;
+
+                let session =
+                    PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+
+                assert_eq!(
+                    session
+                        .inner
+                        .options()
+                        .mssql_schema_options()
+                        .timestamp_policy,
+                    expected
+                );
+            }
+
+            let timestamp_policy = PyDict::new(py);
+            timestamp_policy.set_item("datetime2", 3)?;
+            let schema_options = PyDict::new(py);
+            schema_options.set_item("timestamp_policy", timestamp_policy)?;
+            let session = PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+            assert_eq!(
+                session
+                    .inner
+                    .options()
+                    .mssql_schema_options()
+                    .timestamp_policy,
+                MssqlTimestampPolicy::DateTime2 { precision: 3 }
+            );
+
             let nanosecond_policies = [
                 ("reject_non_100ns", MssqlNanosecondPolicy::RejectNon100ns),
                 ("round_to_100ns", MssqlNanosecondPolicy::RoundTo100ns),
@@ -2991,6 +3077,7 @@ union all select cast(902 as bigint) as order_id",),
                 ("string_policy", "nvarchar"),
                 ("binary_policy", "varbinary"),
                 ("timezone_policy", "sometimes"),
+                ("timestamp_policy", "sometimes"),
                 ("nanosecond_policy", "round"),
                 ("uint64_policy", "decimal"),
                 ("decimal_policy", "normalize"),
@@ -3020,6 +3107,20 @@ union all select cast(902 as bigint) as order_id",),
             bad_string_policy.set_item("nvarchar", 0)?;
             let schema_options = PyDict::new(py);
             schema_options.set_item("string_policy", bad_string_policy)?;
+            let error =
+                match PySession::new(py, None, None, None, None, None, Some(&schema_options)) {
+                    Ok(_) => return Err(PyAssertionError::new_err("expected schema option error")),
+                    Err(error) => error,
+                };
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
+
+            let bad_timestamp_policy = PyDict::new(py);
+            bad_timestamp_policy.set_item("datetime2", 8)?;
+            let schema_options = PyDict::new(py);
+            schema_options.set_item("timestamp_policy", bad_timestamp_policy)?;
             let error =
                 match PySession::new(py, None, None, None, None, None, Some(&schema_options)) {
                     Ok(_) => return Err(PyAssertionError::new_err("expected schema option error")),

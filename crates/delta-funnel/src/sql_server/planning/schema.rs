@@ -13,7 +13,8 @@ pub use arrow_tiberius::{
     Decimal256Policy as MssqlDecimal256Policy, DecimalPolicy as MssqlDecimalPolicy,
     FloatPolicy as MssqlFloatPolicy, NanosecondPolicy as MssqlNanosecondPolicy,
     PlanOptions as MssqlSchemaPlanOptions, StringPolicy as MssqlStringPolicy,
-    TimezonePolicy as MssqlTimezonePolicy, UInt64Policy as MssqlUInt64Policy,
+    TimestampPolicy as MssqlTimestampPolicy, TimezonePolicy as MssqlTimezonePolicy,
+    UInt64Policy as MssqlUInt64Policy,
 };
 
 use crate::{
@@ -500,6 +501,7 @@ mod tests {
             string_policy: MssqlStringPolicy::NVarChar(64),
             binary_policy: MssqlBinaryPolicy::VarBinary(128),
             timezone_policy: MssqlTimezonePolicy::DateTimeOffset,
+            timestamp_policy: MssqlTimestampPolicy::DateTime,
             nanosecond_policy: MssqlNanosecondPolicy::RoundTo100ns,
             uint64_policy: MssqlUInt64Policy::Decimal20_0,
             decimal_policy: MssqlDecimalPolicy::NormalizeNegativeScale,
@@ -511,6 +513,7 @@ mod tests {
         assert_eq!(options.string_policy, MssqlStringPolicy::NVarChar(64));
         assert_eq!(options.binary_policy, MssqlBinaryPolicy::VarBinary(128));
         assert_eq!(options.timezone_policy, MssqlTimezonePolicy::DateTimeOffset);
+        assert_eq!(options.timestamp_policy, MssqlTimestampPolicy::DateTime);
         assert_eq!(
             options.nanosecond_policy,
             MssqlNanosecondPolicy::RoundTo100ns
@@ -523,6 +526,25 @@ mod tests {
         assert_eq!(options.decimal256_policy, MssqlDecimal256Policy::Reject);
         assert_eq!(options.float_policy, MssqlFloatPolicy::RejectNonFinite);
         assert_eq!(options.date64_policy, MssqlDate64Policy::TimestampDateTime2);
+    }
+
+    #[test]
+    fn timestamp_policy_can_plan_legacy_datetime() -> Result<(), DeltaFunnelError> {
+        let schema = Schema::new(vec![Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]);
+        let target = resolved_target()?;
+        let options = MssqlSchemaPlanOptions {
+            timestamp_policy: MssqlTimestampPolicy::DateTime,
+            ..PlanOptions::default()
+        };
+
+        let plan = plan_mssql_output_schema(&schema, &target, options)?;
+
+        assert_eq!(plan.mappings()[0].mssql().ty(), &MssqlType::DateTime);
+        Ok(())
     }
 
     #[test]
