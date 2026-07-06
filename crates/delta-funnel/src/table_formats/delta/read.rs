@@ -11,7 +11,7 @@ use crate::{
 use delta_kernel::arrow::array::BooleanArray;
 use snafu::ResultExt;
 
-use super::{DeltaStorageOptions, KernelPhysicalToLogicalTransform, kernel};
+use super::{DeltaKernelPredicate, DeltaStorageOptions, KernelPhysicalToLogicalTransform, kernel};
 
 /// Kernel scan schema state required to read physical Parquet data.
 #[allow(dead_code)]
@@ -85,6 +85,15 @@ impl KernelScanReadSchema {
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn with_provider_enforced_physical_predicate_rows(mut self) -> Self {
+        self.enforce_physical_predicate_rows = true;
+        self
+    }
+
+    pub(crate) fn with_provider_enforced_physical_predicate(
+        mut self,
+        predicate: &DeltaKernelPredicate,
+    ) -> Self {
+        self.physical_predicate = Some(predicate.as_ref().clone());
         self.enforce_physical_predicate_rows = true;
         self
     }

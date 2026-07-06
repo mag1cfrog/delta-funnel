@@ -61,6 +61,8 @@ pub(crate) struct ProviderScanPlan {
     pub(crate) partition_columns: Vec<String>,
     /// Kernel predicate passed to delta_kernel scan planning for partition pruning.
     pub(crate) kernel_partition_predicate: Option<DeltaKernelPredicate>,
+    /// Kernel predicate safe to evaluate against physical Parquet rows.
+    pub(crate) provider_enforced_row_predicate: Option<DeltaKernelPredicate>,
     kernel_scan: ProjectedDeltaScan,
 }
 
@@ -95,6 +97,7 @@ pub(crate) struct ProviderScanPlanParts {
     pub(crate) pushed_filter_plan: DeltaFilterPushdownPlan,
     pub(crate) partition_columns: Vec<String>,
     pub(crate) kernel_partition_predicate: Option<DeltaKernelPredicate>,
+    pub(crate) provider_enforced_row_predicate: Option<DeltaKernelPredicate>,
     pub(crate) kernel_scan: ProjectedDeltaScan,
 }
 
@@ -111,6 +114,7 @@ impl ProviderScanPlan {
             pushed_filter_plan: parts.pushed_filter_plan,
             partition_columns: parts.partition_columns,
             kernel_partition_predicate: parts.kernel_partition_predicate,
+            provider_enforced_row_predicate: parts.provider_enforced_row_predicate,
             kernel_scan: parts.kernel_scan,
         }
     }

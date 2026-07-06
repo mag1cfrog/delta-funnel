@@ -24,7 +24,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::DeltaFunnelError;
 use crate::error::DeltaScanFileReadPhase;
-use crate::table_formats::KernelScanReadSchema;
+use crate::table_formats::{DeltaKernelPredicate, KernelScanReadSchema};
 
 use super::super::planning::dynamic_filters::{
     DeltaDynamicFilterOutcome, DeltaDynamicFilterPlan, DeltaRetainedDynamicFilter,
@@ -283,9 +283,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
             self.scan_plan.kernel_scan().read_schema(),
             &scan_partition.file_tasks,
             self.execution_options.reader_backend,
-            self.scan_plan
-                .pushed_filter_plan
-                .has_provider_enforced_row_predicate(),
+            self.scan_plan.provider_enforced_row_predicate.as_ref(),
         )?;
 
         match self.execution_options.reader_backend {
@@ -533,12 +531,12 @@ fn partition_read_schema(
     read_schema: KernelScanReadSchema,
     file_tasks: &[DeltaScanFileTask],
     reader_backend: DeltaProviderReaderBackend,
-    enforce_physical_predicate_rows: bool,
+    provider_enforced_row_predicate: Option<&DeltaKernelPredicate>,
 ) -> DataFusionResult<KernelScanReadSchema> {
     let has_deletion_vector_tasks = file_tasks
         .iter()
         .any(|task| task.deletion_vector.is_present());
-    if enforce_physical_predicate_rows
+    if provider_enforced_row_predicate.is_some()
         && has_deletion_vector_tasks
         && !reader_backend.supports_dv_row_index_predicate_reads()
     {
@@ -548,8 +546,8 @@ fn partition_read_schema(
         ));
     }
 
-    let read_schema = if enforce_physical_predicate_rows {
-        read_schema.with_provider_enforced_physical_predicate_rows()
+    let read_schema = if let Some(predicate) = provider_enforced_row_predicate {
+        read_schema.with_provider_enforced_physical_predicate(predicate)
     } else {
         read_schema
     };
@@ -6429,7 +6427,8 @@ mod tests {
             storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
-        let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
+        let scan =
+            build_projected_predicated_stats_delta_scan(&source, None, Some(predicate.clone()))?;
         let sync_read_limiter =
             DeltaProviderSyncReadLimiter::new(DeltaProviderScanExecutionOptions::default(), 1);
         let reader = Arc::new(FakePartitionFileReader {
@@ -6485,7 +6484,8 @@ mod tests {
             storage_options: Default::default(),
         })?;
         let predicate = datafusion_expr_to_kernel_predicate(&col("id").gt(lit(1_i32)))?;
-        let scan = build_projected_predicated_stats_delta_scan(&source, None, Some(predicate))?;
+        let scan =
+            build_projected_predicated_stats_delta_scan(&source, None, Some(predicate.clone()))?;
         let read_schema = scan.read_schema();
         let mut dv_task = fake_task("part-00000.parquet");
         dv_task.deletion_vector = fake_deletion_vector_metadata();
@@ -6496,7 +6496,7 @@ mod tests {
                 read_schema.clone(),
                 &[fake_task("part-00000.parquet")],
                 DeltaProviderReaderBackend::OfficialKernel,
-                false,
+                None,
             )?
             .has_physical_predicate()
         );
@@ -6505,7 +6505,7 @@ mod tests {
                 read_schema.clone(),
                 std::slice::from_ref(&dv_task),
                 DeltaProviderReaderBackend::OfficialKernel,
-                false,
+                None,
             )?
             .has_physical_predicate()
         );
@@ -6514,7 +6514,7 @@ mod tests {
                 read_schema.clone(),
                 std::slice::from_ref(&dv_task),
                 DeltaProviderReaderBackend::NativeAsync,
-                false,
+                None,
             )?
             .has_physical_predicate()
         );
@@ -6522,7 +6522,7 @@ mod tests {
             read_schema,
             &[dv_task],
             DeltaProviderReaderBackend::OfficialKernel,
-            true,
+            Some(&predicate),
         ) {
             Ok(_) => {
                 return Err("exact DV physical predicate must not be silently dropped".into());

@@ -172,6 +172,11 @@ impl DeltaKernelPredicate {
     }
 
     #[must_use]
+    pub(crate) fn from_ref(predicate: PredicateRef) -> Self {
+        Self { inner: predicate }
+    }
+
+    #[must_use]
     pub(crate) fn into_inner(self) -> PredicateRef {
         self.inner
     }
