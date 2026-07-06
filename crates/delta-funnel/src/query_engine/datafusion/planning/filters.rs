@@ -192,6 +192,21 @@ impl DeltaFilterPushdownPlan {
     }
 
     #[must_use]
+    pub(crate) fn provider_enforced_row_predicate(&self) -> Option<DeltaKernelPredicate> {
+        DeltaKernelPredicate::and_from(self.decisions.iter().filter_map(|decision| {
+            let filter = decision.kernel_scan_filter.as_ref()?;
+            if decision.outcome == DeltaFilterPushdownOutcome::Exact
+                && filter.kind == KernelScanFilterKind::DataStats
+                && filter.native_row_predicate_exact_candidate
+            {
+                Some(filter.kernel_predicate.clone())
+            } else {
+                None
+            }
+        }))
+    }
+
+    #[must_use]
     pub(crate) fn with_native_row_predicate_exactness(self) -> Self {
         let decisions = self
             .decisions

@@ -167,6 +167,10 @@ impl DeltaTableProvider {
             self.build_kernel_partition_predicate(&pushed_filter_plan)?;
         let kernel_projected_column_names =
             Self::kernel_projected_column_names(projected_column_names, &pushed_filter_plan);
+        let provider_enforced_row_predicate = self.build_provider_enforced_row_predicate(
+            &pushed_filter_plan,
+            kernel_projected_column_names.as_deref(),
+        )?;
         let kernel_scan = self.build_kernel_scan(
             kernel_projected_column_names.as_deref(),
             kernel_partition_predicate.clone(),
@@ -184,6 +188,7 @@ impl DeltaTableProvider {
             pushed_filter_plan,
             partition_columns,
             kernel_partition_predicate,
+            provider_enforced_row_predicate,
             kernel_scan,
         }))
     }
@@ -295,6 +300,35 @@ impl DeltaTableProvider {
             .collect::<Vec<_>>();
 
         Ok(DeltaKernelPredicate::and_from(predicates))
+    }
+
+    fn build_provider_enforced_row_predicate(
+        &self,
+        pushed_filter_plan: &DeltaFilterPushdownPlan,
+        projected_column_names: Option<&[String]>,
+    ) -> Result<Option<DeltaKernelPredicate>, DeltaFunnelError> {
+        if !pushed_filter_plan.has_provider_enforced_row_predicate() {
+            return Ok(None);
+        }
+
+        let Some(predicate) = pushed_filter_plan.provider_enforced_row_predicate() else {
+            return Ok(None);
+        };
+
+        let physical_predicate = self
+            .build_kernel_scan(projected_column_names, Some(predicate), false)?
+            .physical_predicate();
+        if physical_predicate.is_none() {
+            return DeltaScanFilterSnafu {
+                source_name: self.source_name().to_owned(),
+                table_uri: self.source.table_uri().to_owned(),
+                reason: "exact native row predicate did not produce a physical predicate"
+                    .to_owned(),
+            }
+            .fail();
+        }
+
+        Ok(physical_predicate)
     }
 
     /// Expands the kernel scan schema with accepted predicate columns.

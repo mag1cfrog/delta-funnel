@@ -776,6 +776,86 @@ async fn native_async_provider_scan_applies_dv_after_predicate_pruning()
 }
 
 #[tokio::test]
+async fn native_async_split_data_and_partition_filters_do_not_row_filter_partition_column()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let table = RealParquetDeltaTable::new_with_two_partition_values(
+        "native-async-split-data-partition-filter",
+    )?;
+    register_native_delta_source(&ctx, "orders", table.path().to_string_lossy().to_string())?;
+
+    let partition_only = ctx
+        .sql("select id, region from orders where region = 'us-west' order by id")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(
+        datafusion::arrow::util::pretty::pretty_format_batches(&partition_only)?.to_string(),
+        [
+            "+----+---------+",
+            "| id | region  |",
+            "+----+---------+",
+            "| 1  | us-west |",
+            "| 2  | us-west |",
+            "+----+---------+",
+        ]
+        .join("\n")
+    );
+
+    let dataframe = ctx
+        .sql(
+            "select id, customer_name, region from orders \
+             where id = 1 and region = 'us-west' order by id",
+        )
+        .await?;
+    let physical_plan = dataframe.clone().create_physical_plan().await?;
+    let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut scans = Vec::new();
+    find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+    assert!(!plan_display.contains("FilterExec"), "{plan_display}");
+    assert_eq!(scans.len(), 1, "{plan_display}");
+    assert_eq!(scans[0].scan_plan().pushed_filter_plan.exact_count, 2);
+    assert_eq!(
+        scans[0]
+            .scan_plan()
+            .pushed_filter_plan
+            .residual_filter_count,
+        0
+    );
+    assert!(
+        scans[0]
+            .scan_plan()
+            .pushed_filter_plan
+            .has_provider_enforced_row_predicate()
+    );
+    assert!(
+        scans[0]
+            .scan_plan()
+            .provider_enforced_row_predicate
+            .is_some()
+    );
+
+    let result = dataframe.collect().await?;
+
+    assert_eq!(
+        datafusion::arrow::util::pretty::pretty_format_batches(&result)?.to_string(),
+        [
+            "+----+---------------+---------+",
+            "| id | customer_name | region  |",
+            "+----+---------------+---------+",
+            "| 1  | west-1        | us-west |",
+            "+----+---------------+---------+",
+        ]
+        .join("\n")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn table_provider_scan_returns_projected_non_reading_plan()
 -> Result<(), Box<dyn std::error::Error>> {
     let table = DeltaLogTable::new("table-provider-scan-projection")?;

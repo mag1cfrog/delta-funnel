@@ -255,6 +255,15 @@ impl ProjectedDeltaScan {
         )
     }
 
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn physical_predicate(&self) -> Option<DeltaKernelPredicate> {
+        self.scan
+            .physical_predicate()
+            .clone()
+            .map(DeltaKernelPredicate::from_ref)
+    }
+
     /// Expands this kernel scan into metadata-only scan file records.
     ///
     /// This exhausts kernel scan metadata for one provider scan and does not
