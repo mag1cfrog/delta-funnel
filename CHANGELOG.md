@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.1.6...delta-funnel-v0.2.0) - 2026-07-07
+
+### Added
+
+- replace SQL Server write options with direct backend selection
+
+### Fixed
+
+- match SQL Server datetime rounding when writing timestamp columns as datetime
+- support non-nullable Timestamp(ns) columns mapped to SQL Server datetime
+- keep partition filters out of native row predicates ([#413](https://github.com/mag1cfrog/delta-funnel/pull/413))
+
+### Other
+
+- update arrow-tiberius adapter to 0.2.0 ([#416](https://github.com/mag1cfrog/delta-funnel/pull/416))
+
 ## [0.1.6](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.1.5...delta-funnel-v0.1.6) - 2026-07-04
 
 ### Fixed
