@@ -50,7 +50,12 @@ pub fn preflight_delta_protocol(
     Ok(ProtocolPreflight { protocol })
 }
 
-pub(crate) fn preflight_delta_protocol_with_tracing(
+/// Runs Delta protocol preflight and emits protocol-preflight tracing events.
+///
+/// This has the same behavior and errors as [`preflight_delta_protocol`], with
+/// `protocol_preflight.started`, `protocol_preflight.completed`, and
+/// `protocol_preflight.failed` telemetry around compatibility checks.
+pub fn preflight_delta_protocol_with_tracing(
     source: &PlannedDeltaSource,
 ) -> Result<ProtocolPreflight, DeltaFunnelError> {
     observability::protocol_preflight_started(source.name(), source.version());

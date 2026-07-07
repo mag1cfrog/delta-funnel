@@ -28,8 +28,8 @@ use delta_funnel::{
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaSourceConfig,
     DeltaStorageOptions, DeltaTableProviderConfig, collect_delta_provider_read_stats,
     delta_scan_partition_target_local_environment_diagnostic,
-    derive_delta_scan_partition_target_diagnostic, load_delta_source, preflight_delta_protocol,
-    register_delta_sources_with_scan_execution_options,
+    derive_delta_scan_partition_target_diagnostic, load_delta_source_with_tracing,
+    preflight_delta_protocol_with_tracing, register_delta_sources_with_scan_execution_options,
 };
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::deletion_vector_writer::{
@@ -38,6 +38,7 @@ use delta_kernel::actions::deletion_vector_writer::{
 use futures_util::StreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+use tracing_subscriber::fmt::MakeWriter;
 
 const MIB: u64 = 1024 * 1024;
 const BENCHMARK_FD_PER_PARTITION_CANDIDATES: [usize; 4] = [4, 8, 16, 32];
@@ -58,6 +59,19 @@ const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const PROVIDER_EXEC_DEFAULT_CASE_WORKLOAD: &str = "provider_partitioned_event_log_12m";
 const PROVIDER_EXEC_DEFAULT_CASE_QUERY: &str = "project_event_keys";
 const PROVIDER_EXEC_DEFAULT_CASE_SCHEDULING_PROFILE: &str = "default_execution";
+const PROVIDER_EXEC_FIXTURE_CREATE_COMPLETED_EVENT: &str = "provider_exec_fixture_create.completed";
+const PROVIDER_EXEC_FIXTURE_CREATE_FAILED_EVENT: &str = "provider_exec_fixture_create.failed";
+const PROVIDER_EXEC_FIXTURE_CREATE_STARTED_EVENT: &str = "provider_exec_fixture_create.started";
+const PROVIDER_EXEC_QUERY_EXECUTION_COMPLETED_EVENT: &str = "datafusion_query_execution.completed";
+const PROVIDER_EXEC_QUERY_EXECUTION_FAILED_EVENT: &str = "datafusion_query_execution.failed";
+const PROVIDER_EXEC_QUERY_EXECUTION_FIRST_BATCH_EVENT: &str =
+    "datafusion_query_execution.first_batch";
+const PROVIDER_EXEC_QUERY_EXECUTION_STARTED_EVENT: &str = "datafusion_query_execution.started";
+const PROVIDER_EXEC_QUERY_PLANNING_COMPLETED_EVENT: &str = "datafusion_query_planning.completed";
+const PROVIDER_EXEC_QUERY_PLANNING_FAILED_EVENT: &str = "datafusion_query_planning.failed";
+const PROVIDER_EXEC_QUERY_PLANNING_STARTED_EVENT: &str = "datafusion_query_planning.started";
+const PROVIDER_EXEC_STATS_COLLECT_COMPLETED_EVENT: &str = "provider_read_stats_collect.completed";
+const PROVIDER_EXEC_STATS_COLLECT_STARTED_EVENT: &str = "provider_read_stats_collect.started";
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
 const PROVIDER_EXEC_MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const PROVIDER_EXEC_PROTOCOL_JSON: &str =
@@ -229,16 +243,83 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    if let Some(trace_output_path) = &config.trace_output_path {
+        let subscriber = provider_exec_trace_subscriber(trace_output_path)?;
+        return tracing::subscriber::with_default(subscriber, || run_benchmark(&config));
+    }
+
+    run_benchmark(&config)
+}
+
+fn run_benchmark(config: &BenchmarkRunnerConfig) -> Result<(), Box<dyn Error>> {
     if let Some(output_path) = &config.output_path {
         let mut output = File::create(output_path)?;
-        write_benchmark_csv(&mut output, &config)?;
+        write_benchmark_csv(&mut output, config)?;
     } else {
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        write_benchmark_csv(&mut output, &config)?;
+        write_benchmark_csv(&mut output, config)?;
     }
 
     Ok(())
+}
+
+fn provider_exec_trace_subscriber(
+    path: &Path,
+) -> Result<impl tracing::Subscriber + Send + Sync, Box<dyn Error>> {
+    let writer = TraceFileMakeWriter::new(path.to_path_buf())?;
+    Ok(tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(writer)
+        .finish())
+}
+
+#[derive(Clone)]
+struct TraceFileMakeWriter {
+    path: Arc<PathBuf>,
+}
+
+impl TraceFileMakeWriter {
+    fn new(path: PathBuf) -> io::Result<Self> {
+        File::create(&path)?;
+        Ok(Self {
+            path: Arc::new(path),
+        })
+    }
+}
+
+struct TraceFileWriter {
+    file: Option<File>,
+}
+
+impl<'a> MakeWriter<'a> for TraceFileMakeWriter {
+    type Writer = TraceFileWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path.as_ref())
+            .ok();
+        TraceFileWriter { file }
+    }
+}
+
+impl Write for TraceFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match &mut self.file {
+            Some(file) => file.write(buf),
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.file {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
 }
 
 fn write_benchmark_csv(
@@ -395,7 +476,18 @@ async fn write_provider_exec_benchmark_csv_async(
 
     writeln!(output, "{}", PROVIDER_EXEC_CSV_HEADER.join(","))?;
     for workload in &workloads {
-        let table = ProviderExecDeltaTable::create(&temp_root, workload, config.storage_profile)?;
+        provider_exec_fixture_create_started(workload, config.storage_profile);
+        let table =
+            match ProviderExecDeltaTable::create(&temp_root, workload, config.storage_profile) {
+                Ok(table) => {
+                    provider_exec_fixture_create_completed(&table, workload);
+                    table
+                }
+                Err(error) => {
+                    provider_exec_fixture_create_failed(workload, config.storage_profile, &*error);
+                    return Err(error);
+                }
+            };
         let query_cases = workload
             .query_cases()
             .into_iter()
@@ -452,6 +544,10 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
         output,
         "Without --output, CSV is written to stdout for shell pipelines."
     )?;
+    writeln!(
+        output,
+        "Use --trace-output <path> to write newline-delimited JSON tracing events."
+    )?;
     writeln!(output, "The default mode is synthetic.")?;
     writeln!(
         output,
@@ -480,6 +576,7 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BenchmarkRunnerConfig {
     output_path: Option<PathBuf>,
+    trace_output_path: Option<PathBuf>,
     mode: BenchmarkMode,
     host_probe_local_io: HostProbeLocalIoConfig,
     provider_exec: ProviderExecConfig,
@@ -716,6 +813,15 @@ struct ProviderExecCsvRowInput<'a> {
     summary: &'a ProviderExecSummary,
 }
 
+#[derive(Clone, Copy)]
+struct ProviderExecTraceContext<'a> {
+    table: &'a ProviderExecDeltaTable,
+    query: ProviderExecQueryCase,
+    backend: DeltaProviderReaderBackend,
+    scheduling_profile: ProviderExecSchedulingProfile,
+    repetition_index: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PercentileSummary {
     p50: u64,
@@ -730,6 +836,7 @@ impl BenchmarkRunnerConfig {
         I::Item: Into<std::ffi::OsString>,
     {
         let mut output_path = None;
+        let mut trace_output_path = None;
         let mut mode = BenchmarkMode::Synthetic;
         let mut host_probe_local_io = HostProbeLocalIoConfig::default();
         let mut provider_exec = ProviderExecConfig::default();
@@ -748,6 +855,13 @@ impl BenchmarkRunnerConfig {
                     .ok_or(BenchmarkRunnerConfigError::MissingOutputPath)?;
                 if output_path.replace(PathBuf::from(path)).is_some() {
                     return Err(BenchmarkRunnerConfigError::DuplicateOutputPath);
+                }
+            } else if arg == "--trace-output" {
+                let path = args
+                    .next()
+                    .ok_or(BenchmarkRunnerConfigError::MissingTraceOutputPath)?;
+                if trace_output_path.replace(PathBuf::from(path)).is_some() {
+                    return Err(BenchmarkRunnerConfigError::DuplicateTraceOutputPath);
                 }
             } else if arg == "--mode" {
                 let value = args.next().ok_or(BenchmarkRunnerConfigError::MissingMode)?;
@@ -896,6 +1010,7 @@ impl BenchmarkRunnerConfig {
 
         Ok(Self {
             output_path,
+            trace_output_path,
             mode,
             host_probe_local_io,
             provider_exec,
@@ -1921,8 +2036,11 @@ async fn run_provider_exec_benchmark_case(
     config: &ProviderExecConfig,
 ) -> Result<ProviderExecSummary, Box<dyn Error>> {
     let mut measurements = Vec::with_capacity(config.repetitions);
-    for _ in 0..config.repetitions {
-        measurements.push(run_provider_exec_once(table, query, backend, scheduling_profile).await?);
+    for repetition_index in 0..config.repetitions {
+        measurements.push(
+            run_provider_exec_once(table, query, backend, scheduling_profile, repetition_index)
+                .await?,
+        );
     }
 
     Ok(provider_exec_summary(&measurements))
@@ -1933,13 +2051,14 @@ async fn run_provider_exec_once(
     query: ProviderExecQueryCase,
     backend: DeltaProviderReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
+    repetition_index: usize,
 ) -> Result<ProviderExecRunMeasurement, Box<dyn Error>> {
     let ctx = SessionContext::new();
-    let source = load_delta_source(
+    let source = load_delta_source_with_tracing(
         DeltaSourceConfig::new("orders", table.table_uri.clone())
             .with_storage_options(table.storage_options.clone()),
     )?;
-    let protocol = preflight_delta_protocol(&source)?;
+    let protocol = preflight_delta_protocol_with_tracing(&source)?;
     let execution_options = if scheduling_profile.uses_default_execution_options {
         DeltaProviderScanExecutionOptions::default()
     } else {
@@ -1972,29 +2091,75 @@ async fn run_provider_exec_once(
         }],
         execution_options,
     )?;
+    let trace_context = ProviderExecTraceContext {
+        table,
+        query,
+        backend,
+        scheduling_profile,
+        repetition_index,
+    };
 
     let query_started = Instant::now();
     let planning_started = Instant::now();
-    let dataframe = ctx.sql(query.sql).await?;
-    let physical_plan = dataframe.create_physical_plan().await?;
+    provider_exec_query_planning_started(trace_context);
+    let dataframe = match ctx.sql(query.sql).await {
+        Ok(dataframe) => dataframe,
+        Err(error) => {
+            provider_exec_query_planning_failed(trace_context, &error);
+            return Err(error.into());
+        }
+    };
+    let physical_plan = match dataframe.create_physical_plan().await {
+        Ok(physical_plan) => physical_plan,
+        Err(error) => {
+            provider_exec_query_planning_failed(trace_context, &error);
+            return Err(error.into());
+        }
+    };
     let stats_plan = Arc::clone(&physical_plan);
     let planning_micros = u128_to_u64_saturating(planning_started.elapsed().as_micros());
+    provider_exec_query_planning_completed(trace_context, planning_micros);
     let process_peak_rss_before_bytes = process_peak_rss_bytes();
     let execution_started = Instant::now();
-    let mut stream = datafusion::physical_plan::execute_stream(physical_plan, ctx.task_ctx())?;
+    provider_exec_query_execution_started(trace_context);
     let mut produced_rows = 0_usize;
     let mut produced_batches = 0_usize;
+    let mut stream = match datafusion::physical_plan::execute_stream(physical_plan, ctx.task_ctx())
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            provider_exec_query_execution_failed(
+                trace_context,
+                produced_rows,
+                produced_batches,
+                &error,
+            );
+            return Err(error.into());
+        }
+    };
     let mut first_batch_micros = None;
     let mut batch_latency_micros = Vec::new();
     let mut previous_batch_at = execution_started;
 
     while let Some(batch) = stream.next().await {
-        let batch = batch?;
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => {
+                provider_exec_query_execution_failed(
+                    trace_context,
+                    produced_rows,
+                    produced_batches,
+                    &error,
+                );
+                return Err(error.into());
+            }
+        };
         let now = Instant::now();
         if first_batch_micros.is_none() {
-            first_batch_micros = Some(u128_to_u64_saturating(
-                now.duration_since(execution_started).as_micros(),
-            ));
+            let elapsed_micros =
+                u128_to_u64_saturating(now.duration_since(execution_started).as_micros());
+            first_batch_micros = Some(elapsed_micros);
+            provider_exec_query_execution_first_batch(trace_context, elapsed_micros);
         }
         batch_latency_micros.push(u128_to_u64_saturating(
             now.duration_since(previous_batch_at).as_micros(),
@@ -2005,15 +2170,23 @@ async fn run_provider_exec_once(
     }
 
     let total_micros = u128_to_u64_saturating(query_started.elapsed().as_micros()).max(1);
+    provider_exec_query_execution_completed(
+        trace_context,
+        produced_rows,
+        produced_batches,
+        total_micros,
+    );
     let process_peak_rss_bytes = process_peak_rss_bytes();
     let process_peak_rss_delta_bytes = match (process_peak_rss_before_bytes, process_peak_rss_bytes)
     {
         (Some(before), Some(after)) => Some(after.saturating_sub(before)),
         _ => None,
     };
+    provider_exec_stats_collect_started(trace_context);
     let read_stats = provider_exec_read_stats_measurement(&collect_delta_provider_read_stats(
         stats_plan.as_ref(),
     ));
+    provider_exec_stats_collect_completed(trace_context, read_stats.scan_count);
     let source_rows_per_second = u128_to_u64_saturating(
         (table.row_count as u128).saturating_mul(1_000_000) / u128::from(total_micros),
     );
@@ -2476,6 +2649,203 @@ fn provider_exec_backend_name(backend: DeltaProviderReaderBackend) -> &'static s
         DeltaProviderReaderBackend::OfficialKernel => "official_kernel",
         DeltaProviderReaderBackend::NativeAsync => "native_async",
     }
+}
+
+fn provider_exec_fixture_create_started(
+    workload: &ProviderExecWorkloadCase,
+    storage_profile: ProviderExecStorageProfile,
+) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_FIXTURE_CREATE_STARTED_EVENT,
+        workload_case = workload.name,
+        provider_exec_storage_profile = storage_profile.name,
+        file_count = workload.file_count(),
+        row_count = workload.row_count(),
+        message = PROVIDER_EXEC_FIXTURE_CREATE_STARTED_EVENT
+    );
+}
+
+fn provider_exec_fixture_create_completed(
+    table: &ProviderExecDeltaTable,
+    workload: &ProviderExecWorkloadCase,
+) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_FIXTURE_CREATE_COMPLETED_EVENT,
+        workload_case = workload.name,
+        provider_exec_storage_profile = table.storage_profile_name(),
+        file_count = table.file_count,
+        row_count = table.row_count,
+        data_file_bytes = table.data_file_bytes,
+        message = PROVIDER_EXEC_FIXTURE_CREATE_COMPLETED_EVENT
+    );
+}
+
+fn provider_exec_fixture_create_failed(
+    workload: &ProviderExecWorkloadCase,
+    storage_profile: ProviderExecStorageProfile,
+    error: &dyn fmt::Display,
+) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_FIXTURE_CREATE_FAILED_EVENT,
+        workload_case = workload.name,
+        provider_exec_storage_profile = storage_profile.name,
+        file_count = workload.file_count(),
+        row_count = workload.row_count(),
+        error_summary = error.to_string(),
+        message = PROVIDER_EXEC_FIXTURE_CREATE_FAILED_EVENT
+    );
+}
+
+fn provider_exec_query_planning_started(context: ProviderExecTraceContext<'_>) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_QUERY_PLANNING_STARTED_EVENT,
+        provider_exec_storage_profile = context.table.storage_profile_name(),
+        query_case = context.query.name,
+        reader_backend = provider_exec_backend_name(context.backend),
+        scheduling_mode = context.scheduling_profile.name,
+        repetition_index = context.repetition_index,
+        message = PROVIDER_EXEC_QUERY_PLANNING_STARTED_EVENT
+    );
+}
+
+fn provider_exec_query_planning_completed(
+    context: ProviderExecTraceContext<'_>,
+    planning_micros: u64,
+) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_QUERY_PLANNING_COMPLETED_EVENT,
+        provider_exec_storage_profile = context.table.storage_profile_name(),
+        query_case = context.query.name,
+        reader_backend = provider_exec_backend_name(context.backend),
+        scheduling_mode = context.scheduling_profile.name,
+        repetition_index = context.repetition_index,
+        planning_micros,
+        message = PROVIDER_EXEC_QUERY_PLANNING_COMPLETED_EVENT
+    );
+}
+
+fn provider_exec_query_planning_failed(
+    context: ProviderExecTraceContext<'_>,
+    error: &dyn fmt::Display,
+) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_QUERY_PLANNING_FAILED_EVENT,
+        provider_exec_storage_profile = context.table.storage_profile_name(),
+        query_case = context.query.name,
+        reader_backend = provider_exec_backend_name(context.backend),
+        scheduling_mode = context.scheduling_profile.name,
+        repetition_index = context.repetition_index,
+        error_summary = error.to_string(),
+        message = PROVIDER_EXEC_QUERY_PLANNING_FAILED_EVENT
+    );
+}
+
+fn provider_exec_query_execution_started(context: ProviderExecTraceContext<'_>) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_QUERY_EXECUTION_STARTED_EVENT,
+        provider_exec_storage_profile = context.table.storage_profile_name(),
+        query_case = context.query.name,
+        reader_backend = provider_exec_backend_name(context.backend),
+        scheduling_mode = context.scheduling_profile.name,
+        repetition_index = context.repetition_index,
+        message = PROVIDER_EXEC_QUERY_EXECUTION_STARTED_EVENT
+    );
+}
+
+fn provider_exec_query_execution_first_batch(
+    context: ProviderExecTraceContext<'_>,
+    elapsed_micros: u64,
+) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_QUERY_EXECUTION_FIRST_BATCH_EVENT,
+        provider_exec_storage_profile = context.table.storage_profile_name(),
+        query_case = context.query.name,
+        reader_backend = provider_exec_backend_name(context.backend),
+        scheduling_mode = context.scheduling_profile.name,
+        repetition_index = context.repetition_index,
+        elapsed_micros,
+        message = PROVIDER_EXEC_QUERY_EXECUTION_FIRST_BATCH_EVENT
+    );
+}
+
+fn provider_exec_query_execution_completed(
+    context: ProviderExecTraceContext<'_>,
+    produced_rows: usize,
+    produced_batches: usize,
+    total_micros: u64,
+) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_QUERY_EXECUTION_COMPLETED_EVENT,
+        provider_exec_storage_profile = context.table.storage_profile_name(),
+        query_case = context.query.name,
+        reader_backend = provider_exec_backend_name(context.backend),
+        scheduling_mode = context.scheduling_profile.name,
+        repetition_index = context.repetition_index,
+        produced_rows,
+        produced_batches,
+        total_micros,
+        message = PROVIDER_EXEC_QUERY_EXECUTION_COMPLETED_EVENT
+    );
+}
+
+fn provider_exec_query_execution_failed(
+    context: ProviderExecTraceContext<'_>,
+    produced_rows: usize,
+    produced_batches: usize,
+    error: &dyn fmt::Display,
+) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_QUERY_EXECUTION_FAILED_EVENT,
+        provider_exec_storage_profile = context.table.storage_profile_name(),
+        query_case = context.query.name,
+        reader_backend = provider_exec_backend_name(context.backend),
+        scheduling_mode = context.scheduling_profile.name,
+        repetition_index = context.repetition_index,
+        produced_rows,
+        produced_batches,
+        error_summary = error.to_string(),
+        message = PROVIDER_EXEC_QUERY_EXECUTION_FAILED_EVENT
+    );
+}
+
+fn provider_exec_stats_collect_started(context: ProviderExecTraceContext<'_>) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_STATS_COLLECT_STARTED_EVENT,
+        provider_exec_storage_profile = context.table.storage_profile_name(),
+        query_case = context.query.name,
+        reader_backend = provider_exec_backend_name(context.backend),
+        scheduling_mode = context.scheduling_profile.name,
+        repetition_index = context.repetition_index,
+        message = PROVIDER_EXEC_STATS_COLLECT_STARTED_EVENT
+    );
+}
+
+fn provider_exec_stats_collect_completed(
+    context: ProviderExecTraceContext<'_>,
+    provider_stats_scan_count: usize,
+) {
+    tracing::info!(
+        target: "delta_funnel",
+        telemetry_event = PROVIDER_EXEC_STATS_COLLECT_COMPLETED_EVENT,
+        provider_exec_storage_profile = context.table.storage_profile_name(),
+        query_case = context.query.name,
+        reader_backend = provider_exec_backend_name(context.backend),
+        scheduling_mode = context.scheduling_profile.name,
+        repetition_index = context.repetition_index,
+        provider_stats_scan_count,
+        message = PROVIDER_EXEC_STATS_COLLECT_COMPLETED_EVENT
+    );
 }
 
 fn provider_exec_filter_matches(filter: &Option<String>, candidate: &str) -> bool {
@@ -3074,6 +3444,8 @@ impl SyntheticWorkloadCase {
 enum BenchmarkRunnerConfigError {
     MissingOutputPath,
     DuplicateOutputPath,
+    MissingTraceOutputPath,
+    DuplicateTraceOutputPath,
     MissingMode,
     DuplicateMode,
     InvalidMode(String),
@@ -3112,6 +3484,10 @@ impl fmt::Display for BenchmarkRunnerConfigError {
         match self {
             Self::MissingOutputPath => write!(formatter, "--output requires a path"),
             Self::DuplicateOutputPath => write!(formatter, "--output may be provided only once"),
+            Self::MissingTraceOutputPath => write!(formatter, "--trace-output requires a path"),
+            Self::DuplicateTraceOutputPath => {
+                write!(formatter, "--trace-output may be provided only once")
+            }
             Self::MissingMode => write!(formatter, "--mode requires a value"),
             Self::DuplicateMode => write!(formatter, "--mode may be provided only once"),
             Self::InvalidMode(value) => write!(
@@ -5412,6 +5788,7 @@ mod tests {
             config,
             BenchmarkRunnerConfig {
                 output_path: None,
+                trace_output_path: None,
                 mode: BenchmarkMode::Synthetic,
                 host_probe_local_io: HostProbeLocalIoConfig::default(),
                 provider_exec: ProviderExecConfig::default(),
@@ -5432,6 +5809,19 @@ mod tests {
             Some(PathBuf::from("target/scan-bench.csv"))
         );
         assert!(!config.show_help);
+
+        Ok(())
+    }
+
+    #[test]
+    fn runner_config_accepts_trace_output_path() -> Result<(), Box<dyn Error>> {
+        let config =
+            BenchmarkRunnerConfig::parse(["--trace-output", "target/scan-bench.trace.jsonl"])?;
+
+        assert_eq!(
+            config.trace_output_path,
+            Some(PathBuf::from("target/scan-bench.trace.jsonl"))
+        );
 
         Ok(())
     }
@@ -5608,6 +5998,19 @@ mod tests {
         assert_eq!(
             BenchmarkRunnerConfig::parse(["--output", "a.csv", "--output", "b.csv"]),
             Err(BenchmarkRunnerConfigError::DuplicateOutputPath)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--trace-output"]),
+            Err(BenchmarkRunnerConfigError::MissingTraceOutputPath)
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--trace-output",
+                "a.jsonl",
+                "--trace-output",
+                "b.jsonl"
+            ]),
+            Err(BenchmarkRunnerConfigError::DuplicateTraceOutputPath)
         );
         assert_eq!(
             BenchmarkRunnerConfig::parse(["--unknown"]),
@@ -5791,6 +6194,7 @@ mod tests {
             )
         );
         assert!(usage.contains("CSV is written to stdout"));
+        assert!(usage.contains("Use --trace-output"));
         assert!(usage.contains("The default mode is synthetic."));
         assert!(usage.contains("Use --host-probe-local-io"));
         assert!(usage.contains("Use --provider-exec-repetitions"));
@@ -5807,6 +6211,7 @@ mod tests {
         let mut output = Vec::new();
         let config = BenchmarkRunnerConfig {
             output_path: None,
+            trace_output_path: None,
             mode: BenchmarkMode::Synthetic,
             host_probe_local_io: HostProbeLocalIoConfig::default(),
             provider_exec: ProviderExecConfig::default(),
@@ -5842,6 +6247,7 @@ mod tests {
         let mut output = Vec::new();
         let config = BenchmarkRunnerConfig {
             output_path: None,
+            trace_output_path: None,
             mode: BenchmarkMode::HostProbe,
             host_probe_local_io: HostProbeLocalIoConfig::default(),
             provider_exec: ProviderExecConfig::default(),
@@ -7103,11 +7509,11 @@ mod tests {
             &workload,
             ProviderExecStorageProfile::local(),
         )?;
-        let source = load_delta_source(
+        let source = load_delta_source_with_tracing(
             DeltaSourceConfig::new("orders", table.table_uri.clone())
                 .with_storage_options(table.storage_options.clone()),
         )?;
-        let _protocol = preflight_delta_protocol(&source)?;
+        let _protocol = preflight_delta_protocol_with_tracing(&source)?;
         let metadata_log =
             fs::read_to_string(table.path.join("_delta_log/00000000000000000000.json"))?;
 
@@ -7170,6 +7576,7 @@ mod tests {
                 query,
                 backend,
                 scheduling_profile,
+                0,
             ))?;
             assert_eq!(measurement.produced_rows, 16);
             assert!(measurement.produced_batches > 0);
@@ -7210,6 +7617,7 @@ mod tests {
             query,
             DeltaProviderScanExecutionOptions::default().reader_backend,
             ProviderExecSchedulingProfile::default_execution_case(),
+            0,
         ))?;
 
         assert_eq!(measurement.produced_rows, 16);
@@ -7273,6 +7681,7 @@ mod tests {
                 query,
                 backend,
                 scheduling_profile,
+                0,
             ))?;
             assert_eq!(measurement.produced_rows, 1);
             assert_eq!(measurement.produced_batches, 1);

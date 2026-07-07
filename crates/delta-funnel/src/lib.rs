@@ -82,6 +82,7 @@ pub use table_formats::{
     DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource, ProtocolPreflight,
     load_delta_source, load_delta_sources, preflight_delta_protocol, preflight_delta_sources,
 };
+pub use table_formats::{load_delta_source_with_tracing, preflight_delta_protocol_with_tracing};
 
 /// Current crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -31,8 +31,10 @@ pub(crate) use kernel::{
     arrow_partition_type_to_kernel_primitive, datafusion_expr_to_kernel_predicate,
     kernel_partition_scalar_to_datafusion_scalar,
 };
-pub(crate) use protocol::preflight_delta_protocol_with_tracing;
-pub use protocol::{ProtocolPreflight, preflight_delta_protocol, preflight_delta_sources};
+pub use protocol::{
+    ProtocolPreflight, preflight_delta_protocol, preflight_delta_protocol_with_tracing,
+    preflight_delta_sources,
+};
 pub(crate) use read::{
     KernelDataFilePredicateEvalRequest, KernelDataFileReadRequest, KernelDataFileReader,
     KernelDataFileReaderConfig, KernelDataFileTransformRequest, KernelScanReadSchema,
@@ -512,7 +514,12 @@ pub fn load_delta_source(
     load_delta_source_after_name_validation(config, false)
 }
 
-pub(crate) fn load_delta_source_with_tracing(
+/// Loads a Delta source and emits source-loading tracing events.
+///
+/// This has the same behavior and errors as [`load_delta_source`], with
+/// `source_loading.started`, `source_loading.completed`, and
+/// `source_loading.failed` telemetry around snapshot loading.
+pub fn load_delta_source_with_tracing(
     config: DeltaSourceConfig,
 ) -> Result<PlannedDeltaSource, DeltaFunnelError> {
     validate_table_source_names([config.name.as_str()])?;
