@@ -16,9 +16,9 @@ pub use execution::{
     MssqlOutputBatchValidationReport, MssqlOutputFieldReport, MssqlOutputWriteJob,
     MssqlOutputWriteStatus, MssqlPreparedTarget, MssqlPreparedTargetAction,
     MssqlPreparedTargetReport, MssqlTargetCleanupStatus, MssqlWorkflowWriteOptions,
-    MssqlWorkflowWriteReport, MssqlWriteFailureContext, MssqlWriteFailureReport, MssqlWriteOptions,
+    MssqlWorkflowWriteReport, MssqlWriteBackend, MssqlWriteFailureContext, MssqlWriteFailureReport,
     MssqlWritePhase, MssqlWriteReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport,
-    MssqlWriteStats, default_mssql_write_options, mssql_write_options_for_output_plan,
+    MssqlWriteStats, default_mssql_write_backend, mssql_write_backend_for_output_plan,
     validate_mssql_output_record_batch, validate_mssql_output_schema, write_mssql_outputs_to_mssql,
     write_output_batches_to_mssql,
 };

@@ -5,7 +5,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use tracing::Instrument;
 
 use crate::{
-    DeltaFunnelError, MssqlOutputBatchStream, MssqlTargetOutputPlan, MssqlWriteOptions,
+    DeltaFunnelError, MssqlOutputBatchStream, MssqlTargetOutputPlan, MssqlWriteBackend,
     MssqlWriteReport, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, ValidationOptions,
     observability, plan_mssql_target_for_resolved_output, report::PhaseTimer,
     write_output_batches_to_mssql_with_validation_options,
@@ -174,7 +174,7 @@ impl DeltaFunnelSession {
                 planned.output_plan().clone(),
                 planned.resolved_target().clone(),
                 batches,
-                self.options.mssql_write_options(),
+                self.options.mssql_write_backend(),
                 self.options.validation_options(),
             )
             .await
@@ -206,7 +206,7 @@ pub(crate) trait OrchestratorMssqlOutputWriter: Send {
         output_plan: MssqlTargetOutputPlan,
         resolved_target: ResolvedMssqlTarget,
         batches: MssqlOutputBatchStream,
-        write_options: MssqlWriteOptions,
+        write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
@@ -221,7 +221,7 @@ impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
         output_plan: MssqlTargetOutputPlan,
         resolved_target: ResolvedMssqlTarget,
         batches: MssqlOutputBatchStream,
-        write_options: MssqlWriteOptions,
+        write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         write_output_batches_to_mssql_with_validation_options(
@@ -229,7 +229,7 @@ impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
             resolved_target,
             output_plan.schema_plan_options(),
             batches,
-            write_options,
+            write_backend,
             validation_options,
         )
         .await
@@ -256,7 +256,7 @@ mod tests {
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlConnectionSource,
         MssqlOutputBatchStream, MssqlOutputTarget, MssqlTargetCleanupStatus, MssqlTargetConfig,
-        MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteOptions, MssqlWriteReport,
+        MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteBackend, MssqlWriteReport,
         ResolvedMssqlTarget, TargetValidationMode, ValidationOptions,
         table_formats::RealParquetDeltaTable,
     };
@@ -297,7 +297,7 @@ mod tests {
             output_plan: MssqlTargetOutputPlan,
             resolved_target: ResolvedMssqlTarget,
             mut batches: MssqlOutputBatchStream,
-            _write_options: MssqlWriteOptions,
+            _write_backend: MssqlWriteBackend,
             validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;

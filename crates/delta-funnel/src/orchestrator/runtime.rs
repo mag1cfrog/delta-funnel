@@ -201,7 +201,7 @@ mod tests {
     use crate::{
         DeltaSourceConfig, DryRunScanSummaryMode, LoadMode, MssqlConnectionConfig,
         MssqlConnectionSource, MssqlOutputBatchStream, MssqlOutputTarget, MssqlTargetCleanupStatus,
-        MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteOptions,
+        MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteBackend,
         ResolvedMssqlTarget, RunMode, SessionOptions, ValidationOptions,
         table_formats::RealParquetDeltaTable,
     };
@@ -265,7 +265,7 @@ mod tests {
             output_plan: MssqlTargetOutputPlan,
             resolved_target: ResolvedMssqlTarget,
             mut batches: MssqlOutputBatchStream,
-            _write_options: MssqlWriteOptions,
+            _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;
@@ -309,7 +309,7 @@ mod tests {
             resolved_target: ResolvedMssqlTarget,
             schema_options: crate::MssqlSchemaPlanOptions,
             batches: MssqlOutputBatchStream,
-            write_options: MssqlWriteOptions,
+            write_backend: MssqlWriteBackend,
             validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let output_plan = crate::plan_mssql_target_for_resolved_output(
@@ -324,7 +324,7 @@ mod tests {
                 output_plan,
                 resolved_target,
                 batches,
-                write_options,
+                write_backend,
                 validation_options,
             )
             .await

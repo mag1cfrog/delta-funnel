@@ -11,7 +11,7 @@ use crate::{
 
 use super::{
     LoadMode, MssqlConnectedLifecycleClient, MssqlConnectionConfig, MssqlSchemaPlanOptions,
-    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteFailureContext, MssqlWriteOptions,
+    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteBackend, MssqlWriteFailureContext,
     MssqlWritePhase, ResolvedMssqlTarget, plan_mssql_output_schema, plan_mssql_target_output,
 };
 use super::{MssqlPreparedTarget, write::initialize_mssql_bulk_writer};
@@ -97,7 +97,7 @@ impl MssqlConnectedOutputClient {
     pub(crate) async fn initialize_bulk_writer(
         &mut self,
         prepared_target: &MssqlPreparedTarget,
-        options: MssqlWriteOptions,
+        options: MssqlWriteBackend,
     ) -> Result<arrow_tiberius::ConnectedBulkWriter<'_>, DeltaFunnelError> {
         initialize_mssql_bulk_writer(
             &mut self.client,

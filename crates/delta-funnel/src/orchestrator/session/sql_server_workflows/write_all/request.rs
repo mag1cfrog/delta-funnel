@@ -304,7 +304,7 @@ mod tests {
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlBatchShapingReport,
         MssqlOutputBatchStream, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus,
         MssqlTargetConfig, MssqlTargetTable, MssqlTargetTableState, MssqlWorkflowOutputWriter,
-        MssqlWriteFailureContext, MssqlWriteOptions, MssqlWritePhase, MssqlWriteReport,
+        MssqlWriteBackend, MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport,
         PhaseStatus, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, RowCount,
         WriteAllCacheAliasStatus, WriteAllCacheReport, WriteAllNoCacheReason,
         plan_mssql_target_for_resolved_output, table_formats::RealParquetDeltaTable,
@@ -345,7 +345,7 @@ mod tests {
             resolved_target: ResolvedMssqlTarget,
             schema_options: MssqlSchemaPlanOptions,
             mut batches: MssqlOutputBatchStream,
-            _write_options: MssqlWriteOptions,
+            _write_backend: MssqlWriteBackend,
             _validation_options: crate::ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;
