@@ -11,17 +11,18 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{TableName, connect_mssql_client_from_ado_string};
 use datafusion::arrow::{
-    array::{ArrayRef, Int64Array},
+    array::{ArrayRef, Int32Array, Int64Array, TimestampNanosecondArray},
     record_batch::RecordBatch,
 };
 use delta_funnel::{
     DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession, LoadMode, MssqlConnectionConfig,
     MssqlOutputTarget, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus, MssqlTargetConfig,
-    MssqlTargetResolutionContext, MssqlTargetTable, OutputWritePlan, RowCount, RunMode,
-    SessionOptions, ValidationStatus, default_mssql_write_backend, write_output_batches_to_mssql,
+    MssqlTargetResolutionContext, MssqlTargetTable, MssqlTimestampPolicy, MssqlWriteBackend,
+    OutputWritePlan, RowCount, RunMode, SessionOptions, ValidationStatus,
+    default_mssql_write_backend, write_output_batches_to_mssql,
 };
 use futures_util::stream;
 
@@ -30,6 +31,7 @@ const SCHEMA_ENV: &str = "DELTA_FUNNEL_MSSQL_TEST_SCHEMA";
 const APPEND_EXISTING_OUTPUT_NAME: &str = "mssql_direct_raw_bulk_append_orders";
 const CREATE_AND_LOAD_OUTPUT_NAME: &str = "mssql_direct_raw_bulk_create_orders";
 const ORCHESTRATOR_OUTPUT_NAME: &str = "mssql_orchestrator_runtime_orders";
+const TIMESTAMP_NS_DATETIME_OUTPUT_NAME: &str = "mssql_direct_raw_bulk_timestamp_ns_datetime";
 const EXPECTED_ORDER_IDS: &[i64] = &[101, 102, 103];
 const APPEND_EXISTING_EXPECTED_ORDER_IDS: &[i64] = &[99, 101, 102, 103];
 static NEXT_TABLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -116,6 +118,16 @@ async fn mssql_direct_raw_bulk_create_and_load_writes_two_batches_when_configure
     };
 
     run_create_and_load_direct_raw_bulk_test(config).await
+}
+
+#[tokio::test]
+async fn mssql_direct_raw_bulk_round_trips_non_nullable_timestamp_ns_datetime_when_configured()
+-> TestResult<()> {
+    let Some(config) = configured_or_skip() else {
+        return Ok(());
+    };
+
+    run_non_nullable_timestamp_ns_datetime_test(config).await
 }
 
 #[test]
@@ -232,6 +244,69 @@ async fn run_create_and_load_direct_raw_bulk_test(
     }
 }
 
+async fn run_non_nullable_timestamp_ns_datetime_test(
+    config: MssqlIntegrationConfig,
+) -> TestResult<()> {
+    for backend in [
+        MssqlWriteBackend::BaselineTokenRow,
+        MssqlWriteBackend::DirectRawBulk,
+    ] {
+        let table = unique_table_name(&config.schema)?;
+        let mut admin = connect_mssql_client_from_ado_string(&config.connection_string).await?;
+
+        drop_table_if_exists(&mut admin, &table).await?;
+        let write_result = async {
+            let report = write_timestamp_ns_datetime_batch(
+                &config,
+                table.table().as_str(),
+                backend,
+                TIMESTAMP_NS_DATETIME_OUTPUT_NAME,
+            )
+            .await?;
+            if !admin.table_exists(&table).await? {
+                return Err(test_error(format!(
+                    "created MSSQL test table is not visible: {}",
+                    table.quoted_sql()
+                )));
+            }
+            assert_timestamp_ns_datetime_values_persisted(&mut admin, &table).await?;
+
+            Ok(report)
+        }
+        .await;
+        let cleanup_result = drop_table_if_exists(&mut admin, &table).await;
+
+        match (write_result, cleanup_result) {
+            (Ok(report), Ok(())) => {
+                assert_eq!(
+                    report.stats().output_name(),
+                    TIMESTAMP_NS_DATETIME_OUTPUT_NAME
+                );
+                assert_eq!(report.stats().rows_written(), 3);
+                assert_eq!(report.stats().batches_written(), 1);
+                assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotAttempted);
+                assert_eq!(report.output_row_count(), RowCount::exact(3));
+                assert_eq!(report.target_row_count(), RowCount::exact(3));
+                assert_eq!(report.validation_status(), ValidationStatus::passed());
+            }
+            (Err(write_error), Ok(())) => return Err(write_error),
+            (Ok(report), Err(cleanup_error)) => {
+                return Err(test_error(format!(
+                    "write succeeded with {}; cleanup failed: {cleanup_error}",
+                    write_report_summary(&report)
+                )));
+            }
+            (Err(write_error), Err(cleanup_error)) => {
+                return Err(test_error(format!(
+                    "write failed: {write_error}; cleanup failed: {cleanup_error}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn run_create_and_load_orchestrator_runtime_test(config: MssqlIntegrationConfig) -> TestResult<()> {
     let table = unique_table_name(&config.schema)?;
     let admin_runtime = tokio::runtime::Builder::new_current_thread()
@@ -325,6 +400,39 @@ async fn write_order_id_batches(
     .await?)
 }
 
+async fn write_timestamp_ns_datetime_batch(
+    config: &MssqlIntegrationConfig,
+    table_name: &str,
+    backend: MssqlWriteBackend,
+    output_name: &str,
+) -> TestResult<delta_funnel::MssqlWriteReport> {
+    let output_schema = timestamp_ns_datetime_schema();
+    let connection = MssqlConnectionConfig::new(config.connection_string.clone())?
+        .with_display_label("mssql-timestamp-ns-datetime-integration");
+    let target_table = MssqlTargetTable::new(config.schema.clone(), table_name.to_owned())?;
+    let target = MssqlTargetConfig::new(target_table)
+        .with_load_mode(LoadMode::CreateAndLoad)
+        .resolve(MssqlTargetResolutionContext {
+            output_name: Some(output_name),
+            default_connection: Some(&connection),
+        })?;
+    let schema_options = MssqlSchemaPlanOptions {
+        timestamp_policy: MssqlTimestampPolicy::DateTime,
+        ..MssqlSchemaPlanOptions::default()
+    };
+    let batch = timestamp_ns_datetime_batch(Arc::clone(&output_schema))?;
+    let batches = stream::iter(vec![Ok::<RecordBatch, DeltaFunnelError>(batch)]);
+
+    Ok(write_output_batches_to_mssql(
+        output_schema.as_ref(),
+        target,
+        schema_options,
+        batches,
+        backend,
+    )
+    .await?)
+}
+
 fn write_orchestrator_runtime_order_ids(
     config: &MssqlIntegrationConfig,
     table_name: &str,
@@ -378,6 +486,17 @@ async fn assert_order_ids_persisted(
 ) -> TestResult<()> {
     client
         .execute_statement(&order_id_assertion_sql(table, expected_order_ids))
+        .await?;
+
+    Ok(())
+}
+
+async fn assert_timestamp_ns_datetime_values_persisted(
+    client: &mut arrow_tiberius::ConnectedMssqlClient,
+    table: &TableName,
+) -> TestResult<()> {
+    client
+        .execute_statement(&timestamp_ns_datetime_assertion_sql(table))
         .await?;
 
     Ok(())
@@ -445,6 +564,42 @@ END;"
     )
 }
 
+fn timestamp_ns_datetime_assertion_sql(table: &TableName) -> String {
+    let expected_rows = timestamp_ns_datetime_cases()
+        .iter()
+        .map(|(row_id, _nanos, literal)| {
+            format!("({row_id}, CAST(CAST(N'{literal}' AS datetime2(6)) AS datetime))")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = table.quoted_sql();
+
+    format!(
+        "\
+IF (SELECT COUNT_BIG(*) FROM {table}) <> 3
+BEGIN
+    RAISERROR('unexpected timestamp datetime row count', 16, 1);
+    RETURN;
+END;
+IF EXISTS (
+    SELECT [id], [event_time] FROM {table}
+    EXCEPT
+    SELECT [expected].[id], [expected].[event_time]
+    FROM (VALUES {expected_rows}) AS [expected]([id], [event_time])
+)
+OR EXISTS (
+    SELECT [expected].[id], [expected].[event_time]
+    FROM (VALUES {expected_rows}) AS [expected]([id], [event_time])
+    EXCEPT
+    SELECT [id], [event_time] FROM {table}
+)
+BEGIN
+    RAISERROR('unexpected timestamp datetime values', 16, 1);
+    RETURN;
+END;"
+    )
+}
+
 fn order_id_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "order_id",
@@ -457,6 +612,43 @@ fn order_id_batch(schema: SchemaRef, values: Vec<i64>) -> TestResult<RecordBatch
     let order_ids: ArrayRef = Arc::new(Int64Array::from(values));
 
     Ok(RecordBatch::try_new(schema, vec![order_ids])?)
+}
+
+fn timestamp_ns_datetime_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+    ]))
+}
+
+fn timestamp_ns_datetime_batch(schema: SchemaRef) -> TestResult<RecordBatch> {
+    let cases = timestamp_ns_datetime_cases();
+    let ids: ArrayRef = Arc::new(Int32Array::from(
+        cases
+            .iter()
+            .map(|(row_id, _nanos, _literal)| *row_id)
+            .collect::<Vec<_>>(),
+    ));
+    let event_times: ArrayRef = Arc::new(TimestampNanosecondArray::from(
+        cases
+            .iter()
+            .map(|(_row_id, nanos, _literal)| *nanos)
+            .collect::<Vec<_>>(),
+    ));
+
+    Ok(RecordBatch::try_new(schema, vec![ids, event_times])?)
+}
+
+fn timestamp_ns_datetime_cases() -> [(i32, i64, &'static str); 3] {
+    [
+        (1, 1_780_529_793_687_000_000, "2026-06-03T23:36:33.687000"),
+        (2, 1_778_615_767_493_000_000, "2026-05-12T19:56:07.493000"),
+        (3, 1_774_840_482_427_000_000, "2026-03-30T03:14:42.427000"),
+    ]
 }
 
 fn non_empty_value(value: Option<String>) -> Option<String> {
