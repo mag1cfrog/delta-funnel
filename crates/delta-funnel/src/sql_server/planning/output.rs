@@ -1,7 +1,7 @@
 //! SQL Server target output planning.
 
 use arrow_schema::Schema;
-use arrow_tiberius::SchemaMapping;
+use arrow_tiberius::{PlannedSchema, SchemaMapping};
 
 use crate::DeltaFunnelError;
 
@@ -68,6 +68,12 @@ impl MssqlTargetOutputPlan {
     #[must_use]
     pub fn schema_plan_options(&self) -> MssqlSchemaPlanOptions {
         self.schema_plan.plan_options()
+    }
+
+    /// Returns the profile-bound schema plan passed to arrow-tiberius writers.
+    #[must_use]
+    pub fn planned_schema(&self) -> &PlannedSchema {
+        self.schema_plan.planned_schema()
     }
 
     /// Returns planned Arrow-to-MSSQL column mappings in output field order.

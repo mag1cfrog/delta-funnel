@@ -2969,7 +2969,8 @@ mod tests {
         };
         assert_eq!(context.phase(), MssqlWritePhase::WriteBatch);
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
-        assert!(message.contains("fake sink writer failed on write"));
+        assert!(message.contains("write backend unavailable"));
+        assert!(!message.contains("fake sink writer failed on write"));
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "write 1", "cleanup CreatedTable"]
@@ -3004,7 +3005,8 @@ mod tests {
         };
         assert_eq!(context.phase(), MssqlWritePhase::Finalize);
         assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
-        assert!(message.contains("fake sink writer failed on finish"));
+        assert!(message.contains("write backend unavailable"));
+        assert!(!message.contains("fake sink writer failed on finish"));
         assert_eq!(
             logged_events(&log)?,
             vec![
@@ -3052,7 +3054,8 @@ mod tests {
             context.validation_status(),
             ValidationStatus::skipped(ReportReasonCode::FailureBeforeValidation)
         );
-        assert!(message.contains("fake sink writer failed on finish"));
+        assert!(message.contains("write backend unavailable"));
+        assert!(!message.contains("fake sink writer failed on finish"));
         assert_phase_timing(
             context.phase_timings(),
             VALIDATION_PHASE,

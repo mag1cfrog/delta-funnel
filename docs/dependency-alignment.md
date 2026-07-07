@@ -7,7 +7,7 @@ owning feature work needs them.
 ## Selected Dependencies
 
 - `snafu = "0.9"` is the Rust error-handling framework.
-- `arrow-tiberius = "0.1.6"` is the Arrow to SQL Server planning and write
+- `arrow-tiberius = "0.2.0"` is the Arrow to SQL Server planning and write
   path. It emits writer lifecycle spans and events under the `arrow_tiberius`
   tracing target, but it does not install a tracing subscriber.
 - `arrow-tiberius` brings in `tiberius-raw-bulk =0.12.3-raw-bulk.14`

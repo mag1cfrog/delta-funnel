@@ -4,8 +4,8 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use arrow_schema::Schema;
 use arrow_tiberius::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, MssqlProfile, SchemaMapping,
-    plan_arrow_schema_to_mssql_mappings,
+    Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, MssqlProfile, PlannedSchema,
+    SchemaMapping, plan_arrow_schema_to_mssql_schema,
 };
 
 pub use arrow_tiberius::{
@@ -30,8 +30,7 @@ use super::{MssqlTargetSummary, ResolvedMssqlTarget};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlSchemaPlan {
     target: MssqlTargetSummary,
-    plan_options: MssqlSchemaPlanOptions,
-    mappings: Vec<SchemaMapping>,
+    planned_schema: PlannedSchema,
     diagnostics: DiagnosticSet,
     diagnostic_reports: Vec<MssqlSchemaDiagnostic>,
 }
@@ -46,13 +45,19 @@ impl MssqlSchemaPlan {
     /// Returns the Arrow-to-MSSQL planning options used for this plan.
     #[must_use]
     pub const fn plan_options(&self) -> MssqlSchemaPlanOptions {
-        self.plan_options
+        self.planned_schema.plan_options()
+    }
+
+    /// Returns the profile-bound schema plan passed to arrow-tiberius writers.
+    #[must_use]
+    pub const fn planned_schema(&self) -> &PlannedSchema {
+        &self.planned_schema
     }
 
     /// Returns planned Arrow-to-MSSQL column mappings in output field order.
     #[must_use]
     pub fn mappings(&self) -> &[SchemaMapping] {
-        &self.mappings
+        self.planned_schema.mappings()
     }
 
     /// Returns non-fatal diagnostics returned by arrow-tiberius.
@@ -172,7 +177,7 @@ pub fn plan_mssql_output_schema(
     validate_output_identity(target.output_name())?;
     validate_unique_output_field_names(target.output_name(), schema)?;
 
-    let outcome = plan_arrow_schema_to_mssql_mappings(
+    let outcome = plan_arrow_schema_to_mssql_schema(
         schema,
         MssqlProfile::sql_server_2016_compat_100(),
         options,
@@ -189,13 +194,12 @@ pub fn plan_mssql_output_schema(
         },
     })?;
 
-    let (mappings, diagnostics) = outcome.into_parts();
+    let (planned_schema, diagnostics) = outcome.into_parts();
     let diagnostic_reports = mssql_schema_diagnostic_reports(target.output_name(), &diagnostics);
 
     Ok(MssqlSchemaPlan {
         target: target.summary(),
-        plan_options: options,
-        mappings,
+        planned_schema,
         diagnostics,
         diagnostic_reports,
     })
