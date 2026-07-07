@@ -51,6 +51,28 @@ cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
   --output target/delta-provider-exec-bench.csv
 ```
 
+Run one representative provider execution case with the same scan execution
+defaults used by normal provider registration:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode provider-exec \
+  --provider-exec-default-case \
+  --provider-exec-repetitions 1 \
+  --output target/delta-provider-exec-default-case.csv
+```
+
+Write tracing events for phase timing derivation:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode provider-exec \
+  --provider-exec-default-case \
+  --provider-exec-repetitions 1 \
+  --output target/delta-provider-exec-default-case.csv \
+  --trace-output target/delta-provider-exec-default-case.trace.jsonl
+```
+
 Provider-exec mode creates temporary local Delta tables with Parquet data,
 loads them through `load_delta_source`, registers them through production
 DataFusion provider registration, selects the requested provider backend through
