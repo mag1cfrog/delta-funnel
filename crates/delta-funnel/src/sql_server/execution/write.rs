@@ -1,4 +1,4 @@
-//! SQL Server write options.
+//! SQL Server write execution.
 //!
 //! This module owns Delta Funnel write defaults around `arrow-tiberius`.
 
@@ -8,7 +8,6 @@ use std::{
 };
 
 use arrow_schema::Schema;
-pub use arrow_tiberius::WriteOptions as MssqlWriteOptions;
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::{
@@ -121,12 +120,12 @@ impl<'client> MssqlBulkWriterFactory for MssqlConnectedBulkWriterFactory<'client
         let MssqlBulkWriterInitializationRequest {
             table,
             planned_schema,
-            options,
+            backend,
             ..
         } = request;
 
         self.client
-            .bulk_writer(table, planned_schema, options)
+            .bulk_writer(table, planned_schema, backend.into())
             .await
     }
 }
@@ -137,7 +136,7 @@ pub(crate) struct MssqlBulkWriterInitializationRequest {
     output_name: String,
     table: arrow_tiberius::TableName,
     planned_schema: arrow_tiberius::PlannedSchema,
-    options: MssqlWriteOptions,
+    backend: MssqlWriteBackend,
     prepared_action: MssqlPreparedTargetAction,
     cleanup: MssqlTargetCleanupStatus,
 }
@@ -148,7 +147,7 @@ impl MssqlBulkWriterInitializationRequest {
     pub(crate) fn from_prepared_target(
         output_plan: &MssqlTargetOutputPlan,
         prepared_target: &MssqlPreparedTarget,
-        options: MssqlWriteOptions,
+        backend: MssqlWriteBackend,
     ) -> Result<Self, DeltaFunnelError> {
         ensure_prepared_target_matches_output_plan(output_plan, prepared_target)?;
 
@@ -156,7 +155,7 @@ impl MssqlBulkWriterInitializationRequest {
             output_name: output_plan.output_name().to_owned(),
             table: prepared_target.table_name().clone(),
             planned_schema: output_plan.planned_schema().clone(),
-            options,
+            backend,
             prepared_action: prepared_target.report().action(),
             cleanup: prepared_target.report().cleanup(),
         })
@@ -180,10 +179,10 @@ impl MssqlBulkWriterInitializationRequest {
         self.planned_schema.mappings()
     }
 
-    /// Returns the write options passed to the writer.
+    /// Returns the write backend passed to the writer.
     #[must_use]
-    pub(crate) const fn options(&self) -> MssqlWriteOptions {
-        self.options
+    pub(crate) const fn backend(&self) -> MssqlWriteBackend {
+        self.backend
     }
 
     /// Returns the prepared lifecycle action that permits writer initialization.
@@ -241,21 +240,52 @@ impl fmt::Display for MssqlWritePhase {
     }
 }
 
-/// Returns Delta Funnel's default SQL Server write options.
-#[must_use]
-pub fn default_mssql_write_options() -> MssqlWriteOptions {
-    MssqlWriteOptions {
-        backend: arrow_tiberius::WriteBackend::DirectRawBulk,
-        ..MssqlWriteOptions::default()
+/// SQL Server write backend selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MssqlWriteBackend {
+    /// Select the best available backend for the current plan.
+    #[default]
+    Auto,
+    /// Use Tiberius' row-oriented TokenRow bulk-load path.
+    BaselineTokenRow,
+    /// Use direct bulk-row payload encoding through Tiberius' framed sink.
+    DirectFramedBulk,
+    /// Use the raw bulk-row payload path exposed by the Tiberius fork.
+    DirectRawBulk,
+}
+
+impl From<MssqlWriteBackend> for arrow_tiberius::WriteBackend {
+    fn from(backend: MssqlWriteBackend) -> Self {
+        match backend {
+            MssqlWriteBackend::Auto => Self::Auto,
+            MssqlWriteBackend::BaselineTokenRow => Self::BaselineTokenRow,
+            MssqlWriteBackend::DirectFramedBulk => Self::DirectFramedBulk,
+            MssqlWriteBackend::DirectRawBulk => Self::DirectRawBulk,
+        }
     }
 }
 
-/// Builds write options from a planned SQL Server output target.
+impl From<MssqlWriteBackend> for arrow_tiberius::WriteOptions {
+    fn from(backend: MssqlWriteBackend) -> Self {
+        Self {
+            backend: backend.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Returns Delta Funnel's default SQL Server write backend.
 #[must_use]
-pub fn mssql_write_options_for_output_plan(
+pub fn default_mssql_write_backend() -> MssqlWriteBackend {
+    MssqlWriteBackend::DirectRawBulk
+}
+
+/// Builds a write backend from a planned SQL Server output target.
+#[must_use]
+pub fn mssql_write_backend_for_output_plan(
     _output_plan: &MssqlTargetOutputPlan,
-) -> MssqlWriteOptions {
-    default_mssql_write_options()
+) -> MssqlWriteBackend {
+    default_mssql_write_backend()
 }
 
 /// Initializes one SQL Server bulk writer after target lifecycle preparation.
@@ -264,7 +294,7 @@ pub(crate) async fn initialize_mssql_bulk_writer<'client>(
     client: &'client mut arrow_tiberius::ConnectedMssqlClient,
     output_plan: &MssqlTargetOutputPlan,
     prepared_target: &MssqlPreparedTarget,
-    options: MssqlWriteOptions,
+    options: MssqlWriteBackend,
 ) -> Result<arrow_tiberius::ConnectedBulkWriter<'client>, DeltaFunnelError> {
     initialize_mssql_bulk_writer_with_factory(
         output_plan,
@@ -280,7 +310,7 @@ pub(crate) async fn initialize_mssql_bulk_writer<'client>(
 pub(crate) async fn initialize_mssql_bulk_writer_with_factory<F>(
     output_plan: &MssqlTargetOutputPlan,
     prepared_target: &MssqlPreparedTarget,
-    options: MssqlWriteOptions,
+    options: MssqlWriteBackend,
     factory: F,
 ) -> Result<F::Writer, DeltaFunnelError>
 where
@@ -543,7 +573,7 @@ pub(crate) async fn write_mssql_batches_with_writer<W, S>(
     output_plan: &MssqlTargetOutputPlan,
     batches: S,
     mut writer: W,
-    _options: MssqlWriteOptions,
+    _options: MssqlWriteBackend,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     W: MssqlBulkLoadWriter,
@@ -922,8 +952,8 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
     use arrow_tiberius::{
-        Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, PlanOptions, SchemaCheck,
-        StringPolicy, WriteBackend, WriteOptions, WritePhase,
+        Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, PlanOptions, StringPolicy,
+        WritePhase,
     };
     use datafusion::arrow::{
         array::{Int64Array, StringArray, StringViewArray},
@@ -932,6 +962,7 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
+    use crate::MssqlWriteBackend as WriteBackend;
     use crate::{
         DeltaFunnelError, MssqlBatchShapingReport, MssqlConnectionConfig, MssqlConnectionSource,
         MssqlOutputFieldReport, MssqlTargetConfig, MssqlTargetTable, MssqlWriteStats, PhaseStatus,
@@ -1349,17 +1380,14 @@ mod tests {
             &output_plan,
             MssqlPreparedTargetAction::VerifiedExisting,
         )?;
-        let options = WriteOptions {
-            backend: WriteBackend::BaselineTokenRow,
-            schema_check: SchemaCheck::Strict,
-        };
+        let backend = WriteBackend::BaselineTokenRow;
         let request_log = Arc::new(Mutex::new(None));
         let factory = RecordingBulkWriterFactory::with_request_log(Arc::clone(&request_log));
 
         let writer = initialize_mssql_bulk_writer_with_factory(
             &output_plan,
             &prepared_target,
-            options,
+            backend,
             factory,
         )
         .await?;
@@ -1373,7 +1401,7 @@ mod tests {
         assert_eq!(request.output_name(), "orders_output");
         assert_eq!(request.table().quoted_sql(), "[dbo].[orders]");
         assert_eq!(request.mappings(), output_plan.schema_mappings());
-        assert_eq!(request.options(), options);
+        assert_eq!(request.backend(), backend);
         assert_eq!(
             request.prepared_action(),
             MssqlPreparedTargetAction::VerifiedExisting
@@ -1397,7 +1425,7 @@ mod tests {
         let error = initialize_mssql_bulk_writer_with_factory(
             &output_plan,
             &prepared_target,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             factory,
         )
         .await
@@ -1506,7 +1534,7 @@ mod tests {
         let error = initialize_mssql_bulk_writer_with_factory(
             &output_plan,
             &prepared_target,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             factory,
         )
         .await
@@ -1566,7 +1594,7 @@ mod tests {
             &output_plan,
             batches,
             writer,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await?;
 
@@ -1625,7 +1653,7 @@ mod tests {
             &output_plan,
             batches,
             writer,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await?;
 
@@ -1648,7 +1676,7 @@ mod tests {
             &output_plan,
             batches,
             writer,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await?;
 
@@ -1682,7 +1710,7 @@ mod tests {
             &output_plan,
             batches,
             writer,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         {
@@ -1730,7 +1758,7 @@ mod tests {
             &output_plan,
             batches,
             writer,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         {
@@ -1777,7 +1805,7 @@ mod tests {
             &output_plan,
             batches,
             writer,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         {
@@ -1838,7 +1866,7 @@ mod tests {
             &output_plan,
             batches,
             writer,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         {
@@ -1879,7 +1907,7 @@ mod tests {
             &output_plan,
             batches,
             writer,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         {
@@ -2260,18 +2288,21 @@ mod tests {
     }
 
     #[test]
-    fn default_options_pin_direct_raw_bulk_backend() {
-        let options = default_mssql_write_options();
+    fn default_backend_pins_direct_raw_bulk() {
+        let backend = default_mssql_write_backend();
 
-        assert_eq!(options.backend, WriteBackend::DirectRawBulk);
+        assert_eq!(backend, WriteBackend::DirectRawBulk);
     }
 
     #[test]
-    fn default_options_preserve_arrow_tiberius_schema_check_default() {
-        let options = default_mssql_write_options();
+    fn write_backend_conversion_preserves_arrow_tiberius_schema_check_default() {
+        let backend = default_mssql_write_backend();
+        let arrow_options = arrow_tiberius::WriteOptions::from(backend);
 
-        assert_eq!(options.schema_check, WriteOptions::default().schema_check);
-        assert_eq!(options.schema_check, SchemaCheck::Strict);
+        assert_eq!(
+            arrow_options.schema_check,
+            arrow_tiberius::SchemaCheck::Strict
+        );
     }
 
     #[test]
@@ -2290,11 +2321,10 @@ mod tests {
             plan_options,
         )?;
 
-        let write_options = mssql_write_options_for_output_plan(&output_plan);
+        let backend = mssql_write_backend_for_output_plan(&output_plan);
 
         assert_eq!(output_plan.planned_schema().plan_options(), plan_options);
-        assert_eq!(write_options.backend, WriteBackend::DirectRawBulk);
-        assert_eq!(write_options.schema_check, SchemaCheck::Strict);
+        assert_eq!(backend, WriteBackend::DirectRawBulk);
         Ok(())
     }
 

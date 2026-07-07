@@ -21,7 +21,7 @@ use delta_funnel::{
     DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession, LoadMode, MssqlConnectionConfig,
     MssqlOutputTarget, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus, MssqlTargetConfig,
     MssqlTargetResolutionContext, MssqlTargetTable, OutputWritePlan, RowCount, RunMode,
-    SessionOptions, ValidationStatus, default_mssql_write_options, write_output_batches_to_mssql,
+    SessionOptions, ValidationStatus, default_mssql_write_backend, write_output_batches_to_mssql,
 };
 use futures_util::stream;
 
@@ -320,7 +320,7 @@ async fn write_order_id_batches(
         target,
         MssqlSchemaPlanOptions::default(),
         batches,
-        default_mssql_write_options(),
+        default_mssql_write_backend(),
     )
     .await?)
 }

@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     LoadMode, MssqlBulkLoadWriter, MssqlPreparedTarget, MssqlSchemaPlanOptions,
-    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteFailureContext, MssqlWriteOptions,
+    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteBackend, MssqlWriteFailureContext,
     MssqlWritePhase, MssqlWriteReport, ResolvedMssqlTarget,
 };
 use super::{
@@ -59,7 +59,7 @@ pub async fn write_output_batches_to_mssql<S>(
     resolved_target: ResolvedMssqlTarget,
     schema_options: MssqlSchemaPlanOptions,
     batches: S,
-    write_options: MssqlWriteOptions,
+    write_backend: MssqlWriteBackend,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
@@ -67,7 +67,7 @@ where
     let request =
         plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
 
-    write_mssql_output_connection_request(request, batches, write_options).await
+    write_mssql_output_connection_request(request, batches, write_backend).await
 }
 
 pub(crate) async fn write_output_batches_to_mssql_with_validation_options<S>(
@@ -75,7 +75,7 @@ pub(crate) async fn write_output_batches_to_mssql_with_validation_options<S>(
     resolved_target: ResolvedMssqlTarget,
     schema_options: MssqlSchemaPlanOptions,
     batches: S,
-    write_options: MssqlWriteOptions,
+    write_backend: MssqlWriteBackend,
     validation_options: ValidationOptions,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
@@ -87,7 +87,7 @@ where
     write_mssql_output_connection_request_with_validation_options(
         request,
         batches,
-        write_options,
+        write_backend,
         validation_options,
     )
     .await
@@ -113,7 +113,7 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         &'connection mut self,
         output_plan: &MssqlTargetOutputPlan,
         prepared_target: &MssqlPreparedTarget,
-        options: MssqlWriteOptions,
+        options: MssqlWriteBackend,
     ) -> Result<Self::Writer<'connection>, DeltaFunnelError>;
 
     /// Cleans up a prepared target after a later failure.
@@ -149,7 +149,7 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         output_plan: &MssqlTargetOutputPlan,
         prepared_target: &MssqlPreparedTarget,
         batches: S,
-        options: MssqlWriteOptions,
+        options: MssqlWriteBackend,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>
     where
         Self: 'static,
@@ -197,7 +197,7 @@ impl MssqlOneOutputSinkConnection for MssqlConnectedOutputClient {
         &'connection mut self,
         _output_plan: &MssqlTargetOutputPlan,
         prepared_target: &MssqlPreparedTarget,
-        options: MssqlWriteOptions,
+        options: MssqlWriteBackend,
     ) -> Result<Self::Writer<'connection>, DeltaFunnelError> {
         self.initialize_bulk_writer(prepared_target, options).await
     }
@@ -236,7 +236,7 @@ impl MssqlOneOutputSinkConnection for MssqlConnectedOutputClient {
 pub(crate) async fn write_mssql_output_connection_request<S>(
     request: MssqlOutputConnectionRequest,
     batches: S,
-    options: MssqlWriteOptions,
+    options: MssqlWriteBackend,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
@@ -253,7 +253,7 @@ where
 pub(crate) async fn write_mssql_output_connection_request_with_validation_options<S>(
     request: MssqlOutputConnectionRequest,
     batches: S,
-    options: MssqlWriteOptions,
+    options: MssqlWriteBackend,
     validation_options: ValidationOptions,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
@@ -280,7 +280,7 @@ pub(crate) async fn write_mssql_output_batches_on_connection<C, S>(
     output_plan: MssqlTargetOutputPlan,
     connection: C,
     batches: S,
-    options: MssqlWriteOptions,
+    options: MssqlWriteBackend,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     C: MssqlOneOutputSinkConnection + 'static,
@@ -301,7 +301,7 @@ async fn write_mssql_output_batches_on_connection_with_phase_timings<C, S>(
     output_plan: MssqlTargetOutputPlan,
     mut connection: C,
     batches: S,
-    options: MssqlWriteOptions,
+    options: MssqlWriteBackend,
     validation_options: ValidationOptions,
     mut phase_timings: Vec<PhaseTimingReport>,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
@@ -1053,7 +1053,7 @@ mod tests {
     use super::*;
     use crate::{
         MssqlConnectionConfig, MssqlPreparedTargetAction, MssqlTargetConfig, MssqlTargetTable,
-        MssqlWritePhase, PhaseStatus, PhaseTimingReport, default_mssql_write_options,
+        MssqlWritePhase, PhaseStatus, PhaseTimingReport, default_mssql_write_backend,
         plan_mssql_target_for_output,
     };
 
@@ -1191,7 +1191,7 @@ mod tests {
             &'connection mut self,
             _output_plan: &MssqlTargetOutputPlan,
             _prepared_target: &MssqlPreparedTarget,
-            _options: MssqlWriteOptions,
+            _options: MssqlWriteBackend,
         ) -> Result<Self::Writer<'connection>, DeltaFunnelError> {
             self.record("initialize")?;
             if let Some(error) = self.initialize_error.take() {
@@ -1439,7 +1439,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             validation_options,
             Vec::new(),
         )
@@ -1484,7 +1484,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             validation_options,
             Vec::new(),
         )
@@ -1516,7 +1516,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await?;
 
@@ -1554,7 +1554,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await?;
 
@@ -1600,7 +1600,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await?;
 
@@ -1646,7 +1646,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -1703,7 +1703,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             validation_options,
             Vec::new(),
         )
@@ -1764,7 +1764,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -1829,7 +1829,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -1891,7 +1891,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -1951,7 +1951,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await?;
 
@@ -1995,7 +1995,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await?;
 
@@ -2041,7 +2041,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             validation_options,
             Vec::new(),
         )
@@ -2260,7 +2260,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             validation_options,
             Vec::new(),
         )
@@ -2301,7 +2301,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             ValidationOptions::new(),
             Vec::new(),
         )
@@ -2344,7 +2344,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             ValidationOptions::new(),
             Vec::new(),
         )
@@ -2409,7 +2409,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             ValidationOptions::new(),
             Vec::new(),
         )
@@ -2465,7 +2465,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             validation_options,
             Vec::new(),
         )
@@ -2537,7 +2537,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             ValidationOptions::new(),
             Vec::new(),
         )
@@ -2593,7 +2593,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             validation_options,
             Vec::new(),
         )
@@ -2681,7 +2681,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -2723,7 +2723,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             validation_options,
             Vec::new(),
         )
@@ -2779,7 +2779,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -2826,7 +2826,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -2870,7 +2870,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -2908,7 +2908,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -2954,7 +2954,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -2990,7 +2990,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -3034,7 +3034,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()
@@ -3093,7 +3093,7 @@ mod tests {
             output_plan,
             connection,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
         )
         .await
         .err()

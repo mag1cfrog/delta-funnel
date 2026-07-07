@@ -20,8 +20,8 @@ use crate::{
 
 use super::{
     LoadMode, MssqlBatchShapingReport, MssqlConnectionSource, MssqlConnectionSummary,
-    MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteFailureContext,
-    MssqlWriteOptions, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_options,
+    MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteBackend,
+    MssqlWriteFailureContext, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_backend,
     write_output_batches_to_mssql_with_validation_options,
 };
 
@@ -53,7 +53,7 @@ pub struct MssqlOutputWriteJob {
     resolved_target: ResolvedMssqlTarget,
     schema_options: MssqlSchemaPlanOptions,
     batches: MssqlOutputBatchStreamFactory,
-    write_options: MssqlWriteOptions,
+    write_backend: MssqlWriteBackend,
     validation_options: ValidationOptions,
     phase_timings: Vec<PhaseTimingReport>,
 }
@@ -65,7 +65,7 @@ impl MssqlOutputWriteJob {
         resolved_target: ResolvedMssqlTarget,
         schema_options: MssqlSchemaPlanOptions,
         batches: F,
-        write_options: MssqlWriteOptions,
+        write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
     ) -> Self
     where
@@ -83,7 +83,7 @@ impl MssqlOutputWriteJob {
                     Ok(Box::pin(stream) as MssqlOutputBatchStream)
                 })
             }),
-            write_options,
+            write_backend,
             validation_options,
             phase_timings: Vec::new(),
         }
@@ -96,8 +96,8 @@ impl MssqlOutputWriteJob {
         self
     }
 
-    /// Creates a deferred SQL Server output write job using default write options.
-    pub fn with_default_write_options<F, Fut, S>(
+    /// Creates a deferred SQL Server output write job using the default write backend.
+    pub fn with_default_write_backend<F, Fut, S>(
         output_schema: SchemaRef,
         resolved_target: ResolvedMssqlTarget,
         schema_options: MssqlSchemaPlanOptions,
@@ -113,7 +113,7 @@ impl MssqlOutputWriteJob {
             resolved_target,
             schema_options,
             batches,
-            default_mssql_write_options(),
+            default_mssql_write_backend(),
             ValidationOptions::default(),
         )
     }
@@ -143,7 +143,7 @@ impl MssqlOutputWriteJob {
         ResolvedMssqlTarget,
         MssqlSchemaPlanOptions,
         MssqlOutputBatchStreamFactory,
-        MssqlWriteOptions,
+        MssqlWriteBackend,
         ValidationOptions,
         Vec<PhaseTimingReport>,
     ) {
@@ -152,7 +152,7 @@ impl MssqlOutputWriteJob {
             self.resolved_target,
             self.schema_options,
             self.batches,
-            self.write_options,
+            self.write_backend,
             self.validation_options,
             self.phase_timings,
         )
@@ -668,7 +668,7 @@ pub(crate) trait MssqlWorkflowOutputWriter: Send {
         resolved_target: ResolvedMssqlTarget,
         schema_options: MssqlSchemaPlanOptions,
         batches: MssqlOutputBatchStream,
-        write_options: MssqlWriteOptions,
+        write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
@@ -683,7 +683,7 @@ impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
         resolved_target: ResolvedMssqlTarget,
         schema_options: MssqlSchemaPlanOptions,
         batches: MssqlOutputBatchStream,
-        write_options: MssqlWriteOptions,
+        write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         write_output_batches_to_mssql_with_validation_options(
@@ -691,7 +691,7 @@ impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
             resolved_target,
             schema_options,
             batches,
-            write_options,
+            write_backend,
             validation_options,
         )
         .await
@@ -813,7 +813,7 @@ where
         resolved_target,
         schema_options,
         batches,
-        write_options,
+        write_backend,
         validation_options,
         planned_phase_timings,
     ) = job.into_parts();
@@ -840,7 +840,7 @@ where
             resolved_target,
             schema_options,
             batches,
-            write_options,
+            write_backend,
             validation_options,
         )
         .await
@@ -983,7 +983,7 @@ mod tests {
             resolved_target: ResolvedMssqlTarget,
             _schema_options: MssqlSchemaPlanOptions,
             _batches: MssqlOutputBatchStream,
-            _write_options: MssqlWriteOptions,
+            _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
@@ -1005,7 +1005,7 @@ mod tests {
             resolved_target: ResolvedMssqlTarget,
             _schema_options: MssqlSchemaPlanOptions,
             mut batches: MssqlOutputBatchStream,
-            _write_options: MssqlWriteOptions,
+            _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
@@ -1705,7 +1705,7 @@ mod tests {
         factory_calls: Arc<Mutex<Vec<String>>>,
     ) -> Result<MssqlOutputWriteJob, DeltaFunnelError> {
         let output_name = output_plan.output_name().to_owned();
-        Ok(MssqlOutputWriteJob::with_default_write_options(
+        Ok(MssqlOutputWriteJob::with_default_write_backend(
             output_schema(),
             resolved_target(output_plan)?,
             MssqlSchemaPlanOptions::default(),
@@ -1725,7 +1725,7 @@ mod tests {
         message: &'static str,
     ) -> Result<MssqlOutputWriteJob, DeltaFunnelError> {
         let output_name = output_plan.output_name().to_owned();
-        Ok(MssqlOutputWriteJob::with_default_write_options(
+        Ok(MssqlOutputWriteJob::with_default_write_backend(
             output_schema(),
             resolved_target(output_plan)?,
             MssqlSchemaPlanOptions::default(),
@@ -1748,7 +1748,7 @@ mod tests {
         factory_calls: Arc<Mutex<Vec<String>>>,
     ) -> Result<MssqlOutputWriteJob, DeltaFunnelError> {
         let output_name = output_plan.output_name().to_owned();
-        Ok(MssqlOutputWriteJob::with_default_write_options(
+        Ok(MssqlOutputWriteJob::with_default_write_backend(
             output_schema(),
             resolved_target(output_plan)?,
             MssqlSchemaPlanOptions::default(),

@@ -24,8 +24,8 @@ pub use workflow::{
 pub(crate) use workflow::{MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer};
 pub(crate) use write::MssqlBulkLoadWriter;
 pub use write::{
-    MssqlWriteOptions, MssqlWritePhase, default_mssql_write_options,
-    mssql_write_options_for_output_plan, validate_mssql_output_record_batch,
+    MssqlWriteBackend, MssqlWritePhase, default_mssql_write_backend,
+    mssql_write_backend_for_output_plan, validate_mssql_output_record_batch,
     validate_mssql_output_schema,
 };
 

@@ -5,7 +5,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputWriteJob, MssqlSchemaPlanOptions,
-    MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, MssqlWriteOptions, MssqlWriteReport,
+    MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, MssqlWriteBackend, MssqlWriteReport,
     ResolvedMssqlTarget, ValidationOptions, write_mssql_outputs_with_writer,
     write_output_batches_to_mssql_with_validation_options,
 };
@@ -31,7 +31,7 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowPublicOutputWriter {
         resolved_target: ResolvedMssqlTarget,
         schema_options: MssqlSchemaPlanOptions,
         batches: MssqlOutputBatchStream,
-        write_options: MssqlWriteOptions,
+        write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         write_output_batches_to_mssql_with_validation_options(
@@ -39,7 +39,7 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowPublicOutputWriter {
             resolved_target,
             schema_options,
             batches,
-            write_options,
+            write_backend,
             validation_options,
         )
         .await
@@ -74,7 +74,7 @@ impl DeltaFunnelSession {
                     planned.resolved_target().clone(),
                     planned.output_plan().schema_plan_options(),
                     batches,
-                    self.options.mssql_write_options(),
+                    self.options.mssql_write_backend(),
                     self.options.validation_options(),
                 )
                 .with_phase_timings(planned.phase_timings().to_vec()))
@@ -112,7 +112,7 @@ impl DeltaFunnelSession {
                     planned.resolved_target().clone(),
                     planned.output_plan().schema_plan_options(),
                     batches,
-                    self.options.mssql_write_options(),
+                    self.options.mssql_write_backend(),
                     self.options.validation_options(),
                 )
                 .with_phase_timings(planned.phase_timings().to_vec()))

@@ -805,7 +805,7 @@ mod tests {
         DeltaProviderSchedulingReport, DeltaSourceConfig, MssqlConnectionConfig,
         MssqlOutputBatchStream, MssqlOutputTarget, MssqlOutputWriteJob, MssqlSchemaPlanOptions,
         MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetResolutionContext,
-        MssqlWorkflowWriteOptions, MssqlWriteOptions, OutputWritePlan, QueryOptions,
+        MssqlWorkflowWriteOptions, MssqlWriteBackend, OutputWritePlan, QueryOptions,
         ResolvedMssqlTarget, SessionOptions, ValidationOptions, plan_mssql_target_for_output,
         write_mssql_outputs_with_writer,
     };
@@ -834,7 +834,7 @@ mod tests {
             _resolved_target: ResolvedMssqlTarget,
             _schema_options: MssqlSchemaPlanOptions,
             _batches: MssqlOutputBatchStream,
-            _write_options: MssqlWriteOptions,
+            _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
         ) -> Result<MssqlWriteReport, crate::DeltaFunnelError> {
             self.outcomes.pop_front().ok_or_else(|| {
@@ -1340,7 +1340,7 @@ mod tests {
     fn job(
         output_plan: MssqlTargetOutputPlan,
     ) -> Result<MssqlOutputWriteJob, crate::DeltaFunnelError> {
-        Ok(MssqlOutputWriteJob::with_default_write_options(
+        Ok(MssqlOutputWriteJob::with_default_write_backend(
             orders_schema_ref(),
             resolved_target(output_plan)?,
             MssqlSchemaPlanOptions::default(),

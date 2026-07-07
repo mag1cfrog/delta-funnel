@@ -2,8 +2,8 @@ use std::fmt;
 
 use crate::{
     DeltaFunnelError, DeltaProviderScanExecutionOptions, MssqlConnectionConfig,
-    MssqlSchemaPlanOptions, MssqlWorkflowWriteOptions, MssqlWriteOptions, QueryOptions,
-    ValidationOptions, default_mssql_write_options,
+    MssqlSchemaPlanOptions, MssqlWorkflowWriteOptions, MssqlWriteBackend, QueryOptions,
+    ValidationOptions, default_mssql_write_backend,
 };
 
 /// Session-wide options for lazy query-load orchestration.
@@ -12,7 +12,7 @@ pub struct SessionOptions {
     query_options: QueryOptions,
     provider_scan_options: DeltaProviderScanExecutionOptions,
     mssql_schema_options: MssqlSchemaPlanOptions,
-    mssql_write_options: MssqlWriteOptions,
+    mssql_write_backend: MssqlWriteBackend,
     mssql_workflow_options: MssqlWorkflowWriteOptions,
     validation_options: ValidationOptions,
     default_mssql_connection: Option<MssqlConnectionConfig>,
@@ -24,7 +24,7 @@ impl Default for SessionOptions {
             query_options: QueryOptions::default(),
             provider_scan_options: DeltaProviderScanExecutionOptions::default(),
             mssql_schema_options: MssqlSchemaPlanOptions::default(),
-            mssql_write_options: default_mssql_write_options(),
+            mssql_write_backend: default_mssql_write_backend(),
             mssql_workflow_options: MssqlWorkflowWriteOptions::default(),
             validation_options: ValidationOptions::default(),
             default_mssql_connection: None,
@@ -66,13 +66,13 @@ impl SessionOptions {
         self
     }
 
-    /// Sets SQL Server write options.
+    /// Sets SQL Server write backend selection.
     #[must_use]
-    pub const fn with_mssql_write_options(
+    pub const fn with_mssql_write_backend(
         mut self,
-        mssql_write_options: MssqlWriteOptions,
+        mssql_write_backend: MssqlWriteBackend,
     ) -> Self {
-        self.mssql_write_options = mssql_write_options;
+        self.mssql_write_backend = mssql_write_backend;
         self
     }
 
@@ -121,10 +121,10 @@ impl SessionOptions {
         self.mssql_schema_options
     }
 
-    /// Returns SQL Server write options.
+    /// Returns SQL Server write backend selection.
     #[must_use]
-    pub const fn mssql_write_options(&self) -> MssqlWriteOptions {
-        self.mssql_write_options
+    pub const fn mssql_write_backend(&self) -> MssqlWriteBackend {
+        self.mssql_write_backend
     }
 
     /// Returns SQL Server multi-output workflow options.
@@ -167,7 +167,7 @@ impl fmt::Debug for SessionOptions {
             .field("query_options", &self.query_options)
             .field("provider_scan_options", &self.provider_scan_options)
             .field("mssql_schema_options", &self.mssql_schema_options)
-            .field("mssql_write_options", &self.mssql_write_options)
+            .field("mssql_write_backend", &self.mssql_write_backend)
             .field("mssql_workflow_options", &self.mssql_workflow_options)
             .field("validation_options", &self.validation_options)
             .field(
