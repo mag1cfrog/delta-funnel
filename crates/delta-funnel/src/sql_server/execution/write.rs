@@ -120,12 +120,14 @@ impl<'client> MssqlBulkWriterFactory for MssqlConnectedBulkWriterFactory<'client
     ) -> Result<Self::Writer, arrow_tiberius::Error> {
         let MssqlBulkWriterInitializationRequest {
             table,
-            mappings,
+            planned_schema,
             options,
             ..
         } = request;
 
-        self.client.bulk_writer(table, mappings, options).await
+        self.client
+            .bulk_writer(table, planned_schema, options)
+            .await
     }
 }
 
@@ -134,7 +136,7 @@ impl<'client> MssqlBulkWriterFactory for MssqlConnectedBulkWriterFactory<'client
 pub(crate) struct MssqlBulkWriterInitializationRequest {
     output_name: String,
     table: arrow_tiberius::TableName,
-    mappings: Vec<arrow_tiberius::SchemaMapping>,
+    planned_schema: arrow_tiberius::PlannedSchema,
     options: MssqlWriteOptions,
     prepared_action: MssqlPreparedTargetAction,
     cleanup: MssqlTargetCleanupStatus,
@@ -153,7 +155,7 @@ impl MssqlBulkWriterInitializationRequest {
         Ok(Self {
             output_name: output_plan.output_name().to_owned(),
             table: prepared_target.table_name().clone(),
-            mappings: output_plan.schema_mappings().to_vec(),
+            planned_schema: output_plan.planned_schema().clone(),
             options,
             prepared_action: prepared_target.report().action(),
             cleanup: prepared_target.report().cleanup(),
@@ -175,7 +177,7 @@ impl MssqlBulkWriterInitializationRequest {
     /// Returns the planned schema mappings passed to the writer.
     #[must_use]
     pub(crate) fn mappings(&self) -> &[arrow_tiberius::SchemaMapping] {
-        &self.mappings
+        self.planned_schema.mappings()
     }
 
     /// Returns the write options passed to the writer.
@@ -251,12 +253,9 @@ pub fn default_mssql_write_options() -> MssqlWriteOptions {
 /// Builds write options from a planned SQL Server output target.
 #[must_use]
 pub fn mssql_write_options_for_output_plan(
-    output_plan: &MssqlTargetOutputPlan,
+    _output_plan: &MssqlTargetOutputPlan,
 ) -> MssqlWriteOptions {
-    MssqlWriteOptions {
-        plan_options: output_plan.schema_plan_options(),
-        ..default_mssql_write_options()
-    }
+    default_mssql_write_options()
 }
 
 /// Initializes one SQL Server bulk writer after target lifecycle preparation.
@@ -296,7 +295,12 @@ where
     let prepared_action = request.prepared_action();
 
     factory.initialize(request).await.map_err(|source| {
-        mssql_writer_initialization_error(output_plan, prepared_action, cleanup, source.to_string())
+        mssql_arrow_tiberius_writer_initialization_error(
+            output_plan,
+            prepared_action,
+            cleanup,
+            &source,
+        )
     })
 }
 
@@ -644,7 +648,7 @@ where
                     shaped_rows,
                 ),
             );
-            mssql_write_phase_error(
+            mssql_arrow_tiberius_write_phase_error(
                 output_plan,
                 MssqlWritePhase::WriteBatch,
                 write_failure_report_metrics(
@@ -655,7 +659,7 @@ where
                     cleanup,
                 )
                 .with_phase_timings(phase_timings.write_batch_failed()),
-                source.to_string(),
+                &source,
             )
         })?;
 
@@ -679,7 +683,7 @@ where
                 shaped_rows,
             ),
         );
-        mssql_write_phase_error(
+        mssql_arrow_tiberius_write_phase_error(
             output_plan,
             MssqlWritePhase::Finalize,
             write_failure_report_metrics(
@@ -690,7 +694,7 @@ where
                 cleanup,
             )
             .with_phase_timings(phase_timings.finalize_failed(finalize_elapsed)),
-            source.to_string(),
+            &source,
         )
     })?;
 
@@ -744,6 +748,21 @@ fn mssql_write_phase_error(
     }
 }
 
+fn mssql_arrow_tiberius_write_phase_error(
+    output_plan: &MssqlTargetOutputPlan,
+    phase: MssqlWritePhase,
+    metrics: MssqlWriteReportMetrics,
+    source: &arrow_tiberius::Error,
+) -> DeltaFunnelError {
+    DeltaFunnelError::MssqlWritePhase {
+        context: Box::new(
+            MssqlWriteFailureContext::from_output_plan_with_metrics(output_plan, phase, metrics)
+                .with_diagnostics(arrow_tiberius_write_diagnostics(source)),
+        ),
+        message: arrow_tiberius_safe_error_message(source),
+    }
+}
+
 fn mssql_writer_initialization_error(
     output_plan: &MssqlTargetOutputPlan,
     prepared_action: MssqlPreparedTargetAction,
@@ -762,6 +781,62 @@ fn mssql_writer_initialization_error(
         ),
         format!("prepared target action {prepared_action:?}: {message}"),
     )
+}
+
+fn mssql_arrow_tiberius_writer_initialization_error(
+    output_plan: &MssqlTargetOutputPlan,
+    prepared_action: MssqlPreparedTargetAction,
+    cleanup: MssqlTargetCleanupStatus,
+    source: &arrow_tiberius::Error,
+) -> DeltaFunnelError {
+    DeltaFunnelError::MssqlWritePhase {
+        context: Box::new(
+            MssqlWriteFailureContext::from_output_plan_with_metrics(
+                output_plan,
+                MssqlWritePhase::InitializeWriter,
+                write_report_metrics(
+                    RowCount::unavailable(),
+                    MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
+                    MssqlWriteProgress::zero(),
+                    false,
+                    cleanup,
+                ),
+            )
+            .with_diagnostics(arrow_tiberius_write_diagnostics(source)),
+        ),
+        message: format!(
+            "prepared target action {prepared_action:?}: {}",
+            arrow_tiberius_safe_error_message(source)
+        ),
+    }
+}
+
+fn arrow_tiberius_safe_error_message(source: &arrow_tiberius::Error) -> String {
+    let info = source.safe_error_info();
+    let phase = info.phase().map(|phase| phase.as_str());
+
+    match phase {
+        Some(phase) => format!(
+            "arrow-tiberius {phase} failed: {} ({})",
+            info.summary(),
+            info.kind()
+        ),
+        None => format!("arrow-tiberius error: {} ({})", info.summary(), info.kind()),
+    }
+}
+
+fn arrow_tiberius_write_diagnostics(source: &arrow_tiberius::Error) -> Vec<MssqlWriteDiagnostic> {
+    source
+        .safe_error_info()
+        .diagnostics()
+        .map(|diagnostics| {
+            diagnostics
+                .all()
+                .iter()
+                .map(MssqlWriteDiagnostic::from_arrow_tiberius)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn ensure_prepared_target_matches_output_plan(
@@ -847,8 +922,8 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
     use arrow_tiberius::{
-        DiagnosticCode, DiagnosticSeverity, PlanOptions, SchemaCheck, StringPolicy, WriteBackend,
-        WriteOptions,
+        Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, PlanOptions, SchemaCheck,
+        StringPolicy, WriteBackend, WriteOptions, WritePhase,
     };
     use datafusion::arrow::{
         array::{Int64Array, StringArray, StringViewArray},
@@ -1277,10 +1352,6 @@ mod tests {
         let options = WriteOptions {
             backend: WriteBackend::BaselineTokenRow,
             schema_check: SchemaCheck::Strict,
-            plan_options: PlanOptions {
-                string_policy: StringPolicy::NVarChar(128),
-                ..PlanOptions::default()
-            },
         };
         let request_log = Arc::new(Mutex::new(None));
         let factory = RecordingBulkWriterFactory::with_request_log(Arc::clone(&request_log));
@@ -1336,17 +1407,78 @@ mod tests {
         })?;
         let message = assert_initialize_writer_error(
             error,
-            r"target metadata failed\nfor test",
+            "write backend unavailable",
             MssqlTargetCleanupStatus::NotAttempted,
         )?;
         let request = take_initialization_request(&request_log)?;
 
         assert!(message.contains("CreatedTable"));
+        assert!(!message.contains("target metadata failed"));
         assert_eq!(request.cleanup(), MssqlTargetCleanupStatus::NotAttempted);
         assert_eq!(
             request.prepared_action(),
             MssqlPreparedTargetAction::CreatedTable
         );
+        Ok(())
+    }
+
+    #[test]
+    fn arrow_tiberius_writer_errors_use_safe_message_and_structured_diagnostics()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let source = arrow_tiberius::Error::DirectEncoding {
+            diagnostics: DiagnosticSet::from(vec![
+                Diagnostic::error(
+                    DiagnosticCode::DirectEncodingUnsupportedBatch,
+                    "direct encoder rejected test batch\nwith detail",
+                )
+                .with_field(arrow_tiberius::FieldRef::new(1, "status"))
+                .with_row(7),
+            ]),
+        }
+        .with_write_phase(WritePhase::DirectEncoding);
+
+        let error = mssql_arrow_tiberius_write_phase_error(
+            &output_plan,
+            MssqlWritePhase::Finalize,
+            write_failure_report_metrics(
+                RowCount::partial(2),
+                MssqlBatchShapingReport::completed(1, 2, 1, 2),
+                MssqlWriteProgress::new(2, 1, 25),
+                true,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ),
+            &source,
+        );
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected MSSQL write phase error".to_owned(),
+            });
+        };
+
+        assert_eq!(
+            message,
+            "arrow-tiberius direct_encoding failed: direct encoding failed with diagnostics (DirectEncoding)"
+        );
+        assert_eq!(context.phase(), MssqlWritePhase::Finalize);
+        assert_eq!(context.diagnostics().len(), 1);
+        let diagnostic = &context.diagnostics()[0];
+        assert_eq!(
+            diagnostic.code(),
+            DiagnosticCode::DirectEncodingUnsupportedBatch
+        );
+        assert_eq!(
+            diagnostic.message(),
+            r"direct encoder rejected test batch\nwith detail"
+        );
+        assert_eq!(
+            diagnostic
+                .field()
+                .map(|field| (field.index(), field.name())),
+            Some((1, "status"))
+        );
+        assert_eq!(diagnostic.row(), Some(7));
         Ok(())
     }
 
@@ -2143,16 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn default_options_preserve_arrow_tiberius_plan_options_default() {
-        let options = default_mssql_write_options();
-
-        assert_eq!(options.plan_options, WriteOptions::default().plan_options);
-        assert_eq!(options.plan_options, PlanOptions::default());
-    }
-
-    #[test]
-    fn write_options_for_output_plan_preserve_schema_plan_options() -> Result<(), DeltaFunnelError>
-    {
+    fn output_plan_preserves_schema_plan_options() -> Result<(), DeltaFunnelError> {
         let connection = secret_connection()?;
         let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
         let plan_options = PlanOptions {
@@ -2169,9 +2292,9 @@ mod tests {
 
         let write_options = mssql_write_options_for_output_plan(&output_plan);
 
+        assert_eq!(output_plan.planned_schema().plan_options(), plan_options);
         assert_eq!(write_options.backend, WriteBackend::DirectRawBulk);
         assert_eq!(write_options.schema_check, SchemaCheck::Strict);
-        assert_eq!(write_options.plan_options, plan_options);
         Ok(())
     }
 
