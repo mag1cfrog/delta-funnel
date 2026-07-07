@@ -55,6 +55,9 @@ const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
 const BENCHMARK_SCHEMA_VERSION: u32 = 19;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
+const PROVIDER_EXEC_DEFAULT_CASE_WORKLOAD: &str = "provider_partitioned_event_log_12m";
+const PROVIDER_EXEC_DEFAULT_CASE_QUERY: &str = "project_event_keys";
+const PROVIDER_EXEC_DEFAULT_CASE_SCHEDULING_PROFILE: &str = "default_execution";
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
 const PROVIDER_EXEC_MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const PROVIDER_EXEC_PROTOCOL_JSON: &str =
@@ -353,28 +356,41 @@ async fn write_provider_exec_benchmark_csv_async(
         .filter(|workload| provider_exec_filter_matches(&config.workload_filter, workload.name))
         .collect::<Vec<_>>();
     validate_provider_exec_filter_result("workload", &config.workload_filter, workloads.len())?;
-    let scheduling_profiles = ProviderExecSchedulingProfile::standard_cases(run_environment);
-    let scheduling_profiles = scheduling_profiles
+    let scheduling_profiles = if config.default_case {
+        vec![ProviderExecSchedulingProfile::default_execution_case()]
+    } else {
+        let scheduling_profiles = ProviderExecSchedulingProfile::standard_cases(run_environment);
+        let scheduling_profiles = scheduling_profiles
+            .into_iter()
+            .filter(|profile| {
+                provider_exec_filter_matches(&config.scheduling_profile_filter, profile.name)
+            })
+            .collect::<Vec<_>>();
+        validate_provider_exec_filter_result(
+            "scheduling profile",
+            &config.scheduling_profile_filter,
+            scheduling_profiles.len(),
+        )?;
+        scheduling_profiles
+    };
+    let backends = if config.default_case {
+        vec![DeltaProviderScanExecutionOptions::default().reader_backend]
+    } else {
+        let backends = [
+            DeltaProviderReaderBackend::OfficialKernel,
+            DeltaProviderReaderBackend::NativeAsync,
+        ]
         .into_iter()
-        .filter(|profile| {
-            provider_exec_filter_matches(&config.scheduling_profile_filter, profile.name)
+        .filter(|backend| {
+            provider_exec_filter_matches(
+                &config.backend_filter,
+                provider_exec_backend_name(*backend),
+            )
         })
         .collect::<Vec<_>>();
-    validate_provider_exec_filter_result(
-        "scheduling profile",
-        &config.scheduling_profile_filter,
-        scheduling_profiles.len(),
-    )?;
-    let backends = [
-        DeltaProviderReaderBackend::OfficialKernel,
-        DeltaProviderReaderBackend::NativeAsync,
-    ]
-    .into_iter()
-    .filter(|backend| {
-        provider_exec_filter_matches(&config.backend_filter, provider_exec_backend_name(*backend))
-    })
-    .collect::<Vec<_>>();
-    validate_provider_exec_filter_result("backend", &config.backend_filter, backends.len())?;
+        validate_provider_exec_filter_result("backend", &config.backend_filter, backends.len())?;
+        backends
+    };
     let temp_root = config.temp_dir.clone().unwrap_or_else(env::temp_dir);
 
     writeln!(output, "{}", PROVIDER_EXEC_CSV_HEADER.join(","))?;
@@ -453,6 +469,10 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
         output,
         "Use --provider-exec-workload, --provider-exec-query, --provider-exec-backend, and --provider-exec-scheduling-profile to run a focused provider-exec case."
     )?;
+    writeln!(
+        output,
+        "Use --provider-exec-default-case to run one representative provider-exec case with production default scan execution options."
+    )?;
     writeln!(output, "The default seed is {DEFAULT_BENCHMARK_SEED}.")?;
     Ok(())
 }
@@ -480,6 +500,7 @@ struct ProviderExecConfig {
     repetitions: usize,
     temp_dir: Option<PathBuf>,
     storage_profile: ProviderExecStorageProfile,
+    default_case: bool,
     workload_filter: Option<String>,
     query_filter: Option<String>,
     backend_filter: Option<String>,
@@ -539,11 +560,12 @@ struct ProviderExecQueryCase {
 #[derive(Debug, Clone, Copy)]
 struct ProviderExecSchedulingProfile {
     name: &'static str,
-    scan_target_partitions: usize,
-    max_concurrent_file_reads_per_scan: usize,
+    scan_target_partitions: Option<usize>,
+    max_concurrent_file_reads_per_scan: Option<usize>,
     max_concurrent_file_reads_per_partition: usize,
     output_buffer_capacity_per_partition: usize,
     native_async_prefetch_file_count_per_partition: usize,
+    uses_default_execution_options: bool,
 }
 
 struct ProviderExecDeltaTable {
@@ -811,6 +833,8 @@ impl BenchmarkRunnerConfig {
                         value.to_string_lossy().into_owned(),
                     )
                 })?;
+            } else if arg == "--provider-exec-default-case" {
+                provider_exec.default_case = true;
             } else if arg == "--provider-exec-workload" {
                 let value = args
                     .next()
@@ -868,6 +892,7 @@ impl BenchmarkRunnerConfig {
                 ));
             }
         }
+        provider_exec.apply_default_case()?;
 
         Ok(Self {
             output_path,
@@ -897,11 +922,44 @@ impl Default for ProviderExecConfig {
             repetitions: DEFAULT_PROVIDER_EXEC_REPETITIONS,
             temp_dir: None,
             storage_profile: ProviderExecStorageProfile::local(),
+            default_case: false,
             workload_filter: None,
             query_filter: None,
             backend_filter: None,
             scheduling_profile_filter: None,
         }
+    }
+}
+
+impl ProviderExecConfig {
+    fn apply_default_case(&mut self) -> Result<(), BenchmarkRunnerConfigError> {
+        if !self.default_case {
+            return Ok(());
+        }
+        if self.workload_filter.is_some() {
+            return Err(BenchmarkRunnerConfigError::ProviderExecDefaultCaseConflict(
+                "--provider-exec-workload",
+            ));
+        }
+        if self.query_filter.is_some() {
+            return Err(BenchmarkRunnerConfigError::ProviderExecDefaultCaseConflict(
+                "--provider-exec-query",
+            ));
+        }
+        if self.backend_filter.is_some() {
+            return Err(BenchmarkRunnerConfigError::ProviderExecDefaultCaseConflict(
+                "--provider-exec-backend",
+            ));
+        }
+        if self.scheduling_profile_filter.is_some() {
+            return Err(BenchmarkRunnerConfigError::ProviderExecDefaultCaseConflict(
+                "--provider-exec-scheduling-profile",
+            ));
+        }
+
+        self.workload_filter = Some(PROVIDER_EXEC_DEFAULT_CASE_WORKLOAD.to_owned());
+        self.query_filter = Some(PROVIDER_EXEC_DEFAULT_CASE_QUERY.to_owned());
+        Ok(())
     }
 }
 
@@ -1142,48 +1200,68 @@ impl ProviderExecQueryCase {
 }
 
 impl ProviderExecSchedulingProfile {
+    fn default_execution_case() -> Self {
+        let options = DeltaProviderScanExecutionOptions::default();
+        Self {
+            name: PROVIDER_EXEC_DEFAULT_CASE_SCHEDULING_PROFILE,
+            scan_target_partitions: None,
+            max_concurrent_file_reads_per_scan: options.max_concurrent_file_reads_per_scan,
+            max_concurrent_file_reads_per_partition: options
+                .max_concurrent_file_reads_per_partition,
+            output_buffer_capacity_per_partition: options.output_buffer_capacity_per_partition,
+            native_async_prefetch_file_count_per_partition: options
+                .native_async_prefetch_file_count_per_partition,
+            uses_default_execution_options: true,
+        }
+    }
+
     fn standard_cases(run_environment: BenchmarkRunEnvironment) -> Vec<Self> {
         let available_parallelism = run_environment.available_parallelism.unwrap_or(4).max(1);
         let mut profiles = vec![
             Self {
                 name: "lazy_serial_buffer_1",
-                scan_target_partitions: 1,
-                max_concurrent_file_reads_per_scan: 1,
+                scan_target_partitions: Some(1),
+                max_concurrent_file_reads_per_scan: Some(1),
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 1,
                 native_async_prefetch_file_count_per_partition: 0,
+                uses_default_execution_options: false,
             },
             Self {
                 name: "lazy_parallel_buffer_1",
-                scan_target_partitions: 4,
-                max_concurrent_file_reads_per_scan: 4,
+                scan_target_partitions: Some(4),
+                max_concurrent_file_reads_per_scan: Some(4),
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 1,
                 native_async_prefetch_file_count_per_partition: 0,
+                uses_default_execution_options: false,
             },
             Self {
                 name: "lazy_parallel_buffer_4",
-                scan_target_partitions: 4,
-                max_concurrent_file_reads_per_scan: 4,
+                scan_target_partitions: Some(4),
+                max_concurrent_file_reads_per_scan: Some(4),
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 4,
                 native_async_prefetch_file_count_per_partition: 0,
+                uses_default_execution_options: false,
             },
             Self {
                 name: "prefetch_1_parallel_buffer_1",
-                scan_target_partitions: 4,
-                max_concurrent_file_reads_per_scan: 8,
+                scan_target_partitions: Some(4),
+                max_concurrent_file_reads_per_scan: Some(8),
                 max_concurrent_file_reads_per_partition: 2,
                 output_buffer_capacity_per_partition: 1,
                 native_async_prefetch_file_count_per_partition: 1,
+                uses_default_execution_options: false,
             },
             Self {
                 name: "prefetch_2_parallel_buffer_1",
-                scan_target_partitions: 4,
-                max_concurrent_file_reads_per_scan: 12,
+                scan_target_partitions: Some(4),
+                max_concurrent_file_reads_per_scan: Some(12),
                 max_concurrent_file_reads_per_partition: 3,
                 output_buffer_capacity_per_partition: 1,
                 native_async_prefetch_file_count_per_partition: 2,
+                uses_default_execution_options: false,
             },
         ];
         profiles.extend(
@@ -1196,13 +1274,14 @@ impl ProviderExecSchedulingProfile {
             .into_iter()
             .map(|(name, scan_multiplier)| Self {
                 name,
-                scan_target_partitions: available_parallelism,
-                max_concurrent_file_reads_per_scan: available_parallelism
-                    .saturating_mul(scan_multiplier)
-                    .max(1),
+                scan_target_partitions: Some(available_parallelism),
+                max_concurrent_file_reads_per_scan: Some(
+                    available_parallelism.saturating_mul(scan_multiplier).max(1),
+                ),
                 max_concurrent_file_reads_per_partition: 3,
                 output_buffer_capacity_per_partition: 1,
                 native_async_prefetch_file_count_per_partition: 2,
+                uses_default_execution_options: false,
             }),
         );
         profiles
@@ -1861,23 +1940,35 @@ async fn run_provider_exec_once(
             .with_storage_options(table.storage_options.clone()),
     )?;
     let protocol = preflight_delta_protocol(&source)?;
-    let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
-        backend,
-        scheduling_profile.max_concurrent_file_reads_per_scan,
-        scheduling_profile.max_concurrent_file_reads_per_partition,
-    )?
-    .with_output_buffer_capacity_per_partition(
-        scheduling_profile.output_buffer_capacity_per_partition,
-    )?
-    .with_native_async_prefetch_file_count_per_partition(
-        scheduling_profile.native_async_prefetch_file_count_per_partition,
-    )?;
+    let execution_options = if scheduling_profile.uses_default_execution_options {
+        DeltaProviderScanExecutionOptions::default()
+    } else {
+        let max_concurrent_file_reads_per_scan = scheduling_profile
+            .max_concurrent_file_reads_per_scan
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provider-exec scheduling profile is missing scan-wide capacity",
+                )
+            })?;
+        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            backend,
+            max_concurrent_file_reads_per_scan,
+            scheduling_profile.max_concurrent_file_reads_per_partition,
+        )?
+        .with_output_buffer_capacity_per_partition(
+            scheduling_profile.output_buffer_capacity_per_partition,
+        )?
+        .with_native_async_prefetch_file_count_per_partition(
+            scheduling_profile.native_async_prefetch_file_count_per_partition,
+        )?
+    };
     register_delta_sources_with_scan_execution_options(
         &ctx,
         vec![DeltaTableProviderConfig {
             source,
             protocol,
-            scan_target_partitions: Some(scheduling_profile.scan_target_partitions),
+            scan_target_partitions: scheduling_profile.scan_target_partitions,
         }],
         execution_options,
     )?;
@@ -2299,11 +2390,12 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         input.query.name.to_owned(),
         provider_exec_backend_name(input.backend).to_owned(),
         input.scheduling_profile.name.to_owned(),
-        input.scheduling_profile.scan_target_partitions.to_string(),
+        optional_usize(input.scheduling_profile.scan_target_partitions),
         input
             .scheduling_profile
             .max_concurrent_file_reads_per_scan
-            .to_string(),
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
         input
             .scheduling_profile
             .max_concurrent_file_reads_per_partition
@@ -3009,6 +3101,7 @@ enum BenchmarkRunnerConfigError {
     DuplicateProviderExecBackendFilter,
     MissingProviderExecSchedulingProfileFilter,
     DuplicateProviderExecSchedulingProfileFilter,
+    ProviderExecDefaultCaseConflict(&'static str),
     MissingSeed,
     InvalidSeed(String),
     UnknownArgument(String),
@@ -3120,6 +3213,10 @@ impl fmt::Display for BenchmarkRunnerConfigError {
             Self::DuplicateProviderExecSchedulingProfileFilter => write!(
                 formatter,
                 "--provider-exec-scheduling-profile may be provided only once"
+            ),
+            Self::ProviderExecDefaultCaseConflict(argument) => write!(
+                formatter,
+                "--provider-exec-default-case cannot be combined with {argument}"
             ),
             Self::MissingSeed => write!(formatter, "--seed requires a u64 value"),
             Self::InvalidSeed(value) => write!(formatter, "invalid --seed value `{value}`"),
@@ -5415,6 +5512,7 @@ mod tests {
                 repetitions: 5,
                 temp_dir: Some(PathBuf::from("target")),
                 storage_profile: ProviderExecStorageProfile::s3_normal(),
+                default_case: false,
                 workload_filter: Some("provider_partitioned_event_log_12m".to_owned()),
                 query_filter: Some("count_events".to_owned()),
                 backend_filter: Some("native_async".to_owned()),
@@ -5423,6 +5521,54 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn runner_config_accepts_provider_exec_default_case() -> Result<(), Box<dyn Error>> {
+        let config = BenchmarkRunnerConfig::parse([
+            "--mode",
+            "provider-exec",
+            "--provider-exec-default-case",
+        ])?;
+
+        assert_eq!(config.mode, BenchmarkMode::ProviderExec);
+        assert!(config.provider_exec.default_case);
+        assert_eq!(
+            config.provider_exec.workload_filter,
+            Some(PROVIDER_EXEC_DEFAULT_CASE_WORKLOAD.to_owned())
+        );
+        assert_eq!(
+            config.provider_exec.query_filter,
+            Some(PROVIDER_EXEC_DEFAULT_CASE_QUERY.to_owned())
+        );
+        assert_eq!(config.provider_exec.backend_filter, None);
+        assert_eq!(config.provider_exec.scheduling_profile_filter, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn runner_config_rejects_default_case_with_explicit_execution_filters() {
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--provider-exec-default-case",
+                "--provider-exec-backend",
+                "native_async",
+            ]),
+            Err(BenchmarkRunnerConfigError::ProviderExecDefaultCaseConflict(
+                "--provider-exec-backend"
+            ))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--provider-exec-default-case",
+                "--provider-exec-scheduling-profile",
+                "lazy_parallel_buffer_1",
+            ]),
+            Err(BenchmarkRunnerConfigError::ProviderExecDefaultCaseConflict(
+                "--provider-exec-scheduling-profile"
+            ))
+        );
     }
 
     #[test]
@@ -5650,6 +5796,7 @@ mod tests {
         assert!(usage.contains("Use --provider-exec-repetitions"));
         assert!(usage.contains("Use --provider-exec-storage-profile"));
         assert!(usage.contains("Use --provider-exec-workload"));
+        assert!(usage.contains("Use --provider-exec-default-case"));
         assert!(usage.contains("The default seed is 0."));
 
         Ok(())
@@ -6859,25 +7006,54 @@ mod tests {
             scheduling_profiles[4].native_async_prefetch_file_count_per_partition,
             2
         );
-        assert_eq!(scheduling_profiles[5].scan_target_partitions, 8);
-        assert_eq!(scheduling_profiles[5].max_concurrent_file_reads_per_scan, 8);
+        assert_eq!(scheduling_profiles[5].scan_target_partitions, Some(8));
+        assert_eq!(
+            scheduling_profiles[5].max_concurrent_file_reads_per_scan,
+            Some(8)
+        );
         assert_eq!(
             scheduling_profiles[5].max_concurrent_file_reads_per_partition,
             3
         );
         assert_eq!(
             scheduling_profiles[6].max_concurrent_file_reads_per_scan,
-            16
+            Some(16)
         );
         assert_eq!(
             scheduling_profiles[7].max_concurrent_file_reads_per_scan,
-            24
+            Some(24)
         );
         assert_eq!(
             scheduling_profiles[8].max_concurrent_file_reads_per_scan,
-            32
+            Some(32)
         );
         Ok(())
+    }
+
+    #[test]
+    fn provider_exec_default_case_uses_scan_execution_defaults() {
+        let profile = ProviderExecSchedulingProfile::default_execution_case();
+        let options = DeltaProviderScanExecutionOptions::default();
+
+        assert_eq!(profile.name, PROVIDER_EXEC_DEFAULT_CASE_SCHEDULING_PROFILE);
+        assert_eq!(profile.scan_target_partitions, None);
+        assert_eq!(
+            profile.max_concurrent_file_reads_per_scan,
+            options.max_concurrent_file_reads_per_scan
+        );
+        assert_eq!(
+            profile.max_concurrent_file_reads_per_partition,
+            options.max_concurrent_file_reads_per_partition
+        );
+        assert_eq!(
+            profile.output_buffer_capacity_per_partition,
+            options.output_buffer_capacity_per_partition
+        );
+        assert_eq!(
+            profile.native_async_prefetch_file_count_per_partition,
+            options.native_async_prefetch_file_count_per_partition
+        );
+        assert!(profile.uses_default_execution_options);
     }
 
     #[test]
@@ -6974,11 +7150,12 @@ mod tests {
         let query = workload.query_cases()[0];
         let scheduling_profile = ProviderExecSchedulingProfile {
             name: "test_lazy_serial",
-            scan_target_partitions: 1,
-            max_concurrent_file_reads_per_scan: 1,
+            scan_target_partitions: Some(1),
+            max_concurrent_file_reads_per_scan: Some(1),
             max_concurrent_file_reads_per_partition: 1,
             output_buffer_capacity_per_partition: 1,
             native_async_prefetch_file_count_per_partition: 0,
+            uses_default_execution_options: false,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6997,6 +7174,46 @@ mod tests {
             assert_eq!(measurement.produced_rows, 16);
             assert!(measurement.produced_batches > 0);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_exec_reads_synthetic_mimic_table_with_default_execution_case()
+    -> Result<(), Box<dyn Error>> {
+        let partition_date = SyntheticDate {
+            year: 2026,
+            month: 6,
+            day: 12,
+        };
+        let workload = ProviderExecWorkloadCase {
+            name: "test_provider_synthetic_mimic_default_execution",
+            schema_kind: ProviderExecSchemaKind::SyntheticPartitionedEventLog,
+            file_specs: vec![ProviderExecFileSpec {
+                path: synthetic_file_path(partition_date, 0),
+                rows: 16,
+                partition_date: Some(partition_date),
+            }],
+            deleted_row_indexes_per_file: &[],
+        };
+        let table = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile::local(),
+        )?;
+        let query = workload.query_cases()[0];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let measurement = runtime.block_on(run_provider_exec_once(
+            &table,
+            query,
+            DeltaProviderScanExecutionOptions::default().reader_backend,
+            ProviderExecSchedulingProfile::default_execution_case(),
+        ))?;
+
+        assert_eq!(measurement.produced_rows, 16);
+        assert!(measurement.produced_batches > 0);
 
         Ok(())
     }
@@ -7031,11 +7248,12 @@ mod tests {
         let query = workload.query_cases()[1];
         let scheduling_profile = ProviderExecSchedulingProfile {
             name: "test_lazy_serial",
-            scan_target_partitions: 1,
-            max_concurrent_file_reads_per_scan: 1,
+            scan_target_partitions: Some(1),
+            max_concurrent_file_reads_per_scan: Some(1),
             max_concurrent_file_reads_per_partition: 1,
             output_buffer_capacity_per_partition: 1,
             native_async_prefetch_file_count_per_partition: 0,
+            uses_default_execution_options: false,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7174,11 +7392,12 @@ mod tests {
             backend: DeltaProviderReaderBackend::NativeAsync,
             scheduling_profile: ProviderExecSchedulingProfile {
                 name: "lazy_parallel_buffer_4",
-                scan_target_partitions: 4,
-                max_concurrent_file_reads_per_scan: 4,
+                scan_target_partitions: Some(4),
+                max_concurrent_file_reads_per_scan: Some(4),
                 max_concurrent_file_reads_per_partition: 1,
                 output_buffer_capacity_per_partition: 4,
                 native_async_prefetch_file_count_per_partition: 0,
+                uses_default_execution_options: false,
             },
             summary: &summary,
         });
