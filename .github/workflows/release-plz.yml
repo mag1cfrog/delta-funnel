@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RELEASE_PLZ_RUST_VERSION: "1.91"
+
 jobs:
   release-pr:
     name: Release-plz PR
@@ -45,17 +48,10 @@ jobs:
           token: ${{ steps.generate-token.outputs.token }}
           persist-credentials: false
 
-      - name: Read Rust version
-        id: rust-version
+      - name: Install release-plz Rust toolchain
         run: |
-          version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
-          test -n "$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install "${{ steps.rust-version.outputs.version }}" --profile minimal
-          rustup default "${{ steps.rust-version.outputs.version }}"
+          rustup toolchain install "$RELEASE_PLZ_RUST_VERSION" --profile minimal
+          rustup default "$RELEASE_PLZ_RUST_VERSION"
 
       - name: Configure Cargo target
         run: echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/release-plz-target" >> "$GITHUB_ENV"
@@ -117,17 +113,10 @@ jobs:
           token: ${{ steps.generate-token.outputs.token }}
           persist-credentials: false
 
-      - name: Read Rust version
-        id: rust-version
+      - name: Install release-plz Rust toolchain
         run: |
-          version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
-          test -n "$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install "${{ steps.rust-version.outputs.version }}" --profile minimal
-          rustup default "${{ steps.rust-version.outputs.version }}"
+          rustup toolchain install "$RELEASE_PLZ_RUST_VERSION" --profile minimal
+          rustup default "$RELEASE_PLZ_RUST_VERSION"
 
       - name: Configure Cargo target
         run: echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/release-plz-target" >> "$GITHUB_ENV"
