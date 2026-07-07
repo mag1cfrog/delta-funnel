@@ -14,7 +14,9 @@ use std::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{TableName, connect_mssql_client_from_ado_string};
 use datafusion::arrow::{
-    array::{ArrayRef, Int32Array, Int64Array, TimestampNanosecondArray},
+    array::{
+        ArrayRef, Int32Array, Int64Array, TimestampMicrosecondArray, TimestampNanosecondArray,
+    },
     record_batch::RecordBatch,
 };
 use delta_funnel::{
@@ -567,8 +569,10 @@ END;"
 fn timestamp_ns_datetime_assertion_sql(table: &TableName) -> String {
     let expected_rows = timestamp_ns_datetime_cases()
         .iter()
-        .map(|(row_id, _nanos, literal)| {
-            format!("({row_id}, CAST(CAST(N'{literal}' AS datetime2(6)) AS datetime))")
+        .map(|(row_id, _nanos, timestamp_ns, _micros, timestamp_us)| {
+            format!(
+                "({row_id}, CAST(CAST(N'{timestamp_ns}' AS datetime2(6)) AS datetime), CAST(CAST(N'{timestamp_us}' AS datetime2(6)) AS datetime))"
+            )
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -582,16 +586,16 @@ BEGIN
     RETURN;
 END;
 IF EXISTS (
-    SELECT [id], [event_time] FROM {table}
+    SELECT [id], [event_time], [rounding_time] FROM {table}
     EXCEPT
-    SELECT [expected].[id], [expected].[event_time]
-    FROM (VALUES {expected_rows}) AS [expected]([id], [event_time])
+    SELECT [expected].[id], [expected].[event_time], [expected].[rounding_time]
+    FROM (VALUES {expected_rows}) AS [expected]([id], [event_time], [rounding_time])
 )
 OR EXISTS (
-    SELECT [expected].[id], [expected].[event_time]
-    FROM (VALUES {expected_rows}) AS [expected]([id], [event_time])
+    SELECT [expected].[id], [expected].[event_time], [expected].[rounding_time]
+    FROM (VALUES {expected_rows}) AS [expected]([id], [event_time], [rounding_time])
     EXCEPT
-    SELECT [id], [event_time] FROM {table}
+    SELECT [id], [event_time], [rounding_time] FROM {table}
 )
 BEGIN
     RAISERROR('unexpected timestamp datetime values', 16, 1);
@@ -622,6 +626,11 @@ fn timestamp_ns_datetime_schema() -> SchemaRef {
             DataType::Timestamp(TimeUnit::Nanosecond, None),
             false,
         ),
+        Field::new(
+            "rounding_time",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
     ]))
 }
 
@@ -630,24 +639,51 @@ fn timestamp_ns_datetime_batch(schema: SchemaRef) -> TestResult<RecordBatch> {
     let ids: ArrayRef = Arc::new(Int32Array::from(
         cases
             .iter()
-            .map(|(row_id, _nanos, _literal)| *row_id)
+            .map(|(row_id, _nanos, _timestamp_ns, _micros, _timestamp_us)| *row_id)
             .collect::<Vec<_>>(),
     ));
     let event_times: ArrayRef = Arc::new(TimestampNanosecondArray::from(
         cases
             .iter()
-            .map(|(_row_id, nanos, _literal)| *nanos)
+            .map(|(_row_id, nanos, _timestamp_ns, _micros, _timestamp_us)| *nanos)
+            .collect::<Vec<_>>(),
+    ));
+    let rounding_times: ArrayRef = Arc::new(TimestampMicrosecondArray::from(
+        cases
+            .iter()
+            .map(|(_row_id, _nanos, _timestamp_ns, micros, _timestamp_us)| *micros)
             .collect::<Vec<_>>(),
     ));
 
-    Ok(RecordBatch::try_new(schema, vec![ids, event_times])?)
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![ids, event_times, rounding_times],
+    )?)
 }
 
-fn timestamp_ns_datetime_cases() -> [(i32, i64, &'static str); 3] {
+fn timestamp_ns_datetime_cases() -> [(i32, i64, &'static str, i64, &'static str); 3] {
     [
-        (1, 1_780_529_793_687_000_000, "2026-06-03T23:36:33.687000"),
-        (2, 1_778_615_767_493_000_000, "2026-05-12T19:56:07.493000"),
-        (3, 1_774_840_482_427_000_000, "2026-03-30T03:14:42.427000"),
+        (
+            1,
+            1_780_529_793_687_000_000,
+            "2026-06-03T23:36:33.687000",
+            1_780_529_793_684_582,
+            "2026-06-03T23:36:33.684582",
+        ),
+        (
+            2,
+            1_778_615_767_493_000_000,
+            "2026-05-12T19:56:07.493000",
+            1_778_615_767_491_500,
+            "2026-05-12T19:56:07.491500",
+        ),
+        (
+            3,
+            1_774_840_482_427_000_000,
+            "2026-03-30T03:14:42.427000",
+            1_774_840_482_424_582,
+            "2026-03-30T03:14:42.424582",
+        ),
     ]
 }
 
