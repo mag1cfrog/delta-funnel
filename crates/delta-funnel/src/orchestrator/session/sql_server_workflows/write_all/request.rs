@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
-    DeltaFunnelError, MssqlWorkflowOutputWriter, PhaseTimingReport, ReportReasonCode,
-    observability,
+    DeltaFunnelError, MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter,
+    PhaseTimingReport, ReportReasonCode, observability,
     report::{PhaseTimer, sql_server::WriteAllReport},
     support::sanitize_text_for_display,
 };
@@ -243,6 +243,28 @@ impl DeltaFunnelSession {
             requests,
             options,
             MssqlWorkflowPublicOutputWriter,
+        )
+        .await
+    }
+
+    /// Runs the multi-output write workflow through a local stream-draining
+    /// writer for benchmark phase timing without connecting to SQL Server.
+    ///
+    /// # Errors
+    ///
+    /// Returns planning, source, SQL, or stream execution errors from the
+    /// normal `write_all` path. It does not perform SQL Server lifecycle,
+    /// writer initialization, target validation, or cleanup.
+    #[doc(hidden)]
+    pub async fn write_all_for_stream_benchmark(
+        &self,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+    ) -> Result<WriteAllReport, DeltaFunnelError> {
+        self.write_all_with_options_and_writer_with_tracing(
+            requests,
+            options,
+            MssqlStreamBenchmarkOutputWriter,
         )
         .await
     }

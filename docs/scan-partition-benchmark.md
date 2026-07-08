@@ -106,10 +106,15 @@ executed Delta scan plan. The dynamic partition pruning fields are:
 The provider-exec matrix compares the official kernel backend against the
 native async backend with lazy and bounded-prefetch scheduling profiles. It
 covers non-DV and sparse-DV versions of a many-small-files shape, a
-fewer-larger-files shape, and a 12,808,140-row
+fewer-larger-files shape, a 12,808,140-row
 `provider_partitioned_event_log_12m` shape based on the synthetic partitioned
-event log model. Each workload runs a projection query, a count-style query,
-and a predicate query that exercises provider predicate handling. Each case runs
+event log model, and a 13,394,789-row
+`provider_wide_event_export_13m` shape with a sanitized 34-column event export
+schema. The wide export workload runs sanitized primary-export,
+secondary-export, and summary query shapes with metadata enrichment,
+classification, source precedence, and output filtering CTEs. Other workloads
+run a projection query, a count-style query, and a predicate query that
+exercises provider predicate handling. Each case runs
 production scheduling profiles for serial lazy reads,
 parallel lazy reads, and parallel lazy reads with a larger bounded output
 handoff buffer. It also includes native async prefetch profiles that open up to
@@ -145,6 +150,31 @@ cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
   --provider-exec-repetitions 1 \
   --output target/delta-provider-exec-s3-normal-project.csv
 ```
+
+Run the wide event export preset as one no-DB `write_all` workflow with JSONL
+phase tracing:
+
+```bash
+cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+  --mode provider-exec \
+  --provider-exec-storage-profile s3-throttled \
+  --provider-exec-workload provider_wide_event_export_13m \
+  --provider-exec-query write_all_exports \
+  --provider-exec-phase-aligned-workflow \
+  --provider-exec-backend native_async \
+  --provider-exec-scheduling-profile prefetch_2_parallel_buffer_1 \
+  --provider-exec-repetitions 1 \
+  --trace-output target/delta-provider-exec-wide-event-export.jsonl \
+  --output target/delta-provider-exec-wide-event-export.csv
+```
+
+The phase-aligned workflow registers the synthetic Delta source once, builds
+the three sanitized output queries, and drains their Arrow streams through the
+same multi-output workflow phase boundaries used by the SQL Server path. It
+does not open SQL Server, prepare target tables, bulk insert rows, validate a
+target table, or swap tables.
+The `s3-throttled` profile is the closer lab-like timing envelope for this
+wide workflow; `s3-normal` remains useful as a lower-latency bound.
 
 Run one available-parallelism multiplier sweep case:
 
@@ -214,6 +244,8 @@ The default matrix currently covers:
 - Workloads:
   - `partitioned_event_log_target_shape`: target synthetic table shape, 956
     files, about 393 MiB, 933 daily partitions.
+  - `wide_event_export_target_shape`: sanitized wide event export shape,
+    13,394,789 rows, 1204 files, 933 daily partitions, and 34 columns.
   - `many_tiny_files`: 4096 files, 64 KiB per file, small-file latency pressure.
   - `mixed_tiny_large_files`: 1024 tiny files plus 16 large files, mixed size
     grouping pressure.

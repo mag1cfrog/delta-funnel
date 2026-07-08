@@ -749,6 +749,126 @@ where
     ))
 }
 
+/// Drains a selected output stream through the write-loop reporting path without
+/// opening SQL Server, preparing lifecycle objects, or writing target rows.
+pub(crate) async fn drain_mssql_batches_for_stream_benchmark<S>(
+    output_plan: &MssqlTargetOutputPlan,
+    batches: S,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
+    let mut input_rows = 0_u64;
+    let mut input_batches = 0_u64;
+    let mut shaped_rows = 0_u64;
+    let mut shaped_batches = 0_u64;
+    let cleanup = MssqlTargetCleanupStatus::NotApplicable;
+    let started_at = Instant::now();
+    let mut phase_timings = MssqlWriteLoopPhaseTimings::default();
+    pin_mut!(batches);
+    observability::datafusion_batch_stream_started(
+        output_plan.output_name(),
+        output_plan.target_table(),
+        output_plan.load_mode(),
+    );
+
+    loop {
+        let poll_started_at = Instant::now();
+        let Some(batch) = batches.next().await else {
+            phase_timings.add_poll_batch_stream(poll_started_at.elapsed());
+            break;
+        };
+        phase_timings.add_poll_batch_stream(poll_started_at.elapsed());
+
+        let batch = batch.map_err(|source| {
+            let batch_shaping = trace_datafusion_batch_stream_finished(
+                output_plan,
+                MssqlBatchShapingReport::failed(
+                    input_batches,
+                    input_rows,
+                    shaped_batches,
+                    shaped_rows,
+                ),
+            );
+            mssql_write_phase_error(
+                output_plan,
+                MssqlWritePhase::PollBatchStream,
+                write_failure_report_metrics(
+                    RowCount::partial(input_rows),
+                    batch_shaping,
+                    MssqlWriteProgress::new(
+                        shaped_rows,
+                        shaped_batches,
+                        elapsed_ms_since(started_at),
+                    ),
+                    false,
+                    cleanup,
+                )
+                .with_phase_timings(phase_timings.poll_batch_stream_failed()),
+                source.to_string(),
+            )
+        })?;
+
+        let row_count = batch_row_count(batch.num_rows());
+        input_rows = input_rows.saturating_add(row_count);
+        input_batches = input_batches.saturating_add(1);
+
+        let validation_started_at = Instant::now();
+        let validation_result = arrow_tiberius::validate_record_batch_schema_against_mappings(
+            &batch,
+            output_plan.schema_mappings(),
+        );
+        phase_timings.add_validate_batch_schema(validation_started_at.elapsed());
+        validation_result.map_err(|source| {
+            let batch_shaping = trace_datafusion_batch_stream_finished(
+                output_plan,
+                MssqlBatchShapingReport::failed(
+                    input_batches,
+                    input_rows,
+                    shaped_batches,
+                    shaped_rows,
+                ),
+            );
+            mssql_batch_schema_validation_error(
+                output_plan,
+                source,
+                write_failure_report_metrics(
+                    RowCount::partial(input_rows),
+                    batch_shaping,
+                    MssqlWriteProgress::new(
+                        shaped_rows,
+                        shaped_batches,
+                        elapsed_ms_since(started_at),
+                    ),
+                    false,
+                    cleanup,
+                )
+                .with_phase_timings(phase_timings.validate_batch_schema_failed()),
+            )
+        })?;
+
+        shaped_rows = shaped_rows.saturating_add(row_count);
+        shaped_batches = shaped_batches.saturating_add(1);
+    }
+
+    let batch_shaping = trace_datafusion_batch_stream_finished(
+        output_plan,
+        MssqlBatchShapingReport::completed(input_batches, input_rows, shaped_batches, shaped_rows),
+    );
+
+    Ok(MssqlWriteReport::from_output_plan_with_metrics(
+        output_plan,
+        write_report_metrics(
+            RowCount::exact(input_rows),
+            batch_shaping,
+            MssqlWriteProgress::new(shaped_rows, shaped_batches, elapsed_ms_since(started_at)),
+            false,
+            cleanup,
+        )
+        .with_phase_timings(phase_timings.completed(Duration::ZERO)),
+    ))
+}
+
 fn trace_datafusion_batch_stream_finished(
     output_plan: &MssqlTargetOutputPlan,
     report: MssqlBatchShapingReport,
@@ -1639,6 +1759,44 @@ mod tests {
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_benchmark_drain_counts_rows_without_writing_batches()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
+        let second = orders_batch(vec![3], vec![None])?;
+        let batches = stream::iter(vec![Ok(first), Ok(second)]);
+
+        let report = drain_mssql_batches_for_stream_benchmark(&output_plan, batches).await?;
+
+        assert_eq!(report.output_name(), "orders_output");
+        assert_eq!(report.stats().rows_written(), 3);
+        assert_eq!(report.stats().batches_written(), 2);
+        assert_eq!(report.output_row_count(), RowCount::exact(3));
+        assert_batch_shaping(report.batch_shaping(), PhaseStatus::completed(), 2, 3, 2, 3);
+        assert_phase_timing(
+            report.phase_timings(),
+            POLL_BATCH_STREAM_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            VALIDATE_BATCH_SCHEMA_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            WRITE_BATCH_PHASE,
+            PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+        )?;
+        assert_phase_timing(
+            report.phase_timings(),
+            FINALIZE_PHASE,
+            PhaseStatus::completed(),
+        )?;
         Ok(())
     }
 
