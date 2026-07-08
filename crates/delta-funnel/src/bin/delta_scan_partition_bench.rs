@@ -2419,13 +2419,10 @@ async fn run_provider_exec_write_workflow_once(
         )
         .await?;
     if !report.workflow().all_succeeded() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "provider-exec stream benchmark workflow failed: {}",
-                report.workflow()
-            ),
-        )
+        return Err(io::Error::other(format!(
+            "provider-exec stream benchmark workflow failed: {}",
+            report.workflow()
+        ))
         .into());
     }
 
