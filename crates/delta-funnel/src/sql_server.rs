@@ -23,7 +23,7 @@ pub use execution::{
     write_output_batches_to_mssql,
 };
 pub(crate) use execution::{
-    MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer,
+    MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer,
     write_output_batches_to_mssql_with_validation_options,
 };
 pub use planning::{

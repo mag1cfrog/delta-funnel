@@ -22,11 +22,15 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit}
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use delta_funnel::{
-    DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
-    DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
-    DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+    DeltaFunnelSession, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend,
+    DeltaProviderScanExecutionOptions, DeltaScanPartitionTargetDiagnosticInput,
+    DeltaScanPartitionTargetDiagnosticOutput, DeltaScanPartitionTargetDiagnosticSource,
+    DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaSourceConfig,
-    DeltaStorageOptions, DeltaTableProviderConfig, collect_delta_provider_read_stats,
+    DeltaStorageOptions, DeltaTableProviderConfig, LoadMode, MssqlConnectionConfig,
+    MssqlOutputTarget, MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetTable,
+    MssqlTimezonePolicy, OutputWritePlan, PhaseTimingReport, QueryOptions, RunMode, SessionOptions,
+    WriteAllCacheMode, WriteAllOptions, collect_delta_provider_read_stats,
     delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic, load_delta_source_with_tracing,
     preflight_delta_protocol_with_tracing, register_delta_sources_with_scan_execution_options,
@@ -72,6 +76,7 @@ const PROVIDER_EXEC_QUERY_PLANNING_FAILED_EVENT: &str = "datafusion_query_planni
 const PROVIDER_EXEC_QUERY_PLANNING_STARTED_EVENT: &str = "datafusion_query_planning.started";
 const PROVIDER_EXEC_STATS_COLLECT_COMPLETED_EVENT: &str = "provider_read_stats_collect.completed";
 const PROVIDER_EXEC_STATS_COLLECT_STARTED_EVENT: &str = "provider_read_stats_collect.started";
+const PROVIDER_EXEC_WRITE_WORKFLOW_QUERY: &str = "write_all_exports";
 const MAX_PROVIDER_EXEC_REPETITIONS: usize = 128;
 const PROVIDER_EXEC_MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
 const PROVIDER_EXEC_PROTOCOL_JSON: &str =
@@ -493,19 +498,60 @@ async fn write_provider_exec_benchmark_csv_async(
             .into_iter()
             .filter(|query| provider_exec_filter_matches(&config.query_filter, query.name))
             .collect::<Vec<_>>();
-        validate_provider_exec_filter_result("query", &config.query_filter, query_cases.len())?;
+        if config.phase_aligned_workflow {
+            if workload.schema_kind != ProviderExecSchemaKind::SyntheticWideEventExport {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--provider-exec-phase-aligned-workflow only supports provider_wide_event_export_13m",
+                )
+                .into());
+            }
+            let workflow_query_matches = provider_exec_filter_matches(
+                &config.query_filter,
+                PROVIDER_EXEC_WRITE_WORKFLOW_QUERY,
+            );
+            validate_provider_exec_filter_result(
+                "query",
+                &config.query_filter,
+                usize::from(workflow_query_matches),
+            )?;
+            if !workflow_query_matches {
+                continue;
+            }
+        } else {
+            validate_provider_exec_filter_result("query", &config.query_filter, query_cases.len())?;
+        }
+        let query_cases = if config.phase_aligned_workflow {
+            vec![ProviderExecQueryCase {
+                name: PROVIDER_EXEC_WRITE_WORKFLOW_QUERY,
+                sql: "",
+            }]
+        } else {
+            query_cases
+        };
         for query in query_cases {
             for backend in &backends {
                 for scheduling_profile in &scheduling_profiles {
-                    let summary = run_provider_exec_benchmark_case(
-                        &table,
-                        workload,
-                        query,
-                        *backend,
-                        *scheduling_profile,
-                        config,
-                    )
-                    .await?;
+                    let summary = if config.phase_aligned_workflow {
+                        run_provider_exec_write_workflow_case(
+                            &table,
+                            workload,
+                            *backend,
+                            *scheduling_profile,
+                            config,
+                        )
+                        .await?
+                    } else {
+                        run_provider_exec_benchmark_case(
+                            &table,
+                            workload,
+                            query,
+                            *backend,
+                            *scheduling_profile,
+                            config,
+                        )
+                        .await?
+                    };
                     writeln!(
                         output,
                         "{}",
@@ -569,6 +615,10 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
         output,
         "Use --provider-exec-default-case to run one representative provider-exec case with production default scan execution options."
     )?;
+    writeln!(
+        output,
+        "Use --provider-exec-phase-aligned-workflow to run the wide export preset as one no-DB write_all workflow."
+    )?;
     writeln!(output, "The default seed is {DEFAULT_BENCHMARK_SEED}.")?;
     Ok(())
 }
@@ -598,6 +648,7 @@ struct ProviderExecConfig {
     temp_dir: Option<PathBuf>,
     storage_profile: ProviderExecStorageProfile,
     default_case: bool,
+    phase_aligned_workflow: bool,
     workload_filter: Option<String>,
     query_filter: Option<String>,
     backend_filter: Option<String>,
@@ -639,6 +690,7 @@ struct ProviderExecWorkloadCase {
 enum ProviderExecSchemaKind {
     SimpleOrders,
     SyntheticPartitionedEventLog,
+    SyntheticWideEventExport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -652,6 +704,158 @@ struct ProviderExecFileSpec {
 struct ProviderExecQueryCase {
     name: &'static str,
     sql: &'static str,
+}
+
+macro_rules! wide_event_transform_sql {
+    ($select:literal) => {
+        concat!(
+            r#"
+WITH metadata_raw AS (
+    SELECT 0 AS metadata_bucket, 'level_a' AS metadata_level, 10 AS priority
+    UNION ALL SELECT 0, 'level_a_fallback', 1
+    UNION ALL SELECT 1, 'level_b', 10
+    UNION ALL SELECT 2, 'level_c', 10
+    UNION ALL SELECT 3, 'level_d', 10
+    UNION ALL SELECT 4, 'level_e', 10
+    UNION ALL SELECT 5, 'level_f', 10
+    UNION ALL SELECT 6, 'level_g', 10
+),
+metadata_ranked AS (
+    SELECT
+        metadata_bucket,
+        metadata_level,
+        row_number() OVER (
+            PARTITION BY metadata_bucket
+            ORDER BY priority DESC
+        ) AS rn
+    FROM metadata_raw
+),
+metadata_one AS (
+    SELECT metadata_bucket, metadata_level
+    FROM metadata_ranked
+    WHERE rn = 1
+),
+normalized_events AS (
+    SELECT
+        primary_event_id,
+        group_id,
+        secondary_event_id,
+        CASE
+            WHEN source_kind IN ('web', 'api') THEN 'source_a'
+            WHEN source_kind = 'mobile' THEN 'source_b'
+            ELSE 'source_c'
+        END AS source_kind,
+        actor_numeric_id,
+        category_num,
+        position_num,
+        position_code,
+        metric_x,
+        metric_y,
+        metric_z,
+        event_time,
+        event_year,
+        event_month,
+        event_day,
+        event_processed_year,
+        event_processed_month,
+        event_processed_day,
+        position_processed_year,
+        position_processed_month,
+        position_processed_day,
+        record_processed_year,
+        record_processed_month,
+        record_processed_day,
+        CASE
+            WHEN category_num < 311 THEN 'secondary'
+            ELSE 'primary'
+        END AS source_group,
+        CASE
+            WHEN category_num < 311 THEN secondary_event_id
+            ELSE group_id
+        END AS resolved_event_key,
+        CASE
+            WHEN category_num < 311 THEN 'secondary_segment'
+            ELSE 'primary_segment'
+        END AS resolution_diagnostic,
+        validation_flag,
+        quality_tier,
+        event_year AS local_event_year,
+        event_month AS local_event_month,
+        event_day AS local_event_day,
+        category_num % 7 AS metadata_bucket
+    FROM orders
+),
+enriched_events AS (
+    SELECT
+        n.*,
+        m.metadata_level AS source_level
+    FROM normalized_events n
+    LEFT JOIN metadata_one m
+      ON n.metadata_bucket = m.metadata_bucket
+),
+primary_keys AS (
+    SELECT DISTINCT group_id AS precedence_key
+    FROM enriched_events
+    WHERE source_group = 'primary'
+),
+post_precedence AS (
+    SELECT e.*
+    FROM enriched_events e
+    LEFT JOIN primary_keys p
+      ON e.resolved_event_key = p.precedence_key
+     AND e.source_group = 'secondary'
+    WHERE NOT (
+        e.source_group = 'secondary'
+        AND p.precedence_key IS NOT NULL
+    )
+),
+export_ready AS (
+    SELECT
+        primary_event_id,
+        group_id,
+        secondary_event_id,
+        source_kind,
+        actor_numeric_id,
+        category_num,
+        position_num,
+        position_code,
+        metric_x,
+        metric_y,
+        metric_z,
+        event_time,
+        event_year,
+        event_month,
+        event_day,
+        event_processed_year,
+        event_processed_month,
+        event_processed_day,
+        position_processed_year,
+        position_processed_month,
+        position_processed_day,
+        record_processed_year,
+        record_processed_month,
+        record_processed_day,
+        resolution_diagnostic,
+        resolved_event_key,
+        validation_flag,
+        source_level,
+        source_group,
+        CAST(
+            local_event_year * 10000
+            + local_event_month * 100
+            + local_event_day
+            AS STRING
+        ) AS local_date_key,
+        quality_tier,
+        local_event_year,
+        local_event_month,
+        local_event_day
+    FROM post_precedence
+)
+"#,
+            $select
+        )
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -949,6 +1153,8 @@ impl BenchmarkRunnerConfig {
                 })?;
             } else if arg == "--provider-exec-default-case" {
                 provider_exec.default_case = true;
+            } else if arg == "--provider-exec-phase-aligned-workflow" {
+                provider_exec.phase_aligned_workflow = true;
             } else if arg == "--provider-exec-workload" {
                 let value = args
                     .next()
@@ -1038,6 +1244,7 @@ impl Default for ProviderExecConfig {
             temp_dir: None,
             storage_profile: ProviderExecStorageProfile::local(),
             default_case: false,
+            phase_aligned_workflow: false,
             workload_filter: None,
             query_filter: None,
             backend_filter: None,
@@ -1205,6 +1412,7 @@ impl ProviderExecWorkloadCase {
                 &[1, 4_096, 8_191],
             ),
             Self::synthetic_partitioned_event_log()?,
+            Self::synthetic_wide_event_export()?,
         ])
     }
 
@@ -1249,6 +1457,30 @@ impl ProviderExecWorkloadCase {
         Ok(Self {
             name: "provider_partitioned_event_log_12m",
             schema_kind: ProviderExecSchemaKind::SyntheticPartitionedEventLog,
+            file_specs,
+            deleted_row_indexes_per_file: &[],
+        })
+    }
+
+    fn synthetic_wide_event_export() -> Result<Self, Box<dyn Error>> {
+        let workload = SyntheticWorkloadCase::wide_event_export_target_shape()?;
+        let file_specs = workload
+            .file_set
+            .files
+            .iter()
+            .map(|file| {
+                let rows = usize::try_from(file.rows)?;
+                Ok(ProviderExecFileSpec {
+                    path: file.path.clone(),
+                    rows,
+                    partition_date: Some(file.partition_date),
+                })
+            })
+            .collect::<Result<Vec<_>, std::num::TryFromIntError>>()?;
+
+        Ok(Self {
+            name: "provider_wide_event_export_13m",
+            schema_kind: ProviderExecSchemaKind::SyntheticWideEventExport,
             file_specs,
             deleted_row_indexes_per_file: &[],
         })
@@ -1308,6 +1540,35 @@ impl ProviderExecQueryCase {
                 Self {
                     name: "filter_recent_events",
                     sql: "select primary_event_id, category_num from orders where event_year >= 2025",
+                },
+            ],
+            ProviderExecSchemaKind::SyntheticWideEventExport => [
+                Self {
+                    name: "project_primary_export",
+                    sql: wide_event_transform_sql!(
+                        "SELECT * FROM export_ready WHERE source_group = 'primary'"
+                    ),
+                },
+                Self {
+                    name: "project_secondary_export",
+                    sql: wide_event_transform_sql!(
+                        "SELECT * FROM export_ready WHERE source_group = 'secondary'"
+                    ),
+                },
+                Self {
+                    name: "summary_export",
+                    sql: wide_event_transform_sql!(
+                        "SELECT \
+                            COUNT(*) AS transformed_rows, \
+                            SUM(CASE WHEN source_group = 'primary' THEN 1 ELSE 0 END) AS primary_rows, \
+                            SUM(CASE WHEN source_group = 'secondary' THEN 1 ELSE 0 END) AS secondary_rows, \
+                            COUNT(DISTINCT resolved_event_key) AS resolved_key_count, \
+                            COUNT(DISTINCT group_id) AS group_key_count, \
+                            COUNT(DISTINCT primary_event_id) AS primary_event_count, \
+                            COUNT(DISTINCT secondary_event_id) AS secondary_event_count, \
+                            COUNT(DISTINCT source_kind || '-' || quality_tier || '-' || local_date_key) AS segment_date_count \
+                         FROM export_ready"
+                    ),
                 },
             ],
         }
@@ -2046,6 +2307,169 @@ async fn run_provider_exec_benchmark_case(
     Ok(provider_exec_summary(&measurements))
 }
 
+async fn run_provider_exec_write_workflow_case(
+    table: &ProviderExecDeltaTable,
+    workload: &ProviderExecWorkloadCase,
+    backend: DeltaProviderReaderBackend,
+    scheduling_profile: ProviderExecSchedulingProfile,
+    config: &ProviderExecConfig,
+) -> Result<ProviderExecSummary, Box<dyn Error>> {
+    let mut measurements = Vec::with_capacity(config.repetitions);
+    for repetition_index in 0..config.repetitions {
+        measurements.push(
+            run_provider_exec_write_workflow_once(
+                table,
+                workload,
+                backend,
+                scheduling_profile,
+                repetition_index,
+            )
+            .await?,
+        );
+    }
+
+    Ok(provider_exec_summary(&measurements))
+}
+
+async fn run_provider_exec_write_workflow_once(
+    table: &ProviderExecDeltaTable,
+    workload: &ProviderExecWorkloadCase,
+    backend: DeltaProviderReaderBackend,
+    scheduling_profile: ProviderExecSchedulingProfile,
+    _repetition_index: usize,
+) -> Result<ProviderExecRunMeasurement, Box<dyn Error>> {
+    let query_started = Instant::now();
+    let execution_options = provider_exec_scan_execution_options(backend, scheduling_profile)?;
+    let connection = MssqlConnectionConfig::new(
+        "server=benchmark.invalid;database=delta_funnel_benchmark;user=benchmark;password=benchmark",
+    )?
+    .with_display_label("provider-exec stream benchmark");
+    let query_options = QueryOptions {
+        target_partitions: scheduling_profile.scan_target_partitions,
+        output_batch_size: None,
+    };
+    let mut session = DeltaFunnelSession::new(
+        SessionOptions::new()
+            .with_query_options(query_options)
+            .with_provider_scan_options(execution_options)
+            .with_mssql_schema_options(provider_exec_write_workflow_schema_options())
+            .with_default_mssql_connection(connection),
+    )?;
+    session.delta_lake(
+        DeltaSourceConfig::new("orders", table.table_uri.clone())
+            .with_storage_options(table.storage_options.clone()),
+    )?;
+
+    let mut requests = Vec::new();
+    for query in workload.query_cases() {
+        let lazy_table = session.table_from_sql(query.sql).await?;
+        let target = provider_exec_write_workflow_target(query.name)?;
+        requests.push(OutputWritePlan::new(lazy_table, target));
+    }
+
+    let process_peak_rss_before_bytes = process_peak_rss_bytes();
+    let report = session
+        .write_all_for_stream_benchmark(
+            &requests,
+            WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+        )
+        .await?;
+    if !report.workflow().all_succeeded() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "provider-exec stream benchmark workflow failed: {}",
+                report.workflow()
+            ),
+        )
+        .into());
+    }
+
+    let produced_rows = report
+        .outputs()
+        .iter()
+        .map(|output| output.output_row_count().exact_value().unwrap_or(0))
+        .map(u64_to_usize_saturating)
+        .fold(0_usize, usize::saturating_add);
+    let produced_batches = report
+        .outputs()
+        .iter()
+        .map(|output| output.batch_shaping().output_batches())
+        .map(u64_to_usize_saturating)
+        .fold(0_usize, usize::saturating_add);
+    let total_micros = u128_to_u64_saturating(query_started.elapsed().as_micros()).max(1);
+    let process_peak_rss_bytes = process_peak_rss_bytes();
+    let process_peak_rss_delta_bytes = match (process_peak_rss_before_bytes, process_peak_rss_bytes)
+    {
+        (Some(before), Some(after)) => Some(after.saturating_sub(before)),
+        _ => None,
+    };
+    let provider_stats = report
+        .sources()
+        .iter()
+        .filter_map(|source| source.provider_read_stats().cloned())
+        .collect::<Vec<_>>();
+    let batch_latency_micros = report
+        .outputs()
+        .iter()
+        .filter_map(|output| phase_elapsed_micros(output.phase_timings(), "poll_batch_stream"))
+        .collect::<Vec<_>>();
+    let planning_micros =
+        phase_elapsed_micros(report.phase_timings(), "output_planning").unwrap_or(0);
+    let time_to_first_batch_micros = report
+        .outputs()
+        .iter()
+        .find_map(|output| phase_elapsed_micros(output.phase_timings(), "output_stream_setup"))
+        .unwrap_or(0);
+    let source_rows_per_second = u128_to_u64_saturating(
+        (table.row_count as u128).saturating_mul(1_000_000) / u128::from(total_micros),
+    );
+
+    Ok(ProviderExecRunMeasurement {
+        planning_micros,
+        time_to_first_batch_micros,
+        total_micros,
+        source_rows_per_second,
+        produced_rows,
+        produced_batches,
+        process_peak_rss_bytes,
+        process_peak_rss_delta_bytes,
+        batch_latency_micros,
+        read_stats: provider_exec_read_stats_measurement(&provider_stats),
+    })
+}
+
+fn provider_exec_write_workflow_target(
+    query_name: &str,
+) -> Result<MssqlOutputTarget, Box<dyn Error>> {
+    let table_name = format!("synthetic_{query_name}");
+    let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", table_name)?)
+        .with_load_mode(LoadMode::Replace);
+    Ok(MssqlOutputTarget::new(
+        query_name,
+        target_config,
+        RunMode::Execute,
+    ))
+}
+
+fn provider_exec_write_workflow_schema_options() -> MssqlSchemaPlanOptions {
+    MssqlSchemaPlanOptions {
+        timezone_policy: MssqlTimezonePolicy::NormalizeUtcDateTime2,
+        ..MssqlSchemaPlanOptions::default()
+    }
+}
+
+fn phase_elapsed_micros(phase_timings: &[PhaseTimingReport], phase_name: &str) -> Option<u64> {
+    phase_timings
+        .iter()
+        .find(|timing| timing.phase_name() == phase_name)
+        .and_then(PhaseTimingReport::elapsed_micros)
+}
+
+fn u64_to_usize_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 async fn run_provider_exec_once(
     table: &ProviderExecDeltaTable,
     query: ProviderExecQueryCase,
@@ -2059,29 +2483,7 @@ async fn run_provider_exec_once(
             .with_storage_options(table.storage_options.clone()),
     )?;
     let protocol = preflight_delta_protocol_with_tracing(&source)?;
-    let execution_options = if scheduling_profile.uses_default_execution_options {
-        DeltaProviderScanExecutionOptions::default()
-    } else {
-        let max_concurrent_file_reads_per_scan = scheduling_profile
-            .max_concurrent_file_reads_per_scan
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "provider-exec scheduling profile is missing scan-wide capacity",
-                )
-            })?;
-        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
-            backend,
-            max_concurrent_file_reads_per_scan,
-            scheduling_profile.max_concurrent_file_reads_per_partition,
-        )?
-        .with_output_buffer_capacity_per_partition(
-            scheduling_profile.output_buffer_capacity_per_partition,
-        )?
-        .with_native_async_prefetch_file_count_per_partition(
-            scheduling_profile.native_async_prefetch_file_count_per_partition,
-        )?
-    };
+    let execution_options = provider_exec_scan_execution_options(backend, scheduling_profile)?;
     register_delta_sources_with_scan_execution_options(
         &ctx,
         vec![DeltaTableProviderConfig {
@@ -2203,6 +2605,37 @@ async fn run_provider_exec_once(
         batch_latency_micros,
         read_stats,
     })
+}
+
+fn provider_exec_scan_execution_options(
+    backend: DeltaProviderReaderBackend,
+    scheduling_profile: ProviderExecSchedulingProfile,
+) -> Result<DeltaProviderScanExecutionOptions, Box<dyn Error>> {
+    if scheduling_profile.uses_default_execution_options {
+        return Ok(DeltaProviderScanExecutionOptions::default());
+    }
+
+    let max_concurrent_file_reads_per_scan = scheduling_profile
+        .max_concurrent_file_reads_per_scan
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "provider-exec scheduling profile is missing scan-wide capacity",
+            )
+        })?;
+    Ok(
+        DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            backend,
+            max_concurrent_file_reads_per_scan,
+            scheduling_profile.max_concurrent_file_reads_per_partition,
+        )?
+        .with_output_buffer_capacity_per_partition(
+            scheduling_profile.output_buffer_capacity_per_partition,
+        )?
+        .with_native_async_prefetch_file_count_per_partition(
+            scheduling_profile.native_async_prefetch_file_count_per_partition,
+        )?,
+    )
 }
 
 fn provider_exec_summary(measurements: &[ProviderExecRunMeasurement]) -> ProviderExecSummary {
@@ -2876,8 +3309,9 @@ fn provider_exec_arrow_schema(schema_kind: ProviderExecSchemaKind) -> SchemaRef 
             Field::new("id", DataType::Int32, false),
             Field::new("customer_name", DataType::Utf8, true),
         ])),
-        ProviderExecSchemaKind::SyntheticPartitionedEventLog => Arc::new(Schema::new(
-            synthetic_columns()
+        ProviderExecSchemaKind::SyntheticPartitionedEventLog
+        | ProviderExecSchemaKind::SyntheticWideEventExport => Arc::new(Schema::new(
+            provider_exec_synthetic_columns(schema_kind)
                 .into_iter()
                 .map(|column| {
                     Field::new(
@@ -2912,8 +3346,9 @@ fn provider_exec_record_batch(
         ProviderExecSchemaKind::SimpleOrders => {
             provider_exec_simple_orders_record_batch(schema, first_row_id, file.rows)
         }
-        ProviderExecSchemaKind::SyntheticPartitionedEventLog => {
-            provider_exec_synthetic_record_batch(schema, file, first_row_id)
+        ProviderExecSchemaKind::SyntheticPartitionedEventLog
+        | ProviderExecSchemaKind::SyntheticWideEventExport => {
+            provider_exec_synthetic_record_batch(schema_kind, schema, file, first_row_id)
         }
     }
 }
@@ -2938,6 +3373,7 @@ fn provider_exec_simple_orders_record_batch(
 }
 
 fn provider_exec_synthetic_record_batch(
+    schema_kind: ProviderExecSchemaKind,
     schema: SchemaRef,
     file: &ProviderExecFileSpec,
     first_row_id: usize,
@@ -2948,10 +3384,16 @@ fn provider_exec_synthetic_record_batch(
             "synthetic provider-exec file is missing its partition date",
         )
     })?;
-    let columns = synthetic_columns()
+    let columns = provider_exec_synthetic_columns(schema_kind)
         .into_iter()
         .map(|column| {
-            provider_exec_synthetic_column_array(column, partition_date, first_row_id, file.rows)
+            provider_exec_synthetic_column_array(
+                schema_kind,
+                column,
+                partition_date,
+                first_row_id,
+                file.rows,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -2959,6 +3401,7 @@ fn provider_exec_synthetic_record_batch(
 }
 
 fn provider_exec_synthetic_column_array(
+    schema_kind: ProviderExecSchemaKind,
     column: ColumnShape,
     partition_date: SyntheticDate,
     first_row_id: usize,
@@ -2968,7 +3411,9 @@ fn provider_exec_synthetic_column_array(
     let array = match column.data_type {
         SyntheticDataType::String => Arc::new(StringArray::from(
             row_ids
-                .map(|row_id| provider_exec_synthetic_string_value(column.name, row_id))
+                .map(|row_id| {
+                    provider_exec_synthetic_string_value(schema_kind, column.name, row_id)
+                })
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
         SyntheticDataType::Int => Arc::new(Int32Array::from(
@@ -3003,7 +3448,28 @@ fn provider_exec_synthetic_column_array(
     Ok(array)
 }
 
-fn provider_exec_synthetic_string_value(column_name: &str, row_id: usize) -> Option<String> {
+fn provider_exec_synthetic_string_value(
+    schema_kind: ProviderExecSchemaKind,
+    column_name: &str,
+    row_id: usize,
+) -> Option<String> {
+    if schema_kind == ProviderExecSchemaKind::SyntheticWideEventExport {
+        return match column_name {
+            "primary_event_id" => Some(format!("event-primary-{row_id:018}")),
+            "group_id" => Some(format!("group-{row_id:032}")),
+            "secondary_event_id" => Some(format!("event-secondary-{row_id:017}")),
+            "source_kind" => Some(["web", "mobile", "api", "batch"][row_id % 4].to_owned()),
+            "position_code" => Some(format!("position-code-{:05}", row_id % 36_000)),
+            "resolution_diagnostic" => Some(format!("resolution-diagnostic-{:08}", row_id % 9)),
+            "resolved_event_key" => Some(format!("resolved-key-{row_id:024}")),
+            "source_level" => Some(format!("source-level-{:02}", row_id % 7)),
+            "source_group" => Some(["primary", "secondary"][row_id % 2].to_owned()),
+            "local_date_key" => Some(format!("local-date-key-{:08}", row_id % 1_500)),
+            "quality_tier" => Some(format!("quality-tier-{:02}", row_id % 22)),
+            _ => Some(format!("{column_name}-{row_id:016}")),
+        };
+    }
+
     match column_name {
         "primary_event_id" => Some(format!("event-{row_id:012}")),
         "group_id" => Some(format!("group-{:05}", row_id % 34_500)),
@@ -3027,15 +3493,21 @@ fn provider_exec_synthetic_int_value(
         "event_year" => partition_date.year,
         "event_month" => i32::from(partition_date.month),
         "event_day" => i32::from(partition_date.day),
-        "event_processed_year" | "category_processed_year" | "record_processed_year" => {
-            partition_date.year
-        }
-        "event_processed_month" | "category_processed_month" | "record_processed_month" => {
-            i32::from(partition_date.month)
-        }
-        "event_processed_day" | "category_processed_day" | "record_processed_day" => {
-            i32::from(partition_date.day)
-        }
+        "event_processed_year"
+        | "category_processed_year"
+        | "position_processed_year"
+        | "record_processed_year"
+        | "local_event_year" => partition_date.year,
+        "event_processed_month"
+        | "category_processed_month"
+        | "position_processed_month"
+        | "record_processed_month"
+        | "local_event_month" => i32::from(partition_date.month),
+        "event_processed_day"
+        | "category_processed_day"
+        | "position_processed_day"
+        | "record_processed_day"
+        | "local_event_day" => i32::from(partition_date.day),
         _ => i32::try_from(row_id % 10_000)?,
     };
 
@@ -3060,6 +3532,7 @@ fn provider_exec_synthetic_bigint_value(
     let value = match column_name {
         "actor_numeric_id" => row_id % 11_900,
         "category_num" => row_id % 4_096,
+        "position_num" => row_id % 10,
         _ => row_id,
     };
 
@@ -3134,7 +3607,8 @@ fn provider_exec_stats_json(
                 file.rows
             ))
         }
-        ProviderExecSchemaKind::SyntheticPartitionedEventLog => {
+        ProviderExecSchemaKind::SyntheticPartitionedEventLog
+        | ProviderExecSchemaKind::SyntheticWideEventExport => {
             let partition_date = file.partition_date.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -3171,16 +3645,19 @@ fn provider_exec_delta_schema_json(schema_kind: ProviderExecSchemaKind) -> Strin
             provider_exec_delta_field_json("id", "integer", false),
             provider_exec_delta_field_json("customer_name", "string", true),
         ],
-        ProviderExecSchemaKind::SyntheticPartitionedEventLog => synthetic_columns()
-            .into_iter()
-            .map(|column| {
-                provider_exec_delta_field_json(
-                    column.name,
-                    provider_exec_delta_data_type(column.data_type),
-                    true,
-                )
-            })
-            .collect(),
+        ProviderExecSchemaKind::SyntheticPartitionedEventLog
+        | ProviderExecSchemaKind::SyntheticWideEventExport => {
+            provider_exec_synthetic_columns(schema_kind)
+                .into_iter()
+                .map(|column| {
+                    provider_exec_delta_field_json(
+                        column.name,
+                        provider_exec_delta_data_type(column.data_type),
+                        true,
+                    )
+                })
+                .collect()
+        }
     };
 
     format!(r#"{{"type":"struct","fields":[{}]}}"#, fields.join(","))
@@ -3329,6 +3806,17 @@ impl SyntheticWorkloadCase {
 
         Ok(Self {
             name: "partitioned_event_log_target_shape",
+            shape,
+            file_set,
+        })
+    }
+
+    fn wide_event_export_target_shape() -> Result<Self, SyntheticGenerationError> {
+        let shape = SyntheticDeltaTableShape::wide_event_export();
+        let file_set = shape.generate_file_set()?;
+
+        Ok(Self {
+            name: "wide_event_export_target_shape",
             shape,
             file_set,
         })
@@ -4112,6 +4600,140 @@ impl SyntheticDeltaTableShape {
                     column_name: "group_code",
                     distinct_count: 50,
                     max_length: Some(10),
+                },
+            ],
+        }
+    }
+
+    fn wide_event_export() -> Self {
+        Self {
+            name: "synthetic_wide_event_export",
+            total_rows: 13_394_789,
+            active_file_count: 1_204,
+            active_data_size_bytes: 704_643_072,
+            file_size_bytes: DistributionSummary {
+                average: 585_252,
+                p50: 465_342,
+                p90: 1_362_711,
+                p99: 1_775_296,
+            },
+            rows_per_file: DistributionSummary {
+                average: 11_125,
+                p50: 8_941,
+                p90: 25_884,
+                p99: 34_224,
+            },
+            partitioning: PartitioningShape {
+                columns: ["event_year", "event_month", "event_day"],
+                partition_count: 933,
+                start_date: SyntheticDate {
+                    year: 2023,
+                    month: 2,
+                    day: 3,
+                },
+                end_date: SyntheticDate {
+                    year: 2026,
+                    month: 6,
+                    day: 12,
+                },
+                average_files_per_partition_hundredths: 129,
+                max_files_per_partition: 5,
+            },
+            delta_features: DeltaFeatureShape {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                compression: "zstd",
+                table_features: vec![
+                    "appendOnly",
+                    "changeDataFeed",
+                    "deletionVectors",
+                    "invariants",
+                ],
+                deletion_vectors_enabled_in_source_shape: true,
+                active_deletion_vectors_in_benchmark: 0,
+            },
+            schema: SchemaShape {
+                all_columns_nullable: true,
+                columns: wide_event_export_columns(),
+            },
+            row_distribution: RowDistributionShape {
+                source_split: vec![
+                    CategoryRowCount {
+                        category: "primary_segment",
+                        rows: 12_378_915,
+                    },
+                    CategoryRowCount {
+                        category: "secondary_segment",
+                        rows: 1_015_874,
+                    },
+                ],
+                uniform_category: UniformCategoryShape {
+                    column_name: "category_num",
+                    category_count: 7,
+                    min_rows_per_category: 1_890_000,
+                    max_rows_per_category: 1_930_000,
+                },
+                seasonality: vec![
+                    CategoryRowCount {
+                        category: "2023",
+                        rows: 2_660_000,
+                    },
+                    CategoryRowCount {
+                        category: "2024",
+                        rows: 3_890_000,
+                    },
+                    CategoryRowCount {
+                        category: "2025",
+                        rows: 3_890_000,
+                    },
+                    CategoryRowCount {
+                        category: "2026_through_06_12",
+                        rows: 2_954_789,
+                    },
+                ],
+            },
+            null_patterns: vec![
+                NullPattern {
+                    column_name: "actor_numeric_id",
+                    null_rows: 40_000,
+                    rationale: "sparse optional numeric identifier",
+                },
+                NullPattern {
+                    column_name: "metric_z",
+                    null_rows: 12_378_915,
+                    rationale: "missing for primary_segment rows",
+                },
+                NullPattern {
+                    column_name: "quality_tier",
+                    null_rows: 12_378_915,
+                    rationale: "missing for primary_segment rows",
+                },
+                NullPattern {
+                    column_name: "validation_flag",
+                    null_rows: 12_420_000,
+                    rationale: "mostly unavailable boolean flag",
+                },
+            ],
+            cardinalities: vec![
+                CardinalityHint {
+                    column_name: "primary_event_id",
+                    distinct_count: 13_394_789,
+                    max_length: Some(32),
+                },
+                CardinalityHint {
+                    column_name: "secondary_event_id",
+                    distinct_count: 13_394_789,
+                    max_length: Some(36),
+                },
+                CardinalityHint {
+                    column_name: "group_id",
+                    distinct_count: 36_900,
+                    max_length: Some(38),
+                },
+                CardinalityHint {
+                    column_name: "actor_numeric_id",
+                    distinct_count: 11_900,
+                    max_length: None,
                 },
             ],
         }
@@ -5077,6 +5699,53 @@ fn synthetic_columns() -> Vec<ColumnShape> {
     ]
 }
 
+fn provider_exec_synthetic_columns(schema_kind: ProviderExecSchemaKind) -> Vec<ColumnShape> {
+    match schema_kind {
+        ProviderExecSchemaKind::SimpleOrders => Vec::new(),
+        ProviderExecSchemaKind::SyntheticPartitionedEventLog => synthetic_columns(),
+        ProviderExecSchemaKind::SyntheticWideEventExport => wide_event_export_columns(),
+    }
+}
+
+fn wide_event_export_columns() -> Vec<ColumnShape> {
+    vec![
+        string_column("primary_event_id"),
+        string_column("group_id"),
+        string_column("secondary_event_id"),
+        string_column("source_kind"),
+        bigint_column("actor_numeric_id"),
+        bigint_column("category_num"),
+        bigint_column("position_num"),
+        string_column("position_code"),
+        double_column("metric_x"),
+        double_column("metric_y"),
+        double_column("metric_z"),
+        timestamp_column("event_time"),
+        int_column("event_year"),
+        int_column("event_month"),
+        int_column("event_day"),
+        int_column("event_processed_year"),
+        int_column("event_processed_month"),
+        int_column("event_processed_day"),
+        int_column("position_processed_year"),
+        int_column("position_processed_month"),
+        int_column("position_processed_day"),
+        int_column("record_processed_year"),
+        int_column("record_processed_month"),
+        int_column("record_processed_day"),
+        string_column("resolution_diagnostic"),
+        string_column("resolved_event_key"),
+        boolean_column("validation_flag"),
+        string_column("source_level"),
+        string_column("source_group"),
+        string_column("local_date_key"),
+        string_column("quality_tier"),
+        int_column("local_event_year"),
+        int_column("local_event_month"),
+        int_column("local_event_day"),
+    ]
+}
+
 fn select_active_dates_for_year(
     start: SyntheticDate,
     end: SyntheticDate,
@@ -5885,6 +6554,7 @@ mod tests {
             "5",
             "--provider-exec-storage-profile",
             "s3-normal",
+            "--provider-exec-phase-aligned-workflow",
             "--provider-exec-workload",
             "provider_partitioned_event_log_12m",
             "--provider-exec-query",
@@ -5903,6 +6573,7 @@ mod tests {
                 temp_dir: Some(PathBuf::from("target")),
                 storage_profile: ProviderExecStorageProfile::s3_normal(),
                 default_case: false,
+                phase_aligned_workflow: true,
                 workload_filter: Some("provider_partitioned_event_log_12m".to_owned()),
                 query_filter: Some("count_events".to_owned()),
                 backend_filter: Some("native_async".to_owned()),
@@ -6201,6 +6872,7 @@ mod tests {
         assert!(usage.contains("Use --provider-exec-storage-profile"));
         assert!(usage.contains("Use --provider-exec-workload"));
         assert!(usage.contains("Use --provider-exec-default-case"));
+        assert!(usage.contains("Use --provider-exec-phase-aligned-workflow"));
         assert!(usage.contains("The default seed is 0."));
 
         Ok(())
@@ -7349,6 +8021,11 @@ mod tests {
             .iter()
             .map(|query| query.name)
             .collect::<Vec<_>>();
+        let wide_query_cases = workloads[5].query_cases();
+        let wide_query_names = wide_query_cases
+            .iter()
+            .map(|query| query.name)
+            .collect::<Vec<_>>();
         let scheduling_profiles =
             ProviderExecSchedulingProfile::standard_cases(BenchmarkRunEnvironment {
                 schema_version: BENCHMARK_SCHEMA_VERSION,
@@ -7368,7 +8045,8 @@ mod tests {
                 "provider_few_larger_files",
                 "provider_many_small_files_sparse_dv",
                 "provider_few_larger_files_sparse_dv",
-                "provider_partitioned_event_log_12m"
+                "provider_partitioned_event_log_12m",
+                "provider_wide_event_export_13m"
             ]
         );
         assert_eq!(workloads[0].deletion_vector_deleted_rows(), 0);
@@ -7380,12 +8058,61 @@ mod tests {
         );
         assert_eq!(workloads[4].file_count(), 956);
         assert_eq!(workloads[4].row_count(), 12_808_140);
+        assert_eq!(
+            workloads[5].schema_kind,
+            ProviderExecSchemaKind::SyntheticWideEventExport
+        );
+        assert_eq!(workloads[5].file_count(), 1_204);
+        assert_eq!(workloads[5].row_count(), 13_394_789);
         assert!(simple_query_names.contains(&"project_id"));
         assert!(simple_query_names.contains(&"count_rows"));
         assert!(simple_query_names.contains(&"filter_tail_ids"));
         assert!(synthetic_query_names.contains(&"project_event_keys"));
         assert!(synthetic_query_names.contains(&"count_events"));
         assert!(synthetic_query_names.contains(&"filter_recent_events"));
+        assert!(wide_query_names.contains(&"project_primary_export"));
+        assert!(wide_query_names.contains(&"project_secondary_export"));
+        assert!(wide_query_names.contains(&"summary_export"));
+        assert!(wide_query_cases[0].sql.contains("position_num"));
+        assert!(wide_query_cases[0].sql.contains("event_time"));
+        assert!(wide_query_cases[0].sql.contains("local_event_day"));
+        assert!(wide_query_cases[0].sql.contains("metadata_ranked"));
+        assert!(wide_query_cases[0].sql.contains("post_precedence"));
+        assert!(
+            wide_query_cases[1]
+                .sql
+                .contains("source_group = 'secondary'")
+        );
+        assert!(
+            wide_query_cases[2]
+                .sql
+                .contains("COUNT(DISTINCT resolved_event_key)")
+        );
+        assert!(
+            !wide_query_cases
+                .iter()
+                .any(|query| query.sql.contains("player"))
+        );
+        assert!(
+            !wide_query_cases
+                .iter()
+                .any(|query| query.sql.contains("tracking"))
+        );
+        assert!(
+            !wide_query_cases
+                .iter()
+                .any(|query| query.sql.contains("pitch"))
+        );
+        assert!(
+            !wide_query_cases
+                .iter()
+                .any(|query| query.sql.contains("hawkeye"))
+        );
+        assert!(
+            !wide_query_cases
+                .iter()
+                .any(|query| query.sql.contains("trackman"))
+        );
         assert_eq!(
             scheduling_profile_names,
             [
@@ -7487,6 +8214,43 @@ mod tests {
     }
 
     #[test]
+    fn provider_exec_wide_event_export_schema_is_sanitized_and_target_scaled()
+    -> Result<(), Box<dyn Error>> {
+        let shape = SyntheticDeltaTableShape::wide_event_export();
+        let schema = provider_exec_arrow_schema(ProviderExecSchemaKind::SyntheticWideEventExport);
+        let field_names = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(shape.total_rows, 13_394_789);
+        assert_eq!(shape.active_file_count, 1_204);
+        assert_eq!(shape.partitioning.partition_count, 933);
+        assert_eq!(shape.source_split_rows(), shape.total_rows);
+        assert_eq!(shape.row_distribution.source_split[0].rows, 12_378_915);
+        assert_eq!(shape.row_distribution.source_split[1].rows, 1_015_874);
+        assert_eq!(schema.fields().len(), 34);
+        assert_eq!(
+            wide_event_export_columns()
+                .into_iter()
+                .filter(|column| column.data_type == SyntheticDataType::String)
+                .count(),
+            11
+        );
+        assert!(field_names.contains(&"primary_event_id"));
+        assert!(field_names.contains(&"position_num"));
+        assert!(field_names.contains(&"local_event_day"));
+        assert!(!field_names.iter().any(|name| name.contains("game")));
+        assert!(!field_names.iter().any(|name| name.contains("pitch")));
+        assert!(!field_names.iter().any(|name| name.contains("fielder")));
+        assert!(!field_names.iter().any(|name| name.contains("hawkeye")));
+        assert!(!field_names.iter().any(|name| name.contains("trackman")));
+
+        Ok(())
+    }
+
+    #[test]
     fn provider_exec_creates_synthetic_mimic_delta_table() -> Result<(), Box<dyn Error>> {
         let partition_date = SyntheticDate {
             year: 2026,
@@ -7521,6 +8285,51 @@ mod tests {
         assert_eq!(table.row_count, 16);
         assert!(metadata_log.contains("primary_event_id"));
         assert!(metadata_log.contains("validation_flag"));
+        assert!(
+            table
+                .path
+                .join(synthetic_file_path(partition_date, 0))
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_exec_creates_wide_event_export_delta_table() -> Result<(), Box<dyn Error>> {
+        let partition_date = SyntheticDate {
+            year: 2026,
+            month: 6,
+            day: 12,
+        };
+        let workload = ProviderExecWorkloadCase {
+            name: "test_provider_wide_event_export",
+            schema_kind: ProviderExecSchemaKind::SyntheticWideEventExport,
+            file_specs: vec![ProviderExecFileSpec {
+                path: synthetic_file_path(partition_date, 0),
+                rows: 16,
+                partition_date: Some(partition_date),
+            }],
+            deleted_row_indexes_per_file: &[],
+        };
+
+        let table = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile::local(),
+        )?;
+        let source = load_delta_source_with_tracing(
+            DeltaSourceConfig::new("orders", table.table_uri.clone())
+                .with_storage_options(table.storage_options.clone()),
+        )?;
+        let _protocol = preflight_delta_protocol_with_tracing(&source)?;
+        let metadata_log =
+            fs::read_to_string(table.path.join("_delta_log/00000000000000000000.json"))?;
+
+        assert_eq!(table.file_count, 1);
+        assert_eq!(table.row_count, 16);
+        assert!(metadata_log.contains("primary_event_id"));
+        assert!(metadata_log.contains("position_num"));
+        assert!(metadata_log.contains("local_event_day"));
         assert!(
             table
                 .path

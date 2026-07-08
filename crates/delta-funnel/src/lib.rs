@@ -74,7 +74,7 @@ pub use sql_server::{
     write_mssql_outputs_to_mssql, write_output_batches_to_mssql,
 };
 pub(crate) use sql_server::{
-    MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer,
+    MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer,
     write_output_batches_to_mssql_with_validation_options,
 };
 pub use support::sanitize_uri_for_display;

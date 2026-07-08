@@ -21,8 +21,10 @@ pub use workflow::{
     MssqlWriteFailureReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport,
     write_mssql_outputs_to_mssql,
 };
-pub(crate) use workflow::{MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer};
-pub(crate) use write::MssqlBulkLoadWriter;
+pub(crate) use workflow::{
+    MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer,
+};
+pub(crate) use write::{MssqlBulkLoadWriter, drain_mssql_batches_for_stream_benchmark};
 pub use write::{
     MssqlWriteBackend, MssqlWritePhase, default_mssql_write_backend,
     mssql_write_backend_for_output_plan, validate_mssql_output_record_batch,

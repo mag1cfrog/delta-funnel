@@ -15,13 +15,15 @@ use tracing::Instrument;
 
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationOptions,
-    ValidationStatus, observability, report::PhaseTimer, support::sanitize_text_for_display,
+    ValidationStatus, observability, plan_mssql_target_for_resolved_output, report::PhaseTimer,
+    support::sanitize_text_for_display,
 };
 
 use super::{
     LoadMode, MssqlBatchShapingReport, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteBackend,
     MssqlWriteFailureContext, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_backend,
+    drain_mssql_batches_for_stream_benchmark,
     write_output_batches_to_mssql_with_validation_options,
 };
 
@@ -660,6 +662,8 @@ pub async fn write_mssql_outputs_to_mssql(
     write_mssql_outputs_with_writer(jobs, options, MssqlPublicOneOutputWriter).await
 }
 
+pub(crate) struct MssqlStreamBenchmarkOutputWriter;
+
 #[async_trait]
 pub(crate) trait MssqlWorkflowOutputWriter: Send {
     async fn write_output(
@@ -695,6 +699,27 @@ impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
             validation_options,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl MssqlWorkflowOutputWriter for MssqlStreamBenchmarkOutputWriter {
+    async fn write_output(
+        &mut self,
+        output_schema: SchemaRef,
+        resolved_target: ResolvedMssqlTarget,
+        schema_options: MssqlSchemaPlanOptions,
+        batches: MssqlOutputBatchStream,
+        _write_backend: MssqlWriteBackend,
+        _validation_options: ValidationOptions,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        let output_plan = plan_mssql_target_for_resolved_output(
+            output_schema.as_ref(),
+            &resolved_target,
+            schema_options,
+        )?;
+
+        drain_mssql_batches_for_stream_benchmark(&output_plan, batches).await
     }
 }
 
