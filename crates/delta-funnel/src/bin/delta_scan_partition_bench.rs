@@ -1,4 +1,48 @@
-//! Portable synthetic Delta scan partition benchmark runner.
+//! Portable Delta scan and provider execution benchmark runner.
+//!
+//! This binary writes CSV benchmark rows to stdout by default. Use `--output`
+//! to write a CSV file and `--trace-output` to write JSONL tracing events.
+//! The main modes are:
+//!
+//! - `synthetic`: model scan-partition policy choices from synthetic file
+//!   shapes without creating Delta tables.
+//! - `host-probe`: measure local scheduler and optional local I/O signals that
+//!   feed scan-partition policy decisions.
+//! - `provider-exec`: create temporary synthetic Delta tables, register them
+//!   through the Delta provider, and measure real DataFusion execution.
+//!
+//! Common focused provider-exec run:
+//!
+//! ```bash
+//! cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+//!   --mode provider-exec \
+//!   --provider-exec-storage-profile s3-normal \
+//!   --provider-exec-workload provider_partitioned_event_log_12m \
+//!   --provider-exec-query project_event_keys \
+//!   --provider-exec-backend native_async \
+//!   --provider-exec-scheduling-profile lazy_parallel_buffer_4 \
+//!   --provider-exec-repetitions 1 \
+//!   --output target/delta-provider-exec.csv
+//! ```
+//!
+//! Phase-aligned wide export workflow run:
+//!
+//! ```bash
+//! cargo run -p delta-funnel --bin delta_scan_partition_bench -- \
+//!   --mode provider-exec \
+//!   --provider-exec-storage-profile s3-throttled \
+//!   --provider-exec-workload provider_wide_event_export_13m \
+//!   --provider-exec-query write_all_exports \
+//!   --provider-exec-phase-aligned-workflow \
+//!   --provider-exec-backend native_async \
+//!   --provider-exec-scheduling-profile prefetch_2_parallel_buffer_1 \
+//!   --provider-exec-repetitions 1 \
+//!   --trace-output target/delta-provider-exec-wide-event.jsonl \
+//!   --output target/delta-provider-exec-wide-event.csv
+//! ```
+//!
+//! See `docs/scan-partition-benchmark.md` for the full schema, workload, and
+//! storage-profile reference.
 
 use std::collections::BTreeMap;
 use std::env;
