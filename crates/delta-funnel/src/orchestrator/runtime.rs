@@ -13,7 +13,8 @@ use super::session::OrchestratorMssqlOutputWriter;
 use crate::MssqlWorkflowOutputWriter;
 use crate::{
     DeltaFunnelError, DeltaFunnelSession, LazyTable, MssqlDryRunOutputReport,
-    MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, WriteAllOptions, WriteAllReport,
+    MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, TablePreview, WriteAllOptions,
+    WriteAllReport,
 };
 
 /// Blocking runtime boundary for high-level Delta Funnel session actions.
@@ -72,7 +73,7 @@ impl DeltaFunnelRuntime {
         session: &DeltaFunnelSession,
         table: &LazyTable,
         limit: usize,
-    ) -> Result<String, DeltaFunnelError> {
+    ) -> Result<TablePreview, DeltaFunnelError> {
         reject_nested_runtime()?;
         self.runtime.block_on(session.preview_table(table, limit))
     }
@@ -268,9 +269,19 @@ mod tests {
 
         let preview = runtime.preview_table(&session, &table, 1)?;
 
-        assert!(preview.contains("| status |"));
-        assert!(preview.lines().any(|line| line.contains("| open   |")));
-        assert!(!preview.lines().any(|line| line.contains("| closed |")));
+        assert!(preview.text().contains("| status |"));
+        assert!(
+            preview
+                .text()
+                .lines()
+                .any(|line| line.contains("| open   |"))
+        );
+        assert!(
+            !preview
+                .text()
+                .lines()
+                .any(|line| line.contains("| closed |"))
+        );
         Ok(())
     }
 

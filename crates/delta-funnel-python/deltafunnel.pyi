@@ -67,8 +67,11 @@ class PendingDeltaSource:
 
 class Preview:
     text: str
+    html: str
 
     def __str__(self) -> str: ...
+
+    def _repr_html_(self) -> str: ...
 
 
 class Table:

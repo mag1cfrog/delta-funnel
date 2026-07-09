@@ -90,6 +90,33 @@ pub enum LazyTableKind {
     DerivedSql,
 }
 
+/// Rendered bounded preview of a lazy table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TablePreview {
+    text: String,
+    html: String,
+}
+
+impl TablePreview {
+    /// Creates a rendered lazy table preview.
+    #[must_use]
+    pub fn new(text: String, html: String) -> Self {
+        Self { text, html }
+    }
+
+    /// Returns the plain text table preview.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Returns the HTML table preview.
+    #[must_use]
+    pub fn html(&self) -> &str {
+        &self.html
+    }
+}
+
 /// MSSQL output target selected from a lazy table.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MssqlOutputTarget {

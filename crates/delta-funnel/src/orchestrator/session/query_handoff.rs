@@ -1,11 +1,19 @@
 use std::{
+    fmt::Write,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
 use datafusion::{
-    arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
+    arrow::{
+        datatypes::{DataType, SchemaRef},
+        record_batch::RecordBatch,
+        util::{
+            display::{ArrayFormatter, FormatOptions},
+            pretty::pretty_format_batches,
+        },
+    },
     physical_plan::ExecutionPlan,
     prelude::{DataFrame, SessionContext},
 };
@@ -18,7 +26,7 @@ use crate::{
 
 use super::{
     DeltaFunnelSession, LazyTable, LazyTableKind, PendingDerivedTable, RegisteredDerivedTable,
-    RegisteredSessionSource,
+    RegisteredSessionSource, TablePreview,
     errors::{datafusion_handoff_setup_error, unknown_lazy_table_error},
 };
 
@@ -158,14 +166,22 @@ impl DeltaFunnelSession {
         &self,
         table: &LazyTable,
         limit: usize,
-    ) -> Result<String, DeltaFunnelError> {
+    ) -> Result<TablePreview, DeltaFunnelError> {
         let dataframe = self.dataframe_for_lazy_table(table).await?;
-        dataframe
+        let schema = Arc::new(dataframe.schema().as_arrow().clone());
+        let batches = dataframe
             .limit(0, Some(limit))
             .map_err(|error| datafusion_handoff_setup_error("preview_limit", error))?
-            .to_string()
+            .collect()
             .await
-            .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))
+            .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
+        let text = pretty_format_batches(&batches)
+            .map_err(|error| datafusion_handoff_setup_error("preview_text", error))?
+            .to_string();
+        let html = preview_batches_to_html(&schema, &batches)
+            .map_err(|error| datafusion_handoff_setup_error("preview_html", error))?;
+
+        Ok(TablePreview::new(text, html))
     }
 
     pub(super) async fn dataframe_for_lazy_table(
@@ -238,6 +254,121 @@ impl DeltaFunnelSession {
                 .await
             })
         })
+    }
+}
+
+fn preview_batches_to_html(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<String, datafusion::arrow::error::ArrowError> {
+    let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    let column_count = schema.fields().len();
+    let mut html = String::new();
+    html.push_str("<div class=\"deltafunnel-preview\"><style>");
+    html.push_str(".deltafunnel-preview{font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;font-size:12px;line-height:1.35;color:var(--vscode-editor-foreground,#111827)}");
+    html.push_str(".deltafunnel-preview .df-wrap{display:inline-block;max-width:100%;overflow:auto;border:1px solid rgba(127,127,127,.35);border-radius:6px;background:var(--vscode-editor-background,#fff)}");
+    html.push_str(".deltafunnel-preview table{border-collapse:separate;border-spacing:0}");
+    html.push_str(".deltafunnel-preview th,.deltafunnel-preview td{padding:6px 10px;border-bottom:1px solid rgba(127,127,127,.18);white-space:nowrap;text-align:left;vertical-align:top}");
+    html.push_str(".deltafunnel-preview th{position:sticky;top:0;background:var(--vscode-editor-background,#fff);font-weight:600;border-bottom:1px solid rgba(127,127,127,.35)}");
+    html.push_str(
+        ".deltafunnel-preview tbody tr:nth-child(even){background:rgba(127,127,127,.05)}",
+    );
+    html.push_str(".deltafunnel-preview .df-type,.deltafunnel-preview .df-footer{color:var(--vscode-descriptionForeground,#64748b);font-size:11px}");
+    html.push_str(
+        ".deltafunnel-preview .df-num{text-align:right;font-variant-numeric:tabular-nums}",
+    );
+    html.push_str(".deltafunnel-preview .df-footer{margin-top:6px}");
+    html.push_str("@media (prefers-color-scheme:dark){.deltafunnel-preview{color:var(--vscode-editor-foreground,#e5e7eb)}.deltafunnel-preview .df-wrap,.deltafunnel-preview th{background:var(--vscode-editor-background,#0b1220)}}");
+    html.push_str("</style>");
+
+    if column_count == 0 {
+        html.push_str("<div class=\"df-wrap\" style=\"padding:10px\">(No columns)</div>");
+        write!(
+            html,
+            "<div class=\"df-footer\">Showing <b>{row_count}</b> rows, <b>0</b> columns.</div></div>"
+        )
+        .expect("write to String");
+        return Ok(html);
+    }
+
+    html.push_str("<div class=\"df-wrap\"><table><thead><tr>");
+    for field in schema.fields() {
+        let class = if is_numeric_type(field.data_type()) {
+            " class=\"df-num\""
+        } else {
+            ""
+        };
+        write!(html, "<th{class}><span>").expect("write to String");
+        push_html_escaped(&mut html, field.name());
+        html.push_str("</span><br><span class=\"df-type\">");
+        push_html_escaped(&mut html, &field.data_type().to_string());
+        html.push_str("</span></th>");
+    }
+    html.push_str("</tr></thead><tbody>");
+
+    let options = FormatOptions::default().with_null("null");
+    for batch in batches {
+        let formatters = batch
+            .columns()
+            .iter()
+            .map(|column| ArrayFormatter::try_new(column.as_ref(), &options))
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in 0..batch.num_rows() {
+            html.push_str("<tr>");
+            for (field, formatter) in schema.fields().iter().zip(&formatters) {
+                let class = if is_numeric_type(field.data_type()) {
+                    " class=\"df-num\""
+                } else {
+                    ""
+                };
+                write!(html, "<td{class}>").expect("write to String");
+                push_html_escaped(&mut html, &formatter.value(row).to_string());
+                html.push_str("</td>");
+            }
+            html.push_str("</tr>");
+        }
+    }
+
+    write!(
+        html,
+        "</tbody></table></div><div class=\"df-footer\">Showing <b>{row_count}</b> rows, <b>{column_count}</b> columns.</div></div>"
+    )
+    .expect("write to String");
+
+    Ok(html)
+}
+
+fn is_numeric_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
+fn push_html_escaped(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&#39;"),
+            _ => output.push(character),
+        }
     }
 }
 
@@ -361,9 +492,17 @@ mod tests {
 
         let preview = session.preview_table(&table, 1).await?;
 
-        assert!(preview.contains("| id |"));
-        assert!(preview.lines().any(|line| line.contains("| 1  |")));
-        assert!(!preview.lines().any(|line| line.contains("| 2  |")));
+        assert!(preview.text().contains("| id |"));
+        assert!(preview.text().lines().any(|line| line.contains("| 1  |")));
+        assert!(!preview.text().lines().any(|line| line.contains("| 2  |")));
+        assert!(preview.html().contains("class=\"deltafunnel-preview\""));
+        assert!(
+            preview
+                .html()
+                .contains("<th class=\"df-num\"><span>id</span>")
+        );
+        assert!(preview.html().contains("<td class=\"df-num\">1</td>"));
+        assert!(!preview.html().contains("<td class=\"df-num\">2</td>"));
         Ok(())
     }
 
@@ -375,8 +514,26 @@ mod tests {
 
         let preview = session.preview_table(&alias, 20).await?;
 
-        assert!(preview.contains("| region |"));
-        assert!(preview.lines().any(|line| line.contains("| west   |")));
+        assert!(preview.text().contains("| region |"));
+        assert!(
+            preview
+                .text()
+                .lines()
+                .any(|line| line.contains("| west   |"))
+        );
+        assert!(preview.html().contains("<td>west</td>"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_table_html_escapes_cell_values() -> Result<(), DeltaFunnelError> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = session.table_from_sql("select '<tag>' as marker").await?;
+
+        let preview = session.preview_table(&table, 20).await?;
+
+        assert!(preview.html().contains("&lt;tag&gt;"));
+        assert!(!preview.html().contains("<td><tag></td>"));
         Ok(())
     }
 

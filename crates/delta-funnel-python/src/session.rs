@@ -226,7 +226,7 @@ impl PySession {
         py: Python<'_>,
         table: &delta_funnel::LazyTable,
         limit: usize,
-    ) -> PyResult<String> {
+    ) -> PyResult<delta_funnel::TablePreview> {
         py.detach(|| self.runtime.preview_table(&self.inner, table, limit))
             .map_err(|error| rust_error_to_py(py, error))
     }

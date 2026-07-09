@@ -9,11 +9,15 @@ use crate::session::PySession;
 #[pyclass(name = "Preview", module = "deltafunnel")]
 pub(crate) struct PyPreview {
     text: String,
+    html: String,
 }
 
 impl PyPreview {
-    const fn new(text: String) -> Self {
-        Self { text }
+    fn new(preview: delta_funnel::TablePreview) -> Self {
+        Self {
+            text: preview.text().to_owned(),
+            html: preview.html().to_owned(),
+        }
     }
 }
 
@@ -24,12 +28,21 @@ impl PyPreview {
         &self.text
     }
 
+    #[getter]
+    fn html(&self) -> &str {
+        &self.html
+    }
+
     fn __str__(&self) -> &str {
         &self.text
     }
 
     fn __repr__(&self) -> &str {
         &self.text
+    }
+
+    fn _repr_html_(&self) -> &str {
+        &self.html
     }
 }
 
@@ -211,6 +224,7 @@ mod tests {
 
             let preview = table.call_method1("preview", (1,))?;
             let text = preview.getattr("text")?.extract::<String>()?;
+            let html = preview.getattr("html")?.extract::<String>()?;
 
             assert_eq!(
                 preview
@@ -220,6 +234,16 @@ mod tests {
                 "Preview"
             );
             assert_eq!(preview.str()?.extract::<String>()?, text);
+            assert_eq!(
+                preview.call_method0("_repr_html_")?.extract::<String>()?,
+                html
+            );
+            assert!(html.contains("class=\"deltafunnel-preview\""));
+            assert!(html.contains("<td class=\"df-num\">1</td>"));
+            assert!(!html.contains("<td class=\"df-num\">2</td>"));
+            assert!(
+                html.contains("<th class=\"df-num\"><span>id</span><br><span class=\"df-type\">")
+            );
             assert!(text.contains("| id |"));
             assert!(text.lines().any(|line| line.contains("| 1  |")));
             assert!(!text.lines().any(|line| line.contains("| 2  |")));
