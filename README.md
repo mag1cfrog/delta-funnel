@@ -73,6 +73,8 @@ daily_orders = session.table_from_sql("""
     where order_date >= date '2026-01-01'
 """)
 
+daily_orders.show(limit=20)
+
 report = daily_orders.write_to_mssql(
     schema="dbo",
     table="daily_orders",
@@ -88,6 +90,12 @@ preserved.
 `session.delta_lake(..., name="orders")` registers a Delta source immediately.
 `session.delta_lake(...)` without `name` returns a pending source; call
 `.alias("orders")` before SQL references it.
+
+`Table.preview(limit=20)` and `Table.show(limit=20)` are terminal actions that
+execute the DataFusion query and read rows with the limit applied before
+collection. They do not contact SQL Server or write rows. `preview()` returns a
+`Preview` object with text and notebook HTML representations; `show()` prints
+the text preview to Python stdout.
 
 For private S3 Delta sources in Python, see the
 [`docs-site/docs/python-api-walkthrough.md`](docs-site/docs/python-api-walkthrough.md)

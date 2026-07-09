@@ -18,6 +18,8 @@ referenced by queries.
 
 A table is a lazy query object. It may represent a Delta source or SQL derived
 from other registered tables. Creating a table does not by itself execute rows.
+Previewing, showing, writing, or dry-running a table are terminal actions that
+may plan and read data.
 
 ## Output
 
