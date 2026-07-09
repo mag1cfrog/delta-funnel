@@ -99,51 +99,14 @@ For private S3 sources, SQL Server load modes, dry runs, and reports, see the
 
 ## Multi-output Writes
 
-`Table.to_mssql(...)` creates an output spec without writing. `Session.write_all`
-writes the specs in one workflow.
+For workflows that write several related tables in one run, use
+`Table.to_mssql(...)` to create output specs and `Session.write_all(...)` to
+execute them together. Shared lazy SQL dependencies can be cached during the
+workflow so common upstream work is not repeated for each output.
 
-```python
-active_orders = session.table_from_sql("""
-    select *
-    from orders
-    where status = 'active'
-""").alias("active_orders")
-
-west = session.table_from_sql("""
-    select * from active_orders where region = 'west'
-""")
-east = session.table_from_sql("""
-    select * from active_orders where region = 'east'
-""")
-
-outputs = [
-    west.to_mssql(
-        schema="dbo",
-        table="active_orders_west",
-        load_mode="append_existing",
-        name="west_active_orders",
-    ),
-    east.to_mssql(
-        schema="dbo",
-        table="active_orders_east",
-        load_mode="append_existing",
-        name="east_active_orders",
-    ),
-]
-
-dry_run_report = session.write_all(outputs, dry_run=True)
-report = session.write_all(outputs, options={"cache_mode": "disabled"})
-```
-
-`options={"cache_mode": "auto"}` is the default execute behavior. It may cache
-shared lazy SQL aliases during one `write_all` call. Use
-`options={"cache_mode": "disabled"}` to force the baseline path.
-
-> [!IMPORTANT]
-> `options` is only accepted for execute `write_all` calls, not dry runs.
-
-The first Python surface does not include persistent `cache`, `persist`,
-or `materialize` APIs.
+See the
+[`dry runs and reports`](https://mag1cfrog.github.io/delta-funnel/dry-runs-reports/)
+guide for multi-output dry runs and cache options.
 
 ## Rust API
 
