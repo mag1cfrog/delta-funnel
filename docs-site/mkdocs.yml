@@ -6,6 +6,7 @@ repo_url: https://github.com/mag1cfrog/delta-funnel
 
 theme:
   name: material
+  variant: modern
   features:
     - navigation.sections
     - content.code.copy
