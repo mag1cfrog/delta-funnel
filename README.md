@@ -172,21 +172,8 @@ For the full Rust API, see
 [`docs.rs/delta-funnel`](https://docs.rs/delta-funnel) and the
 [`query_load_dry_run` example](crates/delta-funnel/examples/query_load_dry_run.rs).
 
-## Build And Test
+## Development
 
-```bash
-cargo fmt --all --check
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-```
-
-SQL Server integration tests are opt-in:
-
-```bash
-cargo xtask sqlserver-test
-```
-
-The xtask runner can start a local SQL Server container, run Rust and Python
-write tests, and remove the container when it exits. See
-[`docs/mssql-integration-tests.md`](docs/mssql-integration-tests.md).
+For local builds and test setup, see the
+[`installation guide`](https://mag1cfrog.github.io/delta-funnel/install/) and
+[`SQL Server guide`](https://mag1cfrog.github.io/delta-funnel/sql-server/).
