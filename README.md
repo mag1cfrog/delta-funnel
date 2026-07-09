@@ -36,7 +36,7 @@ Use Delta Funnel when:
 - You want SQL transforms over Delta Lake without a cluster.
 - You want Rust or Python orchestration with reports and tracing.
 
-## Install Or Build
+## Install
 
 For Rust, add the `delta-funnel` crate:
 
@@ -55,59 +55,46 @@ uv add deltafunnel
 ```python
 from deltafunnel import Session
 
-connection_string = (
+ado_connection_string = (
     "server=tcp:localhost,1433;"
     "database=warehouse;"
-    "user id=etl_user;"
-    "password=REPLACE_ME;"
+    "User ID=etl_user;"
+    "Password=REPLACE_ME;"
     "encrypt=true;"
     "TrustServerCertificate=yes"
 )
 
-session = Session(default_mssql_connection_string=connection_string)
+session = Session(default_mssql_connection_string=ado_connection_string)
+
+# Register the Delta table as "orders" so SQL can reference it.
 orders = session.delta_lake("file:///path/to/orders-delta", name="orders")
 
+# Build a lazy DataFusion SQL query. No rows are read yet.
 daily_orders = session.table_from_sql("""
     select customer_id, order_date, total_amount
     from orders
     where order_date >= date '2026-01-01'
 """)
 
-daily_orders.show(limit=20)
+# Preview executes the DataFusion query with a limit; notebooks render it as a table.
+daily_orders.preview(limit=20)
+```
 
+![Synthetic Delta Funnel table preview showing customer_id, order_date, and total_amount rows.](https://mag1cfrog.github.io/delta-funnel/assets/table-preview.png)
+
+```python
+# Write executes the query and loads the result into SQL Server.
 report = daily_orders.write_to_mssql(
     schema="dbo",
     table="daily_orders",
-    load_mode="create_and_load",
+    load_mode="create_and_load",  # use "replace" only to rebuild an existing target
 )
 ```
 
-Use `replace` only for existing targets. DeltaFunnel writes a staging table,
-validates it, then swaps it into the final target name. Table metadata such as
-indexes, constraints, triggers, permissions, and extended properties is not
-preserved.
-
-`session.delta_lake(..., name="orders")` registers a Delta source immediately.
-`session.delta_lake(...)` without `name` returns a pending source; call
-`.alias("orders")` before SQL references it.
-
-`Table.preview(limit=20)` and `Table.show(limit=20)` are terminal actions that
-execute the DataFusion query and read rows with the limit applied before
-collection. They do not contact SQL Server or write rows. `preview()` returns a
-`Preview` object with text and notebook HTML representations; `show()` prints
-the text preview to Python stdout.
-
-For private S3 Delta sources in Python, see the
-[`docs-site/docs/python-api-walkthrough.md`](docs-site/docs/python-api-walkthrough.md)
-guide. The current S3 path expects explicit `storage_options` credentials for
-local shell usage and can behave differently from `deltalake` if the two
-libraries resolve AWS credentials differently.
-
-Reports are plain Python `dict` values converted from Rust report types. Report
-formatting is designed to avoid exposing connection strings, credentials, and
-raw row values. See
-[`docs/failure-reports-and-tracing.md`](docs/failure-reports-and-tracing.md)
-for the failure-report and tracing rules.
+For private S3 sources, SQL Server load modes, dry runs, and reports, see the
+[`Python API walkthrough`](https://mag1cfrog.github.io/delta-funnel/python-api-walkthrough/),
+[`SQL Server guide`](https://mag1cfrog.github.io/delta-funnel/sql-server/), and
+[`dry runs and reports`](https://mag1cfrog.github.io/delta-funnel/dry-runs-reports/).
 
 ## Dry Runs
 

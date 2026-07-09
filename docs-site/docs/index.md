@@ -57,6 +57,52 @@ For Python:
 uv add deltafunnel
 ```
 
+## Python Quickstart
+
+```python
+from deltafunnel import Session
+
+ado_connection_string = (
+    "server=tcp:localhost,1433;"
+    "database=warehouse;"
+    "User ID=etl_user;"
+    "Password=REPLACE_ME;"
+    "encrypt=true;"
+    "TrustServerCertificate=yes"
+)
+
+session = Session(default_mssql_connection_string=ado_connection_string)
+
+# Register the Delta table as "orders" so SQL can reference it.
+orders = session.delta_lake("file:///path/to/orders-delta", name="orders")
+
+# Build a lazy DataFusion SQL query. No rows are read yet.
+daily_orders = session.table_from_sql("""
+    select customer_id, order_date, total_amount
+    from orders
+    where order_date >= date '2026-01-01'
+""")
+
+# Preview executes the DataFusion query with a limit; notebooks render it as a table.
+daily_orders.preview(limit=20)
+```
+
+![Synthetic Delta Funnel table preview showing customer_id, order_date, and total_amount rows.](assets/table-preview.png)
+
+```python
+# Write executes the query and loads the result into SQL Server.
+report = daily_orders.write_to_mssql(
+    schema="dbo",
+    table="daily_orders",
+    load_mode="create_and_load",  # use "replace" only to rebuild an existing target
+)
+```
+
+For private S3 sources, SQL Server load modes, dry runs, and reports, see the
+[Python API walkthrough](python-api-walkthrough.md),
+[SQL Server guide](sql-server.md), and
+[dry runs and reports](dry-runs-reports.md).
+
 ## Start here
 
 - [Installation](install.md): add the Rust crate or Python package.
