@@ -3,16 +3,16 @@
 ![Surreal banner showing Delta Lake data flowing through a Rust-orange funnel into a database barrel.](https://raw.githubusercontent.com/mag1cfrog/delta-funnel/main/assets/delta-funnel-banner.jpg)
 
 <h3 align="center">
-  <strong>Fast, lightweight Delta Lake to SQL Server loads without Spark or ODBC.</strong>
+  <strong>Delta Lake to SQL Server. No Spark. No JDBC/ODBC bottleneck.</strong>
 </h3>
 
 <p align="center">
-  A lightweight Rust and Python toolkit for reading Delta Lake tables,<br/>
-  transforming them with DataFusion SQL, and writing through native TDS bulk loads.
+  DataFusion SQL in.<br/>
+  Native TDS bulk load out.
 </p>
 
 <p align="center">
-  Built in Rust. Python API included.<br/>
+  <strong>Observed:</strong> 13.4M rows in ~14 minutes vs. a ~2 hour Spark/JDBC path.<br/>
   <a href="https://mag1cfrog.github.io/delta-funnel/">Read the Delta Funnel documentation</a>.
 </p>
 
@@ -29,14 +29,12 @@
 
 ## When To Use It
 
-Use Delta Funnel when you need to:
+Use Delta Funnel when:
 
-- Read Delta Lake tables from local paths or object-store URIs.
-- Transform rows with DataFusion SQL.
-- Load one or more results into Microsoft SQL Server.
-- Use native TDS bulk writes designed to be significantly faster than ODBC-based loads.
-- Run the workflow from Rust or from a PyO3 native extension module in Python.
-- Avoid standing up Spark for a focused Delta Lake to SQL Server pipeline.
+- SQL Server writes are the bottleneck.
+- Spark is too much machinery for a focused export.
+- You want SQL transforms over Delta Lake without a cluster.
+- You want Rust or Python orchestration with reports and tracing.
 
 ## Install Or Build
 
