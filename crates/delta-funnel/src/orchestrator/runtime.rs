@@ -264,7 +264,7 @@ mod tests {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let table = runtime.table_from_sql(
             &mut session,
-            "select 'open' as status union all select 'closed' as status",
+            "select 'open' as status union all select 'closed' as status order by status desc",
         )?;
 
         let preview = runtime.preview_table(&session, &table, 1)?;

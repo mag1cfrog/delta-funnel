@@ -219,7 +219,7 @@ mod tests {
             let session = module.getattr("Session")?.call0()?;
             let table = session.call_method1(
                 "table_from_sql",
-                ("select 1 as id union all select 2 as id",),
+                ("select 1 as id union all select 2 as id order by id",),
             )?;
 
             let preview = table.call_method1("preview", (1,))?;

@@ -1,5 +1,4 @@
 use std::{
-    fmt::Write,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -283,11 +282,9 @@ fn preview_batches_to_html(
 
     if column_count == 0 {
         html.push_str("<div class=\"df-wrap\" style=\"padding:10px\">(No columns)</div>");
-        write!(
-            html,
+        html.push_str(&format!(
             "<div class=\"df-footer\">Showing <b>{row_count}</b> rows, <b>0</b> columns.</div></div>"
-        )
-        .expect("write to String");
+        ));
         return Ok(html);
     }
 
@@ -298,7 +295,7 @@ fn preview_batches_to_html(
         } else {
             ""
         };
-        write!(html, "<th{class}><span>").expect("write to String");
+        html.push_str(&format!("<th{class}><span>"));
         push_html_escaped(&mut html, field.name());
         html.push_str("</span><br><span class=\"df-type\">");
         push_html_escaped(&mut html, &field.data_type().to_string());
@@ -321,7 +318,7 @@ fn preview_batches_to_html(
                 } else {
                     ""
                 };
-                write!(html, "<td{class}>").expect("write to String");
+                html.push_str(&format!("<td{class}>"));
                 push_html_escaped(&mut html, &formatter.value(row).to_string());
                 html.push_str("</td>");
             }
@@ -329,11 +326,9 @@ fn preview_batches_to_html(
         }
     }
 
-    write!(
-        html,
+    html.push_str(&format!(
         "</tbody></table></div><div class=\"df-footer\">Showing <b>{row_count}</b> rows, <b>{column_count}</b> columns.</div></div>"
-    )
-    .expect("write to String");
+    ));
 
     Ok(html)
 }
@@ -487,7 +482,7 @@ mod tests {
     async fn preview_table_returns_limited_formatted_rows() -> Result<(), DeltaFunnelError> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let table = session
-            .table_from_sql("select 1 as id union all select 2 as id")
+            .table_from_sql("select 1 as id union all select 2 as id order by id")
             .await?;
 
         let preview = session.preview_table(&table, 1).await?;
