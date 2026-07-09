@@ -108,25 +108,69 @@ See the
 [`dry runs and reports`](https://mag1cfrog.github.io/delta-funnel/dry-runs-reports/)
 guide for multi-output dry runs and cache options.
 
-## Rust API
+## Rust Quickstart
 
-The Rust crate owns the workflow implementation and public report types. A
-minimal dry-run example is available at
-[`crates/delta-funnel/examples/query_load_dry_run.rs`](crates/delta-funnel/examples/query_load_dry_run.rs).
+```rust
+use delta_funnel::{
+    DeltaFunnelRuntime, DeltaFunnelSession, DeltaSourceConfig, LoadMode,
+    MssqlConnectionConfig, MssqlOutputTarget, MssqlTargetConfig,
+    MssqlTargetTable, OutputWritePlan, RunMode, SessionOptions,
+};
 
-Run it with a local Delta table path:
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let ado_connection_string = concat!(
+        "server=tcp:localhost,1433;",
+        "database=warehouse;",
+        "User ID=etl_user;",
+        "Password=REPLACE_ME;",
+        "encrypt=true;",
+        "TrustServerCertificate=yes",
+    );
 
-```bash
-DELTA_FUNNEL_EXAMPLE_ORDERS_DELTA=/path/to/orders \
-  cargo run -p delta-funnel --example query_load_dry_run
+    let default_connection = MssqlConnectionConfig::new(ado_connection_string)?
+        .with_display_label("warehouse");
+    let mut session = DeltaFunnelSession::new(
+        SessionOptions::new().with_default_mssql_connection(default_connection),
+    )?;
+    let runtime = DeltaFunnelRuntime::new()?;
+
+    // Register the Delta table as "orders" so SQL can reference it.
+    let _orders = session.delta_lake(DeltaSourceConfig::new(
+        "orders",
+        "file:///path/to/orders-delta",
+    ))?;
+
+    // Build a lazy DataFusion SQL query. No rows are read yet.
+    let daily_orders = runtime.table_from_sql(
+        &mut session,
+        r#"
+        select customer_id, order_date, total_amount
+        from orders
+        where order_date >= date '2026-01-01'
+        "#,
+    )?;
+
+    // Preview executes the DataFusion query with a limit.
+    let preview = runtime.preview_table(&session, &daily_orders, 20)?;
+    println!("{}", preview.text());
+
+    // Write executes the query and loads the result into SQL Server.
+    let target = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "daily_orders")?)
+        .with_load_mode(LoadMode::CreateAndLoad);
+    let output = OutputWritePlan::new(
+        daily_orders,
+        MssqlOutputTarget::new("daily_orders", target, RunMode::Execute),
+    );
+    let report = runtime.write_to_mssql(&session, &output)?;
+
+    println!("wrote output {}", report.output_name());
+    Ok(())
+}
 ```
 
-Core Rust entry points include:
-
-- `DeltaFunnelSession` for source registration and session state.
-- `DeltaFunnelRuntime` for lazy SQL planning, dry runs, and writes.
-- `OutputWritePlan` and `MssqlOutputTarget` for output planning.
-- `WriteAllOptions` and `WriteAllCacheMode` for multi-output execution.
+For the full Rust API, see
+[`docs.rs/delta-funnel`](https://docs.rs/delta-funnel) and the
+[`query_load_dry_run` example](crates/delta-funnel/examples/query_load_dry_run.rs).
 
 ## Build And Test
 
