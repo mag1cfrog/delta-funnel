@@ -36,7 +36,7 @@ Use Delta Funnel when:
 - You want SQL transforms over Delta Lake without a cluster.
 - You want Rust or Python orchestration with reports and tracing.
 
-## Install Or Build
+## Install
 
 For Rust, add the `delta-funnel` crate:
 
@@ -55,159 +55,125 @@ uv add deltafunnel
 ```python
 from deltafunnel import Session
 
-connection_string = (
+ado_connection_string = (
     "server=tcp:localhost,1433;"
     "database=warehouse;"
-    "user id=etl_user;"
-    "password=REPLACE_ME;"
+    "User ID=etl_user;"
+    "Password=REPLACE_ME;"
     "encrypt=true;"
     "TrustServerCertificate=yes"
 )
 
-session = Session(default_mssql_connection_string=connection_string)
+session = Session(default_mssql_connection_string=ado_connection_string)
+
+# Register the Delta table as "orders" so SQL can reference it.
 orders = session.delta_lake("file:///path/to/orders-delta", name="orders")
 
+# Build a lazy DataFusion SQL query. No rows are read yet.
 daily_orders = session.table_from_sql("""
     select customer_id, order_date, total_amount
     from orders
     where order_date >= date '2026-01-01'
 """)
 
-daily_orders.show(limit=20)
+# Preview executes the DataFusion query with a limit; notebooks render it as a table.
+daily_orders.preview(limit=20)
+```
 
+![Synthetic Delta Funnel table preview showing customer_id, order_date, and total_amount rows.](https://mag1cfrog.github.io/delta-funnel/assets/table-preview.png)
+
+```python
+# Write executes the query and loads the result into SQL Server.
 report = daily_orders.write_to_mssql(
     schema="dbo",
     table="daily_orders",
-    load_mode="create_and_load",
+    load_mode="create_and_load",  # use "replace" only to rebuild an existing target
+    # dry_run=True,  # validate the load plan without writing rows
 )
 ```
 
-Use `replace` only for existing targets. DeltaFunnel writes a staging table,
-validates it, then swaps it into the final target name. Table metadata such as
-indexes, constraints, triggers, permissions, and extended properties is not
-preserved.
-
-`session.delta_lake(..., name="orders")` registers a Delta source immediately.
-`session.delta_lake(...)` without `name` returns a pending source; call
-`.alias("orders")` before SQL references it.
-
-`Table.preview(limit=20)` and `Table.show(limit=20)` are terminal actions that
-execute the DataFusion query and read rows with the limit applied before
-collection. They do not contact SQL Server or write rows. `preview()` returns a
-`Preview` object with text and notebook HTML representations; `show()` prints
-the text preview to Python stdout.
-
-For private S3 Delta sources in Python, see the
-[`docs-site/docs/python-api-walkthrough.md`](docs-site/docs/python-api-walkthrough.md)
-guide. The current S3 path expects explicit `storage_options` credentials for
-local shell usage and can behave differently from `deltalake` if the two
-libraries resolve AWS credentials differently.
-
-Reports are plain Python `dict` values converted from Rust report types. Report
-formatting is designed to avoid exposing connection strings, credentials, and
-raw row values. See
-[`docs/failure-reports-and-tracing.md`](docs/failure-reports-and-tracing.md)
-for the failure-report and tracing rules.
-
-## Dry Runs
-
-Use `dry_run=True` on the same write methods to validate the plan without
-writing rows:
-
-```python
-dry_run_report = daily_orders.write_to_mssql(
-    schema="dbo",
-    table="daily_orders",
-    load_mode="create_and_load",
-    dry_run=True,
-)
-```
-
-There are no public Python `dry_run_*` methods.
+For private S3 sources, SQL Server load modes, dry runs, and reports, see the
+[`Python API walkthrough`](https://mag1cfrog.github.io/delta-funnel/python-api-walkthrough/),
+[`SQL Server guide`](https://mag1cfrog.github.io/delta-funnel/sql-server/), and
+[`dry runs and reports`](https://mag1cfrog.github.io/delta-funnel/dry-runs-reports/).
 
 ## Multi-output Writes
 
-`Table.to_mssql(...)` creates an output spec without writing. `Session.write_all`
-writes the specs in one workflow.
+For workflows that write several related tables in one run, use
+`Table.to_mssql(...)` to create output specs and `Session.write_all(...)` to
+execute them together. Shared lazy SQL dependencies can be cached during the
+workflow so common upstream work is not repeated for each output.
 
-```python
-active_orders = session.table_from_sql("""
-    select *
-    from orders
-    where status = 'active'
-""").alias("active_orders")
+See the
+[`dry runs and reports`](https://mag1cfrog.github.io/delta-funnel/dry-runs-reports/)
+guide for multi-output dry runs and cache options.
 
-west = session.table_from_sql("""
-    select * from active_orders where region = 'west'
-""")
-east = session.table_from_sql("""
-    select * from active_orders where region = 'east'
-""")
+## Rust Quickstart
 
-outputs = [
-    west.to_mssql(
-        schema="dbo",
-        table="active_orders_west",
-        load_mode="append_existing",
-        name="west_active_orders",
-    ),
-    east.to_mssql(
-        schema="dbo",
-        table="active_orders_east",
-        load_mode="append_existing",
-        name="east_active_orders",
-    ),
-]
+```rust
+use delta_funnel::{
+    DeltaFunnelRuntime, DeltaFunnelSession, DeltaSourceConfig, LoadMode,
+    MssqlConnectionConfig, MssqlOutputTarget, MssqlTargetConfig,
+    MssqlTargetTable, OutputWritePlan, RunMode, SessionOptions,
+};
 
-dry_run_report = session.write_all(outputs, dry_run=True)
-report = session.write_all(outputs, options={"cache_mode": "disabled"})
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let ado_connection_string = concat!(
+        "server=tcp:localhost,1433;",
+        "database=warehouse;",
+        "User ID=etl_user;",
+        "Password=REPLACE_ME;",
+        "encrypt=true;",
+        "TrustServerCertificate=yes",
+    );
+
+    let default_connection = MssqlConnectionConfig::new(ado_connection_string)?
+        .with_display_label("warehouse");
+    let mut session = DeltaFunnelSession::new(
+        SessionOptions::new().with_default_mssql_connection(default_connection),
+    )?;
+    let runtime = DeltaFunnelRuntime::new()?;
+
+    // Register the Delta table as "orders" so SQL can reference it.
+    let _orders = session.delta_lake(DeltaSourceConfig::new(
+        "orders",
+        "file:///path/to/orders-delta",
+    ))?;
+
+    // Build a lazy DataFusion SQL query. No rows are read yet.
+    let daily_orders = runtime.table_from_sql(
+        &mut session,
+        r#"
+        select customer_id, order_date, total_amount
+        from orders
+        where order_date >= date '2026-01-01'
+        "#,
+    )?;
+
+    // Preview executes the DataFusion query with a limit.
+    let preview = runtime.preview_table(&session, &daily_orders, 20)?;
+    println!("{}", preview.text());
+
+    // Write executes the query and loads the result into SQL Server.
+    let target = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "daily_orders")?)
+        .with_load_mode(LoadMode::CreateAndLoad);
+    let output = OutputWritePlan::new(
+        daily_orders,
+        MssqlOutputTarget::new("daily_orders", target, RunMode::Execute),
+    );
+    let report = runtime.write_to_mssql(&session, &output)?;
+
+    println!("wrote output {}", report.output_name());
+    Ok(())
+}
 ```
 
-`options={"cache_mode": "auto"}` is the default execute behavior. It may cache
-shared lazy SQL aliases during one `write_all` call. Use
-`options={"cache_mode": "disabled"}` to force the baseline path.
+For the full Rust API, see
+[`docs.rs/delta-funnel`](https://docs.rs/delta-funnel) and the
+[`query_load_dry_run` example](crates/delta-funnel/examples/query_load_dry_run.rs).
 
-> [!IMPORTANT]
-> `options` is only accepted for execute `write_all` calls, not dry runs.
+## Development
 
-The first Python surface does not include persistent `cache`, `persist`,
-or `materialize` APIs.
-
-## Rust API
-
-The Rust crate owns the workflow implementation and public report types. A
-minimal dry-run example is available at
-[`crates/delta-funnel/examples/query_load_dry_run.rs`](crates/delta-funnel/examples/query_load_dry_run.rs).
-
-Run it with a local Delta table path:
-
-```bash
-DELTA_FUNNEL_EXAMPLE_ORDERS_DELTA=/path/to/orders \
-  cargo run -p delta-funnel --example query_load_dry_run
-```
-
-Core Rust entry points include:
-
-- `DeltaFunnelSession` for source registration and session state.
-- `DeltaFunnelRuntime` for lazy SQL planning, dry runs, and writes.
-- `OutputWritePlan` and `MssqlOutputTarget` for output planning.
-- `WriteAllOptions` and `WriteAllCacheMode` for multi-output execution.
-
-## Build And Test
-
-```bash
-cargo fmt --all --check
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-```
-
-SQL Server integration tests are opt-in:
-
-```bash
-cargo xtask sqlserver-test
-```
-
-The xtask runner can start a local SQL Server container, run Rust and Python
-write tests, and remove the container when it exits. See
-[`docs/mssql-integration-tests.md`](docs/mssql-integration-tests.md).
+For local builds and test setup, see the
+[`installation guide`](https://mag1cfrog.github.io/delta-funnel/install/) and
+[`SQL Server guide`](https://mag1cfrog.github.io/delta-funnel/sql-server/).
