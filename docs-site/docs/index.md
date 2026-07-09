@@ -1,6 +1,6 @@
 ---
 title: "Delta Funnel: Delta Lake to SQL Server"
-description: Lightweight Rust and Python toolkit for fast Delta Lake to SQL Server loads with DataFusion SQL and native TDS bulk writes, without Spark or ODBC.
+description: Delta Lake to SQL Server without Spark or JDBC/ODBC bottlenecks. Transform with DataFusion SQL and bulk-load through native TDS.
 ---
 
 # Delta Funnel
@@ -8,12 +8,16 @@ description: Lightweight Rust and Python toolkit for fast Delta Lake to SQL Serv
 ![Surreal banner showing Delta Lake data flowing through a Rust-orange funnel into a database barrel.](https://raw.githubusercontent.com/mag1cfrog/delta-funnel/main/assets/delta-funnel-banner.jpg)
 
 <h3 align="center">
-  <strong>Fast, lightweight Delta Lake to SQL Server loads without Spark or ODBC.</strong>
+  <strong>Delta Lake to SQL Server. No Spark. No JDBC/ODBC bottleneck.</strong>
 </h3>
 
 <p align="center">
-  A lightweight Rust and Python toolkit for reading Delta Lake tables,<br/>
-  transforming them with DataFusion SQL, and writing through native TDS bulk loads.
+  DataFusion SQL in.<br/>
+  Native TDS bulk load out.
+</p>
+
+<p align="center">
+  <strong>Observed:</strong> 13.4M rows in ~14 minutes vs. a ~2 hour Spark/JDBC path.
 </p>
 
 <p align="center">
@@ -23,11 +27,17 @@ description: Lightweight Rust and Python toolkit for fast Delta Lake to SQL Serv
   <a href="https://pypi.org/project/deltafunnel/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-blue.svg"></a>
 </p>
 
-Project links: [Delta Funnel GitHub repository](https://github.com/mag1cfrog/delta-funnel),
-[deltafunnel Python package on PyPI](https://pypi.org/project/deltafunnel/),
-[delta-funnel Rust crate on crates.io](https://crates.io/crates/delta-funnel),
-[delta-funnel Rust API documentation on docs.rs](https://docs.rs/delta-funnel),
-and [Delta Funnel release notes](https://github.com/mag1cfrog/delta-funnel/releases).
+Project links: [GitHub](https://github.com/mag1cfrog/delta-funnel),
+[PyPI](https://pypi.org/project/deltafunnel/),
+[crates.io](https://crates.io/crates/delta-funnel),
+[docs.rs](https://docs.rs/delta-funnel),
+and [release notes](https://github.com/mag1cfrog/delta-funnel/releases).
+
+## Why I Wrote This
+
+People like to have the finalized golden-layer data ported into a relational database like MSSQL. I work at an on-prem Microsoft shop, which means the practical deployment target was a Windows VM, so I had to set up WSL + Spark just to do the job. And because [`sql-spark-connector`](https://github.com/microsoft/sql-spark-connector) is no longer maintained, I had to deal with slow plain JDBC writes as well.
+
+One day I had enough of both, so I decided to pull together a native solution on top of [`delta-kernel-rs`](https://github.com/delta-io/delta-kernel-rs), [`tiberius`](https://github.com/prisma/tiberius), and [`datafusion`](https://github.com/apache/datafusion), without the overhead of JVM or JDBC/ODBC. It works unexpectedly well.
 
 !!! note "Project status"
     Delta Funnel is early project code. The Rust crate is available on
