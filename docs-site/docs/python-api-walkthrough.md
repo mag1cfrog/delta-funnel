@@ -105,8 +105,20 @@ daily_orders = session.table_from_sql("""
 """)
 ```
 
-`table_from_sql` creates a lazy table. It does not execute rows until a write or
-dry run needs the plan.
+`table_from_sql` creates a lazy table. It does not execute rows until a
+terminal action reads or writes the table.
+
+## Preview rows
+
+```python
+preview = daily_orders.preview(limit=20)
+daily_orders.show(limit=20)
+```
+
+`preview()` and `show()` execute the DataFusion query and read rows with the
+limit applied before collection. They do not contact SQL Server or write rows.
+`preview()` returns a `Preview` object with text and notebook HTML
+representations. `show()` prints the text preview to Python stdout.
 
 ## Write to SQL Server
 

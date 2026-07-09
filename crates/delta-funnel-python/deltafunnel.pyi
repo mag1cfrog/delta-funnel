@@ -65,8 +65,21 @@ class PendingDeltaSource:
     def alias(self, name: str) -> Table: ...
 
 
+class Preview:
+    text: str
+    html: str
+
+    def __str__(self) -> str: ...
+
+    def _repr_html_(self) -> str: ...
+
+
 class Table:
     def alias(self, name: str) -> Table: ...
+
+    def preview(self, limit: int = 20) -> Preview: ...
+
+    def show(self, limit: int = 20) -> None: ...
 
     def to_mssql(
         self,

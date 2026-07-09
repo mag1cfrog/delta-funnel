@@ -13,7 +13,8 @@ use super::session::OrchestratorMssqlOutputWriter;
 use crate::MssqlWorkflowOutputWriter;
 use crate::{
     DeltaFunnelError, DeltaFunnelSession, LazyTable, MssqlDryRunOutputReport,
-    MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, WriteAllOptions, WriteAllReport,
+    MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, TablePreview, WriteAllOptions,
+    WriteAllReport,
 };
 
 /// Blocking runtime boundary for high-level Delta Funnel session actions.
@@ -60,6 +61,21 @@ impl DeltaFunnelRuntime {
     ) -> Result<LazyTable, DeltaFunnelError> {
         reject_nested_runtime()?;
         self.runtime.block_on(session.table_from_sql(sql))
+    }
+
+    /// Runs a bounded lazy table preview for a synchronous host.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as [`DeltaFunnelSession::preview_table`].
+    pub fn preview_table(
+        &self,
+        session: &DeltaFunnelSession,
+        table: &LazyTable,
+        limit: usize,
+    ) -> Result<TablePreview, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime.block_on(session.preview_table(table, limit))
     }
 
     /// Runs a single-output dry run through the high-level session API.
@@ -240,6 +256,33 @@ mod tests {
             table,
             MssqlOutputTarget::new(output_name, target, RunMode::Execute),
         ))
+    }
+
+    #[test]
+    fn runtime_preview_table_returns_limited_formatted_rows() -> Result<(), DeltaFunnelError> {
+        let runtime = DeltaFunnelRuntime::new()?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = runtime.table_from_sql(
+            &mut session,
+            "select 'open' as status union all select 'closed' as status order by status desc",
+        )?;
+
+        let preview = runtime.preview_table(&session, &table, 1)?;
+
+        assert!(preview.text().contains("| status |"));
+        assert!(
+            preview
+                .text()
+                .lines()
+                .any(|line| line.contains("| open   |"))
+        );
+        assert!(
+            !preview
+                .text()
+                .lines()
+                .any(|line| line.contains("| closed |"))
+        );
+        Ok(())
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

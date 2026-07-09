@@ -25,8 +25,15 @@ Core Python entry points:
 - `Session`
 - `PendingDeltaSource`
 - `Table`
+- `Preview`
 - `MssqlOutputSpec`
 - `DeltaFunnelError`
+
+`Table.preview(limit=20)` returns a `Preview` object. It executes the
+DataFusion query with the limit applied before collection, reads rows, and does
+not write to SQL Server. `Preview.text` is the plain text table and
+`Preview.html` backs notebook `_repr_html_()` display. `Table.show(limit=20)`
+executes the same preview and prints the text form to Python stdout.
 
 For Delta sources, `Session.delta_lake(..., storage_options=...)` accepts a
 mapping of string keys and values and forwards them to the underlying

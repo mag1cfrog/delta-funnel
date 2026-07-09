@@ -5,6 +5,47 @@ use pyo3::prelude::*;
 use crate::output::PyMssqlOutputSpec;
 use crate::session::PySession;
 
+/// Rendered preview of a Delta Funnel table.
+#[pyclass(name = "Preview", module = "deltafunnel")]
+pub(crate) struct PyPreview {
+    text: String,
+    html: String,
+}
+
+impl PyPreview {
+    fn new(preview: delta_funnel::TablePreview) -> Self {
+        Self {
+            text: preview.text().to_owned(),
+            html: preview.html().to_owned(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyPreview {
+    #[getter]
+    fn text(&self) -> &str {
+        &self.text
+    }
+
+    #[getter]
+    fn html(&self) -> &str {
+        &self.html
+    }
+
+    fn __str__(&self) -> &str {
+        &self.text
+    }
+
+    fn __repr__(&self) -> &str {
+        &self.text
+    }
+
+    fn _repr_html_(&self) -> &str {
+        &self.html
+    }
+}
+
 /// Lazy Delta Funnel table.
 ///
 /// A `Table` can be aliased for later SQL, converted to a `MssqlOutputSpec`,
@@ -96,6 +137,26 @@ impl PyTable {
             .write_to_mssql(py, &spec.write_plan(delta_funnel::RunMode::Execute))
     }
 
+    /// Returns a bounded rendered preview of this lazy table.
+    #[pyo3(signature = (limit=20))]
+    fn preview(&self, py: Python<'_>, limit: usize) -> PyResult<PyPreview> {
+        let text = self
+            .session
+            .borrow(py)
+            .preview_table(py, &self.inner, limit)?;
+        Ok(PyPreview::new(text))
+    }
+
+    /// Prints a bounded preview of this lazy table to Python stdout.
+    #[pyo3(signature = (limit=20))]
+    fn show(&self, py: Python<'_>, limit: usize) -> PyResult<()> {
+        let preview = self.preview(py, limit)?;
+        py.import("builtins")?
+            .getattr("print")?
+            .call1((preview.text.as_str(),))?;
+        Ok(())
+    }
+
     fn __repr__(&self, py: Python<'_>) -> String {
         let kind = match self.inner.kind() {
             delta_funnel::LazyTableKind::DeltaSource => "delta_source",
@@ -119,6 +180,7 @@ impl PyTable {
 }
 
 pub(crate) fn add_table(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<PyPreview>()?;
     module.add_class::<PyTable>()
 }
 
@@ -139,7 +201,76 @@ mod tests {
                 table_type.getattr("__name__")?.extract::<String>()?,
                 "Table"
             );
+            let preview_type = module.getattr("Preview")?;
+            assert_eq!(
+                preview_type.getattr("__name__")?.extract::<String>()?,
+                "Preview"
+            );
 
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_preview_returns_limited_preview_object() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1(
+                "table_from_sql",
+                ("select 1 as id union all select 2 as id order by id",),
+            )?;
+
+            let preview = table.call_method1("preview", (1,))?;
+            let text = preview.getattr("text")?.extract::<String>()?;
+            let html = preview.getattr("html")?.extract::<String>()?;
+
+            assert_eq!(
+                preview
+                    .get_type()
+                    .getattr("__name__")?
+                    .extract::<String>()?,
+                "Preview"
+            );
+            assert_eq!(preview.str()?.extract::<String>()?, text);
+            assert_eq!(
+                preview.call_method0("_repr_html_")?.extract::<String>()?,
+                html
+            );
+            assert!(html.contains("class=\"deltafunnel-preview\""));
+            assert!(html.contains("<td class=\"df-num\">1</td>"));
+            assert!(!html.contains("<td class=\"df-num\">2</td>"));
+            assert!(
+                html.contains("<th class=\"df-num\"><span>id</span><br><span class=\"df-type\">")
+            );
+            assert!(text.contains("| id |"));
+            assert!(text.lines().any(|line| line.contains("| 1  |")));
+            assert!(!text.lines().any(|line| line.contains("| 2  |")));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_show_prints_preview_to_python_stdout() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1("table_from_sql", ("select 'west' as region",))?;
+            let sys = py.import("sys")?;
+            let io = py.import("io")?;
+            let capture = io.call_method0("StringIO")?;
+            let old_stdout = sys.getattr("stdout")?;
+
+            sys.setattr("stdout", &capture)?;
+            let show_result = table.call_method1("show", (20,));
+            sys.setattr("stdout", old_stdout)?;
+            show_result?;
+
+            let output = capture.call_method0("getvalue")?.extract::<String>()?;
+            assert!(output.contains("| region |"));
+            assert!(output.lines().any(|line| line.contains("| west   |")));
             Ok(())
         })
     }

@@ -7,5 +7,5 @@ pub use runtime::DeltaFunnelRuntime;
 pub use session::{
     DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan,
     PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions,
-    WriteAllCacheMode, WriteAllOptions,
+    TablePreview, WriteAllCacheMode, WriteAllOptions,
 };
