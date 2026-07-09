@@ -221,6 +221,16 @@ impl PySession {
         json_value_to_py(py, &report.to_json_value())
     }
 
+    pub(crate) fn preview_table(
+        &self,
+        py: Python<'_>,
+        table: &delta_funnel::LazyTable,
+        limit: usize,
+    ) -> PyResult<String> {
+        py.detach(|| self.runtime.preview_table(&self.inner, table, limit))
+            .map_err(|error| rust_error_to_py(py, error))
+    }
+
     fn dry_run_all_to_mssql(
         &self,
         py: Python<'_>,
