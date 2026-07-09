@@ -62,6 +62,21 @@ impl DeltaFunnelRuntime {
         self.runtime.block_on(session.table_from_sql(sql))
     }
 
+    /// Runs a bounded lazy table preview for a synchronous host.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as [`DeltaFunnelSession::preview_table`].
+    pub fn preview_table(
+        &self,
+        session: &DeltaFunnelSession,
+        table: &LazyTable,
+        limit: usize,
+    ) -> Result<String, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime.block_on(session.preview_table(table, limit))
+    }
+
     /// Runs a single-output dry run through the high-level session API.
     ///
     /// # Errors
@@ -240,6 +255,23 @@ mod tests {
             table,
             MssqlOutputTarget::new(output_name, target, RunMode::Execute),
         ))
+    }
+
+    #[test]
+    fn runtime_preview_table_returns_limited_formatted_rows() -> Result<(), DeltaFunnelError> {
+        let runtime = DeltaFunnelRuntime::new()?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = runtime.table_from_sql(
+            &mut session,
+            "select 'open' as status union all select 'closed' as status",
+        )?;
+
+        let preview = runtime.preview_table(&session, &table, 1)?;
+
+        assert!(preview.contains("| status |"));
+        assert!(preview.lines().any(|line| line.contains("| open   |")));
+        assert!(!preview.lines().any(|line| line.contains("| closed |")));
+        Ok(())
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

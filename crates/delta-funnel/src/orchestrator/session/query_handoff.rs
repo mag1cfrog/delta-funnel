@@ -147,6 +147,27 @@ impl DeltaFunnelSession {
         })))
     }
 
+    /// Executes a bounded preview of a lazy table and returns DataFusion's
+    /// formatted table output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lazy table is unknown, DataFusion cannot apply
+    /// the limit, or preview execution fails.
+    pub async fn preview_table(
+        &self,
+        table: &LazyTable,
+        limit: usize,
+    ) -> Result<String, DeltaFunnelError> {
+        let dataframe = self.dataframe_for_lazy_table(table).await?;
+        dataframe
+            .limit(0, Some(limit))
+            .map_err(|error| datafusion_handoff_setup_error("preview_limit", error))?
+            .to_string()
+            .await
+            .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))
+    }
+
     pub(super) async fn dataframe_for_lazy_table(
         &self,
         table: &LazyTable,
@@ -328,6 +349,34 @@ mod tests {
         let rows = collect_stream_row_count(stream).await?;
 
         assert_eq!(rows, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_table_returns_limited_formatted_rows() -> Result<(), DeltaFunnelError> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+
+        let preview = session.preview_table(&table, 1).await?;
+
+        assert!(preview.contains("| id |"));
+        assert!(preview.lines().any(|line| line.contains("| 1  |")));
+        assert!(!preview.lines().any(|line| line.contains("| 2  |")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_table_reads_registered_derived_alias() -> Result<(), DeltaFunnelError> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let pending = session.table_from_sql("select 'west' as region").await?;
+        let alias = session.register_alias("regions", &pending)?;
+
+        let preview = session.preview_table(&alias, 20).await?;
+
+        assert!(preview.contains("| region |"));
+        assert!(preview.lines().any(|line| line.contains("| west   |")));
         Ok(())
     }
 
