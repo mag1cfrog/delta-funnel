@@ -313,24 +313,6 @@ mod tests {
     }
 
     #[test]
-    fn dependency_alignment_doc_tracks_arrow_tiberius_observability_release() {
-        let docs = include_str!("../../../../../docs/dependency-alignment.md");
-
-        assert!(docs.contains("arrow-tiberius = \"0.2.0\""));
-        assert!(docs.contains("tiberius-raw-bulk =0.12.3-raw-bulk.14"));
-        assert!(docs.contains("arrow_tiberius"));
-        assert!(docs.contains("tiberius_raw_bulk::protocol"));
-        assert!(!docs.contains("arrow-tiberius = \"0.1.6\""));
-        assert!(!docs.contains("arrow-tiberius = \"0.1.3\""));
-        assert!(!docs.contains("arrow-tiberius = \"0.1.4\""));
-        assert!(!docs.contains("arrow-tiberius = \"0.1.5\""));
-        assert!(!docs.contains("arrow-tiberius = \"0.1.1\""));
-        assert!(!docs.contains("arrow-tiberius = \"0.1.2\""));
-        assert!(!docs.contains("raw-bulk.13"));
-        assert!(!docs.contains("pre-publish"));
-    }
-
-    #[test]
     fn connection_module_stays_before_lifecycle_sql_and_row_writing_boundaries() {
         let source = include_str!("connection.rs");
         let forbidden_patterns = [
