@@ -88,6 +88,7 @@ report = daily_orders.write_to_mssql(
     schema="dbo",
     table="daily_orders",
     load_mode="create_and_load",  # use "replace" only to rebuild an existing target
+    # dry_run=True,  # validate the load plan without writing rows
 )
 ```
 
@@ -95,22 +96,6 @@ For private S3 sources, SQL Server load modes, dry runs, and reports, see the
 [`Python API walkthrough`](https://mag1cfrog.github.io/delta-funnel/python-api-walkthrough/),
 [`SQL Server guide`](https://mag1cfrog.github.io/delta-funnel/sql-server/), and
 [`dry runs and reports`](https://mag1cfrog.github.io/delta-funnel/dry-runs-reports/).
-
-## Dry Runs
-
-Use `dry_run=True` on the same write methods to validate the plan without
-writing rows:
-
-```python
-dry_run_report = daily_orders.write_to_mssql(
-    schema="dbo",
-    table="daily_orders",
-    load_mode="create_and_load",
-    dry_run=True,
-)
-```
-
-There are no public Python `dry_run_*` methods.
 
 ## Multi-output Writes
 

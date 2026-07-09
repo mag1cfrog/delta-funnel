@@ -95,6 +95,7 @@ report = daily_orders.write_to_mssql(
     schema="dbo",
     table="daily_orders",
     load_mode="create_and_load",  # use "replace" only to rebuild an existing target
+    # dry_run=True,  # validate the load plan without writing rows
 )
 ```
 
