@@ -202,10 +202,16 @@ impl PySession {
         &self,
         py: Python<'_>,
         request: &delta_funnel::OutputWritePlan,
+        reporter: Option<delta_funnel::progress::ProgressReporter>,
     ) -> PyResult<Py<PyAny>> {
-        let report = self
-            .runtime
-            .dry_run_to_mssql(&self.inner, request)
+        let report = reporter
+            .map_or_else(
+                || self.runtime.dry_run_to_mssql(&self.inner, request),
+                |reporter| {
+                    self.runtime
+                        .dry_run_to_mssql_with_progress(&self.inner, request, reporter)
+                },
+            )
             .map_err(|error| rust_error_to_py(py, error))?;
         json_value_to_py(py, &report.to_json_value())
     }
@@ -214,9 +220,18 @@ impl PySession {
         &self,
         py: Python<'_>,
         request: &delta_funnel::OutputWritePlan,
+        reporter: Option<delta_funnel::progress::ProgressReporter>,
     ) -> PyResult<Py<PyAny>> {
         let report = py
-            .detach(|| self.runtime.write_to_mssql(&self.inner, request))
+            .detach(|| {
+                reporter.map_or_else(
+                    || self.runtime.write_to_mssql(&self.inner, request),
+                    |reporter| {
+                        self.runtime
+                            .write_to_mssql_with_progress(&self.inner, request, reporter)
+                    },
+                )
+            })
             .map_err(|error| rust_error_to_py(py, error))?;
         json_value_to_py(py, &report.to_json_value())
     }

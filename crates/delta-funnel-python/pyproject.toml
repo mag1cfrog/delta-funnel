@@ -19,6 +19,7 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+dependencies = ["rich>=14,<15"]
 
 [project.urls]
 Homepage = "https://mag1cfrog.github.io/delta-funnel/"

@@ -3,6 +3,7 @@
 use pyo3::prelude::*;
 
 use crate::output::PyMssqlOutputSpec;
+use crate::progress::PythonProgress;
 use crate::session::PySession;
 
 /// Rendered preview of a Delta Funnel table.
@@ -103,7 +104,7 @@ impl PyTable {
     ///
     /// Pass `dry_run=True` to plan without writing. Returns a plain Python
     /// `dict` report.
-    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None))]
+    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(
         &self,
@@ -114,6 +115,7 @@ impl PyTable {
         dry_run: Option<bool>,
         name: Option<String>,
         connection_string: Option<String>,
+        progress: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
         let spec = PyMssqlOutputSpec::new(
             py,
@@ -125,16 +127,20 @@ impl PyTable {
             name,
             connection_string,
         )?;
+        let progress = PythonProgress::new(progress);
         if dry_run == Some(true) {
-            return self
-                .session
-                .borrow(py)
-                .dry_run_to_mssql(py, &spec.write_plan(delta_funnel::RunMode::DryRun));
+            return self.session.borrow(py).dry_run_to_mssql(
+                py,
+                &spec.write_plan(delta_funnel::RunMode::DryRun),
+                progress.as_ref().map(PythonProgress::reporter),
+            );
         }
 
-        self.session
-            .borrow(py)
-            .write_to_mssql(py, &spec.write_plan(delta_funnel::RunMode::Execute))
+        self.session.borrow(py).write_to_mssql(
+            py,
+            &spec.write_plan(delta_funnel::RunMode::Execute),
+            progress.as_ref().map(PythonProgress::reporter),
+        )
     }
 
     /// Returns a bounded rendered preview of this lazy table.
