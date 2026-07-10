@@ -340,6 +340,7 @@ mod tests {
             mut batches: MssqlOutputBatchStream,
             _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
+            _reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;
             let mut batch_count = 0_u64;
@@ -399,6 +400,7 @@ mod tests {
                 batches,
                 write_backend,
                 validation_options,
+                None,
             )
             .await
         }

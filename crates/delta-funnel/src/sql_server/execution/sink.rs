@@ -116,13 +116,13 @@ pub(crate) async fn write_output_batches_to_mssql_with_reporter<S>(
 where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
+    let request =
+        plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
     emit_progress_phase(
         Some(reporter),
         ProgressPhase::Connecting,
-        resolved_target.output_name(),
+        request.output_plan().output_name(),
     );
-    let request =
-        plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
 
     run_mssql_output_connection_request(
         request,
@@ -1168,9 +1168,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        MssqlConnectionConfig, MssqlPreparedTargetAction, MssqlTargetConfig, MssqlTargetTable,
-        MssqlWritePhase, PhaseStatus, PhaseTimingReport, default_mssql_write_backend,
-        plan_mssql_target_for_output,
+        MssqlConnectionConfig, MssqlPreparedTargetAction, MssqlTargetConfig,
+        MssqlTargetResolutionContext, MssqlTargetTable, MssqlWritePhase, PhaseStatus,
+        PhaseTimingReport, default_mssql_write_backend, plan_mssql_target_for_output,
     };
 
     #[derive(Default)]
@@ -1564,6 +1564,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reporter_stays_in_planning_when_connection_request_planning_fails()
+    -> Result<(), DeltaFunnelError> {
+        let connection = secret_connection()?;
+        let resolved_target = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?)
+            .resolve(MssqlTargetResolutionContext {
+                output_name: Some("orders_output"),
+                default_connection: Some(&connection),
+            })?;
+        let unsupported_schema = Schema::new(vec![Field::new(
+            "items",
+            DataType::new_list(DataType::Int64, true),
+            true,
+        )]);
+        let batches = stream::empty::<Result<RecordBatch, DeltaFunnelError>>();
+        let (reporter, phases) = recording_reporter();
+
+        let error = write_output_batches_to_mssql_with_reporter(
+            unsupported_schema,
+            resolved_target,
+            MssqlSchemaPlanOptions::default(),
+            batches,
+            default_mssql_write_backend(),
+            ValidationOptions::new(),
+            &reporter,
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected connection request planning failure".to_owned(),
+        })?;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::MssqlSchemaPlanning { .. }
+        ));
+        assert!(reported_phases(&phases)?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn one_output_sink_runs_lifecycle_before_writer_initialization()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan()?;
@@ -1798,12 +1838,16 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let connection = FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_count(4);
         let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+        let (reporter, phases) = recording_reporter();
 
-        let error = write_mssql_output_batches_on_connection(
+        let error = run_mssql_output_batches_on_connection(
             output_plan,
             connection,
             batches,
             default_mssql_write_backend(),
+            ValidationOptions::new(),
+            Vec::new(),
+            Some(&reporter),
         )
         .await
         .err()
@@ -1841,6 +1885,15 @@ mod tests {
                 "finish",
                 "count target rows",
                 "cleanup CreatedStagingTable"
+            ]
+        );
+        assert_eq!(
+            reported_phases(&phases)?,
+            vec![
+                ProgressPhase::PreparingTarget,
+                ProgressPhase::Writing,
+                ProgressPhase::Validating,
+                ProgressPhase::CleaningUp,
             ]
         );
         Ok(())
@@ -1981,12 +2034,16 @@ mod tests {
                 true,
             ));
         let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+        let (reporter, phases) = recording_reporter();
 
-        let error = write_mssql_output_batches_on_connection(
+        let error = run_mssql_output_batches_on_connection(
             output_plan,
             connection,
             batches,
             default_mssql_write_backend(),
+            ValidationOptions::new(),
+            Vec::new(),
+            Some(&reporter),
         )
         .await
         .err()
@@ -2031,6 +2088,16 @@ mod tests {
                 "count target rows",
                 "swap",
                 "cleanup CreatedStagingTable"
+            ]
+        );
+        assert_eq!(
+            reported_phases(&phases)?,
+            vec![
+                ProgressPhase::PreparingTarget,
+                ProgressPhase::Writing,
+                ProgressPhase::Validating,
+                ProgressPhase::SwappingTarget,
+                ProgressPhase::CleaningUp,
             ]
         );
         Ok(())
@@ -2990,12 +3057,16 @@ mod tests {
         let batches = stream::iter(vec![Err(DeltaFunnelError::Config {
             message: "stream failed".to_owned(),
         })]);
+        let (reporter, phases) = recording_reporter();
 
-        let error = write_mssql_output_batches_on_connection(
+        let error = run_mssql_output_batches_on_connection(
             output_plan,
             connection,
             batches,
             default_mssql_write_backend(),
+            ValidationOptions::new(),
+            Vec::new(),
+            Some(&reporter),
         )
         .await
         .err()
@@ -3023,6 +3094,14 @@ mod tests {
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "cleanup CreatedTable"]
+        );
+        assert_eq!(
+            reported_phases(&phases)?,
+            vec![
+                ProgressPhase::PreparingTarget,
+                ProgressPhase::Writing,
+                ProgressPhase::CleaningUp,
+            ]
         );
         Ok(())
     }

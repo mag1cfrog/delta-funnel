@@ -333,9 +333,10 @@ mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
         sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        thread,
     };
 
     use crate::{
@@ -984,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn host_callback_panic_escapes_without_a_second_delivery()
+    fn host_callback_panic_after_started_escapes_without_an_unwind_delivery()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -998,8 +999,9 @@ mod tests {
         let deliveries = Arc::new(AtomicUsize::new(0));
         let callback_deliveries = Arc::clone(&deliveries);
         let reporter = ProgressReporter::new(move |_| {
-            callback_deliveries.fetch_add(1, Ordering::SeqCst);
-            resume_unwind(Box::new("host callback panic"));
+            if callback_deliveries.fetch_add(1, Ordering::SeqCst) == 1 {
+                resume_unwind(Box::new("host callback panic"));
+            }
         });
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
@@ -1007,7 +1009,95 @@ mod tests {
         }));
 
         assert!(panic.is_err());
-        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(deliveries.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn interleaved_actions_keep_callbacks_serial_ordered_and_isolated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("interleaved-progress")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let west_request = output_request(
+            source.clone(),
+            "west_output",
+            "west_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let east_request =
+            output_request(source, "east_output", "east_sink", LoadMode::AppendExisting)?;
+        let session = Arc::new(session);
+
+        type ActionEvents = Arc<Mutex<Vec<(ProgressEventKind, Option<String>)>>>;
+        let barrier = Arc::new(Barrier::new(2));
+        let make_reporter = |events: ActionEvents, active: Arc<AtomicBool>| {
+            let barrier = Arc::clone(&barrier);
+            ProgressReporter::new(move |event| {
+                assert!(!active.swap(true, Ordering::SeqCst));
+                let mut events = match events.lock() {
+                    Ok(events) => events,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                events.push((event.kind(), event.output_name().map(str::to_owned)));
+                drop(events);
+                if event.kind() == ProgressEventKind::Started {
+                    barrier.wait();
+                }
+                assert!(active.swap(false, Ordering::SeqCst));
+            })
+        };
+        let west_events = Arc::new(Mutex::new(Vec::new()));
+        let east_events = Arc::new(Mutex::new(Vec::new()));
+        let west_active = Arc::new(AtomicBool::new(false));
+        let east_active = Arc::new(AtomicBool::new(false));
+        let west_reporter = make_reporter(Arc::clone(&west_events), Arc::clone(&west_active));
+        let east_reporter = make_reporter(Arc::clone(&east_events), Arc::clone(&east_active));
+        let west_session = Arc::clone(&session);
+        let east_session = Arc::clone(&session);
+
+        let west_action = thread::spawn(move || {
+            west_session.dry_run_to_mssql_with_reporter(&west_request, west_reporter)
+        });
+        let east_action = thread::spawn(move || {
+            east_session.dry_run_to_mssql_with_reporter(&east_request, east_reporter)
+        });
+
+        west_action
+            .join()
+            .map_err(|_| std::io::Error::other("west progress action panicked"))??;
+        east_action
+            .join()
+            .map_err(|_| std::io::Error::other("east progress action panicked"))??;
+
+        assert!(!west_active.load(Ordering::SeqCst));
+        assert!(!east_active.load(Ordering::SeqCst));
+        let expected = |output_name: &str| {
+            vec![
+                (ProgressEventKind::Started, None),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    Some(output_name.to_owned()),
+                ),
+                (ProgressEventKind::Completed, None),
+            ]
+        };
+        assert_eq!(
+            west_events
+                .lock()
+                .map_err(|_| std::io::Error::other("west progress event mutex was poisoned"))?
+                .as_slice(),
+            expected("west_output")
+        );
+        assert_eq!(
+            east_events
+                .lock()
+                .map_err(|_| std::io::Error::other("east progress event mutex was poisoned"))?
+                .as_slice(),
+            expected("east_output")
+        );
         Ok(())
     }
 

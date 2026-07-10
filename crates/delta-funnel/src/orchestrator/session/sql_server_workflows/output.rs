@@ -109,7 +109,7 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter::default(), None)
+        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter, None)
             .await
     }
 
@@ -118,12 +118,8 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
         reporter: ProgressReporter,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.run_mssql_write_with_tracing(
-            request,
-            &mut MssqlPublicOneOutputWriter::with_reporter(reporter.clone()),
-            Some(&reporter),
-        )
-        .await
+        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter, Some(&reporter))
+            .await
     }
 
     async fn run_mssql_write_with_tracing<W>(
@@ -265,6 +261,7 @@ impl DeltaFunnelSession {
                 batches,
                 self.options.mssql_write_backend(),
                 self.options.validation_options(),
+                reporter,
             )
             .await
             .map(ensure_validation_phase_timing)
@@ -289,6 +286,10 @@ fn ensure_validation_phase_timing(report: MssqlWriteReport) -> MssqlWriteReport 
 
 #[async_trait]
 pub(crate) trait OrchestratorMssqlOutputWriter: Send {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the injected writer boundary receives one planned write plus its reporter"
+    )]
     async fn write_output(
         &mut self,
         output_schema: SchemaRef,
@@ -297,21 +298,11 @@ pub(crate) trait OrchestratorMssqlOutputWriter: Send {
         batches: MssqlOutputBatchStream,
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
-#[derive(Default)]
-struct MssqlPublicOneOutputWriter {
-    reporter: Option<ProgressReporter>,
-}
-
-impl MssqlPublicOneOutputWriter {
-    fn with_reporter(reporter: ProgressReporter) -> Self {
-        Self {
-            reporter: Some(reporter),
-        }
-    }
-}
+struct MssqlPublicOneOutputWriter;
 
 #[async_trait]
 impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
@@ -323,8 +314,9 @@ impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
         batches: MssqlOutputBatchStream,
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        match self.reporter.as_ref() {
+        match reporter {
             Some(reporter) => {
                 write_output_batches_to_mssql_with_reporter(
                     output_schema.as_ref(),
@@ -432,6 +424,18 @@ mod tests {
     #[derive(Default)]
     struct FakeOrchestratorWriter {
         calls: Vec<FakeOrchestratorWriteCall>,
+        failure: Option<DeltaFunnelError>,
+    }
+
+    impl FakeOrchestratorWriter {
+        fn failing_with(message: &str) -> Self {
+            Self {
+                failure: Some(DeltaFunnelError::Config {
+                    message: message.to_owned(),
+                }),
+                ..Self::default()
+            }
+        }
     }
 
     #[async_trait]
@@ -444,6 +448,7 @@ mod tests {
             mut batches: MssqlOutputBatchStream,
             _write_backend: MssqlWriteBackend,
             validation_options: ValidationOptions,
+            _reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;
             let mut batch_count = 0_u64;
@@ -456,6 +461,10 @@ mod tests {
                     }
                 })?);
                 batch_count = batch_count.saturating_add(1);
+            }
+
+            if let Some(error) = self.failure.take() {
+                return Err(error);
             }
 
             self.calls.push(FakeOrchestratorWriteCall {
@@ -959,6 +968,73 @@ mod tests {
                 (ProgressEventKind::Completed, None, None),
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_failure_emits_one_terminal_without_sensitive_progress_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let derived = session
+            .table_from_sql(
+                "select 'row-secret' as payload, \
+                 'file:///tmp/orders?token=uri-secret' as source_uri",
+            )
+            .await?;
+        let request = execute_output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+        let mut writer = FakeOrchestratorWriter::failing_with("raw-error-secret");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            let mut events = match callback_events.lock() {
+                Ok(events) => events,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            events.push((event.kind(), format!("{event:?}")));
+        });
+
+        let error = session
+            .write_to_mssql_with_writer_and_reporter(&request, &mut writer, reporter)
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(DeltaFunnelError::Config { message }) if message == "raw-error-secret"
+        ));
+        let events = match events.lock() {
+            Ok(events) => events,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(
+            events.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec![
+                ProgressEventKind::Started,
+                ProgressEventKind::PhaseChanged,
+                ProgressEventKind::PhaseChanged,
+                ProgressEventKind::Failed,
+            ]
+        );
+        let payloads = events
+            .iter()
+            .map(|(_, payload)| payload.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for sensitive in [
+            "secret-token",
+            "row-secret",
+            "uri-secret",
+            "raw-error-secret",
+            "server=tcp",
+        ] {
+            assert!(!payloads.contains(sensitive));
+        }
         Ok(())
     }
 

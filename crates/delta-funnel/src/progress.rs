@@ -2,7 +2,7 @@
 
 #![allow(
     dead_code,
-    reason = "progress dispatch is connected in the next review slice"
+    reason = "metric and multi-output variants are consumed by follow-up progress slices"
 )]
 
 use std::sync::Arc;
