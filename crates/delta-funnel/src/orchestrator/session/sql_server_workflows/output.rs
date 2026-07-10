@@ -10,6 +10,7 @@ use crate::{
     observability, plan_mssql_target_for_resolved_output,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::PhaseTimer,
+    write_output_batches_to_mssql_with_reporter,
     write_output_batches_to_mssql_with_validation_options,
 };
 
@@ -108,7 +109,7 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter, None)
+        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter::default(), None)
             .await
     }
 
@@ -117,8 +118,12 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
         reporter: ProgressReporter,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter, Some(&reporter))
-            .await
+        self.run_mssql_write_with_tracing(
+            request,
+            &mut MssqlPublicOneOutputWriter::with_reporter(reporter.clone()),
+            Some(&reporter),
+        )
+        .await
     }
 
     async fn run_mssql_write_with_tracing<W>(
@@ -295,7 +300,18 @@ pub(crate) trait OrchestratorMssqlOutputWriter: Send {
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
-struct MssqlPublicOneOutputWriter;
+#[derive(Default)]
+struct MssqlPublicOneOutputWriter {
+    reporter: Option<ProgressReporter>,
+}
+
+impl MssqlPublicOneOutputWriter {
+    fn with_reporter(reporter: ProgressReporter) -> Self {
+        Self {
+            reporter: Some(reporter),
+        }
+    }
+}
 
 #[async_trait]
 impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
@@ -308,15 +324,31 @@ impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql_with_validation_options(
-            output_schema.as_ref(),
-            resolved_target,
-            output_plan.schema_plan_options(),
-            batches,
-            write_backend,
-            validation_options,
-        )
-        .await
+        match self.reporter.as_ref() {
+            Some(reporter) => {
+                write_output_batches_to_mssql_with_reporter(
+                    output_schema.as_ref(),
+                    resolved_target,
+                    output_plan.schema_plan_options(),
+                    batches,
+                    write_backend,
+                    validation_options,
+                    reporter,
+                )
+                .await
+            }
+            None => {
+                write_output_batches_to_mssql_with_validation_options(
+                    output_schema.as_ref(),
+                    resolved_target,
+                    output_plan.schema_plan_options(),
+                    batches,
+                    write_backend,
+                    validation_options,
+                )
+                .await
+            }
+        }
     }
 }
 

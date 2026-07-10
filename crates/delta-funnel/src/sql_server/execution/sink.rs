@@ -12,6 +12,7 @@ use crate::{
     ValidationOptions, ValidationStatus,
     error::MssqlWritePhaseSnafu,
     observability,
+    progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     report::{
         PhaseTimer,
         sql_server::{MssqlBatchShapingReport, MssqlWriteReportMetrics},
@@ -39,6 +40,16 @@ const INITIALIZE_WRITER_PHASE: &str = "initialize_writer";
 const CLEANUP_PHASE: &str = "cleanup";
 const VALIDATION_PHASE: &str = "validation";
 const SWAP_TARGET_PHASE: &str = "swap_target";
+
+fn emit_progress_phase(
+    reporter: Option<&ProgressReporter>,
+    phase: ProgressPhase,
+    output_name: &str,
+) {
+    if let Some(reporter) = reporter {
+        reporter.emit(&ProgressEvent::phase_changed(phase, Some(output_name)));
+    }
+}
 
 /// Writes one resolved output to SQL Server from an Arrow record batch stream.
 ///
@@ -89,6 +100,36 @@ where
         batches,
         write_backend,
         validation_options,
+    )
+    .await
+}
+
+pub(crate) async fn write_output_batches_to_mssql_with_reporter<S>(
+    output_schema: impl AsRef<arrow_schema::Schema>,
+    resolved_target: ResolvedMssqlTarget,
+    schema_options: MssqlSchemaPlanOptions,
+    batches: S,
+    write_backend: MssqlWriteBackend,
+    validation_options: ValidationOptions,
+    reporter: &ProgressReporter,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
+    emit_progress_phase(
+        Some(reporter),
+        ProgressPhase::Connecting,
+        resolved_target.output_name(),
+    );
+    let request =
+        plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
+
+    run_mssql_output_connection_request(
+        request,
+        batches,
+        write_backend,
+        validation_options,
+        Some(reporter),
     )
     .await
 }
@@ -259,17 +300,31 @@ pub(crate) async fn write_mssql_output_connection_request_with_validation_option
 where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
+    run_mssql_output_connection_request(request, batches, options, validation_options, None).await
+}
+
+async fn run_mssql_output_connection_request<S>(
+    request: MssqlOutputConnectionRequest,
+    batches: S,
+    options: MssqlWriteBackend,
+    validation_options: ValidationOptions,
+    reporter: Option<&ProgressReporter>,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
     let output_plan = request.output_plan().clone();
     let connection = connect_mssql_output_client(request).await?;
     let phase_timings = connection.phase_timings().to_vec();
 
-    write_mssql_output_batches_on_connection_with_phase_timings(
+    run_mssql_output_batches_on_connection(
         output_plan,
         connection,
         batches,
         options,
         validation_options,
         phase_timings,
+        reporter,
     )
     .await
 }
@@ -299,16 +354,46 @@ where
 
 async fn write_mssql_output_batches_on_connection_with_phase_timings<C, S>(
     output_plan: MssqlTargetOutputPlan,
-    mut connection: C,
+    connection: C,
     batches: S,
     options: MssqlWriteBackend,
     validation_options: ValidationOptions,
-    mut phase_timings: Vec<PhaseTimingReport>,
+    phase_timings: Vec<PhaseTimingReport>,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     C: MssqlOneOutputSinkConnection + 'static,
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
+    run_mssql_output_batches_on_connection(
+        output_plan,
+        connection,
+        batches,
+        options,
+        validation_options,
+        phase_timings,
+        None,
+    )
+    .await
+}
+
+async fn run_mssql_output_batches_on_connection<C, S>(
+    output_plan: MssqlTargetOutputPlan,
+    mut connection: C,
+    batches: S,
+    options: MssqlWriteBackend,
+    validation_options: ValidationOptions,
+    mut phase_timings: Vec<PhaseTimingReport>,
+    reporter: Option<&ProgressReporter>,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    C: MssqlOneOutputSinkConnection + 'static,
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
+    emit_progress_phase(
+        reporter,
+        ProgressPhase::PreparingTarget,
+        output_plan.output_name(),
+    );
     let prepare_timer = PhaseTimer::start(PREPARE_TARGET_LIFECYCLE_PHASE);
     let prepared_target = match connection.prepare_target_lifecycle(&output_plan).await {
         Ok(prepared_target) => prepared_target,
@@ -334,11 +419,13 @@ where
                 &output_plan,
                 &prepared_target,
                 error_with_phase_timings(error, phase_timings),
+                reporter,
             )
             .await);
         }
     };
 
+    emit_progress_phase(reporter, ProgressPhase::Writing, output_plan.output_name());
     match connection
         .write_prepared_batches(&output_plan, &prepared_target, batches, options)
         .await
@@ -346,6 +433,15 @@ where
         Ok(report) => {
             let report = write_report_with_cleanup(&report, prepared_target.report().cleanup())
                 .with_phase_timings(phase_timings);
+            if validation_options.target_validation_mode() != TargetValidationMode::Disabled
+                || output_plan.load_mode() == LoadMode::Replace
+            {
+                emit_progress_phase(
+                    reporter,
+                    ProgressPhase::Validating,
+                    output_plan.output_name(),
+                );
+            }
             match validate_written_target(
                 &mut connection,
                 &output_plan,
@@ -356,28 +452,39 @@ where
             )
             .await
             {
-                Ok(report) => match swap_replace_target_after_validation(
-                    &mut connection,
-                    &output_plan,
-                    &prepared_target,
-                    report,
-                )
-                .await
-                {
-                    Ok(report) => Ok(report),
-                    Err(error) => Err(cleanup_after_prepared_target_failure(
+                Ok(report) => {
+                    if output_plan.load_mode() == LoadMode::Replace {
+                        emit_progress_phase(
+                            reporter,
+                            ProgressPhase::SwappingTarget,
+                            output_plan.output_name(),
+                        );
+                    }
+                    match swap_replace_target_after_validation(
                         &mut connection,
                         &output_plan,
                         &prepared_target,
-                        error,
+                        report,
                     )
-                    .await),
-                },
+                    .await
+                    {
+                        Ok(report) => Ok(report),
+                        Err(error) => Err(cleanup_after_prepared_target_failure(
+                            &mut connection,
+                            &output_plan,
+                            &prepared_target,
+                            error,
+                            reporter,
+                        )
+                        .await),
+                    }
+                }
                 Err(error) => Err(cleanup_after_prepared_target_failure(
                     &mut connection,
                     &output_plan,
                     &prepared_target,
                     error,
+                    reporter,
                 )
                 .await),
             }
@@ -387,6 +494,7 @@ where
             &output_plan,
             &prepared_target,
             error_with_phase_timings(error, phase_timings),
+            reporter,
         )
         .await),
     }
@@ -883,10 +991,18 @@ async fn cleanup_after_prepared_target_failure<C>(
     output_plan: &MssqlTargetOutputPlan,
     prepared_target: &MssqlPreparedTarget,
     original_error: DeltaFunnelError,
+    reporter: Option<&ProgressReporter>,
 ) -> DeltaFunnelError
 where
     C: MssqlOneOutputSinkConnection,
 {
+    if prepared_target.report().cleanup() != MssqlTargetCleanupStatus::NotApplicable {
+        emit_progress_phase(
+            reporter,
+            ProgressPhase::CleaningUp,
+            output_plan.output_name(),
+        );
+    }
     let cleanup_timer = PhaseTimer::start(CLEANUP_PHASE);
     match connection
         .cleanup_prepared_target(output_plan, Some(prepared_target))
@@ -1376,6 +1492,28 @@ mod tests {
             })
     }
 
+    fn recording_reporter() -> (ProgressReporter, Arc<Mutex<Vec<ProgressPhase>>>) {
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let recorded_phases = Arc::clone(&phases);
+        let reporter = ProgressReporter::new(move |event| {
+            if let (Some(phase), Ok(mut phases)) = (event.phase(), recorded_phases.lock()) {
+                phases.push(phase);
+            }
+        });
+        (reporter, phases)
+    }
+
+    fn reported_phases(
+        phases: &Arc<Mutex<Vec<ProgressPhase>>>,
+    ) -> Result<Vec<ProgressPhase>, DeltaFunnelError> {
+        phases
+            .lock()
+            .map(|phases| phases.clone())
+            .map_err(|_| DeltaFunnelError::Config {
+                message: "progress phase mutex was poisoned".to_owned(),
+            })
+    }
+
     fn assert_phase_timing(
         timings: &[PhaseTimingReport],
         phase_name: &str,
@@ -1434,14 +1572,16 @@ mod tests {
         let batches = stream::iter(vec![Ok(orders_batch(2)?), Ok(orders_batch(1)?)]);
         let validation_options =
             ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Disabled);
+        let (reporter, phases) = recording_reporter();
 
-        let report = write_mssql_output_batches_on_connection_with_phase_timings(
+        let report = run_mssql_output_batches_on_connection(
             output_plan,
             connection,
             batches,
             default_mssql_write_backend(),
             validation_options,
             Vec::new(),
+            Some(&reporter),
         )
         .await?;
 
@@ -1467,6 +1607,10 @@ mod tests {
             "write_batch",
             PhaseStatus::completed(),
         )?;
+        assert_eq!(
+            reported_phases(&phases)?,
+            vec![ProgressPhase::PreparingTarget, ProgressPhase::Writing]
+        );
         Ok(())
     }
 
@@ -1549,12 +1693,16 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let connection = FakeSinkConnection::with_log(Arc::clone(&log)).with_target_row_count(3);
         let batches = stream::iter(vec![Ok(orders_batch(2)?), Ok(orders_batch(1)?)]);
+        let (reporter, phases) = recording_reporter();
 
-        let report = write_mssql_output_batches_on_connection(
+        let report = run_mssql_output_batches_on_connection(
             output_plan,
             connection,
             batches,
             default_mssql_write_backend(),
+            ValidationOptions::new(),
+            Vec::new(),
+            Some(&reporter),
         )
         .await?;
 
@@ -1583,6 +1731,15 @@ mod tests {
                 "finish",
                 "count target rows",
                 "swap"
+            ]
+        );
+        assert_eq!(
+            reported_phases(&phases)?,
+            vec![
+                ProgressPhase::PreparingTarget,
+                ProgressPhase::Writing,
+                ProgressPhase::Validating,
+                ProgressPhase::SwappingTarget,
             ]
         );
         Ok(())
@@ -2774,12 +2931,16 @@ mod tests {
                 "initialize failed",
             ));
         let batches = stream::iter(vec![Ok(orders_batch(1)?)]);
+        let (reporter, phases) = recording_reporter();
 
-        let error = write_mssql_output_batches_on_connection(
+        let error = run_mssql_output_batches_on_connection(
             output_plan,
             connection,
             batches,
             default_mssql_write_backend(),
+            ValidationOptions::new(),
+            Vec::new(),
+            Some(&reporter),
         )
         .await
         .err()
@@ -2808,6 +2969,14 @@ mod tests {
         assert_eq!(
             logged_events(&log)?,
             vec!["prepare", "initialize", "cleanup CreatedTable"]
+        );
+        assert_eq!(
+            reported_phases(&phases)?,
+            vec![
+                ProgressPhase::PreparingTarget,
+                ProgressPhase::Writing,
+                ProgressPhase::CleaningUp,
+            ]
         );
         Ok(())
     }
