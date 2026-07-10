@@ -7,7 +7,9 @@ use tracing::Instrument;
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlTargetOutputPlan, MssqlWriteBackend,
     MssqlWriteReport, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, ValidationOptions,
-    observability, plan_mssql_target_for_resolved_output, report::PhaseTimer,
+    observability, plan_mssql_target_for_resolved_output,
+    progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
+    report::PhaseTimer,
     write_output_batches_to_mssql_with_validation_options,
 };
 
@@ -106,14 +108,24 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.write_to_mssql_with_writer_with_tracing(request, &mut MssqlPublicOneOutputWriter)
+        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter, None)
             .await
     }
 
-    async fn write_to_mssql_with_writer_with_tracing<W>(
+    pub(crate) async fn write_to_mssql_with_reporter(
+        &self,
+        request: &OutputWritePlan,
+        reporter: ProgressReporter,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter, Some(&reporter))
+            .await
+    }
+
+    async fn run_mssql_write_with_tracing<W>(
         &self,
         request: &OutputWritePlan,
         writer: &mut W,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>
     where
         W: OrchestratorMssqlOutputWriter,
@@ -133,7 +145,16 @@ impl DeltaFunnelSession {
                 target_config.table(),
                 target_config.load_mode(),
             );
-            let result = self.write_to_mssql_with_writer(request, writer).await;
+            let result = match reporter {
+                Some(reporter) => {
+                    self.run_mssql_write_with_reporter(request, writer, reporter)
+                        .await
+                }
+                None => {
+                    self.plan_and_write_mssql_output(request, writer, None)
+                        .await
+                }
+            };
             match &result {
                 Ok(report) => observability::output_completed(
                     report.output_name(),
@@ -154,6 +175,7 @@ impl DeltaFunnelSession {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn write_to_mssql_with_writer<W>(
         &self,
         request: &OutputWritePlan,
@@ -163,7 +185,69 @@ impl DeltaFunnelSession {
         W: OrchestratorMssqlOutputWriter,
     {
         ensure_execute_run_mode(request.target().run_mode())?;
+        self.plan_and_write_mssql_output(request, writer, None)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn write_to_mssql_with_writer_and_reporter<W>(
+        &self,
+        request: &OutputWritePlan,
+        writer: &mut W,
+        reporter: ProgressReporter,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError>
+    where
+        W: OrchestratorMssqlOutputWriter,
+    {
+        ensure_execute_run_mode(request.target().run_mode())?;
+        self.run_mssql_write_with_reporter(request, writer, &reporter)
+            .await
+    }
+
+    async fn run_mssql_write_with_reporter<W>(
+        &self,
+        request: &OutputWritePlan,
+        writer: &mut W,
+        reporter: &ProgressReporter,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError>
+    where
+        W: OrchestratorMssqlOutputWriter,
+    {
+        reporter.emit(&ProgressEvent::started(ProgressOperation::WriteToMssql));
+        let result = self
+            .plan_and_write_mssql_output(request, writer, Some(reporter))
+            .await;
+        reporter.emit(&if result.is_ok() {
+            ProgressEvent::completed()
+        } else {
+            ProgressEvent::failed()
+        });
+        result
+    }
+
+    async fn plan_and_write_mssql_output<W>(
+        &self,
+        request: &OutputWritePlan,
+        writer: &mut W,
+        reporter: Option<&ProgressReporter>,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError>
+    where
+        W: OrchestratorMssqlOutputWriter,
+    {
+        let output_name = Some(request.target().output_name());
+        if let Some(reporter) = reporter {
+            reporter.emit(&ProgressEvent::phase_changed(
+                ProgressPhase::PlanningOutput,
+                output_name,
+            ));
+        }
         let planned = self.plan_mssql_output(request)?;
+        if let Some(reporter) = reporter {
+            reporter.emit(&ProgressEvent::phase_changed(
+                ProgressPhase::SettingUpStream,
+                output_name,
+            ));
+        }
         let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
         let batches = self.batch_stream_for_lazy_table(planned.table()).await?;
 
@@ -249,6 +333,8 @@ fn ensure_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::SchemaRef;
     use futures_util::StreamExt;
@@ -258,6 +344,7 @@ mod tests {
         MssqlOutputBatchStream, MssqlOutputTarget, MssqlTargetCleanupStatus, MssqlTargetConfig,
         MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteBackend, MssqlWriteReport,
         ResolvedMssqlTarget, TargetValidationMode, ValidationOptions,
+        progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         table_formats::RealParquetDeltaTable,
     };
 
@@ -272,6 +359,32 @@ mod tests {
         OUTPUT_SCHEMA_PLANNING_PHASE, OrchestratorMssqlOutputWriter, SQL_TARGET_PLANNING_PHASE,
         VALIDATION_PHASE,
     };
+
+    type RecordedProgress = (
+        ProgressEventKind,
+        Option<ProgressOperation>,
+        Option<ProgressPhase>,
+    );
+
+    fn recording_reporter() -> (ProgressReporter, Arc<Mutex<Vec<RecordedProgress>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            let mut events = match callback_events.lock() {
+                Ok(events) => events,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            events.push((event.kind(), event.operation(), event.phase()));
+        });
+        (reporter, events)
+    }
+
+    fn progress_events(events: &Mutex<Vec<RecordedProgress>>) -> Vec<RecordedProgress> {
+        match events.lock() {
+            Ok(events) => events.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeOrchestratorWriteCall {
@@ -694,14 +807,33 @@ mod tests {
             "orders_sink",
             LoadMode::AppendExisting,
         )?;
+        let (reporter, events) = recording_reporter();
 
-        let error = session.write_to_mssql(&request).await;
+        let error = session
+            .write_to_mssql_with_reporter(&request, reporter)
+            .await;
 
         assert!(matches!(
             error,
             Err(DeltaFunnelError::MissingMssqlConnection { output_name })
                 if output_name == "orders_output"
         ));
+        assert_eq!(
+            progress_events(&events),
+            vec![
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::WriteToMssql),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PlanningOutput),
+                ),
+                (ProgressEventKind::Failed, None, None),
+            ]
+        );
         Ok(())
     }
 
@@ -726,9 +858,10 @@ mod tests {
             LoadMode::CreateAndLoad,
         )?;
         let mut writer = FakeOrchestratorWriter::default();
+        let (reporter, events) = recording_reporter();
 
         let report = session
-            .write_to_mssql_with_writer(&request, &mut writer)
+            .write_to_mssql_with_writer_and_reporter(&request, &mut writer, reporter)
             .await?;
 
         assert_eq!(writer.calls.len(), 1);
@@ -772,6 +905,27 @@ mod tests {
         assert_eq!(
             validation_timing.status(),
             crate::PhaseStatus::not_started(crate::ReportReasonCode::NotExecuted)
+        );
+        assert_eq!(
+            progress_events(&events),
+            vec![
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::WriteToMssql),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PlanningOutput),
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::SettingUpStream),
+                ),
+                (ProgressEventKind::Completed, None, None),
+            ]
         );
         Ok(())
     }
@@ -871,9 +1025,10 @@ mod tests {
             LoadMode::AppendExisting,
         )?;
         let mut writer = FakeOrchestratorWriter::default();
+        let (reporter, events) = recording_reporter();
 
         let error = session
-            .write_to_mssql_with_writer(&request, &mut writer)
+            .write_to_mssql_with_writer_and_reporter(&request, &mut writer, reporter)
             .await;
 
         assert!(matches!(
@@ -883,6 +1038,7 @@ mod tests {
                     && message.contains("dry_run_to_mssql")
         ));
         assert!(writer.calls.is_empty());
+        assert!(progress_events(&events).is_empty());
         Ok(())
     }
 }

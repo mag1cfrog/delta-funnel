@@ -1,5 +1,6 @@
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, observability,
+    progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::PhaseTimer,
     report::sql_server::{
         MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport,
@@ -49,8 +50,28 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
     ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
         ensure_dry_run_mode(request.target().run_mode())?;
-
         self.plan_dry_run_output(request)
+    }
+
+    pub(crate) fn dry_run_to_mssql_with_reporter(
+        &self,
+        request: &OutputWritePlan,
+        reporter: ProgressReporter,
+    ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
+        ensure_dry_run_mode(request.target().run_mode())?;
+
+        reporter.emit(&ProgressEvent::started(ProgressOperation::DryRunToMssql));
+        reporter.emit(&ProgressEvent::phase_changed(
+            ProgressPhase::PlanningOutput,
+            Some(request.target().output_name()),
+        ));
+        let result = self.plan_dry_run_output(request);
+        reporter.emit(&if result.is_ok() {
+            ProgressEvent::completed()
+        } else {
+            ProgressEvent::failed()
+        });
+        result
     }
 
     /// Dry-runs multiple selected lazy tables as one MSSQL output workflow.
@@ -309,12 +330,13 @@ fn ensure_write_all_dry_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelErr
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex, atomic::Ordering};
 
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlOutputTarget, MssqlTargetConfig,
         MssqlTargetTable, OutputStatus, ReportReasonCode, ValidationOptions, ValidationStatus,
         WorkflowStatus,
+        progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
     };
 
     use super::super::{
@@ -333,6 +355,32 @@ mod tests {
     use crate::MssqlDryRunSqlIdentityState;
 
     const LAZY_SQL_PLANNING_PHASE: &str = "lazy_sql_planning";
+
+    type RecordedProgress = (
+        ProgressEventKind,
+        Option<ProgressOperation>,
+        Option<ProgressPhase>,
+    );
+
+    fn recording_reporter() -> (ProgressReporter, Arc<Mutex<Vec<RecordedProgress>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            let mut events = match callback_events.lock() {
+                Ok(events) => events,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            events.push((event.kind(), event.operation(), event.phase()));
+        });
+        (reporter, events)
+    }
+
+    fn progress_events(events: &Mutex<Vec<RecordedProgress>>) -> Vec<RecordedProgress> {
+        match events.lock() {
+            Ok(events) => events.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
 
     #[test]
     fn sql_identity_status_and_hash_are_stable() {
@@ -389,8 +437,9 @@ mod tests {
             "west_orders",
             LoadMode::CreateAndLoad,
         )?;
+        let (reporter, events) = recording_reporter();
 
-        let report = session.dry_run_to_mssql(&request)?;
+        let report = session.dry_run_to_mssql_with_reporter(&request, reporter)?;
 
         assert_eq!(report.output_name(), "west_output");
         assert_eq!(report.run_mode(), RunMode::DryRun);
@@ -472,6 +521,22 @@ mod tests {
             assert_eq!(timing.elapsed_micros(), None);
         }
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            progress_events(&events),
+            vec![
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::DryRunToMssql),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PlanningOutput),
+                ),
+                (ProgressEventKind::Completed, None, None),
+            ]
+        );
         Ok(())
     }
 
@@ -830,14 +895,16 @@ mod tests {
             "orders_sink",
             LoadMode::AppendExisting,
         )?;
+        let (reporter, events) = recording_reporter();
 
-        let error = session.dry_run_to_mssql(&request);
+        let error = session.dry_run_to_mssql_with_reporter(&request, reporter);
 
         assert!(matches!(
             error,
             Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
                 if message.contains("dry_run_to_mssql requires RunMode::DryRun")
         ));
+        assert!(progress_events(&events).is_empty());
         Ok(())
     }
 
@@ -853,14 +920,31 @@ mod tests {
             "orders_sink",
             LoadMode::AppendExisting,
         )?;
+        let (reporter, events) = recording_reporter();
 
-        let error = session.dry_run_to_mssql(&request);
+        let error = session.dry_run_to_mssql_with_reporter(&request, reporter);
 
         assert!(matches!(
             error,
             Err(DeltaFunnelError::MissingMssqlConnection { output_name })
                 if output_name == "orders_output"
         ));
+        assert_eq!(
+            progress_events(&events),
+            vec![
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::DryRunToMssql),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PlanningOutput),
+                ),
+                (ProgressEventKind::Failed, None, None),
+            ]
+        );
         Ok(())
     }
 

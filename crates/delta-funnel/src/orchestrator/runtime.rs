@@ -14,7 +14,7 @@ use crate::MssqlWorkflowOutputWriter;
 use crate::{
     DeltaFunnelError, DeltaFunnelSession, LazyTable, MssqlDryRunOutputReport,
     MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, TablePreview, WriteAllOptions,
-    WriteAllReport,
+    WriteAllReport, progress::ProgressReporter,
 };
 
 /// Blocking runtime boundary for high-level Delta Funnel session actions.
@@ -92,6 +92,18 @@ impl DeltaFunnelRuntime {
         session.dry_run_to_mssql(request)
     }
 
+    /// Runs a single-output dry run with a workspace host progress reporter.
+    #[doc(hidden)]
+    pub fn dry_run_to_mssql_with_progress(
+        &self,
+        session: &DeltaFunnelSession,
+        request: &OutputWritePlan,
+        reporter: ProgressReporter,
+    ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        session.dry_run_to_mssql_with_reporter(request, reporter)
+    }
+
     /// Runs a multi-output dry run through the high-level session API.
     ///
     /// # Errors
@@ -134,6 +146,19 @@ impl DeltaFunnelRuntime {
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         reject_nested_runtime()?;
         self.runtime.block_on(session.write_to_mssql(request))
+    }
+
+    /// Blocks on one selected output write with a workspace host progress reporter.
+    #[doc(hidden)]
+    pub fn write_to_mssql_with_progress(
+        &self,
+        session: &DeltaFunnelSession,
+        request: &OutputWritePlan,
+        reporter: ProgressReporter,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.write_to_mssql_with_reporter(request, reporter))
     }
 
     #[cfg(test)]
@@ -209,6 +234,11 @@ fn reject_nested_runtime() -> Result<(), DeltaFunnelError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::SchemaRef;
@@ -389,13 +419,19 @@ mod tests {
         )?;
         let output = runtime.table_from_sql(&mut session, "select 1 as id")?;
         let request = output_request(output, "orders_output", "orders_sink")?;
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let callback_deliveries = Arc::clone(&deliveries);
+        let reporter = ProgressReporter::new(move |_| {
+            callback_deliveries.fetch_add(1, Ordering::Relaxed);
+        });
 
-        let report = runtime.dry_run_to_mssql(&session, &request)?;
+        let report = runtime.dry_run_to_mssql_with_progress(&session, &request, reporter)?;
 
         assert_eq!(report.output_name(), "orders_output");
         assert_eq!(report.run_mode(), RunMode::DryRun);
         assert!(!report.sql_server_contacted());
         assert!(!report.row_production_started());
+        assert_eq!(deliveries.load(Ordering::Relaxed), 3);
         Ok(())
     }
 
