@@ -330,7 +330,13 @@ fn ensure_write_all_dry_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelErr
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::Ordering};
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlOutputTarget, MssqlTargetConfig,
@@ -974,6 +980,34 @@ mod tests {
         assert!(!report.row_production_started());
         assert!(!report.table_lifecycle_started());
         assert!(!report.bulk_writer_started());
+        Ok(())
+    }
+
+    #[test]
+    fn host_callback_panic_escapes_without_a_second_delivery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(
+            source,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let callback_deliveries = Arc::clone(&deliveries);
+        let reporter = ProgressReporter::new(move |_| {
+            callback_deliveries.fetch_add(1, Ordering::SeqCst);
+            resume_unwind(Box::new("host callback panic"));
+        });
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = session.dry_run_to_mssql_with_reporter(&request, reporter);
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
