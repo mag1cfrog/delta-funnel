@@ -4,14 +4,18 @@ use std::{
     error::Error,
     fs,
     path::PathBuf,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use delta_funnel::{
-    DeltaFunnelSession, DeltaSourceConfig, FileCount, LoadMode, MssqlConnectionConfig,
-    MssqlDryRunSqlIdentityState, MssqlOutputTarget, MssqlTargetConfig, MssqlTargetTable,
-    OutputStatus, OutputWritePlan, ReportReasonCode, RowCount, RunMode, SessionOptions,
-    SourceUsageStatus, ValidationStatus,
+    DeltaFunnelRuntime, DeltaFunnelSession, DeltaSourceConfig, FileCount, LoadMode,
+    MssqlConnectionConfig, MssqlDryRunSqlIdentityState, MssqlOutputTarget, MssqlTargetConfig,
+    MssqlTargetTable, OutputStatus, OutputWritePlan, ReportReasonCode, RowCount, RunMode,
+    SessionOptions, SourceUsageStatus, ValidationStatus,
+    progress::{
+        ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
+    },
 };
 
 type TestError = Box<dyn Error + Send + Sync + 'static>;
@@ -47,6 +51,56 @@ impl Drop for DeltaLogFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[test]
+fn hidden_progress_contract_is_usable_outside_the_crate() -> TestResult<()> {
+    let orders = DeltaLogFixture::new("progress-contract", ORDERS_SCHEMA_FIELDS_JSON)?;
+    let mut session = session_with_default_connection()?;
+    let orders_table = session.delta_lake(DeltaSourceConfig::new("orders", orders.uri()))?;
+    let output = output_request(
+        orders_table,
+        "orders_output",
+        "orders_sink",
+        LoadMode::AppendExisting,
+        RunMode::DryRun,
+    )?;
+    let runtime = DeltaFunnelRuntime::new()?;
+    let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let callback_events = Arc::clone(&events);
+    let reporter = ProgressReporter::new(move |event: &ProgressEvent| {
+        let summary = match event.kind() {
+            ProgressEventKind::Started => match event.operation() {
+                Some(ProgressOperation::DryRunToMssql) => "started dry_run_to_mssql",
+                _ => "other",
+            },
+            ProgressEventKind::PhaseChanged => match event.phase() {
+                Some(ProgressPhase::PlanningOutput) => "phase planning_output",
+                _ => "other",
+            },
+            ProgressEventKind::Completed => "completed",
+            _ => "other",
+        };
+        if let Ok(mut events) = callback_events.lock() {
+            events.push(summary);
+        }
+    });
+
+    let report = runtime.dry_run_to_mssql_with_progress(&session, &output, reporter)?;
+
+    assert_eq!(report.status(), OutputStatus::dry_run_planned());
+    assert_eq!(
+        events
+            .lock()
+            .map_err(|_| std::io::Error::other("progress event mutex was poisoned"))?
+            .as_slice(),
+        [
+            "started dry_run_to_mssql",
+            "phase planning_output",
+            "completed"
+        ]
+    );
+    Ok(())
 }
 
 #[tokio::test]
