@@ -1,5 +1,6 @@
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, observability,
+    progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::PhaseTimer,
     report::sql_server::{
         MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport,
@@ -49,8 +50,28 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
     ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
         ensure_dry_run_mode(request.target().run_mode())?;
-
         self.plan_dry_run_output(request)
+    }
+
+    pub(crate) fn dry_run_to_mssql_with_reporter(
+        &self,
+        request: &OutputWritePlan,
+        reporter: ProgressReporter,
+    ) -> Result<MssqlDryRunOutputReport, DeltaFunnelError> {
+        ensure_dry_run_mode(request.target().run_mode())?;
+
+        reporter.emit(&ProgressEvent::started(ProgressOperation::DryRunToMssql));
+        reporter.emit(&ProgressEvent::phase_changed(
+            ProgressPhase::PlanningOutput,
+            Some(request.target().output_name()),
+        ));
+        let result = self.plan_dry_run_output(request);
+        reporter.emit(&if result.is_ok() {
+            ProgressEvent::completed()
+        } else {
+            ProgressEvent::failed()
+        });
+        result
     }
 
     /// Dry-runs multiple selected lazy tables as one MSSQL output workflow.
@@ -309,12 +330,20 @@ fn ensure_write_all_dry_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelErr
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        sync::{
+            Arc, Barrier, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread,
+    };
 
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlOutputTarget, MssqlTargetConfig,
         MssqlTargetTable, OutputStatus, ReportReasonCode, ValidationOptions, ValidationStatus,
         WorkflowStatus,
+        progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
     };
 
     use super::super::{
@@ -333,6 +362,32 @@ mod tests {
     use crate::MssqlDryRunSqlIdentityState;
 
     const LAZY_SQL_PLANNING_PHASE: &str = "lazy_sql_planning";
+
+    type RecordedProgress = (
+        ProgressEventKind,
+        Option<ProgressOperation>,
+        Option<ProgressPhase>,
+    );
+
+    fn recording_reporter() -> (ProgressReporter, Arc<Mutex<Vec<RecordedProgress>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            let mut events = match callback_events.lock() {
+                Ok(events) => events,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            events.push((event.kind(), event.operation(), event.phase()));
+        });
+        (reporter, events)
+    }
+
+    fn progress_events(events: &Mutex<Vec<RecordedProgress>>) -> Vec<RecordedProgress> {
+        match events.lock() {
+            Ok(events) => events.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
 
     #[test]
     fn sql_identity_status_and_hash_are_stable() {
@@ -389,8 +444,9 @@ mod tests {
             "west_orders",
             LoadMode::CreateAndLoad,
         )?;
+        let (reporter, events) = recording_reporter();
 
-        let report = session.dry_run_to_mssql(&request)?;
+        let report = session.dry_run_to_mssql_with_reporter(&request, reporter)?;
 
         assert_eq!(report.output_name(), "west_output");
         assert_eq!(report.run_mode(), RunMode::DryRun);
@@ -472,6 +528,22 @@ mod tests {
             assert_eq!(timing.elapsed_micros(), None);
         }
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            progress_events(&events),
+            vec![
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::DryRunToMssql),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PlanningOutput),
+                ),
+                (ProgressEventKind::Completed, None, None),
+            ]
+        );
         Ok(())
     }
 
@@ -830,14 +902,16 @@ mod tests {
             "orders_sink",
             LoadMode::AppendExisting,
         )?;
+        let (reporter, events) = recording_reporter();
 
-        let error = session.dry_run_to_mssql(&request);
+        let error = session.dry_run_to_mssql_with_reporter(&request, reporter);
 
         assert!(matches!(
             error,
             Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
                 if message.contains("dry_run_to_mssql requires RunMode::DryRun")
         ));
+        assert!(progress_events(&events).is_empty());
         Ok(())
     }
 
@@ -853,14 +927,31 @@ mod tests {
             "orders_sink",
             LoadMode::AppendExisting,
         )?;
+        let (reporter, events) = recording_reporter();
 
-        let error = session.dry_run_to_mssql(&request);
+        let error = session.dry_run_to_mssql_with_reporter(&request, reporter);
 
         assert!(matches!(
             error,
             Err(DeltaFunnelError::MissingMssqlConnection { output_name })
                 if output_name == "orders_output"
         ));
+        assert_eq!(
+            progress_events(&events),
+            vec![
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::DryRunToMssql),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PlanningOutput),
+                ),
+                (ProgressEventKind::Failed, None, None),
+            ]
+        );
         Ok(())
     }
 
@@ -890,6 +981,123 @@ mod tests {
         assert!(!report.row_production_started());
         assert!(!report.table_lifecycle_started());
         assert!(!report.bulk_writer_started());
+        Ok(())
+    }
+
+    #[test]
+    fn host_callback_panic_after_started_escapes_without_an_unwind_delivery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = output_request(
+            source,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let callback_deliveries = Arc::clone(&deliveries);
+        let reporter = ProgressReporter::new(move |_| {
+            if callback_deliveries.fetch_add(1, Ordering::SeqCst) == 1 {
+                resume_unwind(Box::new("host callback panic"));
+            }
+        });
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = session.dry_run_to_mssql_with_reporter(&request, reporter);
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(deliveries.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn interleaved_actions_keep_callbacks_serial_ordered_and_isolated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("interleaved-progress")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let west_request = output_request(
+            source.clone(),
+            "west_output",
+            "west_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let east_request =
+            output_request(source, "east_output", "east_sink", LoadMode::AppendExisting)?;
+        let session = Arc::new(session);
+
+        type ActionEvents = Arc<Mutex<Vec<(ProgressEventKind, Option<String>)>>>;
+        let barrier = Arc::new(Barrier::new(2));
+        let make_reporter = |events: ActionEvents, active: Arc<AtomicBool>| {
+            let barrier = Arc::clone(&barrier);
+            ProgressReporter::new(move |event| {
+                assert!(!active.swap(true, Ordering::SeqCst));
+                let mut events = match events.lock() {
+                    Ok(events) => events,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                events.push((event.kind(), event.output_name().map(str::to_owned)));
+                drop(events);
+                if event.kind() == ProgressEventKind::Started {
+                    barrier.wait();
+                }
+                assert!(active.swap(false, Ordering::SeqCst));
+            })
+        };
+        let west_events = Arc::new(Mutex::new(Vec::new()));
+        let east_events = Arc::new(Mutex::new(Vec::new()));
+        let west_active = Arc::new(AtomicBool::new(false));
+        let east_active = Arc::new(AtomicBool::new(false));
+        let west_reporter = make_reporter(Arc::clone(&west_events), Arc::clone(&west_active));
+        let east_reporter = make_reporter(Arc::clone(&east_events), Arc::clone(&east_active));
+        let west_session = Arc::clone(&session);
+        let east_session = Arc::clone(&session);
+
+        let west_action = thread::spawn(move || {
+            west_session.dry_run_to_mssql_with_reporter(&west_request, west_reporter)
+        });
+        let east_action = thread::spawn(move || {
+            east_session.dry_run_to_mssql_with_reporter(&east_request, east_reporter)
+        });
+
+        west_action
+            .join()
+            .map_err(|_| std::io::Error::other("west progress action panicked"))??;
+        east_action
+            .join()
+            .map_err(|_| std::io::Error::other("east progress action panicked"))??;
+
+        assert!(!west_active.load(Ordering::SeqCst));
+        assert!(!east_active.load(Ordering::SeqCst));
+        let expected = |output_name: &str| {
+            vec![
+                (ProgressEventKind::Started, None),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    Some(output_name.to_owned()),
+                ),
+                (ProgressEventKind::Completed, None),
+            ]
+        };
+        assert_eq!(
+            west_events
+                .lock()
+                .map_err(|_| std::io::Error::other("west progress event mutex was poisoned"))?
+                .as_slice(),
+            expected("west_output")
+        );
+        assert_eq!(
+            east_events
+                .lock()
+                .map_err(|_| std::io::Error::other("east progress event mutex was poisoned"))?
+                .as_slice(),
+            expected("east_output")
+        );
         Ok(())
     }
 

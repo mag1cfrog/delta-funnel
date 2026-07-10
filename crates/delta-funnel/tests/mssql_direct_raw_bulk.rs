@@ -6,8 +6,10 @@
 use std::{
     env,
     error::Error,
-    sync::Arc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -24,7 +26,9 @@ use delta_funnel::{
     MssqlOutputTarget, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus, MssqlTargetConfig,
     MssqlTargetResolutionContext, MssqlTargetTable, MssqlTimestampPolicy, MssqlWriteBackend,
     OutputWritePlan, RowCount, RunMode, SessionOptions, ValidationStatus,
-    default_mssql_write_backend, write_output_batches_to_mssql,
+    default_mssql_write_backend,
+    progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
+    write_output_batches_to_mssql,
 };
 use futures_util::stream;
 
@@ -460,8 +464,54 @@ union all select cast(103 as bigint) as order_id",
         orders,
         MssqlOutputTarget::new(ORCHESTRATOR_OUTPUT_NAME, target, RunMode::Execute),
     );
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback_events = Arc::clone(&events);
+    let reporter = ProgressReporter::new(move |event| {
+        let mut events = match callback_events.lock() {
+            Ok(events) => events,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        events.push((
+            event.kind(),
+            event.operation(),
+            event.phase(),
+            event.output_name().map(str::to_owned),
+        ));
+    });
 
-    Ok(runtime.write_to_mssql(&session, &request)?)
+    let report = runtime.write_to_mssql_with_progress(&session, &request, reporter)?;
+    let events = match events.lock() {
+        Ok(events) => events,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let phase = |phase| {
+        (
+            ProgressEventKind::PhaseChanged,
+            None,
+            Some(phase),
+            Some(ORCHESTRATOR_OUTPUT_NAME.to_owned()),
+        )
+    };
+    assert_eq!(
+        events.as_slice(),
+        [
+            (
+                ProgressEventKind::Started,
+                Some(ProgressOperation::WriteToMssql),
+                None,
+                None,
+            ),
+            phase(ProgressPhase::PlanningOutput),
+            phase(ProgressPhase::SettingUpStream),
+            phase(ProgressPhase::Connecting),
+            phase(ProgressPhase::PreparingTarget),
+            phase(ProgressPhase::Writing),
+            phase(ProgressPhase::Validating),
+            (ProgressEventKind::Completed, None, None, None),
+        ]
+    );
+
+    Ok(report)
 }
 
 async fn create_append_existing_table(

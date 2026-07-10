@@ -1,0 +1,464 @@
+//! Typed progress events for workspace host integrations.
+
+#![allow(
+    dead_code,
+    reason = "metric and multi-output variants are consumed by follow-up progress slices"
+)]
+
+use std::sync::Arc;
+
+use crate::support::sanitize_text_for_display;
+
+type ProgressCallback = dyn Fn(&ProgressEvent) + Send + Sync + 'static;
+
+/// Top-level operation represented by a progress action.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ProgressOperation {
+    /// Execute one SQL Server output write.
+    WriteToMssql,
+    /// Plan one SQL Server output without executing it.
+    DryRunToMssql,
+}
+
+/// Stable visible phase of a progress action.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ProgressPhase {
+    /// Resolve and plan the selected output.
+    PlanningOutput,
+    /// Set up the selected output batch stream.
+    SettingUpStream,
+    /// Establish the SQL Server connection.
+    Connecting,
+    /// Prepare the SQL Server target table.
+    PreparingTarget,
+    /// Write the output batch stream as one visible phase.
+    Writing,
+    /// Validate the completed write.
+    Validating,
+    /// Swap a validated replace staging table into place.
+    SwappingTarget,
+    /// Clean up a target created by Delta Funnel after failure.
+    CleaningUp,
+}
+
+/// Kind of one typed progress event.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ProgressEventKind {
+    /// The action started.
+    Started,
+    /// The action entered a different visible phase.
+    PhaseChanged,
+    /// Work advanced within the current visible phase.
+    Progress,
+    /// The action completed successfully.
+    Completed,
+    /// The action completed with one or more structured output failures.
+    CompletedWithFailures,
+    /// The action failed.
+    Failed,
+    /// The action was cancelled.
+    Cancelled,
+}
+
+/// One immutable typed progress event emitted by the core crate.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressEvent {
+    state: ProgressEventState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProgressEventState {
+    Started(ProgressOperation),
+    PhaseChanged(ProgressSnapshot),
+    Progress(ProgressSnapshot),
+    Completed,
+    CompletedWithFailures,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgressSnapshot {
+    phase: ProgressPhase,
+    output_name: Option<String>,
+    output_position: Option<ProgressOutputPosition>,
+    file_progress: Option<DeltaFileProgress>,
+    metrics: Option<ProgressMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProgressOutputPosition {
+    index: u64,
+    count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeltaFileProgress {
+    handled: u64,
+    total: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProgressMetrics {
+    rows: u64,
+    batches: u64,
+}
+
+impl ProgressEvent {
+    pub(crate) const fn started(operation: ProgressOperation) -> Self {
+        Self {
+            state: ProgressEventState::Started(operation),
+        }
+    }
+
+    pub(crate) fn phase_changed(phase: ProgressPhase, output_name: Option<&str>) -> Self {
+        Self {
+            state: ProgressEventState::PhaseChanged(ProgressSnapshot::new(phase, output_name)),
+        }
+    }
+
+    pub(crate) fn progress(
+        phase: ProgressPhase,
+        output_name: Option<&str>,
+        rows: u64,
+        batches: u64,
+    ) -> Self {
+        let mut snapshot = ProgressSnapshot::new(phase, output_name);
+        snapshot.metrics = Some(ProgressMetrics { rows, batches });
+        Self {
+            state: ProgressEventState::Progress(snapshot),
+        }
+    }
+
+    pub(crate) fn file_progress(
+        phase: ProgressPhase,
+        output_name: Option<&str>,
+        files_handled: u64,
+        files_total: u64,
+    ) -> Option<Self> {
+        let mut snapshot = ProgressSnapshot::new(phase, output_name);
+        snapshot.file_progress = DeltaFileProgress::new(files_handled, files_total);
+        snapshot.file_progress.map(|_| Self {
+            state: ProgressEventState::Progress(snapshot),
+        })
+    }
+
+    pub(crate) fn progress_with_files(
+        phase: ProgressPhase,
+        output_name: Option<&str>,
+        files_handled: u64,
+        files_total: u64,
+        rows: u64,
+        batches: u64,
+    ) -> Self {
+        let mut snapshot = ProgressSnapshot::new(phase, output_name);
+        snapshot.file_progress = DeltaFileProgress::new(files_handled, files_total);
+        snapshot.metrics = Some(ProgressMetrics { rows, batches });
+        Self {
+            state: ProgressEventState::Progress(snapshot),
+        }
+    }
+
+    pub(crate) const fn completed() -> Self {
+        Self {
+            state: ProgressEventState::Completed,
+        }
+    }
+
+    pub(crate) const fn completed_with_failures() -> Self {
+        Self {
+            state: ProgressEventState::CompletedWithFailures,
+        }
+    }
+
+    pub(crate) const fn failed() -> Self {
+        Self {
+            state: ProgressEventState::Failed,
+        }
+    }
+
+    pub(crate) const fn cancelled() -> Self {
+        Self {
+            state: ProgressEventState::Cancelled,
+        }
+    }
+
+    /// Returns the event kind.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn kind(&self) -> ProgressEventKind {
+        match self.state {
+            ProgressEventState::Started(_) => ProgressEventKind::Started,
+            ProgressEventState::PhaseChanged(_) => ProgressEventKind::PhaseChanged,
+            ProgressEventState::Progress(_) => ProgressEventKind::Progress,
+            ProgressEventState::Completed => ProgressEventKind::Completed,
+            ProgressEventState::CompletedWithFailures => ProgressEventKind::CompletedWithFailures,
+            ProgressEventState::Failed => ProgressEventKind::Failed,
+            ProgressEventState::Cancelled => ProgressEventKind::Cancelled,
+        }
+    }
+
+    /// Returns the operation for a started event.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn operation(&self) -> Option<ProgressOperation> {
+        match self.state {
+            ProgressEventState::Started(operation) => Some(operation),
+            _ => None,
+        }
+    }
+
+    /// Returns the visible phase for a phase or progress event.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn phase(&self) -> Option<ProgressPhase> {
+        match &self.state {
+            ProgressEventState::PhaseChanged(snapshot) | ProgressEventState::Progress(snapshot) => {
+                Some(snapshot.phase)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the sanitized logical output name when one is active.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn output_name(&self) -> Option<&str> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.output_name.as_deref())
+    }
+
+    /// Returns the one-based active output index when present.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn output_index(&self) -> Option<u64> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.output_position)
+            .map(|position| position.index)
+    }
+
+    /// Returns the total output count when present.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn output_count(&self) -> Option<u64> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.output_position)
+            .map(|position| position.count)
+    }
+
+    /// Returns the selected Delta files handled when determinate progress is active.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn files_handled(&self) -> Option<u64> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.file_progress)
+            .map(|progress| progress.handled)
+    }
+
+    /// Returns the selected Delta file total when determinate progress is active.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn files_total(&self) -> Option<u64> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.file_progress)
+            .map(|progress| progress.total)
+    }
+
+    /// Returns the accepted row count when present.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn rows(&self) -> Option<u64> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.metrics)
+            .map(|metrics| metrics.rows)
+    }
+
+    /// Returns the accepted batch count when present.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn batches(&self) -> Option<u64> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.metrics)
+            .map(|metrics| metrics.batches)
+    }
+
+    const fn snapshot(&self) -> Option<&ProgressSnapshot> {
+        match &self.state {
+            ProgressEventState::PhaseChanged(snapshot) | ProgressEventState::Progress(snapshot) => {
+                Some(snapshot)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl ProgressSnapshot {
+    fn new(phase: ProgressPhase, output_name: Option<&str>) -> Self {
+        Self {
+            phase,
+            output_name: output_name.map(sanitize_text_for_display),
+            output_position: None,
+            file_progress: None,
+            metrics: None,
+        }
+    }
+}
+
+impl DeltaFileProgress {
+    const fn new(handled: u64, total: u64) -> Option<Self> {
+        if total == 0 {
+            return None;
+        }
+
+        Some(Self {
+            handled: if handled > total { total } else { handled },
+            total,
+        })
+    }
+}
+
+/// Cloneable per-action callback owner used by workspace host integrations.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct ProgressReporter {
+    callback: Option<Arc<ProgressCallback>>,
+}
+
+impl ProgressReporter {
+    /// Creates a reporter that synchronously borrows each emitted event.
+    #[doc(hidden)]
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: Fn(&ProgressEvent) + Send + Sync + 'static,
+    {
+        Self {
+            callback: Some(Arc::new(callback)),
+        }
+    }
+
+    pub(crate) fn emit(&self, event: &ProgressEvent) {
+        if let Some(callback) = &self.callback {
+            callback(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    #[test]
+    fn events_expose_only_the_payload_for_their_kind() {
+        let started = ProgressEvent::started(ProgressOperation::WriteToMssql);
+        assert_eq!(started.kind(), ProgressEventKind::Started);
+        assert_eq!(started.operation(), Some(ProgressOperation::WriteToMssql));
+        assert_eq!(started.phase(), None);
+        assert_eq!(started.output_name(), None);
+        assert_eq!(started.rows(), None);
+
+        let phase =
+            ProgressEvent::phase_changed(ProgressPhase::PlanningOutput, Some("orders\noutput"));
+        assert_eq!(phase.kind(), ProgressEventKind::PhaseChanged);
+        assert_eq!(phase.operation(), None);
+        assert_eq!(phase.phase(), Some(ProgressPhase::PlanningOutput));
+        assert_eq!(phase.output_name(), Some(r"orders\noutput"));
+        assert_eq!(phase.output_index(), None);
+        assert_eq!(phase.output_count(), None);
+        assert_eq!(phase.files_handled(), None);
+        assert_eq!(phase.files_total(), None);
+        assert_eq!(phase.rows(), None);
+        assert_eq!(phase.batches(), None);
+
+        let progress = ProgressEvent::progress(ProgressPhase::Writing, Some("orders"), 42, 3);
+        assert_eq!(progress.kind(), ProgressEventKind::Progress);
+        assert_eq!(progress.phase(), Some(ProgressPhase::Writing));
+        assert_eq!(progress.output_name(), Some("orders"));
+        assert_eq!(progress.files_handled(), None);
+        assert_eq!(progress.files_total(), None);
+        assert_eq!(progress.rows(), Some(42));
+        assert_eq!(progress.batches(), Some(3));
+    }
+
+    #[test]
+    fn file_progress_is_paired_positive_and_capped() -> Result<(), Box<dyn std::error::Error>> {
+        let progress =
+            ProgressEvent::progress_with_files(ProgressPhase::Writing, Some("orders"), 7, 5, 42, 3);
+
+        assert_eq!(progress.kind(), ProgressEventKind::Progress);
+        assert_eq!(progress.phase(), Some(ProgressPhase::Writing));
+        assert_eq!(progress.files_handled(), Some(5));
+        assert_eq!(progress.files_total(), Some(5));
+        assert_eq!(progress.rows(), Some(42));
+        assert_eq!(progress.batches(), Some(3));
+        assert!(
+            ProgressEvent::file_progress(ProgressPhase::Writing, Some("orders"), 0, 0).is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_events_have_no_action_payload() {
+        let events = [
+            ProgressEvent::completed(),
+            ProgressEvent::completed_with_failures(),
+            ProgressEvent::failed(),
+            ProgressEvent::cancelled(),
+        ];
+
+        assert_eq!(
+            events.iter().map(ProgressEvent::kind).collect::<Vec<_>>(),
+            [
+                ProgressEventKind::Completed,
+                ProgressEventKind::CompletedWithFailures,
+                ProgressEventKind::Failed,
+                ProgressEventKind::Cancelled,
+            ]
+        );
+        assert!(events.iter().all(|event| event.operation().is_none()));
+        assert!(events.iter().all(|event| event.phase().is_none()));
+        assert!(events.iter().all(|event| event.output_name().is_none()));
+        assert!(events.iter().all(|event| event.files_handled().is_none()));
+        assert!(events.iter().all(|event| event.files_total().is_none()));
+        assert!(events.iter().all(|event| event.rows().is_none()));
+    }
+
+    #[test]
+    fn reporter_clones_share_the_owned_borrowing_callback() {
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let callback_deliveries = Arc::clone(&deliveries);
+        let reporter = ProgressReporter::new(move |event| {
+            assert_eq!(event.kind(), ProgressEventKind::Started);
+            callback_deliveries.fetch_add(1, Ordering::Relaxed);
+        });
+        let cloned = reporter.clone();
+        let event = ProgressEvent::started(ProgressOperation::WriteToMssql);
+
+        reporter.emit(&event);
+        cloned.emit(&event);
+
+        assert_eq!(deliveries.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn default_reporter_is_a_no_op() {
+        ProgressReporter::default().emit(&ProgressEvent::failed());
+    }
+
+    #[test]
+    fn reporter_is_send_and_sync() {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ProgressReporter>();
+    }
+}
