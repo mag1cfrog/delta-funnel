@@ -466,7 +466,18 @@ union all select cast(103 as bigint) as order_id",
     );
     let events = Arc::new(Mutex::new(Vec::new()));
     let callback_events = Arc::clone(&events);
+    let write_progress = Arc::new(Mutex::new(Vec::new()));
+    let callback_write_progress = Arc::clone(&write_progress);
     let reporter = ProgressReporter::new(move |event| {
+        if event.kind() == ProgressEventKind::Progress {
+            if let Some(metrics) = event.rows().zip(event.batches()) {
+                match callback_write_progress.lock() {
+                    Ok(mut progress) => progress.push(metrics),
+                    Err(poisoned) => poisoned.into_inner().push(metrics),
+                }
+            }
+            return;
+        }
         let mut events = match callback_events.lock() {
             Ok(events) => events,
             Err(poisoned) => poisoned.into_inner(),
@@ -510,6 +521,24 @@ union all select cast(103 as bigint) as order_id",
             (ProgressEventKind::Completed, None, None, None),
         ]
     );
+    let write_progress = match write_progress.lock() {
+        Ok(progress) => progress,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert_eq!(
+        u64::try_from(write_progress.len())?,
+        report.stats().batches_written()
+    );
+    assert_eq!(
+        write_progress.last().copied(),
+        Some((
+            report.stats().rows_written(),
+            report.stats().batches_written()
+        ))
+    );
+    assert!(write_progress.windows(2).all(|progress| {
+        progress[0].0 <= progress[1].0 && progress[0].1.checked_add(1) == Some(progress[1].1)
+    }));
 
     Ok(report)
 }
