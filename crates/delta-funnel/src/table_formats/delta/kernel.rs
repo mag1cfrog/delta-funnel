@@ -11,6 +11,7 @@ use datafusion::logical_expr::{Expr as DataFusionExpr, Operator as DataFusionOpe
 pub(crate) use delta_kernel::actions::deletion_vector::{
     DeletionVectorDescriptor, DeletionVectorStorageType,
 };
+use delta_kernel::arrow::array::Array as _;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 pub(crate) use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::arrow::error::ArrowError;
@@ -40,6 +41,26 @@ pub(crate) use delta_kernel::{
     try_parse_uri,
 };
 use snafu::Snafu;
+
+/// Approximates Add actions excluded while Kernel planned this metadata batch.
+///
+/// Kernel's final selection combines metadata filtering with Add/Remove
+/// deduplication, so this is not an exact count of current snapshot files. It
+/// is still useful as a best-effort indication of planning work and costs no
+/// additional metadata IO.
+pub(crate) fn approximate_files_filtered_during_planning(metadata: &ScanMetadata) -> Option<u64> {
+    let arrow_data = metadata
+        .scan_files
+        .data()
+        .any_ref()
+        .downcast_ref::<ArrowEngineData>()?;
+    let paths = arrow_data.record_batch().column_by_name("path")?;
+    let selection = metadata.scan_files.selection_vector();
+    let filtered = (0..paths.len())
+        .filter(|&index| !paths.is_null(index) && !selection.get(index).copied().unwrap_or(true))
+        .count();
+    u64::try_from(filtered).ok()
+}
 
 /// Protocol details extracted through the private kernel adapter boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]

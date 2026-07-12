@@ -103,6 +103,8 @@ struct ProgressOutputPosition {
 struct DeltaFileProgress {
     handled: u64,
     total: u64,
+    runtime_pruned: u64,
+    planning_pruned: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +146,19 @@ impl ProgressEvent {
         files_total: u64,
     ) -> Option<Self> {
         let mut snapshot = ProgressSnapshot::new(phase, output_name);
-        snapshot.file_progress = DeltaFileProgress::new(files_handled, files_total);
+        snapshot.file_progress = DeltaFileProgress::new(files_handled, files_total, 0, None);
+        snapshot.file_progress.map(|_| Self {
+            state: ProgressEventState::Progress(snapshot),
+        })
+    }
+
+    pub(crate) fn file_progress_from_provider_stats(
+        phase: ProgressPhase,
+        output_name: Option<&str>,
+        provider_stats: &[crate::DeltaProviderReadStatsSnapshot],
+    ) -> Option<Self> {
+        let mut snapshot = ProgressSnapshot::new(phase, output_name);
+        snapshot.file_progress = DeltaFileProgress::from_provider_stats(provider_stats);
         snapshot.file_progress.map(|_| Self {
             state: ProgressEventState::Progress(snapshot),
         })
@@ -159,7 +173,7 @@ impl ProgressEvent {
         batches: u64,
     ) -> Self {
         let mut snapshot = ProgressSnapshot::new(phase, output_name);
-        snapshot.file_progress = DeltaFileProgress::new(files_handled, files_total);
+        snapshot.file_progress = DeltaFileProgress::new(files_handled, files_total, 0, None);
         snapshot.metrics = Some(ProgressMetrics { rows, batches });
         Self {
             state: ProgressEventState::Progress(snapshot),
@@ -271,6 +285,24 @@ impl ProgressEvent {
             .map(|progress| progress.total)
     }
 
+    /// Returns selected files skipped by dynamic partition pruning.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn files_runtime_pruned(&self) -> Option<u64> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.file_progress)
+            .map(|progress| progress.runtime_pruned)
+    }
+
+    /// Returns the approximate files excluded during metadata planning.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn files_planning_pruned(&self) -> Option<u64> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.file_progress)
+            .and_then(|progress| progress.planning_pruned)
+    }
+
     /// Returns the accepted row count when present.
     #[doc(hidden)]
     #[must_use]
@@ -312,15 +344,61 @@ impl ProgressSnapshot {
 }
 
 impl DeltaFileProgress {
-    const fn new(handled: u64, total: u64) -> Option<Self> {
+    const fn new(
+        handled: u64,
+        total: u64,
+        runtime_pruned: u64,
+        planning_pruned: Option<u64>,
+    ) -> Option<Self> {
         if total == 0 {
             return None;
         }
 
+        let handled = if handled > total { total } else { handled };
         Some(Self {
-            handled: if handled > total { total } else { handled },
+            handled,
             total,
+            runtime_pruned: if runtime_pruned > handled {
+                handled
+            } else {
+                runtime_pruned
+            },
+            planning_pruned,
         })
+    }
+
+    fn from_provider_stats(
+        provider_stats: &[crate::DeltaProviderReadStatsSnapshot],
+    ) -> Option<Self> {
+        if provider_stats.is_empty()
+            || provider_stats
+                .iter()
+                .any(|stats| stats.scan_metadata_exhausted != Some(true))
+        {
+            return None;
+        }
+
+        let total = provider_stats
+            .iter()
+            .try_fold(0_u64, |total, stats| total.checked_add(stats.files_planned))?;
+        let (completed, pruned) =
+            provider_stats
+                .iter()
+                .fold((0_u64, 0_u64), |(completed, pruned), stats| {
+                    (
+                        completed.saturating_add(stats.files_completed),
+                        pruned.saturating_add(stats.dynamic_partition_files_pruned),
+                    )
+                });
+        let planning_pruned = provider_stats.iter().try_fold(0_u64, |total, stats| {
+            total.checked_add(stats.files_filtered_during_planning?)
+        });
+        Self::new(
+            completed.saturating_add(pruned),
+            total,
+            pruned,
+            planning_pruned,
+        )
     }
 }
 
@@ -358,6 +436,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend};
 
     #[test]
     fn events_expose_only_the_payload_for_their_kind() {
@@ -378,6 +457,8 @@ mod tests {
         assert_eq!(phase.output_count(), None);
         assert_eq!(phase.files_handled(), None);
         assert_eq!(phase.files_total(), None);
+        assert_eq!(phase.files_runtime_pruned(), None);
+        assert_eq!(phase.files_planning_pruned(), None);
         assert_eq!(phase.rows(), None);
         assert_eq!(phase.batches(), None);
 
@@ -387,6 +468,8 @@ mod tests {
         assert_eq!(progress.output_name(), Some("orders"));
         assert_eq!(progress.files_handled(), None);
         assert_eq!(progress.files_total(), None);
+        assert_eq!(progress.files_runtime_pruned(), None);
+        assert_eq!(progress.files_planning_pruned(), None);
         assert_eq!(progress.rows(), Some(42));
         assert_eq!(progress.batches(), Some(3));
     }
@@ -400,12 +483,117 @@ mod tests {
         assert_eq!(progress.phase(), Some(ProgressPhase::Writing));
         assert_eq!(progress.files_handled(), Some(5));
         assert_eq!(progress.files_total(), Some(5));
+        assert_eq!(progress.files_runtime_pruned(), Some(0));
+        assert_eq!(progress.files_planning_pruned(), None);
         assert_eq!(progress.rows(), Some(42));
         assert_eq!(progress.batches(), Some(3));
         assert!(
             ProgressEvent::file_progress(ProgressPhase::Writing, Some("orders"), 0, 0).is_none()
         );
         Ok(())
+    }
+
+    #[test]
+    fn provider_stats_sum_selected_and_handled_files_across_scans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stats = [
+            provider_stats(Some(true), 5, 2, 1),
+            provider_stats(Some(true), 7, 1, 2),
+        ];
+
+        let Some(progress) = ProgressEvent::file_progress_from_provider_stats(
+            ProgressPhase::Writing,
+            Some("orders"),
+            &stats,
+        ) else {
+            return Err("eligible provider stats did not produce file progress".into());
+        };
+
+        assert_eq!(progress.files_total(), Some(12));
+        assert_eq!(progress.files_handled(), Some(6));
+        assert_eq!(progress.files_runtime_pruned(), Some(3));
+        assert_eq!(progress.files_planning_pruned(), Some(18));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_stats_cap_handled_files_at_the_selected_total()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stats = [provider_stats(Some(true), 5, 4, 3)];
+
+        let Some(progress) =
+            ProgressEvent::file_progress_from_provider_stats(ProgressPhase::Writing, None, &stats)
+        else {
+            return Err("eligible provider stats did not produce file progress".into());
+        };
+
+        assert_eq!(progress.files_total(), Some(5));
+        assert_eq!(progress.files_handled(), Some(5));
+        assert_eq!(progress.files_runtime_pruned(), Some(3));
+        assert_eq!(progress.files_planning_pruned(), Some(9));
+        Ok(())
+    }
+
+    #[test]
+    fn ineligible_provider_stats_stay_indeterminate() {
+        assert!(
+            ProgressEvent::file_progress_from_provider_stats(ProgressPhase::Writing, None, &[])
+                .is_none()
+        );
+
+        for stats in [
+            provider_stats(Some(false), 1, 0, 0),
+            provider_stats(None, 1, 0, 0),
+            provider_stats(Some(true), 0, 0, 0),
+        ] {
+            assert!(
+                ProgressEvent::file_progress_from_provider_stats(
+                    ProgressPhase::Writing,
+                    None,
+                    &[stats],
+                )
+                .is_none()
+            );
+        }
+    }
+
+    fn provider_stats(
+        scan_metadata_exhausted: Option<bool>,
+        files_planned: u64,
+        files_completed: u64,
+        dynamic_partition_files_pruned: u64,
+    ) -> DeltaProviderReadStatsSnapshot {
+        DeltaProviderReadStatsSnapshot {
+            source_name: "orders".to_owned(),
+            snapshot_version: 1,
+            reader_backend: DeltaProviderReaderBackend::NativeAsync,
+            scan_metadata_exhausted,
+            scan_partitions_planned: 1,
+            files_planned,
+            files_filtered_during_planning: Some(9),
+            estimated_rows: None,
+            estimated_bytes: None,
+            datafusion_output_batch_size: None,
+            scan_partitions_started: 0,
+            scan_partitions_completed: 0,
+            files_started: files_completed,
+            files_completed,
+            dynamic_partition_files_pruned,
+            dynamic_partition_files_kept: 0,
+            dynamic_filters_received: 0,
+            dynamic_filters_accepted: 0,
+            dynamic_filters_unsupported: 0,
+            dynamic_filter_snapshots: 0,
+            dynamic_partition_files_not_pruned_missing_metadata: 0,
+            dynamic_partition_files_not_pruned_unsupported_expression: 0,
+            batches_produced: 0,
+            rows_produced: 0,
+            deletion_vector_payloads_loaded: 0,
+            deletion_vectors_applied: 0,
+            deletion_vector_rows_deleted: 0,
+            deletion_vector_failures: 0,
+            deletion_vector_rejections: 0,
+        }
     }
 
     #[test]

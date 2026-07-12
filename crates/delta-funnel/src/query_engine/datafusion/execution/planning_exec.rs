@@ -104,6 +104,7 @@ impl DeltaScanPlanningExec {
                 .iter()
                 .map(|partition| partition.file_tasks.len())
                 .sum(),
+            files_filtered_during_planning: partition_plan.files_filtered_during_planning,
             estimated_rows: partition_plan.estimated_rows,
             estimated_bytes: partition_plan.estimated_bytes,
         }));
@@ -173,13 +174,16 @@ impl DeltaScanPlanningExec {
 
     /// Returns a cheap point-in-time snapshot of provider-owned read progress.
     ///
-    /// This is the internal handoff for later orchestration and progress
-    /// reporting. It intentionally stays separate from DataFusion metrics so
-    /// callers can inspect partial progress after success, failure, or stream
-    /// cancellation.
+    /// The returned values do not update. Callers that need a later snapshot
+    /// retain `read_stats_handle` instead.
     #[allow(dead_code)]
     pub(crate) fn read_stats_snapshot(&self) -> super::read_stats::DeltaProviderReadStatsSnapshot {
         self.read_stats.snapshot()
+    }
+
+    /// Returns the shared counters used to create later read stats snapshots.
+    pub(crate) fn read_stats_handle(&self) -> Arc<DeltaProviderReadStats> {
+        Arc::clone(&self.read_stats)
     }
 }
 
@@ -2787,6 +2791,10 @@ mod tests {
                     .map(|partition| partition.file_tasks.len())
                     .sum::<usize>()
             )?
+        );
+        assert_eq!(
+            read_stats.files_filtered_during_planning,
+            scans[0].partition_plan().files_filtered_during_planning
         );
         assert_eq!(
             read_stats.estimated_rows,
@@ -5873,6 +5881,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 1,
             files_planned: 3,
+            files_filtered_during_planning: None,
             estimated_rows: Some(4),
             estimated_bytes: Some(3),
         }));
@@ -5992,6 +6001,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 2,
             files_planned: 2,
+            files_filtered_during_planning: None,
             estimated_rows: Some(3),
             estimated_bytes: Some(2),
         }));
@@ -6135,6 +6145,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 1,
             files_planned: 3,
+            files_filtered_during_planning: None,
             estimated_rows: Some(4),
             estimated_bytes: Some(3),
         }));
@@ -6226,6 +6237,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 1,
             files_planned: 3,
+            files_filtered_during_planning: None,
             estimated_rows: Some(5),
             estimated_bytes: Some(3),
         }));
@@ -6635,6 +6647,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 1,
             files_planned: 2,
+            files_filtered_during_planning: None,
             estimated_rows: Some(3),
             estimated_bytes: Some(2),
         }))

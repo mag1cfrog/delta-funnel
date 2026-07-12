@@ -13,14 +13,18 @@ use datafusion::{
             pretty::pretty_format_batches,
         },
     },
-    physical_plan::ExecutionPlan,
     prelude::{DataFrame, SessionContext},
 };
 use futures_util::{Stream, StreamExt};
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
-    collect_delta_provider_read_stats, datafusion_query_output_stream,
+    datafusion_query_output_stream,
+    progress::{ProgressEvent, ProgressPhase, ProgressReporter},
+    query_engine::datafusion::{
+        DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
+        snapshot_delta_provider_read_stats,
+    },
 };
 
 use super::{
@@ -44,22 +48,27 @@ pub(super) fn provider_read_stats_snapshot(
     }
 }
 
-pub(crate) struct ProviderStatsRecordingStream {
+/// Records final Delta provider statistics for a write-all report.
+///
+/// The recorder keeps only shared read counters and snapshots them when the
+/// wrapped stream ends or fails.
+pub(crate) struct FinalDeltaReadStatsRecorder {
     inner: MssqlOutputBatchStream,
-    physical_plan: Arc<dyn ExecutionPlan>,
+    // One live counter handle for each Delta scan in the output plan.
+    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
     provider_stats: SharedProviderReadStats,
     recorded: bool,
 }
 
-impl ProviderStatsRecordingStream {
+impl FinalDeltaReadStatsRecorder {
     pub(crate) fn new(
         inner: MssqlOutputBatchStream,
-        physical_plan: Arc<dyn ExecutionPlan>,
+        read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
         provider_stats: SharedProviderReadStats,
     ) -> Self {
         Self {
             inner,
-            physical_plan,
+            read_stats_handles,
             provider_stats,
             recorded: false,
         }
@@ -70,7 +79,7 @@ impl ProviderStatsRecordingStream {
             return;
         }
         self.recorded = true;
-        let snapshots = collect_delta_provider_read_stats(self.physical_plan.as_ref());
+        let snapshots = snapshot_delta_provider_read_stats(&self.read_stats_handles);
         if snapshots.is_empty() {
             return;
         }
@@ -81,7 +90,7 @@ impl ProviderStatsRecordingStream {
     }
 }
 
-impl Stream for ProviderStatsRecordingStream {
+impl Stream for FinalDeltaReadStatsRecorder {
     type Item = Result<RecordBatch, DeltaFunnelError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -95,6 +104,84 @@ impl Stream for ProviderStatsRecordingStream {
                 Poll::Ready(Some(Err(error)))
             }
             other => other,
+        }
+    }
+}
+
+/// Reports Delta file progress while forwarding a single output batch stream.
+///
+/// The tracker keeps only the shared provider counters extracted from the
+/// physical plan. It does not retain the plan, run another query, or read Delta
+/// metadata again.
+struct DeltaFileProgressTracker {
+    inner: MssqlOutputBatchStream,
+    // One live counter handle for each Delta scan in the output plan.
+    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+    reporter: ProgressReporter,
+    output_name: String,
+    // The last emitted handled and total counts, used to suppress duplicates.
+    last_file_progress: Option<(u64, u64)>,
+}
+
+impl DeltaFileProgressTracker {
+    fn new(
+        inner: MssqlOutputBatchStream,
+        read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+        reporter: ProgressReporter,
+        output_name: String,
+    ) -> Self {
+        Self {
+            inner,
+            read_stats_handles,
+            reporter,
+            output_name,
+            last_file_progress: None,
+        }
+    }
+
+    /// Emits only when the visible handled and total file counts have changed.
+    fn emit_if_changed(&mut self) {
+        let snapshots = snapshot_delta_provider_read_stats(&self.read_stats_handles);
+        let Some(event) = ProgressEvent::file_progress_from_provider_stats(
+            ProgressPhase::Writing,
+            Some(&self.output_name),
+            &snapshots,
+        ) else {
+            return;
+        };
+        let Some(file_progress) = event.files_handled().zip(event.files_total()) else {
+            return;
+        };
+        if self.last_file_progress == Some(file_progress) {
+            return;
+        }
+        self.last_file_progress = Some(file_progress);
+        self.reporter.emit(&event);
+    }
+}
+
+impl Stream for DeltaFileProgressTracker {
+    type Item = Result<RecordBatch, DeltaFunnelError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(context) {
+            Poll::Ready(None) => {
+                // Capture final progress before the shared counters are dropped.
+                self.emit_if_changed();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                // Keep the last partial progress when query execution fails.
+                self.emit_if_changed();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(batch))) => {
+                // A ready batch is the existing foreground sampling boundary.
+                self.emit_if_changed();
+                Poll::Ready(Some(Ok(batch)))
+            }
+            // Do not add a timer or wake the stream only to refresh progress.
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -122,11 +209,12 @@ pub(super) async fn batch_stream_for_lazy_table_from_session_parts(
     let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
         .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
     if let Some(provider_stats) = provider_stats {
-        return Ok(Box::pin(ProviderStatsRecordingStream::new(
+        let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        return Ok(Box::pin(FinalDeltaReadStatsRecorder::new(
             Box::pin(stream.map(|batch| {
                 batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
             })),
-            physical_plan,
+            read_stats_handles,
             provider_stats,
         )));
     }
@@ -137,21 +225,38 @@ pub(super) async fn batch_stream_for_lazy_table_from_session_parts(
 }
 
 impl DeltaFunnelSession {
+    /// Builds a batch stream and optionally reports Delta file progress while
+    /// that stream is consumed.
+    ///
+    /// `progress` contains the reporter and output name used for emitted
+    /// events. `None` returns the normal stream without progress sampling.
     pub(crate) async fn batch_stream_for_lazy_table(
         &self,
         table: &LazyTable,
+        progress: Option<(&ProgressReporter, &str)>,
     ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
         let dataframe = self.dataframe_for_lazy_table(table).await?;
         let physical_plan = dataframe
             .create_physical_plan()
             .await
             .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
-        let stream = datafusion_query_output_stream(physical_plan, self.context.task_ctx())
-            .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
-
-        Ok(Box::pin(stream.map(|batch| {
+        let stream =
+            datafusion_query_output_stream(Arc::clone(&physical_plan), self.context.task_ctx())
+                .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
+        let stream = Box::pin(stream.map(|batch| {
             batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
-        })))
+        }));
+        let Some((reporter, output_name)) = progress else {
+            return Ok(stream);
+        };
+        let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+
+        Ok(Box::pin(DeltaFileProgressTracker::new(
+            stream,
+            read_stats_handles,
+            reporter.clone(),
+            output_name.to_owned(),
+        )))
     }
 
     /// Executes a bounded preview of a lazy table and returns DataFusion's
@@ -411,10 +516,11 @@ pub(super) async fn dataframe_for_lazy_table_from_session_parts(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex, atomic::Ordering};
 
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig, QueryOptions, table_formats::RealParquetDeltaTable,
+        DeltaFunnelError, DeltaSourceConfig, QueryOptions, progress::ProgressReporter,
+        table_formats::RealParquetDeltaTable,
     };
 
     use super::super::{
@@ -426,6 +532,40 @@ mod tests {
         },
     };
 
+    type RecordedFileProgress = (String, u64, u64);
+
+    fn recording_file_progress() -> (ProgressReporter, Arc<Mutex<Vec<RecordedFileProgress>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            let (Some(output_name), Some(handled), Some(total)) = (
+                event.output_name(),
+                event.files_handled(),
+                event.files_total(),
+            ) else {
+                return;
+            };
+            match callback_events.lock() {
+                Ok(mut events) => events.push((output_name.to_owned(), handled, total)),
+                Err(poisoned) => {
+                    poisoned
+                        .into_inner()
+                        .push((output_name.to_owned(), handled, total));
+                }
+            }
+        });
+        (reporter, events)
+    }
+
+    fn recorded_file_progress(
+        events: &Mutex<Vec<RecordedFileProgress>>,
+    ) -> Vec<RecordedFileProgress> {
+        match events.lock() {
+            Ok(events) => events.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     #[tokio::test]
     async fn batch_stream_for_lazy_table_reads_registered_delta_source()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -436,10 +576,76 @@ mod tests {
             table.path().to_string_lossy().to_string(),
         ))?;
 
-        let stream = session.batch_stream_for_lazy_table(&source).await?;
+        let stream = session.batch_stream_for_lazy_table(&source, None).await?;
         let rows = collect_stream_row_count(stream).await?;
 
         assert_eq!(rows, table.rows());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_stream_reports_changing_delta_file_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let (reporter, events) = recording_file_progress();
+
+        let stream = session
+            .batch_stream_for_lazy_table(&source, Some((&reporter, "orders output")))
+            .await?;
+        let rows = collect_stream_row_count(stream).await?;
+
+        assert_eq!(rows, table.rows());
+        let events = recorded_file_progress(&events);
+        let Some(last) = events.last() else {
+            return Err("Delta stream did not report file progress".into());
+        };
+        assert_eq!(last.0, "orders output");
+        assert!(last.2 > 0);
+        assert_eq!(last.1, last.2);
+        assert!(events.windows(2).all(|events| events[0] != events[1]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_stream_sums_file_progress_across_delta_scans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders = RealParquetDeltaTable::new_default("orders")?;
+        let customers = RealParquetDeltaTable::new_default("customers")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            orders.path().to_string_lossy().to_string(),
+        ))?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "customers",
+            customers.path().to_string_lossy().to_string(),
+        ))?;
+        let joined = session
+            .table_from_sql(
+                "select o.id \
+                 from orders o \
+                 join customers c on o.id = c.id",
+            )
+            .await?;
+        let (reporter, events) = recording_file_progress();
+
+        let stream = session
+            .batch_stream_for_lazy_table(&joined, Some((&reporter, "joined output")))
+            .await?;
+        let rows = collect_stream_row_count(stream).await?;
+
+        assert_eq!(rows, 3);
+        let events = recorded_file_progress(&events);
+        let Some(last) = events.last() else {
+            return Err("joined Delta stream did not report file progress".into());
+        };
+        assert_eq!(last, &("joined output".to_owned(), 2, 2));
+        assert!(events.windows(2).all(|events| events[0] != events[1]));
         Ok(())
     }
 
@@ -455,7 +661,7 @@ mod tests {
             .table_from_sql("select 1 as id union all select 2 as id")
             .await?;
 
-        let stream = session.batch_stream_for_lazy_table(&derived).await?;
+        let stream = session.batch_stream_for_lazy_table(&derived, None).await?;
         let rows = collect_stream_row_count(stream).await?;
 
         assert_eq!(rows, 2);
@@ -471,7 +677,7 @@ mod tests {
             .await?;
         let alias = session.register_alias("customer_names", &derived)?;
 
-        let stream = session.batch_stream_for_lazy_table(&alias).await?;
+        let stream = session.batch_stream_for_lazy_table(&alias, None).await?;
         let rows = collect_stream_row_count(stream).await?;
 
         assert_eq!(rows, 1);
@@ -538,7 +744,10 @@ mod tests {
         let session = DeltaFunnelSession::new(SessionOptions::default())?;
 
         let error = session
-            .batch_stream_for_lazy_table(&LazyTable::placeholder(42, LazyTableKind::DeltaSource))
+            .batch_stream_for_lazy_table(
+                &LazyTable::placeholder(42, LazyTableKind::DeltaSource),
+                None,
+            )
             .await;
 
         assert!(matches!(
@@ -651,8 +860,8 @@ mod tests {
             vec!["replacement"]
         );
 
-        let west_stream = session.batch_stream_for_lazy_table(&west).await?;
-        let east_stream = session.batch_stream_for_lazy_table(&east).await?;
+        let west_stream = session.batch_stream_for_lazy_table(&west, None).await?;
+        let east_stream = session.batch_stream_for_lazy_table(&east, None).await?;
         let west_markers = collect_stream_marker_values(west_stream).await?;
         let east_markers = collect_stream_marker_values(east_stream).await?;
 
@@ -703,8 +912,12 @@ mod tests {
         let replanned_east = session.table_from_sql(EAST_SQL).await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
-        let west_stream = session.batch_stream_for_lazy_table(&replanned_west).await?;
-        let east_stream = session.batch_stream_for_lazy_table(&replanned_east).await?;
+        let west_stream = session
+            .batch_stream_for_lazy_table(&replanned_west, None)
+            .await?;
+        let east_stream = session
+            .batch_stream_for_lazy_table(&replanned_east, None)
+            .await?;
         let west_markers = collect_stream_marker_values(west_stream).await?;
         let east_markers = collect_stream_marker_values(east_stream).await?;
 

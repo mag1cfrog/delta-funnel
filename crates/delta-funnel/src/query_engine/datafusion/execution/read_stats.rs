@@ -24,6 +24,8 @@ pub struct DeltaProviderReadStatsSnapshot {
     pub scan_partitions_planned: u64,
     /// Selected provider file tasks planned for this scan.
     pub files_planned: u64,
+    /// Approximate Add actions excluded during Kernel metadata planning.
+    pub files_filtered_during_planning: Option<u64>,
     /// Estimated output rows from planning when every selected file had stats.
     pub estimated_rows: Option<u64>,
     /// Estimated bytes from planning when every selected file had a byte size.
@@ -88,6 +90,8 @@ pub(crate) struct DeltaProviderReadStatsConfig {
     pub(crate) scan_partitions_planned: usize,
     /// Selected provider file tasks planned for this scan.
     pub(crate) files_planned: usize,
+    /// Approximate Add actions excluded during Kernel metadata planning.
+    pub(crate) files_filtered_during_planning: Option<u64>,
     /// Estimated output rows from planning when every selected file had stats.
     pub(crate) estimated_rows: Option<u64>,
     /// Estimated bytes from planning when every selected file had a byte size.
@@ -104,6 +108,7 @@ pub(crate) struct DeltaProviderReadStats {
     scan_metadata_exhausted: Option<bool>,
     scan_partitions_planned: u64,
     files_planned: u64,
+    files_filtered_during_planning: Option<u64>,
     estimated_rows: Option<u64>,
     estimated_bytes: Option<u64>,
     datafusion_output_batch_size: AtomicU64,
@@ -141,6 +146,7 @@ impl DeltaProviderReadStats {
             scan_metadata_exhausted: config.scan_metadata_exhausted,
             scan_partitions_planned: usize_to_u64_saturating(config.scan_partitions_planned),
             files_planned: usize_to_u64_saturating(config.files_planned),
+            files_filtered_during_planning: config.files_filtered_during_planning,
             estimated_rows: config.estimated_rows,
             estimated_bytes: config.estimated_bytes,
             datafusion_output_batch_size: AtomicU64::new(0),
@@ -177,6 +183,7 @@ impl DeltaProviderReadStats {
             scan_metadata_exhausted: self.scan_metadata_exhausted,
             scan_partitions_planned: self.scan_partitions_planned,
             files_planned: self.files_planned,
+            files_filtered_during_planning: self.files_filtered_during_planning,
             estimated_rows: self.estimated_rows,
             estimated_bytes: self.estimated_bytes,
             datafusion_output_batch_size: nonzero_atomic_snapshot(
@@ -349,6 +356,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 3,
             files_planned: 5,
+            files_filtered_during_planning: Some(12),
             estimated_rows: Some(99),
             estimated_bytes: Some(42),
         });
@@ -363,6 +371,7 @@ mod tests {
         assert_eq!(snapshot.scan_metadata_exhausted, Some(true));
         assert_eq!(snapshot.scan_partitions_planned, 3);
         assert_eq!(snapshot.files_planned, 5);
+        assert_eq!(snapshot.files_filtered_during_planning, Some(12));
         assert_eq!(snapshot.estimated_rows, Some(99));
         assert_eq!(snapshot.estimated_bytes, Some(42));
         assert_eq!(snapshot.datafusion_output_batch_size, None);
@@ -402,6 +411,7 @@ mod tests {
             scan_metadata_exhausted: Some(false),
             scan_partitions_planned: 1,
             files_planned: 1,
+            files_filtered_during_planning: None,
             estimated_rows: None,
             estimated_bytes: None,
         });
@@ -464,6 +474,7 @@ mod tests {
             scan_metadata_exhausted: None,
             scan_partitions_planned: THREADS,
             files_planned: THREADS,
+            files_filtered_during_planning: None,
             estimated_rows: None,
             estimated_bytes: None,
         }));

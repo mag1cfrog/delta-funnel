@@ -19,6 +19,7 @@ use futures_util::{
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationStatus,
     observability,
+    progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     report::sql_server::{
         MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
         MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
@@ -568,12 +569,16 @@ impl MssqlWriteLoopPhaseTimings {
 }
 
 /// Writes one planned SQL Server output through an injected bulk-load writer.
+///
+/// When provided, `reporter` receives cumulative row and batch counts only
+/// after the writer accepts each batch.
 #[allow(dead_code)]
 pub(crate) async fn write_mssql_batches_with_writer<W, S>(
     output_plan: &MssqlTargetOutputPlan,
     batches: S,
     mut writer: W,
     _options: MssqlWriteBackend,
+    reporter: Option<&ProgressReporter>,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     W: MssqlBulkLoadWriter,
@@ -697,6 +702,14 @@ where
         batches_written = batches_written.saturating_add(1);
         shaped_rows = shaped_rows.saturating_add(row_count);
         shaped_batches = shaped_batches.saturating_add(1);
+        if let Some(reporter) = reporter {
+            reporter.emit(&ProgressEvent::progress(
+                ProgressPhase::Writing,
+                Some(output_plan.output_name()),
+                rows_written,
+                batches_written,
+            ));
+        }
     }
 
     let finalize_started_at = Instant::now();
@@ -1715,6 +1728,7 @@ mod tests {
             batches,
             writer,
             default_mssql_write_backend(),
+            None,
         )
         .await?;
 
@@ -1812,6 +1826,7 @@ mod tests {
             batches,
             writer,
             default_mssql_write_backend(),
+            None,
         )
         .await?;
 
@@ -1835,6 +1850,7 @@ mod tests {
             batches,
             writer,
             default_mssql_write_backend(),
+            None,
         )
         .await?;
 
@@ -1869,6 +1885,7 @@ mod tests {
             batches,
             writer,
             default_mssql_write_backend(),
+            None,
         )
         .await
         {
@@ -1917,6 +1934,7 @@ mod tests {
             batches,
             writer,
             default_mssql_write_backend(),
+            None,
         )
         .await
         {
@@ -1964,6 +1982,7 @@ mod tests {
             batches,
             writer,
             default_mssql_write_backend(),
+            None,
         )
         .await
         {
@@ -2011,6 +2030,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_loop_reports_only_batches_accepted_by_the_writer() -> Result<(), DeltaFunnelError>
+    {
+        let output_plan = output_plan_for_orders_schema()?;
+        let writer = FakeBulkLoadWriter::default().fail_on_write_batch(2);
+        let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
+        let second = orders_batch(vec![3], vec![None])?;
+        let batches = stream::iter(vec![Ok(first), Ok(second)]);
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let callback_progress = Arc::clone(&progress);
+        let reporter = ProgressReporter::new(move |event| {
+            let Some(metrics) = event.rows().zip(event.batches()) else {
+                return;
+            };
+            match callback_progress.lock() {
+                Ok(mut progress) => progress.push(metrics),
+                Err(poisoned) => poisoned.into_inner().push(metrics),
+            }
+        });
+
+        let result = write_mssql_batches_with_writer(
+            &output_plan,
+            batches,
+            writer,
+            default_mssql_write_backend(),
+            Some(&reporter),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let progress = match progress.lock() {
+            Ok(progress) => progress,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(*progress, [(2, 1)]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn write_loop_create_and_load_write_failure_does_not_report_partial_write()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_for_orders_schema_with_load_mode(LoadMode::CreateAndLoad)?;
@@ -2025,6 +2082,7 @@ mod tests {
             batches,
             writer,
             default_mssql_write_backend(),
+            None,
         )
         .await
         {
@@ -2066,6 +2124,7 @@ mod tests {
             batches,
             writer,
             default_mssql_write_backend(),
+            None,
         )
         .await
         {

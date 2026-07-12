@@ -6,7 +6,10 @@
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use delta_funnel::progress::{
     ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
@@ -17,6 +20,8 @@ use pyo3::types::PyDict;
 
 #[cfg(test)]
 static ATTACHMENT_FAILURE_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
+
+const METRIC_RENDER_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Connects one Rust action to one optional Rich progress display.
 pub(crate) struct PythonProgress {
@@ -37,7 +42,9 @@ impl PythonProgress {
         };
         let state = Arc::new(Mutex::new(ProgressState::new(mode)));
         let reporter_state = Arc::clone(&state);
-        let reporter = ProgressReporter::new(move |event| render_event(&reporter_state, event));
+        let reporter = ProgressReporter::new(move |event| {
+            render_event(&reporter_state, event, Instant::now());
+        });
         Some(Self { reporter, state })
     }
 
@@ -111,6 +118,8 @@ struct ProgressState {
     render: RenderState,
     pending_interruption: Option<PyErr>,
     final_event: Option<ProgressEventKind>,
+    visible: VisibleProgress,
+    metric_throttle: MetricRenderThrottle,
 }
 
 impl ProgressState {
@@ -119,6 +128,8 @@ impl ProgressState {
             render: RenderState::Pending(mode),
             pending_interruption: None,
             final_event: None,
+            visible: VisibleProgress::new(),
+            metric_throttle: MetricRenderThrottle::new(),
         }
     }
 
@@ -127,6 +138,8 @@ impl ProgressState {
             render: RenderState::Busy,
             pending_interruption: None,
             final_event: None,
+            visible: VisibleProgress::new(),
+            metric_throttle: MetricRenderThrottle::new(),
         }
     }
 
@@ -135,7 +148,198 @@ impl ProgressState {
             render: RenderState::Done,
             pending_interruption: None,
             final_event: None,
+            visible: VisibleProgress::new(),
+            metric_throttle: MetricRenderThrottle::new(),
         }
+    }
+}
+
+/// Limits how often numeric progress enters Python while retaining new values.
+struct MetricRenderThrottle {
+    /// When the latest metric values were last included in a Rich update.
+    last_metrics_shown_at: Option<Instant>,
+    /// True when `VisibleProgress` contains newer metrics than Rich has shown.
+    metrics_waiting_to_render: bool,
+}
+
+impl MetricRenderThrottle {
+    const fn new() -> Self {
+        Self {
+            last_metrics_shown_at: None,
+            metrics_waiting_to_render: false,
+        }
+    }
+
+    /// Returns true when this event should update Rich now.
+    fn should_render(
+        &mut self,
+        kind: ProgressEventKind,
+        visible_metrics_changed: bool,
+        now: Instant,
+    ) -> bool {
+        if visible_metrics_changed {
+            self.metrics_waiting_to_render = true;
+        }
+        if kind != ProgressEventKind::Progress {
+            // Phase and terminal updates include any pending metrics immediately.
+            if self.metrics_waiting_to_render {
+                self.last_metrics_shown_at = Some(now);
+                self.metrics_waiting_to_render = false;
+            }
+            return true;
+        }
+        if !self.metrics_waiting_to_render {
+            return false;
+        }
+        if self
+            .last_metrics_shown_at
+            .is_some_and(|last| now.saturating_duration_since(last) < METRIC_RENDER_INTERVAL)
+        {
+            return false;
+        }
+        self.last_metrics_shown_at = Some(now);
+        self.metrics_waiting_to_render = false;
+        true
+    }
+}
+
+/// Latest progress values retained even when a display update is throttled.
+struct VisibleProgress {
+    phase: Option<ProgressPhase>,
+    output_name: Option<String>,
+    files_handled: Option<u64>,
+    files_total: Option<u64>,
+    files_runtime_pruned: Option<u64>,
+    files_planning_pruned: Option<u64>,
+    rows: Option<u64>,
+    batches: Option<u64>,
+}
+
+impl VisibleProgress {
+    const fn new() -> Self {
+        Self {
+            phase: None,
+            output_name: None,
+            files_handled: None,
+            files_total: None,
+            files_runtime_pruned: None,
+            files_planning_pruned: None,
+            rows: None,
+            batches: None,
+        }
+    }
+
+    /// Merges one event without discarding file or write values omitted by it.
+    fn incorporate(&mut self, event: &ProgressEvent) -> bool {
+        if let Some(phase) = event.phase() {
+            self.phase = Some(phase);
+        }
+        if let Some(output_name) = event.output_name() {
+            self.output_name = Some(output_name.to_owned());
+        }
+        let file_progress = match (
+            event.files_handled(),
+            event.files_total(),
+            event.files_runtime_pruned(),
+        ) {
+            (Some(handled), Some(total), Some(runtime_pruned)) => Some((
+                handled,
+                total,
+                runtime_pruned,
+                event.files_planning_pruned(),
+            )),
+            _ => None,
+        };
+        self.incorporate_metrics(file_progress, event.rows().zip(event.batches()))
+    }
+
+    /// Merges monotonic counters and reports whether a visible value changed.
+    fn incorporate_metrics(
+        &mut self,
+        file_progress: Option<(u64, u64, u64, Option<u64>)>,
+        write_progress: Option<(u64, u64)>,
+    ) -> bool {
+        let before = self.metric_values();
+        if let Some((handled, total, runtime_pruned, planning_pruned)) = file_progress {
+            // The first eligible snapshot fixes the total for this plan scope.
+            let fixed_total = self.files_total.unwrap_or(total);
+            self.files_total = Some(fixed_total);
+            let handled = self
+                .files_handled
+                .unwrap_or(0)
+                .max(handled.min(fixed_total));
+            self.files_handled = Some(handled);
+            self.files_runtime_pruned = Some(
+                self.files_handled
+                    .unwrap_or(0)
+                    .min(self.files_runtime_pruned.unwrap_or(0).max(runtime_pruned)),
+            );
+            if let Some(planning_pruned) = planning_pruned {
+                self.files_planning_pruned =
+                    Some(self.files_planning_pruned.unwrap_or(0).max(planning_pruned));
+            }
+        }
+        if let Some((rows, batches)) = write_progress {
+            self.rows = Some(self.rows.unwrap_or(0).max(rows));
+            self.batches = Some(self.batches.unwrap_or(0).max(batches));
+        }
+        self.metric_values() != before
+    }
+
+    const fn metric_values(&self) -> [Option<u64>; 6] {
+        [
+            self.files_handled,
+            self.files_total,
+            self.files_runtime_pruned,
+            self.files_planning_pruned,
+            self.rows,
+            self.batches,
+        ]
+    }
+
+    fn file_progress_text(&self) -> Option<String> {
+        let (Some(handled), Some(total), Some(runtime_pruned)) = (
+            self.files_handled,
+            self.files_total,
+            self.files_runtime_pruned,
+        ) else {
+            return None;
+        };
+        let prefix = format!("Delta files {handled}/{total}");
+        match (
+            runtime_pruned,
+            self.files_planning_pruned.filter(|pruned| *pruned > 0),
+        ) {
+            (0, None) => Some(prefix),
+            (runtime, None) => Some(format!("{prefix} | pruned {runtime} at runtime")),
+            (0, Some(planning)) => Some(format!("{prefix} | pruned ~{planning} in planning")),
+            (runtime, Some(planning)) => Some(format!(
+                "{prefix} | pruned {runtime} at runtime, ~{planning} in planning"
+            )),
+        }
+    }
+
+    fn description(&self, kind: ProgressEventKind) -> String {
+        let label = if ends_action(kind) {
+            terminal_label(kind)
+        } else {
+            self.phase.map_or("Working", phase_label)
+        };
+        let mut description = label.to_owned();
+        if let Some(output_name) = &self.output_name {
+            description.push_str(": ");
+            description.push_str(output_name);
+        }
+        if let (Some(rows), Some(batches)) = (self.rows, self.batches) {
+            let row_label = count_label(rows, "row", "rows");
+            let rows = compact_row_count(rows);
+            description.push_str(&format!(
+                " - {rows} {}, {batches} {}",
+                row_label,
+                count_label(batches, "batch", "batches")
+            ));
+        }
+        description
     }
 }
 
@@ -207,7 +411,7 @@ fn successful<T>(call: PythonCall<T>, pending_interruption: &mut Option<PyErr>) 
 }
 
 /// Handles one Rust progress event and updates Rich when needed.
-fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
+fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instant) {
     // Take the state out and release the mutex before calling Rich. Python code
     // may call other code, so running it while holding the mutex could deadlock.
     let current = {
@@ -215,6 +419,13 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let visible_metrics_changed = state.visible.incorporate(event);
+        if !state
+            .metric_throttle
+            .should_render(event.kind(), visible_metrics_changed, now)
+        {
+            return;
+        }
         std::mem::replace(&mut *state, ProgressState::busy())
     };
 
@@ -222,6 +433,8 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
         render,
         mut pending_interruption,
         final_event,
+        visible,
+        metric_throttle,
     } = current;
     let final_event = if ends_action(event.kind()) {
         Some(event.kind())
@@ -256,8 +469,9 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
             updates_enabled,
         } if ends_action(event.kind()) => {
             let updates_enabled = if updates_enabled {
+                let description = visible.description(event.kind());
                 successful(
-                    try_python(|py| update_renderer(py, &renderer, terminal_label(event.kind()))),
+                    try_python(|py| update_renderer(py, &renderer, &description, &visible)),
                     &mut pending_interruption,
                 )
                 .is_some()
@@ -272,17 +486,17 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
         RenderState::Active {
             renderer,
             updates_enabled: true,
-        } if event.kind() == ProgressEventKind::PhaseChanged => {
-            // This issue shows phases only. #434 will handle numeric Progress
-            // events. If this update fails, stop later updates but keep the
-            // task so `finish` can still close it once.
-            let updated = event.phase().is_none_or(|phase| {
-                successful(
-                    try_python(|py| update_renderer(py, &renderer, phase_label(phase))),
-                    &mut pending_interruption,
-                )
-                .is_some()
-            });
+        } if matches!(
+            event.kind(),
+            ProgressEventKind::PhaseChanged | ProgressEventKind::Progress
+        ) =>
+        {
+            let description = visible.description(event.kind());
+            let updated = successful(
+                try_python(|py| update_renderer(py, &renderer, &description, &visible)),
+                &mut pending_interruption,
+            )
+            .is_some();
             RenderState::Active {
                 renderer,
                 updates_enabled: updated,
@@ -297,6 +511,8 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
         render,
         pending_interruption,
         final_event,
+        visible,
+        metric_throttle,
     };
 
     // Rust sends these events one at a time, so returning the state here cannot
@@ -341,9 +557,11 @@ fn create_renderer(
     let elapsed_column = progress_module.getattr("TimeElapsedColumn")?.call0()?;
     let bar_column = progress_module.getattr("BarColumn")?.call0()?;
     let task_progress_column = progress_module.getattr("TaskProgressColumn")?.call0()?;
+    let file_count_column = progress_module
+        .getattr("TextColumn")?
+        .call1(("{task.fields[file_progress]}",))?;
 
-    // Refresh only when Rust sends an event. A background refresh thread is not
-    // useful for these infrequent phase changes.
+    // Refresh only when Rust admits an event through the metric throttle.
     let progress_kwargs = PyDict::new(py);
     progress_kwargs.set_item("console", console)?;
     progress_kwargs.set_item("auto_refresh", false)?;
@@ -356,14 +574,16 @@ fn create_renderer(
             "{task.description}",
             bar_column,
             task_progress_column,
+            file_count_column,
         ),
         Some(&progress_kwargs),
     )?;
 
-    // Start without a total. #434 will add the file total to this same task so
-    // the display and elapsed time continue without restarting.
+    // Start without a total. The first eligible file snapshot updates this
+    // same task so its display and elapsed time continue without restarting.
     let task_kwargs = PyDict::new(py);
     task_kwargs.set_item("total", py.None())?;
+    task_kwargs.set_item("file_progress", "")?;
     let task_id = progress.call_method(
         "add_task",
         (operation_label(event.operation()),),
@@ -381,15 +601,47 @@ fn start_renderer(py: Python<'_>, renderer: &RichRenderer) -> PyResult<()> {
     Ok(())
 }
 
-/// Shows a new description immediately in both terminals and notebooks.
-fn update_renderer(py: Python<'_>, renderer: &RichRenderer, description: &str) -> PyResult<()> {
+/// Shows the latest description and determinate file position immediately.
+fn update_renderer(
+    py: Python<'_>,
+    renderer: &RichRenderer,
+    description: &str,
+    visible: &VisibleProgress,
+) -> PyResult<()> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("description", description)?;
+    if let (Some(handled), Some(total)) = (visible.files_handled, visible.files_total) {
+        kwargs.set_item("completed", handled)?;
+        kwargs.set_item("total", total)?;
+    }
+    if let Some(file_progress) = visible.file_progress_text() {
+        kwargs.set_item("file_progress", file_progress)?;
+    }
     kwargs.set_item("refresh", true)?;
     renderer
         .progress
         .call_method(py, "update", (renderer.task_id.bind(py),), Some(&kwargs))?;
     Ok(())
+}
+
+const fn count_label(count: u64, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
+}
+
+/// Shortens large row counts while keeping two decimal places.
+fn compact_row_count(rows: u64) -> String {
+    if rows < 1_000 {
+        return rows.to_string();
+    }
+
+    let rounded_hundredths = |divisor: u128| (u128::from(rows) * 100 + divisor / 2) / divisor;
+    let thousands = rounded_hundredths(1_000);
+    let (value, suffix) = if thousands < 100_000 {
+        (thousands, "K")
+    } else {
+        (rounded_hundredths(1_000_000), "M")
+    };
+    format!("{}.{:02}{suffix}", value / 100, value % 100)
 }
 
 /// Returns the Rust action result reported with a saved Python interruption.
@@ -636,9 +888,10 @@ class Progress:
 
     def update(self, task_id, **kwargs):
         records.append({"call": "update", "task_id": task_id, **kwargs})
-        terminal = kwargs.get("description") in {
+        description = kwargs.get("description", "")
+        terminal = any(description.startswith(label) for label in (
             "Completed", "Completed with failures", "Failed", "Cancelled"
-        }
+        ))
         maybe_fail("terminal" if terminal else "update")
 
     def stop(self):
@@ -654,6 +907,7 @@ progress_module.Progress = Progress
 progress_module.TimeElapsedColumn = object
 progress_module.BarColumn = object
 progress_module.TaskProgressColumn = object
+progress_module.TextColumn = lambda *args, **kwargs: object()
 rich.console = console_module
 rich.progress = progress_module
 sys.modules["rich"] = rich
@@ -685,6 +939,193 @@ sys.modules["rich.progress"] = progress_module
                 Ok(())
             });
         }
+    }
+
+    #[test]
+    fn metric_throttle_renders_first_latest_and_bypass_events_without_sleeping() {
+        let started_at = Instant::now();
+        let mut throttle = MetricRenderThrottle::new();
+
+        assert!(throttle.should_render(ProgressEventKind::Progress, true, started_at,));
+        assert!(!throttle.should_render(
+            ProgressEventKind::Progress,
+            true,
+            started_at + Duration::from_millis(249),
+        ));
+        assert!(throttle.should_render(
+            ProgressEventKind::Progress,
+            true,
+            started_at + Duration::from_millis(250),
+        ));
+        assert!(throttle.should_render(
+            ProgressEventKind::PhaseChanged,
+            false,
+            started_at + Duration::from_millis(251),
+        ));
+        assert!(throttle.should_render(
+            ProgressEventKind::Failed,
+            false,
+            started_at + Duration::from_millis(252),
+        ));
+    }
+
+    #[test]
+    fn rapid_metric_updates_are_bounded_by_the_injected_clock() {
+        let started_at = Instant::now();
+        let mut throttle = MetricRenderThrottle::new();
+        let rendered = (0..1_000_u64)
+            .filter(|millis| {
+                throttle.should_render(
+                    ProgressEventKind::Progress,
+                    true,
+                    started_at + Duration::from_millis(*millis),
+                )
+            })
+            .count();
+
+        assert_eq!(rendered, 4);
+    }
+
+    #[test]
+    fn visible_progress_merges_file_and_write_snapshots_monotonically() {
+        let mut visible = VisibleProgress::new();
+        visible.phase = Some(ProgressPhase::Writing);
+        visible.output_name = Some("orders".to_owned());
+
+        assert!(visible.incorporate_metrics(Some((2, 10, 0, Some(90))), None));
+        assert!(visible.incorporate_metrics(None, Some((40, 1))));
+        assert!(visible.incorporate_metrics(Some((6, 10, 3, Some(90))), Some((75, 2))));
+        assert!(!visible.incorporate_metrics(Some((4, 20, 1, None)), Some((60, 1))));
+
+        assert_eq!(
+            visible.metric_values(),
+            [Some(6), Some(10), Some(3), Some(90), Some(75), Some(2)]
+        );
+        assert_eq!(
+            visible.file_progress_text().as_deref(),
+            Some("Delta files 6/10 | pruned 3 at runtime, ~90 in planning")
+        );
+        assert_eq!(
+            visible.description(ProgressEventKind::Progress),
+            "Writing to SQL Server: orders - 75 rows, 2 batches"
+        );
+        assert_eq!(
+            visible.description(ProgressEventKind::Failed),
+            "Failed: orders - 75 rows, 2 batches"
+        );
+    }
+
+    #[test]
+    fn large_row_counts_use_two_decimal_k_and_m_suffixes() {
+        assert_eq!(compact_row_count(999), "999");
+        assert_eq!(compact_row_count(1_000), "1.00K");
+        assert_eq!(compact_row_count(12_345), "12.35K");
+        assert_eq!(compact_row_count(999_994), "999.99K");
+        assert_eq!(compact_row_count(999_995), "1.00M");
+        assert_eq!(compact_row_count(1_234_567), "1.23M");
+
+        let mut visible = VisibleProgress::new();
+        visible.phase = Some(ProgressPhase::Writing);
+        visible.incorporate_metrics(None, Some((1_234_567, 152)));
+        assert_eq!(
+            visible.description(ProgressEventKind::Progress),
+            "Writing to SQL Server - 1.23M rows, 152 batches"
+        );
+    }
+
+    #[test]
+    fn file_progress_text_omits_unavailable_or_zero_pruning_counts() {
+        let mut visible = VisibleProgress::new();
+        visible.incorporate_metrics(Some((8, 10, 0, None)), None);
+        assert_eq!(
+            visible.file_progress_text().as_deref(),
+            Some("Delta files 8/10")
+        );
+
+        visible.incorporate_metrics(Some((8, 10, 3, None)), None);
+        assert_eq!(
+            visible.file_progress_text().as_deref(),
+            Some("Delta files 8/10 | pruned 3 at runtime")
+        );
+
+        visible.incorporate_metrics(Some((8, 10, 3, Some(90))), None);
+        assert_eq!(
+            visible.file_progress_text().as_deref(),
+            Some("Delta files 8/10 | pruned 3 at runtime, ~90 in planning")
+        );
+
+        let mut planning_only = VisibleProgress::new();
+        planning_only.incorporate_metrics(Some((8, 10, 0, Some(90))), None);
+        assert_eq!(
+            planning_only.file_progress_text().as_deref(),
+            Some("Delta files 8/10 | pruned ~90 in planning")
+        );
+    }
+
+    #[test]
+    fn renderer_switches_the_existing_task_to_determinate_progress() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            let progress = py.import("rich.progress")?.getattr("Progress")?.call0()?;
+            let task_id = progress.call_method1("add_task", ("Starting",))?;
+            let renderer = RichRenderer {
+                progress: progress.unbind(),
+                task_id: task_id.unbind(),
+            };
+            let mut visible = VisibleProgress::new();
+            visible.phase = Some(ProgressPhase::Writing);
+            visible.output_name = Some("orders".to_owned());
+            visible.incorporate_metrics(Some((3, 10, 2, Some(90))), Some((42, 2)));
+
+            update_renderer(
+                py,
+                &renderer,
+                &visible.description(ProgressEventKind::Progress),
+                &visible,
+            )?;
+
+            let update = records.bind(py).get_item(2)?.cast_into::<PyDict>()?;
+            assert_eq!(update.get_item("task_id")?.unwrap().extract::<u8>()?, 7);
+            assert_eq!(update.get_item("completed")?.unwrap().extract::<u64>()?, 3);
+            assert_eq!(update.get_item("total")?.unwrap().extract::<u64>()?, 10);
+            assert_eq!(
+                update
+                    .get_item("file_progress")?
+                    .unwrap()
+                    .extract::<String>()?,
+                "Delta files 3/10 | pruned 2 at runtime, ~90 in planning"
+            );
+            assert_eq!(
+                update
+                    .get_item("description")?
+                    .unwrap()
+                    .extract::<String>()?,
+                "Writing to SQL Server: orders - 42 rows, 2 batches"
+            );
+            assert!(update.get_item("refresh")?.unwrap().extract::<bool>()?);
+
+            update_renderer(
+                py,
+                &renderer,
+                &visible.description(ProgressEventKind::Failed),
+                &visible,
+            )?;
+            let terminal = records.bind(py).get_item(3)?.cast_into::<PyDict>()?;
+            assert_eq!(
+                terminal
+                    .get_item("description")?
+                    .unwrap()
+                    .extract::<String>()?,
+                "Failed: orders - 42 rows, 2 batches"
+            );
+            assert_eq!(
+                terminal.get_item("completed")?.unwrap().extract::<u64>()?,
+                3
+            );
+            assert_eq!(terminal.get_item("total")?.unwrap().extract::<u64>()?, 10);
+            Ok(())
+        })
     }
 
     fn dry_run(py: Python<'_>, progress: Option<Option<bool>>) -> PyResult<()> {
@@ -848,7 +1289,7 @@ sys.modules["rich.progress"] = progress_module
                     .get_item(4)?
                     .get_item("description")?
                     .extract::<String>()?,
-                "Planning output"
+                "Planning output: orders"
             );
             assert_eq!(
                 records
@@ -856,7 +1297,7 @@ sys.modules["rich.progress"] = progress_module
                     .get_item(5)?
                     .get_item("description")?
                     .extract::<String>()?,
-                "Failed"
+                "Failed: orders"
             );
             Ok(())
         })
@@ -894,7 +1335,7 @@ sys.modules["rich.progress"] = progress_module
             let console = records.get_item(0)?.cast_into::<PyDict>()?;
             assert!(console.get_item("stderr")?.unwrap().extract::<bool>()?);
             let progress = records.get_item(1)?.cast_into::<PyDict>()?;
-            assert_eq!(progress.get_item("columns")?.unwrap().extract::<u8>()?, 4);
+            assert_eq!(progress.get_item("columns")?.unwrap().extract::<u8>()?, 5);
             assert!(
                 !progress
                     .get_item("auto_refresh")?
@@ -925,7 +1366,7 @@ sys.modules["rich.progress"] = progress_module
                     .get_item(4)?
                     .get_item("description")?
                     .extract::<String>()?,
-                "Planning output"
+                "Planning output: orders"
             );
             assert!(
                 records
@@ -938,7 +1379,7 @@ sys.modules["rich.progress"] = progress_module
                     .get_item(5)?
                     .get_item("description")?
                     .extract::<String>()?,
-                "Completed"
+                "Completed: orders"
             );
             assert!(
                 records

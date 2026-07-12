@@ -133,3 +133,44 @@ report = daily_orders.write_to_mssql(
 The returned report is a plain Python `dict` converted from Rust report types.
 Report formatting is designed to avoid exposing connection strings,
 credentials, and raw row values.
+
+### Progress display
+
+`progress=None`, the default, shows a Rich progress display when Rich detects
+an interactive terminal or Jupyter. Use `progress=True` to force the display in
+scripts or CI, or `progress=False` to disable it.
+
+```python
+report = daily_orders.write_to_mssql(
+    schema="dbo",
+    table="daily_orders",
+    load_mode="create_and_load",
+    progress=True,
+)
+```
+
+The display starts without a percentage. When the query plan has complete
+statistics for at least one selected Delta file, the same display becomes a
+determinate bar. Its percentage measures selected Delta files handled. Files
+removed by Delta metadata pruning are outside that selected total. File sizes
+can differ, so the percentage is not an estimate of bytes read, elapsed time,
+or whole-action completion.
+
+The file line can show `Delta files 8/10 | pruned 3 at runtime, ~90 in
+planning`. Runtime pruning is the exact number of selected files skipped while
+the query ran. Planning pruning is an approximate count from Delta Kernel
+metadata selection, so the display prefixes it with `~`.
+
+The description also shows cumulative rows and batches after SQL Server accepts
+each batch. Dry runs do not have write counters. Queries without eligible Delta
+scan statistics, including queries with zero selected files, remain
+indeterminate.
+
+Rapid numeric updates are combined before rendering. Status changes and the
+final result still appear immediately. If an action fails, the final display
+keeps the latest actual file position and accepted write counters instead of
+filling the bar.
+
+Progress reuses statistics already maintained by the active query plan. It does
+not run an extra count query, expand Delta metadata again, or make additional
+object-store requests.

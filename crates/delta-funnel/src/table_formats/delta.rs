@@ -51,6 +51,8 @@ use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot, s3_auth_mode
 pub(crate) struct KernelScanMetadataExpansion {
     /// File-level metadata rows yielded by Delta Kernel scan metadata expansion.
     pub(crate) files: Vec<KernelScanFileMetadata>,
+    /// Approximate Add actions excluded during Kernel metadata planning.
+    pub(crate) files_filtered_during_planning: Option<u64>,
     /// Whether the kernel scan metadata iterator was consumed to completion.
     ///
     /// This records that the adapter did not stop after a partial metadata
@@ -290,13 +292,26 @@ impl ProjectedDeltaScan {
         )?;
         let engine = kernel::DefaultEngineBuilder::new(store).build();
         let mut files = Vec::new();
+        let mut files_filtered_during_planning = Some(0_u64);
+        let mut saw_metadata_batch = false;
 
         for scan_metadata in self.scan.scan_metadata(&engine)? {
-            files = scan_metadata?.visit_scan_files(files, collect_scan_file)?;
+            let scan_metadata = scan_metadata?;
+            saw_metadata_batch = true;
+            files_filtered_during_planning = files_filtered_during_planning.and_then(|total| {
+                kernel::approximate_files_filtered_during_planning(&scan_metadata)
+                    .and_then(|batch| total.checked_add(batch))
+            });
+            files = scan_metadata.visit_scan_files(files, collect_scan_file)?;
         }
 
         Ok(KernelScanMetadataExpansion {
             files,
+            files_filtered_during_planning: if saw_metadata_batch {
+                files_filtered_during_planning
+            } else {
+                None
+            },
             scan_metadata_exhausted: true,
         })
     }
