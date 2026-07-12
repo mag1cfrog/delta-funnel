@@ -104,6 +104,17 @@ impl PyTable {
     ///
     /// Pass `dry_run=True` to plan without writing. Returns a plain Python
     /// `dict` report.
+    ///
+    /// By default, shows an indeterminate phase display in interactive
+    /// terminals and Jupyter, and stays quiet elsewhere. Pass `progress=True`
+    /// to force the display or `progress=False` to disable it. Terminal
+    /// progress uses stderr and remains separate from diagnostic logging.
+    /// Progress display does not provide cancellation.
+    ///
+    /// If Python interrupts progress rendering, Delta Funnel finishes action
+    /// cleanup before raising the interruption. When possible, the exception
+    /// includes `deltafunnel_operation_status` and, for a failed action,
+    /// `deltafunnel_operation_error`.
     #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(
