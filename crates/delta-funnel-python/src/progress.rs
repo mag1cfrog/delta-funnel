@@ -464,11 +464,16 @@ mod tests {
 
     impl StderrGuard {
         fn capture(py: Python<'_>) -> PyResult<(Self, Py<PyAny>)> {
+            let capture = py.import("io")?.call_method0("StringIO")?.unbind();
+            let guard = Self::replace(py, capture.bind(py))?;
+            Ok((guard, capture))
+        }
+
+        fn replace(py: Python<'_>, replacement: &Bound<'_, PyAny>) -> PyResult<Self> {
             let sys = py.import("sys")?;
             let original = sys.getattr("stderr")?.unbind();
-            let capture = py.import("io")?.call_method0("StringIO")?.unbind();
-            sys.setattr("stderr", capture.bind(py))?;
-            Ok((Self { original }, capture))
+            sys.setattr("stderr", replacement)?;
+            Ok(Self { original })
         }
     }
 
@@ -1107,6 +1112,138 @@ sys.modules["rich.progress"] = progress_module
 
                 drop(stderr);
                 drop(guard);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn exceptions_that_reject_metadata_are_still_raised_unchanged() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+class RejectingKeyboardInterrupt(KeyboardInterrupt):
+    def __setattr__(self, name, value):
+        raise RuntimeError("metadata rejected")
+
+class RejectingBaseException(BaseException):
+    def __setattr__(self, name, value):
+        raise RuntimeError("metadata rejected")
+
+failures = [
+    RejectingKeyboardInterrupt("keyboard marker"),
+    RejectingBaseException("custom marker"),
+]
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )?;
+            let failures = locals
+                .get_item("failures")?
+                .ok_or_else(|| PyRuntimeError::new_err("missing hostile exceptions"))?
+                .cast_into::<PyList>()?;
+
+            for failure in failures.iter() {
+                let (guard, _records, failure) = ModuleGuard::install_with_exception(
+                    py,
+                    true,
+                    false,
+                    Some("update"),
+                    failure,
+                    false,
+                )?;
+                let (stderr, _capture) = StderrGuard::capture(py)?;
+
+                let error = dry_run(py, Some(Some(true))).unwrap_err();
+
+                assert!(error.value(py).is(failure.bind(py)));
+                assert!(
+                    error
+                        .value(py)
+                        .getattr("deltafunnel_operation_status")
+                        .is_err()
+                );
+
+                drop(stderr);
+                drop(guard);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn hostile_stderr_is_called_once_and_cannot_replace_the_interruption() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            for mode in ["short", "buffer", "fail", "interrupt", "mutate"] {
+                let (module_guard, _records, failure) = ModuleGuard::install_with_failure(
+                    py,
+                    true,
+                    false,
+                    Some("update"),
+                    true,
+                    false,
+                )?;
+                let locals = PyDict::new(py);
+                locals.set_item("failure", failure.bind(py))?;
+                locals.set_item("mode", mode)?;
+                py.run(
+                    c_str!(
+                        r#"
+class HostileStderr:
+    def __init__(self):
+        self.calls = []
+        self.buffered = None
+
+    def write(self, message):
+        self.calls.append(message)
+        if mode == "short":
+            return 1
+        if mode == "buffer":
+            self.buffered = message
+            return len(message)
+        if mode == "fail":
+            raise RuntimeError("stderr failed")
+        if mode == "interrupt":
+            raise SystemExit("stderr interrupted")
+        failure.stderr_touched = True
+        return len(message)
+
+stream = HostileStderr()
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )?;
+                let stream = locals
+                    .get_item("stream")?
+                    .ok_or_else(|| PyRuntimeError::new_err("missing hostile stderr"))?;
+                let stderr_guard = StderrGuard::replace(py, &stream)?;
+
+                let error = dry_run(py, Some(Some(true))).unwrap_err();
+
+                assert!(error.value(py).is(failure.bind(py)));
+                let calls = stream.getattr("calls")?.cast_into::<PyList>()?;
+                assert_eq!(calls.len(), 1);
+                assert_eq!(
+                    calls.get_item(0)?.extract::<String>()?,
+                    "DeltaFunnel action status: completed; the Python result was not delivered.\n"
+                );
+                if mode == "mutate" {
+                    assert!(
+                        error
+                            .value(py)
+                            .getattr("stderr_touched")?
+                            .extract::<bool>()?
+                    );
+                }
+
+                drop(stderr_guard);
+                drop(module_guard);
             }
             Ok(())
         })
