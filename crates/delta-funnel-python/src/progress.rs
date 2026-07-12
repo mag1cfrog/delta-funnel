@@ -903,6 +903,12 @@ sys.modules["rich.progress"] = progress_module
                     .extract::<String>()?,
                 "Completed"
             );
+            assert!(
+                records
+                    .get_item(5)?
+                    .get_item("refresh")?
+                    .extract::<bool>()?
+            );
             Ok(())
         })
     }
