@@ -701,6 +701,7 @@ const fn phase_label(phase: ProgressPhase) -> &'static str {
         ProgressPhase::Validating => "Validating write",
         ProgressPhase::SwappingTarget => "Swapping target table",
         ProgressPhase::CleaningUp => "Cleaning up",
+        ProgressPhase::ReportingSources => "Preparing source reports",
         _ => "Working",
     }
 }
@@ -1985,6 +1986,10 @@ stream = HostileStderr()
             "Swapping target table"
         );
         assert_eq!(phase_label(ProgressPhase::CleaningUp), "Cleaning up");
+        assert_eq!(
+            phase_label(ProgressPhase::ReportingSources),
+            "Preparing source reports"
+        );
     }
 
     #[test]

@@ -47,6 +47,8 @@ pub enum ProgressPhase {
     SwappingTarget,
     /// Clean up a target created by Delta Funnel after failure.
     CleaningUp,
+    /// Build source reports after output work has finished.
+    ReportingSources,
 }
 
 /// Kind of one typed progress event.

@@ -118,6 +118,22 @@ impl DeltaFunnelRuntime {
         session.dry_run_all_to_mssql_with_tracing(requests)
     }
 
+    /// Runs a multi-output dry run and reports its live progress to the caller.
+    ///
+    /// Progress describes work while it is happening. The returned report
+    /// describes the completed dry-run result. Reporting progress does not
+    /// change that result.
+    #[doc(hidden)]
+    pub fn dry_run_all_to_mssql_with_progress(
+        &self,
+        session: &DeltaFunnelSession,
+        requests: &[OutputWritePlan],
+        reporter: ProgressReporter,
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        session.dry_run_all_to_mssql_with_progress(requests, reporter)
+    }
+
     /// Runs a multi-output dry run with source scan-summary options.
     ///
     /// # Errors
