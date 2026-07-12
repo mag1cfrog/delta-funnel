@@ -205,16 +205,14 @@ impl PySession {
         request: &delta_funnel::OutputWritePlan,
         progress: Option<&PythonProgress>,
     ) -> PyResult<Py<PyAny>> {
-        let report = progress.map_or_else(
-            || self.runtime.dry_run_to_mssql(&self.inner, request),
-            |progress| {
-                self.runtime.dry_run_to_mssql_with_progress(
-                    &self.inner,
-                    request,
-                    progress.reporter(),
-                )
-            },
-        );
+        let report = match progress {
+            Some(progress) => self.runtime.dry_run_to_mssql_with_progress(
+                &self.inner,
+                request,
+                progress.reporter(),
+            ),
+            None => self.runtime.dry_run_to_mssql(&self.inner, request),
+        };
         let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
             progress.finish(py, report.as_ref().err())?;
@@ -223,23 +221,22 @@ impl PySession {
         json_value_to_py(py, &report.to_json_value())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the GIL-detached call carries the core error until Python conversion resumes"
+    )]
     pub(crate) fn write_to_mssql(
         &self,
         py: Python<'_>,
         request: &delta_funnel::OutputWritePlan,
         progress: Option<&PythonProgress>,
     ) -> PyResult<Py<PyAny>> {
-        let report = py.detach(|| {
-            progress.map_or_else(
-                || self.runtime.write_to_mssql(&self.inner, request),
-                |progress| {
-                    self.runtime.write_to_mssql_with_progress(
-                        &self.inner,
-                        request,
-                        progress.reporter(),
-                    )
-                },
-            )
+        let report = py.detach(|| match progress {
+            Some(progress) => {
+                self.runtime
+                    .write_to_mssql_with_progress(&self.inner, request, progress.reporter())
+            }
+            None => self.runtime.write_to_mssql(&self.inner, request),
         });
         let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
@@ -249,6 +246,10 @@ impl PySession {
         json_value_to_py(py, &report.to_json_value())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the GIL-detached call carries the core error until Python conversion resumes"
+    )]
     pub(crate) fn preview_table(
         &self,
         py: Python<'_>,
@@ -271,6 +272,10 @@ impl PySession {
         json_value_to_py(py, &report.to_json_value())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the GIL-detached call carries the core error until Python conversion resumes"
+    )]
     fn execute_write_all(
         &self,
         py: Python<'_>,

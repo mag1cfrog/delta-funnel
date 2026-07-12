@@ -5603,11 +5603,10 @@ impl SyntheticPartitionedWorkPlan {
             bytes_max: bytes.iter().copied().max().unwrap_or_default(),
             work_micros_p50: percentile_nearest_rank(work.clone(), 50),
             work_micros_p95: percentile_nearest_rank(work.clone(), 95),
-            work_imbalance_basis_points: if average_work == 0 {
-                0
-            } else {
-                max_work.saturating_mul(10_000) / average_work
-            },
+            work_imbalance_basis_points: max_work
+                .saturating_mul(10_000)
+                .checked_div(average_work)
+                .unwrap_or_default(),
         }
     }
 }
