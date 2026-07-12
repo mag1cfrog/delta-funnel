@@ -1,114 +1,231 @@
-//! Bridges core progress events to one lazily created Rich progress task.
+//! Shows core progress events with one lazily created Rich progress task.
 //!
-//! The bridge is created per Python action. It owns no Python objects until the
-//! core emits `Started`, then updates the same task through the final lifecycle
-//! event. Rich decides whether that task uses terminal or Jupyter rendering.
+//! Each Python write creates its own adapter. The adapter imports nothing from
+//! Rich until the Rust action starts, then updates the same task until the
+//! action finishes. Rich chooses terminal or Jupyter rendering.
 
 use std::sync::{Arc, Mutex};
 
 use delta_funnel::progress::{
     ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
 };
+use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-/// Per-action owner of the core reporter connected to Python rendering.
+/// Connects one Rust action to one optional Rich progress display.
 pub(crate) struct PythonProgress {
     reporter: ProgressReporter,
+    state: Arc<Mutex<ProgressState>>,
 }
 
 impl PythonProgress {
-    /// Creates the bridge unless the caller explicitly disabled progress.
+    /// Creates an adapter unless the caller passed `progress=False`.
     ///
-    /// `None` uses Rich's environment detection, while `Some(true)` forces
-    /// interactive rendering without selecting a terminal or Jupyter backend.
+    /// `progress=None` shows progress only when Rich detects an interactive
+    /// terminal or Jupyter. `progress=True` also shows it in scripts and CI.
     pub(crate) fn new(progress: Option<bool>) -> Option<Self> {
         let mode = match progress {
             Some(false) => return None,
             Some(true) => ProgressMode::Forced,
             None => ProgressMode::Automatic,
         };
-        let state = Arc::new(Mutex::new(RenderState::Pending(mode)));
+        let state = Arc::new(Mutex::new(ProgressState::new(mode)));
         let reporter_state = Arc::clone(&state);
         let reporter = ProgressReporter::new(move |event| render_event(&reporter_state, event));
-        Some(Self { reporter })
+        Some(Self { reporter, state })
     }
 
-    /// Returns the cloneable reporter passed into the core action.
+    /// Returns the reporter that the Rust action uses to send progress events.
     pub(crate) fn reporter(&self) -> ProgressReporter {
         self.reporter.clone()
     }
+
+    /// Closes the Rich progress display after the Rust action finishes.
+    ///
+    /// If Rich raised a Python interruption such as `KeyboardInterrupt` during
+    /// the action, returns that same exception now.
+    pub(crate) fn finish(&self, py: Python<'_>) -> PyResult<()> {
+        // Set the shared state to Done before calling Rich. If Rich calls back
+        // into this adapter while stopping, it cannot stop the display twice.
+        let mut state = {
+            let mut shared = match self.state.lock() {
+                Ok(shared) => shared,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::replace(&mut *shared, ProgressState::done())
+        };
+
+        if let RenderState::Active { renderer, .. } = state.render
+            && let Err(error) = renderer.progress.call_method0(py, "stop")
+            && !error.is_instance_of::<PyException>(py)
+            && state.pending_interruption.is_none()
+        {
+            state.pending_interruption = Some(error);
+        }
+
+        match state.pending_interruption {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
 }
 
-/// Controls whether Rich may suppress rendering in a non-interactive process.
+/// Controls whether Rich may hide progress in a non-interactive process.
 #[derive(Clone, Copy)]
 enum ProgressMode {
-    /// Render only when Rich detects an interactive terminal or Jupyter.
+    /// Show progress only in an interactive terminal or Jupyter.
     Automatic,
-    /// Ask Rich to render even when its environment is non-interactive.
+    /// Show progress even in scripts, pipes, or CI.
     Forced,
 }
 
-/// The two Python objects needed to update one Rich task.
+/// Python handles needed to update one Rich task.
 struct RichRenderer {
     progress: Py<PyAny>,
     task_id: Py<PyAny>,
 }
 
-/// Lifecycle state for one action's renderer.
+/// Current display state and the first Python interruption waiting to be raised.
+struct ProgressState {
+    render: RenderState,
+    pending_interruption: Option<PyErr>,
+}
+
+impl ProgressState {
+    const fn new(mode: ProgressMode) -> Self {
+        Self {
+            render: RenderState::Pending(mode),
+            pending_interruption: None,
+        }
+    }
+
+    const fn busy() -> Self {
+        Self {
+            render: RenderState::Busy,
+            pending_interruption: None,
+        }
+    }
+
+    const fn done() -> Self {
+        Self {
+            render: RenderState::Done,
+            pending_interruption: None,
+        }
+    }
+}
+
+/// Current state of one action's Rich display.
 enum RenderState {
-    /// No Python object exists yet; wait for the core `Started` event.
+    /// The Rust action has not started, so no Rich objects exist yet.
     Pending(ProgressMode),
-    /// One Rich task exists and remains eligible for boundary cleanup.
+    /// A Rich task exists and must still be stopped after the Rust action.
     Active {
         renderer: RichRenderer,
-        /// False after a phase update cannot attach to Python or render.
+        /// False after an update fails; final cleanup is still allowed.
         updates_enabled: bool,
     },
-    /// Temporary ownership sentinel while arbitrary Python runs without the mutex.
+    /// A Rich call is running while the task is temporarily outside the mutex.
     Busy,
-    /// Rendering is disabled, unavailable, or finalized for this action.
+    /// Progress is disabled, unavailable, or already closed.
     Done,
 }
 
-/// Applies one synchronous core event without holding the state mutex in Python.
-fn render_event(state: &Mutex<RenderState>, event: &ProgressEvent) {
-    // Move ownership out of the mutex before attaching to Python. Rich methods
-    // are arbitrary Python and must never run while this lock is held.
+/// Result of trying to call Rich from a Rust progress callback.
+enum PythonCall<T> {
+    /// Rich returned normally.
+    Succeeded(T),
+    /// Python was unavailable or Rich raised an ordinary `Exception`.
+    Failed,
+    /// Rich raised a `BaseException` such as `KeyboardInterrupt`.
+    Interrupted(PyErr),
+}
+
+/// Calls Rich when Python is available and classifies any Python exception.
+fn try_python<T>(call: impl for<'py> FnOnce(Python<'py>) -> PyResult<T>) -> PythonCall<T> {
+    Python::try_attach(|py| match call(py) {
+        Ok(value) => PythonCall::Succeeded(value),
+        Err(error) if error.is_instance_of::<PyException>(py) => PythonCall::Failed,
+        Err(error) => PythonCall::Interrupted(error),
+    })
+    .unwrap_or(PythonCall::Failed)
+}
+
+/// Returns Rich's value, or saves the first interruption for `finish`.
+fn successful<T>(call: PythonCall<T>, pending_interruption: &mut Option<PyErr>) -> Option<T> {
+    match call {
+        PythonCall::Succeeded(value) => Some(value),
+        PythonCall::Failed => None,
+        PythonCall::Interrupted(error) => {
+            if pending_interruption.is_none() {
+                *pending_interruption = Some(error);
+            }
+            None
+        }
+    }
+}
+
+/// Handles one Rust progress event and updates Rich when needed.
+fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
+    // Take the state out and release the mutex before calling Rich. Python code
+    // may call other code, so running it while holding the mutex could deadlock.
     let current = {
-        let Ok(mut state) = state.lock() else {
-            return;
+        let mut state = match state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
         };
-        std::mem::replace(&mut *state, RenderState::Busy)
+        std::mem::replace(&mut *state, ProgressState::busy())
     };
 
-    let next = match current {
-        // Renderer creation is intentionally delayed until the core confirms
-        // that the action crossed its public Started boundary.
-        RenderState::Pending(mode) if event.kind() == ProgressEventKind::Started => {
-            Python::try_attach(|py| start_renderer(py, mode, event))
-                .flatten()
-                .map_or(RenderState::Done, |renderer| RenderState::Active {
-                    renderer,
-                    updates_enabled: true,
-                })
-        }
-        // Every action-ending event gets one final label and one stop attempt,
-        // even when an earlier phase update disabled further updates.
-        RenderState::Active { renderer, .. } if ends_action(event.kind()) => {
-            let _ = Python::try_attach(|py| finish_renderer(py, &renderer, event.kind()));
-            RenderState::Done
+    let ProgressState {
+        render,
+        mut pending_interruption,
+    } = current;
+    let render = match render {
+        // Wait for Started before importing Rich. Requests rejected before the
+        // action begins should not perform any progress-related Python work.
+        RenderState::Pending(mode) if event.kind() == ProgressEventKind::Started => successful(
+            try_python(|py| start_renderer(py, mode, event)),
+            &mut pending_interruption,
+        )
+        .flatten()
+        .map_or(RenderState::Done, |renderer| RenderState::Active {
+            renderer,
+            updates_enabled: true,
+        }),
+        // Show the final result now, but keep the task open. `finish` stops it
+        // only after the Rust action has returned and completed its cleanup.
+        RenderState::Active {
+            renderer,
+            updates_enabled,
+        } if ends_action(event.kind()) => {
+            let updates_enabled = if updates_enabled {
+                successful(
+                    try_python(|py| update_renderer(py, &renderer, terminal_label(event.kind()))),
+                    &mut pending_interruption,
+                )
+                .is_some()
+            } else {
+                false
+            };
+            RenderState::Active {
+                renderer,
+                updates_enabled,
+            }
         }
         RenderState::Active {
             renderer,
             updates_enabled: true,
         } if event.kind() == ProgressEventKind::PhaseChanged => {
-            // Phase-only progress ignores numeric Progress events until #434.
-            // Losing Python attachment or a Rich update disables later phase
-            // updates, while retaining the renderer for boundary cleanup.
+            // This issue shows phases only. #434 will handle numeric Progress
+            // events. If this update fails, stop later updates but keep the
+            // task so `finish` can still close it once.
             let updated = event.phase().is_none_or(|phase| {
-                Python::try_attach(|py| update_renderer(py, &renderer, phase_label(phase)))
-                    .is_some_and(|result| result.is_ok())
+                successful(
+                    try_python(|py| update_renderer(py, &renderer, phase_label(phase))),
+                    &mut pending_interruption,
+                )
+                .is_some()
             });
             RenderState::Active {
                 renderer,
@@ -120,100 +237,89 @@ fn render_event(state: &Mutex<RenderState>, event: &ProgressEvent) {
         | state @ RenderState::Done => state,
         RenderState::Busy => RenderState::Done,
     };
+    let next = ProgressState {
+        render,
+        pending_interruption,
+    };
 
-    // Core callbacks are serial, so the state can be returned after the Python
-    // call without another callback legitimately taking ownership in between.
-    if let Ok(mut state) = state.lock() {
-        *state = next;
-    }
+    // Rust sends these events one at a time, so returning the state here cannot
+    // overwrite work from another progress callback.
+    let mut state = match state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *state = next;
 }
 
-/// Lazily creates one Rich console, progress display, and indeterminate task.
+/// Creates one Rich display after the Rust action has started.
+///
+/// Returns `Ok(None)` when automatic progress should stay hidden.
 fn start_renderer(
     py: Python<'_>,
     mode: ProgressMode,
     event: &ProgressEvent,
-) -> Option<RichRenderer> {
-    // Rich owns terminal and Jupyter capability detection. Delta Funnel only
-    // chooses stderr for terminal output and whether rendering is forced.
-    let console_type = py.import("rich.console").ok()?.getattr("Console").ok()?;
+) -> PyResult<Option<RichRenderer>> {
+    // Rich detects the terminal or Jupyter environment. Delta Funnel only asks
+    // for stderr in terminals and tells Rich when progress is forced.
+    let console_type = py.import("rich.console")?.getattr("Console")?;
     let console_kwargs = PyDict::new(py);
-    console_kwargs.set_item("stderr", true).ok()?;
+    console_kwargs.set_item("stderr", true)?;
     if matches!(mode, ProgressMode::Forced) {
-        console_kwargs.set_item("force_interactive", true).ok()?;
+        console_kwargs.set_item("force_interactive", true)?;
     }
-    let console = console_type.call((), Some(&console_kwargs)).ok()?;
+    let console = console_type.call((), Some(&console_kwargs))?;
 
-    // Automatic mode stays quiet for scripts, pipes, and CI. A Jupyter console
-    // is considered renderable even though it is not an interactive terminal.
-    if matches!(mode, ProgressMode::Automatic)
-        && !console
-            .getattr("is_interactive")
-            .and_then(|value| value.extract::<bool>())
-            .unwrap_or(false)
-        && !console
-            .getattr("is_jupyter")
-            .and_then(|value| value.extract::<bool>())
-            .unwrap_or(false)
-    {
-        return None;
+    // Rich reports Jupyter separately from interactive terminals. Automatic
+    // mode stays quiet only when Rich reports neither one.
+    let is_interactive = console.getattr("is_interactive")?.extract::<bool>()?;
+    let is_jupyter = console.getattr("is_jupyter")?.extract::<bool>()?;
+    if matches!(mode, ProgressMode::Automatic) && !is_interactive && !is_jupyter {
+        return Ok(None);
     }
 
-    // Keep presentation identical across Rich backends: elapsed time, stable
-    // description, the bar, then its determinate or indeterminate status.
-    let progress_module = py.import("rich.progress").ok()?;
-    let progress_type = progress_module.getattr("Progress").ok()?;
-    let elapsed_column = progress_module
-        .getattr("TimeElapsedColumn")
-        .ok()?
-        .call0()
-        .ok()?;
-    let bar_column = progress_module.getattr("BarColumn").ok()?.call0().ok()?;
-    let task_progress_column = progress_module
-        .getattr("TaskProgressColumn")
-        .ok()?
-        .call0()
-        .ok()?;
+    // Use the same columns in terminals and notebooks: elapsed time, current
+    // phase, progress bar, and numeric progress when a total becomes available.
+    let progress_module = py.import("rich.progress")?;
+    let progress_type = progress_module.getattr("Progress")?;
+    let elapsed_column = progress_module.getattr("TimeElapsedColumn")?.call0()?;
+    let bar_column = progress_module.getattr("BarColumn")?.call0()?;
+    let task_progress_column = progress_module.getattr("TaskProgressColumn")?.call0()?;
 
-    // Core events drive every refresh. Disabling Rich's background refresher
-    // avoids a worker thread and makes notebook updates deterministic.
+    // Refresh only when Rust sends an event. A background refresh thread is not
+    // useful for these infrequent phase changes.
     let progress_kwargs = PyDict::new(py);
-    progress_kwargs.set_item("console", console).ok()?;
-    progress_kwargs.set_item("auto_refresh", false).ok()?;
-    progress_kwargs.set_item("transient", false).ok()?;
-    progress_kwargs.set_item("redirect_stdout", false).ok()?;
-    progress_kwargs.set_item("redirect_stderr", false).ok()?;
-    let progress = progress_type
-        .call(
-            (
-                elapsed_column,
-                "{task.description}",
-                bar_column,
-                task_progress_column,
-            ),
-            Some(&progress_kwargs),
-        )
-        .ok()?;
+    progress_kwargs.set_item("console", console)?;
+    progress_kwargs.set_item("auto_refresh", false)?;
+    progress_kwargs.set_item("transient", false)?;
+    progress_kwargs.set_item("redirect_stdout", false)?;
+    progress_kwargs.set_item("redirect_stderr", false)?;
+    let progress = progress_type.call(
+        (
+            elapsed_column,
+            "{task.description}",
+            bar_column,
+            task_progress_column,
+        ),
+        Some(&progress_kwargs),
+    )?;
 
-    // Start indeterminate. #434 will set total and completed on this same task,
-    // preserving the renderer and elapsed time when file totals become known.
+    // Start without a total. #434 will add the file total to this same task so
+    // the display and elapsed time continue without restarting.
     let task_kwargs = PyDict::new(py);
-    task_kwargs.set_item("total", py.None()).ok()?;
-    let task_id = progress
-        .call_method(
-            "add_task",
-            (operation_label(event.operation()),),
-            Some(&task_kwargs),
-        )
-        .ok()?;
-    progress.call_method0("start").ok()?;
-    Some(RichRenderer {
+    task_kwargs.set_item("total", py.None())?;
+    let task_id = progress.call_method(
+        "add_task",
+        (operation_label(event.operation()),),
+        Some(&task_kwargs),
+    )?;
+    progress.call_method0("start")?;
+    Ok(Some(RichRenderer {
         progress: progress.unbind(),
         task_id: task_id.unbind(),
-    })
+    }))
 }
 
-/// Changes the task description and explicitly refreshes notebook output.
+/// Shows a new description immediately in both terminals and notebooks.
 fn update_renderer(py: Python<'_>, renderer: &RichRenderer, description: &str) -> PyResult<()> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("description", description)?;
@@ -224,16 +330,9 @@ fn update_renderer(py: Python<'_>, renderer: &RichRenderer, description: &str) -
     Ok(())
 }
 
-/// Shows the final action state and makes the single boundary stop attempt.
-fn finish_renderer(py: Python<'_>, renderer: &RichRenderer, kind: ProgressEventKind) {
-    let _ = update_renderer(py, renderer, terminal_label(kind));
-    let _ = renderer.progress.call_method0(py, "stop");
-}
-
-/// Returns whether an event permanently ends the progress action.
+/// Returns true when Rust will send no more progress for this action.
 ///
-/// This is a lifecycle boundary and is unrelated to terminal versus Jupyter
-/// rendering.
+/// This describes the action state, not terminal versus Jupyter rendering.
 const fn ends_action(kind: ProgressEventKind) -> bool {
     matches!(
         kind,
@@ -244,7 +343,7 @@ const fn ends_action(kind: ProgressEventKind) -> bool {
     )
 }
 
-/// Returns the description shown before the first phase is available.
+/// Returns the text shown before Rust reports the first phase.
 const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
     match operation {
         Some(ProgressOperation::WriteToMssql) => "Writing to SQL Server",
@@ -253,7 +352,7 @@ const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
     }
 }
 
-/// Maps internal phases to stable, sanitized user-facing descriptions.
+/// Returns safe, stable text for an internal Rust phase.
 const fn phase_label(phase: ProgressPhase) -> &'static str {
     match phase {
         ProgressPhase::PlanningOutput => "Planning output",
@@ -268,7 +367,7 @@ const fn phase_label(phase: ProgressPhase) -> &'static str {
     }
 }
 
-/// Maps an action-ending event to its final user-facing description.
+/// Returns the final text shown when the action ends.
 const fn terminal_label(kind: ProgressEventKind) -> &'static str {
     match kind {
         ProgressEventKind::Completed => "Completed",
@@ -283,6 +382,7 @@ const fn terminal_label(kind: ProgressEventKind) -> &'static str {
 mod tests {
     use std::sync::{MutexGuard, PoisonError};
 
+    use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
     use pyo3::ffi::c_str;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
 
@@ -306,6 +406,18 @@ mod tests {
             interactive: bool,
             jupyter: bool,
         ) -> PyResult<(Self, Py<PyList>)> {
+            let (guard, records, _) =
+                Self::install_with_failure(py, interactive, jupyter, None, false)?;
+            Ok((guard, records))
+        }
+
+        fn install_with_failure(
+            py: Python<'_>,
+            interactive: bool,
+            jupyter: bool,
+            fail_call: Option<&str>,
+            interruption: bool,
+        ) -> PyResult<(Self, Py<PyList>, Py<PyAny>)> {
             let modules = py
                 .import("sys")?
                 .getattr("modules")?
@@ -323,11 +435,24 @@ mod tests {
             locals.set_item("records", &records)?;
             locals.set_item("interactive", interactive)?;
             locals.set_item("jupyter", jupyter)?;
+            locals.set_item("fail_call", fail_call)?;
+            let failure = if interruption {
+                py.get_type::<PyKeyboardInterrupt>()
+                    .call1(("renderer interrupted",))?
+            } else {
+                py.get_type::<PyRuntimeError>()
+                    .call1(("renderer failed",))?
+            };
+            locals.set_item("failure", &failure)?;
             py.run(
                 c_str!(
                     r#"
 import sys
 import types
+
+def maybe_fail(call):
+    if fail_call == call:
+        raise failure
 
 class Console:
     def __init__(self, **kwargs):
@@ -355,9 +480,11 @@ class Progress:
 
     def update(self, task_id, **kwargs):
         records.append({"call": "update", "task_id": task_id, **kwargs})
+        maybe_fail("update")
 
     def stop(self):
         records.append({"call": "stop"})
+        maybe_fail("stop")
 
 rich = types.ModuleType("rich")
 rich.__path__ = []
@@ -378,7 +505,7 @@ sys.modules["rich.progress"] = progress_module
                 Some(&locals),
                 Some(&locals),
             )?;
-            Ok((Self { originals }, records.unbind()))
+            Ok((Self { originals }, records.unbind(), failure.unbind()))
         }
     }
 
@@ -418,6 +545,20 @@ sys.modules["rich.progress"] = progress_module
         if let Some(progress) = progress {
             kwargs.set_item("progress", progress)?;
         }
+        table.call_method("write_to_mssql", (), Some(&kwargs))?;
+        Ok(())
+    }
+
+    fn execute_without_connection(py: Python<'_>) -> PyResult<()> {
+        let module = PyModule::new(py, "deltafunnel")?;
+        deltafunnel(&module)?;
+        let session = module.getattr("Session")?.call0()?;
+        let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("schema", "dbo")?;
+        kwargs.set_item("table", "orders")?;
+        kwargs.set_item("load_mode", "append_existing")?;
+        kwargs.set_item("progress", true)?;
         table.call_method("write_to_mssql", (), Some(&kwargs))?;
         Ok(())
     }
@@ -547,6 +688,78 @@ sys.modules["rich.progress"] = progress_module
                     .extract::<bool>()?
             );
             assert!(record_strings(records.bind(py), "call")?.contains(&"progress".to_owned()));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ordinary_rich_update_failure_does_not_replace_the_report() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, _failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), false)?;
+
+            dry_run(py, Some(Some(true)))?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                ["console", "progress", "add_task", "start", "update", "stop"]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn interruption_from_update_is_raised_after_stop() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true)?;
+
+            let error = dry_run(py, Some(Some(true))).unwrap_err();
+
+            assert!(error.is_instance_of::<PyKeyboardInterrupt>(py));
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                ["console", "progress", "add_task", "start", "update", "stop"]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn interruption_from_stop_is_raised_as_the_same_object() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("stop"), true)?;
+
+            let error = dry_run(py, Some(Some(true))).unwrap_err();
+
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                record_strings(records.bind(py), "call")?.last(),
+                Some(&"stop".to_owned())
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn detached_execute_raises_saved_interruption_after_core_failure() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true)?;
+
+            let error = execute_without_connection(py).unwrap_err();
+
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                record_strings(records.bind(py), "call")?.last(),
+                Some(&"stop".to_owned())
+            );
             Ok(())
         })
     }

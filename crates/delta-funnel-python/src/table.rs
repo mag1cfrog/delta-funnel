@@ -132,14 +132,14 @@ impl PyTable {
             return self.session.borrow(py).dry_run_to_mssql(
                 py,
                 &spec.write_plan(delta_funnel::RunMode::DryRun),
-                progress.as_ref().map(PythonProgress::reporter),
+                progress.as_ref(),
             );
         }
 
         self.session.borrow(py).write_to_mssql(
             py,
             &spec.write_plan(delta_funnel::RunMode::Execute),
-            progress.as_ref().map(PythonProgress::reporter),
+            progress.as_ref(),
         )
     }
 
