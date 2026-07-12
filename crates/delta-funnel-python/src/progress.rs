@@ -390,6 +390,8 @@ const fn terminal_label(kind: ProgressEventKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
     use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PySystemExit};
     use pyo3::ffi::c_str;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
@@ -398,12 +400,28 @@ mod tests {
     use crate::{deltafunnel, test_support::python_state};
 
     const MODULE_NAMES: [&str; 3] = ["rich", "rich.console", "rich.progress"];
+    type ModuleSnapshot = Vec<(&'static str, Option<Py<PyAny>>)>;
 
     struct ModuleGuard {
         originals: Vec<(&'static str, Option<Py<PyAny>>)>,
     }
 
     impl ModuleGuard {
+        fn snapshot(py: Python<'_>) -> PyResult<ModuleSnapshot> {
+            let modules = py
+                .import("sys")?
+                .getattr("modules")?
+                .cast_into::<PyDict>()?;
+            MODULE_NAMES
+                .iter()
+                .map(|name| {
+                    modules
+                        .get_item(name)
+                        .map(|value| (*name, value.map(Bound::unbind)))
+                })
+                .collect()
+        }
+
         fn install(
             py: Python<'_>,
             interactive: bool,
@@ -422,18 +440,7 @@ mod tests {
             interruption: bool,
             stop_also_interrupts: bool,
         ) -> PyResult<(Self, Py<PyList>, Py<PyAny>)> {
-            let modules = py
-                .import("sys")?
-                .getattr("modules")?
-                .cast_into::<PyDict>()?;
-            let originals = MODULE_NAMES
-                .iter()
-                .map(|name| {
-                    modules
-                        .get_item(name)
-                        .map(|value| (*name, value.map(Bound::unbind)))
-                })
-                .collect::<PyResult<Vec<_>>>()?;
+            let originals = Self::snapshot(py)?;
             let records = PyList::empty(py);
             let locals = PyDict::new(py);
             locals.set_item("records", &records)?;
@@ -579,6 +586,59 @@ sys.modules["rich.progress"] = progress_module
             .iter()
             .map(|record| record.get_item(key)?.extract::<String>())
             .collect()
+    }
+
+    fn assert_modules_match(
+        py: Python<'_>,
+        expected: &[(&str, Option<Py<PyAny>>)],
+    ) -> PyResult<()> {
+        let modules = py
+            .import("sys")?
+            .getattr("modules")?
+            .cast_into::<PyDict>()?;
+        for (name, expected) in expected {
+            let actual = modules.get_item(name)?;
+            match (actual, expected) {
+                (Some(actual), Some(expected)) => assert!(actual.is(expected.bind(py))),
+                (None, None) => {}
+                _ => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "module {name} was not restored"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn python_state_is_restored_after_unwind_and_poisoned_lock_recovers() -> PyResult<()> {
+        let mut baseline = None;
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _state = python_state();
+            let snapshot = Python::attach(ModuleGuard::snapshot);
+            let Ok(snapshot) = snapshot else {
+                resume_unwind(Box::new("failed to capture Python module state"));
+            };
+            baseline = Some(snapshot);
+            let installed = Python::attach(|py| ModuleGuard::install(py, true, false));
+            let Ok((_modules, _records)) = installed else {
+                resume_unwind(Box::new("failed to install fake Rich modules"));
+            };
+            resume_unwind(Box::new("test unwind"));
+        }));
+        assert!(unwind.is_err());
+        let Some(baseline) = baseline else {
+            return Err(PyRuntimeError::new_err(
+                "test unwind occurred before capturing Python module state",
+            ));
+        };
+
+        // The first guard was poisoned by the unwind. Reacquiring it proves
+        // that python_state recovers the lock instead of failing later tests.
+        let _state = python_state();
+        Python::attach(|py| assert_modules_match(py, &baseline))
     }
 
     #[test]
