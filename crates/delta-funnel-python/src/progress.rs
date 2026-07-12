@@ -221,6 +221,8 @@ impl MetricRenderThrottle {
 struct VisibleProgress {
     phase: Option<ProgressPhase>,
     output_name: Option<String>,
+    output_index: Option<u64>,
+    output_count: Option<u64>,
     files_handled: Option<u64>,
     files_total: Option<u64>,
     files_runtime_pruned: Option<u64>,
@@ -234,6 +236,8 @@ impl VisibleProgress {
         Self {
             phase: None,
             output_name: None,
+            output_index: None,
+            output_count: None,
             files_handled: None,
             files_total: None,
             files_runtime_pruned: None,
@@ -243,13 +247,19 @@ impl VisibleProgress {
         }
     }
 
-    /// Merges one event without discarding file or write values omitted by it.
+    /// Merges one event while retaining metrics only within the same output.
     fn incorporate(&mut self, event: &ProgressEvent) -> bool {
         if let Some(phase) = event.phase() {
+            let output_name = event.output_name().map(str::to_owned);
+            let output_position = event.output_index().zip(event.output_count());
+            if self.output_name != output_name
+                || self.output_index.zip(self.output_count) != output_position
+            {
+                self.clear_metrics();
+            }
             self.phase = Some(phase);
-        }
-        if let Some(output_name) = event.output_name() {
-            self.output_name = Some(output_name.to_owned());
+            self.output_name = output_name;
+            (self.output_index, self.output_count) = output_position.unzip();
         }
         let file_progress = match (
             event.files_handled(),
@@ -265,6 +275,15 @@ impl VisibleProgress {
             _ => None,
         };
         self.incorporate_metrics(file_progress, event.rows().zip(event.batches()))
+    }
+
+    fn clear_metrics(&mut self) {
+        self.files_handled = None;
+        self.files_total = None;
+        self.files_runtime_pruned = None;
+        self.files_planning_pruned = None;
+        self.rows = None;
+        self.batches = None;
     }
 
     /// Merges monotonic counters and reports whether a visible value changed.
@@ -339,7 +358,10 @@ impl VisibleProgress {
         } else {
             self.phase.map_or("Working", phase_label)
         };
-        let mut description = label.to_owned();
+        let mut description = match self.output_index.zip(self.output_count) {
+            Some((index, count)) => format!("Output {index}/{count} - {label}"),
+            None => label.to_owned(),
+        };
         if let Some(output_name) = &self.output_name {
             description.push_str(": ");
             description.push_str(output_name);
@@ -624,13 +646,20 @@ fn update_renderer(
 ) -> PyResult<()> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("description", description)?;
-    if let (Some(handled), Some(total)) = (visible.files_handled, visible.files_total) {
-        kwargs.set_item("completed", handled)?;
-        kwargs.set_item("total", total)?;
+    match (visible.files_handled, visible.files_total) {
+        (Some(handled), Some(total)) => {
+            kwargs.set_item("completed", handled)?;
+            kwargs.set_item("total", total)?;
+        }
+        _ => {
+            kwargs.set_item("completed", 0)?;
+            kwargs.set_item("total", py.None())?;
+        }
     }
-    if let Some(file_progress) = visible.file_progress_text() {
-        kwargs.set_item("file_progress", file_progress)?;
-    }
+    kwargs.set_item(
+        "file_progress",
+        visible.file_progress_text().unwrap_or_default(),
+    )?;
     kwargs.set_item("refresh", true)?;
     renderer
         .progress
@@ -1168,6 +1197,33 @@ sys.modules["rich.progress"] = progress_module
         Ok(())
     }
 
+    fn dry_run_all(py: Python<'_>, output_names: &[&str]) -> PyResult<()> {
+        let module = PyModule::new(py, "deltafunnel")?;
+        deltafunnel(&module)?;
+        let session_kwargs = PyDict::new(py);
+        session_kwargs.set_item(
+            "default_mssql_connection_string",
+            "server=tcp:sql.example.com;password=secret-token",
+        )?;
+        let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+        let outputs = output_names
+            .iter()
+            .map(|output_name| {
+                let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("schema", "dbo")?;
+                kwargs.set_item("table", output_name)?;
+                kwargs.set_item("load_mode", "create_and_load")?;
+                table.call_method("to_mssql", (), Some(&kwargs))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("dry_run", true)?;
+        kwargs.set_item("progress", true)?;
+        session.call_method("write_all", (PyList::new(py, outputs)?,), Some(&kwargs))?;
+        Ok(())
+    }
+
     fn execute_without_connection(py: Python<'_>) -> PyResult<()> {
         let module = PyModule::new(py, "deltafunnel")?;
         deltafunnel(&module)?;
@@ -1317,6 +1373,49 @@ sys.modules["rich.progress"] = progress_module
                     .get_item("description")?
                     .extract::<String>()?,
                 "Failed: orders"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_uses_one_task_and_clears_output_scope_before_completion() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+
+            dry_run_all(py, &["west", "east"])?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "progress", "add_task", "start", "update", "update", "update",
+                    "update", "stop"
+                ]
+            );
+            let descriptions = records
+                .bind(py)
+                .iter()
+                .filter_map(|record| {
+                    (record.get_item("call").ok()?.extract::<String>().ok()? == "update")
+                        .then(|| {
+                            record
+                                .get_item("description")
+                                .ok()?
+                                .extract::<String>()
+                                .ok()
+                        })
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                descriptions,
+                [
+                    "Output 1/2 - Planning output: west",
+                    "Output 2/2 - Planning output: east",
+                    "Preparing source reports",
+                    "Completed",
+                ]
             );
             Ok(())
         })
