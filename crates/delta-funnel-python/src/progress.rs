@@ -210,13 +210,22 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
         // Wait for Started before importing Rich. Requests rejected before the
         // action begins should not perform any progress-related Python work.
         RenderState::Pending(mode) if event.kind() == ProgressEventKind::Started => successful(
-            try_python(|py| start_renderer(py, mode, event)),
+            try_python(|py| create_renderer(py, mode, event)),
             &mut pending_interruption,
         )
         .flatten()
-        .map_or(RenderState::Done, |renderer| RenderState::Active {
-            renderer,
-            updates_enabled: true,
+        .map_or(RenderState::Done, |renderer| {
+            // Keep ownership even if start fails so finish can still make the
+            // one stop attempt after the Rust action returns.
+            let updates_enabled = successful(
+                try_python(|py| start_renderer(py, &renderer)),
+                &mut pending_interruption,
+            )
+            .is_some();
+            RenderState::Active {
+                renderer,
+                updates_enabled,
+            }
         }),
         // Show the final result now, but keep the task open. `finish` stops it
         // only after the Rust action has returned and completed its cleanup.
@@ -280,7 +289,7 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
 /// Creates one Rich display after the Rust action has started.
 ///
 /// Returns `Ok(None)` when automatic progress should stay hidden.
-fn start_renderer(
+fn create_renderer(
     py: Python<'_>,
     mode: ProgressMode,
     event: &ProgressEvent,
@@ -338,11 +347,16 @@ fn start_renderer(
         (operation_label(event.operation()),),
         Some(&task_kwargs),
     )?;
-    progress.call_method0("start")?;
     Ok(Some(RichRenderer {
         progress: progress.unbind(),
         task_id: task_id.unbind(),
     }))
+}
+
+/// Starts a fully constructed Rich task.
+fn start_renderer(py: Python<'_>, renderer: &RichRenderer) -> PyResult<()> {
+    renderer.progress.call_method0(py, "start")?;
+    Ok(())
 }
 
 /// Shows a new description immediately in both terminals and notebooks.
@@ -535,6 +549,7 @@ def maybe_fail(call):
 class Console:
     def __init__(self, **kwargs):
         records.append({"call": "console", **kwargs})
+        maybe_fail("console")
         self.is_interactive = interactive or kwargs.get("force_interactive", False)
         self.is_jupyter = jupyter
 
@@ -548,13 +563,16 @@ class Progress:
             "redirect_stdout": kwargs.get("redirect_stdout"),
             "redirect_stderr": kwargs.get("redirect_stderr"),
         })
+        maybe_fail("progress")
 
     def add_task(self, description, **kwargs):
         records.append({"call": "add_task", "description": description, "total": kwargs.get("total")})
+        maybe_fail("add_task")
         return 7
 
     def start(self):
         records.append({"call": "start"})
+        maybe_fail("start")
 
     def update(self, task_id, **kwargs):
         records.append({"call": "update", "task_id": task_id, **kwargs})
@@ -819,6 +837,59 @@ sys.modules["rich.progress"] = progress_module
                     .extract::<bool>()?
             );
             assert!(record_strings(records.bind(py), "call")?.contains(&"progress".to_owned()));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ordinary_construction_failures_disable_progress_without_cleanup() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            for stage in ["console", "progress", "add_task"] {
+                let (guard, records, _failure) =
+                    ModuleGuard::install_with_failure(py, true, false, Some(stage), false, false)?;
+
+                dry_run(py, Some(Some(true)))?;
+
+                assert!(!record_strings(records.bind(py), "call")?.contains(&"stop".to_owned()));
+                drop(guard);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ordinary_start_failure_still_stops_the_constructed_task() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, _failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("start"), false, false)?;
+
+            dry_run(py, Some(Some(true)))?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                ["console", "progress", "add_task", "start", "stop"]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn start_interruption_is_raised_after_stopping_the_task() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("start"), true, false)?;
+            let (_stderr, _capture) = StderrGuard::capture(py)?;
+
+            let error = dry_run(py, Some(Some(true))).unwrap_err();
+
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                ["console", "progress", "add_task", "start", "stop"]
+            );
             Ok(())
         })
     }
