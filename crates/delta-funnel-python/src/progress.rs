@@ -1244,52 +1244,56 @@ sys.modules["rich.progress"] = progress_module
     fn built_in_interruptions_keep_identity_and_python_state() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
-            for exception_type in [
-                py.get_type::<PyKeyboardInterrupt>(),
-                py.get_type::<PySystemExit>(),
-                py.get_type::<PyGeneratorExit>(),
-            ] {
-                let failure = exception_type.call1(("renderer interrupted", 42))?;
-                let cause = py.get_type::<PyRuntimeError>().call1(("original cause",))?;
-                let context = py
-                    .get_type::<PyRuntimeError>()
-                    .call1(("original context",))?;
-                failure.setattr("__cause__", &cause)?;
-                failure.setattr("__context__", &context)?;
-                let (guard, records, failure) = ModuleGuard::install_with_exception(
-                    py,
-                    true,
-                    false,
-                    Some("update"),
-                    failure,
-                    false,
-                )?;
-                let (stderr, _capture) = StderrGuard::capture(py)?;
+            for stage in ["console", "start", "update", "terminal", "stop"] {
+                for exception_type in [
+                    py.get_type::<PyKeyboardInterrupt>(),
+                    py.get_type::<PySystemExit>(),
+                    py.get_type::<PyGeneratorExit>(),
+                ] {
+                    let failure = exception_type.call1(("renderer interrupted", 42))?;
+                    let cause = py.get_type::<PyRuntimeError>().call1(("original cause",))?;
+                    let context = py
+                        .get_type::<PyRuntimeError>()
+                        .call1(("original context",))?;
+                    failure.setattr("__cause__", &cause)?;
+                    failure.setattr("__context__", &context)?;
+                    let (guard, records, failure) = ModuleGuard::install_with_exception(
+                        py,
+                        true,
+                        false,
+                        Some(stage),
+                        failure,
+                        false,
+                    )?;
+                    let (stderr, _capture) = StderrGuard::capture(py)?;
 
-                let error = dry_run(py, Some(Some(true))).unwrap_err();
-                let value = error.value(py);
+                    let error = dry_run(py, Some(Some(true))).unwrap_err();
+                    let value = error.value(py);
 
-                assert!(value.is(failure.bind(py)));
-                assert_eq!(
-                    value.getattr("args")?.extract::<(String, u8)>()?,
-                    ("renderer interrupted".to_owned(), 42)
-                );
-                assert!(!value.getattr("__traceback__")?.is_none());
-                assert!(value.getattr("__cause__")?.is(&cause));
-                assert!(value.getattr("__context__")?.is(&context));
-                assert_eq!(
-                    value
-                        .getattr("deltafunnel_operation_status")?
-                        .extract::<String>()?,
-                    "completed"
-                );
-                assert_eq!(
-                    record_strings(records.bind(py), "call")?.last(),
-                    Some(&"stop".to_owned())
-                );
+                    assert!(value.is(failure.bind(py)));
+                    assert_eq!(
+                        value.getattr("args")?.extract::<(String, u8)>()?,
+                        ("renderer interrupted".to_owned(), 42)
+                    );
+                    assert!(!value.getattr("__traceback__")?.is_none());
+                    assert!(value.getattr("__cause__")?.is(&cause));
+                    assert!(value.getattr("__context__")?.is(&context));
+                    assert_eq!(
+                        value
+                            .getattr("deltafunnel_operation_status")?
+                            .extract::<String>()?,
+                        "completed"
+                    );
+                    let calls = record_strings(records.bind(py), "call")?;
+                    if stage == "console" {
+                        assert!(!calls.contains(&"stop".to_owned()));
+                    } else {
+                        assert_eq!(calls.last(), Some(&"stop".to_owned()));
+                    }
 
-                drop(stderr);
-                drop(guard);
+                    drop(stderr);
+                    drop(guard);
+                }
             }
             Ok(())
         })
