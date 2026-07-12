@@ -951,6 +951,34 @@ sys.modules["rich.progress"] = progress_module
     }
 
     #[test]
+    fn construction_interruptions_are_raised_after_the_action_without_cleanup() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            for stage in ["console", "progress", "add_task"] {
+                let (guard, records, failure) =
+                    ModuleGuard::install_with_failure(py, true, false, Some(stage), true, false)?;
+                let (stderr, _capture) = StderrGuard::capture(py)?;
+
+                let error = dry_run(py, Some(Some(true))).unwrap_err();
+
+                assert!(error.value(py).is(failure.bind(py)));
+                assert_eq!(
+                    error
+                        .value(py)
+                        .getattr("deltafunnel_operation_status")?
+                        .extract::<String>()?,
+                    "completed"
+                );
+                assert!(!record_strings(records.bind(py), "call")?.contains(&"stop".to_owned()));
+
+                drop(stderr);
+                drop(guard);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
     fn ordinary_start_failure_still_stops_the_constructed_task() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
