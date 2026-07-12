@@ -1261,6 +1261,22 @@ sys.modules["rich.progress"] = progress_module
         Ok(())
     }
 
+    fn execute_all_without_connection(py: Python<'_>) -> PyResult<()> {
+        let module = PyModule::new(py, "deltafunnel")?;
+        deltafunnel(&module)?;
+        let session = module.getattr("Session")?.call0()?;
+        let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+        let output_kwargs = PyDict::new(py);
+        output_kwargs.set_item("schema", "dbo")?;
+        output_kwargs.set_item("table", "orders")?;
+        output_kwargs.set_item("load_mode", "append_existing")?;
+        let output = table.call_method("to_mssql", (), Some(&output_kwargs))?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("progress", true)?;
+        session.call_method("write_all", (PyList::new(py, [output])?,), Some(&kwargs))?;
+        Ok(())
+    }
+
     fn record_strings(records: &Bound<'_, PyList>, key: &str) -> PyResult<Vec<String>> {
         records
             .iter()
@@ -1396,6 +1412,44 @@ sys.modules["rich.progress"] = progress_module
                     .get_item("description")?
                     .extract::<String>()?,
                 "Failed: orders"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_execute_failure_uses_one_failed_rich_lifecycle() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+
+            let error = execute_all_without_connection(py).unwrap_err();
+
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "missing_mssql_connection"
+            );
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "progress", "add_task", "start", "update", "update", "stop"
+                ]
+            );
+            assert_eq!(
+                records
+                    .bind(py)
+                    .get_item(4)?
+                    .get_item("description")?
+                    .extract::<String>()?,
+                "Output 1/1 - Planning output: orders"
+            );
+            assert_eq!(
+                records
+                    .bind(py)
+                    .get_item(5)?
+                    .get_item("description")?
+                    .extract::<String>()?,
+                "Output 1/1 - Failed: orders"
             );
             Ok(())
         })
