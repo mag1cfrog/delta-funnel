@@ -1087,6 +1087,26 @@ sys.modules["rich.progress"] = progress_module
     }
 
     #[test]
+    fn ordinary_stop_failure_does_not_replace_the_report_or_retry() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, _failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("stop"), false, false)?;
+
+            dry_run(py, Some(Some(true)))?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?
+                    .iter()
+                    .filter(|call| call.as_str() == "stop")
+                    .count(),
+                1
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn interruption_from_stop_is_raised_as_the_same_object() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
