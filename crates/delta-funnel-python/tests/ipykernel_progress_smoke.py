@@ -1,3 +1,6 @@
+import os
+import sys
+
 from jupyter_client import KernelManager
 
 
@@ -16,17 +19,22 @@ def execute(client, code):
             return messages
 
 
-manager = KernelManager(kernel_name="python3")
-manager.start_kernel()
-client = manager.client()
-client.start_channels()
+manager = KernelManager(kernel_name=sys.argv[1])
+client = None
 try:
+    manager.start_kernel()
+    client = manager.client()
+    client.start_channels()
     client.wait_for_ready(timeout=30)
+    expected_executable = os.path.realpath(sys.executable)
     action_messages = execute(
         client,
-        """
+        f"""
 import deltafunnel
+import os
+import sys
 
+assert os.path.realpath(sys.executable) == {expected_executable!r}
 table = deltafunnel.Session().table_from_sql("select 1 as id")
 try:
     table.write_to_mssql(
@@ -66,5 +74,9 @@ print("ACTION_DONE")
         for message in sentinel_messages
     )
 finally:
-    client.stop_channels()
-    manager.shutdown_kernel(now=True)
+    try:
+        if client is not None:
+            client.stop_channels()
+    finally:
+        if manager.has_kernel:
+            manager.shutdown_kernel(now=True)

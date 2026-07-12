@@ -141,6 +141,7 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
     let ipykernel_progress_smoke = python_crate
         .join("tests")
         .join("ipykernel_progress_smoke.py");
+    let ipykernel_name = "deltafunnel-progress-smoke";
     let temp_parent = repo_root.join("target").join("xtask");
     let temp_dir = TempDir::create_in(&temp_parent, "python-package-check")?;
     let tool_tmp = temp_dir.path().join("tmp");
@@ -244,7 +245,23 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
 
     let mut command = Command::new(&venv_python);
     command
+        .arg("-m")
+        .arg("ipykernel")
+        .arg("install")
+        .arg("--prefix")
+        .arg(&venv_dir)
+        .arg("--name")
+        .arg(ipykernel_name)
+        .env("TMPDIR", &tool_tmp);
+    run_command(
+        &mut command,
+        "install isolated kernel spec for progress smoke test",
+    )?;
+
+    let mut command = Command::new(&venv_python);
+    command
         .arg(&ipykernel_progress_smoke)
+        .arg(ipykernel_name)
         .env("TMPDIR", &tool_tmp);
     run_command(&mut command, "smoke-test progress in a real ipykernel")?;
 
