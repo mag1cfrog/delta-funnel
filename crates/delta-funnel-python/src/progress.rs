@@ -44,8 +44,9 @@ impl PythonProgress {
     /// Closes the Rich progress display after the Rust action finishes.
     ///
     /// If Rich raised a Python interruption such as `KeyboardInterrupt` during
-    /// the action, returns that same exception now.
-    pub(crate) fn finish(&self, py: Python<'_>) -> PyResult<()> {
+    /// the action, returns that same exception now. When the Rust action also
+    /// failed, attaches its sanitized Python error for callers to inspect.
+    pub(crate) fn finish(&self, py: Python<'_>, operation_error: Option<&PyErr>) -> PyResult<()> {
         // Set the shared state to Done before calling Rich. If Rich calls back
         // into this adapter while stopping, it cannot stop the display twice.
         let mut state = {
@@ -65,7 +66,16 @@ impl PythonProgress {
         }
 
         match state.pending_interruption {
-            Some(error) => Err(error),
+            Some(error) => {
+                if let Some(operation_error) = operation_error {
+                    // Metadata is best effort. A custom exception may reject
+                    // attributes, but it must still be raised unchanged.
+                    let _ = error
+                        .value(py)
+                        .setattr("deltafunnel_operation_error", operation_error.value(py));
+                }
+                Err(error)
+            }
             None => Ok(()),
         }
     }
@@ -380,21 +390,14 @@ const fn terminal_label(kind: ProgressEventKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{MutexGuard, PoisonError};
-
-    use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
+    use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PySystemExit};
     use pyo3::ffi::c_str;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
 
     use super::*;
-    use crate::deltafunnel;
+    use crate::{deltafunnel, test_support::python_state};
 
     const MODULE_NAMES: [&str; 3] = ["rich", "rich.console", "rich.progress"];
-    static PYTHON_STATE: Mutex<()> = Mutex::new(());
-
-    fn python_state() -> MutexGuard<'static, ()> {
-        PYTHON_STATE.lock().unwrap_or_else(PoisonError::into_inner)
-    }
 
     struct ModuleGuard {
         originals: Vec<(&'static str, Option<Py<PyAny>>)>,
@@ -407,7 +410,7 @@ mod tests {
             jupyter: bool,
         ) -> PyResult<(Self, Py<PyList>)> {
             let (guard, records, _) =
-                Self::install_with_failure(py, interactive, jupyter, None, false)?;
+                Self::install_with_failure(py, interactive, jupyter, None, false, false)?;
             Ok((guard, records))
         }
 
@@ -417,6 +420,7 @@ mod tests {
             jupyter: bool,
             fail_call: Option<&str>,
             interruption: bool,
+            stop_also_interrupts: bool,
         ) -> PyResult<(Self, Py<PyList>, Py<PyAny>)> {
             let modules = py
                 .import("sys")?
@@ -444,6 +448,11 @@ mod tests {
                     .call1(("renderer failed",))?
             };
             locals.set_item("failure", &failure)?;
+            locals.set_item("stop_also_interrupts", stop_also_interrupts)?;
+            locals.set_item(
+                "stop_failure",
+                py.get_type::<PySystemExit>().call1(("stop interrupted",))?,
+            )?;
             py.run(
                 c_str!(
                     r#"
@@ -453,6 +462,8 @@ import types
 def maybe_fail(call):
     if fail_call == call:
         raise failure
+    if stop_also_interrupts and call == "stop":
+        raise stop_failure
 
 class Console:
     def __init__(self, **kwargs):
@@ -697,7 +708,7 @@ sys.modules["rich.progress"] = progress_module
         let _state = python_state();
         Python::attach(|py| {
             let (_guard, records, _failure) =
-                ModuleGuard::install_with_failure(py, true, false, Some("update"), false)?;
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), false, false)?;
 
             dry_run(py, Some(Some(true)))?;
 
@@ -714,7 +725,7 @@ sys.modules["rich.progress"] = progress_module
         let _state = python_state();
         Python::attach(|py| {
             let (_guard, records, failure) =
-                ModuleGuard::install_with_failure(py, true, false, Some("update"), true)?;
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
 
             let error = dry_run(py, Some(Some(true))).unwrap_err();
 
@@ -733,7 +744,7 @@ sys.modules["rich.progress"] = progress_module
         let _state = python_state();
         Python::attach(|py| {
             let (_guard, records, failure) =
-                ModuleGuard::install_with_failure(py, true, false, Some("stop"), true)?;
+                ModuleGuard::install_with_failure(py, true, false, Some("stop"), true, false)?;
 
             let error = dry_run(py, Some(Some(true))).unwrap_err();
 
@@ -751,11 +762,38 @@ sys.modules["rich.progress"] = progress_module
         let _state = python_state();
         Python::attach(|py| {
             let (_guard, records, failure) =
-                ModuleGuard::install_with_failure(py, true, false, Some("update"), true)?;
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
 
             let error = execute_without_connection(py).unwrap_err();
 
             assert!(error.value(py).is(failure.bind(py)));
+            let operation_error = error.value(py).getattr("deltafunnel_operation_error")?;
+            assert_eq!(
+                operation_error.getattr("phase")?.extract::<String>()?,
+                "mssql_target_config"
+            );
+            assert_eq!(
+                operation_error.getattr("kind")?.extract::<String>()?,
+                "missing_mssql_connection"
+            );
+            assert_eq!(
+                record_strings(records.bind(py), "call")?.last(),
+                Some(&"stop".to_owned())
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn update_interruption_wins_when_stop_also_interrupts() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, first_interruption) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, true)?;
+
+            let error = dry_run(py, Some(Some(true))).unwrap_err();
+
+            assert!(error.value(py).is(first_interruption.bind(py)));
             assert_eq!(
                 record_strings(records.bind(py), "call")?.last(),
                 Some(&"stop".to_owned())

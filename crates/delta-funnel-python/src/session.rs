@@ -215,10 +215,11 @@ impl PySession {
                 )
             },
         );
+        let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
-            progress.finish(py)?;
+            progress.finish(py, report.as_ref().err())?;
         }
-        let report = report.map_err(|error| rust_error_to_py(py, error))?;
+        let report = report?;
         json_value_to_py(py, &report.to_json_value())
     }
 
@@ -240,10 +241,11 @@ impl PySession {
                 },
             )
         });
+        let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
-            progress.finish(py)?;
+            progress.finish(py, report.as_ref().err())?;
         }
-        let report = report.map_err(|error| rust_error_to_py(py, error))?;
+        let report = report?;
         json_value_to_py(py, &report.to_json_value())
     }
 
