@@ -20,6 +20,10 @@ pub enum ProgressOperation {
     WriteToMssql,
     /// Plan one SQL Server output without executing it.
     DryRunToMssql,
+    /// Execute a multi-output SQL Server write workflow.
+    WriteAllToMssql,
+    /// Plan a multi-output SQL Server write workflow without executing it.
+    DryRunAllToMssql,
 }
 
 /// Stable visible phase of a progress action.
@@ -494,6 +498,21 @@ mod tests {
         assert_eq!(progress.files_planning_pruned(), None);
         assert_eq!(progress.rows(), Some(42));
         assert_eq!(progress.batches(), Some(3));
+    }
+
+    #[test]
+    fn started_events_preserve_each_operation_identity() {
+        for operation in [
+            ProgressOperation::WriteToMssql,
+            ProgressOperation::DryRunToMssql,
+            ProgressOperation::WriteAllToMssql,
+            ProgressOperation::DryRunAllToMssql,
+        ] {
+            assert_eq!(
+                ProgressEvent::started(operation).operation(),
+                Some(operation)
+            );
+        }
     }
 
     #[test]

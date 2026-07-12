@@ -684,6 +684,8 @@ const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
     match operation {
         Some(ProgressOperation::WriteToMssql) => "Writing to SQL Server",
         Some(ProgressOperation::DryRunToMssql) => "Planning SQL Server write",
+        Some(ProgressOperation::WriteAllToMssql) => "Writing outputs to SQL Server",
+        Some(ProgressOperation::DryRunAllToMssql) => "Planning SQL Server outputs",
         _ => "Running SQL Server action",
     }
 }
@@ -1983,5 +1985,25 @@ stream = HostileStderr()
             "Swapping target table"
         );
         assert_eq!(phase_label(ProgressPhase::CleaningUp), "Cleaning up");
+    }
+
+    #[test]
+    fn all_core_operations_have_curated_labels() {
+        assert_eq!(
+            operation_label(Some(ProgressOperation::WriteToMssql)),
+            "Writing to SQL Server"
+        );
+        assert_eq!(
+            operation_label(Some(ProgressOperation::DryRunToMssql)),
+            "Planning SQL Server write"
+        );
+        assert_eq!(
+            operation_label(Some(ProgressOperation::WriteAllToMssql)),
+            "Writing outputs to SQL Server"
+        );
+        assert_eq!(
+            operation_label(Some(ProgressOperation::DryRunAllToMssql)),
+            "Planning SQL Server outputs"
+        );
     }
 }
