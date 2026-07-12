@@ -580,10 +580,34 @@ if metadata["Version"] != expected_version:
 "#;
 
 const PYTHON_IMPORT_SMOKE: &str = r#"
+import contextlib
 import deltafunnel
+import io
+import os
 
 session = deltafunnel.Session()
 assert repr(session).startswith("deltafunnel.Session(")
+table = session.table_from_sql("select 1 as id")
+write_options = {
+    "schema": "dbo",
+    "table": "orders",
+    "load_mode": "create_and_load",
+    "dry_run": True,
+    "connection_string": "server=tcp:sql.example.com;password=not-used",
+}
+environment = dict(os.environ)
+
+automatic_output = io.StringIO()
+with contextlib.redirect_stderr(automatic_output):
+    report = table.write_to_mssql(**write_options)
+assert report["run_mode"] == "dry_run"
+assert automatic_output.getvalue() == ""
+
+forced_output = io.StringIO()
+with contextlib.redirect_stderr(forced_output):
+    table.write_to_mssql(**write_options, progress=True)
+assert "Completed" in forced_output.getvalue()
+assert dict(os.environ) == environment
 print(deltafunnel.__version__)
 "#;
 
