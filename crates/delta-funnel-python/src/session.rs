@@ -2097,6 +2097,7 @@ union all select cast(302 as bigint) as order_id",),
             options.set_item("cache_mode", "disabled")?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("options", options)?;
+            kwargs.set_item("progress", true)?;
             kwargs.set_item("dry_run", false)?;
 
             let report = session.call_method("write_all", (outputs,), Some(&kwargs))?;
@@ -2415,6 +2416,7 @@ union all select cast(902 as bigint) as order_id",),
     #[test]
     fn write_all_rejects_bad_options_with_config_phase() -> PyResult<()> {
         Python::attach(|py| {
+            let initial_adapter_count = adapter_creation_count();
             let session = Py::new(
                 py,
                 PySession::new(
@@ -2437,6 +2439,7 @@ union all select cast(902 as bigint) as order_id",),
             options.set_item("bogus", "disabled")?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("options", options)?;
+            kwargs.set_item("progress", true)?;
             let outputs = PyList::new(py, [&spec])?;
             let error = session
                 .bind(py)
@@ -2460,12 +2463,15 @@ union all select cast(902 as bigint) as order_id",),
             let kwargs = PyDict::new(py);
             kwargs.set_item("options", options)?;
             kwargs.set_item("dry_run", true)?;
+            kwargs.set_item("progress", true)?;
             let outputs = PyList::new(py, [&spec])?;
             let error = session
                 .bind(py)
                 .call_method("write_all", (outputs,), Some(&kwargs))
                 .unwrap_err();
             assert_config_error(py, &error, "invalid_option_value")?;
+
+            assert_eq!(adapter_creation_count(), initial_adapter_count);
 
             Ok(())
         })
@@ -2474,6 +2480,7 @@ union all select cast(902 as bigint) as order_id",),
     #[test]
     fn write_all_rejects_output_specs_from_another_session() -> PyResult<()> {
         Python::attach(|py| {
+            let initial_adapter_count = adapter_creation_count();
             let first_session =
                 Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
             let second_session =
@@ -2486,6 +2493,7 @@ union all select cast(902 as bigint) as order_id",),
             let outputs = PyList::new(py, [&spec])?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("dry_run", true)?;
+            kwargs.set_item("progress", true)?;
 
             let error = second_session
                 .bind(py)
@@ -2500,6 +2508,7 @@ union all select cast(902 as bigint) as order_id",),
                 error.value(py).getattr("kind")?.extract::<String>()?,
                 "output_session_mismatch"
             );
+            assert_eq!(adapter_creation_count(), initial_adapter_count);
 
             Ok(())
         })
