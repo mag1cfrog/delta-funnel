@@ -231,9 +231,15 @@ impl MetricRenderThrottle {
         self.metrics_waiting_to_render = false;
         true
     }
+
+    /// Returns true when Rust has newer counters that have not been sent to Rich.
+    const fn has_pending_update(&self) -> bool {
+        self.metrics_waiting_to_render
+    }
 }
 
 /// Latest progress values retained even when a display update is throttled.
+#[derive(Clone)]
 struct VisibleProgress {
     phase: Option<ProgressPhase>,
     output_name: Option<String>,
@@ -263,14 +269,16 @@ impl VisibleProgress {
         }
     }
 
-    /// Merges one event while retaining metrics only within the same output.
+    /// Applies an event to the values shown by Rich.
+    ///
+    /// Starting another output, cache operation, restoration, or source report
+    /// clears the previous file and write counters first. Returns true when the
+    /// event changes a numeric counter.
     fn incorporate(&mut self, event: &ProgressEvent) -> bool {
         if let Some(phase) = event.phase() {
             let output_name = event.output_name().map(str::to_owned);
             let output_position = event.output_index().zip(event.output_count());
-            if self.output_name != output_name
-                || self.output_index.zip(self.output_count) != output_position
-            {
+            if self.scope_changes(event) {
                 self.clear_metrics();
             }
             self.phase = Some(phase);
@@ -293,6 +301,26 @@ impl VisibleProgress {
         self.incorporate_metrics(file_progress, event.rows().zip(event.batches()))
     }
 
+    /// Returns true when this event must stop using the current counters.
+    ///
+    /// One output keeps its counters while moving from writing to validation.
+    /// Starting another output clears them. Cache work has no output name, so
+    /// starting cache materialization, cache restoration, or source reporting
+    /// also clears them. Every cache materialization starts with empty counters,
+    /// even when the preceding event used the same phase name.
+    fn scope_changes(&self, event: &ProgressEvent) -> bool {
+        let Some(phase) = event.phase() else {
+            return false;
+        };
+        self.output_name.as_deref() != event.output_name()
+            || self.output_index.zip(self.output_count)
+                != event.output_index().zip(event.output_count())
+            || (event.kind() == ProgressEventKind::PhaseChanged
+                && event.output_name().is_none()
+                && (self.phase != Some(phase) || phase == ProgressPhase::MaterializingCache))
+    }
+
+    /// Clears file and write counters so the next work cannot show old values.
     fn clear_metrics(&mut self) {
         self.files_handled = None;
         self.files_total = None;
@@ -462,6 +490,40 @@ fn successful<T>(call: PythonCall<T>, pending_interruption: &mut Option<PyErr>) 
     }
 }
 
+/// Sends the last saved counters to Rich before they are cleared.
+///
+/// Nothing happens when there is no active Rich display or no saved update. If
+/// Rich raises a normal error, later display updates are disabled. If it raises
+/// `KeyboardInterrupt` or another exception that must stop Python, that same
+/// exception is saved and raised after the Rust action ends.
+fn flush_previous_metrics(
+    render: RenderState,
+    previous_visible: Option<&VisibleProgress>,
+    pending_interruption: &mut Option<PyErr>,
+) -> RenderState {
+    match (render, previous_visible) {
+        (
+            RenderState::Active {
+                renderer,
+                updates_enabled: true,
+            },
+            Some(previous_visible),
+        ) => {
+            let description = previous_visible.description(ProgressEventKind::Progress);
+            let updates_enabled = successful(
+                try_python(|py| update_renderer(py, &renderer, &description, previous_visible)),
+                pending_interruption,
+            )
+            .is_some();
+            RenderState::Active {
+                renderer,
+                updates_enabled,
+            }
+        }
+        (render, _) => render,
+    }
+}
+
 /// Handles one Rust progress event and updates Rich when needed.
 fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instant) {
     // Take the state out and release the mutex before calling Rich. Python code
@@ -471,28 +533,42 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let previous_visible = (state.visible.scope_changes(event)
+            && state.metric_throttle.has_pending_update())
+        .then(|| state.visible.clone());
         let visible_metrics_changed = state.visible.incorporate(event);
         if !state
             .metric_throttle
             .should_render(event.kind(), visible_metrics_changed, now)
+            && previous_visible.is_none()
         {
             return;
         }
-        std::mem::replace(&mut *state, ProgressState::busy())
+        (
+            std::mem::replace(&mut *state, ProgressState::busy()),
+            previous_visible,
+        )
     };
 
-    let ProgressState {
-        render,
-        mut pending_interruption,
-        final_event,
-        visible,
-        metric_throttle,
-    } = current;
+    let (
+        ProgressState {
+            render,
+            mut pending_interruption,
+            final_event,
+            visible,
+            metric_throttle,
+        },
+        previous_visible,
+    ) = current;
     let final_event = if ends_action(event.kind()) {
         Some(event.kind())
     } else {
         final_event
     };
+    // Show the last throttled counters before replacing their output or plan
+    // scope with the phase carried by the current event.
+    let render =
+        flush_previous_metrics(render, previous_visible.as_ref(), &mut pending_interruption);
     let render = match render {
         // Wait for Started before importing Rich. Requests rejected before the
         // action begins should not perform any progress-related Python work.
@@ -1189,6 +1265,52 @@ sys.modules["rich.progress"] = progress_module
                 3
             );
             assert_eq!(terminal.get_item("total")?.unwrap().extract::<u64>()?, 10);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pending_metrics_are_flushed_before_their_scope_is_replaced() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            let progress = py.import("rich.progress")?.getattr("Progress")?.call0()?;
+            let task_id = progress.call_method1("add_task", ("Starting",))?;
+            let render = RenderState::Active {
+                renderer: RichRenderer {
+                    progress: progress.unbind(),
+                    task_id: task_id.unbind(),
+                },
+                updates_enabled: true,
+            };
+            let mut visible = VisibleProgress::new();
+            visible.phase = Some(ProgressPhase::Writing);
+            visible.output_name = Some("orders".to_owned());
+            visible.output_index = Some(1);
+            visible.output_count = Some(2);
+            visible.incorporate_metrics(Some((8, 10, 3, Some(90))), Some((1_250, 4)));
+            let mut interruption = None;
+
+            let render = flush_previous_metrics(render, Some(&visible), &mut interruption);
+
+            assert!(matches!(
+                render,
+                RenderState::Active {
+                    updates_enabled: true,
+                    ..
+                }
+            ));
+            assert!(interruption.is_none());
+            let update = records.bind(py).get_item(2)?.cast_into::<PyDict>()?;
+            assert_eq!(
+                update
+                    .get_item("description")?
+                    .unwrap()
+                    .extract::<String>()?,
+                "Output 1/2 - Writing to SQL Server: orders - 1.25K rows, 4 batches"
+            );
+            assert_eq!(update.get_item("completed")?.unwrap().extract::<u64>()?, 8);
+            assert_eq!(update.get_item("total")?.unwrap().extract::<u64>()?, 10);
             Ok(())
         })
     }
