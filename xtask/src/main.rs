@@ -200,12 +200,18 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
         .env("TMPDIR", &tool_tmp);
     run_command(&mut command, "install Python wheel into clean virtualenv")?;
 
-    let mut command = Command::new(&venv_python);
-    command
-        .arg("-c")
-        .arg(PYTHON_IMPORT_SMOKE)
-        .env("TMPDIR", &tool_tmp);
-    run_command(&mut command, "import deltafunnel and construct Session()")?;
+    for logging_order in ["before", "after"] {
+        let mut command = Command::new(&venv_python);
+        command
+            .arg("-c")
+            .arg(PYTHON_PROGRESS_SMOKE)
+            .arg(logging_order)
+            .env("TMPDIR", &tool_tmp);
+        run_command(
+            &mut command,
+            "smoke-test Python progress and logging isolation",
+        )?;
+    }
 
     Ok(())
 }
@@ -579,11 +585,12 @@ if metadata["Version"] != expected_version:
     raise SystemExit(f"unexpected package version: {metadata['Version']}")
 "#;
 
-const PYTHON_IMPORT_SMOKE: &str = r#"
+const PYTHON_PROGRESS_SMOKE: &str = r#"
 import contextlib
 import deltafunnel
 import io
 import os
+import sys
 
 session = deltafunnel.Session()
 assert repr(session).startswith("deltafunnel.Session(")
@@ -596,6 +603,9 @@ write_options = {
     "connection_string": "server=tcp:sql.example.com;password=not-used",
 }
 environment = dict(os.environ)
+logging_order = sys.argv[1]
+if logging_order == "after":
+    deltafunnel.init_logging()
 
 automatic_output = io.StringIO()
 with contextlib.redirect_stderr(automatic_output):
@@ -608,6 +618,8 @@ with contextlib.redirect_stderr(forced_output):
     table.write_to_mssql(**write_options, progress=True)
 assert "Completed" in forced_output.getvalue()
 assert dict(os.environ) == environment
+if logging_order == "before":
+    deltafunnel.init_logging()
 print(deltafunnel.__version__)
 "#;
 
