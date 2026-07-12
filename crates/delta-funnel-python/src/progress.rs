@@ -934,6 +934,27 @@ sys.modules["rich.progress"] = progress_module
     }
 
     #[test]
+    fn renderer_arguments_exclude_query_and_connection_secrets() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+
+            dry_run(py, Some(Some(true)))?;
+
+            let rendered = records.bind(py).repr()?.extract::<String>()?;
+            for secret in [
+                "select 1 as id",
+                "sql.example.com",
+                "password=secret-token",
+                "secret-token",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
     fn ordinary_construction_failures_disable_progress_without_cleanup() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
