@@ -6,12 +6,13 @@ use futures_util::StreamExt;
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
     datafusion_query_output_stream,
+    query_engine::datafusion::collect_delta_provider_read_stats_handles,
 };
 
 use super::super::super::{
     DeltaFunnelSession, LazyTableKind, OutputWritePlan,
     errors::{cached_output_stream_setup_error, unknown_cached_alias_error},
-    query_handoff::{ProviderStatsRecordingStream, SharedProviderReadStats},
+    query_handoff::{FinalDeltaReadStatsRecorder, SharedProviderReadStats},
     registry::{DerivedTableDependency, read_only_sql_options},
 };
 use super::{MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan};
@@ -48,12 +49,13 @@ pub(super) async fn replanned_sql_batch_stream(
     let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
         .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
     if let Some(provider_stats) = provider_stats {
+        let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
         let error_output_name = output_name.clone();
-        return Ok(Box::pin(ProviderStatsRecordingStream::new(
+        return Ok(Box::pin(FinalDeltaReadStatsRecorder::new(
             Box::pin(stream.map(move |batch| {
                 batch.map_err(|error| cached_output_stream_setup_error(&error_output_name, error))
             })),
-            physical_plan,
+            read_stats_handles,
             provider_stats,
         )));
     }

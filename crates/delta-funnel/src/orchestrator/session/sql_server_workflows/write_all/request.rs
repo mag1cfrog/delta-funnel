@@ -1414,7 +1414,7 @@ mod tests {
                 assert_eq!(source_scans.load(Ordering::SeqCst), 1);
             }
 
-            let restored_error = match session.batch_stream_for_lazy_table(&big).await {
+            let restored_error = match session.batch_stream_for_lazy_table(&big, None).await {
                 Ok(stream) => match collect_stream_row_count(stream).await {
                     Ok(rows) => {
                         return Err(
@@ -1520,7 +1520,8 @@ mod tests {
             );
             assert_eq!(big_source_scans.load(Ordering::SeqCst), 2);
 
-            let restored_names_error = match session.batch_stream_for_lazy_table(&names).await {
+            let restored_names_error = match session.batch_stream_for_lazy_table(&names, None).await
+            {
                 Ok(stream) => match collect_stream_row_count(stream).await {
                     Ok(rows) => {
                         return Err(format!(

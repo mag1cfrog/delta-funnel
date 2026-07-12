@@ -250,7 +250,12 @@ impl DeltaFunnelSession {
             ));
         }
         let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
-        let batches = self.batch_stream_for_lazy_table(planned.table()).await?;
+        let batches = self
+            .batch_stream_for_lazy_table(
+                planned.table(),
+                reporter.map(|reporter| (reporter, request.target().output_name())),
+            )
+            .await?;
 
         let phase_timings = planned.phase_timings().to_vec();
         writer

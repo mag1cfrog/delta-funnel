@@ -29,6 +29,9 @@ pub use planning::partition_target::{
 };
 pub use session::{QueryOptions, datafusion_session_config, datafusion_session_context};
 
+/// Shared live read counters for one physical Delta scan.
+pub(crate) type DeltaProviderReadStatsHandle = Arc<execution::read_stats::DeltaProviderReadStats>;
+
 impl From<DeltaFunnelError> for DataFusionError {
     fn from(error: DeltaFunnelError) -> Self {
         Self::External(Box::new(error))
@@ -41,24 +44,38 @@ impl From<DeltaFunnelError> for DataFusionError {
 pub fn collect_delta_provider_read_stats(
     plan: &dyn ExecutionPlan,
 ) -> Vec<DeltaProviderReadStatsSnapshot> {
+    snapshot_delta_provider_read_stats(&collect_delta_provider_read_stats_handles(plan))
+}
+
+/// Collects shared read stats counters without retaining the physical plan.
+pub(crate) fn collect_delta_provider_read_stats_handles(
+    plan: &dyn ExecutionPlan,
+) -> Vec<DeltaProviderReadStatsHandle> {
     let mut found = Vec::new();
-    collect_delta_provider_read_stats_into(plan, &mut found);
+    collect_delta_provider_read_stats_handles_into(plan, &mut found);
     found
 }
 
-fn collect_delta_provider_read_stats_into(
+fn collect_delta_provider_read_stats_handles_into(
     plan: &dyn ExecutionPlan,
-    found: &mut Vec<DeltaProviderReadStatsSnapshot>,
+    found: &mut Vec<DeltaProviderReadStatsHandle>,
 ) {
     if let Some(scan) = plan
         .as_any()
         .downcast_ref::<execution::DeltaScanPlanningExec>()
     {
-        found.push(scan.read_stats_snapshot());
+        found.push(scan.read_stats_handle());
     }
     for child in plan.children() {
-        collect_delta_provider_read_stats_into(child.as_ref(), found);
+        collect_delta_provider_read_stats_handles_into(child.as_ref(), found);
     }
+}
+
+/// Creates point-in-time snapshots from shared live read counters.
+pub(crate) fn snapshot_delta_provider_read_stats(
+    handles: &[DeltaProviderReadStatsHandle],
+) -> Vec<DeltaProviderReadStatsSnapshot> {
+    handles.iter().map(|stats| stats.snapshot()).collect()
 }
 
 /// Executes one selected DataFusion query output as a single merged stream.
