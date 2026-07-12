@@ -65,15 +65,20 @@ impl PythonProgress {
             state.pending_interruption = Some(error);
         }
 
+        let status = action_status(state.final_event, operation_error.is_some());
         match state.pending_interruption {
             Some(error) => {
+                // Metadata is best effort. A custom exception may reject
+                // attributes, but it must still be raised unchanged.
+                let _ = error
+                    .value(py)
+                    .setattr("deltafunnel_operation_status", status);
                 if let Some(operation_error) = operation_error {
-                    // Metadata is best effort. A custom exception may reject
-                    // attributes, but it must still be raised unchanged.
                     let _ = error
                         .value(py)
                         .setattr("deltafunnel_operation_error", operation_error.value(py));
                 }
+                write_interruption_notice(py, status);
                 Err(error)
             }
             None => Ok(()),
@@ -100,6 +105,7 @@ struct RichRenderer {
 struct ProgressState {
     render: RenderState,
     pending_interruption: Option<PyErr>,
+    final_event: Option<ProgressEventKind>,
 }
 
 impl ProgressState {
@@ -107,6 +113,7 @@ impl ProgressState {
         Self {
             render: RenderState::Pending(mode),
             pending_interruption: None,
+            final_event: None,
         }
     }
 
@@ -114,6 +121,7 @@ impl ProgressState {
         Self {
             render: RenderState::Busy,
             pending_interruption: None,
+            final_event: None,
         }
     }
 
@@ -121,6 +129,7 @@ impl ProgressState {
         Self {
             render: RenderState::Done,
             pending_interruption: None,
+            final_event: None,
         }
     }
 }
@@ -190,7 +199,13 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
     let ProgressState {
         render,
         mut pending_interruption,
+        final_event,
     } = current;
+    let final_event = if ends_action(event.kind()) {
+        Some(event.kind())
+    } else {
+        final_event
+    };
     let render = match render {
         // Wait for Started before importing Rich. Requests rejected before the
         // action begins should not perform any progress-related Python work.
@@ -250,6 +265,7 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent) {
     let next = ProgressState {
         render,
         pending_interruption,
+        final_event,
     };
 
     // Rust sends these events one at a time, so returning the state here cannot
@@ -340,6 +356,28 @@ fn update_renderer(py: Python<'_>, renderer: &RichRenderer, description: &str) -
     Ok(())
 }
 
+/// Returns the Rust action result reported with a saved Python interruption.
+const fn action_status(final_event: Option<ProgressEventKind>, failed: bool) -> &'static str {
+    match final_event {
+        Some(ProgressEventKind::Completed) => "completed",
+        Some(ProgressEventKind::CompletedWithFailures) => "completed_with_failures",
+        Some(ProgressEventKind::Failed) => "failed",
+        Some(ProgressEventKind::Cancelled) => "cancelled",
+        _ if failed => "failed",
+        _ => "completed",
+    }
+}
+
+/// Makes one best-effort attempt to explain why no Python result was returned.
+fn write_interruption_notice(py: Python<'_>, status: &str) {
+    let message =
+        format!("DeltaFunnel action status: {status}; the Python result was not delivered.\n");
+    let _ = py.import("sys").and_then(|sys| {
+        sys.getattr("stderr")?.call_method1("write", (message,))?;
+        Ok(())
+    });
+}
+
 /// Returns true when Rust will send no more progress for this action.
 ///
 /// This describes the action state, not terminal versus Jupyter rendering.
@@ -404,6 +442,28 @@ mod tests {
 
     struct ModuleGuard {
         originals: Vec<(&'static str, Option<Py<PyAny>>)>,
+    }
+
+    struct StderrGuard {
+        original: Py<PyAny>,
+    }
+
+    impl StderrGuard {
+        fn capture(py: Python<'_>) -> PyResult<(Self, Py<PyAny>)> {
+            let sys = py.import("sys")?;
+            let original = sys.getattr("stderr")?.unbind();
+            let capture = py.import("io")?.call_method0("StringIO")?.unbind();
+            sys.setattr("stderr", capture.bind(py))?;
+            Ok((Self { original }, capture))
+        }
+    }
+
+    impl Drop for StderrGuard {
+        fn drop(&mut self) {
+            let _ = Python::try_attach(|py| {
+                py.import("sys")?.setattr("stderr", self.original.bind(py))
+            });
+        }
     }
 
     impl ModuleGuard {
@@ -786,6 +846,7 @@ sys.modules["rich.progress"] = progress_module
         Python::attach(|py| {
             let (_guard, records, failure) =
                 ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
+            let (_stderr, _capture) = StderrGuard::capture(py)?;
 
             let error = dry_run(py, Some(Some(true))).unwrap_err();
 
@@ -800,11 +861,47 @@ sys.modules["rich.progress"] = progress_module
     }
 
     #[test]
+    fn interruption_reports_completed_status_once_on_stderr() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, _records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
+            let (_stderr, capture) = StderrGuard::capture(py)?;
+
+            let error = dry_run(py, Some(Some(true))).unwrap_err();
+
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "completed"
+            );
+            assert!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_error")
+                    .is_err()
+            );
+            assert_eq!(
+                capture
+                    .bind(py)
+                    .call_method0("getvalue")?
+                    .extract::<String>()?,
+                "DeltaFunnel action status: completed; the Python result was not delivered.\n"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn interruption_from_stop_is_raised_as_the_same_object() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
             let (_guard, records, failure) =
                 ModuleGuard::install_with_failure(py, true, false, Some("stop"), true, false)?;
+            let (_stderr, _capture) = StderrGuard::capture(py)?;
 
             let error = dry_run(py, Some(Some(true))).unwrap_err();
 
@@ -823,11 +920,19 @@ sys.modules["rich.progress"] = progress_module
         Python::attach(|py| {
             let (_guard, records, failure) =
                 ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
+            let (_stderr, _capture) = StderrGuard::capture(py)?;
 
             let error = execute_without_connection(py).unwrap_err();
 
             assert!(error.value(py).is(failure.bind(py)));
             let operation_error = error.value(py).getattr("deltafunnel_operation_error")?;
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "failed"
+            );
             assert_eq!(
                 operation_error.getattr("phase")?.extract::<String>()?,
                 "mssql_target_config"
@@ -850,6 +955,7 @@ sys.modules["rich.progress"] = progress_module
         Python::attach(|py| {
             let (_guard, records, first_interruption) =
                 ModuleGuard::install_with_failure(py, true, false, Some("update"), true, true)?;
+            let (_stderr, _capture) = StderrGuard::capture(py)?;
 
             let error = dry_run(py, Some(Some(true))).unwrap_err();
 
