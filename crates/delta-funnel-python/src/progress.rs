@@ -444,7 +444,7 @@ const fn terminal_label(kind: ProgressEventKind) -> &'static str {
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-    use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PySystemExit};
+    use pyo3::exceptions::{PyGeneratorExit, PyKeyboardInterrupt, PyRuntimeError, PySystemExit};
     use pyo3::ffi::c_str;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
 
@@ -514,13 +514,6 @@ mod tests {
             interruption: bool,
             stop_also_interrupts: bool,
         ) -> PyResult<(Self, Py<PyList>, Py<PyAny>)> {
-            let originals = Self::snapshot(py)?;
-            let records = PyList::empty(py);
-            let locals = PyDict::new(py);
-            locals.set_item("records", &records)?;
-            locals.set_item("interactive", interactive)?;
-            locals.set_item("jupyter", jupyter)?;
-            locals.set_item("fail_call", fail_call)?;
             let failure = if interruption {
                 py.get_type::<PyKeyboardInterrupt>()
                     .call1(("renderer interrupted",))?
@@ -528,6 +521,31 @@ mod tests {
                 py.get_type::<PyRuntimeError>()
                     .call1(("renderer failed",))?
             };
+            Self::install_with_exception(
+                py,
+                interactive,
+                jupyter,
+                fail_call,
+                failure,
+                stop_also_interrupts,
+            )
+        }
+
+        fn install_with_exception(
+            py: Python<'_>,
+            interactive: bool,
+            jupyter: bool,
+            fail_call: Option<&str>,
+            failure: Bound<'_, PyAny>,
+            stop_also_interrupts: bool,
+        ) -> PyResult<(Self, Py<PyList>, Py<PyAny>)> {
+            let originals = Self::snapshot(py)?;
+            let records = PyList::empty(py);
+            let locals = PyDict::new(py);
+            locals.set_item("records", &records)?;
+            locals.set_item("interactive", interactive)?;
+            locals.set_item("jupyter", jupyter)?;
+            locals.set_item("fail_call", fail_call)?;
             locals.set_item("failure", &failure)?;
             locals.set_item("stop_also_interrupts", stop_also_interrupts)?;
             locals.set_item(
@@ -1035,6 +1053,61 @@ sys.modules["rich.progress"] = progress_module
                 record_strings(records.bind(py), "call")?.last(),
                 Some(&"stop".to_owned())
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn built_in_interruptions_keep_identity_and_python_state() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            for exception_type in [
+                py.get_type::<PyKeyboardInterrupt>(),
+                py.get_type::<PySystemExit>(),
+                py.get_type::<PyGeneratorExit>(),
+            ] {
+                let failure = exception_type.call1(("renderer interrupted", 42))?;
+                let cause = py.get_type::<PyRuntimeError>().call1(("original cause",))?;
+                let context = py
+                    .get_type::<PyRuntimeError>()
+                    .call1(("original context",))?;
+                failure.setattr("__cause__", &cause)?;
+                failure.setattr("__context__", &context)?;
+                let (guard, records, failure) = ModuleGuard::install_with_exception(
+                    py,
+                    true,
+                    false,
+                    Some("update"),
+                    failure,
+                    false,
+                )?;
+                let (stderr, _capture) = StderrGuard::capture(py)?;
+
+                let error = dry_run(py, Some(Some(true))).unwrap_err();
+                let value = error.value(py);
+
+                assert!(value.is(failure.bind(py)));
+                assert_eq!(
+                    value.getattr("args")?.extract::<(String, u8)>()?,
+                    ("renderer interrupted".to_owned(), 42)
+                );
+                assert!(!value.getattr("__traceback__")?.is_none());
+                assert!(value.getattr("__cause__")?.is(&cause));
+                assert!(value.getattr("__context__")?.is(&context));
+                assert_eq!(
+                    value
+                        .getattr("deltafunnel_operation_status")?
+                        .extract::<String>()?,
+                    "completed"
+                );
+                assert_eq!(
+                    record_strings(records.bind(py), "call")?.last(),
+                    Some(&"stop".to_owned())
+                );
+
+                drop(stderr);
+                drop(guard);
+            }
             Ok(())
         })
     }
