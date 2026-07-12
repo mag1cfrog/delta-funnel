@@ -13,6 +13,7 @@ use datafusion::{
             pretty::pretty_format_batches,
         },
     },
+    physical_plan::ExecutionPlan,
     prelude::{DataFrame, SessionContext},
 };
 use futures_util::{Stream, StreamExt};
@@ -123,6 +124,41 @@ struct DeltaFileProgressTracker {
     last_file_progress: Option<(u64, u64)>,
 }
 
+/// Adds optional live file progress and final provider statistics tracking to
+/// one physical-plan stream.
+///
+/// Both trackers reuse the same live Delta scan counters. They do not execute
+/// another query or retain the physical plan. `progress` contains the reporter
+/// and output name used for live events.
+pub(super) fn wrap_stream_with_delta_read_tracking(
+    mut stream: MssqlOutputBatchStream,
+    physical_plan: &dyn ExecutionPlan,
+    provider_stats: Option<SharedProviderReadStats>,
+    progress: Option<(ProgressReporter, String)>,
+) -> MssqlOutputBatchStream {
+    if provider_stats.is_none() && progress.is_none() {
+        return stream;
+    }
+
+    let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan);
+    if let Some((reporter, output_name)) = progress {
+        stream = Box::pin(DeltaFileProgressTracker::new(
+            stream,
+            read_stats_handles.clone(),
+            reporter,
+            output_name,
+        ));
+    }
+    if let Some(provider_stats) = provider_stats {
+        stream = Box::pin(FinalDeltaReadStatsRecorder::new(
+            stream,
+            read_stats_handles,
+            provider_stats,
+        ));
+    }
+    stream
+}
+
 impl DeltaFileProgressTracker {
     fn new(
         inner: MssqlOutputBatchStream,
@@ -193,6 +229,7 @@ pub(super) async fn batch_stream_for_lazy_table_from_session_parts(
     derived_tables: Vec<RegisteredDerivedTable>,
     pending_derived_tables: Vec<PendingDerivedTable>,
     provider_stats: Option<SharedProviderReadStats>,
+    progress: Option<(ProgressReporter, String)>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     let dataframe = dataframe_for_lazy_table_from_session_parts(
         &context,
@@ -208,20 +245,16 @@ pub(super) async fn batch_stream_for_lazy_table_from_session_parts(
         .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
     let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
         .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
-    if let Some(provider_stats) = provider_stats {
-        let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-        return Ok(Box::pin(FinalDeltaReadStatsRecorder::new(
-            Box::pin(stream.map(|batch| {
-                batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
-            })),
-            read_stats_handles,
-            provider_stats,
-        )));
-    }
-
-    Ok(Box::pin(stream.map(|batch| {
+    let stream = Box::pin(stream.map(|batch| {
         batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
-    })))
+    }));
+
+    Ok(wrap_stream_with_delta_read_tracking(
+        stream,
+        physical_plan.as_ref(),
+        provider_stats,
+        progress,
+    ))
 }
 
 impl DeltaFunnelSession {
@@ -332,13 +365,18 @@ impl DeltaFunnelSession {
         &self,
         table: LazyTable,
     ) -> MssqlOutputBatchStreamFactory {
-        self.lazy_table_batch_stream_factory_with_provider_stats(table, None)
+        self.lazy_table_batch_stream_factory_for_write_all(table, None, None)
     }
 
-    pub(super) fn lazy_table_batch_stream_factory_with_provider_stats(
+    /// Builds a deferred stream factory with write-all's optional final stats
+    /// and live file progress tracking.
+    ///
+    /// `progress` contains an output-scoped reporter and that output's name.
+    pub(super) fn lazy_table_batch_stream_factory_for_write_all(
         &self,
         table: LazyTable,
         provider_stats: Option<SharedProviderReadStats>,
+        progress: Option<(ProgressReporter, String)>,
     ) -> MssqlOutputBatchStreamFactory {
         let context = self.context.clone();
         let sources = self.sources.clone();
@@ -354,6 +392,7 @@ impl DeltaFunnelSession {
                     derived_tables,
                     pending_derived_tables,
                     provider_stats,
+                    progress,
                 )
                 .await
             })

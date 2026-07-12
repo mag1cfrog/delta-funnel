@@ -488,6 +488,8 @@ mod tests {
         output_count: Option<u64>,
         rows: Option<u64>,
         batches: Option<u64>,
+        files_handled: Option<u64>,
+        files_total: Option<u64>,
     }
 
     fn recording_progress() -> (ProgressReporter, Arc<Mutex<Vec<RecordedProgress>>>) {
@@ -504,6 +506,8 @@ mod tests {
                     output_count: event.output_count(),
                     rows: event.rows(),
                     batches: event.batches(),
+                    files_handled: event.files_handled(),
+                    files_total: event.files_total(),
                 });
             }
         });
@@ -989,6 +993,62 @@ mod tests {
                 events.last().map(|event| event.kind),
                 Some(ProgressEventKind::Failed)
             );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn write_all_file_progress_is_scoped_to_each_attempted_output()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let table = RealParquetDeltaTable::new_default("orders")?;
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            session.delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))?;
+            let west = session
+                .table_from_sql("select id from orders where id <= 2")
+                .await?;
+            let east = session
+                .table_from_sql("select id from orders where id > 2")
+                .await?;
+            let west = execute_output_request(
+                west,
+                "west_output",
+                "west_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let east = execute_output_request(
+                east,
+                "east_output",
+                "east_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let (reporter, events) = recording_progress();
+
+            let report = session
+                .write_all_with_progress_and_writer(
+                    &[west, east],
+                    WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                    reporter,
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+            assert!(report.all_succeeded());
+
+            let events = events.lock().map_err(|_| "progress event lock poisoned")?;
+            for output_index in [1, 2] {
+                let Some(last) = events.iter().rev().find(|event| {
+                    event.output_index == Some(output_index) && event.files_total.is_some()
+                }) else {
+                    return Err(
+                        format!("output {output_index} did not report file progress").into(),
+                    );
+                };
+                assert_eq!(last.files_handled, last.files_total);
+                assert!(last.files_total.is_some_and(|total| total > 0));
+            }
             Ok(())
         }
 

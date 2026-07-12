@@ -79,16 +79,19 @@ impl DeltaFunnelSession {
             .enumerate()
             .map(|(output_index, planned)| {
                 let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
-                let batches = self.lazy_table_batch_stream_factory_with_provider_stats(
-                    planned.table().clone(),
-                    provider_stats.clone(),
-                );
                 let progress = reporter.and_then(|reporter| {
                     reporter.for_output(
                         usize_to_u64_saturating(output_index.saturating_add(1)),
                         output_count,
                     )
                 });
+                let batches = self.lazy_table_batch_stream_factory_for_write_all(
+                    planned.table().clone(),
+                    provider_stats.clone(),
+                    progress.clone().map(|reporter| {
+                        (reporter, planned.resolved_target().output_name().to_owned())
+                    }),
+                );
 
                 Ok(MssqlOutputWriteJob::new(
                     output_schema,
@@ -119,17 +122,18 @@ impl DeltaFunnelSession {
             .enumerate()
             .map(|(output_index, planned)| {
                 let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
-                let batches = self.cached_output_batch_stream_factory_with_provider_stats(
-                    planned.request(),
-                    active_aliases,
-                    provider_stats.clone(),
-                )?;
                 let progress = reporter.and_then(|reporter| {
                     reporter.for_output(
                         usize_to_u64_saturating(output_index.saturating_add(1)),
                         output_count,
                     )
                 });
+                let batches = self.cached_output_batch_stream_factory_for_write_all(
+                    planned.request(),
+                    active_aliases,
+                    provider_stats.clone(),
+                    progress.clone(),
+                )?;
 
                 Ok(MssqlOutputWriteJob::new(
                     output_schema,
