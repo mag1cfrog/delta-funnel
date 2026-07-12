@@ -5,6 +5,8 @@
 //! action finishes. Rich chooses terminal or Jupyter rendering.
 
 #[cfg(test)]
+use std::cell::Cell;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     sync::{Arc, Mutex},
@@ -20,6 +22,16 @@ use pyo3::types::PyDict;
 
 #[cfg(test)]
 static ATTACHMENT_FAILURE_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static ADAPTER_CREATION_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn adapter_creation_count() -> usize {
+    ADAPTER_CREATION_COUNT.get()
+}
 
 const METRIC_RENDER_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -40,6 +52,8 @@ impl PythonProgress {
             Some(true) => ProgressMode::Forced,
             None => ProgressMode::Automatic,
         };
+        #[cfg(test)]
+        ADAPTER_CREATION_COUNT.set(ADAPTER_CREATION_COUNT.get().saturating_add(1));
         let state = Arc::new(Mutex::new(ProgressState::new(mode)));
         let reporter_state = Arc::clone(&state);
         let reporter = ProgressReporter::new(move |event| {

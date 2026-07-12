@@ -58,6 +58,7 @@ class Session:
         *,
         options: Options | None = None,
         dry_run: bool | None = None,
+        progress: bool | None = None,
     ) -> Report: ...
 
 
