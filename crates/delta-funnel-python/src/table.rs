@@ -109,7 +109,9 @@ impl PyTable {
     /// terminals and Jupyter, and stays quiet elsewhere. Pass `progress=True`
     /// to force the display or `progress=False` to disable it. Terminal
     /// progress uses stderr and remains separate from diagnostic logging.
-    /// Progress display does not provide cancellation.
+    /// After planning, eligible Delta scans show selected file progress and
+    /// available runtime and approximate planning pruning counts. Progress
+    /// display does not provide cancellation.
     ///
     /// If Python interrupts progress rendering, Delta Funnel finishes action
     /// cleanup before raising the interruption. When possible, the exception

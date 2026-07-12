@@ -104,6 +104,7 @@ impl DeltaScanPlanningExec {
                 .iter()
                 .map(|partition| partition.file_tasks.len())
                 .sum(),
+            files_filtered_during_planning: partition_plan.files_filtered_during_planning,
             estimated_rows: partition_plan.estimated_rows,
             estimated_bytes: partition_plan.estimated_bytes,
         }));
@@ -2790,6 +2791,10 @@ mod tests {
                     .map(|partition| partition.file_tasks.len())
                     .sum::<usize>()
             )?
+        );
+        assert_eq!(
+            read_stats.files_filtered_during_planning,
+            scans[0].partition_plan().files_filtered_during_planning
         );
         assert_eq!(
             read_stats.estimated_rows,
@@ -5876,6 +5881,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 1,
             files_planned: 3,
+            files_filtered_during_planning: None,
             estimated_rows: Some(4),
             estimated_bytes: Some(3),
         }));
@@ -5995,6 +6001,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 2,
             files_planned: 2,
+            files_filtered_during_planning: None,
             estimated_rows: Some(3),
             estimated_bytes: Some(2),
         }));
@@ -6138,6 +6145,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 1,
             files_planned: 3,
+            files_filtered_during_planning: None,
             estimated_rows: Some(4),
             estimated_bytes: Some(3),
         }));
@@ -6229,6 +6237,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 1,
             files_planned: 3,
+            files_filtered_during_planning: None,
             estimated_rows: Some(5),
             estimated_bytes: Some(3),
         }));
@@ -6638,6 +6647,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 1,
             files_planned: 2,
+            files_filtered_during_planning: None,
             estimated_rows: Some(3),
             estimated_bytes: Some(2),
         }))

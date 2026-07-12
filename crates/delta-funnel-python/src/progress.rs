@@ -209,6 +209,8 @@ struct VisibleProgress {
     output_name: Option<String>,
     files_handled: Option<u64>,
     files_total: Option<u64>,
+    files_runtime_pruned: Option<u64>,
+    files_planning_pruned: Option<u64>,
     rows: Option<u64>,
     batches: Option<u64>,
 }
@@ -220,6 +222,8 @@ impl VisibleProgress {
             output_name: None,
             files_handled: None,
             files_total: None,
+            files_runtime_pruned: None,
+            files_planning_pruned: None,
             rows: None,
             batches: None,
         }
@@ -233,28 +237,47 @@ impl VisibleProgress {
         if let Some(output_name) = event.output_name() {
             self.output_name = Some(output_name.to_owned());
         }
-        self.incorporate_metrics(
-            event.files_handled().zip(event.files_total()),
-            event.rows().zip(event.batches()),
-        )
+        let file_progress = match (
+            event.files_handled(),
+            event.files_total(),
+            event.files_runtime_pruned(),
+        ) {
+            (Some(handled), Some(total), Some(runtime_pruned)) => Some((
+                handled,
+                total,
+                runtime_pruned,
+                event.files_planning_pruned(),
+            )),
+            _ => None,
+        };
+        self.incorporate_metrics(file_progress, event.rows().zip(event.batches()))
     }
 
     /// Merges monotonic counters and reports whether a visible value changed.
     fn incorporate_metrics(
         &mut self,
-        file_progress: Option<(u64, u64)>,
+        file_progress: Option<(u64, u64, u64, Option<u64>)>,
         write_progress: Option<(u64, u64)>,
     ) -> bool {
         let before = self.metric_values();
-        if let Some((handled, total)) = file_progress {
+        if let Some((handled, total, runtime_pruned, planning_pruned)) = file_progress {
             // The first eligible snapshot fixes the total for this plan scope.
             let fixed_total = self.files_total.unwrap_or(total);
             self.files_total = Some(fixed_total);
-            self.files_handled = Some(
+            let handled = self
+                .files_handled
+                .unwrap_or(0)
+                .max(handled.min(fixed_total));
+            self.files_handled = Some(handled);
+            self.files_runtime_pruned = Some(
                 self.files_handled
                     .unwrap_or(0)
-                    .max(handled.min(fixed_total)),
+                    .min(self.files_runtime_pruned.unwrap_or(0).max(runtime_pruned)),
             );
+            if let Some(planning_pruned) = planning_pruned {
+                self.files_planning_pruned =
+                    Some(self.files_planning_pruned.unwrap_or(0).max(planning_pruned));
+            }
         }
         if let Some((rows, batches)) = write_progress {
             self.rows = Some(self.rows.unwrap_or(0).max(rows));
@@ -263,13 +286,37 @@ impl VisibleProgress {
         self.metric_values() != before
     }
 
-    const fn metric_values(&self) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
-        (
+    const fn metric_values(&self) -> [Option<u64>; 6] {
+        [
             self.files_handled,
             self.files_total,
+            self.files_runtime_pruned,
+            self.files_planning_pruned,
             self.rows,
             self.batches,
-        )
+        ]
+    }
+
+    fn file_progress_text(&self) -> Option<String> {
+        let (Some(handled), Some(total), Some(runtime_pruned)) = (
+            self.files_handled,
+            self.files_total,
+            self.files_runtime_pruned,
+        ) else {
+            return None;
+        };
+        let prefix = format!("Delta files {handled}/{total}");
+        match (
+            runtime_pruned,
+            self.files_planning_pruned.filter(|pruned| *pruned > 0),
+        ) {
+            (0, None) => Some(prefix),
+            (runtime, None) => Some(format!("{prefix} | pruned {runtime} at runtime")),
+            (0, Some(planning)) => Some(format!("{prefix} | pruned ~{planning} in planning")),
+            (runtime, Some(planning)) => Some(format!(
+                "{prefix} | pruned {runtime} at runtime, ~{planning} in planning"
+            )),
+        }
     }
 
     fn description(&self, kind: ProgressEventKind) -> String {
@@ -512,7 +559,9 @@ fn create_renderer(
     let elapsed_column = progress_module.getattr("TimeElapsedColumn")?.call0()?;
     let bar_column = progress_module.getattr("BarColumn")?.call0()?;
     let task_progress_column = progress_module.getattr("TaskProgressColumn")?.call0()?;
-    let file_count_column = progress_module.getattr("MofNCompleteColumn")?.call0()?;
+    let file_count_column = progress_module
+        .getattr("TextColumn")?
+        .call1(("{task.fields[file_progress]}",))?;
 
     // Refresh only when Rust admits an event through the metric throttle.
     let progress_kwargs = PyDict::new(py);
@@ -536,6 +585,7 @@ fn create_renderer(
     // same task so its display and elapsed time continue without restarting.
     let task_kwargs = PyDict::new(py);
     task_kwargs.set_item("total", py.None())?;
+    task_kwargs.set_item("file_progress", "")?;
     let task_id = progress.call_method(
         "add_task",
         (operation_label(event.operation()),),
@@ -565,6 +615,9 @@ fn update_renderer(
     if let (Some(handled), Some(total)) = (visible.files_handled, visible.files_total) {
         kwargs.set_item("completed", handled)?;
         kwargs.set_item("total", total)?;
+    }
+    if let Some(file_progress) = visible.file_progress_text() {
+        kwargs.set_item("file_progress", file_progress)?;
     }
     kwargs.set_item("refresh", true)?;
     renderer
@@ -840,7 +893,7 @@ progress_module.Progress = Progress
 progress_module.TimeElapsedColumn = object
 progress_module.BarColumn = object
 progress_module.TaskProgressColumn = object
-progress_module.MofNCompleteColumn = object
+progress_module.TextColumn = lambda *args, **kwargs: object()
 rich.console = console_module
 rich.progress = progress_module
 sys.modules["rich"] = rich
@@ -925,14 +978,18 @@ sys.modules["rich.progress"] = progress_module
         visible.phase = Some(ProgressPhase::Writing);
         visible.output_name = Some("orders".to_owned());
 
-        assert!(visible.incorporate_metrics(Some((2, 10)), None));
+        assert!(visible.incorporate_metrics(Some((2, 10, 0, Some(90))), None));
         assert!(visible.incorporate_metrics(None, Some((40, 1))));
-        assert!(visible.incorporate_metrics(Some((6, 10)), Some((75, 2))));
-        assert!(!visible.incorporate_metrics(Some((4, 20)), Some((60, 1))));
+        assert!(visible.incorporate_metrics(Some((6, 10, 3, Some(90))), Some((75, 2))));
+        assert!(!visible.incorporate_metrics(Some((4, 20, 1, None)), Some((60, 1))));
 
         assert_eq!(
             visible.metric_values(),
-            (Some(6), Some(10), Some(75), Some(2))
+            [Some(6), Some(10), Some(3), Some(90), Some(75), Some(2)]
+        );
+        assert_eq!(
+            visible.file_progress_text().as_deref(),
+            Some("Delta files 6/10 | pruned 3 at runtime, ~90 in planning")
         );
         assert_eq!(
             visible.description(ProgressEventKind::Progress),
@@ -941,6 +998,35 @@ sys.modules["rich.progress"] = progress_module
         assert_eq!(
             visible.description(ProgressEventKind::Failed),
             "Failed: orders - 75 rows, 2 batches"
+        );
+    }
+
+    #[test]
+    fn file_progress_text_omits_unavailable_or_zero_pruning_counts() {
+        let mut visible = VisibleProgress::new();
+        visible.incorporate_metrics(Some((8, 10, 0, None)), None);
+        assert_eq!(
+            visible.file_progress_text().as_deref(),
+            Some("Delta files 8/10")
+        );
+
+        visible.incorporate_metrics(Some((8, 10, 3, None)), None);
+        assert_eq!(
+            visible.file_progress_text().as_deref(),
+            Some("Delta files 8/10 | pruned 3 at runtime")
+        );
+
+        visible.incorporate_metrics(Some((8, 10, 3, Some(90))), None);
+        assert_eq!(
+            visible.file_progress_text().as_deref(),
+            Some("Delta files 8/10 | pruned 3 at runtime, ~90 in planning")
+        );
+
+        let mut planning_only = VisibleProgress::new();
+        planning_only.incorporate_metrics(Some((8, 10, 0, Some(90))), None);
+        assert_eq!(
+            planning_only.file_progress_text().as_deref(),
+            Some("Delta files 8/10 | pruned ~90 in planning")
         );
     }
 
@@ -958,7 +1044,7 @@ sys.modules["rich.progress"] = progress_module
             let mut visible = VisibleProgress::new();
             visible.phase = Some(ProgressPhase::Writing);
             visible.output_name = Some("orders".to_owned());
-            visible.incorporate_metrics(Some((3, 10)), Some((42, 2)));
+            visible.incorporate_metrics(Some((3, 10, 2, Some(90))), Some((42, 2)));
 
             update_renderer(
                 py,
@@ -971,6 +1057,13 @@ sys.modules["rich.progress"] = progress_module
             assert_eq!(update.get_item("task_id")?.unwrap().extract::<u8>()?, 7);
             assert_eq!(update.get_item("completed")?.unwrap().extract::<u64>()?, 3);
             assert_eq!(update.get_item("total")?.unwrap().extract::<u64>()?, 10);
+            assert_eq!(
+                update
+                    .get_item("file_progress")?
+                    .unwrap()
+                    .extract::<String>()?,
+                "Delta files 3/10 | pruned 2 at runtime, ~90 in planning"
+            );
             assert_eq!(
                 update
                     .get_item("description")?

@@ -82,6 +82,8 @@ pub(crate) struct ProviderScanMetadataExpansion {
     pub(crate) snapshot_version: u64,
     /// File metadata records selected by Delta Kernel for this provider scan.
     pub(crate) files: Vec<KernelScanFileMetadata>,
+    /// Approximate Add actions excluded during Kernel metadata planning.
+    pub(crate) files_filtered_during_planning: Option<u64>,
     /// Whether the kernel scan metadata iterator was consumed to completion.
     pub(crate) scan_metadata_exhausted: bool,
 }
@@ -143,6 +145,7 @@ impl ProviderScanPlan {
     ) -> Result<ProviderScanMetadataExpansion, DeltaFunnelError> {
         let KernelScanMetadataExpansion {
             files,
+            files_filtered_during_planning,
             scan_metadata_exhausted,
         } = self
             .kernel_scan
@@ -158,6 +161,7 @@ impl ProviderScanPlan {
             table_uri: self.table_uri.clone(),
             snapshot_version: self.snapshot_version,
             files,
+            files_filtered_during_planning,
             scan_metadata_exhausted,
         })
     }
@@ -193,6 +197,7 @@ impl ProviderScanMetadataExpansion {
             table_uri,
             snapshot_version,
             files,
+            files_filtered_during_planning: _,
             scan_metadata_exhausted: _,
         } = self;
 
@@ -210,6 +215,7 @@ impl ProviderScanMetadataExpansion {
             table_uri,
             snapshot_version,
             files,
+            files_filtered_during_planning,
             scan_metadata_exhausted,
         } = self;
         let file_tasks =
@@ -220,6 +226,7 @@ impl ProviderScanMetadataExpansion {
             table_uri,
             snapshot_version,
             scan_metadata_exhausted,
+            files_filtered_during_planning,
             file_tasks,
             options,
         })
@@ -348,6 +355,7 @@ mod tests {
         assert_eq!(expansion.table_uri, plan.table_uri);
         assert_eq!(expansion.snapshot_version, 1);
         assert!(expansion.scan_metadata_exhausted);
+        assert_eq!(expansion.files_filtered_during_planning, Some(2));
         assert_eq!(expansion.files.len(), 1);
         assert_eq!(expansion.files[0].path, "part-00000.parquet");
         assert_eq!(
@@ -400,6 +408,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(expansion.scan_metadata_exhausted);
+        assert_eq!(expansion.files_filtered_during_planning, Some(0));
         assert_eq!(
             paths,
             vec![
@@ -496,6 +505,7 @@ mod tests {
         assert_eq!(partition_plan.table_uri, table_uri);
         assert_eq!(partition_plan.snapshot_version, 1);
         assert!(partition_plan.scan_metadata_exhausted);
+        assert_eq!(partition_plan.files_filtered_during_planning, Some(0));
         assert_eq!(partition_plan.partitions.len(), 1);
         assert_eq!(
             partition_paths,

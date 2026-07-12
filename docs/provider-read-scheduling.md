@@ -94,6 +94,11 @@ existing counters:
 skipped tasks reduce `files_started` and `files_completed`, because skipped
 tasks never enter a reader backend.
 
+`files_filtered_during_planning` is a best-effort count of Add actions excluded
+by Delta Kernel metadata planning. Kernel's final selection also includes
+Add/Remove deduplication, so this is not an exact count of current snapshot
+files. The Python progress display marks this value as approximate.
+
 The provider does not currently expose `dynamic_filters_completed` or
 `dynamic_filters_too_late`. DataFusion does not provide a completion signal
 that this scan can observe without coupling to producer internals or blocking

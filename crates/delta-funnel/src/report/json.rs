@@ -701,6 +701,7 @@ fn provider_read_stats_value(stats: &DeltaProviderReadStatsSnapshot) -> Value {
         "scan_metadata_exhausted": stats.scan_metadata_exhausted,
         "scan_partitions_planned": stats.scan_partitions_planned,
         "files_planned": stats.files_planned,
+        "files_filtered_during_planning": stats.files_filtered_during_planning,
         "estimated_rows": stats.estimated_rows,
         "estimated_bytes": stats.estimated_bytes,
         "datafusion_output_batch_size": stats.datafusion_output_batch_size,
@@ -1289,6 +1290,10 @@ mod tests {
             "native_async"
         );
         assert_eq!(value["provider_read_stats"]["files_planned"], 5);
+        assert_eq!(
+            value["provider_read_stats"]["files_filtered_during_planning"],
+            8
+        );
         assert_eq!(value["provider_read_stats"]["rows_produced"], 10);
         assert_eq!(
             value["provider_read_stats"]["dynamic_partition_files_pruned"],
@@ -1383,6 +1388,7 @@ mod tests {
             scan_metadata_exhausted: Some(true),
             scan_partitions_planned: 4,
             files_planned: 5,
+            files_filtered_during_planning: Some(8),
             estimated_rows: Some(99),
             estimated_bytes: Some(2048),
             datafusion_output_batch_size: Some(128),

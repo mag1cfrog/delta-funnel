@@ -21,6 +21,8 @@ pub(crate) struct DeltaScanFileTaskPartitionPlanRequest {
     pub(crate) snapshot_version: u64,
     /// Whether the upstream scan metadata iterator was consumed to completion.
     pub(crate) scan_metadata_exhausted: bool,
+    /// Approximate Add actions excluded during Kernel metadata planning.
+    pub(crate) files_filtered_during_planning: Option<u64>,
     /// Delta-aware file tasks selected for this provider scan.
     pub(crate) file_tasks: Vec<DeltaScanFileTask>,
     /// Partition grouping options for this provider scan.
@@ -45,6 +47,8 @@ pub(crate) struct DeltaScanFileTaskPartitionPlan {
     pub(crate) partitions: Vec<DeltaScanFileTaskPartition>,
     /// Whether upstream scan metadata was consumed to completion.
     pub(crate) scan_metadata_exhausted: bool,
+    /// Approximate Add actions excluded during Kernel metadata planning.
+    pub(crate) files_filtered_during_planning: Option<u64>,
     /// Total estimated bytes when every input file task has a known byte estimate.
     pub(crate) estimated_bytes: Option<u64>,
     /// Total estimated rows when every input file task has a known row estimate.
@@ -102,6 +106,7 @@ impl DeltaScanFileTaskPartitionPlan {
             table_uri,
             snapshot_version,
             scan_metadata_exhausted,
+            files_filtered_during_planning,
             file_tasks,
             options,
         } = request;
@@ -149,6 +154,7 @@ impl DeltaScanFileTaskPartitionPlan {
             snapshot_version,
             partitions,
             scan_metadata_exhausted,
+            files_filtered_during_planning,
             estimated_bytes,
             estimated_rows,
         })
@@ -463,6 +469,7 @@ mod tests {
             table_uri: "file:///tmp/table".to_owned(),
             snapshot_version: 42,
             scan_metadata_exhausted: true,
+            files_filtered_during_planning: Some(7),
             file_tasks,
             options: DeltaScanFileTaskPartitionOptions { target_partitions },
         }
@@ -601,6 +608,7 @@ mod tests {
         assert_eq!(plan.table_uri, "file:///tmp/table");
         assert_eq!(plan.snapshot_version, 42);
         assert!(plan.scan_metadata_exhausted);
+        assert_eq!(plan.files_filtered_during_planning, Some(7));
         assert!(plan.partitions.is_empty());
         assert_eq!(plan.estimated_bytes, Some(0));
         assert_eq!(plan.estimated_rows, Some(0));

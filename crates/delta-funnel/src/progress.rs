@@ -103,6 +103,8 @@ struct ProgressOutputPosition {
 struct DeltaFileProgress {
     handled: u64,
     total: u64,
+    runtime_pruned: u64,
+    planning_pruned: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +146,7 @@ impl ProgressEvent {
         files_total: u64,
     ) -> Option<Self> {
         let mut snapshot = ProgressSnapshot::new(phase, output_name);
-        snapshot.file_progress = DeltaFileProgress::new(files_handled, files_total);
+        snapshot.file_progress = DeltaFileProgress::new(files_handled, files_total, 0, None);
         snapshot.file_progress.map(|_| Self {
             state: ProgressEventState::Progress(snapshot),
         })
@@ -171,7 +173,7 @@ impl ProgressEvent {
         batches: u64,
     ) -> Self {
         let mut snapshot = ProgressSnapshot::new(phase, output_name);
-        snapshot.file_progress = DeltaFileProgress::new(files_handled, files_total);
+        snapshot.file_progress = DeltaFileProgress::new(files_handled, files_total, 0, None);
         snapshot.metrics = Some(ProgressMetrics { rows, batches });
         Self {
             state: ProgressEventState::Progress(snapshot),
@@ -283,6 +285,24 @@ impl ProgressEvent {
             .map(|progress| progress.total)
     }
 
+    /// Returns selected files skipped by dynamic partition pruning.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn files_runtime_pruned(&self) -> Option<u64> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.file_progress)
+            .map(|progress| progress.runtime_pruned)
+    }
+
+    /// Returns the approximate files excluded during metadata planning.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn files_planning_pruned(&self) -> Option<u64> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.file_progress)
+            .and_then(|progress| progress.planning_pruned)
+    }
+
     /// Returns the accepted row count when present.
     #[doc(hidden)]
     #[must_use]
@@ -324,14 +344,26 @@ impl ProgressSnapshot {
 }
 
 impl DeltaFileProgress {
-    const fn new(handled: u64, total: u64) -> Option<Self> {
+    const fn new(
+        handled: u64,
+        total: u64,
+        runtime_pruned: u64,
+        planning_pruned: Option<u64>,
+    ) -> Option<Self> {
         if total == 0 {
             return None;
         }
 
+        let handled = if handled > total { total } else { handled };
         Some(Self {
-            handled: if handled > total { total } else { handled },
+            handled,
             total,
+            runtime_pruned: if runtime_pruned > handled {
+                handled
+            } else {
+                runtime_pruned
+            },
+            planning_pruned,
         })
     }
 
@@ -349,12 +381,24 @@ impl DeltaFileProgress {
         let total = provider_stats
             .iter()
             .try_fold(0_u64, |total, stats| total.checked_add(stats.files_planned))?;
-        let handled = provider_stats.iter().fold(0_u64, |handled, stats| {
-            handled
-                .saturating_add(stats.files_completed)
-                .saturating_add(stats.dynamic_partition_files_pruned)
+        let (completed, pruned) =
+            provider_stats
+                .iter()
+                .fold((0_u64, 0_u64), |(completed, pruned), stats| {
+                    (
+                        completed.saturating_add(stats.files_completed),
+                        pruned.saturating_add(stats.dynamic_partition_files_pruned),
+                    )
+                });
+        let planning_pruned = provider_stats.iter().try_fold(0_u64, |total, stats| {
+            total.checked_add(stats.files_filtered_during_planning?)
         });
-        Self::new(handled, total)
+        Self::new(
+            completed.saturating_add(pruned),
+            total,
+            pruned,
+            planning_pruned,
+        )
     }
 }
 
@@ -413,6 +457,8 @@ mod tests {
         assert_eq!(phase.output_count(), None);
         assert_eq!(phase.files_handled(), None);
         assert_eq!(phase.files_total(), None);
+        assert_eq!(phase.files_runtime_pruned(), None);
+        assert_eq!(phase.files_planning_pruned(), None);
         assert_eq!(phase.rows(), None);
         assert_eq!(phase.batches(), None);
 
@@ -422,6 +468,8 @@ mod tests {
         assert_eq!(progress.output_name(), Some("orders"));
         assert_eq!(progress.files_handled(), None);
         assert_eq!(progress.files_total(), None);
+        assert_eq!(progress.files_runtime_pruned(), None);
+        assert_eq!(progress.files_planning_pruned(), None);
         assert_eq!(progress.rows(), Some(42));
         assert_eq!(progress.batches(), Some(3));
     }
@@ -435,6 +483,8 @@ mod tests {
         assert_eq!(progress.phase(), Some(ProgressPhase::Writing));
         assert_eq!(progress.files_handled(), Some(5));
         assert_eq!(progress.files_total(), Some(5));
+        assert_eq!(progress.files_runtime_pruned(), Some(0));
+        assert_eq!(progress.files_planning_pruned(), None);
         assert_eq!(progress.rows(), Some(42));
         assert_eq!(progress.batches(), Some(3));
         assert!(
@@ -461,6 +511,8 @@ mod tests {
 
         assert_eq!(progress.files_total(), Some(12));
         assert_eq!(progress.files_handled(), Some(6));
+        assert_eq!(progress.files_runtime_pruned(), Some(3));
+        assert_eq!(progress.files_planning_pruned(), Some(18));
         Ok(())
     }
 
@@ -477,6 +529,8 @@ mod tests {
 
         assert_eq!(progress.files_total(), Some(5));
         assert_eq!(progress.files_handled(), Some(5));
+        assert_eq!(progress.files_runtime_pruned(), Some(3));
+        assert_eq!(progress.files_planning_pruned(), Some(9));
         Ok(())
     }
 
@@ -516,6 +570,7 @@ mod tests {
             scan_metadata_exhausted,
             scan_partitions_planned: 1,
             files_planned,
+            files_filtered_during_planning: Some(9),
             estimated_rows: None,
             estimated_bytes: None,
             datafusion_output_batch_size: None,
