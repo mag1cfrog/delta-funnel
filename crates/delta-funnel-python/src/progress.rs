@@ -6,8 +6,6 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -24,11 +22,9 @@ use serde_json::Value;
 use crate::json::json_value_to_py;
 
 #[cfg(test)]
-static ATTACHMENT_FAILURE_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
 thread_local! {
     static ADAPTER_CREATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static ATTACHMENT_FAILURE_COUNTDOWN: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -466,14 +462,9 @@ fn try_python<T>(call: impl for<'py> FnOnce(Python<'py>) -> PyResult<T>) -> Pyth
 
 #[cfg(test)]
 fn attachment_unavailable_for_test() -> bool {
-    matches!(
-        ATTACHMENT_FAILURE_COUNTDOWN.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |remaining| remaining.checked_sub(1),
-        ),
-        Ok(1)
-    )
+    let remaining = ATTACHMENT_FAILURE_COUNTDOWN.get();
+    ATTACHMENT_FAILURE_COUNTDOWN.set(remaining.saturating_sub(1));
+    remaining == 1
 }
 
 /// Returns Rich's value, or saves the first interruption for `finish`.
@@ -881,14 +872,14 @@ mod tests {
 
     impl AttachmentFailureGuard {
         fn fail_on_call(call: usize) -> Self {
-            ATTACHMENT_FAILURE_COUNTDOWN.store(call, Ordering::Relaxed);
+            ATTACHMENT_FAILURE_COUNTDOWN.set(call);
             Self
         }
     }
 
     impl Drop for AttachmentFailureGuard {
         fn drop(&mut self) {
-            ATTACHMENT_FAILURE_COUNTDOWN.store(0, Ordering::Relaxed);
+            ATTACHMENT_FAILURE_COUNTDOWN.set(0);
         }
     }
 
@@ -991,7 +982,14 @@ mod tests {
                 c_str!(
                     r#"
 import sys
+import threading
 import types
+
+owner_thread = threading.get_ident()
+
+def record(value):
+    if threading.get_ident() == owner_thread:
+        records.append(value)
 
 def maybe_fail(call):
     if fail_call == call:
@@ -1001,14 +999,14 @@ def maybe_fail(call):
 
 class Console:
     def __init__(self, **kwargs):
-        records.append({"call": "console", **kwargs})
+        record({"call": "console", **kwargs})
         maybe_fail("console")
         self.is_interactive = interactive or kwargs.get("force_interactive", False)
         self.is_jupyter = jupyter
 
 class Progress:
     def __init__(self, *columns, **kwargs):
-        records.append({
+        record({
             "call": "progress",
             "columns": len(columns),
             "auto_refresh": kwargs.get("auto_refresh"),
@@ -1019,16 +1017,16 @@ class Progress:
         maybe_fail("progress")
 
     def add_task(self, description, **kwargs):
-        records.append({"call": "add_task", "description": description, "total": kwargs.get("total")})
+        record({"call": "add_task", "description": description, "total": kwargs.get("total")})
         maybe_fail("add_task")
         return 7
 
     def start(self):
-        records.append({"call": "start"})
+        record({"call": "start"})
         maybe_fail("start")
 
     def update(self, task_id, **kwargs):
-        records.append({"call": "update", "task_id": task_id, **kwargs})
+        record({"call": "update", "task_id": task_id, **kwargs})
         description = kwargs.get("description", "")
         terminal = any(description.startswith(label) for label in (
             "Completed", "Completed with failures", "Failed", "Cancelled"
@@ -1036,7 +1034,7 @@ class Progress:
         maybe_fail("terminal" if terminal else "update")
 
     def stop(self):
-        records.append({"call": "stop"})
+        record({"call": "stop"})
         maybe_fail("stop")
 
 rich = types.ModuleType("rich")
