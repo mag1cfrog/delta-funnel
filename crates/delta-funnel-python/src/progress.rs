@@ -695,6 +695,7 @@ const fn phase_label(phase: ProgressPhase) -> &'static str {
     match phase {
         ProgressPhase::PlanningOutput => "Planning output",
         ProgressPhase::SettingUpStream => "Preparing data stream",
+        ProgressPhase::MaterializingCache => "Caching shared data",
         ProgressPhase::Connecting => "Connecting to SQL Server",
         ProgressPhase::PreparingTarget => "Preparing target table",
         ProgressPhase::Writing => "Writing to SQL Server",
@@ -1970,6 +1971,10 @@ stream = HostileStderr()
         assert_eq!(
             phase_label(ProgressPhase::SettingUpStream),
             "Preparing data stream"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::MaterializingCache),
+            "Caching shared data"
         );
         assert_eq!(
             phase_label(ProgressPhase::Connecting),

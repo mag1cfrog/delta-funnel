@@ -379,7 +379,7 @@ mod tests {
             return Err("expected cache aliases decision".into());
         };
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
@@ -429,7 +429,7 @@ mod tests {
             return Err("expected cache aliases decision".into());
         };
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
@@ -487,7 +487,7 @@ mod tests {
             return Err("expected cache aliases decision".into());
         };
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
@@ -553,10 +553,10 @@ mod tests {
         assert_eq!(caches[0].table_id(), big.id());
         assert_eq!(caches[1].table_id(), names.id());
         let big_replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
         let names_replacement = session
-            .replace_registered_derived_alias_with_cache(&names)
+            .replace_registered_derived_alias_with_cache(&names, None)
             .await?;
         assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
         assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
@@ -614,7 +614,7 @@ mod tests {
             false,
         )]));
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
 
         let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
@@ -668,7 +668,7 @@ mod tests {
             .ok_or("expected pending west table")?;
         pending_west.sql_text.clear();
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
 
         let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;

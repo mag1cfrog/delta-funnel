@@ -1,12 +1,23 @@
 use std::{fmt, sync::Arc};
 
-use datafusion::{datasource::TableProvider, prelude::SessionContext};
+use datafusion::{
+    datasource::{MemTable, TableProvider},
+    physical_plan::execute_stream_partitioned,
+    prelude::{DataFrame, SessionContext},
+};
+use futures_util::{StreamExt, TryStreamExt, future::try_join_all};
 
-use crate::{DeltaFunnelError, support::sanitize_text_for_display};
+use crate::{
+    DeltaFunnelError, MssqlOutputBatchStream,
+    progress::{ProgressEvent, ProgressPhase, ProgressReporter},
+    query_engine::datafusion::collect_delta_provider_read_stats_handles,
+    support::sanitize_text_for_display,
+};
 
 use super::super::super::{
     DeltaFunnelSession, LazyTable,
     errors::{mssql_scoped_cache_alias_error, unknown_cached_alias_error},
+    query_handoff::{shared_delta_file_progress_state, track_delta_file_progress},
 };
 use super::MssqlDerivedCacheAliasPlan;
 
@@ -149,22 +160,38 @@ impl DeltaFunnelSession {
     pub(crate) async fn replace_registered_derived_alias_with_cache(
         &self,
         table: &LazyTable,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlScopedCacheAliasReplacement<'_>, DeltaFunnelError> {
         let registered = self.registered_derived_for_scoped_cache_alias(table)?;
         let table_id = registered.table().id();
         let alias_name = registered.name().to_owned();
 
-        let cached_provider = self
+        if let Some(reporter) = reporter {
+            reporter.emit(&ProgressEvent::phase_changed(
+                ProgressPhase::MaterializingCache,
+                None,
+            ));
+        }
+        let dataframe = self
             .context
             .table(alias_name.as_str())
             .await
-            .map_err(|error| mssql_scoped_cache_alias_error("resolve", alias_name.as_str(), error))?
-            .cache()
-            .await
             .map_err(|error| {
-                mssql_scoped_cache_alias_error("materialize", alias_name.as_str(), error)
-            })?
-            .into_view();
+                mssql_scoped_cache_alias_error("resolve", alias_name.as_str(), error)
+            })?;
+        let cached_provider = match reporter {
+            Some(reporter) => {
+                self.materialize_cache_with_progress(dataframe, alias_name.as_str(), reporter)
+                    .await?
+            }
+            None => dataframe
+                .cache()
+                .await
+                .map_err(|error| {
+                    mssql_scoped_cache_alias_error("materialize", alias_name.as_str(), error)
+                })?
+                .into_view(),
+        };
 
         let original_provider =
             self.install_scoped_cache_alias_provider(alias_name.as_str(), cached_provider)?;
@@ -180,6 +207,7 @@ impl DeltaFunnelSession {
     pub(super) async fn replace_mssql_cache_aliases(
         &self,
         cache_aliases: &[MssqlDerivedCacheAliasPlan],
+        reporter: Option<&ProgressReporter>,
     ) -> Result<Vec<MssqlScopedCacheAliasReplacement<'_>>, DeltaFunnelError> {
         let mut replacements = Vec::new();
 
@@ -191,7 +219,7 @@ impl DeltaFunnelSession {
                 .clone();
 
             match self
-                .replace_registered_derived_alias_with_cache(&table)
+                .replace_registered_derived_alias_with_cache(&table, reporter)
                 .await
             {
                 Ok(replacement) => replacements.push(replacement),
@@ -202,6 +230,49 @@ impl DeltaFunnelSession {
         }
 
         Ok(replacements)
+    }
+
+    /// Materializes the default DataFusion memory cache while sampling the
+    /// physical plan's Delta file counters.
+    ///
+    /// This preserves the physical plan's partition layout and concurrent
+    /// partition collection. Progress is action-level and has no output name or
+    /// position.
+    async fn materialize_cache_with_progress(
+        &self,
+        dataframe: DataFrame,
+        alias_name: &str,
+        reporter: &ProgressReporter,
+    ) -> Result<Arc<dyn TableProvider>, DeltaFunnelError> {
+        let task_ctx = Arc::new(dataframe.task_ctx());
+        let physical_plan = dataframe
+            .create_physical_plan()
+            .await
+            .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
+        let schema = physical_plan.schema();
+        let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        let progress = shared_delta_file_progress_state(
+            read_stats_handles,
+            reporter.clone(),
+            ProgressPhase::MaterializingCache,
+            None,
+        );
+        let streams = execute_stream_partitioned(physical_plan, task_ctx)
+            .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
+        let partitions = try_join_all(streams.into_iter().map(|stream| {
+            let alias_name = alias_name.to_owned();
+            let stream: MssqlOutputBatchStream = Box::pin(stream.map(move |batch| {
+                batch.map_err(|error| {
+                    mssql_scoped_cache_alias_error("materialize", alias_name.as_str(), error)
+                })
+            }));
+            let stream = track_delta_file_progress(stream, Arc::clone(&progress));
+            async move { stream.try_collect::<Vec<_>>().await }
+        }))
+        .await?;
+        let cached_provider = MemTable::try_new(schema, partitions)
+            .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
+        Ok(Arc::new(cached_provider))
     }
 
     /// Swaps a catalog alias from its original provider to a cached provider.
@@ -345,7 +416,7 @@ mod tests {
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
 
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
 
         assert_eq!(replacement.table_id(), big.id());
@@ -441,7 +512,7 @@ mod tests {
             .await?;
         let big = session.register_alias("big", &pending_big)?;
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
@@ -484,7 +555,7 @@ mod tests {
             .await?;
         let big = session.register_alias("big", &pending_big)?;
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 

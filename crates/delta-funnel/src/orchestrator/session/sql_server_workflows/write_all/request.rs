@@ -1053,6 +1053,79 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn write_all_cache_file_progress_is_action_level_and_resets_for_outputs()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let table = RealParquetDeltaTable::new_default("orders")?;
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            session.delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))?;
+            let pending_big = session
+                .table_from_sql("select id, customer_name from orders")
+                .await?;
+            let big = session.register_alias("big", &pending_big)?;
+            let selected = session
+                .table_from_sql("select id from big where id <= 2")
+                .await?;
+            let big_output =
+                execute_output_request(big, "big_output", "big_orders", LoadMode::AppendExisting)?;
+            let selected_output = execute_output_request(
+                selected,
+                "selected_output",
+                "selected_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let (reporter, events) = recording_progress();
+
+            let report = session
+                .write_all_with_progress_and_writer(
+                    &[big_output, selected_output],
+                    WriteAllOptions::default(),
+                    reporter,
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+            assert!(report.all_succeeded());
+            assert!(matches!(
+                report.cache(),
+                WriteAllCacheReport::CacheAliases { .. }
+            ));
+
+            let events = events.lock().map_err(|_| "progress event lock poisoned")?;
+            let cache_events = events
+                .iter()
+                .filter(|event| event.phase == Some(ProgressPhase::MaterializingCache))
+                .collect::<Vec<_>>();
+            assert!(!cache_events.is_empty());
+            assert!(cache_events.iter().all(|event| {
+                event.output_name.is_none()
+                    && event.output_index.is_none()
+                    && event.output_count.is_none()
+            }));
+            let last_cache_file_event = cache_events
+                .iter()
+                .rev()
+                .find(|event| event.files_total.is_some())
+                .ok_or("cache materialization did not report file progress")?;
+            assert_eq!(
+                last_cache_file_event.files_handled,
+                last_cache_file_event.files_total
+            );
+            let first_output = events
+                .iter()
+                .find(|event| event.phase == Some(ProgressPhase::SettingUpStream))
+                .ok_or("first output did not start")?;
+            assert_eq!(first_output.output_name.as_deref(), Some("big_output"));
+            assert_eq!(first_output.output_index, Some(1));
+            assert_eq!(first_output.output_count, Some(2));
+            assert_eq!(first_output.files_total, None);
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn write_all_preflight_errors_emit_no_progress()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(

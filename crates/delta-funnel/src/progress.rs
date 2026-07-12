@@ -35,6 +35,8 @@ pub enum ProgressPhase {
     PlanningOutput,
     /// Set up the selected output batch stream.
     SettingUpStream,
+    /// Materialize shared data selected by write-all cache planning.
+    MaterializingCache,
     /// Establish the SQL Server connection.
     Connecting,
     /// Prepare the SQL Server target table.

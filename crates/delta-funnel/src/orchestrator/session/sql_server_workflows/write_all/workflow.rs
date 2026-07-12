@@ -179,7 +179,9 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let replacements = self.replace_mssql_cache_aliases(cache_aliases).await?;
+        let replacements = self
+            .replace_mssql_cache_aliases(cache_aliases, reporter)
+            .await?;
         let jobs = match self.build_write_all_cached_jobs(
             planned_outputs,
             cache_aliases,
