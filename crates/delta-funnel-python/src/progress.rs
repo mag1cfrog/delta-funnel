@@ -19,6 +19,9 @@ use delta_funnel::progress::{
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use serde_json::Value;
+
+use crate::json::json_value_to_py;
 
 #[cfg(test)]
 static ATTACHMENT_FAILURE_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
@@ -71,8 +74,14 @@ impl PythonProgress {
     ///
     /// If Rich raised a Python interruption such as `KeyboardInterrupt` during
     /// the action, returns that same exception now. When the Rust action also
-    /// failed, attaches its sanitized Python error for callers to inspect.
-    pub(crate) fn finish(&self, py: Python<'_>, operation_error: Option<&PyErr>) -> PyResult<()> {
+    /// failed, attaches its sanitized Python error for callers to inspect. A
+    /// completed-with-failures action may instead attach its sanitized report.
+    pub(crate) fn finish(
+        &self,
+        py: Python<'_>,
+        operation_error: Option<&PyErr>,
+        operation_report: Option<&Value>,
+    ) -> PyResult<()> {
         // Set the shared state to Done before calling Rich. If Rich calls back
         // into this adapter while stopping, it cannot stop the display twice.
         let mut state = {
@@ -103,6 +112,13 @@ impl PythonProgress {
                     let _ = error
                         .value(py)
                         .setattr("deltafunnel_operation_error", operation_error.value(py));
+                } else if state.final_event == Some(ProgressEventKind::CompletedWithFailures)
+                    && let Some(operation_report) = operation_report
+                    && let Ok(operation_report) = json_value_to_py(py, operation_report)
+                {
+                    let _ = error
+                        .value(py)
+                        .setattr("deltafunnel_operation_report", operation_report.bind(py));
                 }
                 write_interruption_notice(py, status);
                 Err(error)
@@ -769,6 +785,7 @@ mod tests {
     use pyo3::exceptions::{PyGeneratorExit, PyKeyboardInterrupt, PyRuntimeError, PySystemExit};
     use pyo3::ffi::c_str;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
+    use serde_json::json;
 
     use super::*;
     use crate::{deltafunnel, test_support::python_state};
@@ -1787,6 +1804,66 @@ sys.modules["rich.progress"] = progress_module
                     .call_method0("getvalue")?
                     .extract::<String>()?,
                 "DeltaFunnel action status: completed; the Python result was not delivered.\n"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn completed_with_failures_interruption_carries_the_operation_report() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let progress = PythonProgress::new(Some(true))
+                .ok_or_else(|| PyRuntimeError::new_err("progress should be enabled"))?;
+            let interruption = PyKeyboardInterrupt::new_err("renderer interrupted");
+            let interruption_object = interruption.value(py).clone().unbind();
+            {
+                let mut state = match progress.state.lock() {
+                    Ok(state) => state,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                state.pending_interruption = Some(interruption);
+                state.final_event = Some(ProgressEventKind::CompletedWithFailures);
+            }
+            let (_stderr, _capture) = StderrGuard::capture(py)?;
+            let report = json!({
+                "all_succeeded": false,
+                "failed_count": 1,
+                "skipped_count": 1,
+            });
+
+            let error = progress.finish(py, None, Some(&report)).unwrap_err();
+
+            assert!(error.value(py).is(interruption_object.bind(py)));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "completed_with_failures"
+            );
+            let attached = error
+                .value(py)
+                .getattr("deltafunnel_operation_report")?
+                .cast_into::<PyDict>()?;
+            assert!(
+                !attached
+                    .get_item("all_succeeded")?
+                    .unwrap()
+                    .extract::<bool>()?
+            );
+            assert_eq!(
+                attached
+                    .get_item("failed_count")?
+                    .unwrap()
+                    .extract::<u64>()?,
+                1
+            );
+            assert!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_error")
+                    .is_err()
             );
             Ok(())
         })

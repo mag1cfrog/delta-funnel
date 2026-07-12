@@ -231,7 +231,7 @@ impl PySession {
         };
         let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
-            progress.finish(py, report.as_ref().err())?;
+            progress.finish(py, report.as_ref().err(), None)?;
         }
         let report = report?;
         json_value_to_py(py, &report.to_json_value())
@@ -256,7 +256,7 @@ impl PySession {
         });
         let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
-            progress.finish(py, report.as_ref().err())?;
+            progress.finish(py, report.as_ref().err(), None)?;
         }
         let report = report?;
         json_value_to_py(py, &report.to_json_value())
@@ -292,7 +292,7 @@ impl PySession {
         };
         let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
-            progress.finish(py, report.as_ref().err())?;
+            progress.finish(py, report.as_ref().err(), None)?;
         }
         let report = report?;
         json_value_to_py(py, &report.to_json_value())
@@ -322,7 +322,12 @@ impl PySession {
         });
         let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
-            progress.finish(py, report.as_ref().err())?;
+            let operation_report = report
+                .as_ref()
+                .ok()
+                .filter(|report| !report.all_succeeded())
+                .map(delta_funnel::WriteAllReport::to_json_value);
+            progress.finish(py, report.as_ref().err(), operation_report.as_ref())?;
         }
         let report = report?;
         json_value_to_py(py, &report.to_json_value())
