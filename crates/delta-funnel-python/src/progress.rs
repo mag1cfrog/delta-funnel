@@ -325,10 +325,6 @@ impl VisibleProgress {
         } else {
             self.phase.map_or("Working", phase_label)
         };
-        if self.files_total.is_none() && self.rows.is_none() {
-            return label.to_owned();
-        }
-
         let mut description = label.to_owned();
         if let Some(output_name) = &self.output_name {
             description.push_str(": ");
@@ -1257,7 +1253,7 @@ sys.modules["rich.progress"] = progress_module
                     .get_item(4)?
                     .get_item("description")?
                     .extract::<String>()?,
-                "Planning output"
+                "Planning output: orders"
             );
             assert_eq!(
                 records
@@ -1265,7 +1261,7 @@ sys.modules["rich.progress"] = progress_module
                     .get_item(5)?
                     .get_item("description")?
                     .extract::<String>()?,
-                "Failed"
+                "Failed: orders"
             );
             Ok(())
         })
@@ -1334,7 +1330,7 @@ sys.modules["rich.progress"] = progress_module
                     .get_item(4)?
                     .get_item("description")?
                     .extract::<String>()?,
-                "Planning output"
+                "Planning output: orders"
             );
             assert!(
                 records
@@ -1347,7 +1343,7 @@ sys.modules["rich.progress"] = progress_module
                     .get_item(5)?
                     .get_item("description")?
                     .extract::<String>()?,
-                "Completed"
+                "Completed: orders"
             );
             assert!(
                 records

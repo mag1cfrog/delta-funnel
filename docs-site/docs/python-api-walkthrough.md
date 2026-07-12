@@ -156,6 +156,11 @@ removed by Delta metadata pruning are outside that selected total. File sizes
 can differ, so the percentage is not an estimate of bytes read, elapsed time,
 or whole-action completion.
 
+The file line can show `Delta files 8/10 | pruned 3 at runtime, ~90 in
+planning`. Runtime pruning is the exact number of selected files skipped while
+the query ran. Planning pruning is an approximate count from Delta Kernel
+metadata selection, so the display prefixes it with `~`.
+
 The description also shows cumulative rows and batches after SQL Server accepts
 each batch. Dry runs do not have write counters. Queries without eligible Delta
 scan statistics, including queries with zero selected files, remain
