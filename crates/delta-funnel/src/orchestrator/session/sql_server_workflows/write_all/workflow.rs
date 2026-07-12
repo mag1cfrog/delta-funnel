@@ -190,13 +190,15 @@ impl DeltaFunnelSession {
         ) {
             Ok(jobs) => jobs,
             Err(error) => {
-                return Err(restore_mssql_cache_aliases_after_error(error, replacements).await);
+                return Err(
+                    restore_mssql_cache_aliases_after_error(error, replacements, reporter).await,
+                );
             }
         };
         let write_result =
             write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer)
                 .await;
-        let restore_result = restore_mssql_cache_aliases(replacements).await;
+        let restore_result = restore_mssql_cache_aliases(replacements, reporter).await;
 
         match (write_result, restore_result) {
             (Ok(report), Ok(_restorations)) => Ok(report),

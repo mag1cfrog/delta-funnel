@@ -37,6 +37,8 @@ pub enum ProgressPhase {
     SettingUpStream,
     /// Materialize shared data selected by write-all cache planning.
     MaterializingCache,
+    /// Restore session aliases after shared cache execution.
+    RestoringCache,
     /// Establish the SQL Server connection.
     Connecting,
     /// Prepare the SQL Server target table.

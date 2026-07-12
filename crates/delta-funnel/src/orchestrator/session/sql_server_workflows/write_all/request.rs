@@ -1122,6 +1122,22 @@ mod tests {
             assert_eq!(first_output.output_index, Some(1));
             assert_eq!(first_output.output_count, Some(2));
             assert_eq!(first_output.files_total, None);
+            let restoration_index = events
+                .iter()
+                .position(|event| event.phase == Some(ProgressPhase::RestoringCache))
+                .ok_or("cache restoration was not reported")?;
+            let restoration = &events[restoration_index];
+            assert_eq!(restoration.output_name, None);
+            assert_eq!(restoration.output_index, None);
+            assert_eq!(restoration.output_count, None);
+            assert_eq!(restoration.rows, None);
+            assert_eq!(restoration.batches, None);
+            assert_eq!(restoration.files_total, None);
+            let source_reporting_index = events
+                .iter()
+                .position(|event| event.phase == Some(ProgressPhase::ReportingSources))
+                .ok_or("source reporting was not reported")?;
+            assert!(restoration_index < source_reporting_index);
             Ok(())
         }
 

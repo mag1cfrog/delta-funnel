@@ -224,7 +224,12 @@ impl DeltaFunnelSession {
             {
                 Ok(replacement) => replacements.push(replacement),
                 Err(error) => {
-                    return Err(restore_mssql_cache_aliases_after_error(error, replacements).await);
+                    return Err(restore_mssql_cache_aliases_after_error(
+                        error,
+                        replacements,
+                        reporter,
+                    )
+                    .await);
                 }
             }
         }
@@ -343,7 +348,16 @@ impl DeltaFunnelSession {
 
 pub(super) async fn restore_mssql_cache_aliases(
     replacements: Vec<MssqlScopedCacheAliasReplacement<'_>>,
+    reporter: Option<&ProgressReporter>,
 ) -> Result<Vec<MssqlScopedCacheAliasRestoration>, DeltaFunnelError> {
+    if !replacements.is_empty()
+        && let Some(reporter) = reporter
+    {
+        reporter.emit(&ProgressEvent::phase_changed(
+            ProgressPhase::RestoringCache,
+            None,
+        ));
+    }
     let mut restorations = Vec::new();
     let mut first_error = None;
 
@@ -367,8 +381,9 @@ pub(super) async fn restore_mssql_cache_aliases(
 pub(super) async fn restore_mssql_cache_aliases_after_error(
     error: DeltaFunnelError,
     replacements: Vec<MssqlScopedCacheAliasReplacement<'_>>,
+    reporter: Option<&ProgressReporter>,
 ) -> DeltaFunnelError {
-    match restore_mssql_cache_aliases(replacements).await {
+    match restore_mssql_cache_aliases(replacements, reporter).await {
         Ok(_restorations) => error,
         Err(restore_error) => cache_error_with_restore_error(error, restore_error),
     }
@@ -616,7 +631,8 @@ mod tests {
         };
 
         let error =
-            restore_mssql_cache_aliases_after_error(primary_error, vec![broken_replacement]).await;
+            restore_mssql_cache_aliases_after_error(primary_error, vec![broken_replacement], None)
+                .await;
 
         assert!(matches!(
             error,
