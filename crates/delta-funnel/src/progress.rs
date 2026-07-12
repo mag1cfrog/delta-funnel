@@ -180,6 +180,18 @@ impl ProgressEvent {
         }
     }
 
+    /// Adds a validated one-based output position to a phase or progress event.
+    pub(crate) fn with_output_position(mut self, index: u64, count: u64) -> Option<Self> {
+        let position = ProgressOutputPosition::new(index, count)?;
+        match &mut self.state {
+            ProgressEventState::PhaseChanged(snapshot) | ProgressEventState::Progress(snapshot) => {
+                snapshot.output_position = Some(position);
+                Some(self)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) const fn completed() -> Self {
         Self {
             state: ProgressEventState::Completed,
@@ -343,6 +355,16 @@ impl ProgressSnapshot {
     }
 }
 
+impl ProgressOutputPosition {
+    /// Accepts only one-based positions inside the declared output count.
+    const fn new(index: u64, count: u64) -> Option<Self> {
+        if index == 0 || index > count {
+            return None;
+        }
+        Some(Self { index, count })
+    }
+}
+
 impl DeltaFileProgress {
     const fn new(
         handled: u64,
@@ -489,6 +511,42 @@ mod tests {
         assert_eq!(progress.batches(), Some(3));
         assert!(
             ProgressEvent::file_progress(ProgressPhase::Writing, Some("orders"), 0, 0).is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn output_positions_are_one_based_and_belong_only_to_active_work_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(phase) =
+            ProgressEvent::phase_changed(ProgressPhase::PlanningOutput, Some("orders\noutput"))
+                .with_output_position(2, 3)
+        else {
+            return Err("valid phase output position was rejected".into());
+        };
+        let Some(progress) = ProgressEvent::progress(ProgressPhase::Writing, Some("orders"), 42, 3)
+            .with_output_position(2, 3)
+        else {
+            return Err("valid progress output position was rejected".into());
+        };
+
+        for event in [&phase, &progress] {
+            assert_eq!(event.output_index(), Some(2));
+            assert_eq!(event.output_count(), Some(3));
+        }
+        assert_eq!(phase.output_name(), Some(r"orders\noutput"));
+
+        for (index, count) in [(0, 3), (1, 0), (4, 3)] {
+            assert!(
+                ProgressEvent::phase_changed(ProgressPhase::PlanningOutput, None)
+                    .with_output_position(index, count)
+                    .is_none()
+            );
+        }
+        assert!(
+            ProgressEvent::completed()
+                .with_output_position(1, 1)
+                .is_none()
         );
         Ok(())
     }
