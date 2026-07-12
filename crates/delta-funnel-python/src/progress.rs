@@ -4,6 +4,8 @@
 //! Rich until the Rust action starts, then updates the same task until the
 //! action finishes. Rich chooses terminal or Jupyter rendering.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use delta_funnel::progress::{
@@ -12,6 +14,9 @@ use delta_funnel::progress::{
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+
+#[cfg(test)]
+static ATTACHMENT_FAILURE_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
 
 /// Connects one Rust action to one optional Rich progress display.
 pub(crate) struct PythonProgress {
@@ -162,12 +167,29 @@ enum PythonCall<T> {
 
 /// Calls Rich when Python is available and classifies any Python exception.
 fn try_python<T>(call: impl for<'py> FnOnce(Python<'py>) -> PyResult<T>) -> PythonCall<T> {
+    #[cfg(test)]
+    if attachment_unavailable_for_test() {
+        return PythonCall::Failed;
+    }
+
     Python::try_attach(|py| match call(py) {
         Ok(value) => PythonCall::Succeeded(value),
         Err(error) if error.is_instance_of::<PyException>(py) => PythonCall::Failed,
         Err(error) => PythonCall::Interrupted(error),
     })
     .unwrap_or(PythonCall::Failed)
+}
+
+#[cfg(test)]
+fn attachment_unavailable_for_test() -> bool {
+    matches!(
+        ATTACHMENT_FAILURE_COUNTDOWN.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        ),
+        Ok(1)
+    )
 }
 
 /// Returns Rich's value, or saves the first interruption for `finish`.
@@ -460,6 +482,21 @@ mod tests {
 
     struct StderrGuard {
         original: Py<PyAny>,
+    }
+
+    struct AttachmentFailureGuard;
+
+    impl AttachmentFailureGuard {
+        fn fail_on_call(call: usize) -> Self {
+            ATTACHMENT_FAILURE_COUNTDOWN.store(call, Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for AttachmentFailureGuard {
+        fn drop(&mut self) {
+            ATTACHMENT_FAILURE_COUNTDOWN.store(0, Ordering::Relaxed);
+        }
     }
 
     impl StderrGuard {
@@ -993,6 +1030,32 @@ sys.modules["rich.progress"] = progress_module
             dry_run(py, Some(Some(true)))?;
 
             assert_eq!(record_strings(records.bind(py), "call")?, ["console"]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn unavailable_python_attachment_stops_callback_rendering_without_retry() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let cases: [(usize, &[&str]); 3] = [
+                (1, &[]),
+                (3, &["console", "progress", "add_task", "start", "stop"]),
+                (
+                    4,
+                    &["console", "progress", "add_task", "start", "update", "stop"],
+                ),
+            ];
+
+            for (fail_on_call, expected_calls) in cases {
+                let _attachment = AttachmentFailureGuard::fail_on_call(fail_on_call);
+                let (guard, records) = ModuleGuard::install(py, true, false)?;
+
+                dry_run(py, Some(Some(true)))?;
+
+                assert_eq!(record_strings(records.bind(py), "call")?, expected_calls);
+                drop(guard);
+            }
             Ok(())
         })
     }
