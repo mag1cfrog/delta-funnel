@@ -975,6 +975,23 @@ sys.modules["rich.progress"] = progress_module
     }
 
     #[test]
+    fn ordinary_rich_import_failure_does_not_replace_the_report() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            py.import("sys")?
+                .getattr("modules")?
+                .cast_into::<PyDict>()?
+                .set_item("rich.progress", py.None())?;
+
+            dry_run(py, Some(Some(true)))?;
+
+            assert_eq!(record_strings(records.bind(py), "call")?, ["console"]);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn construction_interruptions_are_raised_after_the_action_without_cleanup() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
