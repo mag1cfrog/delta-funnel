@@ -137,6 +137,11 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
 
     let repo_root = repo_root();
     let python_crate = repo_root.join("crates").join("delta-funnel-python");
+    let progress_smoke = python_crate.join("tests").join("progress_smoke.py");
+    let ipykernel_progress_smoke = python_crate
+        .join("tests")
+        .join("ipykernel_progress_smoke.py");
+    let ipykernel_name = "deltafunnel-progress-smoke";
     let temp_parent = repo_root.join("target").join("xtask");
     let temp_dir = TempDir::create_in(&temp_parent, "python-package-check")?;
     let tool_tmp = temp_dir.path().join("tmp");
@@ -200,12 +205,65 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
         .env("TMPDIR", &tool_tmp);
     run_command(&mut command, "install Python wheel into clean virtualenv")?;
 
+    for rich_requirement in [None, Some("rich==14.0.0")] {
+        if let Some(rich_requirement) = rich_requirement {
+            let mut command = Command::new(&venv_python);
+            command
+                .arg("-m")
+                .arg("pip")
+                .arg("install")
+                .arg("--no-cache-dir")
+                .arg(rich_requirement)
+                .env("PIP_CACHE_DIR", &pip_cache)
+                .env("TMPDIR", &tool_tmp);
+            run_command(&mut command, "install minimum supported Rich release")?;
+        }
+
+        for logging_order in ["before", "after"] {
+            let mut command = Command::new(&venv_python);
+            command
+                .arg(&progress_smoke)
+                .arg(logging_order)
+                .env("TMPDIR", &tool_tmp);
+            run_command(
+                &mut command,
+                "smoke-test Python progress and logging isolation",
+            )?;
+        }
+    }
+
     let mut command = Command::new(&venv_python);
     command
-        .arg("-c")
-        .arg(PYTHON_IMPORT_SMOKE)
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("--no-cache-dir")
+        .arg("ipykernel")
+        .env("PIP_CACHE_DIR", &pip_cache)
         .env("TMPDIR", &tool_tmp);
-    run_command(&mut command, "import deltafunnel and construct Session()")?;
+    run_command(&mut command, "install ipykernel for progress smoke test")?;
+
+    let mut command = Command::new(&venv_python);
+    command
+        .arg("-m")
+        .arg("ipykernel")
+        .arg("install")
+        .arg("--prefix")
+        .arg(&venv_dir)
+        .arg("--name")
+        .arg(ipykernel_name)
+        .env("TMPDIR", &tool_tmp);
+    run_command(
+        &mut command,
+        "install isolated kernel spec for progress smoke test",
+    )?;
+
+    let mut command = Command::new(&venv_python);
+    command
+        .arg(&ipykernel_progress_smoke)
+        .arg(ipykernel_name)
+        .env("TMPDIR", &tool_tmp);
+    run_command(&mut command, "smoke-test progress in a real ipykernel")?;
 
     Ok(())
 }
@@ -577,14 +635,6 @@ if metadata["Name"] != "deltafunnel":
     raise SystemExit(f"unexpected package name: {metadata['Name']}")
 if metadata["Version"] != expected_version:
     raise SystemExit(f"unexpected package version: {metadata['Version']}")
-"#;
-
-const PYTHON_IMPORT_SMOKE: &str = r#"
-import deltafunnel
-
-session = deltafunnel.Session()
-assert repr(session).startswith("deltafunnel.Session(")
-print(deltafunnel.__version__)
 "#;
 
 #[cfg(test)]

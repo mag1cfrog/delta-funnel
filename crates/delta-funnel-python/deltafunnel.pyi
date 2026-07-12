@@ -100,6 +100,7 @@ class Table:
         dry_run: bool | None = None,
         name: str | None = None,
         connection_string: str | None = None,
+        progress: bool | None = None,
     ) -> Report: ...
 
 

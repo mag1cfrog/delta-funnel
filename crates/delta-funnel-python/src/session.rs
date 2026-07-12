@@ -6,6 +6,7 @@ use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 use crate::exception::{delta_funnel_error_to_py, delta_funnel_py_error};
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
+use crate::progress::PythonProgress;
 use crate::table::PyTable;
 
 /// Delta Funnel workflow session.
@@ -202,11 +203,23 @@ impl PySession {
         &self,
         py: Python<'_>,
         request: &delta_funnel::OutputWritePlan,
+        progress: Option<&PythonProgress>,
     ) -> PyResult<Py<PyAny>> {
-        let report = self
-            .runtime
-            .dry_run_to_mssql(&self.inner, request)
-            .map_err(|error| rust_error_to_py(py, error))?;
+        let report = progress.map_or_else(
+            || self.runtime.dry_run_to_mssql(&self.inner, request),
+            |progress| {
+                self.runtime.dry_run_to_mssql_with_progress(
+                    &self.inner,
+                    request,
+                    progress.reporter(),
+                )
+            },
+        );
+        let report = report.map_err(|error| rust_error_to_py(py, error));
+        if let Some(progress) = progress {
+            progress.finish(py, report.as_ref().err())?;
+        }
+        let report = report?;
         json_value_to_py(py, &report.to_json_value())
     }
 
@@ -214,10 +227,25 @@ impl PySession {
         &self,
         py: Python<'_>,
         request: &delta_funnel::OutputWritePlan,
+        progress: Option<&PythonProgress>,
     ) -> PyResult<Py<PyAny>> {
-        let report = py
-            .detach(|| self.runtime.write_to_mssql(&self.inner, request))
-            .map_err(|error| rust_error_to_py(py, error))?;
+        let report = py.detach(|| {
+            progress.map_or_else(
+                || self.runtime.write_to_mssql(&self.inner, request),
+                |progress| {
+                    self.runtime.write_to_mssql_with_progress(
+                        &self.inner,
+                        request,
+                        progress.reporter(),
+                    )
+                },
+            )
+        });
+        let report = report.map_err(|error| rust_error_to_py(py, error));
+        if let Some(progress) = progress {
+            progress.finish(py, report.as_ref().err())?;
+        }
+        let report = report?;
         json_value_to_py(py, &report.to_json_value())
     }
 

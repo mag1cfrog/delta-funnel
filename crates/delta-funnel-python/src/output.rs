@@ -145,7 +145,7 @@ fn config_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr
 #[cfg(test)]
 mod tests {
     use super::PyMssqlOutputSpec;
-    use crate::deltafunnel;
+    use crate::{deltafunnel, test_support::python_state};
     use delta_funnel::{LoadMode, MssqlTableName, connect_mssql_client_from_ado_string};
     use pyo3::exceptions::{PyAssertionError, PyKeyError};
     use pyo3::prelude::*;
@@ -305,6 +305,7 @@ mod tests {
 
     #[test]
     fn table_write_to_mssql_dry_run_returns_report_dict() -> PyResult<()> {
+        let _state = python_state();
         Python::attach(|py| {
             let table = sql_table(py)?;
             let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
@@ -356,6 +357,7 @@ mod tests {
 
     #[test]
     fn table_write_to_mssql_dry_run_rejects_missing_connection() -> PyResult<()> {
+        let _state = python_state();
         Python::attach(|py| {
             let table = sql_table(py)?;
             let kwargs = mssql_kwargs(py, "dbo", "orders", "append_existing")?;
@@ -380,6 +382,7 @@ mod tests {
 
     #[test]
     fn table_write_to_mssql_execute_mode_uses_rust_missing_connection_guard() -> PyResult<()> {
+        let _state = python_state();
         Python::attach(|py| {
             let table = sql_table(py)?;
             let kwargs = mssql_kwargs(py, "dbo", "orders", "append_existing")?;
@@ -403,6 +406,7 @@ mod tests {
     #[ignore = "runs through cargo xtask sqlserver-test"]
     fn table_write_to_mssql_execute_writes_with_default_connection_when_configured()
     -> TestResult<()> {
+        let _state = python_state();
         let Some(config) = MssqlIntegrationConfig::from_env() else {
             return Ok(());
         };
@@ -511,6 +515,7 @@ union all select cast(103 as bigint) as order_id",),
     #[ignore = "runs through cargo xtask sqlserver-test"]
     fn table_write_to_mssql_execute_writes_with_connection_override_when_configured()
     -> TestResult<()> {
+        let _state = python_state();
         let Some(config) = MssqlIntegrationConfig::from_env() else {
             return Ok(());
         };
@@ -587,6 +592,7 @@ union all select cast(202 as bigint) as order_id",),
     #[ignore = "runs through cargo xtask sqlserver-test"]
     fn table_write_to_mssql_execute_writes_replace_existing_target_when_configured()
     -> TestResult<()> {
+        let _state = python_state();
         let Some(config) = MssqlIntegrationConfig::from_env() else {
             return Ok(());
         };
@@ -656,6 +662,7 @@ union all select cast(802 as bigint) as order_id",),
     #[ignore = "runs through cargo xtask sqlserver-test"]
     fn table_write_to_mssql_execute_writes_replace_validation_failure_keeps_existing_target()
     -> TestResult<()> {
+        let _state = python_state();
         let Some(config) = MssqlIntegrationConfig::from_env() else {
             return Ok(());
         };

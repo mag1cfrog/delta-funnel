@@ -3,6 +3,7 @@
 use pyo3::prelude::*;
 
 use crate::output::PyMssqlOutputSpec;
+use crate::progress::PythonProgress;
 use crate::session::PySession;
 
 /// Rendered preview of a Delta Funnel table.
@@ -103,7 +104,18 @@ impl PyTable {
     ///
     /// Pass `dry_run=True` to plan without writing. Returns a plain Python
     /// `dict` report.
-    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None))]
+    ///
+    /// By default, shows an indeterminate phase display in interactive
+    /// terminals and Jupyter, and stays quiet elsewhere. Pass `progress=True`
+    /// to force the display or `progress=False` to disable it. Terminal
+    /// progress uses stderr and remains separate from diagnostic logging.
+    /// Progress display does not provide cancellation.
+    ///
+    /// If Python interrupts progress rendering, Delta Funnel finishes action
+    /// cleanup before raising the interruption. When possible, the exception
+    /// includes `deltafunnel_operation_status` and, for a failed action,
+    /// `deltafunnel_operation_error`.
+    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(
         &self,
@@ -114,6 +126,7 @@ impl PyTable {
         dry_run: Option<bool>,
         name: Option<String>,
         connection_string: Option<String>,
+        progress: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
         let spec = PyMssqlOutputSpec::new(
             py,
@@ -125,16 +138,20 @@ impl PyTable {
             name,
             connection_string,
         )?;
+        let progress = PythonProgress::new(progress);
         if dry_run == Some(true) {
-            return self
-                .session
-                .borrow(py)
-                .dry_run_to_mssql(py, &spec.write_plan(delta_funnel::RunMode::DryRun));
+            return self.session.borrow(py).dry_run_to_mssql(
+                py,
+                &spec.write_plan(delta_funnel::RunMode::DryRun),
+                progress.as_ref(),
+            );
         }
 
-        self.session
-            .borrow(py)
-            .write_to_mssql(py, &spec.write_plan(delta_funnel::RunMode::Execute))
+        self.session.borrow(py).write_to_mssql(
+            py,
+            &spec.write_plan(delta_funnel::RunMode::Execute),
+            progress.as_ref(),
+        )
     }
 
     /// Returns a bounded rendered preview of this lazy table.
