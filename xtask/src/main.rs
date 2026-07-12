@@ -200,17 +200,32 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
         .env("TMPDIR", &tool_tmp);
     run_command(&mut command, "install Python wheel into clean virtualenv")?;
 
-    for logging_order in ["before", "after"] {
-        let mut command = Command::new(&venv_python);
-        command
-            .arg("-c")
-            .arg(PYTHON_PROGRESS_SMOKE)
-            .arg(logging_order)
-            .env("TMPDIR", &tool_tmp);
-        run_command(
-            &mut command,
-            "smoke-test Python progress and logging isolation",
-        )?;
+    for rich_requirement in [None, Some("rich==14.0.0")] {
+        if let Some(rich_requirement) = rich_requirement {
+            let mut command = Command::new(&venv_python);
+            command
+                .arg("-m")
+                .arg("pip")
+                .arg("install")
+                .arg("--no-cache-dir")
+                .arg(rich_requirement)
+                .env("PIP_CACHE_DIR", &pip_cache)
+                .env("TMPDIR", &tool_tmp);
+            run_command(&mut command, "install minimum supported Rich release")?;
+        }
+
+        for logging_order in ["before", "after"] {
+            let mut command = Command::new(&venv_python);
+            command
+                .arg("-c")
+                .arg(PYTHON_PROGRESS_SMOKE)
+                .arg(logging_order)
+                .env("TMPDIR", &tool_tmp);
+            run_command(
+                &mut command,
+                "smoke-test Python progress and logging isolation",
+            )?;
+        }
     }
 
     Ok(())
