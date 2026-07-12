@@ -222,6 +222,24 @@ impl DeltaFunnelRuntime {
             .block_on(session.write_all_with_options(requests, options))
     }
 
+    /// Runs a multi-output write and reports its live progress to the caller.
+    ///
+    /// Progress describes work while it is happening. The returned report
+    /// describes the completed per-output results. Reporting progress does not
+    /// change those results.
+    #[doc(hidden)]
+    pub fn write_all_with_progress(
+        &self,
+        session: &DeltaFunnelSession,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+        reporter: ProgressReporter,
+    ) -> Result<WriteAllReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.write_all_with_progress(requests, options, reporter))
+    }
+
     #[cfg(test)]
     pub(crate) fn write_all_with_writer<W>(
         &self,
