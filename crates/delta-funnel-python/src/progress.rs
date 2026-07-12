@@ -1214,7 +1214,11 @@ sys.modules["rich.progress"] = progress_module
         Ok(())
     }
 
-    fn dry_run_all(py: Python<'_>, output_names: &[&str]) -> PyResult<()> {
+    fn dry_run_all(
+        py: Python<'_>,
+        output_names: &[&str],
+        progress: Option<Option<bool>>,
+    ) -> PyResult<()> {
         let module = PyModule::new(py, "deltafunnel")?;
         deltafunnel(&module)?;
         let session_kwargs = PyDict::new(py);
@@ -1236,7 +1240,9 @@ sys.modules["rich.progress"] = progress_module
             .collect::<PyResult<Vec<_>>>()?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("dry_run", true)?;
-        kwargs.set_item("progress", true)?;
+        if let Some(progress) = progress {
+            kwargs.set_item("progress", progress)?;
+        }
         session.call_method("write_all", (PyList::new(py, outputs)?,), Some(&kwargs))?;
         Ok(())
     }
@@ -1401,7 +1407,7 @@ sys.modules["rich.progress"] = progress_module
         Python::attach(|py| {
             let (_guard, records) = ModuleGuard::install(py, true, false)?;
 
-            dry_run_all(py, &["west", "east"])?;
+            dry_run_all(py, &["west", "east"], Some(Some(true)))?;
 
             assert_eq!(
                 record_strings(records.bind(py), "call")?,
@@ -1444,13 +1450,40 @@ sys.modules["rich.progress"] = progress_module
         Python::attach(|py| {
             let (_guard, records) = ModuleGuard::install(py, true, false)?;
 
-            let error = dry_run_all(py, &["orders", "orders"]).unwrap_err();
+            let error = dry_run_all(py, &["orders", "orders"], Some(Some(true))).unwrap_err();
 
             assert_eq!(
                 error.value(py).getattr("kind")?.extract::<String>()?,
                 "mssql_workflow_planning"
             );
             assert!(records.bind(py).is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_uses_the_shared_automatic_forced_and_disabled_modes() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, false, false)?;
+
+            dry_run_all(py, &["orders"], None)?;
+            dry_run_all(py, &["orders"], Some(None))?;
+            dry_run_all(py, &["orders"], Some(Some(false)))?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                ["console", "console"]
+            );
+
+            dry_run_all(py, &["orders"], Some(Some(true)))?;
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "console", "console", "progress", "add_task", "start", "update",
+                    "update", "update", "stop"
+                ]
+            );
             Ok(())
         })
     }
