@@ -191,6 +191,7 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         prepared_target: &MssqlPreparedTarget,
         batches: S,
         options: MssqlWriteBackend,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>
     where
         Self: 'static,
@@ -211,7 +212,8 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         };
         let initialize_timing = initialize_timer.completed();
 
-        match write_mssql_batches_with_writer(output_plan, batches, writer, options).await {
+        match write_mssql_batches_with_writer(output_plan, batches, writer, options, reporter).await
+        {
             Ok(report) => Ok(report.with_phase_timings(vec![initialize_timing])),
             Err(error) => Err(error_with_phase_timings(error, vec![initialize_timing])),
         }
@@ -427,7 +429,7 @@ where
 
     emit_progress_phase(reporter, ProgressPhase::Writing, output_plan.output_name());
     match connection
-        .write_prepared_batches(&output_plan, &prepared_target, batches, options)
+        .write_prepared_batches(&output_plan, &prepared_target, batches, options, reporter)
         .await
     {
         Ok(report) => {
@@ -1171,6 +1173,7 @@ mod tests {
         MssqlConnectionConfig, MssqlPreparedTargetAction, MssqlTargetConfig,
         MssqlTargetResolutionContext, MssqlTargetTable, MssqlWritePhase, PhaseStatus,
         PhaseTimingReport, default_mssql_write_backend, plan_mssql_target_for_output,
+        progress::ProgressEventKind,
     };
 
     #[derive(Default)]
@@ -1496,6 +1499,9 @@ mod tests {
         let phases = Arc::new(Mutex::new(Vec::new()));
         let recorded_phases = Arc::clone(&phases);
         let reporter = ProgressReporter::new(move |event| {
+            if event.kind() != ProgressEventKind::PhaseChanged {
+                return;
+            }
             if let (Some(phase), Ok(mut phases)) = (event.phase(), recorded_phases.lock()) {
                 phases.push(phase);
             }
