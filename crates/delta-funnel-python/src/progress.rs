@@ -331,9 +331,11 @@ impl VisibleProgress {
             description.push_str(output_name);
         }
         if let (Some(rows), Some(batches)) = (self.rows, self.batches) {
+            let row_label = count_label(rows, "row", "rows");
+            let rows = compact_row_count(rows);
             description.push_str(&format!(
                 " - {rows} {}, {batches} {}",
-                count_label(rows, "row", "rows"),
+                row_label,
                 count_label(batches, "batch", "batches")
             ));
         }
@@ -624,6 +626,22 @@ fn update_renderer(
 
 const fn count_label(count: u64, singular: &'static str, plural: &'static str) -> &'static str {
     if count == 1 { singular } else { plural }
+}
+
+/// Shortens large row counts while keeping two decimal places.
+fn compact_row_count(rows: u64) -> String {
+    if rows < 1_000 {
+        return rows.to_string();
+    }
+
+    let rounded_hundredths = |divisor: u128| (u128::from(rows) * 100 + divisor / 2) / divisor;
+    let thousands = rounded_hundredths(1_000);
+    let (value, suffix) = if thousands < 100_000 {
+        (thousands, "K")
+    } else {
+        (rounded_hundredths(1_000_000), "M")
+    };
+    format!("{}.{:02}{suffix}", value / 100, value % 100)
 }
 
 /// Returns the Rust action result reported with a saved Python interruption.
@@ -994,6 +1012,24 @@ sys.modules["rich.progress"] = progress_module
         assert_eq!(
             visible.description(ProgressEventKind::Failed),
             "Failed: orders - 75 rows, 2 batches"
+        );
+    }
+
+    #[test]
+    fn large_row_counts_use_two_decimal_k_and_m_suffixes() {
+        assert_eq!(compact_row_count(999), "999");
+        assert_eq!(compact_row_count(1_000), "1.00K");
+        assert_eq!(compact_row_count(12_345), "12.35K");
+        assert_eq!(compact_row_count(999_994), "999.99K");
+        assert_eq!(compact_row_count(999_995), "1.00M");
+        assert_eq!(compact_row_count(1_234_567), "1.23M");
+
+        let mut visible = VisibleProgress::new();
+        visible.phase = Some(ProgressPhase::Writing);
+        visible.incorporate_metrics(None, Some((1_234_567, 152)));
+        assert_eq!(
+            visible.description(ProgressEventKind::Progress),
+            "Writing to SQL Server - 1.23M rows, 152 batches"
         );
     }
 
