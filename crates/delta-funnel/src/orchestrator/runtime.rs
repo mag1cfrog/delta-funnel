@@ -419,6 +419,7 @@ mod tests {
             batches: MssqlOutputBatchStream,
             write_backend: MssqlWriteBackend,
             validation_options: ValidationOptions,
+            reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let output_plan = crate::plan_mssql_target_for_resolved_output(
                 output_schema.as_ref(),
@@ -434,7 +435,7 @@ mod tests {
                 batches,
                 write_backend,
                 validation_options,
-                None,
+                reporter,
             )
             .await
         }

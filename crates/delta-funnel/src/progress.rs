@@ -454,6 +454,21 @@ impl ProgressReporter {
             callback(event);
         }
     }
+
+    /// Creates a reporter that adds one output position to phase and progress
+    /// events before forwarding them to this reporter.
+    ///
+    /// Action-level start and terminal events are not forwarded because they
+    /// belong to the surrounding multi-output workflow.
+    pub(crate) fn for_output(&self, index: u64, count: u64) -> Option<Self> {
+        ProgressOutputPosition::new(index, count)?;
+        let parent = self.clone();
+        Some(Self::new(move |event| {
+            if let Some(event) = event.clone().with_output_position(index, count) {
+                parent.emit(&event);
+            }
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -569,6 +584,34 @@ mod tests {
                 .with_output_position(1, 1)
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn output_reporter_adds_position_and_drops_action_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            if let Ok(mut events) = recorded.lock() {
+                events.push(event.clone());
+            }
+        });
+        let Some(output_reporter) = reporter.for_output(2, 3) else {
+            return Err("valid output position was rejected".into());
+        };
+
+        output_reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
+        output_reporter.emit(&ProgressEvent::phase_changed(
+            ProgressPhase::Writing,
+            Some("orders"),
+        ));
+        output_reporter.emit(&ProgressEvent::completed());
+
+        let events = events.lock().map_err(|_| "progress event lock poisoned")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].output_index(), Some(2));
+        assert_eq!(events[0].output_count(), Some(3));
         Ok(())
     }
 

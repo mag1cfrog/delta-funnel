@@ -6,7 +6,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputWriteJob, MssqlSchemaPlanOptions,
     MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, MssqlWriteBackend, MssqlWriteReport,
-    ResolvedMssqlTarget, ValidationOptions, write_mssql_outputs_with_writer,
+    ResolvedMssqlTarget, ValidationOptions, progress::ProgressReporter, usize_to_u64_saturating,
+    write_mssql_outputs_with_writer, write_output_batches_to_mssql_with_reporter,
     write_output_batches_to_mssql_with_validation_options,
 };
 
@@ -33,41 +34,61 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowPublicOutputWriter {
         batches: MssqlOutputBatchStream,
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql_with_validation_options(
-            output_schema.as_ref(),
-            resolved_target,
-            schema_options,
-            batches,
-            write_backend,
-            validation_options,
-        )
-        .await
+        match reporter {
+            Some(reporter) => {
+                write_output_batches_to_mssql_with_reporter(
+                    output_schema.as_ref(),
+                    resolved_target,
+                    schema_options,
+                    batches,
+                    write_backend,
+                    validation_options,
+                    reporter,
+                )
+                .await
+            }
+            None => {
+                write_output_batches_to_mssql_with_validation_options(
+                    output_schema.as_ref(),
+                    resolved_target,
+                    schema_options,
+                    batches,
+                    write_backend,
+                    validation_options,
+                )
+                .await
+            }
+        }
     }
 }
 
 impl DeltaFunnelSession {
-    #[allow(dead_code)]
+    /// Builds deferred baseline jobs and binds each optional progress reporter
+    /// to that output's requested position.
     pub(crate) fn build_write_all_baseline_jobs(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
-    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
-        self.build_write_all_baseline_jobs_with_provider_stats(planned_outputs, None)
-    }
-
-    pub(super) fn build_write_all_baseline_jobs_with_provider_stats(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
         provider_stats: Option<SharedProviderReadStats>,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
+        let output_count = usize_to_u64_saturating(planned_outputs.len());
         planned_outputs
             .iter()
-            .map(|planned| {
+            .enumerate()
+            .map(|(output_index, planned)| {
                 let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
                 let batches = self.lazy_table_batch_stream_factory_with_provider_stats(
                     planned.table().clone(),
                     provider_stats.clone(),
                 );
+                let progress = reporter.and_then(|reporter| {
+                    reporter.for_output(
+                        usize_to_u64_saturating(output_index.saturating_add(1)),
+                        output_count,
+                    )
+                });
 
                 Ok(MssqlOutputWriteJob::new(
                     output_schema,
@@ -77,35 +98,38 @@ impl DeltaFunnelSession {
                     self.options.mssql_write_backend(),
                     self.options.validation_options(),
                 )
-                .with_phase_timings(planned.phase_timings().to_vec()))
+                .with_phase_timings(planned.phase_timings().to_vec())
+                .with_progress_reporter(progress))
             })
             .collect()
     }
 
-    #[allow(dead_code)]
+    /// Builds deferred cached jobs and binds each optional progress reporter to
+    /// that output's requested position.
     pub(super) fn build_write_all_cached_jobs(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         active_aliases: &[MssqlDerivedCacheAliasPlan],
-    ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
-        self.build_write_all_cached_jobs_with_provider_stats(planned_outputs, active_aliases, None)
-    }
-
-    pub(super) fn build_write_all_cached_jobs_with_provider_stats(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        active_aliases: &[MssqlDerivedCacheAliasPlan],
         provider_stats: Option<SharedProviderReadStats>,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
+        let output_count = usize_to_u64_saturating(planned_outputs.len());
         planned_outputs
             .iter()
-            .map(|planned| {
+            .enumerate()
+            .map(|(output_index, planned)| {
                 let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
                 let batches = self.cached_output_batch_stream_factory_with_provider_stats(
                     planned.request(),
                     active_aliases,
                     provider_stats.clone(),
                 )?;
+                let progress = reporter.and_then(|reporter| {
+                    reporter.for_output(
+                        usize_to_u64_saturating(output_index.saturating_add(1)),
+                        output_count,
+                    )
+                });
 
                 Ok(MssqlOutputWriteJob::new(
                     output_schema,
@@ -115,77 +139,48 @@ impl DeltaFunnelSession {
                     self.options.mssql_write_backend(),
                     self.options.validation_options(),
                 )
-                .with_phase_timings(planned.phase_timings().to_vec()))
+                .with_phase_timings(planned.phase_timings().to_vec())
+                .with_progress_reporter(progress))
             })
             .collect()
     }
 
-    #[allow(dead_code)]
+    /// Runs the baseline path with an injected writer, optionally collecting
+    /// provider statistics and reporting progress.
     pub(crate) async fn write_all_baseline_with_writer<W>(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         writer: W,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        self.write_all_baseline_with_writer_and_provider_stats(planned_outputs, writer, None)
-            .await
-    }
-
-    pub(super) async fn write_all_baseline_with_writer_and_provider_stats<W>(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        writer: W,
         provider_stats: Option<SharedProviderReadStats>,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let jobs = self
-            .build_write_all_baseline_jobs_with_provider_stats(planned_outputs, provider_stats)?;
+        let jobs = self.build_write_all_baseline_jobs(planned_outputs, provider_stats, reporter)?;
 
         write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
     }
 
-    /// Runs the auto-cache path with an injected workflow writer.
-    ///
-    /// Tests use this to inject a fake writer while the public path supplies a
-    /// writer that calls the existing one-output SQL Server sink.
-    #[allow(dead_code)]
-    async fn write_all_cached_with_writer<W>(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        cache_aliases: &[MssqlDerivedCacheAliasPlan],
-        writer: W,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        self.write_all_cached_with_writer_and_provider_stats(
-            planned_outputs,
-            cache_aliases,
-            writer,
-            None,
-        )
-        .await
-    }
-
-    pub(super) async fn write_all_cached_with_writer_and_provider_stats<W>(
+    /// Runs the auto-cache path with an injected writer, optionally collecting
+    /// provider statistics and reporting progress.
+    pub(super) async fn write_all_cached_with_writer<W>(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         cache_aliases: &[MssqlDerivedCacheAliasPlan],
         writer: W,
         provider_stats: Option<SharedProviderReadStats>,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
         let replacements = self.replace_mssql_cache_aliases(cache_aliases).await?;
-        let jobs = match self.build_write_all_cached_jobs_with_provider_stats(
+        let jobs = match self.build_write_all_cached_jobs(
             planned_outputs,
             cache_aliases,
             provider_stats,
+            reporter,
         ) {
             Ok(jobs) => jobs,
             Err(error) => {
@@ -212,8 +207,13 @@ impl DeltaFunnelSession {
         &self,
         planned_outputs: &[PlannedMssqlOutput],
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
-        self.write_all_baseline_with_writer(planned_outputs, MssqlWorkflowPublicOutputWriter)
-            .await
+        self.write_all_baseline_with_writer(
+            planned_outputs,
+            MssqlWorkflowPublicOutputWriter,
+            None,
+            None,
+        )
+        .await
     }
 
     #[allow(dead_code)]
@@ -226,6 +226,8 @@ impl DeltaFunnelSession {
             planned_outputs,
             cache_aliases,
             MssqlWorkflowPublicOutputWriter,
+            None,
+            None,
         )
         .await
     }
@@ -266,7 +268,7 @@ mod tests {
         let planned = session.plan_write_all_outputs(&[west, east])?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
 
-        let jobs = session.build_write_all_baseline_jobs(&planned)?;
+        let jobs = session.build_write_all_baseline_jobs(&planned, None, None)?;
 
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
         assert_eq!(jobs.len(), 2);

@@ -111,10 +111,11 @@ impl DeltaFunnelSession {
                 let provider_stats = shared_provider_read_stats();
                 let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
-                    .write_all_baseline_with_writer_and_provider_stats(
+                    .write_all_baseline_with_writer(
                         &planned_outputs,
                         writer,
                         Some(Arc::clone(&provider_stats)),
+                        reporter,
                     )
                     .await?;
                 phase_timings.push(workflow_timer.completed());
@@ -258,10 +259,11 @@ impl DeltaFunnelSession {
                 let provider_stats = shared_provider_read_stats();
                 let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
-                    .write_all_baseline_with_writer_and_provider_stats(
+                    .write_all_baseline_with_writer(
                         planned_outputs,
                         writer,
                         Some(Arc::clone(&provider_stats)),
+                        reporter,
                     )
                     .await?;
                 phase_timings.push(workflow_timer.completed());
@@ -283,11 +285,12 @@ impl DeltaFunnelSession {
                 let provider_stats = shared_provider_read_stats();
                 let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
-                    .write_all_cached_with_writer_and_provider_stats(
+                    .write_all_cached_with_writer(
                         planned_outputs,
                         cache_aliases,
                         writer,
                         Some(Arc::clone(&provider_stats)),
+                        reporter,
                     )
                     .await?;
                 phase_timings.push(workflow_timer.completed());
@@ -469,7 +472,9 @@ mod tests {
         PhaseStatus, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, RowCount,
         WriteAllCacheAliasStatus, WriteAllCacheReport, WriteAllNoCacheReason,
         plan_mssql_target_for_resolved_output,
-        progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
+        progress::{
+            ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
+        },
         table_formats::RealParquetDeltaTable,
     };
 
@@ -481,6 +486,8 @@ mod tests {
         output_name: Option<String>,
         output_index: Option<u64>,
         output_count: Option<u64>,
+        rows: Option<u64>,
+        batches: Option<u64>,
     }
 
     fn recording_progress() -> (ProgressReporter, Arc<Mutex<Vec<RecordedProgress>>>) {
@@ -495,6 +502,8 @@ mod tests {
                     output_name: event.output_name().map(str::to_owned),
                     output_index: event.output_index(),
                     output_count: event.output_count(),
+                    rows: event.rows(),
+                    batches: event.batches(),
                 });
             }
         });
@@ -538,6 +547,7 @@ mod tests {
             mut batches: MssqlOutputBatchStream,
             _write_backend: MssqlWriteBackend,
             _validation_options: crate::ValidationOptions,
+            reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;
             let mut batch_count = 0_u64;
@@ -568,6 +578,14 @@ mod tests {
                     rows,
                     batches: batch_count,
                 });
+            if let Some(reporter) = reporter {
+                reporter.emit(&ProgressEvent::progress(
+                    ProgressPhase::Writing,
+                    Some(resolved_target.output_name()),
+                    rows,
+                    batch_count,
+                ));
+            }
 
             if self
                 .fail_output_name
@@ -835,7 +853,7 @@ mod tests {
             assert!(report.all_succeeded());
 
             let events = events.lock().map_err(|_| "progress event lock poisoned")?;
-            assert_eq!(events.len(), 5);
+            assert_eq!(events.len(), 9);
             assert_eq!(events[0].kind, ProgressEventKind::Started);
             assert_eq!(
                 events[0].operation,
@@ -849,11 +867,27 @@ mod tests {
             assert_eq!(events[2].output_name.as_deref(), Some("east_output"));
             assert_eq!(events[2].output_index, Some(2));
             assert_eq!(events[2].output_count, Some(2));
-            assert_eq!(events[3].phase, Some(ProgressPhase::ReportingSources));
-            assert_eq!(events[3].output_name, None);
-            assert_eq!(events[3].output_index, None);
-            assert_eq!(events[3].output_count, None);
-            assert_eq!(events[4].kind, ProgressEventKind::Completed);
+            assert_eq!(events[3].phase, Some(ProgressPhase::SettingUpStream));
+            assert_eq!(events[3].output_name.as_deref(), Some("west_output"));
+            assert_eq!(events[3].output_index, Some(1));
+            assert_eq!(events[3].output_count, Some(2));
+            assert_eq!(events[4].phase, Some(ProgressPhase::Writing));
+            assert_eq!(events[4].output_index, Some(1));
+            assert_eq!(events[4].rows, Some(1));
+            assert_eq!(events[4].batches, Some(1));
+            assert_eq!(events[5].phase, Some(ProgressPhase::SettingUpStream));
+            assert_eq!(events[5].output_name.as_deref(), Some("east_output"));
+            assert_eq!(events[5].output_index, Some(2));
+            assert_eq!(events[5].output_count, Some(2));
+            assert_eq!(events[6].phase, Some(ProgressPhase::Writing));
+            assert_eq!(events[6].output_index, Some(2));
+            assert_eq!(events[6].rows, Some(1));
+            assert_eq!(events[6].batches, Some(1));
+            assert_eq!(events[7].phase, Some(ProgressPhase::ReportingSources));
+            assert_eq!(events[7].output_name, None);
+            assert_eq!(events[7].output_index, None);
+            assert_eq!(events[7].output_count, None);
+            assert_eq!(events[8].kind, ProgressEventKind::Completed);
             Ok(())
         }
 
@@ -888,30 +922,48 @@ mod tests {
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
             )?;
             let output = session.table_from_sql("select 1 as id").await?;
+            let skipped = session.table_from_sql("select 2 as id").await?;
             let output = execute_output_request(
                 output,
                 "orders_output",
                 "orders",
                 LoadMode::AppendExisting,
             )?;
+            let skipped = execute_output_request(
+                skipped,
+                "skipped_output",
+                "skipped_orders",
+                LoadMode::AppendExisting,
+            )?;
             let (reporter, events) = recording_progress();
             let report = session
                 .write_all_with_progress_and_writer(
-                    std::slice::from_ref(&output),
+                    &[output, skipped],
                     WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
                     reporter,
                     FakeWorkflowWriter::failing_on("orders_output"),
                 )
                 .await?;
             assert_eq!(report.failed_count(), 1);
-            assert_eq!(
-                events
-                    .lock()
-                    .map_err(|_| "progress event lock poisoned")?
-                    .last()
-                    .map(|event| event.kind),
-                Some(ProgressEventKind::CompletedWithFailures)
-            );
+            assert_eq!(report.skipped_count(), 1);
+            {
+                let events = events.lock().map_err(|_| "progress event lock poisoned")?;
+                assert_eq!(
+                    events.last().map(|event| event.kind),
+                    Some(ProgressEventKind::CompletedWithFailures)
+                );
+                let attempted_outputs = events
+                    .iter()
+                    .filter(|event| event.phase == Some(ProgressPhase::SettingUpStream))
+                    .collect::<Vec<_>>();
+                assert_eq!(attempted_outputs.len(), 1);
+                assert_eq!(
+                    attempted_outputs[0].output_name.as_deref(),
+                    Some("orders_output")
+                );
+                assert_eq!(attempted_outputs[0].output_index, Some(1));
+                assert_eq!(attempted_outputs[0].output_count, Some(2));
+            }
 
             let mut session = DeltaFunnelSession::new(SessionOptions::new())?;
             let missing_connection = session.table_from_sql("select 1 as id").await?;
