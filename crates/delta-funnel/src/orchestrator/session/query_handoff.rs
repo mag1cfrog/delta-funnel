@@ -532,6 +532,40 @@ mod tests {
         },
     };
 
+    type RecordedFileProgress = (String, u64, u64);
+
+    fn recording_file_progress() -> (ProgressReporter, Arc<Mutex<Vec<RecordedFileProgress>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            let (Some(output_name), Some(handled), Some(total)) = (
+                event.output_name(),
+                event.files_handled(),
+                event.files_total(),
+            ) else {
+                return;
+            };
+            match callback_events.lock() {
+                Ok(mut events) => events.push((output_name.to_owned(), handled, total)),
+                Err(poisoned) => {
+                    poisoned
+                        .into_inner()
+                        .push((output_name.to_owned(), handled, total));
+                }
+            }
+        });
+        (reporter, events)
+    }
+
+    fn recorded_file_progress(
+        events: &Mutex<Vec<RecordedFileProgress>>,
+    ) -> Vec<RecordedFileProgress> {
+        match events.lock() {
+            Ok(events) => events.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     #[tokio::test]
     async fn batch_stream_for_lazy_table_reads_registered_delta_source()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -558,25 +592,7 @@ mod tests {
             "orders",
             table.path().to_string_lossy().to_string(),
         ))?;
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let callback_events = Arc::clone(&events);
-        let reporter = ProgressReporter::new(move |event| {
-            let (Some(output_name), Some(handled), Some(total)) = (
-                event.output_name(),
-                event.files_handled(),
-                event.files_total(),
-            ) else {
-                return;
-            };
-            match callback_events.lock() {
-                Ok(mut events) => events.push((output_name.to_owned(), handled, total)),
-                Err(poisoned) => {
-                    poisoned
-                        .into_inner()
-                        .push((output_name.to_owned(), handled, total));
-                }
-            }
-        });
+        let (reporter, events) = recording_file_progress();
 
         let stream = session
             .batch_stream_for_lazy_table(&source, Some((&reporter, "orders output")))
@@ -584,16 +600,51 @@ mod tests {
         let rows = collect_stream_row_count(stream).await?;
 
         assert_eq!(rows, table.rows());
-        let events = match events.lock() {
-            Ok(events) => events,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let events = recorded_file_progress(&events);
         let Some(last) = events.last() else {
             return Err("Delta stream did not report file progress".into());
         };
         assert_eq!(last.0, "orders output");
         assert!(last.2 > 0);
         assert_eq!(last.1, last.2);
+        assert!(events.windows(2).all(|events| events[0] != events[1]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_stream_sums_file_progress_across_delta_scans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders = RealParquetDeltaTable::new_default("orders")?;
+        let customers = RealParquetDeltaTable::new_default("customers")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            orders.path().to_string_lossy().to_string(),
+        ))?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "customers",
+            customers.path().to_string_lossy().to_string(),
+        ))?;
+        let joined = session
+            .table_from_sql(
+                "select o.id \
+                 from orders o \
+                 join customers c on o.id = c.id",
+            )
+            .await?;
+        let (reporter, events) = recording_file_progress();
+
+        let stream = session
+            .batch_stream_for_lazy_table(&joined, Some((&reporter, "joined output")))
+            .await?;
+        let rows = collect_stream_row_count(stream).await?;
+
+        assert_eq!(rows, 3);
+        let events = recorded_file_progress(&events);
+        let Some(last) = events.last() else {
+            return Err("joined Delta stream did not report file progress".into());
+        };
+        assert_eq!(last, &("joined output".to_owned(), 2, 2));
         assert!(events.windows(2).all(|events| events[0] != events[1]));
         Ok(())
     }
