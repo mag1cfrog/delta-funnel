@@ -599,7 +599,10 @@ class Progress:
 
     def update(self, task_id, **kwargs):
         records.append({"call": "update", "task_id": task_id, **kwargs})
-        maybe_fail("update")
+        terminal = kwargs.get("description") in {
+            "Completed", "Completed with failures", "Failed", "Cancelled"
+        }
+        maybe_fail("terminal" if terminal else "update")
 
     def stop(self):
         records.append({"call": "stop"})
@@ -1068,6 +1071,43 @@ sys.modules["rich.progress"] = progress_module
                 record_strings(records.bind(py), "call")?,
                 ["console", "progress", "add_task", "start", "update", "stop"]
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn terminal_render_failures_follow_the_shared_failure_policy() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            for interruption in [false, true] {
+                let (guard, records, failure) = ModuleGuard::install_with_failure(
+                    py,
+                    true,
+                    false,
+                    Some("terminal"),
+                    interruption,
+                    false,
+                )?;
+                let (stderr, _capture) = StderrGuard::capture(py)?;
+
+                let result = dry_run(py, Some(Some(true)));
+
+                if interruption {
+                    let error = result.unwrap_err();
+                    assert!(error.value(py).is(failure.bind(py)));
+                } else {
+                    result?;
+                }
+                assert_eq!(
+                    record_strings(records.bind(py), "call")?,
+                    [
+                        "console", "progress", "add_task", "start", "update", "update", "stop"
+                    ]
+                );
+
+                drop(stderr);
+                drop(guard);
+            }
             Ok(())
         })
     }
