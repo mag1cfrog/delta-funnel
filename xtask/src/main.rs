@@ -137,6 +137,10 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
 
     let repo_root = repo_root();
     let python_crate = repo_root.join("crates").join("delta-funnel-python");
+    let progress_smoke = python_crate.join("tests").join("progress_smoke.py");
+    let ipykernel_progress_smoke = python_crate
+        .join("tests")
+        .join("ipykernel_progress_smoke.py");
     let temp_parent = repo_root.join("target").join("xtask");
     let temp_dir = TempDir::create_in(&temp_parent, "python-package-check")?;
     let tool_tmp = temp_dir.path().join("tmp");
@@ -217,8 +221,7 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
         for logging_order in ["before", "after"] {
             let mut command = Command::new(&venv_python);
             command
-                .arg("-c")
-                .arg(PYTHON_PROGRESS_SMOKE)
+                .arg(&progress_smoke)
                 .arg(logging_order)
                 .env("TMPDIR", &tool_tmp);
             run_command(
@@ -241,8 +244,7 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
 
     let mut command = Command::new(&venv_python);
     command
-        .arg("-c")
-        .arg(PYTHON_IPYKERNEL_SMOKE)
+        .arg(&ipykernel_progress_smoke)
         .env("TMPDIR", &tool_tmp);
     run_command(&mut command, "smoke-test progress in a real ipykernel")?;
 
@@ -616,117 +618,6 @@ if metadata["Name"] != "deltafunnel":
     raise SystemExit(f"unexpected package name: {metadata['Name']}")
 if metadata["Version"] != expected_version:
     raise SystemExit(f"unexpected package version: {metadata['Version']}")
-"#;
-
-const PYTHON_PROGRESS_SMOKE: &str = r#"
-import contextlib
-import deltafunnel
-import io
-import os
-import sys
-
-session = deltafunnel.Session()
-assert repr(session).startswith("deltafunnel.Session(")
-table = session.table_from_sql("select 1 as id")
-write_options = {
-    "schema": "dbo",
-    "table": "orders",
-    "load_mode": "create_and_load",
-    "dry_run": True,
-    "connection_string": "server=tcp:sql.example.com;password=not-used",
-}
-environment = dict(os.environ)
-logging_order = sys.argv[1]
-if logging_order == "after":
-    deltafunnel.init_logging()
-
-automatic_output = io.StringIO()
-with contextlib.redirect_stderr(automatic_output):
-    report = table.write_to_mssql(**write_options)
-assert report["run_mode"] == "dry_run"
-assert automatic_output.getvalue() == ""
-
-forced_output = io.StringIO()
-with contextlib.redirect_stderr(forced_output):
-    table.write_to_mssql(**write_options, progress=True)
-assert "Completed" in forced_output.getvalue()
-assert dict(os.environ) == environment
-if logging_order == "before":
-    deltafunnel.init_logging()
-print(deltafunnel.__version__)
-"#;
-
-const PYTHON_IPYKERNEL_SMOKE: &str = r#"
-from jupyter_client import KernelManager
-
-
-def execute(client, code):
-    message_id = client.execute(code)
-    messages = []
-    while True:
-        message = client.get_iopub_msg(timeout=30)
-        if message["parent_header"].get("msg_id") != message_id:
-            continue
-        messages.append(message)
-        if (
-            message["msg_type"] == "status"
-            and message["content"]["execution_state"] == "idle"
-        ):
-            return messages
-
-
-manager = KernelManager(kernel_name="python3")
-manager.start_kernel()
-client = manager.client()
-client.start_channels()
-try:
-    client.wait_for_ready(timeout=30)
-    action_messages = execute(
-        client,
-        """
-import deltafunnel
-
-table = deltafunnel.Session().table_from_sql("select 1 as id")
-try:
-    table.write_to_mssql(
-        schema="dbo",
-        table="orders",
-        load_mode="append_existing",
-    )
-except deltafunnel.DeltaFunnelError as error:
-    assert error.kind == "missing_mssql_connection"
-else:
-    raise AssertionError("write unexpectedly succeeded")
-print("ACTION_DONE")
-""",
-    )
-    display_indexes = [
-        index
-        for index, message in enumerate(action_messages)
-        if message["msg_type"] in {"display_data", "update_display_data"}
-    ]
-    action_done_index = next(
-        index
-        for index, message in enumerate(action_messages)
-        if message["msg_type"] == "stream"
-        and "ACTION_DONE" in message["content"]["text"]
-    )
-    assert display_indexes
-    assert max(display_indexes) < action_done_index
-
-    sentinel_messages = execute(client, 'print("SENTINEL")')
-    assert not any(
-        message["msg_type"] in {"display_data", "update_display_data"}
-        for message in sentinel_messages
-    )
-    assert any(
-        message["msg_type"] == "stream"
-        and "SENTINEL" in message["content"]["text"]
-        for message in sentinel_messages
-    )
-finally:
-    client.stop_channels()
-    manager.shutdown_kernel(now=True)
 "#;
 
 #[cfg(test)]
