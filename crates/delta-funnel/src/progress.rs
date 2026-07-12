@@ -150,6 +150,18 @@ impl ProgressEvent {
         })
     }
 
+    pub(crate) fn file_progress_from_provider_stats(
+        phase: ProgressPhase,
+        output_name: Option<&str>,
+        provider_stats: &[crate::DeltaProviderReadStatsSnapshot],
+    ) -> Option<Self> {
+        let mut snapshot = ProgressSnapshot::new(phase, output_name);
+        snapshot.file_progress = DeltaFileProgress::from_provider_stats(provider_stats);
+        snapshot.file_progress.map(|_| Self {
+            state: ProgressEventState::Progress(snapshot),
+        })
+    }
+
     pub(crate) fn progress_with_files(
         phase: ProgressPhase,
         output_name: Option<&str>,
@@ -322,6 +334,28 @@ impl DeltaFileProgress {
             total,
         })
     }
+
+    fn from_provider_stats(
+        provider_stats: &[crate::DeltaProviderReadStatsSnapshot],
+    ) -> Option<Self> {
+        if provider_stats.is_empty()
+            || provider_stats
+                .iter()
+                .any(|stats| stats.scan_metadata_exhausted != Some(true))
+        {
+            return None;
+        }
+
+        let total = provider_stats
+            .iter()
+            .try_fold(0_u64, |total, stats| total.checked_add(stats.files_planned))?;
+        let handled = provider_stats.iter().fold(0_u64, |handled, stats| {
+            handled
+                .saturating_add(stats.files_completed)
+                .saturating_add(stats.dynamic_partition_files_pruned)
+        });
+        Self::new(handled, total)
+    }
 }
 
 /// Cloneable per-action callback owner used by workspace host integrations.
@@ -358,6 +392,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend};
 
     #[test]
     fn events_expose_only_the_payload_for_their_kind() {
@@ -406,6 +441,104 @@ mod tests {
             ProgressEvent::file_progress(ProgressPhase::Writing, Some("orders"), 0, 0).is_none()
         );
         Ok(())
+    }
+
+    #[test]
+    fn provider_stats_sum_selected_and_handled_files_across_scans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stats = [
+            provider_stats(Some(true), 5, 2, 1),
+            provider_stats(Some(true), 7, 1, 2),
+        ];
+
+        let Some(progress) = ProgressEvent::file_progress_from_provider_stats(
+            ProgressPhase::Writing,
+            Some("orders"),
+            &stats,
+        ) else {
+            return Err("eligible provider stats did not produce file progress".into());
+        };
+
+        assert_eq!(progress.files_total(), Some(12));
+        assert_eq!(progress.files_handled(), Some(6));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_stats_cap_handled_files_at_the_selected_total()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stats = [provider_stats(Some(true), 5, 4, 3)];
+
+        let Some(progress) =
+            ProgressEvent::file_progress_from_provider_stats(ProgressPhase::Writing, None, &stats)
+        else {
+            return Err("eligible provider stats did not produce file progress".into());
+        };
+
+        assert_eq!(progress.files_total(), Some(5));
+        assert_eq!(progress.files_handled(), Some(5));
+        Ok(())
+    }
+
+    #[test]
+    fn ineligible_provider_stats_stay_indeterminate() {
+        assert!(
+            ProgressEvent::file_progress_from_provider_stats(ProgressPhase::Writing, None, &[])
+                .is_none()
+        );
+
+        for stats in [
+            provider_stats(Some(false), 1, 0, 0),
+            provider_stats(None, 1, 0, 0),
+            provider_stats(Some(true), 0, 0, 0),
+        ] {
+            assert!(
+                ProgressEvent::file_progress_from_provider_stats(
+                    ProgressPhase::Writing,
+                    None,
+                    &[stats],
+                )
+                .is_none()
+            );
+        }
+    }
+
+    fn provider_stats(
+        scan_metadata_exhausted: Option<bool>,
+        files_planned: u64,
+        files_completed: u64,
+        dynamic_partition_files_pruned: u64,
+    ) -> DeltaProviderReadStatsSnapshot {
+        DeltaProviderReadStatsSnapshot {
+            source_name: "orders".to_owned(),
+            snapshot_version: 1,
+            reader_backend: DeltaProviderReaderBackend::NativeAsync,
+            scan_metadata_exhausted,
+            scan_partitions_planned: 1,
+            files_planned,
+            estimated_rows: None,
+            estimated_bytes: None,
+            datafusion_output_batch_size: None,
+            scan_partitions_started: 0,
+            scan_partitions_completed: 0,
+            files_started: files_completed,
+            files_completed,
+            dynamic_partition_files_pruned,
+            dynamic_partition_files_kept: 0,
+            dynamic_filters_received: 0,
+            dynamic_filters_accepted: 0,
+            dynamic_filters_unsupported: 0,
+            dynamic_filter_snapshots: 0,
+            dynamic_partition_files_not_pruned_missing_metadata: 0,
+            dynamic_partition_files_not_pruned_unsupported_expression: 0,
+            batches_produced: 0,
+            rows_produced: 0,
+            deletion_vector_payloads_loaded: 0,
+            deletion_vectors_applied: 0,
+            deletion_vector_rows_deleted: 0,
+            deletion_vector_failures: 0,
+            deletion_vector_rejections: 0,
+        }
     }
 
     #[test]
