@@ -1439,6 +1439,23 @@ sys.modules["rich.progress"] = progress_module
     }
 
     #[test]
+    fn duplicate_write_all_outputs_fail_before_rich_starts() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+
+            let error = dry_run_all(py, &["orders", "orders"]).unwrap_err();
+
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "mssql_workflow_planning"
+            );
+            assert!(records.bind(py).is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
     fn omitted_and_none_progress_are_both_quiet_when_noninteractive() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
