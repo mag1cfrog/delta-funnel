@@ -754,6 +754,75 @@ sys.modules["rich.progress"] = progress_module
     }
 
     #[test]
+    fn binding_validation_finishes_before_progress_starts() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+
+            for (target, load_mode) in [
+                ("orders", "not_a_load_mode"),
+                ("orders.invalid", "create_and_load"),
+            ] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("schema", "dbo")?;
+                kwargs.set_item("table", target)?;
+                kwargs.set_item("load_mode", load_mode)?;
+                kwargs.set_item("progress", true)?;
+                assert!(
+                    table
+                        .call_method("write_to_mssql", (), Some(&kwargs))
+                        .is_err()
+                );
+            }
+
+            assert!(records.bind(py).is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn planning_failure_after_started_shows_one_failed_lifecycle() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+
+            let error = execute_without_connection(py).unwrap_err();
+
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "missing_mssql_connection"
+            );
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "progress", "add_task", "start", "update", "update", "stop"
+                ]
+            );
+            assert_eq!(
+                records
+                    .bind(py)
+                    .get_item(4)?
+                    .get_item("description")?
+                    .extract::<String>()?,
+                "Planning output"
+            );
+            assert_eq!(
+                records
+                    .bind(py)
+                    .get_item(5)?
+                    .get_item("description")?
+                    .extract::<String>()?,
+                "Failed"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn omitted_and_none_progress_are_both_quiet_when_noninteractive() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
