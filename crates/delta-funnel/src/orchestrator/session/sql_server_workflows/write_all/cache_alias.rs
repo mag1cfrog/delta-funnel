@@ -28,7 +28,6 @@ use super::MssqlDerivedCacheAliasPlan;
 ///
 /// The original provider is owned by this scope until `restore` is awaited.
 /// Callers must not rely on `Drop` for restoration.
-#[allow(dead_code)]
 pub(crate) struct MssqlScopedCacheAliasReplacement<'a> {
     context: &'a SessionContext,
     table_id: u64,
@@ -36,7 +35,6 @@ pub(crate) struct MssqlScopedCacheAliasReplacement<'a> {
     original_provider: Option<Arc<dyn TableProvider>>,
 }
 
-#[allow(dead_code)]
 impl<'a> MssqlScopedCacheAliasReplacement<'a> {
     pub(super) fn new(
         context: &'a SessionContext,
@@ -67,12 +65,14 @@ impl<'a> MssqlScopedCacheAliasReplacement<'a> {
     }
 
     /// Returns the session table id for the replaced alias.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn table_id(&self) -> u64 {
         self.table_id
     }
 
     /// Returns the registered alias name currently backed by the cached provider.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn alias_name(&self) -> &str {
         &self.alias_name
@@ -121,28 +121,29 @@ impl<'a> MssqlScopedCacheAliasReplacement<'a> {
 
 /// Report returned after a scoped cache alias replacement restores the original alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct MssqlScopedCacheAliasRestoration {
     table_id: u64,
     alias_name: String,
     cached_alias_was_present: bool,
 }
 
-#[allow(dead_code)]
 impl MssqlScopedCacheAliasRestoration {
     /// Returns the restored session table id.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn table_id(&self) -> u64 {
         self.table_id
     }
 
     /// Returns the restored alias name.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn alias_name(&self) -> &str {
         &self.alias_name
     }
 
     /// Returns whether a cached alias was present when restoration started.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn cached_alias_was_present(&self) -> bool {
         self.cached_alias_was_present
@@ -159,7 +160,6 @@ impl DeltaFunnelSession {
     ///
     /// This is intentionally a one-alias primitive. It does not choose cache
     /// candidates, replan downstream SQL, or execute any outputs.
-    #[allow(dead_code)]
     pub(crate) async fn replace_registered_derived_alias_with_cache(
         &self,
         table: &LazyTable,
