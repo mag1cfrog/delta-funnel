@@ -111,14 +111,26 @@ terminal action reads or writes the table.
 ## Preview rows
 
 ```python
-preview = daily_orders.preview(limit=20)
-daily_orders.show(limit=20)
+preview = daily_orders.preview(limit=20, progress=None)
+daily_orders.show(limit=20, progress=False)
 ```
 
 `preview()` and `show()` execute the DataFusion query and read rows with the
 limit applied before collection. They do not contact SQL Server or write rows.
 `preview()` returns a `Preview` object with text and notebook HTML
 representations. `show()` prints the text preview to Python stdout.
+
+By default, progress appears in interactive terminals and notebooks and stays
+quiet in scripts and CI. Pass `progress=True` to force it or `progress=False`
+to disable it for one call. Notebook progress finishes before the rich preview
+or `show()` output. In terminals, progress uses stderr, so `show()` keeps stdout
+table-only.
+
+Eligible Delta scans show selected files handled while the bounded query runs.
+A small limit can stop after only part of those files, so a successful preview
+does not force the file bar to 100%. Queries without a reliable Delta file
+total remain indeterminate. The limit is not a progress total, and progress
+does not run a count query or execute the preview twice.
 
 ## Write to SQL Server
 
