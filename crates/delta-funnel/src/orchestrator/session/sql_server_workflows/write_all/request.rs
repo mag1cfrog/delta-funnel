@@ -14,8 +14,8 @@ use super::super::super::{
     query_handoff::{provider_read_stats_snapshot, shared_provider_read_stats},
 };
 use super::{
-    MssqlOutputCacheDecision, MssqlOutputCachePlan, WriteAllCacheMode, WriteAllOptions,
-    cache_report, workflow::MssqlWorkflowPublicOutputWriter,
+    MssqlOutputCacheDecision, WriteAllCacheMode, WriteAllOptions, cache_report,
+    workflow::MssqlWorkflowPublicOutputWriter,
 };
 use tracing::Instrument;
 
@@ -62,7 +62,7 @@ impl DeltaFunnelSession {
             .collect()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn write_all_with_options_and_writer<W>(
         &self,
         requests: &[OutputWritePlan],
@@ -72,12 +72,16 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        validate_write_all_requests(requests)?;
-        self.build_write_all_report(requests, options, writer, None)
+        self.execute_write_all_with_writer(requests, options, writer, None)
             .await
     }
 
-    async fn build_write_all_report<W>(
+    /// Validates and executes one multi-output request with an injected writer.
+    ///
+    /// The optional reporter adds live progress to the same execution path.
+    /// Empty requests still return the normal empty report without emitting a
+    /// progress lifecycle.
+    async fn execute_write_all_with_writer<W>(
         &self,
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
@@ -87,63 +91,117 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
-        let planned_outputs = self.plan_write_outputs(requests, reporter)?;
-        let phase_timings = vec![planning_timer.completed()];
+        validate_write_all_requests(requests)?;
+        let active_reporter = if requests.is_empty() { None } else { reporter };
 
-        match options.cache_mode() {
-            WriteAllCacheMode::Auto => {
-                self.write_all_auto_with_writer(
-                    requests,
-                    &planned_outputs,
-                    writer,
-                    phase_timings,
-                    reporter,
-                )
-                .await
-            }
-            WriteAllCacheMode::Disabled => {
-                let mut phase_timings = phase_timings;
-                phase_timings.push(PhaseTimingReport::skipped(
-                    CACHE_PLANNING_PHASE,
-                    ReportReasonCode::NotExecuted,
-                ));
-                let provider_stats = shared_provider_read_stats();
-                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
-                let workflow = self
-                    .write_all_baseline_with_writer(
-                        &planned_outputs,
-                        writer,
-                        Some(Arc::clone(&provider_stats)),
-                        reporter,
-                    )
-                    .await?;
-                phase_timings.push(workflow_timer.completed());
-                if let Some(reporter) = reporter {
-                    reporter.emit(&ProgressEvent::phase_changed(
-                        ProgressPhase::ReportingSources,
-                        None,
-                    ));
-                }
-                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    &planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                phase_timings.push(source_timer.completed());
-                Ok(
-                    WriteAllReport::new(workflow, cache_report::disabled(), sources)
-                        .with_phase_timings(phase_timings),
-                )
-            }
+        if let Some(reporter) = active_reporter {
+            reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
         }
+
+        let result = async {
+            // Resolve every output before cache planning or execution starts.
+            let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
+            let planned_outputs = self.plan_write_outputs(requests, active_reporter)?;
+            let mut phase_timings = vec![planning_timer.completed()];
+
+            // Cache planning selects the execution route. Disabled mode records
+            // the skipped phase so reports keep the same phase structure.
+            let automatic_cache_plan = match options.cache_mode() {
+                WriteAllCacheMode::Auto => {
+                    let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
+                    let cache_plan = self.plan_mssql_output_cache(requests);
+                    phase_timings.push(cache_timer.completed());
+                    Some(cache_plan)
+                }
+                WriteAllCacheMode::Disabled => {
+                    phase_timings.push(PhaseTimingReport::skipped(
+                        CACHE_PLANNING_PHASE,
+                        ReportReasonCode::NotExecuted,
+                    ));
+                    None
+                }
+            };
+
+            // Run exactly one route while all outputs share the same source
+            // statistics recorder used by the final source report.
+            let provider_stats = shared_provider_read_stats();
+            let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
+            let (workflow, cache) = match automatic_cache_plan.as_ref() {
+                Some(cache_plan) => match cache_plan.decision() {
+                    MssqlOutputCacheDecision::NoCache { .. } => {
+                        let workflow = self
+                            .write_all_baseline_with_writer(
+                                &planned_outputs,
+                                writer,
+                                Some(Arc::clone(&provider_stats)),
+                                active_reporter,
+                            )
+                            .await?;
+                        (workflow, cache_report::from_plan(cache_plan))
+                    }
+                    MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
+                        let workflow = self
+                            .write_all_cached_with_writer(
+                                &planned_outputs,
+                                cache_aliases,
+                                writer,
+                                Some(Arc::clone(&provider_stats)),
+                                active_reporter,
+                            )
+                            .await?;
+                        (workflow, cache_report::from_executed_plan(cache_plan))
+                    }
+                },
+                None => {
+                    let workflow = self
+                        .write_all_baseline_with_writer(
+                            &planned_outputs,
+                            writer,
+                            Some(Arc::clone(&provider_stats)),
+                            active_reporter,
+                        )
+                        .await?;
+                    (workflow, cache_report::disabled())
+                }
+            };
+            phase_timings.push(workflow_timer.completed());
+
+            // Source reporting happens once after either execution route and
+            // uses the provider statistics collected above.
+            if let Some(reporter) = active_reporter {
+                reporter.emit(&ProgressEvent::phase_changed(
+                    ProgressPhase::ReportingSources,
+                    None,
+                ));
+            }
+            let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
+            let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                &planned_outputs,
+                provider_read_stats_snapshot(&provider_stats),
+            )?;
+            phase_timings.push(source_timer.completed());
+
+            Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
+        }
+        .await;
+
+        if let Some(reporter) = active_reporter {
+            reporter.emit(&match &result {
+                Ok(report) if report.all_succeeded() => ProgressEvent::completed(),
+                Ok(_) => ProgressEvent::completed_with_failures(),
+                Err(_) => ProgressEvent::failed(),
+            });
+        }
+        result
     }
 
-    pub(crate) async fn write_all_with_options_and_writer_with_tracing<W>(
+    /// Runs the shared write path inside its tracing and observability boundary.
+    async fn write_all_with_observability<W>(
         &self,
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
         writer: W,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<WriteAllReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
@@ -152,7 +210,7 @@ impl DeltaFunnelSession {
         async move {
             observability::workflow_started(RunMode::Execute, output_count);
             let result = self
-                .write_all_with_options_and_writer(requests, options, writer)
+                .execute_write_all_with_writer(requests, options, writer, reporter)
                 .await;
             observability::workflow_finished(RunMode::Execute, output_count, &result);
             result
@@ -168,6 +226,7 @@ impl DeltaFunnelSession {
     /// contains the final per-output results. A report containing failed or
     /// skipped outputs is still returned successfully and ends with a
     /// completed-with-failures progress event.
+    #[cfg(test)]
     pub(crate) async fn write_all_with_progress_and_writer<W>(
         &self,
         requests: &[OutputWritePlan],
@@ -178,26 +237,11 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        validate_write_all_requests(requests)?;
-        if requests.is_empty() {
-            return self
-                .build_write_all_report(requests, options, writer, None)
-                .await;
-        }
-
-        reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
-        let result = self
-            .build_write_all_report(requests, options, writer, Some(&reporter))
-            .await;
-        reporter.emit(&match &result {
-            Ok(report) if report.all_succeeded() => ProgressEvent::completed(),
-            Ok(_) => ProgressEvent::completed_with_failures(),
-            Err(_) => ProgressEvent::failed(),
-        });
-        result
+        self.execute_write_all_with_writer(requests, options, writer, Some(&reporter))
+            .await
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn write_all_with_writer<W>(
         &self,
         requests: &[OutputWritePlan],
@@ -206,110 +250,8 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        self.write_all_with_options_and_writer_with_tracing(
-            requests,
-            WriteAllOptions::default(),
-            writer,
-        )
-        .await
-    }
-
-    #[allow(dead_code)]
-    async fn write_all_auto_with_writer<W>(
-        &self,
-        requests: &[OutputWritePlan],
-        planned_outputs: &[PlannedMssqlOutput],
-        writer: W,
-        phase_timings: Vec<PhaseTimingReport>,
-        reporter: Option<&ProgressReporter>,
-    ) -> Result<WriteAllReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
-        let cache_plan = self.plan_mssql_output_cache(requests);
-        let mut phase_timings = phase_timings;
-        phase_timings.push(cache_timer.completed());
-
-        self.write_all_auto_plan_with_writer(
-            planned_outputs,
-            &cache_plan,
-            writer,
-            phase_timings,
-            reporter,
-        )
-        .await
-    }
-
-    #[allow(dead_code)]
-    async fn write_all_auto_plan_with_writer<W>(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        cache_plan: &MssqlOutputCachePlan,
-        writer: W,
-        mut phase_timings: Vec<PhaseTimingReport>,
-        reporter: Option<&ProgressReporter>,
-    ) -> Result<WriteAllReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        match cache_plan.decision() {
-            MssqlOutputCacheDecision::NoCache { .. } => {
-                let cache = cache_report::from_plan(cache_plan);
-                let provider_stats = shared_provider_read_stats();
-                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
-                let workflow = self
-                    .write_all_baseline_with_writer(
-                        planned_outputs,
-                        writer,
-                        Some(Arc::clone(&provider_stats)),
-                        reporter,
-                    )
-                    .await?;
-                phase_timings.push(workflow_timer.completed());
-                if let Some(reporter) = reporter {
-                    reporter.emit(&ProgressEvent::phase_changed(
-                        ProgressPhase::ReportingSources,
-                        None,
-                    ));
-                }
-                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                phase_timings.push(source_timer.completed());
-                Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
-            }
-            MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
-                let provider_stats = shared_provider_read_stats();
-                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
-                let workflow = self
-                    .write_all_cached_with_writer(
-                        planned_outputs,
-                        cache_aliases,
-                        writer,
-                        Some(Arc::clone(&provider_stats)),
-                        reporter,
-                    )
-                    .await?;
-                phase_timings.push(workflow_timer.completed());
-                let cache = cache_report::from_executed_plan(cache_plan);
-                if let Some(reporter) = reporter {
-                    reporter.emit(&ProgressEvent::phase_changed(
-                        ProgressPhase::ReportingSources,
-                        None,
-                    ));
-                }
-                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                phase_timings.push(source_timer.completed());
-                Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
-            }
-        }
+        self.execute_write_all_with_writer(requests, WriteAllOptions::default(), writer, None)
+            .await
     }
 
     /// Writes multiple selected lazy tables to SQL Server sequentially.
@@ -348,12 +290,8 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
-        self.write_all_with_options_and_writer_with_tracing(
-            requests,
-            options,
-            MssqlWorkflowPublicOutputWriter,
-        )
-        .await
+        self.write_all_with_observability(requests, options, MssqlWorkflowPublicOutputWriter, None)
+            .await
     }
 
     /// Writes multiple outputs and reports one consolidated progress lifecycle.
@@ -363,21 +301,12 @@ impl DeltaFunnelSession {
         options: WriteAllOptions,
         reporter: ProgressReporter,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
-        let output_count = requests.len();
-        async move {
-            observability::workflow_started(RunMode::Execute, output_count);
-            let result = self
-                .write_all_with_progress_and_writer(
-                    requests,
-                    options,
-                    reporter,
-                    MssqlWorkflowPublicOutputWriter,
-                )
-                .await;
-            observability::workflow_finished(RunMode::Execute, output_count, &result);
-            result
-        }
-        .instrument(observability::workflow_span(RunMode::Execute, output_count))
+        self.write_all_with_observability(
+            requests,
+            options,
+            MssqlWorkflowPublicOutputWriter,
+            Some(&reporter),
+        )
         .await
     }
 
@@ -395,12 +324,8 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
-        self.write_all_with_options_and_writer_with_tracing(
-            requests,
-            options,
-            MssqlStreamBenchmarkOutputWriter,
-        )
-        .await
+        self.write_all_with_observability(requests, options, MssqlStreamBenchmarkOutputWriter, None)
+            .await
     }
 }
 
