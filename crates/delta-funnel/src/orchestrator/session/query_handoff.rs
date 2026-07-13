@@ -53,7 +53,7 @@ pub(super) fn provider_read_stats_snapshot(
 ///
 /// The recorder keeps only shared read counters and snapshots them when the
 /// wrapped stream ends or fails.
-pub(crate) struct FinalDeltaReadStatsRecorder {
+struct FinalDeltaReadStatsRecorder {
     inner: MssqlOutputBatchStream,
     // One live counter handle for each Delta scan in the output plan.
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
@@ -62,7 +62,7 @@ pub(crate) struct FinalDeltaReadStatsRecorder {
 }
 
 impl FinalDeltaReadStatsRecorder {
-    pub(crate) fn new(
+    fn new(
         inner: MssqlOutputBatchStream,
         read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
         provider_stats: SharedProviderReadStats,
@@ -116,11 +116,11 @@ impl Stream for FinalDeltaReadStatsRecorder {
 /// query, or reading Delta metadata again.
 struct DeltaFileProgressTracker {
     inner: MssqlOutputBatchStream,
-    progress: DeltaFileProgressCoordinator,
+    sampler: DeltaFileProgressSampler,
 }
 
-/// Owns the counters and reporter used to emit file progress for one plan.
-pub(super) struct DeltaFileProgressCoordinator {
+/// Samples one plan's counters and emits file progress when they change.
+pub(super) struct DeltaFileProgressSampler {
     // One live counter handle for each Delta scan in the output plan.
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
     reporter: ProgressReporter,
@@ -130,8 +130,8 @@ pub(super) struct DeltaFileProgressCoordinator {
     last_file_progress: Option<(u64, u64)>,
 }
 
-impl DeltaFileProgressCoordinator {
-    /// Creates a file progress coordinator for one physical plan.
+impl DeltaFileProgressSampler {
+    /// Creates a file progress sampler for one physical plan.
     pub(super) fn new(
         read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
         reporter: ProgressReporter,
@@ -169,13 +169,13 @@ impl DeltaFileProgressCoordinator {
 }
 
 /// Wraps a stream so polling it samples the plan's file progress counters.
-pub(super) fn track_delta_file_progress(
+fn track_delta_file_progress(
     stream: MssqlOutputBatchStream,
-    progress: DeltaFileProgressCoordinator,
+    sampler: DeltaFileProgressSampler,
 ) -> MssqlOutputBatchStream {
     Box::pin(DeltaFileProgressTracker {
         inner: stream,
-        progress,
+        sampler,
     })
 }
 
@@ -197,13 +197,13 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
 
     let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan);
     if let Some((reporter, output_name)) = progress {
-        let progress = DeltaFileProgressCoordinator::new(
+        let sampler = DeltaFileProgressSampler::new(
             read_stats_handles.clone(),
             reporter,
             ProgressPhase::Writing,
             Some(output_name),
         );
-        stream = track_delta_file_progress(stream, progress);
+        stream = track_delta_file_progress(stream, sampler);
     }
     if let Some(provider_stats) = provider_stats {
         stream = Box::pin(FinalDeltaReadStatsRecorder::new(
@@ -222,17 +222,17 @@ impl Stream for DeltaFileProgressTracker {
         match self.inner.as_mut().poll_next(context) {
             Poll::Ready(None) => {
                 // Capture final progress before the provider counters are dropped.
-                self.progress.emit_if_changed();
+                self.sampler.emit_if_changed();
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(error))) => {
                 // Keep the last partial progress when query execution fails.
-                self.progress.emit_if_changed();
+                self.sampler.emit_if_changed();
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(Some(Ok(batch))) => {
                 // A ready batch is the existing foreground sampling boundary.
-                self.progress.emit_if_changed();
+                self.sampler.emit_if_changed();
                 Poll::Ready(Some(Ok(batch)))
             }
             // Do not add a timer or wake the stream only to refresh progress.
@@ -241,7 +241,7 @@ impl Stream for DeltaFileProgressTracker {
     }
 }
 
-pub(super) async fn batch_stream_for_lazy_table_from_session_parts(
+async fn batch_stream_for_lazy_table_from_session_parts(
     context: &SessionContext,
     table: &LazyTable,
     sources: &[RegisteredSessionSource],
@@ -359,13 +359,13 @@ impl DeltaFunnelSession {
             Some(reporter) => {
                 let read_stats_handles =
                     collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-                let progress = DeltaFileProgressCoordinator::new(
+                let sampler = DeltaFileProgressSampler::new(
                     read_stats_handles,
                     reporter.clone(),
                     ProgressPhase::CollectingPreview,
                     None,
                 );
-                track_delta_file_progress(stream, progress)
+                track_delta_file_progress(stream, sampler)
             }
             None => stream,
         };
@@ -568,7 +568,7 @@ fn push_html_escaped(output: &mut String, value: &str) {
     }
 }
 
-pub(super) async fn dataframe_for_lazy_table_from_session_parts(
+async fn dataframe_for_lazy_table_from_session_parts(
     context: &SessionContext,
     table: &LazyTable,
     sources: &[RegisteredSessionSource],

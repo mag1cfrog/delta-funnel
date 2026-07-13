@@ -62,7 +62,9 @@ impl PythonProgress {
         };
         #[cfg(test)]
         ADAPTER_CREATION_COUNT.set(ADAPTER_CREATION_COUNT.get().saturating_add(1));
-        let state = Arc::new(Mutex::new(ProgressState::new(mode, output)));
+        let state = Arc::new(Mutex::new(ProgressState::new(RenderState::Pending(
+            ProgressSettings { mode, output },
+        ))));
         let reporter_state = Arc::clone(&state);
         let reporter = ProgressReporter::new(move |event| {
             render_event(&reporter_state, event, Instant::now());
@@ -94,7 +96,7 @@ impl PythonProgress {
                 Ok(shared) => shared,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            std::mem::replace(&mut *shared, ProgressState::done())
+            std::mem::replace(&mut *shared, ProgressState::new(RenderState::Done))
         };
 
         if let RenderState::Active { renderer, .. } = state.render
@@ -173,29 +175,9 @@ struct ProgressState {
 }
 
 impl ProgressState {
-    const fn new(mode: ProgressMode, output: ProgressOutput) -> Self {
+    const fn new(render: RenderState) -> Self {
         Self {
-            render: RenderState::Pending(ProgressSettings { mode, output }),
-            pending_interruption: None,
-            final_event: None,
-            visible: VisibleProgress::new(),
-            metric_throttle: MetricRenderThrottle::new(),
-        }
-    }
-
-    const fn busy() -> Self {
-        Self {
-            render: RenderState::Busy,
-            pending_interruption: None,
-            final_event: None,
-            visible: VisibleProgress::new(),
-            metric_throttle: MetricRenderThrottle::new(),
-        }
-    }
-
-    const fn done() -> Self {
-        Self {
-            render: RenderState::Done,
+            render,
             pending_interruption: None,
             final_event: None,
             visible: VisibleProgress::new(),
@@ -572,7 +554,7 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
             return;
         }
         (
-            std::mem::replace(&mut *state, ProgressState::busy()),
+            std::mem::replace(&mut *state, ProgressState::new(RenderState::Busy)),
             previous_visible,
         )
     };

@@ -18,7 +18,7 @@ use crate::{
 use super::super::super::{
     DeltaFunnelSession, LazyTable,
     errors::{mssql_scoped_cache_alias_error, unknown_cached_alias_error},
-    query_handoff::DeltaFileProgressCoordinator,
+    query_handoff::DeltaFileProgressSampler,
 };
 use super::MssqlDerivedCacheAliasPlan;
 
@@ -175,7 +175,7 @@ impl DeltaFunnelSession {
             .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
         let schema = physical_plan.schema();
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-        let progress = DeltaFileProgressCoordinator::new(
+        let sampler = DeltaFileProgressSampler::new(
             read_stats_handles,
             reporter.clone(),
             ProgressPhase::MaterializingCache,
@@ -195,7 +195,7 @@ impl DeltaFunnelSession {
                 stream
             })
             .collect();
-        let partitions = collect_cache_partitions(streams, progress, alias_name).await?;
+        let partitions = collect_cache_partitions(streams, sampler, alias_name).await?;
         let cached_provider = MemTable::try_new(schema, partitions)
             .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
         Ok(Arc::new(cached_provider))
@@ -270,7 +270,7 @@ impl DeltaFunnelSession {
 /// Collects each cache partition in its own Tokio task and restores its order.
 async fn collect_cache_partitions(
     streams: Vec<MssqlOutputBatchStream>,
-    mut progress: DeltaFileProgressCoordinator,
+    mut sampler: DeltaFileProgressSampler,
     alias_name: &str,
 ) -> Result<Vec<Vec<datafusion::arrow::record_batch::RecordBatch>>, DeltaFunnelError> {
     let mut tasks = JoinSet::new();
@@ -295,16 +295,16 @@ async fn collect_cache_partitions(
     let mut partitions = Vec::new();
     while !tasks.is_empty() {
         tokio::select! {
-            Ok(()) = progress_changes.changed() => progress.emit_if_changed(),
+            Ok(()) = progress_changes.changed() => sampler.emit_if_changed(),
             Some(result) = tasks.join_next() => {
                 match result {
                     Ok((partition_index, batches)) => {
-                        progress.emit_if_changed();
+                        sampler.emit_if_changed();
                         partitions.push((partition_index, batches?));
                     }
                     Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
                     Err(error) => {
-                        progress.emit_if_changed();
+                        sampler.emit_if_changed();
                         return Err(mssql_scoped_cache_alias_error(
                             "materialize",
                             alias_name,
@@ -407,14 +407,14 @@ mod tests {
                 Box::pin(stream) as MssqlOutputBatchStream
             })
             .collect();
-        let progress = DeltaFileProgressCoordinator::new(
+        let sampler = DeltaFileProgressSampler::new(
             Vec::new(),
             ProgressReporter::default(),
             ProgressPhase::MaterializingCache,
             None,
         );
 
-        let partitions = collect_cache_partitions(streams, progress, "big").await?;
+        let partitions = collect_cache_partitions(streams, sampler, "big").await?;
 
         assert_eq!(partitions.len(), 2);
         assert!(partitions.iter().all(|batches| batches.len() == 1));
