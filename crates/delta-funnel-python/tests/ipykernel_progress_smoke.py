@@ -191,10 +191,14 @@ print("PARTIAL_FAILURE_DONE")
 
     preview_messages = execute(
         client,
-        """
+        f"""
 import deltafunnel
 
-table = deltafunnel.Session().table_from_sql("select 1 as id")
+table = deltafunnel.Session().delta_lake(
+    {source_uri!r},
+    name="orders",
+    progress=False,
+)
 table.preview(progress=True)
 """,
     )
@@ -211,9 +215,16 @@ table.preview(progress=True)
         in message["content"].get("data", {}).get("text/html", "")
     )
     assert progress_indexes
-    assert "Completed" in rendered_text(
-        [preview_messages[index] for index in progress_indexes]
-    )
+    progress_displays = [preview_messages[index] for index in progress_indexes]
+    progress_text = rendered_text(progress_displays)
+    assert "Preparing preview" in progress_text
+    assert "Delta files 2/2" in progress_text
+    assert "Completed" in progress_text
+    assert sum(
+        "application/vnd.jupyter.widget-view+json"
+        in message["content"].get("data", {})
+        for message in progress_displays
+    ) == 1
     assert max(progress_indexes) < preview_index
 
     show_messages = execute(
