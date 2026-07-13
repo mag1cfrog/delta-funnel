@@ -21,7 +21,7 @@ use futures_util::{Stream, StreamExt};
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
     datafusion_query_output_stream,
-    progress::{ProgressEvent, ProgressPhase, ProgressReporter},
+    progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
         DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
         snapshot_delta_provider_read_stats,
@@ -338,14 +338,45 @@ impl DeltaFunnelSession {
         table: &LazyTable,
         limit: usize,
     ) -> Result<TablePreview, DeltaFunnelError> {
+        self.build_preview(table, limit, None).await
+    }
+
+    /// Executes the same bounded preview while reporting its live lifecycle.
+    pub(crate) async fn preview_table_with_progress(
+        &self,
+        table: &LazyTable,
+        limit: usize,
+        reporter: ProgressReporter,
+    ) -> Result<TablePreview, DeltaFunnelError> {
+        reporter.emit(&ProgressEvent::started(ProgressOperation::PreviewTable));
+        let result = self.build_preview(table, limit, Some(&reporter)).await;
+        reporter.emit(&if result.is_ok() {
+            ProgressEvent::completed()
+        } else {
+            ProgressEvent::failed()
+        });
+        result
+    }
+
+    /// Runs the existing preview steps and optionally announces each boundary.
+    async fn build_preview(
+        &self,
+        table: &LazyTable,
+        limit: usize,
+        reporter: Option<&ProgressReporter>,
+    ) -> Result<TablePreview, DeltaFunnelError> {
+        emit_preview_phase(reporter, ProgressPhase::PreparingPreview);
         let dataframe = self.dataframe_for_lazy_table(table).await?;
         let schema = Arc::new(dataframe.schema().as_arrow().clone());
-        let batches = dataframe
+        let dataframe = dataframe
             .limit(0, Some(limit))
-            .map_err(|error| datafusion_handoff_setup_error("preview_limit", error))?
+            .map_err(|error| datafusion_handoff_setup_error("preview_limit", error))?;
+        emit_preview_phase(reporter, ProgressPhase::CollectingPreview);
+        let batches = dataframe
             .collect()
             .await
             .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
+        emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
         let text = pretty_format_batches(&batches)
             .map_err(|error| datafusion_handoff_setup_error("preview_text", error))?
             .to_string();
@@ -431,6 +462,12 @@ impl DeltaFunnelSession {
                 .await
             })
         })
+    }
+}
+
+fn emit_preview_phase(reporter: Option<&ProgressReporter>, phase: ProgressPhase) {
+    if let Some(reporter) = reporter {
+        reporter.emit(&ProgressEvent::phase_changed(phase, None));
     }
 }
 
@@ -592,7 +629,8 @@ mod tests {
     use std::sync::{Arc, Mutex, atomic::Ordering};
 
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig, QueryOptions, progress::ProgressReporter,
+        DeltaFunnelError, DeltaSourceConfig, QueryOptions,
+        progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         table_formats::RealParquetDeltaTable,
     };
 
@@ -606,6 +644,25 @@ mod tests {
     };
 
     type RecordedFileProgress = (String, u64, u64);
+    type RecordedPreviewProgress = (
+        ProgressEventKind,
+        Option<ProgressOperation>,
+        Option<ProgressPhase>,
+    );
+
+    fn recording_preview_progress() -> (ProgressReporter, Arc<Mutex<Vec<RecordedPreviewProgress>>>)
+    {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            let event = (event.kind(), event.operation(), event.phase());
+            match callback_events.lock() {
+                Ok(mut events) => events.push(event),
+                Err(poisoned) => poisoned.into_inner().push(event),
+            }
+        });
+        (reporter, events)
+    }
 
     fn recording_file_progress() -> (ProgressReporter, Arc<Mutex<Vec<RecordedFileProgress>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -777,6 +834,80 @@ mod tests {
         );
         assert!(preview.html().contains("<td class=\"df-num\">1</td>"));
         assert!(!preview.html().contains("<td class=\"df-num\">2</td>"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_progress_follows_existing_preview_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = session.table_from_sql("select 1 as id").await?;
+        let (reporter, events) = recording_preview_progress();
+
+        let preview = session
+            .preview_table_with_progress(&table, 1, reporter)
+            .await?;
+
+        assert!(preview.text().contains("| 1  |"));
+        let events = events.lock().map_err(|_| "preview event lock poisoned")?;
+        assert_eq!(
+            events.as_slice(),
+            [
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::PreviewTable),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PreparingPreview),
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::CollectingPreview),
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::FormattingPreview),
+                ),
+                (ProgressEventKind::Completed, None, None),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_progress_fails_once_when_preview_setup_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = LazyTable::placeholder(42, LazyTableKind::DeltaSource);
+        let (reporter, events) = recording_preview_progress();
+
+        let result = session
+            .preview_table_with_progress(&table, 1, reporter)
+            .await;
+
+        assert!(result.is_err());
+        let events = events.lock().map_err(|_| "preview event lock poisoned")?;
+        assert_eq!(
+            events.as_slice(),
+            [
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::PreviewTable),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PreparingPreview),
+                ),
+                (ProgressEventKind::Failed, None, None),
+            ]
+        );
         Ok(())
     }
 

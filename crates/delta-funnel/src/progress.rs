@@ -16,6 +16,8 @@ type ProgressCallback = dyn Fn(&ProgressEvent) + Send + Sync + 'static;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ProgressOperation {
+    /// Execute and format a bounded table preview.
+    PreviewTable,
     /// Execute one SQL Server output write.
     WriteToMssql,
     /// Plan one SQL Server output without executing it.
@@ -31,6 +33,12 @@ pub enum ProgressOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ProgressPhase {
+    /// Prepare the bounded query used for a table preview.
+    PreparingPreview,
+    /// Execute and collect the bounded preview query.
+    CollectingPreview,
+    /// Format collected preview batches as text and HTML.
+    FormattingPreview,
     /// Resolve and plan the selected output.
     PlanningOutput,
     /// Set up the selected output batch stream.
@@ -524,6 +532,7 @@ mod tests {
     #[test]
     fn started_events_preserve_each_operation_identity() {
         for operation in [
+            ProgressOperation::PreviewTable,
             ProgressOperation::WriteToMssql,
             ProgressOperation::DryRunToMssql,
             ProgressOperation::WriteAllToMssql,
