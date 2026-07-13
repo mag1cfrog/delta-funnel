@@ -446,7 +446,7 @@ impl DeltaFunnelSession {
         .ok_or_else(|| unknown_lazy_table_error(table))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn lazy_table_batch_stream_factory(
         &self,
         table: LazyTable,

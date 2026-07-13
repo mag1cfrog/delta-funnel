@@ -69,7 +69,6 @@ impl DeltaFunnelSession {
     /// Dependent outputs are identified from captured lineage so later stream
     /// construction can replan from retained SQL while all cache aliases are
     /// installed.
-    #[allow(dead_code)]
     pub(crate) fn cached_output_stream_route(
         &self,
         request: &OutputWritePlan,
@@ -128,7 +127,7 @@ impl DeltaFunnelSession {
     /// the normal lazy-table stream path. Dependent outputs replan from the
     /// retained SQL text so active scoped cache aliases can replace the
     /// registered providers referenced by that SQL.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn cached_output_batch_stream_factory(
         &self,
         request: &OutputWritePlan,

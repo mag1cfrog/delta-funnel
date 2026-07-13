@@ -1,10 +1,5 @@
 //! Typed progress events for workspace host integrations.
 
-#![allow(
-    dead_code,
-    reason = "metric and multi-output variants are consumed by follow-up progress slices"
-)]
-
 use std::sync::Arc;
 
 use crate::support::sanitize_text_for_display;
@@ -109,6 +104,10 @@ enum ProgressEventState {
     Completed,
     CompletedWithFailures,
     Failed,
+    #[allow(
+        dead_code,
+        reason = "reserved for host-reported cancellation in the progress contract"
+    )]
     Cancelled,
 }
 
@@ -167,6 +166,7 @@ impl ProgressEvent {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn file_progress(
         phase: ProgressPhase,
         output_name: Option<&str>,
@@ -192,6 +192,7 @@ impl ProgressEvent {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn progress_with_files(
         phase: ProgressPhase,
         output_name: Option<&str>,
@@ -238,6 +239,7 @@ impl ProgressEvent {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn cancelled() -> Self {
         Self {
             state: ProgressEventState::Cancelled,

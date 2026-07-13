@@ -25,7 +25,7 @@ const WORKFLOW_EXECUTION_PHASE: &str = "workflow_execution";
 const SOURCE_REPORTING_PHASE: &str = "source_reporting";
 
 impl DeltaFunnelSession {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn plan_write_all_outputs(
         &self,
         requests: &[OutputWritePlan],
