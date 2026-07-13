@@ -53,8 +53,8 @@ Python users can follow these pages in order:
 3. [Core concepts](concepts.md): understand sessions, sources, tables, outputs,
    and reports.
 
-Rust users can start with [Installation](install.md), then continue to the
-[API references](reference/api.md).
+Rust users can follow the same path through [Installation](install.md), the
+[Rust quickstart](rust-quickstart.md), and [Core concepts](concepts.md).
 
 ## Find what you need
 

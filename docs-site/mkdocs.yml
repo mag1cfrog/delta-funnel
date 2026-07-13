@@ -29,6 +29,7 @@ nav:
       - Overview: index.md
       - Installation: install.md
       - Python quickstart: python-api-walkthrough.md
+      - Rust quickstart: rust-quickstart.md
       - Core concepts: concepts.md
   - Core workflows:
       - SQL Server writes: sql-server.md

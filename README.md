@@ -168,6 +168,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+For a guided version of this workflow, see the
+[`Rust quickstart`](https://mag1cfrog.github.io/delta-funnel/rust-quickstart/).
 For the full Rust API, see
 [`docs.rs/delta-funnel`](https://docs.rs/delta-funnel) and the
 [`query_load_dry_run` example](crates/delta-funnel/examples/query_load_dry_run.rs).
