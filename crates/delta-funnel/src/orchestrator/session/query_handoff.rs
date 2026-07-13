@@ -647,7 +647,15 @@ pub(super) async fn dataframe_for_lazy_table_from_session_parts(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::Ordering};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use datafusion::{
+        arrow::datatypes::DataType,
+        logical_expr::{Volatility, create_udf},
+    };
 
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, QueryOptions,
@@ -920,6 +928,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_progress_executes_the_bounded_plan_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (provider, scans) = scan_counting_marker_region_provider("observed")?;
+        session
+            .context()
+            .register_table("preview_source", provider)?;
+        let udf_calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&udf_calls);
+        session.context().register_udf(create_udf(
+            "observe_preview_execution",
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Volatile,
+            Arc::new(move |arguments| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(arguments[0].clone())
+            }),
+        ));
+        let table = session
+            .table_from_sql(
+                "select observe_preview_execution(marker) as marker from preview_source",
+            )
+            .await?;
+        let (reporter, _events) = recording_preview_progress();
+
+        let preview = session
+            .preview_table_with_progress(&table, 1, reporter)
+            .await?;
+
+        assert!(preview.text().contains("observed"));
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        assert_eq!(udf_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn preview_progress_keeps_physical_planning_in_the_preparing_phase_on_failure()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -951,6 +996,45 @@ mod tests {
                     ProgressEventKind::PhaseChanged,
                     None,
                     Some(ProgressPhase::PreparingPreview),
+                ),
+                (ProgressEventKind::Failed, None, None),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_progress_stops_before_formatting_when_execution_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = session
+            .table_from_sql("select cast(1 as bigint) / cast(0 as bigint) as value")
+            .await?;
+        let (reporter, events) = recording_preview_progress();
+
+        let result = session
+            .preview_table_with_progress(&table, 1, reporter)
+            .await;
+
+        assert!(result.is_err());
+        let events = events.lock().map_err(|_| "preview event lock poisoned")?;
+        assert_eq!(
+            events.as_slice(),
+            [
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::PreviewTable),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PreparingPreview),
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::CollectingPreview),
                 ),
                 (ProgressEventKind::Failed, None, None),
             ]
@@ -1022,6 +1106,48 @@ mod tests {
                 .lock()
                 .map_err(|_| "derived preview event lock poisoned")?
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delta_preview_emits_no_file_event_after_its_single_terminal_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_two_files("preview-terminal-order")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let (reporter, events) = recording_preview_progress();
+
+        session
+            .preview_table_with_progress(&source, 20, reporter)
+            .await?;
+
+        let events = events.lock().map_err(|_| "preview event lock poisoned")?;
+        assert!(events.iter().any(|event| {
+            event.0 == ProgressEventKind::Progress
+                && event.2 == Some(ProgressPhase::CollectingPreview)
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.0,
+                        ProgressEventKind::Completed
+                            | ProgressEventKind::CompletedWithFailures
+                            | ProgressEventKind::Failed
+                            | ProgressEventKind::Cancelled
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            events.last(),
+            Some(&(ProgressEventKind::Completed, None, None))
         );
         Ok(())
     }

@@ -917,6 +917,11 @@ mod tests {
         original: Py<PyAny>,
     }
 
+    struct BuiltinPrintGuard {
+        builtins: Py<PyModule>,
+        original: Py<PyAny>,
+    }
+
     struct AttachmentFailureGuard;
 
     impl AttachmentFailureGuard {
@@ -951,6 +956,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = Python::try_attach(|py| {
                 py.import("sys")?.setattr("stderr", self.original.bind(py))
+            });
+        }
+    }
+
+    impl BuiltinPrintGuard {
+        fn replace(py: Python<'_>, replacement: &Bound<'_, PyAny>) -> PyResult<Self> {
+            let builtins = py.import("builtins")?;
+            let original = builtins.getattr("print")?.unbind();
+            builtins.setattr("print", replacement)?;
+            Ok(Self {
+                builtins: builtins.unbind(),
+                original,
+            })
+        }
+    }
+
+    impl Drop for BuiltinPrintGuard {
+        fn drop(&mut self) {
+            let _ = Python::try_attach(|py| {
+                self.builtins
+                    .bind(py)
+                    .setattr("print", self.original.bind(py))
             });
         }
     }
@@ -1071,6 +1098,7 @@ class Console:
         record({"call": "console", **kwargs})
         maybe_fail("console")
         self.stderr = kwargs.get("stderr", False)
+        maybe_fail("stderr_console" if self.stderr else "stdout_console")
         stream_interactive = stderr_interactive if self.stderr else stdout_interactive
         self.is_interactive = stream_interactive or kwargs.get("force_interactive", False)
         self.is_jupyter = jupyter
@@ -1719,6 +1747,48 @@ sys.modules["rich.progress"] = progress_module
     }
 
     #[test]
+    fn preview_stderr_console_failures_follow_the_shared_failure_policy() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            for interruption in [false, true] {
+                let (guard, records, failure) = ModuleGuard::install_with_failure(
+                    py,
+                    true,
+                    false,
+                    Some("stderr_console"),
+                    interruption,
+                    false,
+                )?;
+                let (stderr, _capture) = StderrGuard::capture(py)?;
+
+                let result = preview(py, Some(Some(true)));
+
+                if interruption {
+                    let error = result.unwrap_err();
+                    assert!(error.value(py).is(failure.bind(py)));
+                    assert_eq!(
+                        error
+                            .value(py)
+                            .getattr("deltafunnel_operation_status")?
+                            .extract::<String>()?,
+                        "completed"
+                    );
+                } else {
+                    result?;
+                }
+                assert_eq!(
+                    record_strings(records.bind(py), "call")?,
+                    ["console", "console"]
+                );
+
+                drop(stderr);
+                drop(guard);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
     fn preview_defers_renderer_interruption_until_query_completion() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
@@ -1773,6 +1843,30 @@ sys.modules["rich.progress"] = progress_module
     }
 
     #[test]
+    fn ordinary_renderer_failure_does_not_replace_a_failed_preview() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, renderer_failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), false, false)?;
+
+            let error = preview_sql(
+                py,
+                "select cast(1 as bigint) / cast(0 as bigint) as value",
+                Some(Some(true)),
+            )
+            .unwrap_err();
+
+            assert!(error.is_instance_of::<crate::exception::DeltaFunnelError>(py));
+            assert!(!error.value(py).is(renderer_failure.bind(py)));
+            assert_eq!(
+                record_strings(records.bind(py), "call")?.last(),
+                Some(&"stop".to_owned())
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn show_does_not_print_after_a_deferred_renderer_interruption() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
@@ -1800,6 +1894,51 @@ sys.modules["rich.progress"] = progress_module
                     .call_method0("getvalue")?
                     .extract::<String>()?
                     .is_empty()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn show_print_control_flow_stays_outside_the_progress_adapter() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            let failure = py
+                .get_type::<PySystemExit>()
+                .call1(("print interrupted",))?
+                .unbind();
+            let locals = PyDict::new(py);
+            locals.set_item("failure", failure.bind(py))?;
+            py.run(
+                c_str!(
+                    r#"
+def fail_print(*args, **kwargs):
+    raise failure
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )?;
+            let replacement = locals
+                .get_item("fail_print")?
+                .ok_or_else(|| PyRuntimeError::new_err("missing failing print function"))?;
+            let print_guard = BuiltinPrintGuard::replace(py, &replacement)?;
+
+            let result = show(py, Some(Some(true)));
+            drop(print_guard);
+
+            let error = result.unwrap_err();
+            assert!(error.value(py).is(failure.bind(py)));
+            assert!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")
+                    .is_err()
+            );
+            assert_eq!(
+                record_strings(records.bind(py), "call")?.last(),
+                Some(&"stop".to_owned())
             );
             Ok(())
         })

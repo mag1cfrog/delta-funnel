@@ -321,13 +321,27 @@ mod tests {
                 assert!(error.is_instance_of::<PyTypeError>(py));
 
                 let kwargs = PyDict::new(py);
+                kwargs.set_item("progress", 1)?;
+                let error = table.call_method(method, (), Some(&kwargs)).unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
+
+                let kwargs = PyDict::new(py);
                 kwargs.set_item("progress", true)?;
-                table.call_method(method, (-1,), Some(&kwargs)).unwrap_err();
+                for invalid_limit in [-1_i128, i128::MAX] {
+                    table
+                        .call_method(method, (invalid_limit,), Some(&kwargs))
+                        .unwrap_err();
+                }
 
                 let error = table.call_method1(method, (20, false)).unwrap_err();
                 assert!(error.is_instance_of::<PyTypeError>(py));
             }
 
+            assert_eq!(adapter_creation_count(), initial_count);
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            table.call_method("preview", (), Some(&kwargs))?;
             assert_eq!(adapter_creation_count(), initial_count);
             Ok(())
         })
