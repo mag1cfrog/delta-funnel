@@ -80,8 +80,10 @@ impl PySession {
     /// Registers a named Delta source, or returns a pending source that cannot be referenced by SQL.
     ///
     /// A pending source is not registered in the session SQL catalog and cannot
-    /// be referenced by SQL until `alias(name)` is called.
-    #[pyo3(signature = (source_uri, *, version=None, storage_options=None, name=None))]
+    /// be referenced by SQL until `alias(name)` is called. Progress applies only
+    /// when this call registers a named source. An unnamed pending source stays
+    /// lazy and ignores this call's progress setting.
+    #[pyo3(signature = (source_uri, *, version=None, storage_options=None, name=None, progress=None))]
     fn delta_lake(
         slf: Py<Self>,
         py: Python<'_>,
@@ -89,11 +91,14 @@ impl PySession {
         version: Option<&Bound<'_, PyAny>>,
         storage_options: Option<&Bound<'_, PyDict>>,
         name: Option<String>,
+        progress: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
         let source =
             PendingDeltaSource::new(py, slf.clone_ref(py), source_uri, version, storage_options)?;
         if let Some(name) = name {
-            return Py::new(py, source.register_alias(py, name)?).map(Py::into_any);
+            let progress = PythonProgress::new(progress);
+            return Py::new(py, source.register_alias(py, name, progress.as_ref())?)
+                .map(Py::into_any);
         };
 
         Py::new(py, source).map(Py::into_any)
@@ -196,12 +201,21 @@ impl PySession {
         source_uri: String,
         version: Option<u64>,
         storage_options: delta_funnel::DeltaStorageOptions,
+        progress: Option<&PythonProgress>,
     ) -> PyResult<delta_funnel::LazyTable> {
         let source = delta_source_config(name, source_uri, version, storage_options);
-
-        self.inner
-            .delta_lake(source)
-            .map_err(|error| rust_error_to_py(py, error))
+        let result = match progress {
+            Some(progress) => {
+                self.runtime
+                    .delta_lake_with_progress(&mut self.inner, source, progress.reporter())
+            }
+            None => self.inner.delta_lake(source),
+        }
+        .map_err(|error| rust_error_to_py(py, error));
+        if let Some(progress) = progress {
+            progress.finish(py, result.as_ref().err(), None)?;
+        }
+        result
     }
 
     pub(crate) fn register_table_alias(
@@ -376,13 +390,19 @@ impl PendingDeltaSource {
         })
     }
 
-    fn register_alias(&self, py: Python<'_>, name: String) -> PyResult<PyTable> {
+    fn register_alias(
+        &self,
+        py: Python<'_>,
+        name: String,
+        progress: Option<&PythonProgress>,
+    ) -> PyResult<PyTable> {
         let table = self.session.borrow_mut(py).register_delta_source(
             py,
             name,
             self.source_uri.clone(),
             self.version,
             self.storage_options.clone(),
+            progress,
         )?;
         Ok(PyTable::from_inner(self.session.clone_ref(py), table))
     }
@@ -391,8 +411,13 @@ impl PendingDeltaSource {
 #[pymethods]
 impl PendingDeltaSource {
     /// Registers this pending Delta source under `name` and returns a `Table`.
-    fn alias(&self, py: Python<'_>, name: String) -> PyResult<PyTable> {
-        self.register_alias(py, name)
+    ///
+    /// Progress is selected for this registration call only. The earlier
+    /// `Session.delta_lake(...)` call does not preserve a progress setting.
+    #[pyo3(signature = (name, *, progress=None))]
+    fn alias(&self, py: Python<'_>, name: String, progress: Option<bool>) -> PyResult<PyTable> {
+        let progress = PythonProgress::new(progress);
+        self.register_alias(py, name, progress.as_ref())
     }
 
     fn __repr__(&self) -> String {
@@ -1186,6 +1211,14 @@ mod tests {
                 .extract::<String>()?;
             assert!(delta_lake_doc.contains("pending source"));
             assert!(delta_lake_doc.contains("cannot be referenced by SQL"));
+            assert!(delta_lake_doc.contains("ignores this call's progress setting"));
+            assert!(
+                session_type
+                    .getattr("delta_lake")?
+                    .getattr("__text_signature__")?
+                    .extract::<String>()?
+                    .contains("progress=None")
+            );
 
             let pending_type = module.getattr("PendingDeltaSource")?;
             let pending_doc = pending_type.getattr("__doc__")?.extract::<String>()?;
@@ -1196,6 +1229,14 @@ mod tests {
                 .getattr("__doc__")?
                 .extract::<String>()?;
             assert!(alias_doc.contains("returns a `Table`"));
+            assert!(alias_doc.contains("registration call only"));
+            assert!(
+                pending_type
+                    .getattr("alias")?
+                    .getattr("__text_signature__")?
+                    .extract::<String>()?
+                    .contains("*, progress=None")
+            );
 
             let write_all_doc = session_type
                 .getattr("write_all")?
@@ -1316,6 +1357,61 @@ mod tests {
                     "deltafunnel.Table(id=0, kind=\"delta_source\", name=\"orders\", source_uri={source_uri:?}, snapshot_version=0)"
                 )
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pending_delta_source_defers_progress_selection_until_alias() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("pending-progress")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let initial_count = adapter_creation_count();
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", true)?;
+
+            let pending =
+                session
+                    .bind(py)
+                    .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+
+            assert_eq!(adapter_creation_count(), initial_count);
+            assert!(session.bind(py).borrow().inner.source_reports().is_empty());
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            pending.call_method("alias", ("orders",), Some(&kwargs))?;
+
+            assert_eq!(adapter_creation_count(), initial_count);
+            assert_eq!(session.bind(py).borrow().inner.source_reports().len(), 1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn named_and_pending_alias_registration_create_at_most_one_adapter() -> PyResult<()> {
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("registration-adapters")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let initial_count = adapter_creation_count();
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            kwargs.set_item("progress", true)?;
+
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))?;
+            assert_eq!(adapter_creation_count(), initial_count + 1);
+
+            let pending = session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), None)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", true)?;
+            pending.call_method("alias", ("customers",), Some(&kwargs))?;
+
+            assert_eq!(adapter_creation_count(), initial_count + 2);
+            assert_eq!(session.bind(py).borrow().inner.source_reports().len(), 2);
             Ok(())
         })
     }
@@ -1446,6 +1542,7 @@ mod tests {
     fn delta_lake_rejects_invalid_source_args_before_loading() -> PyResult<()> {
         Python::attach(|py| {
             let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let initial_adapter_count = adapter_creation_count();
 
             let cases = vec![
                 ("", None, "invalid_source_uri"),
@@ -1463,6 +1560,7 @@ mod tests {
             for (uri, version, expected_kind) in cases {
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("name", "orders")?;
+                kwargs.set_item("progress", true)?;
                 if let Some(version) = version {
                     kwargs.set_item("version", version)?;
                 }
@@ -1484,12 +1582,14 @@ mod tests {
                     expected_kind
                 );
                 assert!(session.bind(py).borrow().inner.source_reports().is_empty());
+                assert_eq!(adapter_creation_count(), initial_adapter_count);
             }
 
             let storage_options = PyDict::new(py);
             storage_options.set_item("token", 7)?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("name", "orders")?;
+            kwargs.set_item("progress", true)?;
             kwargs.set_item("storage_options", storage_options)?;
             let error =
                 match session
@@ -1510,6 +1610,16 @@ mod tests {
                 "invalid_storage_options"
             );
             assert!(session.bind(py).borrow().inner.source_reports().is_empty());
+            assert_eq!(adapter_creation_count(), initial_adapter_count);
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", "always")?;
+            let error = session
+                .bind(py)
+                .call_method("delta_lake", ("somewhere",), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyTypeError>(py));
+            assert_eq!(adapter_creation_count(), initial_adapter_count);
 
             Ok(())
         })
