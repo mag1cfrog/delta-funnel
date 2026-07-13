@@ -1380,6 +1380,28 @@ sys.modules["rich.progress"] = progress_module
     }
 
     fn preview(py: Python<'_>, progress: Option<Option<bool>>) -> PyResult<Py<PyAny>> {
+        preview_sql(py, "select 1 as id", progress)
+    }
+
+    fn preview_sql(
+        py: Python<'_>,
+        sql: &str,
+        progress: Option<Option<bool>>,
+    ) -> PyResult<Py<PyAny>> {
+        let module = PyModule::new(py, "deltafunnel")?;
+        deltafunnel(&module)?;
+        let session = module.getattr("Session")?.call0()?;
+        let table = session.call_method1("table_from_sql", (sql,))?;
+        let kwargs = PyDict::new(py);
+        if let Some(progress) = progress {
+            kwargs.set_item("progress", progress)?;
+        }
+        table
+            .call_method("preview", (), Some(&kwargs))
+            .map(Bound::unbind)
+    }
+
+    fn show(py: Python<'_>, progress: Option<Option<bool>>) -> PyResult<()> {
         let module = PyModule::new(py, "deltafunnel")?;
         deltafunnel(&module)?;
         let session = module.getattr("Session")?.call0()?;
@@ -1388,9 +1410,8 @@ sys.modules["rich.progress"] = progress_module
         if let Some(progress) = progress {
             kwargs.set_item("progress", progress)?;
         }
-        table
-            .call_method("preview", (), Some(&kwargs))
-            .map(Bound::unbind)
+        table.call_method("show", (), Some(&kwargs))?;
+        Ok(())
     }
 
     fn dry_run_all(
@@ -1675,6 +1696,71 @@ sys.modules["rich.progress"] = progress_module
                 [
                     "console", "console", "progress", "add_task", "start", "update", "stop"
                 ]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn show_does_not_print_after_a_deferred_renderer_interruption() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, _records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
+            let sys = py.import("sys")?;
+            let original_stdout = sys.getattr("stdout")?.unbind();
+            let stdout = py.import("io")?.call_method0("StringIO")?.unbind();
+            sys.setattr("stdout", stdout.bind(py))?;
+
+            let result = show(py, Some(Some(true)));
+            sys.setattr("stdout", original_stdout.bind(py))?;
+            let error = result.unwrap_err();
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "completed"
+            );
+            assert!(
+                stdout
+                    .bind(py)
+                    .call_method0("getvalue")?
+                    .extract::<String>()?
+                    .is_empty()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn failed_preview_is_attached_to_a_deferred_renderer_interruption() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, _records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
+
+            let error = preview_sql(
+                py,
+                "select cast(1 as bigint) / cast(0 as bigint) as value",
+                Some(Some(true)),
+            )
+            .unwrap_err();
+
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "failed"
+            );
+            assert!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_error")?
+                    .is_instance_of::<crate::exception::DeltaFunnelError>()
             );
             Ok(())
         })
