@@ -78,6 +78,20 @@ impl DeltaFunnelRuntime {
         self.runtime.block_on(session.preview_table(table, limit))
     }
 
+    /// Runs a bounded preview and reports its live lifecycle to the caller.
+    #[doc(hidden)]
+    pub fn preview_table_with_progress(
+        &self,
+        session: &DeltaFunnelSession,
+        table: &LazyTable,
+        limit: usize,
+        reporter: ProgressReporter,
+    ) -> Result<TablePreview, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.preview_table_with_progress(table, limit, reporter))
+    }
+
     /// Runs a single-output dry run through the high-level session API.
     ///
     /// # Errors

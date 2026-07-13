@@ -1,6 +1,6 @@
 //! Shows core progress events with one lazily created Rich progress task.
 //!
-//! Each Python write creates its own adapter. The adapter imports nothing from
+//! Each Python action creates its own adapter. The adapter imports nothing from
 //! Rich until the Rust action starts, then updates the same task until the
 //! action finishes. Rich chooses terminal or Jupyter rendering.
 
@@ -46,6 +46,15 @@ impl PythonProgress {
     /// `progress=None` shows progress only when Rich detects an interactive
     /// terminal or Jupyter. `progress=True` also shows it in scripts and CI.
     pub(crate) fn new(progress: Option<bool>) -> Option<Self> {
+        Self::new_with_output(progress, ProgressOutput::Stderr)
+    }
+
+    /// Creates preview progress that uses stdout only when Rich detects Jupyter.
+    pub(crate) fn for_preview(progress: Option<bool>) -> Option<Self> {
+        Self::new_with_output(progress, ProgressOutput::StdoutInNotebook)
+    }
+
+    fn new_with_output(progress: Option<bool>, output: ProgressOutput) -> Option<Self> {
         let mode = match progress {
             Some(false) => return None,
             Some(true) => ProgressMode::Forced,
@@ -53,7 +62,7 @@ impl PythonProgress {
         };
         #[cfg(test)]
         ADAPTER_CREATION_COUNT.set(ADAPTER_CREATION_COUNT.get().saturating_add(1));
-        let state = Arc::new(Mutex::new(ProgressState::new(mode)));
+        let state = Arc::new(Mutex::new(ProgressState::new(mode, output)));
         let reporter_state = Arc::clone(&state);
         let reporter = ProgressReporter::new(move |event| {
             render_event(&reporter_state, event, Instant::now());
@@ -133,6 +142,21 @@ enum ProgressMode {
     Forced,
 }
 
+/// Selects the stream without duplicating Rich's environment detection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressOutput {
+    /// Always use stderr, including inside notebooks.
+    Stderr,
+    /// Use stdout in notebooks and stderr everywhere else.
+    StdoutInNotebook,
+}
+
+#[derive(Clone, Copy)]
+struct ProgressSettings {
+    mode: ProgressMode,
+    output: ProgressOutput,
+}
+
 /// Python handles needed to update one Rich task.
 struct RichRenderer {
     progress: Py<PyAny>,
@@ -149,9 +173,9 @@ struct ProgressState {
 }
 
 impl ProgressState {
-    const fn new(mode: ProgressMode) -> Self {
+    const fn new(mode: ProgressMode, output: ProgressOutput) -> Self {
         Self {
-            render: RenderState::Pending(mode),
+            render: RenderState::Pending(ProgressSettings { mode, output }),
             pending_interruption: None,
             final_event: None,
             visible: VisibleProgress::new(),
@@ -313,7 +337,7 @@ impl VisibleProgress {
                 != event.output_index().zip(event.output_count())
             || (event.kind() == ProgressEventKind::PhaseChanged
                 && event.output_name().is_none()
-                && (self.phase != Some(phase) || phase == ProgressPhase::MaterializingCache))
+                && starts_new_unnamed_metric_scope(self.phase, phase))
     }
 
     /// Clears file and write counters so the next work cannot show old values.
@@ -419,10 +443,18 @@ impl VisibleProgress {
     }
 }
 
+/// Returns true when an unnamed phase starts unrelated work with fresh metrics.
+fn starts_new_unnamed_metric_scope(current: Option<ProgressPhase>, next: ProgressPhase) -> bool {
+    next == ProgressPhase::MaterializingCache
+        || (current != Some(next)
+            && !(current == Some(ProgressPhase::CollectingPreview)
+                && next == ProgressPhase::FormattingPreview))
+}
+
 /// Current state of one action's Rich display.
 enum RenderState {
     /// The Rust action has not started, so no Rich objects exist yet.
-    Pending(ProgressMode),
+    Pending(ProgressSettings),
     /// A Rich task exists and must still be stopped after the Rust action.
     Active {
         renderer: RichRenderer,
@@ -563,8 +595,8 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
     let render = match render {
         // Wait for Started before importing Rich. Requests rejected before the
         // action begins should not perform any progress-related Python work.
-        RenderState::Pending(mode) if event.kind() == ProgressEventKind::Started => successful(
-            try_python(|py| create_renderer(py, mode, event)),
+        RenderState::Pending(settings) if event.kind() == ProgressEventKind::Started => successful(
+            try_python(|py| create_renderer(py, settings, event)),
             &mut pending_interruption,
         )
         .flatten()
@@ -648,24 +680,34 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
 /// Returns `Ok(None)` when automatic progress should stay hidden.
 fn create_renderer(
     py: Python<'_>,
-    mode: ProgressMode,
+    settings: ProgressSettings,
     event: &ProgressEvent,
 ) -> PyResult<Option<RichRenderer>> {
-    // Rich detects the terminal or Jupyter environment. Delta Funnel only asks
-    // for stderr in terminals and tells Rich when progress is forced.
+    // Rich detects the terminal or Jupyter environment. Preview starts with a
+    // stdout console so the same object can render in notebook output. Other
+    // actions start directly on stderr.
     let console_type = py.import("rich.console")?.getattr("Console")?;
     let console_kwargs = PyDict::new(py);
-    console_kwargs.set_item("stderr", true)?;
-    if matches!(mode, ProgressMode::Forced) {
+    if settings.output == ProgressOutput::Stderr {
+        console_kwargs.set_item("stderr", true)?;
+    }
+    if matches!(settings.mode, ProgressMode::Forced) {
         console_kwargs.set_item("force_interactive", true)?;
     }
-    let console = console_type.call((), Some(&console_kwargs))?;
+    let mut console = console_type.call((), Some(&console_kwargs))?;
 
-    // Rich reports Jupyter separately from interactive terminals. Automatic
-    // mode stays quiet only when Rich reports neither one.
-    let is_interactive = console.getattr("is_interactive")?.extract::<bool>()?;
+    // Rich reports Jupyter separately from interactive terminals. A notebook
+    // keeps the stdout console; other previews select their stderr console
+    // before automatic mode checks whether the rendering stream is interactive.
     let is_jupyter = console.getattr("is_jupyter")?.extract::<bool>()?;
-    if matches!(mode, ProgressMode::Automatic) && !is_interactive && !is_jupyter {
+    if settings.output == ProgressOutput::StdoutInNotebook && !is_jupyter {
+        // Rich ruled out Jupyter, so terminal and forced script previews move
+        // to stderr before any progress task is constructed.
+        console_kwargs.set_item("stderr", true)?;
+        console = console_type.call((), Some(&console_kwargs))?;
+    }
+    let is_interactive = console.getattr("is_interactive")?.extract::<bool>()?;
+    if matches!(settings.mode, ProgressMode::Automatic) && !is_interactive && !is_jupyter {
         return Ok(None);
     }
 
@@ -808,6 +850,7 @@ const fn ends_action(kind: ProgressEventKind) -> bool {
 /// Returns the text shown before Rust reports the first phase.
 const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
     match operation {
+        Some(ProgressOperation::PreviewTable) => "Previewing table",
         Some(ProgressOperation::WriteToMssql) => "Writing to SQL Server",
         Some(ProgressOperation::DryRunToMssql) => "Planning SQL Server write",
         Some(ProgressOperation::WriteAllToMssql) => "Writing outputs to SQL Server",
@@ -819,6 +862,9 @@ const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
 /// Returns safe, stable text for an internal Rust phase.
 const fn phase_label(phase: ProgressPhase) -> &'static str {
     match phase {
+        ProgressPhase::PreparingPreview => "Preparing preview",
+        ProgressPhase::CollectingPreview => "Collecting preview",
+        ProgressPhase::FormattingPreview => "Formatting preview",
         ProgressPhase::PlanningOutput => "Planning output",
         ProgressPhase::SettingUpStream => "Preparing data stream",
         ProgressPhase::MaterializingCache => "Caching shared data",
@@ -871,6 +917,11 @@ mod tests {
         original: Py<PyAny>,
     }
 
+    struct BuiltinPrintGuard {
+        builtins: Py<PyModule>,
+        original: Py<PyAny>,
+    }
+
     struct AttachmentFailureGuard;
 
     impl AttachmentFailureGuard {
@@ -909,6 +960,28 @@ mod tests {
         }
     }
 
+    impl BuiltinPrintGuard {
+        fn replace(py: Python<'_>, replacement: &Bound<'_, PyAny>) -> PyResult<Self> {
+            let builtins = py.import("builtins")?;
+            let original = builtins.getattr("print")?.unbind();
+            builtins.setattr("print", replacement)?;
+            Ok(Self {
+                builtins: builtins.unbind(),
+                original,
+            })
+        }
+    }
+
+    impl Drop for BuiltinPrintGuard {
+        fn drop(&mut self) {
+            let _ = Python::try_attach(|py| {
+                self.builtins
+                    .bind(py)
+                    .setattr("print", self.original.bind(py))
+            });
+        }
+    }
+
     impl ModuleGuard {
         fn snapshot(py: Python<'_>) -> PyResult<ModuleSnapshot> {
             let modules = py
@@ -932,6 +1005,23 @@ mod tests {
         ) -> PyResult<(Self, Py<PyList>)> {
             let (guard, records, _) =
                 Self::install_with_failure(py, interactive, jupyter, None, false, false)?;
+            Ok((guard, records))
+        }
+
+        fn install_with_stream_interactivity(
+            py: Python<'_>,
+            stdout_interactive: bool,
+            stderr_interactive: bool,
+        ) -> PyResult<(Self, Py<PyList>)> {
+            let (guard, records) = Self::install(py, false, false)?;
+            let globals = py
+                .import("rich.console")?
+                .getattr("Console")?
+                .getattr("__init__")?
+                .getattr("__globals__")?
+                .cast_into::<PyDict>()?;
+            globals.set_item("stdout_interactive", stdout_interactive)?;
+            globals.set_item("stderr_interactive", stderr_interactive)?;
             Ok((guard, records))
         }
 
@@ -972,7 +1062,8 @@ mod tests {
             let records = PyList::empty(py);
             let locals = PyDict::new(py);
             locals.set_item("records", &records)?;
-            locals.set_item("interactive", interactive)?;
+            locals.set_item("stdout_interactive", interactive)?;
+            locals.set_item("stderr_interactive", interactive)?;
             locals.set_item("jupyter", jupyter)?;
             locals.set_item("fail_call", fail_call)?;
             locals.set_item("failure", &failure)?;
@@ -1006,14 +1097,19 @@ class Console:
     def __init__(self, **kwargs):
         record({"call": "console", **kwargs})
         maybe_fail("console")
-        self.is_interactive = interactive or kwargs.get("force_interactive", False)
+        self.stderr = kwargs.get("stderr", False)
+        maybe_fail("stderr_console" if self.stderr else "stdout_console")
+        stream_interactive = stderr_interactive if self.stderr else stdout_interactive
+        self.is_interactive = stream_interactive or kwargs.get("force_interactive", False)
         self.is_jupyter = jupyter
 
 class Progress:
     def __init__(self, *columns, **kwargs):
+        console = kwargs.get("console")
         record({
             "call": "progress",
             "columns": len(columns),
+            "console_stderr": None if console is None else console.stderr,
             "auto_refresh": kwargs.get("auto_refresh"),
             "transient": kwargs.get("transient"),
             "redirect_stdout": kwargs.get("redirect_stdout"),
@@ -1157,6 +1253,22 @@ sys.modules["rich.progress"] = progress_module
             visible.description(ProgressEventKind::Failed),
             "Failed: orders - 75 rows, 2 batches"
         );
+    }
+
+    #[test]
+    fn preview_formatting_keeps_the_collection_metric_scope() {
+        assert!(!starts_new_unnamed_metric_scope(
+            Some(ProgressPhase::CollectingPreview),
+            ProgressPhase::FormattingPreview,
+        ));
+        assert!(starts_new_unnamed_metric_scope(
+            Some(ProgressPhase::FormattingPreview),
+            ProgressPhase::ReportingSources,
+        ));
+        assert!(starts_new_unnamed_metric_scope(
+            Some(ProgressPhase::MaterializingCache),
+            ProgressPhase::MaterializingCache,
+        ));
     }
 
     #[test]
@@ -1339,6 +1451,41 @@ sys.modules["rich.progress"] = progress_module
         Ok(())
     }
 
+    fn preview(py: Python<'_>, progress: Option<Option<bool>>) -> PyResult<Py<PyAny>> {
+        preview_sql(py, "select 1 as id", progress)
+    }
+
+    fn preview_sql(
+        py: Python<'_>,
+        sql: &str,
+        progress: Option<Option<bool>>,
+    ) -> PyResult<Py<PyAny>> {
+        let module = PyModule::new(py, "deltafunnel")?;
+        deltafunnel(&module)?;
+        let session = module.getattr("Session")?.call0()?;
+        let table = session.call_method1("table_from_sql", (sql,))?;
+        let kwargs = PyDict::new(py);
+        if let Some(progress) = progress {
+            kwargs.set_item("progress", progress)?;
+        }
+        table
+            .call_method("preview", (), Some(&kwargs))
+            .map(Bound::unbind)
+    }
+
+    fn show(py: Python<'_>, progress: Option<Option<bool>>) -> PyResult<()> {
+        let module = PyModule::new(py, "deltafunnel")?;
+        deltafunnel(&module)?;
+        let session = module.getattr("Session")?.call0()?;
+        let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+        let kwargs = PyDict::new(py);
+        if let Some(progress) = progress {
+            kwargs.set_item("progress", progress)?;
+        }
+        table.call_method("show", (), Some(&kwargs))?;
+        Ok(())
+    }
+
     fn dry_run_all(
         py: Python<'_>,
         output_names: &[&str],
@@ -1492,6 +1639,339 @@ sys.modules["rich.progress"] = progress_module
             let (_guard, records) = ModuleGuard::install(py, true, true)?;
             dry_run(py, Some(Some(false)))?;
             assert!(records.bind(py).is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preview_uses_one_shared_rich_lifecycle() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+
+            preview(py, Some(Some(true)))?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "console", "progress", "add_task", "start", "update", "update",
+                    "update", "update", "stop"
+                ]
+            );
+            assert!(
+                records
+                    .bind(py)
+                    .get_item(2)?
+                    .get_item("console_stderr")?
+                    .extract::<bool>()?
+            );
+            let descriptions = records
+                .bind(py)
+                .iter()
+                .filter_map(|record| {
+                    (record.get_item("call").ok()?.extract::<String>().ok()? == "update")
+                        .then(|| {
+                            record
+                                .get_item("description")
+                                .ok()?
+                                .extract::<String>()
+                                .ok()
+                        })
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                descriptions,
+                [
+                    "Preparing preview",
+                    "Collecting preview",
+                    "Formatting preview",
+                    "Completed",
+                ]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preview_uses_stdout_when_rich_detects_jupyter() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, false, true)?;
+
+            preview(py, None)?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "progress", "add_task", "start", "update", "update", "update",
+                    "update", "stop"
+                ]
+            );
+            assert!(
+                !records
+                    .bind(py)
+                    .get_item(1)?
+                    .get_item("console_stderr")?
+                    .extract::<bool>()?
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn automatic_preview_uses_the_final_output_stream_interactivity() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            for (stdout_interactive, stderr_interactive, should_render) in
+                [(false, true, true), (true, false, false)]
+            {
+                let (guard, records) = ModuleGuard::install_with_stream_interactivity(
+                    py,
+                    stdout_interactive,
+                    stderr_interactive,
+                )?;
+
+                preview(py, None)?;
+
+                let calls = record_strings(records.bind(py), "call")?;
+                assert_eq!(
+                    calls.iter().any(|call| call == "progress"),
+                    should_render,
+                    "stdout interactive: {stdout_interactive}, stderr interactive: {stderr_interactive}"
+                );
+                drop(guard);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preview_stderr_console_failures_follow_the_shared_failure_policy() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            for interruption in [false, true] {
+                let (guard, records, failure) = ModuleGuard::install_with_failure(
+                    py,
+                    true,
+                    false,
+                    Some("stderr_console"),
+                    interruption,
+                    false,
+                )?;
+                let (stderr, _capture) = StderrGuard::capture(py)?;
+
+                let result = preview(py, Some(Some(true)));
+
+                if interruption {
+                    let error = result.unwrap_err();
+                    assert!(error.value(py).is(failure.bind(py)));
+                    assert_eq!(
+                        error
+                            .value(py)
+                            .getattr("deltafunnel_operation_status")?
+                            .extract::<String>()?,
+                        "completed"
+                    );
+                } else {
+                    result?;
+                }
+                assert_eq!(
+                    record_strings(records.bind(py), "call")?,
+                    ["console", "console"]
+                );
+
+                drop(stderr);
+                drop(guard);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preview_defers_renderer_interruption_until_query_completion() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
+
+            let error = preview(py, Some(Some(true))).unwrap_err();
+
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "completed"
+            );
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "console", "progress", "add_task", "start", "update", "stop"
+                ]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ordinary_preview_renderer_failure_preserves_the_preview() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, _failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), false, false)?;
+
+            let preview = preview(py, Some(Some(true)))?;
+
+            assert_eq!(
+                preview
+                    .bind(py)
+                    .get_type()
+                    .getattr("__name__")?
+                    .extract::<String>()?,
+                "Preview"
+            );
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "console", "progress", "add_task", "start", "update", "stop"
+                ]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ordinary_renderer_failure_does_not_replace_a_failed_preview() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, renderer_failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), false, false)?;
+
+            let error = preview_sql(
+                py,
+                "select cast(1 as bigint) / cast(0 as bigint) as value",
+                Some(Some(true)),
+            )
+            .unwrap_err();
+
+            assert!(error.is_instance_of::<crate::exception::DeltaFunnelError>(py));
+            assert!(!error.value(py).is(renderer_failure.bind(py)));
+            assert_eq!(
+                record_strings(records.bind(py), "call")?.last(),
+                Some(&"stop".to_owned())
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn show_does_not_print_after_a_deferred_renderer_interruption() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, _records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
+            let sys = py.import("sys")?;
+            let original_stdout = sys.getattr("stdout")?.unbind();
+            let stdout = py.import("io")?.call_method0("StringIO")?.unbind();
+            sys.setattr("stdout", stdout.bind(py))?;
+
+            let result = show(py, Some(Some(true)));
+            sys.setattr("stdout", original_stdout.bind(py))?;
+            let error = result.unwrap_err();
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "completed"
+            );
+            assert!(
+                stdout
+                    .bind(py)
+                    .call_method0("getvalue")?
+                    .extract::<String>()?
+                    .is_empty()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn show_print_control_flow_stays_outside_the_progress_adapter() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            let failure = py
+                .get_type::<PySystemExit>()
+                .call1(("print interrupted",))?
+                .unbind();
+            let locals = PyDict::new(py);
+            locals.set_item("failure", failure.bind(py))?;
+            py.run(
+                c_str!(
+                    r#"
+def fail_print(*args, **kwargs):
+    raise failure
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )?;
+            let replacement = locals
+                .get_item("fail_print")?
+                .ok_or_else(|| PyRuntimeError::new_err("missing failing print function"))?;
+            let print_guard = BuiltinPrintGuard::replace(py, &replacement)?;
+
+            let result = show(py, Some(Some(true)));
+            drop(print_guard);
+
+            let error = result.unwrap_err();
+            assert!(error.value(py).is(failure.bind(py)));
+            assert!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")
+                    .is_err()
+            );
+            assert_eq!(
+                record_strings(records.bind(py), "call")?.last(),
+                Some(&"stop".to_owned())
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn failed_preview_is_attached_to_a_deferred_renderer_interruption() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, _records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
+
+            let error = preview_sql(
+                py,
+                "select cast(1 as bigint) / cast(0 as bigint) as value",
+                Some(Some(true)),
+            )
+            .unwrap_err();
+
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "failed"
+            );
+            assert!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_error")?
+                    .is_instance_of::<crate::exception::DeltaFunnelError>()
+            );
             Ok(())
         })
     }
@@ -2408,6 +2888,18 @@ stream = HostileStderr()
     #[test]
     fn all_core_phases_have_curated_labels() {
         assert_eq!(
+            phase_label(ProgressPhase::PreparingPreview),
+            "Preparing preview"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::CollectingPreview),
+            "Collecting preview"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::FormattingPreview),
+            "Formatting preview"
+        );
+        assert_eq!(
             phase_label(ProgressPhase::PlanningOutput),
             "Planning output"
         );
@@ -2446,6 +2938,10 @@ stream = HostileStderr()
 
     #[test]
     fn all_core_operations_have_curated_labels() {
+        assert_eq!(
+            operation_label(Some(ProgressOperation::PreviewTable)),
+            "Previewing table"
+        );
         assert_eq!(
             operation_label(Some(ProgressOperation::WriteToMssql)),
             "Writing to SQL Server"

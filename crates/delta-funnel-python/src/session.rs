@@ -271,9 +271,22 @@ impl PySession {
         py: Python<'_>,
         table: &delta_funnel::LazyTable,
         limit: usize,
+        progress: Option<&PythonProgress>,
     ) -> PyResult<delta_funnel::TablePreview> {
-        py.detach(|| self.runtime.preview_table(&self.inner, table, limit))
-            .map_err(|error| rust_error_to_py(py, error))
+        let preview = py.detach(|| match progress {
+            Some(progress) => self.runtime.preview_table_with_progress(
+                &self.inner,
+                table,
+                limit,
+                progress.reporter(),
+            ),
+            None => self.runtime.preview_table(&self.inner, table, limit),
+        });
+        let preview = preview.map_err(|error| rust_error_to_py(py, error));
+        if let Some(progress) = progress {
+            progress.finish(py, preview.as_ref().err(), None)?;
+        }
+        preview
     }
 
     fn dry_run_all_to_mssql(

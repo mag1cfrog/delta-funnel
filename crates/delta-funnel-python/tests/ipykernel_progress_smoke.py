@@ -63,6 +63,53 @@ print("ACTION_DONE")
     assert display_indexes
     assert max(display_indexes) < action_done_index
 
+    preview_messages = execute(
+        client,
+        """
+import deltafunnel
+
+table = deltafunnel.Session().table_from_sql("select 1 as id")
+table.preview(progress=True)
+""",
+    )
+    progress_indexes = [
+        index
+        for index, message in enumerate(preview_messages)
+        if message["msg_type"] in {"display_data", "update_display_data"}
+        and "deltafunnel-preview" not in message["content"].get("data", {}).get("text/html", "")
+    ]
+    preview_index = next(
+        index
+        for index, message in enumerate(preview_messages)
+        if "deltafunnel-preview"
+        in message["content"].get("data", {}).get("text/html", "")
+    )
+    assert progress_indexes
+    assert max(progress_indexes) < preview_index
+
+    show_messages = execute(
+        client,
+        """
+import deltafunnel
+
+table = deltafunnel.Session().table_from_sql("select 1 as id")
+table.show(progress=True)
+print("SHOW_DONE")
+""",
+    )
+    show_progress_indexes = [
+        index
+        for index, message in enumerate(show_messages)
+        if message["msg_type"] in {"display_data", "update_display_data"}
+    ]
+    show_table_index = next(
+        index
+        for index, message in enumerate(show_messages)
+        if message["msg_type"] == "stream" and "| id |" in message["content"]["text"]
+    )
+    assert show_progress_indexes
+    assert max(show_progress_indexes) < show_table_index
+
     sentinel_messages = execute(client, 'print("SENTINEL")')
     assert not any(
         message["msg_type"] in {"display_data", "update_display_data"}

@@ -31,6 +31,35 @@ forced_output = io.StringIO()
 with contextlib.redirect_stderr(forced_output):
     table.write_to_mssql(**write_options, progress=True)
 assert "Completed" in forced_output.getvalue()
+
+preview_stdout = io.StringIO()
+preview_stderr = io.StringIO()
+with contextlib.redirect_stdout(preview_stdout), contextlib.redirect_stderr(
+    preview_stderr
+):
+    preview = table.preview(progress=True)
+assert "| id |" in preview.text
+assert preview_stdout.getvalue() == ""
+assert "Completed" in preview_stderr.getvalue()
+
+for automatic in ({}, {"progress": None}, {"progress": False}):
+    automatic_stdout = io.StringIO()
+    automatic_stderr = io.StringIO()
+    with contextlib.redirect_stdout(automatic_stdout), contextlib.redirect_stderr(
+        automatic_stderr
+    ):
+        automatic_preview = table.preview(**automatic)
+    assert "| id |" in automatic_preview.text
+    assert automatic_stdout.getvalue() == ""
+    assert automatic_stderr.getvalue() == ""
+
+show_stdout = io.StringIO()
+show_stderr = io.StringIO()
+with contextlib.redirect_stdout(show_stdout), contextlib.redirect_stderr(show_stderr):
+    table.show(progress=True)
+assert "| id |" in show_stdout.getvalue()
+assert "Completed" not in show_stdout.getvalue()
+assert "Completed" in show_stderr.getvalue()
 assert dict(os.environ) == environment
 if logging_order == "before":
     deltafunnel.init_logging()
