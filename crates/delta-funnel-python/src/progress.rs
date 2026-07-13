@@ -808,6 +808,7 @@ const fn ends_action(kind: ProgressEventKind) -> bool {
 /// Returns the text shown before Rust reports the first phase.
 const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
     match operation {
+        Some(ProgressOperation::PreviewTable) => "Previewing table",
         Some(ProgressOperation::WriteToMssql) => "Writing to SQL Server",
         Some(ProgressOperation::DryRunToMssql) => "Planning SQL Server write",
         Some(ProgressOperation::WriteAllToMssql) => "Writing outputs to SQL Server",
@@ -819,6 +820,9 @@ const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
 /// Returns safe, stable text for an internal Rust phase.
 const fn phase_label(phase: ProgressPhase) -> &'static str {
     match phase {
+        ProgressPhase::PreparingPreview => "Preparing preview",
+        ProgressPhase::CollectingPreview => "Collecting preview",
+        ProgressPhase::FormattingPreview => "Formatting preview",
         ProgressPhase::PlanningOutput => "Planning output",
         ProgressPhase::SettingUpStream => "Preparing data stream",
         ProgressPhase::MaterializingCache => "Caching shared data",
@@ -1339,6 +1343,19 @@ sys.modules["rich.progress"] = progress_module
         Ok(())
     }
 
+    fn preview(py: Python<'_>, progress: Option<Option<bool>>) -> PyResult<()> {
+        let module = PyModule::new(py, "deltafunnel")?;
+        deltafunnel(&module)?;
+        let session = module.getattr("Session")?.call0()?;
+        let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+        let kwargs = PyDict::new(py);
+        if let Some(progress) = progress {
+            kwargs.set_item("progress", progress)?;
+        }
+        table.call_method("preview", (), Some(&kwargs))?;
+        Ok(())
+    }
+
     fn dry_run_all(
         py: Python<'_>,
         output_names: &[&str],
@@ -1492,6 +1509,49 @@ sys.modules["rich.progress"] = progress_module
             let (_guard, records) = ModuleGuard::install(py, true, true)?;
             dry_run(py, Some(Some(false)))?;
             assert!(records.bind(py).is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preview_uses_one_shared_rich_lifecycle() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+
+            preview(py, Some(Some(true)))?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "progress", "add_task", "start", "update", "update", "update",
+                    "update", "stop"
+                ]
+            );
+            let descriptions = records
+                .bind(py)
+                .iter()
+                .filter_map(|record| {
+                    (record.get_item("call").ok()?.extract::<String>().ok()? == "update")
+                        .then(|| {
+                            record
+                                .get_item("description")
+                                .ok()?
+                                .extract::<String>()
+                                .ok()
+                        })
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                descriptions,
+                [
+                    "Preparing preview",
+                    "Collecting preview",
+                    "Formatting preview",
+                    "Completed",
+                ]
+            );
             Ok(())
         })
     }
@@ -2408,6 +2468,18 @@ stream = HostileStderr()
     #[test]
     fn all_core_phases_have_curated_labels() {
         assert_eq!(
+            phase_label(ProgressPhase::PreparingPreview),
+            "Preparing preview"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::CollectingPreview),
+            "Collecting preview"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::FormattingPreview),
+            "Formatting preview"
+        );
+        assert_eq!(
             phase_label(ProgressPhase::PlanningOutput),
             "Planning output"
         );
@@ -2446,6 +2518,10 @@ stream = HostileStderr()
 
     #[test]
     fn all_core_operations_have_curated_labels() {
+        assert_eq!(
+            operation_label(Some(ProgressOperation::PreviewTable)),
+            "Previewing table"
+        );
         assert_eq!(
             operation_label(Some(ProgressOperation::WriteToMssql)),
             "Writing to SQL Server"

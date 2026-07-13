@@ -157,19 +157,26 @@ impl PyTable {
     }
 
     /// Returns a bounded rendered preview of this lazy table.
-    #[pyo3(signature = (limit=20))]
-    fn preview(&self, py: Python<'_>, limit: usize) -> PyResult<PyPreview> {
-        let text = self
-            .session
-            .borrow(py)
-            .preview_table(py, &self.inner, limit)?;
-        Ok(PyPreview::new(text))
+    ///
+    /// Progress appears automatically in interactive terminals and notebooks.
+    /// Pass `progress=True` to force it or `progress=False` to disable it. The
+    /// progress display closes before the `Preview` object is returned.
+    #[pyo3(signature = (limit=20, *, progress=None))]
+    fn preview(&self, py: Python<'_>, limit: usize, progress: Option<bool>) -> PyResult<PyPreview> {
+        let progress = PythonProgress::new(progress);
+        let preview =
+            self.session
+                .borrow(py)
+                .preview_table(py, &self.inner, limit, progress.as_ref())?;
+        Ok(PyPreview::new(preview))
     }
 
     /// Prints a bounded preview of this lazy table to Python stdout.
-    #[pyo3(signature = (limit=20))]
-    fn show(&self, py: Python<'_>, limit: usize) -> PyResult<()> {
-        let preview = self.preview(py, limit)?;
+    ///
+    /// Progress closes before the preview text is printed.
+    #[pyo3(signature = (limit=20, *, progress=None))]
+    fn show(&self, py: Python<'_>, limit: usize, progress: Option<bool>) -> PyResult<()> {
+        let preview = self.preview(py, limit, progress)?;
         py.import("builtins")?
             .getattr("print")?
             .call1((preview.text.as_str(),))?;
@@ -205,9 +212,10 @@ pub(crate) fn add_table(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::deltafunnel;
+    use crate::{deltafunnel, progress::adapter_creation_count};
+    use pyo3::exceptions::PyTypeError;
     use pyo3::prelude::*;
-    use pyo3::types::{PyAnyMethods, PyModule};
+    use pyo3::types::{PyAnyMethods, PyDict, PyModule};
 
     #[test]
     fn module_exports_table_type() -> PyResult<()> {
@@ -283,13 +291,43 @@ mod tests {
             let old_stdout = sys.getattr("stdout")?;
 
             sys.setattr("stdout", &capture)?;
-            let show_result = table.call_method1("show", (20,));
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            let show_result = table.call_method("show", (20,), Some(&kwargs));
             sys.setattr("stdout", old_stdout)?;
             show_result?;
 
             let output = capture.call_method0("getvalue")?.extract::<String>()?;
             assert!(output.contains("| region |"));
             assert!(output.lines().any(|line| line.contains("| west   |")));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preview_progress_arguments_are_validated_before_adapter_creation() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+            let initial_count = adapter_creation_count();
+
+            for method in ["preview", "show"] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("progress", "always")?;
+                let error = table.call_method(method, (), Some(&kwargs)).unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
+
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("progress", true)?;
+                table.call_method(method, (-1,), Some(&kwargs)).unwrap_err();
+
+                let error = table.call_method1(method, (20, false)).unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
+            }
+
+            assert_eq!(adapter_creation_count(), initial_count);
             Ok(())
         })
     }
