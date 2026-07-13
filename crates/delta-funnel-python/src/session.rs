@@ -1487,6 +1487,58 @@ mod tests {
         })
     }
 
+    #[test]
+    fn delta_registration_entry_points_use_shared_progress_modes() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("registration-modes")?;
+            let cases = [
+                (None, true, true),
+                (Some(None), true, true),
+                (None, false, false),
+                (Some(Some(true)), false, true),
+                (Some(Some(false)), true, false),
+            ];
+
+            for use_pending_alias in [false, true] {
+                for (progress, interactive, should_render) in cases {
+                    let session =
+                        Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+                    let (guard, records) = ModuleGuard::install(py, interactive, false)?;
+
+                    if use_pending_alias {
+                        let pending =
+                            session
+                                .bind(py)
+                                .call_method("delta_lake", (table.uri(),), None)?;
+                        let kwargs = PyDict::new(py);
+                        if let Some(progress) = progress {
+                            kwargs.set_item("progress", progress)?;
+                        }
+                        pending.call_method("alias", ("orders",), Some(&kwargs))?;
+                    } else {
+                        let kwargs = PyDict::new(py);
+                        kwargs.set_item("name", "orders")?;
+                        if let Some(progress) = progress {
+                            kwargs.set_item("progress", progress)?;
+                        }
+                        session.bind(py).call_method(
+                            "delta_lake",
+                            (table.uri(),),
+                            Some(&kwargs),
+                        )?;
+                    }
+
+                    let calls = record_strings(records.bind(py), "call")?;
+                    assert_eq!(calls.iter().any(|call| call == "progress"), should_render);
+                    assert_eq!(session.bind(py).borrow().inner.source_reports().len(), 1);
+                    drop(guard);
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn registration_update_descriptions(records: &Bound<'_, PyList>) -> PyResult<Vec<String>> {
         let mut descriptions = Vec::new();
         for record in records.iter() {
