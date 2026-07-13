@@ -94,7 +94,7 @@ daily_orders.preview(limit=20)
 report = daily_orders.write_to_mssql(
     schema="dbo",
     table="daily_orders",
-    load_mode="create_and_load",  # use "replace" only to rebuild an existing target
+    load_mode="create_and_load",  # "replace" also supports a missing target
     # dry_run=True,  # validate the load plan without writing rows
 )
 ```

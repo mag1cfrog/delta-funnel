@@ -30,11 +30,13 @@ Python accepts these load modes:
 - `create_and_load`
 - `replace`
 
-Choose `create_and_load` for a first load into a new table, `append_existing`
-for appending to an existing table, and `replace` for an existing target that
-should be rebuilt from the output rows.
+Choose `create_and_load` when the target must not already exist,
+`append_existing` for appending to an existing table, and `replace` when the
+target should exactly match the output rows. `replace` can rebuild an existing
+target or create a missing one, including an empty target for empty output.
 
 `replace` writes to a staging table, validates that staging table, then swaps
-it into the final target name. The replacement table is recreated from the
-DeltaFunnel-planned SQL Server schema, so table metadata such as indexes,
-constraints, triggers, permissions, and extended properties is not preserved.
+it into an existing final target or promotes it to a missing final target. The
+replacement table is recreated from the DeltaFunnel-planned SQL Server schema,
+so existing table metadata such as indexes, constraints, triggers, permissions,
+and extended properties is not preserved.

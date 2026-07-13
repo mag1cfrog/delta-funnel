@@ -1,13 +1,11 @@
 # Private S3 Delta Sources
 
-Pass explicit credentials and a region in `storage_options` when reading a
-private S3 Delta table from a local shell. Delta Funnel forwards these values
-to its underlying object-store builder.
+Delta Funnel copies shell `AWS_*` variables into the storage options used for
+S3-compatible sources. Explicit `storage_options` values override equivalent
+environment variables, which makes them useful for per-source credentials and
+regions.
 
-On the current S3 path, Delta Funnel does not auto-load shell `AWS_*` variables,
-`AWS_PROFILE`, or shared AWS config and credentials files.
-
-## Pass credentials and region
+## Override credentials and region
 
 Use these keys:
 
@@ -57,9 +55,9 @@ Session().delta_lake(
 
 ## Troubleshoot credential discovery
 
-If the same table works in `deltalake` but fails in `deltafunnel`, the likely
-cause is a credential-discovery path mismatch, not a Delta snapshot or protocol
-problem.
+If the same table works in `deltalake` but fails in `deltafunnel`, compare the
+effective `AWS_*` environment variables and explicit `storage_options` first.
+The libraries can use different credential-provider paths.
 
 Enable detailed source logging:
 
