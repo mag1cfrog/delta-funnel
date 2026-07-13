@@ -10,40 +10,26 @@ use super::super::super::{
 /// Planner output for one `write_all` cache-selection pass.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MssqlOutputCachePlan {
-    selected_outputs: Vec<MssqlOutputCachePlanOutput>,
     decision: MssqlOutputCacheDecision,
     skipped_candidates: Vec<MssqlCacheCandidateSkip>,
 }
 
 impl MssqlOutputCachePlan {
     pub(super) fn new(
-        selected_outputs: Vec<MssqlOutputCachePlanOutput>,
         decision: MssqlOutputCacheDecision,
         skipped_candidates: Vec<MssqlCacheCandidateSkip>,
     ) -> Self {
         Self {
-            selected_outputs,
             decision,
             skipped_candidates,
         }
     }
 
-    pub(super) fn no_cache(
-        selected_outputs: Vec<MssqlOutputCachePlanOutput>,
-        reason: MssqlNoCacheReason,
-    ) -> Self {
+    pub(super) fn no_cache(reason: MssqlNoCacheReason) -> Self {
         Self {
-            selected_outputs,
             decision: MssqlOutputCacheDecision::NoCache { reason },
             skipped_candidates: Vec::new(),
         }
-    }
-
-    /// Returns selected outputs in caller-provided order.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn selected_outputs(&self) -> &[MssqlOutputCachePlanOutput] {
-        &self.selected_outputs
     }
 
     /// Returns the cache choice for this planning pass.
@@ -63,69 +49,8 @@ impl fmt::Debug for MssqlOutputCachePlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("MssqlOutputCachePlan")
-            .field("selected_outputs", &self.selected_outputs)
             .field("decision", &self.decision)
             .field("skipped_candidates", &self.skipped_candidates)
-            .finish()
-    }
-}
-
-/// Selected output identity captured for cache planning.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct MssqlOutputCachePlanOutput {
-    index: usize,
-    table_id: u64,
-    table_name: String,
-    output_name: String,
-}
-
-impl MssqlOutputCachePlanOutput {
-    pub(super) fn from_request(index: usize, request: &OutputWritePlan) -> Self {
-        Self {
-            index,
-            table_id: request.table().id(),
-            table_name: request.table().name().to_owned(),
-            output_name: request.target().output_name().to_owned(),
-        }
-    }
-
-    /// Returns the output index from the caller-provided request list.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn index(&self) -> usize {
-        self.index
-    }
-
-    /// Returns the selected lazy table id.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn table_id(&self) -> u64 {
-        self.table_id
-    }
-
-    /// Returns the selected lazy table name.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    /// Returns the selected output name.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn output_name(&self) -> &str {
-        &self.output_name
-    }
-}
-
-impl fmt::Debug for MssqlOutputCachePlanOutput {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("MssqlOutputCachePlanOutput")
-            .field("index", &self.index)
-            .field("table_id", &self.table_id)
-            .field("table_name", &sanitize_text_for_display(&self.table_name))
-            .field("output_name", &sanitize_text_for_display(&self.output_name))
             .finish()
     }
 }
@@ -316,16 +241,8 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> MssqlOutputCachePlan {
-        let selected_outputs = requests
-            .iter()
-            .enumerate()
-            .map(|(index, request)| MssqlOutputCachePlanOutput::from_request(index, request))
-            .collect::<Vec<_>>();
-        if selected_outputs.len() < 2 {
-            return MssqlOutputCachePlan::no_cache(
-                selected_outputs,
-                MssqlNoCacheReason::FewerThanTwoOutputs,
-            );
+        if requests.len() < 2 {
+            return MssqlOutputCachePlan::no_cache(MssqlNoCacheReason::FewerThanTwoOutputs);
         }
 
         let mut shared_candidates = Vec::new();
@@ -371,7 +288,6 @@ impl DeltaFunnelSession {
 
         if shared_candidates.len() == 1 {
             return MssqlOutputCachePlan::new(
-                selected_outputs,
                 MssqlOutputCacheDecision::CacheAliases(vec![shared_candidates.remove(0)]),
                 skipped_candidates,
             );
@@ -394,7 +310,6 @@ impl DeltaFunnelSession {
                             })
                     }));
                     return MssqlOutputCachePlan::new(
-                        selected_outputs,
                         MssqlOutputCacheDecision::CacheAliases(selected_aliases),
                         skipped_candidates,
                     );
@@ -412,7 +327,6 @@ impl DeltaFunnelSession {
                         },
                     ));
                     return MssqlOutputCachePlan::new(
-                        selected_outputs,
                         MssqlOutputCacheDecision::NoCache {
                             reason: MssqlNoCacheReason::AmbiguousSharedDerivedAlias,
                         },
@@ -423,7 +337,6 @@ impl DeltaFunnelSession {
         }
 
         MssqlOutputCachePlan::new(
-            selected_outputs,
             MssqlOutputCacheDecision::NoCache {
                 reason: MssqlNoCacheReason::NoSharedRegisteredDerivedAlias,
             },
@@ -582,7 +495,8 @@ mod tests {
     };
 
     #[test]
-    fn cache_plan_shell_preserves_selected_output_order() -> Result<(), DeltaFunnelError> {
+    fn cache_plan_reports_no_shared_alias_for_independent_outputs() -> Result<(), DeltaFunnelError>
+    {
         let session = DeltaFunnelSession::new(SessionOptions::default())?;
         let west = output_request(
             LazyTable::placeholder(7, LazyTableKind::DerivedSql),
@@ -606,15 +520,6 @@ mod tests {
             }
         );
         assert!(plan.skipped_candidates().is_empty());
-        assert_eq!(plan.selected_outputs().len(), 2);
-        assert_eq!(plan.selected_outputs()[0].index(), 0);
-        assert_eq!(plan.selected_outputs()[0].table_id(), 7);
-        assert_eq!(plan.selected_outputs()[0].table_name(), "table_7");
-        assert_eq!(plan.selected_outputs()[0].output_name(), "west_output");
-        assert_eq!(plan.selected_outputs()[1].index(), 1);
-        assert_eq!(plan.selected_outputs()[1].table_id(), 8);
-        assert_eq!(plan.selected_outputs()[1].table_name(), "table_8");
-        assert_eq!(plan.selected_outputs()[1].output_name(), "east_output");
         Ok(())
     }
 
@@ -636,7 +541,6 @@ mod tests {
                 reason: MssqlNoCacheReason::FewerThanTwoOutputs,
             }
         );
-        assert_eq!(plan.selected_outputs().len(), 1);
         Ok(())
     }
 
@@ -652,8 +556,7 @@ mod tests {
 
         let debug = format!("{:?}", session.plan_mssql_output_cache(&[output]));
 
-        assert!(debug.contains("orders"));
-        assert!(debug.contains("output"));
+        assert!(debug.contains("FewerThanTwoOutputs"));
         assert!(!debug.contains('\n'));
         assert!(!debug.contains("secret-token"));
         assert!(!debug.contains("password"));
