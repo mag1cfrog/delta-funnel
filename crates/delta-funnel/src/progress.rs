@@ -457,6 +457,7 @@ impl DeltaFileProgress {
 #[derive(Clone, Default)]
 pub struct ProgressReporter {
     callback: Option<Arc<ProgressCallback>>,
+    output_position: Option<ProgressOutputPosition>,
 }
 
 impl ProgressReporter {
@@ -468,11 +469,22 @@ impl ProgressReporter {
     {
         Self {
             callback: Some(Arc::new(callback)),
+            output_position: None,
         }
     }
 
     pub(crate) fn emit(&self, event: &ProgressEvent) {
-        if let Some(callback) = &self.callback {
+        let Some(callback) = &self.callback else {
+            return;
+        };
+        if let Some(position) = self.output_position {
+            if let Some(event) = event
+                .clone()
+                .with_output_position(position.index, position.count)
+            {
+                callback(&event);
+            }
+        } else {
             callback(event);
         }
     }
@@ -481,15 +493,15 @@ impl ProgressReporter {
     /// events before forwarding them to this reporter.
     ///
     /// Action-level start and terminal events are not forwarded because they
-    /// belong to the surrounding multi-output workflow.
+    /// belong to the surrounding multi-output workflow. Calling this on an
+    /// already scoped reporter keeps its original output position.
     pub(crate) fn for_output(&self, index: u64, count: u64) -> Option<Self> {
-        ProgressOutputPosition::new(index, count)?;
-        let parent = self.clone();
-        Some(Self::new(move |event| {
-            if let Some(event) = event.clone().with_output_position(index, count) {
-                parent.emit(&event);
-            }
-        }))
+        let output_position = ProgressOutputPosition::new(index, count)?;
+        let output_position = self.output_position.unwrap_or(output_position);
+        Some(Self {
+            callback: self.callback.clone(),
+            output_position: Some(output_position),
+        })
     }
 }
 
@@ -624,18 +636,32 @@ mod tests {
         let Some(output_reporter) = reporter.for_output(2, 3) else {
             return Err("valid output position was rejected".into());
         };
+        let cloned_output_reporter = output_reporter.clone();
+        let Some(rescoped_output_reporter) = output_reporter.for_output(1, 3) else {
+            return Err("valid nested output position was rejected".into());
+        };
 
         output_reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
-        output_reporter.emit(&ProgressEvent::phase_changed(
+        cloned_output_reporter.emit(&ProgressEvent::phase_changed(
             ProgressPhase::Writing,
             Some("orders"),
         ));
+        rescoped_output_reporter.emit(&ProgressEvent::progress(
+            ProgressPhase::Writing,
+            Some("orders"),
+            42,
+            3,
+        ));
         output_reporter.emit(&ProgressEvent::completed());
 
+        for (index, count) in [(0, 3), (1, 0), (4, 3)] {
+            assert!(reporter.for_output(index, count).is_none());
+        }
+
         let events = events.lock().map_err(|_| "progress event lock poisoned")?;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].output_index(), Some(2));
-        assert_eq!(events[0].output_count(), Some(3));
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.output_index() == Some(2)));
+        assert!(events.iter().all(|event| event.output_count() == Some(3)));
         Ok(())
     }
 
