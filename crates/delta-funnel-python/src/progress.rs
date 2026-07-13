@@ -918,7 +918,7 @@ pub(crate) mod tests {
         originals: Vec<(&'static str, Option<Py<PyAny>>)>,
     }
 
-    struct StderrGuard {
+    pub(crate) struct StderrGuard {
         original: Py<PyAny>,
     }
 
@@ -943,7 +943,7 @@ pub(crate) mod tests {
     }
 
     impl StderrGuard {
-        fn capture(py: Python<'_>) -> PyResult<(Self, Py<PyAny>)> {
+        pub(crate) fn capture(py: Python<'_>) -> PyResult<(Self, Py<PyAny>)> {
             let capture = py.import("io")?.call_method0("StringIO")?.unbind();
             let guard = Self::replace(py, capture.bind(py))?;
             Ok((guard, capture))
@@ -1030,7 +1030,7 @@ pub(crate) mod tests {
             Ok((guard, records))
         }
 
-        fn install_with_failure(
+        pub(crate) fn install_with_failure(
             py: Python<'_>,
             interactive: bool,
             jupyter: bool,

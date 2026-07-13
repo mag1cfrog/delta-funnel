@@ -1072,7 +1072,7 @@ mod tests {
         deltafunnel,
         progress::{
             adapter_creation_count,
-            tests::{ModuleGuard, record_strings},
+            tests::{ModuleGuard, StderrGuard, record_strings},
         },
         test_support::python_state,
     };
@@ -1537,6 +1537,143 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn ordinary_rich_failure_does_not_change_delta_registration() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("registration-renderer-failure")?;
+
+            for use_pending_alias in [false, true] {
+                let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+                let (_guard, records, _failure) = ModuleGuard::install_with_failure(
+                    py,
+                    true,
+                    false,
+                    Some("update"),
+                    false,
+                    false,
+                )?;
+
+                register_delta_with_forced_progress(py, &session, &table.uri(), use_pending_alias)?;
+
+                assert_eq!(session.bind(py).borrow().inner.source_reports().len(), 1);
+                assert_eq!(
+                    record_strings(records.bind(py), "call")?
+                        .iter()
+                        .filter(|call| call.as_str() == "stop")
+                        .count(),
+                    1
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn renderer_interruption_defers_table_delivery_until_registration_finishes() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("registration-interruption")?;
+
+            for use_pending_alias in [false, true] {
+                let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+                let (_guard, _records, failure) = ModuleGuard::install_with_failure(
+                    py,
+                    true,
+                    false,
+                    Some("update"),
+                    true,
+                    false,
+                )?;
+                let (_stderr, _capture) = StderrGuard::capture(py)?;
+
+                let error = register_delta_with_forced_progress(
+                    py,
+                    &session,
+                    &table.uri(),
+                    use_pending_alias,
+                )
+                .unwrap_err();
+
+                assert!(error.value(py).is(failure.bind(py)));
+                assert_eq!(
+                    error
+                        .value(py)
+                        .getattr("deltafunnel_operation_status")?
+                        .extract::<String>()?,
+                    "completed"
+                );
+                assert!(
+                    error
+                        .value(py)
+                        .getattr("deltafunnel_operation_error")
+                        .is_err()
+                );
+                assert_eq!(session.bind(py).borrow().inner.source_reports().len(), 1);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn renderer_interruption_attaches_delta_registration_failure() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("registration-source-failure")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let (_guard, _records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
+            let (_stderr, _capture) = StderrGuard::capture(py)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            kwargs.set_item("version", 999)?;
+            kwargs.set_item("progress", true)?;
+
+            let error = session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&kwargs))
+                .unwrap_err();
+
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "failed"
+            );
+            let operation_error = error.value(py).getattr("deltafunnel_operation_error")?;
+            assert_eq!(
+                operation_error.getattr("kind")?.extract::<String>()?,
+                "delta_snapshot_load"
+            );
+            assert!(session.bind(py).borrow().inner.source_reports().is_empty());
+            Ok(())
+        })
+    }
+
+    fn register_delta_with_forced_progress(
+        py: Python<'_>,
+        session: &Py<PySession>,
+        source_uri: &str,
+        use_pending_alias: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("progress", true)?;
+        if use_pending_alias {
+            return session
+                .bind(py)
+                .call_method("delta_lake", (source_uri,), None)?
+                .call_method("alias", ("orders",), Some(&kwargs))
+                .map(Bound::unbind);
+        }
+        kwargs.set_item("name", "orders")?;
+        session
+            .bind(py)
+            .call_method("delta_lake", (source_uri,), Some(&kwargs))
+            .map(Bound::unbind)
     }
 
     fn registration_update_descriptions(records: &Bound<'_, PyList>) -> PyResult<Vec<String>> {
