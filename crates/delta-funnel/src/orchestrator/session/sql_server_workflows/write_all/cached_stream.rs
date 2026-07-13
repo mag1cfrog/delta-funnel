@@ -14,7 +14,7 @@ use super::super::super::{
     query_handoff::{SharedProviderReadStats, wrap_stream_with_delta_read_tracking},
     registry::{DerivedTableDependency, read_only_sql_options},
 };
-use super::{MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan};
+use super::MssqlDerivedCacheAliasPlan;
 
 pub(super) fn failing_cached_output_batch_stream_factory(
     output_name: String,
@@ -62,20 +62,19 @@ pub(super) async fn replanned_sql_batch_stream(
 }
 
 impl DeltaFunnelSession {
-    /// Classifies one selected output relative to active cached aliases.
+    /// Returns whether one selected output must be replanned against active caches.
     ///
     /// Direct selected-alias use wins over lineage use because the normal
     /// registered-alias stream path should read the active cached provider.
-    /// Dependent outputs are identified from captured lineage so later stream
-    /// construction can replan from retained SQL while all cache aliases are
-    /// installed.
-    pub(crate) fn cached_output_stream_route(
+    /// Other dependent outputs are identified from captured lineage and must
+    /// be replanned from retained SQL while all cache aliases are installed.
+    fn output_requires_cache_replan(
         &self,
         request: &OutputWritePlan,
         active_aliases: &[MssqlDerivedCacheAliasPlan],
-    ) -> Result<MssqlCachedOutputStreamRoute, DeltaFunnelError> {
+    ) -> Result<bool, DeltaFunnelError> {
         if active_aliases.is_empty() {
-            return Ok(MssqlCachedOutputStreamRoute::UncachedLazyTable);
+            return Ok(false);
         }
 
         for alias in active_aliases {
@@ -83,41 +82,27 @@ impl DeltaFunnelSession {
                 .ok_or_else(|| unknown_cached_alias_error(alias))?;
         }
 
-        if let Some(alias) = active_aliases
+        if active_aliases
             .iter()
-            .find(|alias| request.table().id() == alias.table_id())
+            .any(|alias| request.table().id() == alias.table_id())
         {
-            return Ok(MssqlCachedOutputStreamRoute::DirectCachedAlias(
-                alias.clone(),
-            ));
+            return Ok(false);
         }
 
         if request.table().kind() == LazyTableKind::DeltaSource {
-            return Ok(MssqlCachedOutputStreamRoute::UncachedLazyTable);
+            return Ok(false);
         }
 
         let dependencies = self.transitive_registered_derived_dependencies(request.table())?;
-        let dependent_aliases = active_aliases
-            .iter()
-            .filter(|alias| {
-                dependencies.iter().any(|dependency| {
-                    matches!(
-                        dependency,
-                        DerivedTableDependency::RegisteredDerived { table_id, .. }
-                            if *table_id == alias.table_id()
-                    )
-                })
+        Ok(active_aliases.iter().any(|alias| {
+            dependencies.iter().any(|dependency| {
+                matches!(
+                    dependency,
+                    DerivedTableDependency::RegisteredDerived { table_id, .. }
+                        if *table_id == alias.table_id()
+                )
             })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if dependent_aliases.is_empty() {
-            Ok(MssqlCachedOutputStreamRoute::UncachedLazyTable)
-        } else {
-            Ok(MssqlCachedOutputStreamRoute::ReplannedCachedDependency(
-                dependent_aliases,
-            ))
-        }
+        }))
     }
 
     /// Builds an async stream factory for one output while cache aliases are active.
@@ -136,51 +121,47 @@ impl DeltaFunnelSession {
         provider_stats: Option<SharedProviderReadStats>,
         reporter: Option<ProgressReporter>,
     ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
-        let route = self.cached_output_stream_route(request, active_aliases)?;
-        match route {
-            MssqlCachedOutputStreamRoute::DirectCachedAlias(_)
-            | MssqlCachedOutputStreamRoute::UncachedLazyTable => Ok(self
-                .lazy_table_batch_stream_factory(
-                    request.table().clone(),
-                    provider_stats,
-                    reporter.map(|reporter| (reporter, request.target().output_name().to_owned())),
-                )),
-            MssqlCachedOutputStreamRoute::ReplannedCachedDependency(_) => {
-                let output_name = request.target().output_name().to_owned();
-                let sql_text = match self.sql_text_for_derived_table(request.table()) {
-                    Ok(sql_text) => sql_text.to_owned(),
-                    Err(error) => {
-                        return Ok(failing_cached_output_batch_stream_factory(
-                            output_name,
-                            error,
-                        ));
-                    }
-                };
-                let expected_schema = match self.schema_for_lazy_table(request.table()) {
-                    Ok(schema) => Arc::clone(schema),
-                    Err(error) => {
-                        return Ok(failing_cached_output_batch_stream_factory(
-                            output_name,
-                            error,
-                        ));
-                    }
-                };
-                let context = self.context.clone();
-                Ok(Box::new(move || {
-                    Box::pin(async move {
-                        replanned_sql_batch_stream(
-                            context,
-                            output_name,
-                            sql_text,
-                            expected_schema,
-                            provider_stats,
-                            reporter,
-                        )
-                        .await
-                    })
-                }))
-            }
+        if !self.output_requires_cache_replan(request, active_aliases)? {
+            return Ok(self.lazy_table_batch_stream_factory(
+                request.table().clone(),
+                provider_stats,
+                reporter.map(|reporter| (reporter, request.target().output_name().to_owned())),
+            ));
         }
+
+        let output_name = request.target().output_name().to_owned();
+        let sql_text = match self.sql_text_for_derived_table(request.table()) {
+            Ok(sql_text) => sql_text.to_owned(),
+            Err(error) => {
+                return Ok(failing_cached_output_batch_stream_factory(
+                    output_name,
+                    error,
+                ));
+            }
+        };
+        let expected_schema = match self.schema_for_lazy_table(request.table()) {
+            Ok(schema) => Arc::clone(schema),
+            Err(error) => {
+                return Ok(failing_cached_output_batch_stream_factory(
+                    output_name,
+                    error,
+                ));
+            }
+        };
+        let context = self.context.clone();
+        Ok(Box::new(move || {
+            Box::pin(async move {
+                replanned_sql_batch_stream(
+                    context,
+                    output_name,
+                    sql_text,
+                    expected_schema,
+                    provider_stats,
+                    reporter,
+                )
+                .await
+            })
+        }))
     }
 }
 
@@ -214,12 +195,10 @@ mod tests {
             scan_counting_marker_region_provider,
         },
     };
-    use super::super::{
-        MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan, MssqlOutputCacheDecision,
-    };
+    use super::super::{MssqlDerivedCacheAliasPlan, MssqlOutputCacheDecision};
 
     #[tokio::test]
-    async fn cached_output_stream_route_classifies_direct_dependent_and_unrelated_outputs()
+    async fn output_requires_cache_replan_classifies_direct_dependent_and_unrelated_outputs()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -253,70 +232,14 @@ mod tests {
             return Err("expected cache aliases decision".into());
         };
 
-        assert_eq!(
-            session.cached_output_stream_route(&big_output, caches)?,
-            MssqlCachedOutputStreamRoute::DirectCachedAlias(caches[0].clone())
-        );
-        assert_eq!(
-            session.cached_output_stream_route(&west_output, caches)?,
-            MssqlCachedOutputStreamRoute::ReplannedCachedDependency(vec![caches[0].clone()])
-        );
-        assert_eq!(
-            session.cached_output_stream_route(&unrelated_output, caches)?,
-            MssqlCachedOutputStreamRoute::UncachedLazyTable
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cached_output_stream_route_keeps_multiple_active_dependency_aliases()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("orders")?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
-        let pending_big = session
-            .table_from_sql("select id, customer_name from orders")
-            .await?;
-        let big = session.register_alias("big", &pending_big)?;
-        let pending_names = session
-            .table_from_sql("select customer_name from orders")
-            .await?;
-        let names = session.register_alias("names", &pending_names)?;
-        let west = session
-            .table_from_sql(
-                "select big.id from big join names on big.customer_name = names.customer_name",
-            )
-            .await?;
-        let east = session
-            .table_from_sql(
-                "select big.id from big join names on big.customer_name = names.customer_name",
-            )
-            .await?;
-        let west_output = output_request(
-            west.clone(),
-            "west_output",
-            "west_orders",
-            LoadMode::AppendExisting,
-        )?;
-        let east_output =
-            output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
-        let plan = session.plan_mssql_output_cache(&[west_output.clone(), east_output]);
-        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
-            return Err("expected cache aliases decision".into());
-        };
-
-        assert_eq!(caches.len(), 2);
-        assert_eq!(caches[0].table_id(), big.id());
-        assert_eq!(caches[1].table_id(), names.id());
-        assert_eq!(
-            session.cached_output_stream_route(&west_output, caches)?,
-            MssqlCachedOutputStreamRoute::ReplannedCachedDependency(caches.clone())
-        );
+        assert!(!session.output_requires_cache_replan(&big_output, caches)?);
+        assert!(session.output_requires_cache_replan(&west_output, caches)?);
+        assert!(!session.output_requires_cache_replan(&unrelated_output, caches)?);
         Ok(())
     }
 
     #[test]
-    fn cached_output_stream_route_rejects_unknown_active_alias() -> Result<(), DeltaFunnelError> {
+    fn output_requires_cache_replan_rejects_unknown_active_alias() -> Result<(), DeltaFunnelError> {
         let session = DeltaFunnelSession::new(SessionOptions::default())?;
         let output = output_request(
             LazyTable::placeholder(7, LazyTableKind::DerivedSql),
@@ -330,7 +253,7 @@ mod tests {
             vec![0],
         )];
 
-        let error = session.cached_output_stream_route(&output, &aliases);
+        let error = session.output_requires_cache_replan(&output, &aliases);
 
         assert!(matches!(
             error,

@@ -137,17 +137,6 @@ impl fmt::Debug for MssqlDerivedCacheAliasPlan {
     }
 }
 
-/// Stream construction route for one output while cache aliases are active.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MssqlCachedOutputStreamRoute {
-    /// The selected output table is itself an active cached alias.
-    DirectCachedAlias(MssqlDerivedCacheAliasPlan),
-    /// The selected output depends on one or more active cached aliases.
-    ReplannedCachedDependency(Vec<MssqlDerivedCacheAliasPlan>),
-    /// The selected output does not use any active cached alias.
-    UncachedLazyTable,
-}
-
 /// Candidate skipped during conservative cache selection.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MssqlCacheCandidateSkip {
