@@ -674,7 +674,7 @@ pub async fn write_mssql_outputs_to_mssql(
     jobs: impl IntoIterator<Item = MssqlOutputWriteJob>,
     options: MssqlWorkflowWriteOptions,
 ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
-    write_mssql_outputs_with_writer(jobs, options, MssqlPublicOneOutputWriter).await
+    write_mssql_outputs_with_writer(jobs, options, MssqlWorkflowSinkWriter).await
 }
 
 pub(crate) struct MssqlStreamBenchmarkOutputWriter;
@@ -697,10 +697,10 @@ pub(crate) trait MssqlWorkflowOutputWriter: Send {
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
-struct MssqlPublicOneOutputWriter;
+pub(crate) struct MssqlWorkflowSinkWriter;
 
 #[async_trait]
-impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
+impl MssqlWorkflowOutputWriter for MssqlWorkflowSinkWriter {
     async fn write_output(
         &mut self,
         output_schema: SchemaRef,

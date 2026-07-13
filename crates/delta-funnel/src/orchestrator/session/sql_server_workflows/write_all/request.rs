@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
     DeltaFunnelError, MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter,
-    PhaseTimingReport, ReportReasonCode, observability,
+    MssqlWorkflowSinkWriter, PhaseTimingReport, ReportReasonCode, observability,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::{PhaseTimer, sql_server::WriteAllReport},
     support::sanitize_text_for_display,
@@ -13,10 +13,7 @@ use super::super::super::{
     DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode,
     query_handoff::{provider_read_stats_snapshot, shared_provider_read_stats},
 };
-use super::{
-    MssqlOutputCacheDecision, WriteAllCacheMode, WriteAllOptions, cache_report,
-    workflow::MssqlWorkflowPublicOutputWriter,
-};
+use super::{MssqlOutputCacheDecision, WriteAllCacheMode, WriteAllOptions, cache_report};
 use tracing::Instrument;
 
 const OUTPUT_PLANNING_PHASE: &str = "output_planning";
@@ -285,7 +282,7 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
-        self.write_all_with_observability(requests, options, MssqlWorkflowPublicOutputWriter, None)
+        self.write_all_with_observability(requests, options, MssqlWorkflowSinkWriter, None)
             .await
     }
 
@@ -299,7 +296,7 @@ impl DeltaFunnelSession {
         self.write_all_with_observability(
             requests,
             options,
-            MssqlWorkflowPublicOutputWriter,
+            MssqlWorkflowSinkWriter,
             Some(&reporter),
         )
         .await

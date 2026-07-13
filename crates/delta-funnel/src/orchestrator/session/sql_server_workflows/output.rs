@@ -108,7 +108,7 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter, None)
+        self.run_mssql_write_with_tracing(request, &mut MssqlOneOutputSinkWriter, None)
             .await
     }
 
@@ -117,7 +117,7 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
         reporter: ProgressReporter,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter, Some(&reporter))
+        self.run_mssql_write_with_tracing(request, &mut MssqlOneOutputSinkWriter, Some(&reporter))
             .await
     }
 
@@ -306,10 +306,10 @@ pub(crate) trait OrchestratorMssqlOutputWriter: Send {
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
-struct MssqlPublicOneOutputWriter;
+struct MssqlOneOutputSinkWriter;
 
 #[async_trait]
-impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
+impl OrchestratorMssqlOutputWriter for MssqlOneOutputSinkWriter {
     async fn write_output(
         &mut self,
         output_schema: SchemaRef,

@@ -1,14 +1,11 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
-    DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory, MssqlOutputWriteJob,
-    MssqlSchemaPlanOptions, MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, MssqlWriteBackend,
-    MssqlWriteReport, ResolvedMssqlTarget, ValidationOptions, progress::ProgressReporter,
+    DeltaFunnelError, MssqlOutputBatchStreamFactory, MssqlOutputWriteJob,
+    MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, progress::ProgressReporter,
     usize_to_u64_saturating, write_mssql_outputs_with_writer,
-    write_output_batches_to_mssql_for_workflow,
 };
 
 use super::super::super::{
@@ -21,33 +18,6 @@ use super::{
         restore_mssql_cache_aliases_after_error,
     },
 };
-
-pub(super) struct MssqlWorkflowPublicOutputWriter;
-
-#[async_trait]
-impl MssqlWorkflowOutputWriter for MssqlWorkflowPublicOutputWriter {
-    async fn write_output(
-        &mut self,
-        output_schema: SchemaRef,
-        resolved_target: ResolvedMssqlTarget,
-        schema_options: MssqlSchemaPlanOptions,
-        batches: MssqlOutputBatchStream,
-        write_backend: MssqlWriteBackend,
-        validation_options: ValidationOptions,
-        reporter: Option<&ProgressReporter>,
-    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql_for_workflow(
-            output_schema.as_ref(),
-            resolved_target,
-            schema_options,
-            batches,
-            write_backend,
-            validation_options,
-            reporter,
-        )
-        .await
-    }
-}
 
 impl DeltaFunnelSession {
     /// Combines one planned output, its resolved schema, and its deferred batch
