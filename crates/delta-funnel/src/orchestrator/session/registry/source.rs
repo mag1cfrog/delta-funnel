@@ -246,6 +246,10 @@ mod tests {
         progress::{
             ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
         },
+        query_engine::datafusion::test_support::{
+            FailsOnCustomersSchemaProvider, INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
+            SingleSchemaCatalogProvider,
+        },
     };
 
     use super::super::super::{
@@ -321,6 +325,97 @@ mod tests {
         assert_eq!(events[0].kind(), ProgressEventKind::Started);
         assert_eq!(events[1].phase(), Some(ProgressPhase::LoadingDeltaMetadata));
         assert_eq!(events[2].kind(), ProgressEventKind::Failed);
+        Ok(())
+    }
+
+    #[test]
+    fn delta_lake_progress_reports_protocol_failure_after_validation_starts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table =
+            DeltaLogTable::new_with_protocol("progress-protocol", UNSUPPORTED_PROTOCOL_JSON)?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (reporter, events) = recording_reporter();
+
+        let result = session
+            .delta_lake_with_progress(DeltaSourceConfig::new("orders", table.uri()), reporter);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaProtocolCompatibility { .. })
+        ));
+        let events = events.lock().map_err(|_| "progress events lock poisoned")?;
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].kind(), ProgressEventKind::Started);
+        assert_eq!(events[1].phase(), Some(ProgressPhase::LoadingDeltaMetadata));
+        assert_eq!(
+            events[2].phase(),
+            Some(ProgressPhase::ValidatingDeltaProtocol)
+        );
+        assert_eq!(events[3].kind(), ProgressEventKind::Failed);
+        Ok(())
+    }
+
+    #[test]
+    fn delta_lake_progress_reports_provider_preparation_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_schema(
+            "progress-provider",
+            INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
+        )?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (reporter, events) = recording_reporter();
+
+        let result = session
+            .delta_lake_with_progress(DeltaSourceConfig::new("orders", table.uri()), reporter);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaSourceSchema { .. })
+        ));
+        let events = events.lock().map_err(|_| "progress events lock poisoned")?;
+        assert_eq!(events.len(), 5);
+        assert_eq!(
+            events[3].phase(),
+            Some(ProgressPhase::PreparingDeltaProvider)
+        );
+        assert_eq!(events[4].kind(), ProgressEventKind::Failed);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.phase() != Some(ProgressPhase::RegisteringDeltaSource))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_lake_progress_reports_catalog_registration_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("progress-catalog")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let failing_schema: Arc<dyn datafusion::catalog::SchemaProvider> =
+            Arc::new(FailsOnCustomersSchemaProvider::default());
+        session.context().register_catalog(
+            "datafusion",
+            Arc::new(SingleSchemaCatalogProvider::new(failing_schema)),
+        );
+        let (reporter, events) = recording_reporter();
+
+        let result = session
+            .delta_lake_with_progress(DeltaSourceConfig::new("customers", table.uri()), reporter);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DataFusionRegistration { .. })
+        ));
+        let events = events.lock().map_err(|_| "progress events lock poisoned")?;
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            events[4].phase(),
+            Some(ProgressPhase::RegisteringDeltaSource)
+        );
+        assert_eq!(events[5].kind(), ProgressEventKind::Failed);
+        assert!(session.sources().is_empty());
+        assert_eq!(session.next_table_id(), 0);
         Ok(())
     }
 

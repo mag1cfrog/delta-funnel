@@ -96,7 +96,7 @@ pub fn datafusion_query_output_stream(
 }
 
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
     #![allow(missing_docs)]
 
     use std::any::Any;
