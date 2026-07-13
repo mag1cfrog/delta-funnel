@@ -247,17 +247,14 @@ impl DeltaFunnelSession {
             .iter()
             .enumerate()
             .map(|(output_index, request)| {
-                if let Some(reporter) = reporter
-                    && let Some(event) = ProgressEvent::phase_changed(
+                let output_index = usize_to_u64_saturating(output_index.saturating_add(1));
+                let output_reporter =
+                    reporter.and_then(|reporter| reporter.for_output(output_index, output_count));
+                if let Some(output_reporter) = output_reporter {
+                    output_reporter.emit(&ProgressEvent::phase_changed(
                         ProgressPhase::PlanningOutput,
                         Some(request.target().output_name()),
-                    )
-                    .with_output_position(
-                        usize_to_u64_saturating(output_index.saturating_add(1)),
-                        output_count,
-                    )
-                {
-                    reporter.emit(&event);
+                    ));
                 }
                 self.plan_dry_run_output(request)
             })
