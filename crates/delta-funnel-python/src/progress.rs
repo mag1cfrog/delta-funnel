@@ -847,7 +847,10 @@ const fn terminal_label(kind: ProgressEventKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        thread,
+    };
 
     use pyo3::exceptions::{PyGeneratorExit, PyKeyboardInterrupt, PyRuntimeError, PySystemExit};
     use pyo3::ffi::c_str;
@@ -992,6 +995,8 @@ def record(value):
         records.append(value)
 
 def maybe_fail(call):
+    if threading.get_ident() != owner_thread:
+        return
     if fail_call == call:
         raise failure
     if stop_also_interrupts and call == "stop":
@@ -1455,6 +1460,29 @@ sys.modules["rich.progress"] = progress_module
         // that python_state recovers the lock instead of failing later tests.
         let _state = python_state();
         Python::attach(|py| assert_modules_match(py, &baseline))
+    }
+
+    #[test]
+    fn fake_rich_failures_do_not_escape_to_other_threads() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, _failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("console"), true, true)?;
+
+            let worker = thread::spawn(|| {
+                Python::attach(|py| {
+                    py.import("rich.console")?.getattr("Console")?.call0()?;
+                    Ok::<_, PyErr>(())
+                })
+            });
+            let result = py
+                .detach(|| worker.join())
+                .map_err(|_| PyRuntimeError::new_err("fake Rich thread panicked"))?;
+
+            result?;
+            assert!(records.bind(py).is_empty());
+            Ok(())
+        })
     }
 
     #[test]

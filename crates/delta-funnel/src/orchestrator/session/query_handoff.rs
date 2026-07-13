@@ -199,21 +199,21 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
 impl DeltaFileProgressTracker {
     /// Emits only when the visible handled and total file counts have changed.
     fn emit_if_changed(&self) {
-        let pending = {
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            state.pending_event()
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some((reporter, event)) = pending {
-            reporter.emit(&event);
+        if let Some(event) = state.pending_event() {
+            // Partition streams may run in separate Tokio tasks. Keep delivery
+            // inside this lock so one reporter callback finishes before the
+            // next partition can start another callback.
+            state.reporter.emit(&event);
         }
     }
 }
 
 impl DeltaFileProgressState {
-    fn pending_event(&mut self) -> Option<(ProgressReporter, ProgressEvent)> {
+    fn pending_event(&mut self) -> Option<ProgressEvent> {
         let snapshots = snapshot_delta_provider_read_stats(&self.read_stats_handles);
         let event = ProgressEvent::file_progress_from_provider_stats(
             self.phase,
@@ -225,7 +225,7 @@ impl DeltaFileProgressState {
             return None;
         }
         self.last_file_progress = Some(file_progress);
-        Some((self.reporter.clone(), event))
+        Some(event)
     }
 }
 

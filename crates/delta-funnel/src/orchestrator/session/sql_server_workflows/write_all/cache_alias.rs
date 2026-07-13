@@ -1,11 +1,12 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, panic::resume_unwind, sync::Arc};
 
 use datafusion::{
     datasource::{MemTable, TableProvider},
     physical_plan::execute_stream_partitioned,
     prelude::{DataFrame, SessionContext},
 };
-use futures_util::{StreamExt, TryStreamExt, future::try_join_all};
+use futures_util::{StreamExt, TryStreamExt};
+use tokio::task::JoinSet;
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream,
@@ -17,7 +18,9 @@ use crate::{
 use super::super::super::{
     DeltaFunnelSession, LazyTable,
     errors::{mssql_scoped_cache_alias_error, unknown_cached_alias_error},
-    query_handoff::{shared_delta_file_progress_state, track_delta_file_progress},
+    query_handoff::{
+        SharedDeltaFileProgressState, shared_delta_file_progress_state, track_delta_file_progress,
+    },
 };
 use super::MssqlDerivedCacheAliasPlan;
 
@@ -264,17 +267,19 @@ impl DeltaFunnelSession {
         );
         let streams = execute_stream_partitioned(physical_plan, task_ctx)
             .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
-        let partitions = try_join_all(streams.into_iter().map(|stream| {
-            let alias_name = alias_name.to_owned();
-            let stream: MssqlOutputBatchStream = Box::pin(stream.map(move |batch| {
-                batch.map_err(|error| {
-                    mssql_scoped_cache_alias_error("materialize", alias_name.as_str(), error)
-                })
-            }));
-            let stream = track_delta_file_progress(stream, Arc::clone(&progress));
-            async move { stream.try_collect::<Vec<_>>().await }
-        }))
-        .await?;
+        let streams = streams
+            .into_iter()
+            .map(|stream| {
+                let alias_name = alias_name.to_owned();
+                let stream: MssqlOutputBatchStream = Box::pin(stream.map(move |batch| {
+                    batch.map_err(|error| {
+                        mssql_scoped_cache_alias_error("materialize", alias_name.as_str(), error)
+                    })
+                }));
+                stream
+            })
+            .collect();
+        let partitions = collect_cache_partitions(streams, progress, alias_name).await?;
         let cached_provider = MemTable::try_new(schema, partitions)
             .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
         Ok(Arc::new(cached_provider))
@@ -346,6 +351,36 @@ impl DeltaFunnelSession {
     }
 }
 
+/// Collects each cache partition in its own Tokio task and restores its order.
+async fn collect_cache_partitions(
+    streams: Vec<MssqlOutputBatchStream>,
+    progress: SharedDeltaFileProgressState,
+    alias_name: &str,
+) -> Result<Vec<Vec<datafusion::arrow::record_batch::RecordBatch>>, DeltaFunnelError> {
+    let mut tasks = JoinSet::new();
+    for (partition_index, stream) in streams.into_iter().enumerate() {
+        let stream = track_delta_file_progress(stream, Arc::clone(&progress));
+        tasks.spawn(async move { (partition_index, stream.try_collect::<Vec<_>>().await) });
+    }
+
+    let mut partitions = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((partition_index, batches)) => partitions.push((partition_index, batches?)),
+            Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
+            Err(error) => {
+                return Err(mssql_scoped_cache_alias_error(
+                    "materialize",
+                    alias_name,
+                    error,
+                ));
+            }
+        }
+    }
+    partitions.sort_by_key(|(partition_index, _)| *partition_index);
+    Ok(partitions.into_iter().map(|(_, batches)| batches).collect())
+}
+
 pub(super) async fn restore_mssql_cache_aliases(
     replacements: Vec<MssqlScopedCacheAliasReplacement<'_>>,
     reporter: Option<&ProgressReporter>,
@@ -404,7 +439,10 @@ pub(super) fn cache_error_with_restore_error(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex, atomic::Ordering};
+
+    use datafusion::arrow::{datatypes::Schema, record_batch::RecordBatch};
+    use futures_util::stream;
 
     use super::*;
 
@@ -415,6 +453,42 @@ mod tests {
             test_support::{marker_values_from_batches, scan_counting_marker_region_provider},
         },
     };
+
+    #[tokio::test]
+    async fn cache_partition_collection_uses_one_task_per_partition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let task_ids = Arc::new(Mutex::new(Vec::new()));
+        let streams = (0..2)
+            .map(|_| {
+                let task_ids = Arc::clone(&task_ids);
+                let stream = stream::once(async move {
+                    task_ids
+                        .lock()
+                        .map_err(|_| DeltaFunnelError::Config {
+                            message: "cache task id lock poisoned".to_owned(),
+                        })?
+                        .push(tokio::task::id());
+                    Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+                });
+                Box::pin(stream) as MssqlOutputBatchStream
+            })
+            .collect();
+        let progress = shared_delta_file_progress_state(
+            Vec::new(),
+            ProgressReporter::default(),
+            ProgressPhase::MaterializingCache,
+            None,
+        );
+
+        let partitions = collect_cache_partitions(streams, progress, "big").await?;
+
+        assert_eq!(partitions.len(), 2);
+        assert!(partitions.iter().all(|batches| batches.len() == 1));
+        let task_ids = task_ids.lock().map_err(|_| "cache task id lock poisoned")?;
+        assert_eq!(task_ids.len(), 2);
+        assert_ne!(task_ids[0], task_ids[1]);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn scoped_cache_alias_replacement_materializes_cache_and_restores_original_provider()
