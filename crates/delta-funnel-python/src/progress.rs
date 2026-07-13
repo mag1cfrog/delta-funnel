@@ -1,6 +1,6 @@
 //! Shows core progress events with one lazily created Rich progress task.
 //!
-//! Each Python write creates its own adapter. The adapter imports nothing from
+//! Each Python action creates its own adapter. The adapter imports nothing from
 //! Rich until the Rust action starts, then updates the same task until the
 //! action finishes. Rich chooses terminal or Jupyter rendering.
 
@@ -337,7 +337,7 @@ impl VisibleProgress {
                 != event.output_index().zip(event.output_count())
             || (event.kind() == ProgressEventKind::PhaseChanged
                 && event.output_name().is_none()
-                && (self.phase != Some(phase) || phase == ProgressPhase::MaterializingCache))
+                && starts_new_unnamed_metric_scope(self.phase, phase))
     }
 
     /// Clears file and write counters so the next work cannot show old values.
@@ -441,6 +441,14 @@ impl VisibleProgress {
         }
         description
     }
+}
+
+/// Returns true when an unnamed phase starts unrelated work with fresh metrics.
+fn starts_new_unnamed_metric_scope(current: Option<ProgressPhase>, next: ProgressPhase) -> bool {
+    next == ProgressPhase::MaterializingCache
+        || (current != Some(next)
+            && !(current == Some(ProgressPhase::CollectingPreview)
+                && next == ProgressPhase::FormattingPreview))
 }
 
 /// Current state of one action's Rich display.
@@ -688,18 +696,19 @@ fn create_renderer(
     }
     let mut console = console_type.call((), Some(&console_kwargs))?;
 
-    // Rich reports Jupyter separately from interactive terminals. Automatic
-    // mode stays quiet only when Rich reports neither one.
-    let is_interactive = console.getattr("is_interactive")?.extract::<bool>()?;
+    // Rich reports Jupyter separately from interactive terminals. A notebook
+    // keeps the stdout console; other previews select their stderr console
+    // before automatic mode checks whether the rendering stream is interactive.
     let is_jupyter = console.getattr("is_jupyter")?.extract::<bool>()?;
-    if matches!(settings.mode, ProgressMode::Automatic) && !is_interactive && !is_jupyter {
-        return Ok(None);
-    }
     if settings.output == ProgressOutput::StdoutInNotebook && !is_jupyter {
         // Rich ruled out Jupyter, so terminal and forced script previews move
         // to stderr before any progress task is constructed.
         console_kwargs.set_item("stderr", true)?;
         console = console_type.call((), Some(&console_kwargs))?;
+    }
+    let is_interactive = console.getattr("is_interactive")?.extract::<bool>()?;
+    if matches!(settings.mode, ProgressMode::Automatic) && !is_interactive && !is_jupyter {
+        return Ok(None);
     }
 
     // Use the same columns in terminals and notebooks: elapsed time, current
@@ -972,6 +981,23 @@ mod tests {
             Ok((guard, records))
         }
 
+        fn install_with_stream_interactivity(
+            py: Python<'_>,
+            stdout_interactive: bool,
+            stderr_interactive: bool,
+        ) -> PyResult<(Self, Py<PyList>)> {
+            let (guard, records) = Self::install(py, false, false)?;
+            let globals = py
+                .import("rich.console")?
+                .getattr("Console")?
+                .getattr("__init__")?
+                .getattr("__globals__")?
+                .cast_into::<PyDict>()?;
+            globals.set_item("stdout_interactive", stdout_interactive)?;
+            globals.set_item("stderr_interactive", stderr_interactive)?;
+            Ok((guard, records))
+        }
+
         fn install_with_failure(
             py: Python<'_>,
             interactive: bool,
@@ -1009,7 +1035,8 @@ mod tests {
             let records = PyList::empty(py);
             let locals = PyDict::new(py);
             locals.set_item("records", &records)?;
-            locals.set_item("interactive", interactive)?;
+            locals.set_item("stdout_interactive", interactive)?;
+            locals.set_item("stderr_interactive", interactive)?;
             locals.set_item("jupyter", jupyter)?;
             locals.set_item("fail_call", fail_call)?;
             locals.set_item("failure", &failure)?;
@@ -1044,7 +1071,8 @@ class Console:
         record({"call": "console", **kwargs})
         maybe_fail("console")
         self.stderr = kwargs.get("stderr", False)
-        self.is_interactive = interactive or kwargs.get("force_interactive", False)
+        stream_interactive = stderr_interactive if self.stderr else stdout_interactive
+        self.is_interactive = stream_interactive or kwargs.get("force_interactive", False)
         self.is_jupyter = jupyter
 
 class Progress:
@@ -1197,6 +1225,22 @@ sys.modules["rich.progress"] = progress_module
             visible.description(ProgressEventKind::Failed),
             "Failed: orders - 75 rows, 2 batches"
         );
+    }
+
+    #[test]
+    fn preview_formatting_keeps_the_collection_metric_scope() {
+        assert!(!starts_new_unnamed_metric_scope(
+            Some(ProgressPhase::CollectingPreview),
+            ProgressPhase::FormattingPreview,
+        ));
+        assert!(starts_new_unnamed_metric_scope(
+            Some(ProgressPhase::FormattingPreview),
+            ProgressPhase::ReportingSources,
+        ));
+        assert!(starts_new_unnamed_metric_scope(
+            Some(ProgressPhase::MaterializingCache),
+            ProgressPhase::MaterializingCache,
+        ));
     }
 
     #[test]
@@ -1643,6 +1687,33 @@ sys.modules["rich.progress"] = progress_module
                     .get_item("console_stderr")?
                     .extract::<bool>()?
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn automatic_preview_uses_the_final_output_stream_interactivity() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            for (stdout_interactive, stderr_interactive, should_render) in
+                [(false, true, true), (true, false, false)]
+            {
+                let (guard, records) = ModuleGuard::install_with_stream_interactivity(
+                    py,
+                    stdout_interactive,
+                    stderr_interactive,
+                )?;
+
+                preview(py, None)?;
+
+                let calls = record_strings(records.bind(py), "call")?;
+                assert_eq!(
+                    calls.iter().any(|call| call == "progress"),
+                    should_render,
+                    "stdout interactive: {stdout_interactive}, stderr interactive: {stderr_interactive}"
+                );
+                drop(guard);
+            }
             Ok(())
         })
     }

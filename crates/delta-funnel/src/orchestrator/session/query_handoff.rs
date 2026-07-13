@@ -371,12 +371,12 @@ impl DeltaFunnelSession {
         let dataframe = dataframe
             .limit(0, Some(limit))
             .map_err(|error| datafusion_handoff_setup_error("preview_limit", error))?;
-        emit_preview_phase(reporter, ProgressPhase::CollectingPreview);
         let task_context = Arc::new(dataframe.task_ctx());
         let physical_plan = dataframe
             .create_physical_plan()
             .await
             .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
+        emit_preview_phase(reporter, ProgressPhase::CollectingPreview);
         let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), task_context)
             .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
         let stream: MssqlOutputBatchStream = Box::pin(stream.map(|batch| {
@@ -659,8 +659,8 @@ mod tests {
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
         test_support::{
             DeltaLogTable, collect_stream_marker_values, collect_stream_row_count,
-            marker_region_provider, marker_values_from_batches,
-            scan_counting_marker_region_provider,
+            failing_scan_marker_region_provider, marker_region_provider,
+            marker_values_from_batches, scan_counting_marker_region_provider,
         },
     };
 
@@ -920,10 +920,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_progress_fails_once_when_preview_setup_fails()
+    async fn preview_progress_keeps_physical_planning_in_the_preparing_phase_on_failure()
     -> Result<(), Box<dyn std::error::Error>> {
-        let session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let table = LazyTable::placeholder(42, LazyTableKind::DeltaSource);
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (provider, scans) = failing_scan_marker_region_provider();
+        session
+            .context()
+            .register_table("broken_source", provider)?;
+        let table = session
+            .table_from_sql("select marker from broken_source")
+            .await?;
         let (reporter, events) = recording_preview_progress();
 
         let result = session
@@ -931,6 +937,7 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
         let events = events.lock().map_err(|_| "preview event lock poisoned")?;
         assert_eq!(
             events.as_slice(),
