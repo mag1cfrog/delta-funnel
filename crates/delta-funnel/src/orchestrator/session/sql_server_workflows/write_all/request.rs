@@ -262,7 +262,6 @@ impl DeltaFunnelSession {
     ///
     /// Returns the first pre-execution validation/planning error, or a workflow
     /// execution error from the lower-level SQL Server workflow.
-    #[allow(dead_code)]
     pub async fn write_all(
         &self,
         requests: &[OutputWritePlan],
@@ -281,7 +280,6 @@ impl DeltaFunnelSession {
     ///
     /// Returns the first pre-execution validation/planning error, or a workflow
     /// execution error from the lower-level SQL Server workflow.
-    #[allow(dead_code)]
     pub async fn write_all_with_options(
         &self,
         requests: &[OutputWritePlan],
