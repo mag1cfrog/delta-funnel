@@ -106,10 +106,28 @@ For private S3 sources, SQL Server load modes, dry runs, and reports, see the
 
 ## Start here
 
-- [Installation](install.md): add the Rust crate or Python package.
-- [Python API walkthrough](python-api-walkthrough.md): register a Delta table, transform it, and write to SQL Server.
-- [Concepts](concepts.md): learn the core objects: session, source, table, output, and report.
-- [SQL Server](sql-server.md): configure SQL Server writes and run integration tests.
+Python users can follow these pages in order:
+
+1. [Installation](install.md): add the Rust crate or Python package.
+2. [Python quickstart](python-api-walkthrough.md): register a Delta table,
+   transform it, and write to SQL Server.
+3. [Core concepts](concepts.md): understand sessions, sources, tables, outputs,
+   and reports.
+
+Rust users can start with [Installation](install.md), then continue to the
+[API references](reference/api.md).
+
+## Find what you need
+
+- [SQL Server writes](sql-server.md): configure connections and load modes.
+- [Dry runs and reports](dry-runs-reports.md): validate workflows and inspect
+  structured results.
+- [Progress displays](progress.md): configure and interpret live Python
+  progress.
+- [API references](reference/api.md): find the Rust and Python API entry
+  points.
+- [DataFusion and Delta internals](internals/datafusion-delta.md): explore
+  contributor-focused implementation notes.
 
 ## What this site covers
 
