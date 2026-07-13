@@ -16,7 +16,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::{DataFrame, SessionContext},
 };
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
@@ -372,10 +372,31 @@ impl DeltaFunnelSession {
             .limit(0, Some(limit))
             .map_err(|error| datafusion_handoff_setup_error("preview_limit", error))?;
         emit_preview_phase(reporter, ProgressPhase::CollectingPreview);
-        let batches = dataframe
-            .collect()
+        let task_context = Arc::new(dataframe.task_ctx());
+        let physical_plan = dataframe
+            .create_physical_plan()
             .await
             .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
+        let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), task_context)
+            .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
+        let stream: MssqlOutputBatchStream = Box::pin(stream.map(|batch| {
+            batch.map_err(|error| datafusion_handoff_setup_error("preview_collect", error))
+        }));
+        let stream = match reporter {
+            Some(reporter) => {
+                let read_stats_handles =
+                    collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+                let state = shared_delta_file_progress_state(
+                    read_stats_handles,
+                    reporter.clone(),
+                    ProgressPhase::CollectingPreview,
+                    None,
+                );
+                track_delta_file_progress(stream, state)
+            }
+            None => stream,
+        };
+        let batches = stream.try_collect::<Vec<_>>().await?;
         emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
         let text = pretty_format_batches(&batches)
             .map_err(|error| datafusion_handoff_setup_error("preview_text", error))?
@@ -644,6 +665,7 @@ mod tests {
     };
 
     type RecordedFileProgress = (String, u64, u64);
+    type RecordedPreviewFileProgress = (u64, u64);
     type RecordedPreviewProgress = (
         ProgressEventKind,
         Option<ProgressOperation>,
@@ -659,6 +681,24 @@ mod tests {
             match callback_events.lock() {
                 Ok(mut events) => events.push(event),
                 Err(poisoned) => poisoned.into_inner().push(event),
+            }
+        });
+        (reporter, events)
+    }
+
+    fn recording_preview_file_progress() -> (
+        ProgressReporter,
+        Arc<Mutex<Vec<RecordedPreviewFileProgress>>>,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            let Some(file_progress) = event.files_handled().zip(event.files_total()) else {
+                return;
+            };
+            match callback_events.lock() {
+                Ok(mut events) => events.push(file_progress),
+                Err(poisoned) => poisoned.into_inner().push(file_progress),
             }
         });
         (reporter, events)
@@ -907,6 +947,74 @@ mod tests {
                 ),
                 (ProgressEventKind::Failed, None, None),
             ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_file_progress_uses_the_limited_physical_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_two_files("preview-progress")?;
+        let mut session =
+            DeltaFunnelSession::new(SessionOptions::new().with_query_options(QueryOptions {
+                target_partitions: Some(1),
+                output_batch_size: Some(1),
+            }))?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+
+        let (reporter, full_events) = recording_preview_file_progress();
+        let full = session
+            .preview_table_with_progress(&source, 20, reporter)
+            .await?;
+        assert!(full.text().lines().any(|line| line.contains("| 4  |")));
+        assert_eq!(
+            full_events
+                .lock()
+                .map_err(|_| "full preview event lock poisoned")?
+                .last(),
+            Some(&(2, 2))
+        );
+
+        let (reporter, limited_events) = recording_preview_file_progress();
+        session
+            .preview_table_with_progress(&source, 1, reporter)
+            .await?;
+        {
+            let limited_events = limited_events
+                .lock()
+                .map_err(|_| "limited preview event lock poisoned")?;
+            let (handled, total) = limited_events
+                .last()
+                .copied()
+                .ok_or("limited preview did not report file progress")?;
+            assert_eq!(total, 2);
+            assert!(handled < total);
+        }
+
+        let (reporter, zero_events) = recording_preview_file_progress();
+        session
+            .preview_table_with_progress(&source, 0, reporter)
+            .await?;
+        assert!(
+            zero_events
+                .lock()
+                .map_err(|_| "zero preview event lock poisoned")?
+                .is_empty()
+        );
+
+        let derived = session.table_from_sql("select 1 as id").await?;
+        let (reporter, derived_events) = recording_preview_file_progress();
+        session
+            .preview_table_with_progress(&derived, 1, reporter)
+            .await?;
+        assert!(
+            derived_events
+                .lock()
+                .map_err(|_| "derived preview event lock poisoned")?
+                .is_empty()
         );
         Ok(())
     }
