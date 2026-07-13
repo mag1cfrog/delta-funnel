@@ -15,7 +15,9 @@ use tracing::Instrument;
 
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationOptions,
-    ValidationStatus, observability, plan_mssql_target_for_resolved_output, report::PhaseTimer,
+    ValidationStatus, observability, plan_mssql_target_for_resolved_output,
+    progress::{ProgressEvent, ProgressPhase, ProgressReporter},
+    report::PhaseTimer,
     support::sanitize_text_for_display,
 };
 
@@ -23,7 +25,7 @@ use super::{
     LoadMode, MssqlBatchShapingReport, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteBackend,
     MssqlWriteFailureContext, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_backend,
-    drain_mssql_batches_for_stream_benchmark,
+    drain_mssql_batches_for_stream_benchmark, write_output_batches_to_mssql_with_reporter,
     write_output_batches_to_mssql_with_validation_options,
 };
 
@@ -58,6 +60,7 @@ pub struct MssqlOutputWriteJob {
     write_backend: MssqlWriteBackend,
     validation_options: ValidationOptions,
     phase_timings: Vec<PhaseTimingReport>,
+    progress_reporter: Option<ProgressReporter>,
 }
 
 impl MssqlOutputWriteJob {
@@ -88,6 +91,7 @@ impl MssqlOutputWriteJob {
             write_backend,
             validation_options,
             phase_timings: Vec::new(),
+            progress_reporter: None,
         }
     }
 
@@ -95,6 +99,16 @@ impl MssqlOutputWriteJob {
     #[must_use]
     pub fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
         self.phase_timings = phase_timings;
+        self
+    }
+
+    /// Adds the reporter used only if this deferred output is attempted.
+    #[must_use]
+    pub(crate) fn with_progress_reporter(
+        mut self,
+        progress_reporter: Option<ProgressReporter>,
+    ) -> Self {
+        self.progress_reporter = progress_reporter;
         self
     }
 
@@ -148,6 +162,7 @@ impl MssqlOutputWriteJob {
         MssqlWriteBackend,
         ValidationOptions,
         Vec<PhaseTimingReport>,
+        Option<ProgressReporter>,
     ) {
         (
             self.output_schema,
@@ -157,6 +172,7 @@ impl MssqlOutputWriteJob {
             self.write_backend,
             self.validation_options,
             self.phase_timings,
+            self.progress_reporter,
         )
     }
 }
@@ -666,6 +682,10 @@ pub(crate) struct MssqlStreamBenchmarkOutputWriter;
 
 #[async_trait]
 pub(crate) trait MssqlWorkflowOutputWriter: Send {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the workflow writer receives one planned write plus its progress reporter"
+    )]
     async fn write_output(
         &mut self,
         output_schema: SchemaRef,
@@ -674,6 +694,7 @@ pub(crate) trait MssqlWorkflowOutputWriter: Send {
         batches: MssqlOutputBatchStream,
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
@@ -689,16 +710,33 @@ impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
         batches: MssqlOutputBatchStream,
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql_with_validation_options(
-            output_schema.as_ref(),
-            resolved_target,
-            schema_options,
-            batches,
-            write_backend,
-            validation_options,
-        )
-        .await
+        match reporter {
+            Some(reporter) => {
+                write_output_batches_to_mssql_with_reporter(
+                    output_schema.as_ref(),
+                    resolved_target,
+                    schema_options,
+                    batches,
+                    write_backend,
+                    validation_options,
+                    reporter,
+                )
+                .await
+            }
+            None => {
+                write_output_batches_to_mssql_with_validation_options(
+                    output_schema.as_ref(),
+                    resolved_target,
+                    schema_options,
+                    batches,
+                    write_backend,
+                    validation_options,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -712,6 +750,7 @@ impl MssqlWorkflowOutputWriter for MssqlStreamBenchmarkOutputWriter {
         batches: MssqlOutputBatchStream,
         _write_backend: MssqlWriteBackend,
         _validation_options: ValidationOptions,
+        _reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         let output_plan = plan_mssql_target_for_resolved_output(
             output_schema.as_ref(),
@@ -841,7 +880,14 @@ where
         write_backend,
         validation_options,
         planned_phase_timings,
+        reporter,
     ) = job.into_parts();
+    if let Some(reporter) = reporter.as_ref() {
+        reporter.emit(&ProgressEvent::phase_changed(
+            ProgressPhase::SettingUpStream,
+            Some(target.output_name()),
+        ));
+    }
     let stream_setup_timer = PhaseTimer::start(OUTPUT_STREAM_SETUP_PHASE);
     let (batches, stream_setup_timing) = match batches().await {
         Ok(batches) => (batches, stream_setup_timer.completed()),
@@ -867,6 +913,7 @@ where
             batches,
             write_backend,
             validation_options,
+            reporter.as_ref(),
         )
         .await
     {
@@ -1010,6 +1057,7 @@ mod tests {
             _batches: MssqlOutputBatchStream,
             _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
+            _reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
                 .lock()
@@ -1032,6 +1080,7 @@ mod tests {
             mut batches: MssqlOutputBatchStream,
             _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
+            _reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
                 .lock()

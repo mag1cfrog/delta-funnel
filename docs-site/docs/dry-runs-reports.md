@@ -41,6 +41,27 @@ dry_run_report = session.write_all(outputs, dry_run=True)
 Dry-run calls do not write rows. They are meant to check source planning,
 target identity, lifecycle choices, and output shape.
 
+### Multi-output progress
+
+One `write_all` call uses one consolidated progress display for planning,
+shared cache work, and each sequential output. Active outputs are identified as
+`Output 1/2`, `Output 2/2`, and so on. Pass `progress=False` to suppress the
+display for one call, or `progress=True` to force it in scripts and CI.
+
+Each active physical plan gets its own selected-Delta-file total. The display
+resets when cache work or another output activates, and becomes indeterminate
+when that plan has no reliable file total. Row and batch counts belong only to
+the active output. Dry runs show planning phases but no file, row, or batch
+counters.
+
+The display reuses the active plans and shared-dependency cache. It does not
+repeat shared work or run a separate count query. A report containing failed or
+skipped outputs finishes as `Completed with failures`. A top-level planning,
+cache, orchestration, or cache-restoration error raises an exception and
+finishes as `Failed`. Cache restoration happens before the result is delivered,
+so a restoration error supersedes either a successful report or a report with
+failed outputs.
+
 ## Execute reports
 
 Execute calls return report dictionaries too:

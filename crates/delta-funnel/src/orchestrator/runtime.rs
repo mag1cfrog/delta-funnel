@@ -118,6 +118,22 @@ impl DeltaFunnelRuntime {
         session.dry_run_all_to_mssql_with_tracing(requests)
     }
 
+    /// Runs a multi-output dry run and reports its live progress to the caller.
+    ///
+    /// Progress describes work while it is happening. The returned report
+    /// describes the completed dry-run result. Reporting progress does not
+    /// change that result.
+    #[doc(hidden)]
+    pub fn dry_run_all_to_mssql_with_progress(
+        &self,
+        session: &DeltaFunnelSession,
+        requests: &[OutputWritePlan],
+        reporter: ProgressReporter,
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        session.dry_run_all_to_mssql_with_progress(requests, reporter)
+    }
+
     /// Runs a multi-output dry run with source scan-summary options.
     ///
     /// # Errors
@@ -204,6 +220,24 @@ impl DeltaFunnelRuntime {
         reject_nested_runtime()?;
         self.runtime
             .block_on(session.write_all_with_options(requests, options))
+    }
+
+    /// Runs a multi-output write and reports its live progress to the caller.
+    ///
+    /// Progress describes work while it is happening. The returned report
+    /// describes the completed per-output results. Reporting progress does not
+    /// change those results.
+    #[doc(hidden)]
+    pub fn write_all_with_progress(
+        &self,
+        session: &DeltaFunnelSession,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+        reporter: ProgressReporter,
+    ) -> Result<WriteAllReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.write_all_with_progress(requests, options, reporter))
     }
 
     #[cfg(test)]
@@ -385,6 +419,7 @@ mod tests {
             batches: MssqlOutputBatchStream,
             write_backend: MssqlWriteBackend,
             validation_options: ValidationOptions,
+            reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let output_plan = crate::plan_mssql_target_for_resolved_output(
                 output_schema.as_ref(),
@@ -400,7 +435,7 @@ mod tests {
                 batches,
                 write_backend,
                 validation_options,
-                None,
+                reporter,
             )
             .await
         }

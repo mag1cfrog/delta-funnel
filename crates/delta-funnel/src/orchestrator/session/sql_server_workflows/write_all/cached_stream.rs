@@ -5,14 +5,13 @@ use futures_util::StreamExt;
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
-    datafusion_query_output_stream,
-    query_engine::datafusion::collect_delta_provider_read_stats_handles,
+    datafusion_query_output_stream, progress::ProgressReporter,
 };
 
 use super::super::super::{
     DeltaFunnelSession, LazyTableKind, OutputWritePlan,
     errors::{cached_output_stream_setup_error, unknown_cached_alias_error},
-    query_handoff::{FinalDeltaReadStatsRecorder, SharedProviderReadStats},
+    query_handoff::{SharedProviderReadStats, wrap_stream_with_delta_read_tracking},
     registry::{DerivedTableDependency, read_only_sql_options},
 };
 use super::{MssqlCachedOutputStreamRoute, MssqlDerivedCacheAliasPlan};
@@ -32,6 +31,7 @@ pub(super) async fn replanned_sql_batch_stream(
     sql_text: String,
     expected_schema: SchemaRef,
     provider_stats: Option<SharedProviderReadStats>,
+    reporter: Option<ProgressReporter>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     let dataframe = context
         .sql_with_options(sql_text.as_str(), read_only_sql_options())
@@ -48,21 +48,17 @@ pub(super) async fn replanned_sql_batch_stream(
         .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
     let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
         .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
-    if let Some(provider_stats) = provider_stats {
-        let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-        let error_output_name = output_name.clone();
-        return Ok(Box::pin(FinalDeltaReadStatsRecorder::new(
-            Box::pin(stream.map(move |batch| {
-                batch.map_err(|error| cached_output_stream_setup_error(&error_output_name, error))
-            })),
-            read_stats_handles,
-            provider_stats,
-        )));
-    }
+    let error_output_name = output_name.clone();
+    let stream = Box::pin(stream.map(move |batch| {
+        batch.map_err(|error| cached_output_stream_setup_error(&error_output_name, error))
+    }));
 
-    Ok(Box::pin(stream.map(move |batch| {
-        batch.map_err(|error| cached_output_stream_setup_error(&output_name, error))
-    })))
+    Ok(wrap_stream_with_delta_read_tracking(
+        stream,
+        physical_plan.as_ref(),
+        provider_stats,
+        reporter.map(|reporter| (reporter, output_name)),
+    ))
 }
 
 impl DeltaFunnelSession {
@@ -138,22 +134,26 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
         active_aliases: &[MssqlDerivedCacheAliasPlan],
     ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
-        self.cached_output_batch_stream_factory_with_provider_stats(request, active_aliases, None)
+        self.cached_output_batch_stream_factory_for_write_all(request, active_aliases, None, None)
     }
 
-    pub(crate) fn cached_output_batch_stream_factory_with_provider_stats(
+    /// Builds a cached output stream factory with write-all's optional final
+    /// stats and live file progress tracking.
+    pub(crate) fn cached_output_batch_stream_factory_for_write_all(
         &self,
         request: &OutputWritePlan,
         active_aliases: &[MssqlDerivedCacheAliasPlan],
         provider_stats: Option<SharedProviderReadStats>,
+        reporter: Option<ProgressReporter>,
     ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
         let route = self.cached_output_stream_route(request, active_aliases)?;
         match route {
             MssqlCachedOutputStreamRoute::DirectCachedAlias(_)
             | MssqlCachedOutputStreamRoute::UncachedLazyTable => Ok(self
-                .lazy_table_batch_stream_factory_with_provider_stats(
+                .lazy_table_batch_stream_factory_for_write_all(
                     request.table().clone(),
                     provider_stats,
+                    reporter.map(|reporter| (reporter, request.target().output_name().to_owned())),
                 )),
             MssqlCachedOutputStreamRoute::ReplannedCachedDependency(_) => {
                 let output_name = request.target().output_name().to_owned();
@@ -184,6 +184,7 @@ impl DeltaFunnelSession {
                             sql_text,
                             expected_schema,
                             provider_stats,
+                            reporter,
                         )
                         .await
                     })
@@ -378,7 +379,7 @@ mod tests {
             return Err("expected cache aliases decision".into());
         };
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
@@ -428,7 +429,7 @@ mod tests {
             return Err("expected cache aliases decision".into());
         };
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
@@ -486,7 +487,7 @@ mod tests {
             return Err("expected cache aliases decision".into());
         };
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
@@ -552,10 +553,10 @@ mod tests {
         assert_eq!(caches[0].table_id(), big.id());
         assert_eq!(caches[1].table_id(), names.id());
         let big_replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
         let names_replacement = session
-            .replace_registered_derived_alias_with_cache(&names)
+            .replace_registered_derived_alias_with_cache(&names, None)
             .await?;
         assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
         assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
@@ -613,7 +614,7 @@ mod tests {
             false,
         )]));
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
 
         let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
@@ -667,7 +668,7 @@ mod tests {
             .ok_or("expected pending west table")?;
         pending_west.sql_text.clear();
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big)
+            .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
 
         let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;

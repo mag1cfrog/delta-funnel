@@ -5,7 +5,7 @@
 //! action finishes. Rich chooses terminal or Jupyter rendering.
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -17,9 +17,20 @@ use delta_funnel::progress::{
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use serde_json::Value;
+
+use crate::json::json_value_to_py;
 
 #[cfg(test)]
-static ATTACHMENT_FAILURE_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static ADAPTER_CREATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static ATTACHMENT_FAILURE_COUNTDOWN: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn adapter_creation_count() -> usize {
+    ADAPTER_CREATION_COUNT.get()
+}
 
 const METRIC_RENDER_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -40,6 +51,8 @@ impl PythonProgress {
             Some(true) => ProgressMode::Forced,
             None => ProgressMode::Automatic,
         };
+        #[cfg(test)]
+        ADAPTER_CREATION_COUNT.set(ADAPTER_CREATION_COUNT.get().saturating_add(1));
         let state = Arc::new(Mutex::new(ProgressState::new(mode)));
         let reporter_state = Arc::clone(&state);
         let reporter = ProgressReporter::new(move |event| {
@@ -57,8 +70,14 @@ impl PythonProgress {
     ///
     /// If Rich raised a Python interruption such as `KeyboardInterrupt` during
     /// the action, returns that same exception now. When the Rust action also
-    /// failed, attaches its sanitized Python error for callers to inspect.
-    pub(crate) fn finish(&self, py: Python<'_>, operation_error: Option<&PyErr>) -> PyResult<()> {
+    /// failed, attaches its sanitized Python error for callers to inspect. A
+    /// completed-with-failures action may instead attach its sanitized report.
+    pub(crate) fn finish(
+        &self,
+        py: Python<'_>,
+        operation_error: Option<&PyErr>,
+        operation_report: Option<&Value>,
+    ) -> PyResult<()> {
         // Set the shared state to Done before calling Rich. If Rich calls back
         // into this adapter while stopping, it cannot stop the display twice.
         let mut state = {
@@ -89,6 +108,13 @@ impl PythonProgress {
                     let _ = error
                         .value(py)
                         .setattr("deltafunnel_operation_error", operation_error.value(py));
+                } else if state.final_event == Some(ProgressEventKind::CompletedWithFailures)
+                    && let Some(operation_report) = operation_report
+                    && let Ok(operation_report) = json_value_to_py(py, operation_report)
+                {
+                    let _ = error
+                        .value(py)
+                        .setattr("deltafunnel_operation_report", operation_report.bind(py));
                 }
                 write_interruption_notice(py, status);
                 Err(error)
@@ -201,12 +227,20 @@ impl MetricRenderThrottle {
         self.metrics_waiting_to_render = false;
         true
     }
+
+    /// Returns true when Rust has newer counters that have not been sent to Rich.
+    const fn has_pending_update(&self) -> bool {
+        self.metrics_waiting_to_render
+    }
 }
 
 /// Latest progress values retained even when a display update is throttled.
+#[derive(Clone)]
 struct VisibleProgress {
     phase: Option<ProgressPhase>,
     output_name: Option<String>,
+    output_index: Option<u64>,
+    output_count: Option<u64>,
     files_handled: Option<u64>,
     files_total: Option<u64>,
     files_runtime_pruned: Option<u64>,
@@ -220,6 +254,8 @@ impl VisibleProgress {
         Self {
             phase: None,
             output_name: None,
+            output_index: None,
+            output_count: None,
             files_handled: None,
             files_total: None,
             files_runtime_pruned: None,
@@ -229,13 +265,21 @@ impl VisibleProgress {
         }
     }
 
-    /// Merges one event without discarding file or write values omitted by it.
+    /// Applies an event to the values shown by Rich.
+    ///
+    /// Starting another output, cache operation, restoration, or source report
+    /// clears the previous file and write counters first. Returns true when the
+    /// event changes a numeric counter.
     fn incorporate(&mut self, event: &ProgressEvent) -> bool {
         if let Some(phase) = event.phase() {
+            let output_name = event.output_name().map(str::to_owned);
+            let output_position = event.output_index().zip(event.output_count());
+            if self.scope_changes(event) {
+                self.clear_metrics();
+            }
             self.phase = Some(phase);
-        }
-        if let Some(output_name) = event.output_name() {
-            self.output_name = Some(output_name.to_owned());
+            self.output_name = output_name;
+            (self.output_index, self.output_count) = output_position.unzip();
         }
         let file_progress = match (
             event.files_handled(),
@@ -251,6 +295,35 @@ impl VisibleProgress {
             _ => None,
         };
         self.incorporate_metrics(file_progress, event.rows().zip(event.batches()))
+    }
+
+    /// Returns true when this event must stop using the current counters.
+    ///
+    /// One output keeps its counters while moving from writing to validation.
+    /// Starting another output clears them. Cache work has no output name, so
+    /// starting cache materialization, cache restoration, or source reporting
+    /// also clears them. Every cache materialization starts with empty counters,
+    /// even when the preceding event used the same phase name.
+    fn scope_changes(&self, event: &ProgressEvent) -> bool {
+        let Some(phase) = event.phase() else {
+            return false;
+        };
+        self.output_name.as_deref() != event.output_name()
+            || self.output_index.zip(self.output_count)
+                != event.output_index().zip(event.output_count())
+            || (event.kind() == ProgressEventKind::PhaseChanged
+                && event.output_name().is_none()
+                && (self.phase != Some(phase) || phase == ProgressPhase::MaterializingCache))
+    }
+
+    /// Clears file and write counters so the next work cannot show old values.
+    fn clear_metrics(&mut self) {
+        self.files_handled = None;
+        self.files_total = None;
+        self.files_runtime_pruned = None;
+        self.files_planning_pruned = None;
+        self.rows = None;
+        self.batches = None;
     }
 
     /// Merges monotonic counters and reports whether a visible value changed.
@@ -325,7 +398,10 @@ impl VisibleProgress {
         } else {
             self.phase.map_or("Working", phase_label)
         };
-        let mut description = label.to_owned();
+        let mut description = match self.output_index.zip(self.output_count) {
+            Some((index, count)) => format!("Output {index}/{count} - {label}"),
+            None => label.to_owned(),
+        };
         if let Some(output_name) = &self.output_name {
             description.push_str(": ");
             description.push_str(output_name);
@@ -386,14 +462,9 @@ fn try_python<T>(call: impl for<'py> FnOnce(Python<'py>) -> PyResult<T>) -> Pyth
 
 #[cfg(test)]
 fn attachment_unavailable_for_test() -> bool {
-    matches!(
-        ATTACHMENT_FAILURE_COUNTDOWN.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |remaining| remaining.checked_sub(1),
-        ),
-        Ok(1)
-    )
+    let remaining = ATTACHMENT_FAILURE_COUNTDOWN.get();
+    ATTACHMENT_FAILURE_COUNTDOWN.set(remaining.saturating_sub(1));
+    remaining == 1
 }
 
 /// Returns Rich's value, or saves the first interruption for `finish`.
@@ -410,6 +481,40 @@ fn successful<T>(call: PythonCall<T>, pending_interruption: &mut Option<PyErr>) 
     }
 }
 
+/// Sends the last saved counters to Rich before they are cleared.
+///
+/// Nothing happens when there is no active Rich display or no saved update. If
+/// Rich raises a normal error, later display updates are disabled. If it raises
+/// `KeyboardInterrupt` or another exception that must stop Python, that same
+/// exception is saved and raised after the Rust action ends.
+fn flush_previous_metrics(
+    render: RenderState,
+    previous_visible: Option<&VisibleProgress>,
+    pending_interruption: &mut Option<PyErr>,
+) -> RenderState {
+    match (render, previous_visible) {
+        (
+            RenderState::Active {
+                renderer,
+                updates_enabled: true,
+            },
+            Some(previous_visible),
+        ) => {
+            let description = previous_visible.description(ProgressEventKind::Progress);
+            let updates_enabled = successful(
+                try_python(|py| update_renderer(py, &renderer, &description, previous_visible)),
+                pending_interruption,
+            )
+            .is_some();
+            RenderState::Active {
+                renderer,
+                updates_enabled,
+            }
+        }
+        (render, _) => render,
+    }
+}
+
 /// Handles one Rust progress event and updates Rich when needed.
 fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instant) {
     // Take the state out and release the mutex before calling Rich. Python code
@@ -419,28 +524,42 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let previous_visible = (state.visible.scope_changes(event)
+            && state.metric_throttle.has_pending_update())
+        .then(|| state.visible.clone());
         let visible_metrics_changed = state.visible.incorporate(event);
         if !state
             .metric_throttle
             .should_render(event.kind(), visible_metrics_changed, now)
+            && previous_visible.is_none()
         {
             return;
         }
-        std::mem::replace(&mut *state, ProgressState::busy())
+        (
+            std::mem::replace(&mut *state, ProgressState::busy()),
+            previous_visible,
+        )
     };
 
-    let ProgressState {
-        render,
-        mut pending_interruption,
-        final_event,
-        visible,
-        metric_throttle,
-    } = current;
+    let (
+        ProgressState {
+            render,
+            mut pending_interruption,
+            final_event,
+            visible,
+            metric_throttle,
+        },
+        previous_visible,
+    ) = current;
     let final_event = if ends_action(event.kind()) {
         Some(event.kind())
     } else {
         final_event
     };
+    // Show the last throttled counters before replacing their output or plan
+    // scope with the phase carried by the current event.
+    let render =
+        flush_previous_metrics(render, previous_visible.as_ref(), &mut pending_interruption);
     let render = match render {
         // Wait for Started before importing Rich. Requests rejected before the
         // action begins should not perform any progress-related Python work.
@@ -610,13 +729,20 @@ fn update_renderer(
 ) -> PyResult<()> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("description", description)?;
-    if let (Some(handled), Some(total)) = (visible.files_handled, visible.files_total) {
-        kwargs.set_item("completed", handled)?;
-        kwargs.set_item("total", total)?;
+    match (visible.files_handled, visible.files_total) {
+        (Some(handled), Some(total)) => {
+            kwargs.set_item("completed", handled)?;
+            kwargs.set_item("total", total)?;
+        }
+        _ => {
+            kwargs.set_item("completed", 0)?;
+            kwargs.set_item("total", py.None())?;
+        }
     }
-    if let Some(file_progress) = visible.file_progress_text() {
-        kwargs.set_item("file_progress", file_progress)?;
-    }
+    kwargs.set_item(
+        "file_progress",
+        visible.file_progress_text().unwrap_or_default(),
+    )?;
     kwargs.set_item("refresh", true)?;
     renderer
         .progress
@@ -684,6 +810,8 @@ const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
     match operation {
         Some(ProgressOperation::WriteToMssql) => "Writing to SQL Server",
         Some(ProgressOperation::DryRunToMssql) => "Planning SQL Server write",
+        Some(ProgressOperation::WriteAllToMssql) => "Writing outputs to SQL Server",
+        Some(ProgressOperation::DryRunAllToMssql) => "Planning SQL Server outputs",
         _ => "Running SQL Server action",
     }
 }
@@ -693,12 +821,15 @@ const fn phase_label(phase: ProgressPhase) -> &'static str {
     match phase {
         ProgressPhase::PlanningOutput => "Planning output",
         ProgressPhase::SettingUpStream => "Preparing data stream",
+        ProgressPhase::MaterializingCache => "Caching shared data",
+        ProgressPhase::RestoringCache => "Restoring shared cache",
         ProgressPhase::Connecting => "Connecting to SQL Server",
         ProgressPhase::PreparingTarget => "Preparing target table",
         ProgressPhase::Writing => "Writing to SQL Server",
         ProgressPhase::Validating => "Validating write",
         ProgressPhase::SwappingTarget => "Swapping target table",
         ProgressPhase::CleaningUp => "Cleaning up",
+        ProgressPhase::ReportingSources => "Preparing source reports",
         _ => "Working",
     }
 }
@@ -716,11 +847,15 @@ const fn terminal_label(kind: ProgressEventKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        thread,
+    };
 
     use pyo3::exceptions::{PyGeneratorExit, PyKeyboardInterrupt, PyRuntimeError, PySystemExit};
     use pyo3::ffi::c_str;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
+    use serde_json::json;
 
     use super::*;
     use crate::{deltafunnel, test_support::python_state};
@@ -740,14 +875,14 @@ mod tests {
 
     impl AttachmentFailureGuard {
         fn fail_on_call(call: usize) -> Self {
-            ATTACHMENT_FAILURE_COUNTDOWN.store(call, Ordering::Relaxed);
+            ATTACHMENT_FAILURE_COUNTDOWN.set(call);
             Self
         }
     }
 
     impl Drop for AttachmentFailureGuard {
         fn drop(&mut self) {
-            ATTACHMENT_FAILURE_COUNTDOWN.store(0, Ordering::Relaxed);
+            ATTACHMENT_FAILURE_COUNTDOWN.set(0);
         }
     }
 
@@ -850,9 +985,18 @@ mod tests {
                 c_str!(
                     r#"
 import sys
+import threading
 import types
 
+owner_thread = threading.get_ident()
+
+def record(value):
+    if threading.get_ident() == owner_thread:
+        records.append(value)
+
 def maybe_fail(call):
+    if threading.get_ident() != owner_thread:
+        return
     if fail_call == call:
         raise failure
     if stop_also_interrupts and call == "stop":
@@ -860,14 +1004,14 @@ def maybe_fail(call):
 
 class Console:
     def __init__(self, **kwargs):
-        records.append({"call": "console", **kwargs})
+        record({"call": "console", **kwargs})
         maybe_fail("console")
         self.is_interactive = interactive or kwargs.get("force_interactive", False)
         self.is_jupyter = jupyter
 
 class Progress:
     def __init__(self, *columns, **kwargs):
-        records.append({
+        record({
             "call": "progress",
             "columns": len(columns),
             "auto_refresh": kwargs.get("auto_refresh"),
@@ -878,16 +1022,16 @@ class Progress:
         maybe_fail("progress")
 
     def add_task(self, description, **kwargs):
-        records.append({"call": "add_task", "description": description, "total": kwargs.get("total")})
+        record({"call": "add_task", "description": description, "total": kwargs.get("total")})
         maybe_fail("add_task")
         return 7
 
     def start(self):
-        records.append({"call": "start"})
+        record({"call": "start"})
         maybe_fail("start")
 
     def update(self, task_id, **kwargs):
-        records.append({"call": "update", "task_id": task_id, **kwargs})
+        record({"call": "update", "task_id": task_id, **kwargs})
         description = kwargs.get("description", "")
         terminal = any(description.startswith(label) for label in (
             "Completed", "Completed with failures", "Failed", "Cancelled"
@@ -895,7 +1039,7 @@ class Progress:
         maybe_fail("terminal" if terminal else "update")
 
     def stop(self):
-        records.append({"call": "stop"})
+        record({"call": "stop"})
         maybe_fail("stop")
 
 rich = types.ModuleType("rich")
@@ -1128,6 +1272,52 @@ sys.modules["rich.progress"] = progress_module
         })
     }
 
+    #[test]
+    fn pending_metrics_are_flushed_before_their_scope_is_replaced() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            let progress = py.import("rich.progress")?.getattr("Progress")?.call0()?;
+            let task_id = progress.call_method1("add_task", ("Starting",))?;
+            let render = RenderState::Active {
+                renderer: RichRenderer {
+                    progress: progress.unbind(),
+                    task_id: task_id.unbind(),
+                },
+                updates_enabled: true,
+            };
+            let mut visible = VisibleProgress::new();
+            visible.phase = Some(ProgressPhase::Writing);
+            visible.output_name = Some("orders".to_owned());
+            visible.output_index = Some(1);
+            visible.output_count = Some(2);
+            visible.incorporate_metrics(Some((8, 10, 3, Some(90))), Some((1_250, 4)));
+            let mut interruption = None;
+
+            let render = flush_previous_metrics(render, Some(&visible), &mut interruption);
+
+            assert!(matches!(
+                render,
+                RenderState::Active {
+                    updates_enabled: true,
+                    ..
+                }
+            ));
+            assert!(interruption.is_none());
+            let update = records.bind(py).get_item(2)?.cast_into::<PyDict>()?;
+            assert_eq!(
+                update
+                    .get_item("description")?
+                    .unwrap()
+                    .extract::<String>()?,
+                "Output 1/2 - Writing to SQL Server: orders - 1.25K rows, 4 batches"
+            );
+            assert_eq!(update.get_item("completed")?.unwrap().extract::<u64>()?, 8);
+            assert_eq!(update.get_item("total")?.unwrap().extract::<u64>()?, 10);
+            Ok(())
+        })
+    }
+
     fn dry_run(py: Python<'_>, progress: Option<Option<bool>>) -> PyResult<()> {
         let module = PyModule::new(py, "deltafunnel")?;
         deltafunnel(&module)?;
@@ -1149,6 +1339,39 @@ sys.modules["rich.progress"] = progress_module
         Ok(())
     }
 
+    fn dry_run_all(
+        py: Python<'_>,
+        output_names: &[&str],
+        progress: Option<Option<bool>>,
+    ) -> PyResult<()> {
+        let module = PyModule::new(py, "deltafunnel")?;
+        deltafunnel(&module)?;
+        let session_kwargs = PyDict::new(py);
+        session_kwargs.set_item(
+            "default_mssql_connection_string",
+            "server=tcp:sql.example.com;password=secret-token",
+        )?;
+        let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+        let outputs = output_names
+            .iter()
+            .map(|output_name| {
+                let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("schema", "dbo")?;
+                kwargs.set_item("table", output_name)?;
+                kwargs.set_item("load_mode", "create_and_load")?;
+                table.call_method("to_mssql", (), Some(&kwargs))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("dry_run", true)?;
+        if let Some(progress) = progress {
+            kwargs.set_item("progress", progress)?;
+        }
+        session.call_method("write_all", (PyList::new(py, outputs)?,), Some(&kwargs))?;
+        Ok(())
+    }
+
     fn execute_without_connection(py: Python<'_>) -> PyResult<()> {
         let module = PyModule::new(py, "deltafunnel")?;
         deltafunnel(&module)?;
@@ -1160,6 +1383,22 @@ sys.modules["rich.progress"] = progress_module
         kwargs.set_item("load_mode", "append_existing")?;
         kwargs.set_item("progress", true)?;
         table.call_method("write_to_mssql", (), Some(&kwargs))?;
+        Ok(())
+    }
+
+    fn execute_all_without_connection(py: Python<'_>) -> PyResult<()> {
+        let module = PyModule::new(py, "deltafunnel")?;
+        deltafunnel(&module)?;
+        let session = module.getattr("Session")?.call0()?;
+        let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+        let output_kwargs = PyDict::new(py);
+        output_kwargs.set_item("schema", "dbo")?;
+        output_kwargs.set_item("table", "orders")?;
+        output_kwargs.set_item("load_mode", "append_existing")?;
+        let output = table.call_method("to_mssql", (), Some(&output_kwargs))?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("progress", true)?;
+        session.call_method("write_all", (PyList::new(py, [output])?,), Some(&kwargs))?;
         Ok(())
     }
 
@@ -1221,6 +1460,29 @@ sys.modules["rich.progress"] = progress_module
         // that python_state recovers the lock instead of failing later tests.
         let _state = python_state();
         Python::attach(|py| assert_modules_match(py, &baseline))
+    }
+
+    #[test]
+    fn fake_rich_failures_do_not_escape_to_other_threads() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, _failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("console"), true, true)?;
+
+            let worker = thread::spawn(|| {
+                Python::attach(|py| {
+                    py.import("rich.console")?.getattr("Console")?.call0()?;
+                    Ok::<_, PyErr>(())
+                })
+            });
+            let result = py
+                .detach(|| worker.join())
+                .map_err(|_| PyRuntimeError::new_err("fake Rich thread panicked"))?;
+
+            result?;
+            assert!(records.bind(py).is_empty());
+            Ok(())
+        })
     }
 
     #[test]
@@ -1298,6 +1560,131 @@ sys.modules["rich.progress"] = progress_module
                     .get_item("description")?
                     .extract::<String>()?,
                 "Failed: orders"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_execute_failure_uses_one_failed_rich_lifecycle() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+
+            let error = execute_all_without_connection(py).unwrap_err();
+
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "missing_mssql_connection"
+            );
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "progress", "add_task", "start", "update", "update", "stop"
+                ]
+            );
+            assert_eq!(
+                records
+                    .bind(py)
+                    .get_item(4)?
+                    .get_item("description")?
+                    .extract::<String>()?,
+                "Output 1/1 - Planning output: orders"
+            );
+            assert_eq!(
+                records
+                    .bind(py)
+                    .get_item(5)?
+                    .get_item("description")?
+                    .extract::<String>()?,
+                "Output 1/1 - Failed: orders"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_uses_one_task_and_clears_output_scope_before_completion() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+
+            dry_run_all(py, &["west", "east"], Some(Some(true)))?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "progress", "add_task", "start", "update", "update", "update",
+                    "update", "stop"
+                ]
+            );
+            let descriptions = records
+                .bind(py)
+                .iter()
+                .filter_map(|record| {
+                    (record.get_item("call").ok()?.extract::<String>().ok()? == "update")
+                        .then(|| {
+                            record
+                                .get_item("description")
+                                .ok()?
+                                .extract::<String>()
+                                .ok()
+                        })
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                descriptions,
+                [
+                    "Output 1/2 - Planning output: west",
+                    "Output 2/2 - Planning output: east",
+                    "Preparing source reports",
+                    "Completed",
+                ]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn duplicate_write_all_outputs_fail_before_rich_starts() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+
+            let error = dry_run_all(py, &["orders", "orders"], Some(Some(true))).unwrap_err();
+
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "mssql_workflow_planning"
+            );
+            assert!(records.bind(py).is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_uses_the_shared_automatic_forced_and_disabled_modes() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, false, false)?;
+
+            dry_run_all(py, &["orders"], None)?;
+            dry_run_all(py, &["orders"], Some(None))?;
+            dry_run_all(py, &["orders"], Some(Some(false)))?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                ["console", "console"]
+            );
+
+            dry_run_all(py, &["orders"], Some(Some(true)))?;
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "console", "console", "progress", "add_task", "start", "update",
+                    "update", "update", "stop"
+                ]
             );
             Ok(())
         })
@@ -1675,6 +2062,66 @@ sys.modules["rich.progress"] = progress_module
     }
 
     #[test]
+    fn completed_with_failures_interruption_carries_the_operation_report() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let progress = PythonProgress::new(Some(true))
+                .ok_or_else(|| PyRuntimeError::new_err("progress should be enabled"))?;
+            let interruption = PyKeyboardInterrupt::new_err("renderer interrupted");
+            let interruption_object = interruption.value(py).clone().unbind();
+            {
+                let mut state = match progress.state.lock() {
+                    Ok(state) => state,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                state.pending_interruption = Some(interruption);
+                state.final_event = Some(ProgressEventKind::CompletedWithFailures);
+            }
+            let (_stderr, _capture) = StderrGuard::capture(py)?;
+            let report = json!({
+                "all_succeeded": false,
+                "failed_count": 1,
+                "skipped_count": 1,
+            });
+
+            let error = progress.finish(py, None, Some(&report)).unwrap_err();
+
+            assert!(error.value(py).is(interruption_object.bind(py)));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "completed_with_failures"
+            );
+            let attached = error
+                .value(py)
+                .getattr("deltafunnel_operation_report")?
+                .cast_into::<PyDict>()?;
+            assert!(
+                !attached
+                    .get_item("all_succeeded")?
+                    .unwrap()
+                    .extract::<bool>()?
+            );
+            assert_eq!(
+                attached
+                    .get_item("failed_count")?
+                    .unwrap()
+                    .extract::<u64>()?,
+                1
+            );
+            assert!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_error")
+                    .is_err()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn ordinary_stop_failure_does_not_replace_the_report_or_retry() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
@@ -1969,6 +2416,14 @@ stream = HostileStderr()
             "Preparing data stream"
         );
         assert_eq!(
+            phase_label(ProgressPhase::MaterializingCache),
+            "Caching shared data"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::RestoringCache),
+            "Restoring shared cache"
+        );
+        assert_eq!(
             phase_label(ProgressPhase::Connecting),
             "Connecting to SQL Server"
         );
@@ -1983,5 +2438,29 @@ stream = HostileStderr()
             "Swapping target table"
         );
         assert_eq!(phase_label(ProgressPhase::CleaningUp), "Cleaning up");
+        assert_eq!(
+            phase_label(ProgressPhase::ReportingSources),
+            "Preparing source reports"
+        );
+    }
+
+    #[test]
+    fn all_core_operations_have_curated_labels() {
+        assert_eq!(
+            operation_label(Some(ProgressOperation::WriteToMssql)),
+            "Writing to SQL Server"
+        );
+        assert_eq!(
+            operation_label(Some(ProgressOperation::DryRunToMssql)),
+            "Planning SQL Server write"
+        );
+        assert_eq!(
+            operation_label(Some(ProgressOperation::WriteAllToMssql)),
+            "Writing outputs to SQL Server"
+        );
+        assert_eq!(
+            operation_label(Some(ProgressOperation::DryRunAllToMssql)),
+            "Planning SQL Server outputs"
+        );
     }
 }

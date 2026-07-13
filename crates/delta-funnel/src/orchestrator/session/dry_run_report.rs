@@ -1,10 +1,10 @@
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, observability,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
-    report::PhaseTimer,
     report::sql_server::{
         MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport,
     },
+    report::{PhaseTimer, usize_to_u64_saturating},
 };
 
 use super::{
@@ -88,9 +88,55 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        validate_dry_run_all_requests(requests)?;
+        self.build_dry_run_all_report(requests, None)
+    }
+
+    /// Builds the same report as [`Self::dry_run_all_to_mssql`] while emitting
+    /// live progress events.
+    ///
+    /// Progress events describe the work currently being performed. The
+    /// returned report contains the final planned outputs and source summary.
+    /// Invalid requests fail before progress starts, and empty requests emit no
+    /// progress events.
+    pub(crate) fn dry_run_all_to_mssql_with_progress(
+        &self,
+        requests: &[OutputWritePlan],
+        reporter: ProgressReporter,
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        validate_dry_run_all_requests(requests)?;
+        if requests.is_empty() {
+            return self.build_dry_run_all_report(requests, None);
+        }
+
+        reporter.emit(&ProgressEvent::started(ProgressOperation::DryRunAllToMssql));
+        let result = self.build_dry_run_all_report(requests, Some(&reporter));
+        reporter.emit(&if result.is_ok() {
+            ProgressEvent::completed()
+        } else {
+            ProgressEvent::failed()
+        });
+        result
+    }
+
+    /// Builds the final report from the planned outputs and their sources.
+    ///
+    /// When provided, the reporter announces phase changes while the report is
+    /// built. It does not change the report contents or planning behavior.
+    fn build_dry_run_all_report(
+        &self,
+        requests: &[OutputWritePlan],
+        reporter: Option<&ProgressReporter>,
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
         let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
-        let outputs = self.plan_dry_run_all_outputs(requests)?;
+        let outputs = self.plan_dry_run_outputs(requests, reporter)?;
         let planning_timing = planning_timer.completed();
+        if let Some(reporter) = reporter {
+            reporter.emit(&ProgressEvent::phase_changed(
+                ProgressPhase::ReportingSources,
+                None,
+            ));
+        }
         let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
         let sources = self.source_reports_for_dry_run_outputs(&outputs)?;
         let source_timing = source_timer.completed();
@@ -182,13 +228,37 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<Vec<MssqlDryRunOutputReport>, DeltaFunnelError> {
-        ensure_unique_write_all_output_names(requests)?;
+        validate_dry_run_all_requests(requests)?;
+        self.plan_dry_run_outputs(requests, None)
+    }
+
+    /// Plans each requested output in caller-provided order.
+    ///
+    /// When provided, the reporter announces each output and its position
+    /// before that output is planned.
+    fn plan_dry_run_outputs(
+        &self,
+        requests: &[OutputWritePlan],
+        reporter: Option<&ProgressReporter>,
+    ) -> Result<Vec<MssqlDryRunOutputReport>, DeltaFunnelError> {
+        let output_count = usize_to_u64_saturating(requests.len());
 
         requests
             .iter()
-            .map(|request| {
-                ensure_write_all_dry_run_mode(request.target().run_mode())?;
-
+            .enumerate()
+            .map(|(output_index, request)| {
+                if let Some(reporter) = reporter
+                    && let Some(event) = ProgressEvent::phase_changed(
+                        ProgressPhase::PlanningOutput,
+                        Some(request.target().output_name()),
+                    )
+                    .with_output_position(
+                        usize_to_u64_saturating(output_index.saturating_add(1)),
+                        output_count,
+                    )
+                {
+                    reporter.emit(&event);
+                }
                 self.plan_dry_run_output(request)
             })
             .collect()
@@ -326,6 +396,14 @@ fn ensure_write_all_dry_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelErr
                 .to_owned(),
         }),
     }
+}
+
+fn validate_dry_run_all_requests(requests: &[OutputWritePlan]) -> Result<(), DeltaFunnelError> {
+    ensure_unique_write_all_output_names(requests)?;
+    for request in requests {
+        ensure_write_all_dry_run_mode(request.target().run_mode())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -567,8 +645,24 @@ mod tests {
         let west_table_name = west.name().to_owned();
         let west = output_request(west, "west_output", "west_orders", LoadMode::CreateAndLoad)?;
         let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            let mut events = match callback_events.lock() {
+                Ok(events) => events,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            events.push((
+                event.kind(),
+                event.operation(),
+                event.phase(),
+                event.output_name().map(str::to_owned),
+                event.output_index(),
+                event.output_count(),
+            ));
+        });
 
-        let report = session.dry_run_all_to_mssql(&[west, east])?;
+        let report = session.dry_run_all_to_mssql_with_progress(&[west, east], reporter)?;
 
         assert_eq!(report.run_mode(), RunMode::DryRun);
         assert_eq!(report.status(), WorkflowStatus::success());
@@ -623,6 +717,60 @@ mod tests {
             assert!(timing.elapsed_micros().is_some());
         }
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        let events = match events.lock() {
+            Ok(events) => events,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(
+            events.as_slice(),
+            [
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::DryRunAllToMssql),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PlanningOutput),
+                    Some("west_output".to_owned()),
+                    Some(1),
+                    Some(2),
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PlanningOutput),
+                    Some("east_output".to_owned()),
+                    Some(2),
+                    Some(2),
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::ReportingSources),
+                    None,
+                    None,
+                    None,
+                ),
+                (ProgressEventKind::Completed, None, None, None, None, None,),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_dry_run_all_emits_no_progress() -> Result<(), Box<dyn std::error::Error>> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (reporter, events) = recording_reporter();
+
+        let report = session.dry_run_all_to_mssql_with_progress(&[], reporter)?;
+
+        assert!(report.is_empty());
+        assert!(progress_events(&events).is_empty());
         Ok(())
     }
 
@@ -817,7 +965,9 @@ mod tests {
             LoadMode::AppendExisting,
         )?;
 
-        let error = session.dry_run_all_to_mssql(&[request]);
+        let (reporter, events) = recording_reporter();
+
+        let error = session.dry_run_all_to_mssql_with_progress(&[request], reporter);
 
         assert!(matches!(
             error,
@@ -825,6 +975,7 @@ mod tests {
                 if message.contains("dry_run_all_to_mssql requires RunMode::DryRun")
         ));
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        assert!(progress_events(&events).is_empty());
         Ok(())
     }
 
@@ -846,7 +997,9 @@ mod tests {
             LoadMode::AppendExisting,
         )?;
 
-        let error = session.dry_run_all_to_mssql(&[request]);
+        let (reporter, events) = recording_reporter();
+
+        let error = session.dry_run_all_to_mssql_with_progress(&[request], reporter);
 
         assert!(matches!(
             error,
@@ -854,6 +1007,22 @@ mod tests {
                 if output_name == "orders_output"
         ));
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            progress_events(&events),
+            vec![
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::DryRunAllToMssql),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PlanningOutput),
+                ),
+                (ProgressEventKind::Failed, None, None),
+            ]
+        );
         Ok(())
     }
 
@@ -878,7 +1047,9 @@ mod tests {
             LoadMode::AppendExisting,
         )?;
 
-        let error = session.dry_run_all_to_mssql(&[west, east]);
+        let (reporter, events) = recording_reporter();
+
+        let error = session.dry_run_all_to_mssql_with_progress(&[west, east], reporter);
 
         assert!(matches!(
             error,
@@ -886,6 +1057,7 @@ mod tests {
                 if message.contains("write_all output names must be unique")
                     && message.contains("orders_output")
         ));
+        assert!(progress_events(&events).is_empty());
         Ok(())
     }
 

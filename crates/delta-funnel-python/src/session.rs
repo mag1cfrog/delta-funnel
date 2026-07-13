@@ -115,14 +115,17 @@ impl PySession {
     ///
     /// Pass `dry_run=True` to plan without writing. Execute calls accept
     /// `options={"cache_mode": "auto"}` or `options={"cache_mode": "disabled"}`.
-    /// Returns a plain Python `dict` report.
-    #[pyo3(signature = (outputs, *, options=None, dry_run=None))]
+    /// Returns a plain Python `dict` report. One consolidated progress display
+    /// follows output planning, shared cache work, and sequential writes. Pass
+    /// `progress=False` to disable it for this call.
+    #[pyo3(signature = (outputs, *, options=None, dry_run=None, progress=None))]
     fn write_all(
         slf: Py<Self>,
         py: Python<'_>,
         outputs: Vec<PyRef<'_, PyMssqlOutputSpec>>,
         options: Option<&Bound<'_, PyDict>>,
         dry_run: Option<bool>,
+        progress: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
         for output in &outputs {
             if !output.belongs_to_session(py, &slf) {
@@ -152,11 +155,24 @@ impl PySession {
                     "`options` is only supported for execute `write_all` calls".to_owned(),
                 ));
             }
-            return slf.borrow(py).dry_run_all_to_mssql(py, &requests);
+            if requests.is_empty() {
+                return slf.borrow(py).dry_run_all_to_mssql(py, &requests, None);
+            }
+            let progress = PythonProgress::new(progress);
+            return slf
+                .borrow(py)
+                .dry_run_all_to_mssql(py, &requests, progress.as_ref());
         }
 
         let options = parse_write_all_options(py, options)?;
-        slf.borrow(py).execute_write_all(py, &requests, options)
+        if requests.is_empty() {
+            return slf
+                .borrow(py)
+                .execute_write_all(py, &requests, options, None);
+        }
+        let progress = PythonProgress::new(progress);
+        slf.borrow(py)
+            .execute_write_all(py, &requests, options, progress.as_ref())
     }
 }
 
@@ -205,50 +221,51 @@ impl PySession {
         request: &delta_funnel::OutputWritePlan,
         progress: Option<&PythonProgress>,
     ) -> PyResult<Py<PyAny>> {
-        let report = progress.map_or_else(
-            || self.runtime.dry_run_to_mssql(&self.inner, request),
-            |progress| {
-                self.runtime.dry_run_to_mssql_with_progress(
-                    &self.inner,
-                    request,
-                    progress.reporter(),
-                )
-            },
-        );
+        let report = match progress {
+            Some(progress) => self.runtime.dry_run_to_mssql_with_progress(
+                &self.inner,
+                request,
+                progress.reporter(),
+            ),
+            None => self.runtime.dry_run_to_mssql(&self.inner, request),
+        };
         let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
-            progress.finish(py, report.as_ref().err())?;
+            progress.finish(py, report.as_ref().err(), None)?;
         }
         let report = report?;
         json_value_to_py(py, &report.to_json_value())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the GIL-detached call carries the core error until Python conversion resumes"
+    )]
     pub(crate) fn write_to_mssql(
         &self,
         py: Python<'_>,
         request: &delta_funnel::OutputWritePlan,
         progress: Option<&PythonProgress>,
     ) -> PyResult<Py<PyAny>> {
-        let report = py.detach(|| {
-            progress.map_or_else(
-                || self.runtime.write_to_mssql(&self.inner, request),
-                |progress| {
-                    self.runtime.write_to_mssql_with_progress(
-                        &self.inner,
-                        request,
-                        progress.reporter(),
-                    )
-                },
-            )
+        let report = py.detach(|| match progress {
+            Some(progress) => {
+                self.runtime
+                    .write_to_mssql_with_progress(&self.inner, request, progress.reporter())
+            }
+            None => self.runtime.write_to_mssql(&self.inner, request),
         });
         let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
-            progress.finish(py, report.as_ref().err())?;
+            progress.finish(py, report.as_ref().err(), None)?;
         }
         let report = report?;
         json_value_to_py(py, &report.to_json_value())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the GIL-detached call carries the core error until Python conversion resumes"
+    )]
     pub(crate) fn preview_table(
         &self,
         py: Python<'_>,
@@ -263,26 +280,56 @@ impl PySession {
         &self,
         py: Python<'_>,
         requests: &[delta_funnel::OutputWritePlan],
+        progress: Option<&PythonProgress>,
     ) -> PyResult<Py<PyAny>> {
-        let report = self
-            .runtime
-            .dry_run_all_to_mssql(&self.inner, requests)
-            .map_err(|error| rust_error_to_py(py, error))?;
+        let report = match progress {
+            Some(progress) => self.runtime.dry_run_all_to_mssql_with_progress(
+                &self.inner,
+                requests,
+                progress.reporter(),
+            ),
+            None => self.runtime.dry_run_all_to_mssql(&self.inner, requests),
+        };
+        let report = report.map_err(|error| rust_error_to_py(py, error));
+        if let Some(progress) = progress {
+            progress.finish(py, report.as_ref().err(), None)?;
+        }
+        let report = report?;
         json_value_to_py(py, &report.to_json_value())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the GIL-detached call carries the core error until Python conversion resumes"
+    )]
     fn execute_write_all(
         &self,
         py: Python<'_>,
         requests: &[delta_funnel::OutputWritePlan],
         options: delta_funnel::WriteAllOptions,
+        progress: Option<&PythonProgress>,
     ) -> PyResult<Py<PyAny>> {
-        let report = py
-            .detach(|| {
-                self.runtime
-                    .write_all_with_options(&self.inner, requests, options)
-            })
-            .map_err(|error| rust_error_to_py(py, error))?;
+        let report = py.detach(|| match progress {
+            Some(progress) => self.runtime.write_all_with_progress(
+                &self.inner,
+                requests,
+                options,
+                progress.reporter(),
+            ),
+            None => self
+                .runtime
+                .write_all_with_options(&self.inner, requests, options),
+        });
+        let report = report.map_err(|error| rust_error_to_py(py, error));
+        if let Some(progress) = progress {
+            let operation_report = report
+                .as_ref()
+                .ok()
+                .filter(|report| !report.all_succeeded())
+                .map(delta_funnel::WriteAllReport::to_json_value);
+            progress.finish(py, report.as_ref().err(), operation_report.as_ref())?;
+        }
+        let report = report?;
         json_value_to_py(py, &report.to_json_value())
     }
 }
@@ -984,6 +1031,7 @@ fn source_config_py_error(py: Python<'_>, kind: &'static str, message: String) -
 mod tests {
     use super::{PySession, parse_storage_options};
     use crate::deltafunnel;
+    use crate::progress::adapter_creation_count;
     use delta_funnel::{
         DeltaProviderScanExecutionOptions, DryRunScanSummaryMode, MssqlBinaryPolicy,
         MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy, MssqlFloatPolicy,
@@ -1594,6 +1642,47 @@ mod tests {
     }
 
     #[test]
+    fn empty_write_all_validates_progress_without_creating_an_adapter() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let outputs = PyList::empty(py);
+            let initial_count = adapter_creation_count();
+
+            for dry_run in [false, true] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("dry_run", dry_run)?;
+                kwargs.set_item("progress", true)?;
+                session.call_method("write_all", (&outputs,), Some(&kwargs))?;
+            }
+            assert_eq!(adapter_creation_count(), initial_count);
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", "always")?;
+            let error = session
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyTypeError>(py));
+            assert_eq!(adapter_creation_count(), initial_count);
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("dry_run", true)?;
+            kwargs.set_item("progress", true)?;
+            kwargs.set_item("options", PyDict::new(py))?;
+            let error = session
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .unwrap_err();
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+            assert_eq!(adapter_creation_count(), initial_count);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn table_alias_preserves_alias_validation_errors() -> PyResult<()> {
         Python::attach(|py| {
             let table = DeltaLogFixture::new("orders")?;
@@ -2008,6 +2097,7 @@ union all select cast(302 as bigint) as order_id",),
             options.set_item("cache_mode", "disabled")?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("options", options)?;
+            kwargs.set_item("progress", true)?;
             kwargs.set_item("dry_run", false)?;
 
             let report = session.call_method("write_all", (outputs,), Some(&kwargs))?;
@@ -2326,6 +2416,7 @@ union all select cast(902 as bigint) as order_id",),
     #[test]
     fn write_all_rejects_bad_options_with_config_phase() -> PyResult<()> {
         Python::attach(|py| {
+            let initial_adapter_count = adapter_creation_count();
             let session = Py::new(
                 py,
                 PySession::new(
@@ -2348,6 +2439,7 @@ union all select cast(902 as bigint) as order_id",),
             options.set_item("bogus", "disabled")?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("options", options)?;
+            kwargs.set_item("progress", true)?;
             let outputs = PyList::new(py, [&spec])?;
             let error = session
                 .bind(py)
@@ -2371,12 +2463,15 @@ union all select cast(902 as bigint) as order_id",),
             let kwargs = PyDict::new(py);
             kwargs.set_item("options", options)?;
             kwargs.set_item("dry_run", true)?;
+            kwargs.set_item("progress", true)?;
             let outputs = PyList::new(py, [&spec])?;
             let error = session
                 .bind(py)
                 .call_method("write_all", (outputs,), Some(&kwargs))
                 .unwrap_err();
             assert_config_error(py, &error, "invalid_option_value")?;
+
+            assert_eq!(adapter_creation_count(), initial_adapter_count);
 
             Ok(())
         })
@@ -2385,6 +2480,7 @@ union all select cast(902 as bigint) as order_id",),
     #[test]
     fn write_all_rejects_output_specs_from_another_session() -> PyResult<()> {
         Python::attach(|py| {
+            let initial_adapter_count = adapter_creation_count();
             let first_session =
                 Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
             let second_session =
@@ -2397,6 +2493,7 @@ union all select cast(902 as bigint) as order_id",),
             let outputs = PyList::new(py, [&spec])?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("dry_run", true)?;
+            kwargs.set_item("progress", true)?;
 
             let error = second_session
                 .bind(py)
@@ -2411,6 +2508,7 @@ union all select cast(902 as bigint) as order_id",),
                 error.value(py).getattr("kind")?.extract::<String>()?,
                 "output_session_mismatch"
             );
+            assert_eq!(adapter_creation_count(), initial_adapter_count);
 
             Ok(())
         })

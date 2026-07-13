@@ -3,8 +3,10 @@ use std::{collections::BTreeSet, sync::Arc};
 use crate::{
     DeltaFunnelError, MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter,
     PhaseTimingReport, ReportReasonCode, observability,
+    progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::{PhaseTimer, sql_server::WriteAllReport},
     support::sanitize_text_for_display,
+    usize_to_u64_saturating,
 };
 
 use super::super::super::{
@@ -28,12 +30,33 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<Vec<PlannedMssqlOutput>, DeltaFunnelError> {
-        ensure_unique_write_all_output_names(requests)?;
+        validate_write_all_requests(requests)?;
+        self.plan_write_outputs(requests, None)
+    }
+
+    fn plan_write_outputs(
+        &self,
+        requests: &[OutputWritePlan],
+        reporter: Option<&ProgressReporter>,
+    ) -> Result<Vec<PlannedMssqlOutput>, DeltaFunnelError> {
+        let output_count = usize_to_u64_saturating(requests.len());
 
         requests
             .iter()
-            .map(|request| {
-                ensure_write_all_execute_run_mode(request.target().run_mode())?;
+            .enumerate()
+            .map(|(output_index, request)| {
+                if let Some(reporter) = reporter
+                    && let Some(event) = ProgressEvent::phase_changed(
+                        ProgressPhase::PlanningOutput,
+                        Some(request.target().output_name()),
+                    )
+                    .with_output_position(
+                        usize_to_u64_saturating(output_index.saturating_add(1)),
+                        output_count,
+                    )
+                {
+                    reporter.emit(&event);
+                }
                 self.plan_mssql_output(request)
             })
             .collect()
@@ -49,14 +72,35 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
+        validate_write_all_requests(requests)?;
+        self.build_write_all_report(requests, options, writer, None)
+            .await
+    }
+
+    async fn build_write_all_report<W>(
+        &self,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+        writer: W,
+        reporter: Option<&ProgressReporter>,
+    ) -> Result<WriteAllReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
         let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
-        let planned_outputs = self.plan_write_all_outputs(requests)?;
+        let planned_outputs = self.plan_write_outputs(requests, reporter)?;
         let phase_timings = vec![planning_timer.completed()];
 
         match options.cache_mode() {
             WriteAllCacheMode::Auto => {
-                self.write_all_auto_with_writer(requests, &planned_outputs, writer, phase_timings)
-                    .await
+                self.write_all_auto_with_writer(
+                    requests,
+                    &planned_outputs,
+                    writer,
+                    phase_timings,
+                    reporter,
+                )
+                .await
             }
             WriteAllCacheMode::Disabled => {
                 let mut phase_timings = phase_timings;
@@ -67,13 +111,20 @@ impl DeltaFunnelSession {
                 let provider_stats = shared_provider_read_stats();
                 let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
-                    .write_all_baseline_with_writer_and_provider_stats(
+                    .write_all_baseline_with_writer(
                         &planned_outputs,
                         writer,
                         Some(Arc::clone(&provider_stats)),
+                        reporter,
                     )
                     .await?;
                 phase_timings.push(workflow_timer.completed());
+                if let Some(reporter) = reporter {
+                    reporter.emit(&ProgressEvent::phase_changed(
+                        ProgressPhase::ReportingSources,
+                        None,
+                    ));
+                }
                 let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     &planned_outputs,
@@ -110,6 +161,42 @@ impl DeltaFunnelSession {
         .await
     }
 
+    /// Runs the multi-output write while emitting one top-level progress
+    /// lifecycle.
+    ///
+    /// Progress describes work while it is happening. The returned report
+    /// contains the final per-output results. A report containing failed or
+    /// skipped outputs is still returned successfully and ends with a
+    /// completed-with-failures progress event.
+    pub(crate) async fn write_all_with_progress_and_writer<W>(
+        &self,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+        reporter: ProgressReporter,
+        writer: W,
+    ) -> Result<WriteAllReport, DeltaFunnelError>
+    where
+        W: MssqlWorkflowOutputWriter,
+    {
+        validate_write_all_requests(requests)?;
+        if requests.is_empty() {
+            return self
+                .build_write_all_report(requests, options, writer, None)
+                .await;
+        }
+
+        reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
+        let result = self
+            .build_write_all_report(requests, options, writer, Some(&reporter))
+            .await;
+        reporter.emit(&match &result {
+            Ok(report) if report.all_succeeded() => ProgressEvent::completed(),
+            Ok(_) => ProgressEvent::completed_with_failures(),
+            Err(_) => ProgressEvent::failed(),
+        });
+        result
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn write_all_with_writer<W>(
         &self,
@@ -134,6 +221,7 @@ impl DeltaFunnelSession {
         planned_outputs: &[PlannedMssqlOutput],
         writer: W,
         phase_timings: Vec<PhaseTimingReport>,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<WriteAllReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
@@ -143,8 +231,14 @@ impl DeltaFunnelSession {
         let mut phase_timings = phase_timings;
         phase_timings.push(cache_timer.completed());
 
-        self.write_all_auto_plan_with_writer(planned_outputs, &cache_plan, writer, phase_timings)
-            .await
+        self.write_all_auto_plan_with_writer(
+            planned_outputs,
+            &cache_plan,
+            writer,
+            phase_timings,
+            reporter,
+        )
+        .await
     }
 
     #[allow(dead_code)]
@@ -154,6 +248,7 @@ impl DeltaFunnelSession {
         cache_plan: &MssqlOutputCachePlan,
         writer: W,
         mut phase_timings: Vec<PhaseTimingReport>,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<WriteAllReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
@@ -164,13 +259,20 @@ impl DeltaFunnelSession {
                 let provider_stats = shared_provider_read_stats();
                 let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
-                    .write_all_baseline_with_writer_and_provider_stats(
+                    .write_all_baseline_with_writer(
                         planned_outputs,
                         writer,
                         Some(Arc::clone(&provider_stats)),
+                        reporter,
                     )
                     .await?;
                 phase_timings.push(workflow_timer.completed());
+                if let Some(reporter) = reporter {
+                    reporter.emit(&ProgressEvent::phase_changed(
+                        ProgressPhase::ReportingSources,
+                        None,
+                    ));
+                }
                 let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     planned_outputs,
@@ -183,15 +285,22 @@ impl DeltaFunnelSession {
                 let provider_stats = shared_provider_read_stats();
                 let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
                 let workflow = self
-                    .write_all_cached_with_writer_and_provider_stats(
+                    .write_all_cached_with_writer(
                         planned_outputs,
                         cache_aliases,
                         writer,
                         Some(Arc::clone(&provider_stats)),
+                        reporter,
                     )
                     .await?;
                 phase_timings.push(workflow_timer.completed());
                 let cache = cache_report::from_executed_plan(cache_plan);
+                if let Some(reporter) = reporter {
+                    reporter.emit(&ProgressEvent::phase_changed(
+                        ProgressPhase::ReportingSources,
+                        None,
+                    ));
+                }
                 let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
                 let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                     planned_outputs,
@@ -247,6 +356,31 @@ impl DeltaFunnelSession {
         .await
     }
 
+    /// Writes multiple outputs and reports one consolidated progress lifecycle.
+    pub(crate) async fn write_all_with_progress(
+        &self,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+        reporter: ProgressReporter,
+    ) -> Result<WriteAllReport, DeltaFunnelError> {
+        let output_count = requests.len();
+        async move {
+            observability::workflow_started(RunMode::Execute, output_count);
+            let result = self
+                .write_all_with_progress_and_writer(
+                    requests,
+                    options,
+                    reporter,
+                    MssqlWorkflowPublicOutputWriter,
+                )
+                .await;
+            observability::workflow_finished(RunMode::Execute, output_count, &result);
+            result
+        }
+        .instrument(observability::workflow_span(RunMode::Execute, output_count))
+        .await
+    }
+
     /// Runs the multi-output write workflow through a local stream-draining
     /// writer for benchmark phase timing without connecting to SQL Server.
     ///
@@ -279,6 +413,14 @@ fn ensure_write_all_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunne
                     .to_owned(),
         }),
     }
+}
+
+fn validate_write_all_requests(requests: &[OutputWritePlan]) -> Result<(), DeltaFunnelError> {
+    ensure_unique_write_all_output_names(requests)?;
+    for request in requests {
+        ensure_write_all_execute_run_mode(request.target().run_mode())?;
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_unique_write_all_output_names(
@@ -329,8 +471,48 @@ mod tests {
         MssqlWriteBackend, MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport,
         PhaseStatus, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, RowCount,
         WriteAllCacheAliasStatus, WriteAllCacheReport, WriteAllNoCacheReason,
-        plan_mssql_target_for_resolved_output, table_formats::RealParquetDeltaTable,
+        plan_mssql_target_for_resolved_output,
+        progress::{
+            ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
+        },
+        table_formats::RealParquetDeltaTable,
     };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedProgress {
+        kind: ProgressEventKind,
+        operation: Option<ProgressOperation>,
+        phase: Option<ProgressPhase>,
+        output_name: Option<String>,
+        output_index: Option<u64>,
+        output_count: Option<u64>,
+        rows: Option<u64>,
+        batches: Option<u64>,
+        files_handled: Option<u64>,
+        files_total: Option<u64>,
+    }
+
+    fn recording_progress() -> (ProgressReporter, Arc<Mutex<Vec<RecordedProgress>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            if let Ok(mut events) = recorded.lock() {
+                events.push(RecordedProgress {
+                    kind: event.kind(),
+                    operation: event.operation(),
+                    phase: event.phase(),
+                    output_name: event.output_name().map(str::to_owned),
+                    output_index: event.output_index(),
+                    output_count: event.output_count(),
+                    rows: event.rows(),
+                    batches: event.batches(),
+                    files_handled: event.files_handled(),
+                    files_total: event.files_total(),
+                });
+            }
+        });
+        (reporter, events)
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeOrchestratorWriteCall {
@@ -369,6 +551,7 @@ mod tests {
             mut batches: MssqlOutputBatchStream,
             _write_backend: MssqlWriteBackend,
             _validation_options: crate::ValidationOptions,
+            reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;
             let mut batch_count = 0_u64;
@@ -399,6 +582,14 @@ mod tests {
                     rows,
                     batches: batch_count,
                 });
+            if let Some(reporter) = reporter {
+                reporter.emit(&ProgressEvent::progress(
+                    ProgressPhase::Writing,
+                    Some(resolved_target.output_name()),
+                    rows,
+                    batch_count,
+                ));
+            }
 
             if self
                 .fail_output_name
@@ -626,6 +817,385 @@ mod tests {
                     if message.contains("write_all requires RunMode::Execute")
                         && message.contains("dry_run_all_to_mssql")
             ));
+            Ok(())
+        }
+    }
+
+    mod progress {
+        use super::*;
+
+        #[tokio::test]
+        async fn write_all_progress_reports_planned_output_positions_and_success()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let west = session.table_from_sql("select 1 as id").await?;
+            let east = session.table_from_sql("select 2 as id").await?;
+            let west = execute_output_request(
+                west,
+                "west_output",
+                "west_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let east = execute_output_request(
+                east,
+                "east_output",
+                "east_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let (reporter, events) = recording_progress();
+
+            let report = session
+                .write_all_with_progress_and_writer(
+                    &[west, east],
+                    WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                    reporter,
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+            assert!(report.all_succeeded());
+
+            let events = events.lock().map_err(|_| "progress event lock poisoned")?;
+            assert_eq!(events.len(), 9);
+            assert_eq!(events[0].kind, ProgressEventKind::Started);
+            assert_eq!(
+                events[0].operation,
+                Some(ProgressOperation::WriteAllToMssql)
+            );
+            assert_eq!(events[1].phase, Some(ProgressPhase::PlanningOutput));
+            assert_eq!(events[1].output_name.as_deref(), Some("west_output"));
+            assert_eq!(events[1].output_index, Some(1));
+            assert_eq!(events[1].output_count, Some(2));
+            assert_eq!(events[2].phase, Some(ProgressPhase::PlanningOutput));
+            assert_eq!(events[2].output_name.as_deref(), Some("east_output"));
+            assert_eq!(events[2].output_index, Some(2));
+            assert_eq!(events[2].output_count, Some(2));
+            assert_eq!(events[3].phase, Some(ProgressPhase::SettingUpStream));
+            assert_eq!(events[3].output_name.as_deref(), Some("west_output"));
+            assert_eq!(events[3].output_index, Some(1));
+            assert_eq!(events[3].output_count, Some(2));
+            assert_eq!(events[4].phase, Some(ProgressPhase::Writing));
+            assert_eq!(events[4].output_index, Some(1));
+            assert_eq!(events[4].rows, Some(1));
+            assert_eq!(events[4].batches, Some(1));
+            assert_eq!(events[5].phase, Some(ProgressPhase::SettingUpStream));
+            assert_eq!(events[5].output_name.as_deref(), Some("east_output"));
+            assert_eq!(events[5].output_index, Some(2));
+            assert_eq!(events[5].output_count, Some(2));
+            assert_eq!(events[6].phase, Some(ProgressPhase::Writing));
+            assert_eq!(events[6].output_index, Some(2));
+            assert_eq!(events[6].rows, Some(1));
+            assert_eq!(events[6].batches, Some(1));
+            assert_eq!(events[7].phase, Some(ProgressPhase::ReportingSources));
+            assert_eq!(events[7].output_name, None);
+            assert_eq!(events[7].output_index, None);
+            assert_eq!(events[7].output_count, None);
+            assert_eq!(events[8].kind, ProgressEventKind::Completed);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn empty_write_all_emits_no_progress() -> Result<(), Box<dyn std::error::Error>> {
+            let session = DeltaFunnelSession::new(SessionOptions::new())?;
+            let (reporter, events) = recording_progress();
+
+            let report = session
+                .write_all_with_progress_and_writer(
+                    &[],
+                    WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                    reporter,
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+
+            assert!(report.is_empty());
+            assert!(
+                events
+                    .lock()
+                    .map_err(|_| "progress event lock poisoned")?
+                    .is_empty()
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn write_all_progress_distinguishes_reported_and_top_level_failures()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let output = session.table_from_sql("select 1 as id").await?;
+            let skipped = session.table_from_sql("select 2 as id").await?;
+            let output = execute_output_request(
+                output,
+                "orders_output",
+                "orders",
+                LoadMode::AppendExisting,
+            )?;
+            let skipped = execute_output_request(
+                skipped,
+                "skipped_output",
+                "skipped_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let (reporter, events) = recording_progress();
+            let report = session
+                .write_all_with_progress_and_writer(
+                    &[output, skipped],
+                    WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                    reporter,
+                    FakeWorkflowWriter::failing_on("orders_output"),
+                )
+                .await?;
+            assert_eq!(report.failed_count(), 1);
+            assert_eq!(report.skipped_count(), 1);
+            {
+                let events = events.lock().map_err(|_| "progress event lock poisoned")?;
+                assert_eq!(
+                    events.last().map(|event| event.kind),
+                    Some(ProgressEventKind::CompletedWithFailures)
+                );
+                let attempted_outputs = events
+                    .iter()
+                    .filter(|event| event.phase == Some(ProgressPhase::SettingUpStream))
+                    .collect::<Vec<_>>();
+                assert_eq!(attempted_outputs.len(), 1);
+                assert_eq!(
+                    attempted_outputs[0].output_name.as_deref(),
+                    Some("orders_output")
+                );
+                assert_eq!(attempted_outputs[0].output_index, Some(1));
+                assert_eq!(attempted_outputs[0].output_count, Some(2));
+            }
+
+            let mut session = DeltaFunnelSession::new(SessionOptions::new())?;
+            let missing_connection = session.table_from_sql("select 1 as id").await?;
+            let missing_connection = execute_output_request(
+                missing_connection,
+                "missing_connection",
+                "missing_connection",
+                LoadMode::AppendExisting,
+            )?;
+            let (reporter, events) = recording_progress();
+            let result = session
+                .write_all_with_progress_and_writer(
+                    &[missing_connection],
+                    WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                    reporter,
+                    FakeWorkflowWriter::default(),
+                )
+                .await;
+            assert!(result.is_err());
+            let events = events.lock().map_err(|_| "progress event lock poisoned")?;
+            assert_eq!(events[0].kind, ProgressEventKind::Started);
+            assert_eq!(
+                events.last().map(|event| event.kind),
+                Some(ProgressEventKind::Failed)
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn write_all_file_progress_is_scoped_to_each_attempted_output()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let table = RealParquetDeltaTable::new_default("orders")?;
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            session.delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))?;
+            let west = session
+                .table_from_sql("select id from orders where id <= 2")
+                .await?;
+            let east = session
+                .table_from_sql("select id from orders where id > 2")
+                .await?;
+            let west = execute_output_request(
+                west,
+                "west_output",
+                "west_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let east = execute_output_request(
+                east,
+                "east_output",
+                "east_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let (reporter, events) = recording_progress();
+
+            let report = session
+                .write_all_with_progress_and_writer(
+                    &[west, east],
+                    WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                    reporter,
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+            assert!(report.all_succeeded());
+
+            let events = events.lock().map_err(|_| "progress event lock poisoned")?;
+            for output_index in [1, 2] {
+                let Some(last) = events.iter().rev().find(|event| {
+                    event.output_index == Some(output_index) && event.files_total.is_some()
+                }) else {
+                    return Err(
+                        format!("output {output_index} did not report file progress").into(),
+                    );
+                };
+                assert_eq!(last.files_handled, last.files_total);
+                assert!(last.files_total.is_some_and(|total| total > 0));
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn write_all_cache_file_progress_is_action_level_and_resets_for_outputs()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let table = RealParquetDeltaTable::new_default("orders")?;
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            session.delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))?;
+            let pending_big = session
+                .table_from_sql("select id, customer_name from orders")
+                .await?;
+            let big = session.register_alias("big", &pending_big)?;
+            let selected = session
+                .table_from_sql("select id from big where id <= 2")
+                .await?;
+            let big_output =
+                execute_output_request(big, "big_output", "big_orders", LoadMode::AppendExisting)?;
+            let selected_output = execute_output_request(
+                selected,
+                "selected_output",
+                "selected_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let (reporter, events) = recording_progress();
+
+            let report = session
+                .write_all_with_progress_and_writer(
+                    &[big_output, selected_output],
+                    WriteAllOptions::default(),
+                    reporter,
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+            assert!(report.all_succeeded());
+            assert!(matches!(
+                report.cache(),
+                WriteAllCacheReport::CacheAliases { .. }
+            ));
+
+            let events = events.lock().map_err(|_| "progress event lock poisoned")?;
+            let cache_events = events
+                .iter()
+                .filter(|event| event.phase == Some(ProgressPhase::MaterializingCache))
+                .collect::<Vec<_>>();
+            assert!(!cache_events.is_empty());
+            assert!(cache_events.iter().all(|event| {
+                event.output_name.is_none()
+                    && event.output_index.is_none()
+                    && event.output_count.is_none()
+            }));
+            let last_cache_file_event = cache_events
+                .iter()
+                .rev()
+                .find(|event| event.files_total.is_some())
+                .ok_or("cache materialization did not report file progress")?;
+            assert_eq!(
+                last_cache_file_event.files_handled,
+                last_cache_file_event.files_total
+            );
+            let first_output = events
+                .iter()
+                .find(|event| event.phase == Some(ProgressPhase::SettingUpStream))
+                .ok_or("first output did not start")?;
+            assert_eq!(first_output.output_name.as_deref(), Some("big_output"));
+            assert_eq!(first_output.output_index, Some(1));
+            assert_eq!(first_output.output_count, Some(2));
+            assert_eq!(first_output.files_total, None);
+            let restoration_index = events
+                .iter()
+                .position(|event| event.phase == Some(ProgressPhase::RestoringCache))
+                .ok_or("cache restoration was not reported")?;
+            let restoration = &events[restoration_index];
+            assert_eq!(restoration.output_name, None);
+            assert_eq!(restoration.output_index, None);
+            assert_eq!(restoration.output_count, None);
+            assert_eq!(restoration.rows, None);
+            assert_eq!(restoration.batches, None);
+            assert_eq!(restoration.files_total, None);
+            let source_reporting_index = events
+                .iter()
+                .position(|event| event.phase == Some(ProgressPhase::ReportingSources))
+                .ok_or("source reporting was not reported")?;
+            assert!(restoration_index < source_reporting_index);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn write_all_preflight_errors_emit_no_progress()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let west = session.table_from_sql("select 1 as id").await?;
+            let east = session.table_from_sql("select 2 as id").await?;
+            let west =
+                execute_output_request(west, "duplicate", "west_orders", LoadMode::AppendExisting)?;
+            let east =
+                execute_output_request(east, "duplicate", "east_orders", LoadMode::AppendExisting)?;
+            let (reporter, events) = recording_progress();
+
+            let result = session
+                .write_all_with_progress_and_writer(
+                    &[west, east],
+                    WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                    reporter,
+                    FakeWorkflowWriter::default(),
+                )
+                .await;
+
+            assert!(result.is_err());
+            assert!(
+                events
+                    .lock()
+                    .map_err(|_| "progress event lock poisoned")?
+                    .is_empty()
+            );
+
+            let dry_run = session.table_from_sql("select 3 as id").await?;
+            let dry_run = output_request(
+                dry_run,
+                "dry_run",
+                "dry_run_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let (reporter, events) = recording_progress();
+            let result = session
+                .write_all_with_progress_and_writer(
+                    &[dry_run],
+                    WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                    reporter,
+                    FakeWorkflowWriter::default(),
+                )
+                .await;
+
+            assert!(result.is_err());
+            assert!(
+                events
+                    .lock()
+                    .map_err(|_| "progress event lock poisoned")?
+                    .is_empty()
+            );
             Ok(())
         }
     }

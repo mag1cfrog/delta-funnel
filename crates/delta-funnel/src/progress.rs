@@ -20,6 +20,10 @@ pub enum ProgressOperation {
     WriteToMssql,
     /// Plan one SQL Server output without executing it.
     DryRunToMssql,
+    /// Execute a multi-output SQL Server write workflow.
+    WriteAllToMssql,
+    /// Plan a multi-output SQL Server write workflow without executing it.
+    DryRunAllToMssql,
 }
 
 /// Stable visible phase of a progress action.
@@ -31,6 +35,10 @@ pub enum ProgressPhase {
     PlanningOutput,
     /// Set up the selected output batch stream.
     SettingUpStream,
+    /// Materialize shared data selected by write-all cache planning.
+    MaterializingCache,
+    /// Restore session aliases after shared cache execution.
+    RestoringCache,
     /// Establish the SQL Server connection.
     Connecting,
     /// Prepare the SQL Server target table.
@@ -43,6 +51,8 @@ pub enum ProgressPhase {
     SwappingTarget,
     /// Clean up a target created by Delta Funnel after failure.
     CleaningUp,
+    /// Build source reports after output work has finished.
+    ReportingSources,
 }
 
 /// Kind of one typed progress event.
@@ -177,6 +187,18 @@ impl ProgressEvent {
         snapshot.metrics = Some(ProgressMetrics { rows, batches });
         Self {
             state: ProgressEventState::Progress(snapshot),
+        }
+    }
+
+    /// Adds a validated one-based output position to a phase or progress event.
+    pub(crate) fn with_output_position(mut self, index: u64, count: u64) -> Option<Self> {
+        let position = ProgressOutputPosition::new(index, count)?;
+        match &mut self.state {
+            ProgressEventState::PhaseChanged(snapshot) | ProgressEventState::Progress(snapshot) => {
+                snapshot.output_position = Some(position);
+                Some(self)
+            }
+            _ => None,
         }
     }
 
@@ -343,6 +365,16 @@ impl ProgressSnapshot {
     }
 }
 
+impl ProgressOutputPosition {
+    /// Accepts only one-based positions inside the declared output count.
+    const fn new(index: u64, count: u64) -> Option<Self> {
+        if index == 0 || index > count {
+            return None;
+        }
+        Some(Self { index, count })
+    }
+}
+
 impl DeltaFileProgress {
     const fn new(
         handled: u64,
@@ -426,6 +458,21 @@ impl ProgressReporter {
             callback(event);
         }
     }
+
+    /// Creates a reporter that adds one output position to phase and progress
+    /// events before forwarding them to this reporter.
+    ///
+    /// Action-level start and terminal events are not forwarded because they
+    /// belong to the surrounding multi-output workflow.
+    pub(crate) fn for_output(&self, index: u64, count: u64) -> Option<Self> {
+        ProgressOutputPosition::new(index, count)?;
+        let parent = self.clone();
+        Some(Self::new(move |event| {
+            if let Some(event) = event.clone().with_output_position(index, count) {
+                parent.emit(&event);
+            }
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -475,6 +522,21 @@ mod tests {
     }
 
     #[test]
+    fn started_events_preserve_each_operation_identity() {
+        for operation in [
+            ProgressOperation::WriteToMssql,
+            ProgressOperation::DryRunToMssql,
+            ProgressOperation::WriteAllToMssql,
+            ProgressOperation::DryRunAllToMssql,
+        ] {
+            assert_eq!(
+                ProgressEvent::started(operation).operation(),
+                Some(operation)
+            );
+        }
+    }
+
+    #[test]
     fn file_progress_is_paired_positive_and_capped() -> Result<(), Box<dyn std::error::Error>> {
         let progress =
             ProgressEvent::progress_with_files(ProgressPhase::Writing, Some("orders"), 7, 5, 42, 3);
@@ -490,6 +552,70 @@ mod tests {
         assert!(
             ProgressEvent::file_progress(ProgressPhase::Writing, Some("orders"), 0, 0).is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn output_positions_are_one_based_and_belong_only_to_active_work_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(phase) =
+            ProgressEvent::phase_changed(ProgressPhase::PlanningOutput, Some("orders\noutput"))
+                .with_output_position(2, 3)
+        else {
+            return Err("valid phase output position was rejected".into());
+        };
+        let Some(progress) = ProgressEvent::progress(ProgressPhase::Writing, Some("orders"), 42, 3)
+            .with_output_position(2, 3)
+        else {
+            return Err("valid progress output position was rejected".into());
+        };
+
+        for event in [&phase, &progress] {
+            assert_eq!(event.output_index(), Some(2));
+            assert_eq!(event.output_count(), Some(3));
+        }
+        assert_eq!(phase.output_name(), Some(r"orders\noutput"));
+
+        for (index, count) in [(0, 3), (1, 0), (4, 3)] {
+            assert!(
+                ProgressEvent::phase_changed(ProgressPhase::PlanningOutput, None)
+                    .with_output_position(index, count)
+                    .is_none()
+            );
+        }
+        assert!(
+            ProgressEvent::completed()
+                .with_output_position(1, 1)
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn output_reporter_adds_position_and_drops_action_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            if let Ok(mut events) = recorded.lock() {
+                events.push(event.clone());
+            }
+        });
+        let Some(output_reporter) = reporter.for_output(2, 3) else {
+            return Err("valid output position was rejected".into());
+        };
+
+        output_reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
+        output_reporter.emit(&ProgressEvent::phase_changed(
+            ProgressPhase::Writing,
+            Some("orders"),
+        ));
+        output_reporter.emit(&ProgressEvent::completed());
+
+        let events = events.lock().map_err(|_| "progress event lock poisoned")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].output_index(), Some(2));
+        assert_eq!(events[0].output_count(), Some(3));
         Ok(())
     }
 
