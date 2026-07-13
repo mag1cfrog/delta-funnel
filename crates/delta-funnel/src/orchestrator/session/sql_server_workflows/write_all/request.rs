@@ -127,7 +127,7 @@ impl DeltaFunnelSession {
                 Some(cache_plan) => match cache_plan.decision() {
                     MssqlOutputCacheDecision::NoCache { .. } => {
                         let workflow = self
-                            .write_all_baseline_with_writer(
+                            .write_all_uncached_with_writer(
                                 &planned_outputs,
                                 writer,
                                 Some(Arc::clone(&provider_stats)),
@@ -151,7 +151,7 @@ impl DeltaFunnelSession {
                 },
                 None => {
                     let workflow = self
-                        .write_all_baseline_with_writer(
+                        .write_all_uncached_with_writer(
                             &planned_outputs,
                             writer,
                             Some(Arc::clone(&provider_stats)),
@@ -272,7 +272,7 @@ impl DeltaFunnelSession {
 
     /// Writes multiple selected lazy tables to SQL Server sequentially with explicit options.
     ///
-    /// `WriteAllCacheMode::Disabled` uses the baseline no-cache path. The
+    /// `WriteAllCacheMode::Disabled` uses the uncached path. The
     /// default `Auto` mode performs conservative shared-cache planning and
     /// reports the selected or skipped cache decision.
     ///
@@ -1352,7 +1352,7 @@ mod tests {
         use super::*;
 
         #[tokio::test]
-        async fn write_all_auto_no_candidate_uses_baseline_path()
+        async fn write_all_auto_no_candidate_uses_uncached_path()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -1715,7 +1715,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn write_all_disabled_cache_mode_uses_baseline_path()
+        async fn write_all_disabled_cache_mode_uses_uncached_path()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),

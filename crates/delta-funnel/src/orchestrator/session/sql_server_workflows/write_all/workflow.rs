@@ -71,9 +71,9 @@ impl DeltaFunnelSession {
         .with_progress_reporter(progress)
     }
 
-    /// Builds deferred baseline jobs and binds each optional progress reporter
+    /// Builds deferred uncached jobs and binds each optional progress reporter
     /// to that output's requested position.
-    pub(crate) fn build_write_all_baseline_jobs(
+    pub(crate) fn build_write_all_uncached_jobs(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         provider_stats: Option<SharedProviderReadStats>,
@@ -137,9 +137,9 @@ impl DeltaFunnelSession {
             .collect()
     }
 
-    /// Runs the baseline path with an injected writer, optionally collecting
+    /// Runs the uncached path with an injected writer, optionally collecting
     /// provider statistics and reporting progress.
-    pub(crate) async fn write_all_baseline_with_writer<W>(
+    pub(crate) async fn write_all_uncached_with_writer<W>(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         writer: W,
@@ -149,7 +149,7 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let jobs = self.build_write_all_baseline_jobs(planned_outputs, provider_stats, reporter)?;
+        let jobs = self.build_write_all_uncached_jobs(planned_outputs, provider_stats, reporter)?;
 
         write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
     }
@@ -214,7 +214,7 @@ mod tests {
     use crate::LoadMode;
 
     #[tokio::test]
-    async fn build_write_all_baseline_jobs_preserves_output_metadata_without_stream_setup()
+    async fn build_write_all_uncached_jobs_preserves_output_metadata_without_stream_setup()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -236,7 +236,7 @@ mod tests {
         let planned = session.plan_write_all_outputs(&[west, east])?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
 
-        let jobs = session.build_write_all_baseline_jobs(&planned, None, None)?;
+        let jobs = session.build_write_all_uncached_jobs(&planned, None, None)?;
 
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
         assert_eq!(jobs.len(), 2);
