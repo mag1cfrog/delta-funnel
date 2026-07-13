@@ -1379,7 +1379,7 @@ sys.modules["rich.progress"] = progress_module
         Ok(())
     }
 
-    fn preview(py: Python<'_>, progress: Option<Option<bool>>) -> PyResult<()> {
+    fn preview(py: Python<'_>, progress: Option<Option<bool>>) -> PyResult<Py<PyAny>> {
         let module = PyModule::new(py, "deltafunnel")?;
         deltafunnel(&module)?;
         let session = module.getattr("Session")?.call0()?;
@@ -1388,8 +1388,9 @@ sys.modules["rich.progress"] = progress_module
         if let Some(progress) = progress {
             kwargs.set_item("progress", progress)?;
         }
-        table.call_method("preview", (), Some(&kwargs))?;
-        Ok(())
+        table
+            .call_method("preview", (), Some(&kwargs))
+            .map(Bound::unbind)
     }
 
     fn dry_run_all(
@@ -1620,6 +1621,60 @@ sys.modules["rich.progress"] = progress_module
                     .get_item(1)?
                     .get_item("console_stderr")?
                     .extract::<bool>()?
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preview_defers_renderer_interruption_until_query_completion() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), true, false)?;
+
+            let error = preview(py, Some(Some(true))).unwrap_err();
+
+            assert!(error.value(py).is(failure.bind(py)));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "completed"
+            );
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "console", "progress", "add_task", "start", "update", "stop"
+                ]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ordinary_preview_renderer_failure_preserves_the_preview() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records, _failure) =
+                ModuleGuard::install_with_failure(py, true, false, Some("update"), false, false)?;
+
+            let preview = preview(py, Some(Some(true)))?;
+
+            assert_eq!(
+                preview
+                    .bind(py)
+                    .get_type()
+                    .getattr("__name__")?
+                    .extract::<String>()?,
+                "Preview"
+            );
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "console", "progress", "add_task", "start", "update", "stop"
+                ]
             );
             Ok(())
         })
