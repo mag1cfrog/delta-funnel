@@ -850,6 +850,7 @@ const fn ends_action(kind: ProgressEventKind) -> bool {
 /// Returns the text shown before Rust reports the first phase.
 const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
     match operation {
+        Some(ProgressOperation::RegisterDeltaSource) => "Loading Delta source",
         Some(ProgressOperation::PreviewTable) => "Previewing table",
         Some(ProgressOperation::WriteToMssql) => "Writing to SQL Server",
         Some(ProgressOperation::DryRunToMssql) => "Planning SQL Server write",
@@ -862,6 +863,10 @@ const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
 /// Returns safe, stable text for an internal Rust phase.
 const fn phase_label(phase: ProgressPhase) -> &'static str {
     match phase {
+        ProgressPhase::LoadingDeltaMetadata => "Loading Delta metadata",
+        ProgressPhase::ValidatingDeltaProtocol => "Validating Delta protocol",
+        ProgressPhase::PreparingDeltaProvider => "Preparing Delta provider",
+        ProgressPhase::RegisteringDeltaSource => "Registering Delta source",
         ProgressPhase::PreparingPreview => "Preparing preview",
         ProgressPhase::CollectingPreview => "Collecting preview",
         ProgressPhase::FormattingPreview => "Formatting preview",
@@ -2888,6 +2893,22 @@ stream = HostileStderr()
     #[test]
     fn all_core_phases_have_curated_labels() {
         assert_eq!(
+            phase_label(ProgressPhase::LoadingDeltaMetadata),
+            "Loading Delta metadata"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::ValidatingDeltaProtocol),
+            "Validating Delta protocol"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::PreparingDeltaProvider),
+            "Preparing Delta provider"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::RegisteringDeltaSource),
+            "Registering Delta source"
+        );
+        assert_eq!(
             phase_label(ProgressPhase::PreparingPreview),
             "Preparing preview"
         );
@@ -2938,6 +2959,10 @@ stream = HostileStderr()
 
     #[test]
     fn all_core_operations_have_curated_labels() {
+        assert_eq!(
+            operation_label(Some(ProgressOperation::RegisterDeltaSource)),
+            "Loading Delta source"
+        );
         assert_eq!(
             operation_label(Some(ProgressOperation::PreviewTable)),
             "Previewing table"

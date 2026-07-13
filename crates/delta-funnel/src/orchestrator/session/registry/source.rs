@@ -4,9 +4,16 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, DeltaSourceConfig, DeltaTableProviderConfig,
-    PhaseTimingReport, RegisteredDeltaSource, register_delta_sources_with_scan_execution_options,
+    PhaseTimingReport, RegisteredDeltaSource,
+    progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
+    query_engine::datafusion::{
+        register_delta_source_with_scan_execution_options, reject_existing_delta_registration_name,
+    },
     report::PhaseTimer,
-    table_formats::{load_delta_source_with_tracing, preflight_delta_protocol_with_tracing},
+    table_formats::{
+        load_delta_source_with_tracing, preflight_delta_protocol_with_tracing,
+        validate_table_source_names,
+    },
 };
 
 use super::super::{DeltaFunnelSession, LazyTable};
@@ -113,9 +120,42 @@ impl DeltaFunnelSession {
     /// alias, schema conversion, or DataFusion registration error. Session
     /// source state is updated only after the DataFusion registration succeeds.
     pub fn delta_lake(&mut self, source: DeltaSourceConfig) -> Result<LazyTable, DeltaFunnelError> {
-        self.reject_registered_alias_name(&source.name)?;
+        self.validate_delta_source_registration(&source)?;
+        self.register_delta_source(source, None)
+    }
+
+    /// Registers one Delta source while reporting its live lifecycle.
+    ///
+    /// Name and catalog conflicts fail before progress starts. Once started,
+    /// the reporter receives the source-loading phases and exactly one terminal
+    /// event. Reporting does not change registration or rollback behavior.
+    pub(crate) fn delta_lake_with_progress(
+        &mut self,
+        source: DeltaSourceConfig,
+        reporter: ProgressReporter,
+    ) -> Result<LazyTable, DeltaFunnelError> {
+        self.validate_delta_source_registration(&source)?;
+        reporter.emit(&ProgressEvent::started(
+            ProgressOperation::RegisterDeltaSource,
+        ));
+        let result = self.register_delta_source(source, Some(&reporter));
+        reporter.emit(&if result.is_ok() {
+            ProgressEvent::completed()
+        } else {
+            ProgressEvent::failed()
+        });
+        result
+    }
+
+    /// Performs source loading and catalog registration after local checks.
+    fn register_delta_source(
+        &mut self,
+        source: DeltaSourceConfig,
+        reporter: Option<&ProgressReporter>,
+    ) -> Result<LazyTable, DeltaFunnelError> {
         let mut phase_timings = Vec::new();
 
+        emit_registration_phase(reporter, ProgressPhase::LoadingDeltaMetadata);
         let source_timer = PhaseTimer::start(SOURCE_LOADING_PHASE);
         let planned = match load_delta_source_with_tracing(source) {
             Ok(planned) => {
@@ -128,6 +168,7 @@ impl DeltaFunnelSession {
             }
         };
 
+        emit_registration_phase(reporter, ProgressPhase::ValidatingDeltaProtocol);
         let preflight_timer = PhaseTimer::start(PROTOCOL_PREFLIGHT_PHASE);
         let preflight = match preflight_delta_protocol_with_tracing(&planned) {
             Ok(preflight) => {
@@ -141,15 +182,16 @@ impl DeltaFunnelSession {
         };
 
         let registration_timer = PhaseTimer::start(DATAFUSION_REGISTRATION_PHASE);
-        let configs = vec![DeltaTableProviderConfig {
+        let config = DeltaTableProviderConfig {
             source: planned,
             protocol: preflight,
             scan_target_partitions: None,
-        }];
-        let registered = match register_delta_sources_with_scan_execution_options(
+        };
+        let registered = match register_delta_source_with_scan_execution_options(
             &self.context,
-            configs,
+            config,
             self.options.provider_scan_options(),
+            reporter,
         ) {
             Ok(registered) => {
                 phase_timings.push(registration_timer.completed());
@@ -160,19 +202,21 @@ impl DeltaFunnelSession {
                 return Err(error);
             }
         };
-        let registered =
-            registered
-                .sources
-                .into_iter()
-                .next()
-                .ok_or_else(|| DeltaFunnelError::Config {
-                    message: "Delta source registration returned no registered source".to_owned(),
-                })?;
         let table = self.allocate_delta_source_table(registered.name.clone());
         let session_source =
             RegisteredSessionSource::from_registered(table.clone(), registered, phase_timings);
         self.sources.push(session_source);
         Ok(table)
+    }
+
+    /// Runs checks that must not start source loading or progress rendering.
+    fn validate_delta_source_registration(
+        &self,
+        source: &DeltaSourceConfig,
+    ) -> Result<(), DeltaFunnelError> {
+        validate_table_source_names([source.name.as_str()])?;
+        self.reject_registered_alias_name(&source.name)?;
+        reject_existing_delta_registration_name(&self.context, &source.name, &source.table_uri)
     }
 
     fn allocate_delta_source_table(&mut self, name: String) -> LazyTable {
@@ -182,13 +226,26 @@ impl DeltaFunnelSession {
     }
 }
 
+fn emit_registration_phase(reporter: Option<&ProgressReporter>, phase: ProgressPhase) {
+    if let Some(reporter) = reporter {
+        reporter.emit(&ProgressEvent::phase_changed(phase, None));
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use datafusion::{arrow::datatypes::Schema, datasource::empty::EmptyTable};
+
     use super::{DATAFUSION_REGISTRATION_PHASE, PROTOCOL_PREFLIGHT_PHASE, SOURCE_LOADING_PHASE};
 
     use crate::{
         DeltaFunnelError, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
         DeltaSourceConfig, DeltaStorageOptions, QueryOptions,
+        progress::{
+            ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
+        },
     };
 
     use super::super::super::{
@@ -198,6 +255,125 @@ mod tests {
 
     const UNSUPPORTED_PROTOCOL_JSON: &str =
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":2}}"#;
+
+    fn recording_reporter() -> (ProgressReporter, Arc<Mutex<Vec<ProgressEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        let reporter = ProgressReporter::new(move |event| {
+            if let Ok(mut events) = recorded.lock() {
+                events.push(event.clone());
+            }
+        });
+        (reporter, events)
+    }
+
+    #[test]
+    fn delta_lake_progress_reports_ordered_registration_lifecycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders-progress")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (reporter, events) = recording_reporter();
+
+        session
+            .delta_lake_with_progress(DeltaSourceConfig::new("orders", table.uri()), reporter)?;
+
+        let events = events.lock().map_err(|_| "progress events lock poisoned")?;
+        assert_eq!(events.len(), 6);
+        assert_eq!(events[0].kind(), ProgressEventKind::Started);
+        assert_eq!(
+            events[0].operation(),
+            Some(ProgressOperation::RegisterDeltaSource)
+        );
+        assert_eq!(
+            events[1..5]
+                .iter()
+                .map(ProgressEvent::phase)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(ProgressPhase::LoadingDeltaMetadata),
+                Some(ProgressPhase::ValidatingDeltaProtocol),
+                Some(ProgressPhase::PreparingDeltaProvider),
+                Some(ProgressPhase::RegisteringDeltaSource),
+            ]
+        );
+        assert_eq!(events[5].kind(), ProgressEventKind::Completed);
+        assert!(events.iter().all(|event| event.output_name().is_none()));
+        assert!(events.iter().all(|event| event.files_total().is_none()));
+        assert!(events.iter().all(|event| event.rows().is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn delta_lake_progress_fails_after_start_for_source_loading_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (reporter, events) = recording_reporter();
+
+        let result =
+            session.delta_lake_with_progress(DeltaSourceConfig::new("orders", ""), reporter);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::InvalidSourceUri { .. })
+        ));
+        let events = events.lock().map_err(|_| "progress events lock poisoned")?;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind(), ProgressEventKind::Started);
+        assert_eq!(events[1].phase(), Some(ProgressPhase::LoadingDeltaMetadata));
+        assert_eq!(events[2].kind(), ProgressEventKind::Failed);
+        Ok(())
+    }
+
+    #[test]
+    fn delta_lake_progress_does_not_start_for_local_registration_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders-conflict")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        for source in [
+            DeltaSourceConfig::new("select", ""),
+            DeltaSourceConfig::new("ORDERS", ""),
+        ] {
+            let (reporter, events) = recording_reporter();
+            assert!(session.delta_lake_with_progress(source, reporter).is_err());
+            assert!(
+                events
+                    .lock()
+                    .map_err(|_| "progress events lock poisoned")?
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn delta_lake_progress_does_not_start_for_datafusion_catalog_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.context().register_table(
+            "ExistingOrders",
+            Arc::new(EmptyTable::new(Arc::new(Schema::empty()))),
+        )?;
+        let (reporter, events) = recording_reporter();
+
+        let result = session.delta_lake_with_progress(
+            DeltaSourceConfig::new("existingorders", "secret://must-not-load"),
+            reporter,
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DataFusionRegistration { .. })
+        ));
+        assert!(
+            events
+                .lock()
+                .map_err(|_| "progress events lock poisoned")?
+                .is_empty()
+        );
+        Ok(())
+    }
 
     #[test]
     fn delta_lake_registers_source_and_returns_lazy_table() -> Result<(), Box<dyn std::error::Error>>

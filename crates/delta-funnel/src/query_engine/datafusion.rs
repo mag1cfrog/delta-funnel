@@ -17,6 +17,9 @@ pub use catalog::registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources,
     register_delta_sources, register_delta_sources_with_scan_execution_options,
 };
+pub(crate) use catalog::registration::{
+    register_delta_source_with_scan_execution_options, reject_existing_delta_registration_name,
+};
 pub use execution::{
     DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
 };

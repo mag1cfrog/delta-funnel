@@ -12,7 +12,7 @@ use super::session::OrchestratorMssqlOutputWriter;
 #[cfg(test)]
 use crate::MssqlWorkflowOutputWriter;
 use crate::{
-    DeltaFunnelError, DeltaFunnelSession, LazyTable, MssqlDryRunOutputReport,
+    DeltaFunnelError, DeltaFunnelSession, DeltaSourceConfig, LazyTable, MssqlDryRunOutputReport,
     MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, TablePreview, WriteAllOptions,
     WriteAllReport, progress::ProgressReporter,
 };
@@ -61,6 +61,21 @@ impl DeltaFunnelRuntime {
     ) -> Result<LazyTable, DeltaFunnelError> {
         reject_nested_runtime()?;
         self.runtime.block_on(session.table_from_sql(sql))
+    }
+
+    /// Registers one Delta source and reports its live lifecycle to the caller.
+    ///
+    /// Registration is synchronous and does not enter this type's Tokio
+    /// runtime. The runtime wrapper exists as the public bridge used by
+    /// synchronous host bindings.
+    #[doc(hidden)]
+    pub fn delta_lake_with_progress(
+        &self,
+        session: &mut DeltaFunnelSession,
+        source: DeltaSourceConfig,
+        reporter: ProgressReporter,
+    ) -> Result<LazyTable, DeltaFunnelError> {
+        session.delta_lake_with_progress(source, reporter)
     }
 
     /// Runs a bounded lazy table preview for a synchronous host.

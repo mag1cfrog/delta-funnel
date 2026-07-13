@@ -8,7 +8,10 @@ use datafusion::prelude::SessionContext;
 
 use crate::{
     DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
-    error::DataFusionRegistrationSnafu, observability, support::sanitize_uri_for_display,
+    error::DataFusionRegistrationSnafu,
+    observability,
+    progress::{ProgressEvent, ProgressPhase, ProgressReporter},
+    support::sanitize_uri_for_display,
     table_formats::validate_table_source_names,
 };
 
@@ -81,6 +84,37 @@ pub fn register_delta_sources_with_scan_execution_options(
     register_delta_sources_with_options(ctx, configs, execution_options)
 }
 
+/// Prepares and registers one Delta source with explicit provider options.
+///
+/// When a reporter is present, provider preparation and catalog registration
+/// are announced at their actual boundaries. Reporting does not change the
+/// registration result or expose the internal provider type.
+pub(crate) fn register_delta_source_with_scan_execution_options(
+    ctx: &SessionContext,
+    config: DeltaTableProviderConfig,
+    execution_options: DeltaProviderScanExecutionOptions,
+    reporter: Option<&ProgressReporter>,
+) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
+    execution_options.validate()?;
+    validate_table_source_names([config.source.name()])?;
+    emit_registration_phase(reporter, ProgressPhase::PreparingDeltaProvider);
+    let provider = DeltaTableProvider::try_new_with_execution_options(
+        config.source,
+        config.protocol,
+        config.scan_target_partitions,
+        execution_options,
+    )?;
+    reject_existing_registration_names(ctx, std::slice::from_ref(&provider))?;
+    emit_registration_phase(reporter, ProgressPhase::RegisteringDeltaSource);
+    register_delta_provider_with_tracing(ctx, provider)
+}
+
+fn emit_registration_phase(reporter: Option<&ProgressReporter>, phase: ProgressPhase) {
+    if let Some(reporter) = reporter {
+        reporter.emit(&ProgressEvent::phase_changed(phase, None));
+    }
+}
+
 fn register_delta_sources_with_options(
     ctx: &SessionContext,
     configs: Vec<DeltaTableProviderConfig>,
@@ -116,6 +150,23 @@ fn reject_existing_registration_names(
     ctx: &SessionContext,
     providers: &[DeltaTableProvider],
 ) -> Result<(), DeltaFunnelError> {
+    for provider in providers {
+        reject_existing_delta_registration_name(
+            ctx,
+            provider.source_name(),
+            provider.source_table_uri(),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Rejects a case-insensitive conflict in DataFusion's default catalog.
+pub(crate) fn reject_existing_delta_registration_name(
+    ctx: &SessionContext,
+    source_name: &str,
+    table_uri: &str,
+) -> Result<(), DeltaFunnelError> {
     let state = ctx.state();
     let catalog_options = &state.config_options().catalog;
     let default_catalog = ctx.catalog(&catalog_options.default_catalog);
@@ -126,18 +177,16 @@ fn reject_existing_registration_names(
         .as_ref()
         .map_or_else(Vec::new, |schema| schema.table_names());
 
-    for provider in providers {
-        if let Some(existing_name) = existing_names
-            .iter()
-            .find(|existing_name| existing_name.eq_ignore_ascii_case(provider.source_name()))
-        {
-            return DataFusionRegistrationSnafu {
-                source_name: provider.source_name().to_owned(),
-                table_uri: provider.source_table_uri().to_owned(),
-                reason: format!("table already exists: {existing_name}"),
-            }
-            .fail();
+    if let Some(existing_name) = existing_names
+        .iter()
+        .find(|existing_name| existing_name.eq_ignore_ascii_case(source_name))
+    {
+        return DataFusionRegistrationSnafu {
+            source_name: source_name.to_owned(),
+            table_uri: table_uri.to_owned(),
+            reason: format!("table already exists: {existing_name}"),
         }
+        .fail();
     }
 
     Ok(())
