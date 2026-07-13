@@ -163,7 +163,7 @@ impl PyTable {
     /// progress display closes before the `Preview` object is returned.
     #[pyo3(signature = (limit=20, *, progress=None))]
     fn preview(&self, py: Python<'_>, limit: usize, progress: Option<bool>) -> PyResult<PyPreview> {
-        let progress = PythonProgress::new(progress);
+        let progress = PythonProgress::for_preview(progress);
         let preview =
             self.session
                 .borrow(py)

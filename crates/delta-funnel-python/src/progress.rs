@@ -46,6 +46,15 @@ impl PythonProgress {
     /// `progress=None` shows progress only when Rich detects an interactive
     /// terminal or Jupyter. `progress=True` also shows it in scripts and CI.
     pub(crate) fn new(progress: Option<bool>) -> Option<Self> {
+        Self::new_with_output(progress, ProgressOutput::Stderr)
+    }
+
+    /// Creates preview progress that uses stdout only when Rich detects Jupyter.
+    pub(crate) fn for_preview(progress: Option<bool>) -> Option<Self> {
+        Self::new_with_output(progress, ProgressOutput::StdoutInNotebook)
+    }
+
+    fn new_with_output(progress: Option<bool>, output: ProgressOutput) -> Option<Self> {
         let mode = match progress {
             Some(false) => return None,
             Some(true) => ProgressMode::Forced,
@@ -53,7 +62,7 @@ impl PythonProgress {
         };
         #[cfg(test)]
         ADAPTER_CREATION_COUNT.set(ADAPTER_CREATION_COUNT.get().saturating_add(1));
-        let state = Arc::new(Mutex::new(ProgressState::new(mode)));
+        let state = Arc::new(Mutex::new(ProgressState::new(mode, output)));
         let reporter_state = Arc::clone(&state);
         let reporter = ProgressReporter::new(move |event| {
             render_event(&reporter_state, event, Instant::now());
@@ -133,6 +142,21 @@ enum ProgressMode {
     Forced,
 }
 
+/// Selects the stream without duplicating Rich's environment detection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressOutput {
+    /// Always use stderr, including inside notebooks.
+    Stderr,
+    /// Use stdout in notebooks and stderr everywhere else.
+    StdoutInNotebook,
+}
+
+#[derive(Clone, Copy)]
+struct ProgressSettings {
+    mode: ProgressMode,
+    output: ProgressOutput,
+}
+
 /// Python handles needed to update one Rich task.
 struct RichRenderer {
     progress: Py<PyAny>,
@@ -149,9 +173,9 @@ struct ProgressState {
 }
 
 impl ProgressState {
-    const fn new(mode: ProgressMode) -> Self {
+    const fn new(mode: ProgressMode, output: ProgressOutput) -> Self {
         Self {
-            render: RenderState::Pending(mode),
+            render: RenderState::Pending(ProgressSettings { mode, output }),
             pending_interruption: None,
             final_event: None,
             visible: VisibleProgress::new(),
@@ -422,7 +446,7 @@ impl VisibleProgress {
 /// Current state of one action's Rich display.
 enum RenderState {
     /// The Rust action has not started, so no Rich objects exist yet.
-    Pending(ProgressMode),
+    Pending(ProgressSettings),
     /// A Rich task exists and must still be stopped after the Rust action.
     Active {
         renderer: RichRenderer,
@@ -563,8 +587,8 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
     let render = match render {
         // Wait for Started before importing Rich. Requests rejected before the
         // action begins should not perform any progress-related Python work.
-        RenderState::Pending(mode) if event.kind() == ProgressEventKind::Started => successful(
-            try_python(|py| create_renderer(py, mode, event)),
+        RenderState::Pending(settings) if event.kind() == ProgressEventKind::Started => successful(
+            try_python(|py| create_renderer(py, settings, event)),
             &mut pending_interruption,
         )
         .flatten()
@@ -648,25 +672,34 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
 /// Returns `Ok(None)` when automatic progress should stay hidden.
 fn create_renderer(
     py: Python<'_>,
-    mode: ProgressMode,
+    settings: ProgressSettings,
     event: &ProgressEvent,
 ) -> PyResult<Option<RichRenderer>> {
-    // Rich detects the terminal or Jupyter environment. Delta Funnel only asks
-    // for stderr in terminals and tells Rich when progress is forced.
+    // Rich detects the terminal or Jupyter environment. Preview starts with a
+    // stdout console so the same object can render in notebook output. Other
+    // actions start directly on stderr.
     let console_type = py.import("rich.console")?.getattr("Console")?;
     let console_kwargs = PyDict::new(py);
-    console_kwargs.set_item("stderr", true)?;
-    if matches!(mode, ProgressMode::Forced) {
+    if settings.output == ProgressOutput::Stderr {
+        console_kwargs.set_item("stderr", true)?;
+    }
+    if matches!(settings.mode, ProgressMode::Forced) {
         console_kwargs.set_item("force_interactive", true)?;
     }
-    let console = console_type.call((), Some(&console_kwargs))?;
+    let mut console = console_type.call((), Some(&console_kwargs))?;
 
     // Rich reports Jupyter separately from interactive terminals. Automatic
     // mode stays quiet only when Rich reports neither one.
     let is_interactive = console.getattr("is_interactive")?.extract::<bool>()?;
     let is_jupyter = console.getattr("is_jupyter")?.extract::<bool>()?;
-    if matches!(mode, ProgressMode::Automatic) && !is_interactive && !is_jupyter {
+    if matches!(settings.mode, ProgressMode::Automatic) && !is_interactive && !is_jupyter {
         return Ok(None);
+    }
+    if settings.output == ProgressOutput::StdoutInNotebook && !is_jupyter {
+        // Rich ruled out Jupyter, so terminal and forced script previews move
+        // to stderr before any progress task is constructed.
+        console_kwargs.set_item("stderr", true)?;
+        console = console_type.call((), Some(&console_kwargs))?;
     }
 
     // Use the same columns in terminals and notebooks: elapsed time, current
@@ -1010,14 +1043,17 @@ class Console:
     def __init__(self, **kwargs):
         record({"call": "console", **kwargs})
         maybe_fail("console")
+        self.stderr = kwargs.get("stderr", False)
         self.is_interactive = interactive or kwargs.get("force_interactive", False)
         self.is_jupyter = jupyter
 
 class Progress:
     def __init__(self, *columns, **kwargs):
+        console = kwargs.get("console")
         record({
             "call": "progress",
             "columns": len(columns),
+            "console_stderr": None if console is None else console.stderr,
             "auto_refresh": kwargs.get("auto_refresh"),
             "transient": kwargs.get("transient"),
             "redirect_stdout": kwargs.get("redirect_stdout"),
@@ -1524,9 +1560,16 @@ sys.modules["rich.progress"] = progress_module
             assert_eq!(
                 record_strings(records.bind(py), "call")?,
                 [
-                    "console", "progress", "add_task", "start", "update", "update", "update",
-                    "update", "stop"
+                    "console", "console", "progress", "add_task", "start", "update", "update",
+                    "update", "update", "stop"
                 ]
+            );
+            assert!(
+                records
+                    .bind(py)
+                    .get_item(2)?
+                    .get_item("console_stderr")?
+                    .extract::<bool>()?
             );
             let descriptions = records
                 .bind(py)
@@ -1551,6 +1594,32 @@ sys.modules["rich.progress"] = progress_module
                     "Formatting preview",
                     "Completed",
                 ]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preview_uses_stdout_when_rich_detects_jupyter() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let (_guard, records) = ModuleGuard::install(py, false, true)?;
+
+            preview(py, None)?;
+
+            assert_eq!(
+                record_strings(records.bind(py), "call")?,
+                [
+                    "console", "progress", "add_task", "start", "update", "update", "update",
+                    "update", "stop"
+                ]
+            );
+            assert!(
+                !records
+                    .bind(py)
+                    .get_item(1)?
+                    .get_item("console_stderr")?
+                    .extract::<bool>()?
             );
             Ok(())
         })
