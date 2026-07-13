@@ -43,4 +43,5 @@ nav:
       - API references: reference/api.md
   - Contributors:
       - Local development: contributing/development.md
+      - SQL Server integration tests: contributing/sql-server-tests.md
       - DataFusion and Delta internals: internals/datafusion-delta.md

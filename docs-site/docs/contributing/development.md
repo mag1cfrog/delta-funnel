@@ -49,5 +49,5 @@ cargo xtask sqlserver-test
 The runner can start a local SQL Server container, create the test database,
 run Rust and Python write tests, and remove the container when it exits.
 
-See the detailed guide:
-[SQL Server integration tests](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/mssql-integration-tests.md).
+See [SQL Server integration tests](sql-server-tests.md) for container runtime,
+existing server, and individual suite options.
