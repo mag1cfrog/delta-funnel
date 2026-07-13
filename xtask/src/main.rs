@@ -238,10 +238,13 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
         .arg("pip")
         .arg("install")
         .arg("--no-cache-dir")
-        .arg("ipykernel")
+        .args(["ipykernel", "ipywidgets"])
         .env("PIP_CACHE_DIR", &pip_cache)
         .env("TMPDIR", &tool_tmp);
-    run_command(&mut command, "install ipykernel for progress smoke test")?;
+    run_command(
+        &mut command,
+        "install Jupyter runtime for progress smoke test",
+    )?;
 
     let mut command = Command::new(&venv_python);
     command

@@ -63,6 +63,65 @@ print("ACTION_DONE")
     assert display_indexes
     assert max(display_indexes) < action_done_index
 
+    write_all_messages = execute(
+        client,
+        """
+import deltafunnel
+
+session = deltafunnel.Session()
+outputs = [
+    session.table_from_sql("select 1 as id").to_mssql(
+        schema="dbo",
+        table="west",
+        load_mode="create_and_load",
+        connection_string="server=tcp:sql.example.com;password=not-used",
+    ),
+    session.table_from_sql("select 2 as id").to_mssql(
+        schema="dbo",
+        table="east",
+        load_mode="create_and_load",
+        connection_string="server=tcp:sql.example.com;password=not-used",
+    ),
+]
+report = session.write_all(outputs, dry_run=True, progress=True)
+assert report["run_mode"] == "dry_run"
+assert report["output_count"] == 2
+print("WRITE_ALL_DONE")
+""",
+    )
+    write_all_progress_indexes = [
+        index
+        for index, message in enumerate(write_all_messages)
+        if message["msg_type"] in {"display_data", "update_display_data"}
+    ]
+    write_all_progress = [
+        write_all_messages[index] for index in write_all_progress_indexes
+    ]
+    widget_views = [
+        message
+        for message in write_all_progress
+        if "application/vnd.jupyter.widget-view+json"
+        in message["content"].get("data", {})
+    ]
+    write_all_done_index = next(
+        index
+        for index, message in enumerate(write_all_messages)
+        if message["msg_type"] == "stream"
+        and "WRITE_ALL_DONE" in message["content"]["text"]
+    )
+    assert write_all_progress
+    assert len(widget_views) == 1
+    rendered_progress = "\n".join(
+        value
+        for message in write_all_progress
+        for value in message["content"].get("data", {}).values()
+        if isinstance(value, str)
+    )
+    assert "Output 1/2 - Planning output: west" in rendered_progress
+    assert "Output 2/2 - Planning output: east" in rendered_progress
+    assert "Completed" in rendered_progress
+    assert max(write_all_progress_indexes) < write_all_done_index
+
     preview_messages = execute(
         client,
         """
