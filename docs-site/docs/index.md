@@ -132,8 +132,6 @@ Rust users can start with [Installation](install.md), then continue to the
   standard-library logging.
 - [API references](reference/api.md): find the Rust and Python API entry
   points.
-- [DataFusion and Delta internals](internals/datafusion-delta.md): explore
-  contributor-focused implementation notes.
 
 ## What this site covers
 

@@ -1,11 +1,11 @@
-# DataFusion And Delta Internals
+# DataFusion and Delta Internals
 
 Delta Funnel uses DataFusion for SQL planning and execution, and Delta Kernel
 for Delta Lake metadata and protocol handling.
 
-This page is the entry point for deeper implementation notes. The notes are
-kept in the repository `docs/` directory because they are engineering records,
-not introductory user guides.
+The Delta provider connects those systems. It turns Delta scan metadata into
+bounded DataFusion work, applies Delta transforms and deletion vectors, and
+records read statistics for reports and progress displays.
 
 ## Delta scan planning
 
@@ -14,28 +14,12 @@ provider decides how many scan partitions to request before Delta scan metadata
 is expanded.
 
 - [Scan partition target policy](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/scan-partition-target-policy.md)
-- [Scan partition benchmark](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/scan-partition-benchmark.md)
 
-## Read scheduling
+## Read scheduling and dynamic pruning
 
 Provider reads are bounded so one scan cannot create unbounded file-read work.
 The native async backend applies Delta transforms and deletion-vector masks
-before rows reach DataFusion.
+before rows reach DataFusion. Dynamic partition pruning can skip selected files
+before that work starts.
 
 - [Delta provider read scheduling](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/provider-read-scheduling.md)
-- [Native async backend benchmark notes](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/native-async-backend-benchmark-notes.md)
-
-## Dynamic partition pruning
-
-Dynamic partition pruning is tracked separately because it crosses DataFusion
-physical optimization, Delta scan metadata, provider scheduling, metrics, and
-tests.
-
-- [Dynamic partition pruning investigation](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/dynamic-partition-pruning-investigation.md)
-
-## Dependency boundaries
-
-The first release keeps dependency alignment explicit around Arrow, DataFusion,
-Delta Kernel, and SQL Server writes.
-
-- [Dependency alignment](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/dependency-alignment.md)
