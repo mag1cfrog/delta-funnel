@@ -42,6 +42,10 @@ nav:
   - Reference:
       - API references: reference/api.md
   - Contributors:
-      - Local development: contributing/development.md
-      - SQL Server integration tests: contributing/sql-server-tests.md
-      - DataFusion and Delta internals: internals/datafusion-delta.md
+      - Development:
+          - Local development: contributing/development.md
+          - SQL Server integration tests: contributing/sql-server-tests.md
+      - Delta internals:
+          - DataFusion and Delta overview: internals/datafusion-delta.md
+          - Scan partition planning: internals/scan-partition-planning.md
+          - Provider read scheduling: internals/provider-read-scheduling.md

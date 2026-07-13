@@ -5,7 +5,7 @@ scan planning and provider execution. Its default mode is the deterministic
 synthetic matrix.
 
 The production policy is documented in
-[`scan-partition-target-policy.md`](scan-partition-target-policy.md).
+[Scan partition planning](../docs-site/docs/internals/scan-partition-planning.md).
 
 The synthetic mode does not read Parquet data, contact object storage, require
 S3 credentials, or execute production scan reads. It builds deterministic

@@ -13,7 +13,7 @@ Delta scan planning turns active Delta files into DataFusion scan work. The
 provider decides how many scan partitions to request before Delta scan metadata
 is expanded.
 
-- [Scan partition target policy](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/scan-partition-target-policy.md)
+- [Scan partition target policy](scan-partition-planning.md)
 
 ## Read scheduling and dynamic pruning
 
@@ -22,4 +22,4 @@ The native async backend applies Delta transforms and deletion-vector masks
 before rows reach DataFusion. Dynamic partition pruning can skip selected files
 before that work starts.
 
-- [Delta provider read scheduling](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/provider-read-scheduling.md)
+- [Delta provider read scheduling](provider-read-scheduling.md)

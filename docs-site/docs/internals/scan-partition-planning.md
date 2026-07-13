@@ -78,7 +78,7 @@ does not use:
 
 Those values belong to file task grouping after metadata expansion. They help
 decide how selected files are balanced across the already chosen target, but
-they do not choose the production target in this issue.
+they do not choose the production target under the current policy.
 
 Reasons:
 
@@ -88,15 +88,3 @@ Reasons:
   count.
 - Pre-metadata target derivation keeps zero-target validation before scan
   metadata expansion.
-
-## Benchmark
-
-The synthetic benchmark runner is documented in
-[`scan-partition-benchmark.md`](scan-partition-benchmark.md). It calls the
-production diagnostic facade rather than copying the policy, and it simulates
-grouping and scan work for multiple workload shapes, storage-like profiles, and
-policy parameters.
-
-The benchmark is for policy calibration. It is not production read execution and
-does not measure real Parquet decoding, Arrow batch memory, object-store request
-behavior, or DataFusion runtime scheduling.

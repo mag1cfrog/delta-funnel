@@ -1,9 +1,8 @@
 # Delta Provider Read Scheduling
 
 Delta DataFusion scan execution owns bounded scheduling for provider file reads.
-This document describes the provider scheduling state after the #4 execution
-work, including the #141 official-kernel limiter and the #145 native async
-backend.
+This page explains the two reader backends, concurrency limits, dynamic
+partition pruning, backpressure, and cancellation behavior.
 
 ## Reader Backends
 
@@ -64,7 +63,7 @@ deletion vectors, run physical-to-logical transforms, or emit batches. Kept
 tasks continue through the same reader backend path as before, including
 deletion-vector handling and residual DataFusion filtering.
 
-The first implementation is intentionally opportunistic. Placeholder,
+Dynamic pruning is intentionally opportunistic. Placeholder,
 incomplete, unsupported, missing-metadata, and unparsable dynamic filter states
 degrade to reading the file task. Files that have already started are not
 cancelled, and native async prefetch only skips tasks before they are opened or
@@ -104,7 +103,7 @@ The provider does not currently expose `dynamic_filters_completed` or
 that this scan can observe without coupling to producer internals or blocking
 file admission. A precise too-late counter would also need to observe that a
 dynamic filter became newly useful only after a task had already been opened or
-prefetched; the first implementation intentionally avoids that producer-state
+prefetched; the current design intentionally avoids that producer-state
 coupling.
 
 ## Backpressure And Cancellation
@@ -144,6 +143,3 @@ The native async backend routes Parquet reads through the selected
 permits. The current public scheduling surface is file-stream admission plus
 bounded file setup prefetch; request-level or range-level counters are not yet
 exported as provider metrics.
-
-Benchmark evidence for the current native async defaults is recorded in
-[`native-async-backend-benchmark-notes.md`](native-async-backend-benchmark-notes.md).
