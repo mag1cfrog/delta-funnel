@@ -1,4 +1,5 @@
 import ast
+import base64
 import contextlib
 import importlib.util
 import inspect
@@ -37,19 +38,30 @@ def delta_table_uri(root):
             "createdTime": 1587968585495,
         }
     }
-    add = {
-        "add": {
-            "path": "part-00000.parquet",
-            "partitionValues": {},
-            "size": 0,
-            "modificationTime": 1587968586000,
-            "dataChange": True,
+    parquet = base64.b64decode(
+        Path(__file__).with_name("progress_smoke.parquet.b64").read_text()
+    )
+    data_files = ["part-00000.parquet", "part-00001.parquet"]
+    for data_file in data_files:
+        (table / data_file).write_bytes(parquet)
+    adds = [
+        {
+            "add": {
+                "path": data_file,
+                "partitionValues": {},
+                "size": len(parquet),
+                "modificationTime": 1587968586000,
+                "dataChange": True,
+            }
         }
-    }
+        for data_file in data_files
+    ]
     (log / "00000000000000000000.json").write_text(
         f"{json.dumps(protocol)}\n{json.dumps(metadata)}\n"
     )
-    (log / "00000000000000000001.json").write_text(f"{json.dumps(add)}\n")
+    (log / "00000000000000000001.json").write_text(
+        "".join(f"{json.dumps(add)}\n" for add in adds)
+    )
     return table.resolve().as_uri()
 
 
@@ -243,7 +255,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
     registration_output = io.StringIO()
     with contextlib.redirect_stderr(registration_output):
-        deltafunnel.Session().delta_lake(
+        orders = deltafunnel.Session().delta_lake(
             source_uri,
             name="orders",
             progress=True,
@@ -251,6 +263,10 @@ with tempfile.TemporaryDirectory() as temp_dir:
     registration_text = registration_output.getvalue()
     assert "Completed" in registration_text
     assert source_uri not in registration_text
+
+    preview, preview_output = capture_stderr(orders.preview, progress=True)
+    assert "| id |" in preview.text
+    assert "Delta files 2/2" in preview_output
 
     for progress_mode in QUIET_PROGRESS_MODES:
         pending_session = deltafunnel.Session()
