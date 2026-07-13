@@ -150,30 +150,6 @@ impl MssqlOutputWriteJob {
     pub fn phase_timings(&self) -> &[PhaseTimingReport] {
         &self.phase_timings
     }
-
-    fn into_parts(
-        self,
-    ) -> (
-        SchemaRef,
-        ResolvedMssqlTarget,
-        MssqlSchemaPlanOptions,
-        MssqlOutputBatchStreamFactory,
-        MssqlWriteBackend,
-        ValidationOptions,
-        Vec<PhaseTimingReport>,
-        Option<ProgressReporter>,
-    ) {
-        (
-            self.output_schema,
-            self.resolved_target,
-            self.schema_options,
-            self.batches,
-            self.write_backend,
-            self.validation_options,
-            self.phase_timings,
-            self.progress_reporter,
-        )
-    }
 }
 
 /// SQL Server multi-output workflow options.
@@ -856,17 +832,17 @@ where
     W: MssqlWorkflowOutputWriter,
 {
     let target = job.target_summary();
-    let (
+    let MssqlOutputWriteJob {
         output_schema,
         resolved_target,
         schema_options,
         batches,
         write_backend,
         validation_options,
-        planned_phase_timings,
-        reporter,
-    ) = job.into_parts();
-    if let Some(reporter) = reporter.as_ref() {
+        phase_timings: planned_phase_timings,
+        progress_reporter,
+    } = job;
+    if let Some(reporter) = progress_reporter.as_ref() {
         reporter.emit(&ProgressEvent::phase_changed(
             ProgressPhase::SettingUpStream,
             Some(target.output_name()),
@@ -897,7 +873,7 @@ where
             batches,
             write_backend,
             validation_options,
-            reporter.as_ref(),
+            progress_reporter.as_ref(),
         )
         .await
     {
