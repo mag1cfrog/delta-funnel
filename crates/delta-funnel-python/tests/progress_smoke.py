@@ -47,12 +47,37 @@ def delta_table_uri(root):
     return table.resolve().as_uri()
 
 
-delta_lake_signature = inspect.signature(deltafunnel.Session.delta_lake)
-alias_signature = inspect.signature(deltafunnel.PendingDeltaSource.alias)
-assert delta_lake_signature.parameters["progress"].kind is inspect.Parameter.KEYWORD_ONLY
-assert delta_lake_signature.parameters["progress"].default is None
-assert alias_signature.parameters["progress"].kind is inspect.Parameter.KEYWORD_ONLY
-assert alias_signature.parameters["progress"].default is None
+def capture_stderr(action, *args, **kwargs):
+    output = io.StringIO()
+    with contextlib.redirect_stderr(output):
+        result = action(*args, **kwargs)
+    return result, output.getvalue()
+
+
+def capture_deltafunnel_error(action, *args, **kwargs):
+    output = io.StringIO()
+    with contextlib.redirect_stderr(output):
+        try:
+            action(*args, **kwargs)
+        except deltafunnel.DeltaFunnelError as error:
+            return error, output.getvalue()
+    raise AssertionError("DeltaFunnelError was not raised")
+
+
+for method in [
+    deltafunnel.Session.delta_lake,
+    deltafunnel.PendingDeltaSource.alias,
+    deltafunnel.Table.preview,
+    deltafunnel.Table.show,
+    deltafunnel.Table.write_to_mssql,
+    deltafunnel.Session.write_all,
+]:
+    progress_parameter = inspect.signature(method).parameters["progress"]
+    assert progress_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert progress_parameter.default is None
+
+
+QUIET_PROGRESS_MODES = ({}, {"progress": None}, {"progress": False})
 
 
 session = deltafunnel.Session()
@@ -70,16 +95,69 @@ logging_order = sys.argv[1]
 if logging_order == "after":
     deltafunnel.init_logging()
 
-automatic_output = io.StringIO()
-with contextlib.redirect_stderr(automatic_output):
-    report = table.write_to_mssql(**write_options)
-assert report["run_mode"] == "dry_run"
-assert automatic_output.getvalue() == ""
+for progress_mode in QUIET_PROGRESS_MODES:
+    report, output = capture_stderr(
+        table.write_to_mssql, **write_options, **progress_mode
+    )
+    assert report["run_mode"] == "dry_run"
+    assert output == ""
 
-forced_output = io.StringIO()
-with contextlib.redirect_stderr(forced_output):
-    table.write_to_mssql(**write_options, progress=True)
-assert "Completed" in forced_output.getvalue()
+_, forced_output = capture_stderr(table.write_to_mssql, **write_options, progress=True)
+assert "Completed" in forced_output
+
+execute_options = {
+    "schema": "dbo",
+    "table": "orders",
+    "load_mode": "append_existing",
+}
+for progress_mode in QUIET_PROGRESS_MODES:
+    error, output = capture_deltafunnel_error(
+        table.write_to_mssql, **execute_options, **progress_mode
+    )
+    assert error.kind == "missing_mssql_connection"
+    assert output == ""
+
+error, forced_output = capture_deltafunnel_error(
+    table.write_to_mssql, **execute_options, progress=True
+)
+assert error.kind == "missing_mssql_connection"
+assert "Failed" in forced_output
+
+dry_run_output = table.to_mssql(
+    schema="dbo",
+    table="orders",
+    load_mode="create_and_load",
+    connection_string="server=tcp:sql.example.com;password=not-used",
+)
+for progress_mode in QUIET_PROGRESS_MODES:
+    report, output = capture_stderr(
+        session.write_all, [dry_run_output], dry_run=True, **progress_mode
+    )
+    assert report["run_mode"] == "dry_run"
+    assert output == ""
+
+_, forced_output = capture_stderr(
+    session.write_all, [dry_run_output], dry_run=True, progress=True
+)
+assert "Completed" in forced_output
+
+execute_output = table.to_mssql(
+    schema="dbo",
+    table="orders",
+    load_mode="append_existing",
+)
+for progress_mode in QUIET_PROGRESS_MODES:
+    error, output = capture_deltafunnel_error(
+        session.write_all, [execute_output], **progress_mode
+    )
+    assert error.kind == "missing_mssql_connection"
+    assert output == ""
+
+error, forced_output = capture_deltafunnel_error(
+    session.write_all, [execute_output], progress=True
+)
+assert error.kind == "missing_mssql_connection"
+assert "Failed" in forced_output
 
 preview_stdout = io.StringIO()
 preview_stderr = io.StringIO()
@@ -91,13 +169,13 @@ assert "| id |" in preview.text
 assert preview_stdout.getvalue() == ""
 assert "Completed" in preview_stderr.getvalue()
 
-for automatic in ({}, {"progress": None}, {"progress": False}):
+for progress_mode in QUIET_PROGRESS_MODES:
     automatic_stdout = io.StringIO()
     automatic_stderr = io.StringIO()
     with contextlib.redirect_stdout(automatic_stdout), contextlib.redirect_stderr(
         automatic_stderr
     ):
-        automatic_preview = table.preview(**automatic)
+        automatic_preview = table.preview(**progress_mode)
     assert "| id |" in automatic_preview.text
     assert automatic_stdout.getvalue() == ""
     assert automatic_stderr.getvalue() == ""
@@ -109,6 +187,16 @@ with contextlib.redirect_stdout(show_stdout), contextlib.redirect_stderr(show_st
 assert "| id |" in show_stdout.getvalue()
 assert "Completed" not in show_stdout.getvalue()
 assert "Completed" in show_stderr.getvalue()
+
+for progress_mode in QUIET_PROGRESS_MODES:
+    quiet_stdout = io.StringIO()
+    quiet_stderr = io.StringIO()
+    with contextlib.redirect_stdout(quiet_stdout), contextlib.redirect_stderr(
+        quiet_stderr
+    ):
+        table.show(**progress_mode)
+    assert "| id |" in quiet_stdout.getvalue()
+    assert quiet_stderr.getvalue() == ""
 
 with tempfile.TemporaryDirectory() as temp_dir:
     source_uri = delta_table_uri(temp_dir)
@@ -124,18 +212,18 @@ with tempfile.TemporaryDirectory() as temp_dir:
     assert "Completed" in registration_text
     assert source_uri not in registration_text
 
-    pending_session = deltafunnel.Session()
-    pending_output = io.StringIO()
-    with contextlib.redirect_stderr(pending_output):
-        pending = pending_session.delta_lake(source_uri, progress=True)
-    assert pending_output.getvalue() == ""
-    assert "sources=[]" in repr(pending_session)
-
-    alias_output = io.StringIO()
-    with contextlib.redirect_stderr(alias_output):
-        pending.alias("orders", progress=False)
-    assert alias_output.getvalue() == ""
-    assert 'sources=["orders"]' in repr(pending_session)
+    for progress_mode in QUIET_PROGRESS_MODES:
+        pending_session = deltafunnel.Session()
+        pending, pending_output = capture_stderr(
+            pending_session.delta_lake, source_uri, progress=True
+        )
+        assert pending_output == ""
+        assert "sources=[]" in repr(pending_session)
+        _, alias_output = capture_stderr(
+            pending.alias, "orders", **progress_mode
+        )
+        assert alias_output == ""
+        assert 'sources=["orders"]' in repr(pending_session)
 
     alias_session = deltafunnel.Session()
     pending = alias_session.delta_lake(source_uri)
@@ -144,13 +232,13 @@ with tempfile.TemporaryDirectory() as temp_dir:
         pending.alias("orders", progress=True)
     assert "Completed" in alias_output.getvalue()
 
-    for automatic in ({}, {"progress": None}, {"progress": False}):
+    for progress_mode in QUIET_PROGRESS_MODES:
         automatic_output = io.StringIO()
         with contextlib.redirect_stderr(automatic_output):
             deltafunnel.Session().delta_lake(
                 source_uri,
                 name="orders",
-                **automatic,
+                **progress_mode,
             )
         assert automatic_output.getvalue() == ""
 
