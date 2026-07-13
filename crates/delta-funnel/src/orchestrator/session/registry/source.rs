@@ -308,6 +308,70 @@ mod tests {
     }
 
     #[test]
+    fn delta_lake_progress_preserves_each_reader_backend_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("progress-reader-backends")?;
+
+        for backend in [
+            DeltaProviderReaderBackend::OfficialKernel,
+            DeltaProviderReaderBackend::NativeAsync,
+        ] {
+            let provider_options =
+                DeltaProviderScanExecutionOptions::try_new_with_reader_backend(backend, 1, 1)?;
+            let mut ordinary = DeltaFunnelSession::new(
+                SessionOptions::new().with_provider_scan_options(provider_options),
+            )?;
+            let mut reported = DeltaFunnelSession::new(
+                SessionOptions::new().with_provider_scan_options(provider_options),
+            )?;
+            let source_uri = table.uri();
+
+            let ordinary_table =
+                ordinary.delta_lake(DeltaSourceConfig::new("orders", source_uri.clone()))?;
+            let (reporter, events) = recording_reporter();
+            let reported_table = reported
+                .delta_lake_with_progress(DeltaSourceConfig::new("orders", source_uri), reporter)?;
+
+            assert_eq!(reported_table, ordinary_table);
+            let ordinary_source = ordinary
+                .registered_source("orders")
+                .ok_or("ordinary source was not registered")?;
+            let reported_source = reported
+                .registered_source("orders")
+                .ok_or("reported source was not registered")?;
+            assert_eq!(reported_source.source_uri(), ordinary_source.source_uri());
+            assert_eq!(
+                reported_source.snapshot_version(),
+                ordinary_source.snapshot_version()
+            );
+            assert_eq!(reported_source.schema(), ordinary_source.schema());
+            assert_eq!(reported_source.protocol(), ordinary_source.protocol());
+            assert_eq!(
+                reported.source_reports()[0].scheduling().reader_backend(),
+                backend
+            );
+            let events = events.lock().map_err(|_| "progress events lock poisoned")?;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(ProgressEvent::phase)
+                    .collect::<Vec<_>>(),
+                [
+                    ProgressPhase::LoadingDeltaMetadata,
+                    ProgressPhase::ValidatingDeltaProtocol,
+                    ProgressPhase::PreparingDeltaProvider,
+                    ProgressPhase::RegisteringDeltaSource,
+                ]
+            );
+            assert_eq!(
+                events.last().map(ProgressEvent::kind),
+                Some(ProgressEventKind::Completed)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn delta_lake_progress_fails_after_start_for_source_loading_error()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
