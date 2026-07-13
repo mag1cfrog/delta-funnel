@@ -180,5 +180,5 @@ connection strings, raw metadata, raw rows, or raw internal errors.
 
 Use `deltafunnel.init_logging()` when you need diagnostic details. Logging and
 progress are independent and may be enabled together. See the
-[Python API walkthrough](python-api-walkthrough.md) for complete workflows and
+[Python quickstart](python-api-walkthrough.md) for a complete workflow and
 [Dry runs and reports](dry-runs-reports.md) for report semantics.

@@ -93,7 +93,7 @@ report = daily_orders.write_to_mssql(
 ```
 
 For private S3 sources, SQL Server load modes, dry runs, and reports, see the
-[`Python API walkthrough`](https://mag1cfrog.github.io/delta-funnel/python-api-walkthrough/),
+[`private S3 sources`](https://mag1cfrog.github.io/delta-funnel/advanced/private-s3/),
 [`SQL Server guide`](https://mag1cfrog.github.io/delta-funnel/sql-server/), and
 [`dry runs and reports`](https://mag1cfrog.github.io/delta-funnel/dry-runs-reports/).
 

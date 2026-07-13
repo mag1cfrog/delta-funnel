@@ -100,7 +100,7 @@ report = daily_orders.write_to_mssql(
 ```
 
 For private S3 sources, SQL Server load modes, dry runs, and reports, see the
-[Python API walkthrough](python-api-walkthrough.md),
+[Private S3 sources](advanced/private-s3.md),
 [SQL Server guide](sql-server.md), and
 [dry runs and reports](dry-runs-reports.md).
 
@@ -124,6 +124,8 @@ Rust users can start with [Installation](install.md), then continue to the
   structured results.
 - [Progress displays](progress.md): configure and interpret live Python
   progress.
+- [Private S3 sources](advanced/private-s3.md): configure credentials and
+  troubleshoot source access.
 - [API references](reference/api.md): find the Rust and Python API entry
   points.
 - [DataFusion and Delta internals](internals/datafusion-delta.md): explore

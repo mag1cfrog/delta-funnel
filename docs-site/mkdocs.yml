@@ -35,6 +35,7 @@ nav:
       - Dry runs and reports: dry-runs-reports.md
   - Advanced workflows:
       - Progress displays: progress.md
+      - Private S3 sources: advanced/private-s3.md
   - Reference:
       - API references: reference/api.md
   - Contributors:

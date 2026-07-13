@@ -1,8 +1,7 @@
-# Python API Walkthrough
+# Python Quickstart
 
-This walkthrough uses the `deltafunnel` package. Install it from PyPI, or build
-the local wheel first with `cargo xtask python-package-check` when developing
-the repository.
+This quickstart uses the `deltafunnel` package. Install it from PyPI as
+described in [Installation](install.md) before continuing.
 
 ## Create a session
 
@@ -44,66 +43,8 @@ orders = pending.alias("orders")
 For progress modes and source-registration behavior, see
 [Progress displays](progress.md).
 
-## Read a private S3 Delta table from a local shell
-
-`storage_options` are forwarded to the underlying object-store builder that
-Delta Funnel uses for S3 access. On the current S3 path, Delta Funnel does not
-auto-load shell `AWS_*` variables, `AWS_PROFILE`, or shared AWS config and
-credentials files.
-
-For a private S3 Delta table from a local shell, pass explicit credentials and
-region in `storage_options`:
-
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- `AWS_SESSION_TOKEN` as optional
-- `AWS_REGION`
-
-Delta Funnel also accepts these common lowercase aliases:
-
-- `aws_access_key_id`
-- `aws_secret_access_key`
-- `aws_session_token`
-- `aws_region`
-- `region`
-
-This works reliably:
-
-```python
-import os
-from deltafunnel import Session
-
-storage_options = {
-    "AWS_REGION": "us-east-1",
-    "AWS_ACCESS_KEY_ID": os.environ["AWS_ACCESS_KEY_ID"],
-    "AWS_SECRET_ACCESS_KEY": os.environ["AWS_SECRET_ACCESS_KEY"],
-}
-if os.environ.get("AWS_SESSION_TOKEN"):
-    storage_options["AWS_SESSION_TOKEN"] = os.environ["AWS_SESSION_TOKEN"]
-
-source = Session().delta_lake(
-    "s3://<private-bucket>/<delta-table>",
-    storage_options=storage_options,
-    name="source",
-)
-```
-
-This is not enough by itself:
-
-```python
-Session().delta_lake(
-    "s3://<private-bucket>/<delta-table>",
-    storage_options={"region": "us-east-1"},
-    name="source",
-)
-```
-
-`region` is a supported key, but `region` alone only sets region. It does not
-provide credentials.
-
-If the same table works in `deltalake` but fails in `deltafunnel`, the likely
-cause is a credential-discovery path mismatch, not a Delta snapshot or protocol
-problem.
+For private S3 credentials and troubleshooting, see
+[Private S3 sources](advanced/private-s3.md).
 
 ## Transform rows with SQL
 
