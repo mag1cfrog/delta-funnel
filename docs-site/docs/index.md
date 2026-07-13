@@ -122,6 +122,8 @@ Rust users can start with [Installation](install.md), then continue to the
 - [SQL Server writes](sql-server.md): configure connections and load modes.
 - [Dry runs and reports](dry-runs-reports.md): validate workflows and inspect
   structured results.
+- [Multiple outputs and shared caching](advanced/multiple-outputs.md): write
+  related outputs without repeating common upstream work.
 - [Progress displays](progress.md): configure and interpret live Python
   progress.
 - [Private S3 sources](advanced/private-s3.md): configure credentials and

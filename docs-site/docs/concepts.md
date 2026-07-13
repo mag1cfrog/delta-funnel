@@ -27,6 +27,9 @@ An output describes where a table should be written in SQL Server. Use
 `Table.to_mssql(...)` to create an output spec for `Session.write_all(...)`, or
 use `Table.write_to_mssql(...)` for a single output.
 
+See [Multiple outputs and shared caching](advanced/multiple-outputs.md) for the
+multi-output workflow.
+
 ## Report
 
 A report describes what Delta Funnel planned or executed. Dry-run reports

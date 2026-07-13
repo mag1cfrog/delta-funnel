@@ -105,8 +105,8 @@ execute them together. Shared lazy SQL dependencies can be cached during the
 workflow so common upstream work is not repeated for each output.
 
 See the
-[`dry runs and reports`](https://mag1cfrog.github.io/delta-funnel/dry-runs-reports/)
-guide for multi-output dry runs and cache options.
+[`multiple outputs and shared caching`](https://mag1cfrog.github.io/delta-funnel/advanced/multiple-outputs/)
+guide for setup, dry runs, cache options, and failure behavior.
 
 ## Rust Quickstart
 

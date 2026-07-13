@@ -34,6 +34,7 @@ nav:
       - SQL Server writes: sql-server.md
       - Dry runs and reports: dry-runs-reports.md
   - Advanced workflows:
+      - Multiple outputs and shared caching: advanced/multiple-outputs.md
       - Progress displays: progress.md
       - Private S3 sources: advanced/private-s3.md
       - Python logging: advanced/python-logging.md

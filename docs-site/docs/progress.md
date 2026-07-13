@@ -152,6 +152,9 @@ Progress reads statistics from work that the workflow already performs. It
 does not execute the query twice, run a count query, repeat shared cache work,
 or make extra source requests.
 
+For workflow setup and cache options, see
+[Multiple outputs and shared caching](advanced/multiple-outputs.md).
+
 ## Understand completion and interruption
 
 `Completed` means the top-level action succeeded. For `write_all`, `Completed
