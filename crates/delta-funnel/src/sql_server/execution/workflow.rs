@@ -25,8 +25,7 @@ use super::{
     LoadMode, MssqlBatchShapingReport, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteBackend,
     MssqlWriteFailureContext, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_backend,
-    drain_mssql_batches_for_stream_benchmark, write_output_batches_to_mssql_with_reporter,
-    write_output_batches_to_mssql_with_validation_options,
+    drain_mssql_batches_for_stream_benchmark, write_output_batches_to_mssql_for_workflow,
 };
 
 const OUTPUT_STREAM_SETUP_PHASE: &str = "output_stream_setup";
@@ -712,31 +711,16 @@ impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        match reporter {
-            Some(reporter) => {
-                write_output_batches_to_mssql_with_reporter(
-                    output_schema.as_ref(),
-                    resolved_target,
-                    schema_options,
-                    batches,
-                    write_backend,
-                    validation_options,
-                    reporter,
-                )
-                .await
-            }
-            None => {
-                write_output_batches_to_mssql_with_validation_options(
-                    output_schema.as_ref(),
-                    resolved_target,
-                    schema_options,
-                    batches,
-                    write_backend,
-                    validation_options,
-                )
-                .await
-            }
-        }
+        write_output_batches_to_mssql_for_workflow(
+            output_schema.as_ref(),
+            resolved_target,
+            schema_options,
+            batches,
+            write_backend,
+            validation_options,
+            reporter,
+        )
+        .await
     }
 }
 

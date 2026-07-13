@@ -157,8 +157,7 @@ pub use sql_server::{
 };
 pub(crate) use sql_server::{
     MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter, write_mssql_outputs_with_writer,
-    write_output_batches_to_mssql_with_reporter,
-    write_output_batches_to_mssql_with_validation_options,
+    write_output_batches_to_mssql_for_workflow,
 };
 pub use support::sanitize_uri_for_display;
 pub use table_formats::{

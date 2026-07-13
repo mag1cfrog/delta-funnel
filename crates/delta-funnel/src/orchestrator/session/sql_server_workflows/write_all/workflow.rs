@@ -8,8 +8,7 @@ use crate::{
     MssqlSchemaPlanOptions, MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, MssqlWriteBackend,
     MssqlWriteReport, ResolvedMssqlTarget, ValidationOptions, progress::ProgressReporter,
     usize_to_u64_saturating, write_mssql_outputs_with_writer,
-    write_output_batches_to_mssql_with_reporter,
-    write_output_batches_to_mssql_with_validation_options,
+    write_output_batches_to_mssql_for_workflow,
 };
 
 use super::super::super::{
@@ -37,31 +36,16 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowPublicOutputWriter {
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        match reporter {
-            Some(reporter) => {
-                write_output_batches_to_mssql_with_reporter(
-                    output_schema.as_ref(),
-                    resolved_target,
-                    schema_options,
-                    batches,
-                    write_backend,
-                    validation_options,
-                    reporter,
-                )
-                .await
-            }
-            None => {
-                write_output_batches_to_mssql_with_validation_options(
-                    output_schema.as_ref(),
-                    resolved_target,
-                    schema_options,
-                    batches,
-                    write_backend,
-                    validation_options,
-                )
-                .await
-            }
-        }
+        write_output_batches_to_mssql_for_workflow(
+            output_schema.as_ref(),
+            resolved_target,
+            schema_options,
+            batches,
+            write_backend,
+            validation_options,
+            reporter,
+        )
+        .await
     }
 }
 
