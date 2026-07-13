@@ -110,6 +110,61 @@ print("SHOW_DONE")
     assert show_progress_indexes
     assert max(show_progress_indexes) < show_table_index
 
+    registration_messages = execute(
+        client,
+        """
+import deltafunnel
+import tempfile
+
+with tempfile.TemporaryDirectory() as table:
+    try:
+        deltafunnel.Session().delta_lake(table, name="orders")
+    except deltafunnel.DeltaFunnelError as error:
+        assert error.kind == "delta_snapshot_load"
+    else:
+        raise AssertionError("registration unexpectedly succeeded")
+print("REGISTRATION_DONE")
+""",
+    )
+    registration_progress_indexes = [
+        index
+        for index, message in enumerate(registration_messages)
+        if message["msg_type"] in {"display_data", "update_display_data"}
+    ]
+    registration_done_index = next(
+        index
+        for index, message in enumerate(registration_messages)
+        if message["msg_type"] == "stream"
+        and "REGISTRATION_DONE" in message["content"]["text"]
+    )
+    assert registration_progress_indexes
+    assert max(registration_progress_indexes) < registration_done_index
+
+    pending_messages = execute(
+        client,
+        """
+import deltafunnel
+
+session = deltafunnel.Session()
+pending = session.delta_lake(
+    "file:///definitely-missing-delta-funnel-437",
+    progress=True,
+)
+assert "PendingDeltaSource" in repr(pending)
+assert "sources=[]" in repr(session)
+print("PENDING_DONE")
+""",
+    )
+    assert not any(
+        message["msg_type"] in {"display_data", "update_display_data"}
+        for message in pending_messages
+    )
+    assert any(
+        message["msg_type"] == "stream"
+        and "PENDING_DONE" in message["content"]["text"]
+        for message in pending_messages
+    )
+
     sentinel_messages = execute(client, 'print("SENTINEL")')
     assert not any(
         message["msg_type"] in {"display_data", "update_display_data"}
