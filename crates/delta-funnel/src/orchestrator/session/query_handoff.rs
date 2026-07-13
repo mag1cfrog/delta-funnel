@@ -120,12 +120,10 @@ struct DeltaFileProgressTracker {
     state: SharedDeltaFileProgressState,
 }
 
-/// Shared progress state and callback ordering for one physical plan.
+/// Shared progress state and reporter for one physical plan.
 pub(super) struct DeltaFileProgressCoordinator {
     state: Mutex<DeltaFileProgressState>,
     reporter: ProgressReporter,
-    // Separate from `state` so host callbacks never run while stats are locked.
-    delivery: Mutex<()>,
 }
 
 /// File progress state shared by every tracked stream in one physical plan.
@@ -155,7 +153,6 @@ pub(super) fn shared_delta_file_progress_state(
             output_name,
             last_file_progress: None,
         }),
-        delivery: Mutex::new(()),
     })
 }
 
@@ -206,24 +203,18 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
     stream
 }
 
-impl DeltaFileProgressTracker {
-    /// Emits only when the visible handled and total file counts have changed.
-    fn emit_if_changed(&self) {
-        // Partition tasks may reach this method concurrently. Serialize their
-        // callbacks, but release the stats lock before calling host code.
-        let _delivery = match self.state.delivery.lock() {
-            Ok(delivery) => delivery,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+impl DeltaFileProgressCoordinator {
+    /// Samples the current counters and emits without holding the stats lock.
+    pub(super) fn emit_if_changed(&self) {
         let event = {
-            let mut state = match self.state.state.lock() {
+            let mut state = match self.state.lock() {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
             state.pending_event()
         };
         if let Some(event) = event {
-            self.state.reporter.emit(&event);
+            self.reporter.emit(&event);
         }
     }
 }
@@ -252,17 +243,17 @@ impl Stream for DeltaFileProgressTracker {
         match self.inner.as_mut().poll_next(context) {
             Poll::Ready(None) => {
                 // Capture final progress before the shared counters are dropped.
-                self.emit_if_changed();
+                self.state.emit_if_changed();
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(error))) => {
                 // Keep the last partial progress when query execution fails.
-                self.emit_if_changed();
+                self.state.emit_if_changed();
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(Some(Ok(batch))) => {
                 // A ready batch is the existing foreground sampling boundary.
-                self.emit_if_changed();
+                self.state.emit_if_changed();
                 Poll::Ready(Some(Ok(batch)))
             }
             // Do not add a timer or wake the stream only to refresh progress.

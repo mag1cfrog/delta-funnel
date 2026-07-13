@@ -6,7 +6,7 @@ use datafusion::{
     prelude::{DataFrame, SessionContext},
 };
 use futures_util::{StreamExt, TryStreamExt};
-use tokio::task::JoinSet;
+use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream,
@@ -18,9 +18,7 @@ use crate::{
 use super::super::super::{
     DeltaFunnelSession, LazyTable,
     errors::{mssql_scoped_cache_alias_error, unknown_cached_alias_error},
-    query_handoff::{
-        SharedDeltaFileProgressState, shared_delta_file_progress_state, track_delta_file_progress,
-    },
+    query_handoff::{SharedDeltaFileProgressState, shared_delta_file_progress_state},
 };
 use super::MssqlDerivedCacheAliasPlan;
 
@@ -276,22 +274,44 @@ async fn collect_cache_partitions(
     alias_name: &str,
 ) -> Result<Vec<Vec<datafusion::arrow::record_batch::RecordBatch>>, DeltaFunnelError> {
     let mut tasks = JoinSet::new();
+    // Partition tasks only announce stream-consumption boundaries. The parent
+    // task samples counters and calls the reporter, so no callback needs a
+    // cross-task delivery lock.
+    let (progress_changed, mut progress_changes) = watch::channel(());
     for (partition_index, stream) in streams.into_iter().enumerate() {
-        let stream = track_delta_file_progress(stream, progress.clone());
-        tasks.spawn(async move { (partition_index, stream.try_collect::<Vec<_>>().await) });
+        let progress_changed = progress_changed.clone();
+        tasks.spawn(async move {
+            let batches = stream
+                .inspect(move |_| {
+                    let _ = progress_changed.send(());
+                })
+                .try_collect::<Vec<_>>()
+                .await;
+            (partition_index, batches)
+        });
     }
+    drop(progress_changed);
 
     let mut partitions = Vec::new();
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok((partition_index, batches)) => partitions.push((partition_index, batches?)),
-            Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
-            Err(error) => {
-                return Err(mssql_scoped_cache_alias_error(
-                    "materialize",
-                    alias_name,
-                    error,
-                ));
+    while !tasks.is_empty() {
+        tokio::select! {
+            Ok(()) = progress_changes.changed() => progress.emit_if_changed(),
+            Some(result) = tasks.join_next() => {
+                match result {
+                    Ok((partition_index, batches)) => {
+                        progress.emit_if_changed();
+                        partitions.push((partition_index, batches?));
+                    }
+                    Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
+                    Err(error) => {
+                        progress.emit_if_changed();
+                        return Err(mssql_scoped_cache_alias_error(
+                            "materialize",
+                            alias_name,
+                            error,
+                        ));
+                    }
+                }
             }
         }
     }

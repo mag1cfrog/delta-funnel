@@ -410,6 +410,7 @@ mod tests {
         batches: Option<u64>,
         files_handled: Option<u64>,
         files_total: Option<u64>,
+        task_id: Option<tokio::task::Id>,
     }
 
     fn recording_progress() -> (ProgressReporter, Arc<Mutex<Vec<RecordedProgress>>>) {
@@ -428,6 +429,7 @@ mod tests {
                     batches: event.batches(),
                     files_handled: event.files_handled(),
                     files_total: event.files_total(),
+                    task_id: tokio::task::try_id(),
                 });
             }
         });
@@ -999,6 +1001,7 @@ mod tests {
                 LoadMode::AppendExisting,
             )?;
             let (reporter, events) = recording_progress();
+            let action_task_id = tokio::task::try_id();
 
             let report = session
                 .write_all_with_progress_and_writer(
@@ -1020,6 +1023,11 @@ mod tests {
                 .filter(|event| event.phase == Some(ProgressPhase::MaterializingCache))
                 .collect::<Vec<_>>();
             assert!(!cache_events.is_empty());
+            assert!(
+                cache_events
+                    .iter()
+                    .all(|event| event.task_id == action_task_id)
+            );
             assert!(cache_events.iter().all(|event| {
                 event.output_name.is_none()
                     && event.output_index.is_none()
