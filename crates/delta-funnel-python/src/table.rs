@@ -212,7 +212,7 @@ pub(crate) fn add_table(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{deltafunnel, progress::adapter_creation_count};
+    use crate::{deltafunnel, progress::adapter_creation_count, test_support::python_state};
     use pyo3::exceptions::PyTypeError;
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyModule};
@@ -280,6 +280,7 @@ mod tests {
 
     #[test]
     fn table_show_prints_preview_to_python_stdout() -> PyResult<()> {
+        let _state = python_state();
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
             deltafunnel(&module)?;
