@@ -850,6 +850,7 @@ const fn ends_action(kind: ProgressEventKind) -> bool {
 /// Returns the text shown before Rust reports the first phase.
 const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
     match operation {
+        Some(ProgressOperation::RegisterDeltaSource) => "Loading Delta source",
         Some(ProgressOperation::PreviewTable) => "Previewing table",
         Some(ProgressOperation::WriteToMssql) => "Writing to SQL Server",
         Some(ProgressOperation::DryRunToMssql) => "Planning SQL Server write",
@@ -862,6 +863,10 @@ const fn operation_label(operation: Option<ProgressOperation>) -> &'static str {
 /// Returns safe, stable text for an internal Rust phase.
 const fn phase_label(phase: ProgressPhase) -> &'static str {
     match phase {
+        ProgressPhase::LoadingDeltaMetadata => "Loading Delta metadata",
+        ProgressPhase::ValidatingDeltaProtocol => "Validating Delta protocol",
+        ProgressPhase::PreparingDeltaProvider => "Preparing Delta provider",
+        ProgressPhase::RegisteringDeltaSource => "Registering Delta source",
         ProgressPhase::PreparingPreview => "Preparing preview",
         ProgressPhase::CollectingPreview => "Collecting preview",
         ProgressPhase::FormattingPreview => "Formatting preview",
@@ -892,7 +897,7 @@ const fn terminal_label(kind: ProgressEventKind) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
         thread,
@@ -909,11 +914,11 @@ mod tests {
     const MODULE_NAMES: [&str; 3] = ["rich", "rich.console", "rich.progress"];
     type ModuleSnapshot = Vec<(&'static str, Option<Py<PyAny>>)>;
 
-    struct ModuleGuard {
+    pub(crate) struct ModuleGuard {
         originals: Vec<(&'static str, Option<Py<PyAny>>)>,
     }
 
-    struct StderrGuard {
+    pub(crate) struct StderrGuard {
         original: Py<PyAny>,
     }
 
@@ -938,7 +943,7 @@ mod tests {
     }
 
     impl StderrGuard {
-        fn capture(py: Python<'_>) -> PyResult<(Self, Py<PyAny>)> {
+        pub(crate) fn capture(py: Python<'_>) -> PyResult<(Self, Py<PyAny>)> {
             let capture = py.import("io")?.call_method0("StringIO")?.unbind();
             let guard = Self::replace(py, capture.bind(py))?;
             Ok((guard, capture))
@@ -998,7 +1003,7 @@ mod tests {
                 .collect()
         }
 
-        fn install(
+        pub(crate) fn install(
             py: Python<'_>,
             interactive: bool,
             jupyter: bool,
@@ -1025,7 +1030,7 @@ mod tests {
             Ok((guard, records))
         }
 
-        fn install_with_failure(
+        pub(crate) fn install_with_failure(
             py: Python<'_>,
             interactive: bool,
             jupyter: bool,
@@ -1549,7 +1554,7 @@ sys.modules["rich.progress"] = progress_module
         Ok(())
     }
 
-    fn record_strings(records: &Bound<'_, PyList>, key: &str) -> PyResult<Vec<String>> {
+    pub(crate) fn record_strings(records: &Bound<'_, PyList>, key: &str) -> PyResult<Vec<String>> {
         records
             .iter()
             .map(|record| record.get_item(key)?.extract::<String>())
@@ -2888,6 +2893,22 @@ stream = HostileStderr()
     #[test]
     fn all_core_phases_have_curated_labels() {
         assert_eq!(
+            phase_label(ProgressPhase::LoadingDeltaMetadata),
+            "Loading Delta metadata"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::ValidatingDeltaProtocol),
+            "Validating Delta protocol"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::PreparingDeltaProvider),
+            "Preparing Delta provider"
+        );
+        assert_eq!(
+            phase_label(ProgressPhase::RegisteringDeltaSource),
+            "Registering Delta source"
+        );
+        assert_eq!(
             phase_label(ProgressPhase::PreparingPreview),
             "Preparing preview"
         );
@@ -2938,6 +2959,10 @@ stream = HostileStderr()
 
     #[test]
     fn all_core_operations_have_curated_labels() {
+        assert_eq!(
+            operation_label(Some(ProgressOperation::RegisterDeltaSource)),
+            "Loading Delta source"
+        );
         assert_eq!(
             operation_label(Some(ProgressOperation::PreviewTable)),
             "Previewing table"

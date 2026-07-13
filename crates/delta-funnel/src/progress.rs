@@ -16,6 +16,8 @@ type ProgressCallback = dyn Fn(&ProgressEvent) + Send + Sync + 'static;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ProgressOperation {
+    /// Load and register one named Delta source.
+    RegisterDeltaSource,
     /// Execute and format a bounded table preview.
     PreviewTable,
     /// Execute one SQL Server output write.
@@ -33,6 +35,14 @@ pub enum ProgressOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ProgressPhase {
+    /// Load Delta transaction-log metadata for a source.
+    LoadingDeltaMetadata,
+    /// Check that the loaded Delta protocol is supported.
+    ValidatingDeltaProtocol,
+    /// Build the DataFusion provider for a loaded Delta source.
+    PreparingDeltaProvider,
+    /// Add the prepared Delta provider to the DataFusion catalog.
+    RegisteringDeltaSource,
     /// Prepare the bounded query used for a table preview.
     PreparingPreview,
     /// Execute and collect the bounded preview query.
@@ -532,6 +542,7 @@ mod tests {
     #[test]
     fn started_events_preserve_each_operation_identity() {
         for operation in [
+            ProgressOperation::RegisterDeltaSource,
             ProgressOperation::PreviewTable,
             ProgressOperation::WriteToMssql,
             ProgressOperation::DryRunToMssql,

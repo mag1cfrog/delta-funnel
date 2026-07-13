@@ -1,5 +1,7 @@
 //! Delta table-format source loading.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{DeltaFunnelError, error::DeltaSourceSchemaSnafu, observability};
@@ -40,6 +42,17 @@ pub(crate) use read::{
     KernelDataFileReaderConfig, KernelDataFileTransformRequest, KernelScanReadSchema,
 };
 use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot, s3_auth_mode_hint_for_source};
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_METADATA_LOAD_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Returns this test thread's number of Delta snapshot metadata load attempts.
+#[cfg(test)]
+pub(crate) fn snapshot_metadata_load_attempt_count() -> usize {
+    SNAPSHOT_METADATA_LOAD_ATTEMPTS.get()
+}
 
 /// Metadata-only expansion of one kernel scan.
 ///
@@ -593,6 +606,8 @@ fn load_delta_source_after_name_validation(
         storage_options,
     } = config;
 
+    #[cfg(test)]
+    SNAPSHOT_METADATA_LOAD_ATTEMPTS.set(SNAPSHOT_METADATA_LOAD_ATTEMPTS.get().saturating_add(1));
     let result = load_delta_table_snapshot(&table_uri, version, &storage_options).map(|snapshot| {
         PlannedDeltaSource {
             name,

@@ -10,6 +10,8 @@ pub(crate) use delta::KernelStructType;
 #[cfg(test)]
 pub(crate) use delta::build_projected_delta_scan;
 #[cfg(test)]
+pub(crate) use delta::snapshot_metadata_load_attempt_count;
+#[cfg(test)]
 pub(crate) use delta::test_support::RealParquetDeltaTable;
 pub(crate) use delta::{
     DeltaKernelPartitionScalarAdapterError, DeltaKernelPredicate, KernelColumnMetadataKey,

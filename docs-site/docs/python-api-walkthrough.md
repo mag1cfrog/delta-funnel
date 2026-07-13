@@ -27,12 +27,39 @@ require an ODBC DSN.
 ## Register a Delta source
 
 ```python
-orders = session.delta_lake("file:///path/to/orders-delta", name="orders")
+orders = session.delta_lake(
+    "file:///path/to/orders-delta",
+    name="orders",
+    progress=None,
+)
 ```
 
 Passing `name` registers the source immediately so SQL can reference it.
 Calling `session.delta_lake(...)` without `name` returns a pending source; call
 `.alias("orders")` before using it in SQL.
+
+Source registration uses an indeterminate Rich display because it loads Delta
+metadata but does not scan data files. The display follows metadata loading,
+protocol validation, provider preparation, and catalog registration. By
+default, it appears in interactive terminals and notebooks and stays quiet in
+scripts and CI. Pass `progress=True` to force it or `progress=False` to disable
+it for one registration.
+
+For a pending source, select progress when calling `alias(...)`:
+
+```python
+pending = session.delta_lake("file:///path/to/orders-delta")
+orders = pending.alias("orders", progress=True)
+```
+
+Creating the pending source performs no source loading and shows no progress,
+even if that earlier call receives `progress=True`. It does not save the value.
+Only the later `alias(..., progress=...)` argument controls registration.
+
+Registration progress has no file, byte, row, or percentage total and does not
+make extra object-store requests. Source locations, storage options,
+credentials, raw metadata, and raw errors are not displayed. Progress is a
+concise status view, not a replacement for detailed logging and tracing.
 
 ## Read a private S3 Delta table from a local shell
 

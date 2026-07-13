@@ -38,6 +38,7 @@ class Session:
         version: int | None = None,
         storage_options: Mapping[str, str] | None = None,
         name: str,
+        progress: bool | None = None,
     ) -> Table: ...
 
     @overload
@@ -48,6 +49,7 @@ class Session:
         version: int | None = None,
         storage_options: Mapping[str, str] | None = None,
         name: None = None,
+        progress: bool | None = None,
     ) -> PendingDeltaSource: ...
 
     def table_from_sql(self, sql: str) -> Table: ...
@@ -63,7 +65,7 @@ class Session:
 
 
 class PendingDeltaSource:
-    def alias(self, name: str) -> Table: ...
+    def alias(self, name: str, *, progress: bool | None = None) -> Table: ...
 
 
 class Preview:

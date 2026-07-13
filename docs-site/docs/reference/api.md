@@ -29,6 +29,22 @@ Core Python entry points:
 - `MssqlOutputSpec`
 - `DeltaFunnelError`
 
+`Session.delta_lake(source_uri, *, version=None, storage_options=None,
+name=None, progress=None)` registers a named Delta source immediately when
+`name` is present. Without `name`, it returns a lazy `PendingDeltaSource` and
+does not load or register the source.
+
+`PendingDeltaSource.alias(name, *, progress=None)` performs the deferred
+registration. For both registration forms, `progress=None` enables automatic
+terminal and notebook progress, `True` forces it, and `False` disables it.
+Progress is selected per registration call. A `progress` value passed while
+creating an unnamed pending source is not saved or reused by `alias(...)`.
+
+Delta source registration progress is indeterminate and reports metadata,
+protocol, provider, and catalog phases. Registration does not scan data files,
+so it does not show file, byte, row, or percentage progress. The display omits
+source locations, storage options, credentials, raw metadata, and raw errors.
+
 `Table.preview(limit=20, *, progress=None)` returns a `Preview` object.
 `Table.show(limit=20, *, progress=None)` executes the same preview and prints
 the text form to Python stdout. Both execute the DataFusion query with the limit
