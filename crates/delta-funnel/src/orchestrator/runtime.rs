@@ -160,7 +160,7 @@ impl DeltaFunnelRuntime {
         reporter: ProgressReporter,
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
         reject_nested_runtime()?;
-        session.dry_run_all_to_mssql_with_progress(requests, reporter)
+        session.dry_run_all_to_mssql_with_observability(requests, Some(reporter))
     }
 
     /// Runs a multi-output dry run with source scan-summary options.
