@@ -1,4 +1,6 @@
+import ast
 import contextlib
+import importlib.util
 import inspect
 import io
 import json
@@ -8,6 +10,10 @@ import tempfile
 from pathlib import Path
 
 import deltafunnel
+
+
+for optional_module in ["IPython", "ipykernel", "ipywidgets", "jupyter_client"]:
+    assert importlib.util.find_spec(optional_module) is None
 
 
 def delta_table_uri(root):
@@ -75,6 +81,40 @@ for method in [
     progress_parameter = inspect.signature(method).parameters["progress"]
     assert progress_parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert progress_parameter.default is None
+
+
+stub = ast.parse(Path(deltafunnel.__file__).with_name("__init__.pyi").read_text())
+expected_stub_methods = {
+    "Session": {"delta_lake", "write_all"},
+    "PendingDeltaSource": {"alias"},
+    "Table": {"preview", "show", "write_to_mssql"},
+}
+checked_stub_methods = set()
+for class_definition in [node for node in stub.body if isinstance(node, ast.ClassDef)]:
+    expected_methods = expected_stub_methods.get(class_definition.name, set())
+    for method in [
+        node
+        for node in class_definition.body
+        if isinstance(node, ast.FunctionDef) and node.name in expected_methods
+    ]:
+        keyword_defaults = dict(
+            zip(method.args.kwonlyargs, method.args.kw_defaults, strict=True)
+        )
+        progress_argument, progress_default = next(
+            (argument, default)
+            for argument, default in keyword_defaults.items()
+            if argument.arg == "progress"
+        )
+        assert ast.unparse(progress_argument.annotation) == "bool | None"
+        assert isinstance(progress_default, ast.Constant)
+        assert progress_default.value is None
+        checked_stub_methods.add((class_definition.name, method.name))
+
+assert checked_stub_methods == {
+    (class_name, method)
+    for class_name, methods in expected_stub_methods.items()
+    for method in methods
+}
 
 
 QUIET_PROGRESS_MODES = ({}, {"progress": None}, {"progress": False})
