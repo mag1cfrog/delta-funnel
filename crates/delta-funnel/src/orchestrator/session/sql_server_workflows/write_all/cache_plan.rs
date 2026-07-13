@@ -8,7 +8,6 @@ use super::super::super::{
 };
 
 /// Planner output for one `write_all` cache-selection pass.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MssqlOutputCachePlan {
     selected_outputs: Vec<MssqlOutputCachePlanOutput>,
@@ -16,7 +15,6 @@ pub(crate) struct MssqlOutputCachePlan {
     skipped_candidates: Vec<MssqlCacheCandidateSkip>,
 }
 
-#[allow(dead_code)]
 impl MssqlOutputCachePlan {
     pub(super) fn new(
         selected_outputs: Vec<MssqlOutputCachePlanOutput>,
@@ -42,6 +40,7 @@ impl MssqlOutputCachePlan {
     }
 
     /// Returns selected outputs in caller-provided order.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn selected_outputs(&self) -> &[MssqlOutputCachePlanOutput] {
         &self.selected_outputs
@@ -72,7 +71,6 @@ impl fmt::Debug for MssqlOutputCachePlan {
 }
 
 /// Selected output identity captured for cache planning.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MssqlOutputCachePlanOutput {
     index: usize,
@@ -81,7 +79,6 @@ pub(crate) struct MssqlOutputCachePlanOutput {
     output_name: String,
 }
 
-#[allow(dead_code)]
 impl MssqlOutputCachePlanOutput {
     pub(super) fn from_request(index: usize, request: &OutputWritePlan) -> Self {
         Self {
@@ -93,24 +90,28 @@ impl MssqlOutputCachePlanOutput {
     }
 
     /// Returns the output index from the caller-provided request list.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn index(&self) -> usize {
         self.index
     }
 
     /// Returns the selected lazy table id.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn table_id(&self) -> u64 {
         self.table_id
     }
 
     /// Returns the selected lazy table name.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn table_name(&self) -> &str {
         &self.table_name
     }
 
     /// Returns the selected output name.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn output_name(&self) -> &str {
         &self.output_name
@@ -130,7 +131,6 @@ impl fmt::Debug for MssqlOutputCachePlanOutput {
 }
 
 /// Cache decision for one `write_all` cache-selection pass.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MssqlOutputCacheDecision {
     /// No safe shared cache candidate was selected.
@@ -143,7 +143,6 @@ pub(crate) enum MssqlOutputCacheDecision {
 }
 
 /// Conservative reason no cache alias was selected.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MssqlNoCacheReason {
     /// Cache selection only helps when at least two outputs use a candidate.
@@ -155,7 +154,6 @@ pub(crate) enum MssqlNoCacheReason {
 }
 
 /// Selected registered derived alias cache candidate.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MssqlDerivedCacheAliasPlan {
     table_id: u64,
@@ -163,8 +161,8 @@ pub(crate) struct MssqlDerivedCacheAliasPlan {
     output_indexes: Vec<usize>,
 }
 
-#[allow(dead_code)]
 impl MssqlDerivedCacheAliasPlan {
+    #[cfg(test)]
     pub(crate) fn new(table_id: u64, alias: String, output_indexes: Vec<usize>) -> Self {
         Self {
             table_id,
@@ -215,7 +213,6 @@ impl fmt::Debug for MssqlDerivedCacheAliasPlan {
 }
 
 /// Stream construction route for one output while cache aliases are active.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MssqlCachedOutputStreamRoute {
     /// The selected output table is itself an active cached alias.
@@ -227,7 +224,6 @@ pub(crate) enum MssqlCachedOutputStreamRoute {
 }
 
 /// Candidate skipped during conservative cache selection.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MssqlCacheCandidateSkip {
     table_id: u64,
@@ -235,7 +231,6 @@ pub(crate) struct MssqlCacheCandidateSkip {
     reason: MssqlCacheCandidateSkipReason,
 }
 
-#[allow(dead_code)]
 impl MssqlCacheCandidateSkip {
     pub(super) fn from_registered(
         derived: &RegisteredDerivedTable,
@@ -279,7 +274,6 @@ impl fmt::Debug for MssqlCacheCandidateSkip {
 }
 
 /// Reason a candidate was not eligible for cache selection.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MssqlCacheCandidateSkipReason {
     /// Fewer than two selected outputs use this candidate.
@@ -318,7 +312,6 @@ pub(super) struct MssqlCoveredCacheAlias {
 }
 
 impl DeltaFunnelSession {
-    #[allow(dead_code)]
     pub(crate) fn plan_mssql_output_cache(
         &self,
         requests: &[OutputWritePlan],
