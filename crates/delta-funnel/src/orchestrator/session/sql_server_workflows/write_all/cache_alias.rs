@@ -18,7 +18,7 @@ use crate::{
 use super::super::super::{
     DeltaFunnelSession, LazyTable,
     errors::{mssql_scoped_cache_alias_error, unknown_cached_alias_error},
-    query_handoff::{SharedDeltaFileProgressState, shared_delta_file_progress_state},
+    query_handoff::DeltaFileProgressCoordinator,
 };
 use super::MssqlDerivedCacheAliasPlan;
 
@@ -175,7 +175,7 @@ impl DeltaFunnelSession {
             .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
         let schema = physical_plan.schema();
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-        let progress = shared_delta_file_progress_state(
+        let progress = DeltaFileProgressCoordinator::new(
             read_stats_handles,
             reporter.clone(),
             ProgressPhase::MaterializingCache,
@@ -270,7 +270,7 @@ impl DeltaFunnelSession {
 /// Collects each cache partition in its own Tokio task and restores its order.
 async fn collect_cache_partitions(
     streams: Vec<MssqlOutputBatchStream>,
-    progress: SharedDeltaFileProgressState,
+    mut progress: DeltaFileProgressCoordinator,
     alias_name: &str,
 ) -> Result<Vec<Vec<datafusion::arrow::record_batch::RecordBatch>>, DeltaFunnelError> {
     let mut tasks = JoinSet::new();
@@ -407,7 +407,7 @@ mod tests {
                 Box::pin(stream) as MssqlOutputBatchStream
             })
             .collect();
-        let progress = shared_delta_file_progress_state(
+        let progress = DeltaFileProgressCoordinator::new(
             Vec::new(),
             ProgressReporter::default(),
             ProgressPhase::MaterializingCache,

@@ -111,59 +111,71 @@ impl Stream for FinalDeltaReadStatsRecorder {
 
 /// Reports Delta file progress while forwarding one batch stream.
 ///
-/// Trackers for separate partitions can share one state so file counts remain
-/// monotonic across the whole physical plan. The state keeps only provider
-/// counters and does not retain the plan, run another query, or read Delta
-/// metadata again.
+/// The tracker owns the progress coordinator for this stream. It samples the
+/// existing provider counters without retaining the plan, running another
+/// query, or reading Delta metadata again.
 struct DeltaFileProgressTracker {
     inner: MssqlOutputBatchStream,
-    state: SharedDeltaFileProgressState,
+    progress: DeltaFileProgressCoordinator,
 }
 
-/// Shared progress state and reporter for one physical plan.
+/// Owns the counters and reporter used to emit file progress for one plan.
 pub(super) struct DeltaFileProgressCoordinator {
-    state: Mutex<DeltaFileProgressState>,
-    reporter: ProgressReporter,
-}
-
-/// File progress state shared by every tracked stream in one physical plan.
-struct DeltaFileProgressState {
     // One live counter handle for each Delta scan in the output plan.
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+    reporter: ProgressReporter,
     phase: ProgressPhase,
     output_name: Option<String>,
     // The last emitted handled and total counts, used to suppress duplicates.
     last_file_progress: Option<(u64, u64)>,
 }
 
-pub(super) type SharedDeltaFileProgressState = Arc<DeltaFileProgressCoordinator>;
-
-/// Creates one shared file progress state for a physical plan.
-pub(super) fn shared_delta_file_progress_state(
-    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
-    reporter: ProgressReporter,
-    phase: ProgressPhase,
-    output_name: Option<String>,
-) -> SharedDeltaFileProgressState {
-    Arc::new(DeltaFileProgressCoordinator {
-        reporter,
-        state: Mutex::new(DeltaFileProgressState {
+impl DeltaFileProgressCoordinator {
+    /// Creates a file progress coordinator for one physical plan.
+    pub(super) fn new(
+        read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+        reporter: ProgressReporter,
+        phase: ProgressPhase,
+        output_name: Option<String>,
+    ) -> Self {
+        Self {
             read_stats_handles,
+            reporter,
             phase,
             output_name,
             last_file_progress: None,
-        }),
-    })
+        }
+    }
+
+    /// Emits the current file counts when they have changed since the last sample.
+    pub(super) fn emit_if_changed(&mut self) {
+        let snapshots = snapshot_delta_provider_read_stats(&self.read_stats_handles);
+        let Some(event) = ProgressEvent::file_progress_from_provider_stats(
+            self.phase,
+            self.output_name.as_deref(),
+            &snapshots,
+        ) else {
+            return;
+        };
+        let Some(file_progress) = event.files_handled().zip(event.files_total()) else {
+            return;
+        };
+        if self.last_file_progress == Some(file_progress) {
+            return;
+        }
+        self.last_file_progress = Some(file_progress);
+        self.reporter.emit(&event);
+    }
 }
 
-/// Wraps a stream so polling it samples the shared file progress state.
+/// Wraps a stream so polling it samples the plan's file progress counters.
 pub(super) fn track_delta_file_progress(
     stream: MssqlOutputBatchStream,
-    state: SharedDeltaFileProgressState,
+    progress: DeltaFileProgressCoordinator,
 ) -> MssqlOutputBatchStream {
     Box::pin(DeltaFileProgressTracker {
         inner: stream,
-        state,
+        progress,
     })
 }
 
@@ -185,13 +197,13 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
 
     let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan);
     if let Some((reporter, output_name)) = progress {
-        let state = shared_delta_file_progress_state(
+        let progress = DeltaFileProgressCoordinator::new(
             read_stats_handles.clone(),
             reporter,
             ProgressPhase::Writing,
             Some(output_name),
         );
-        stream = track_delta_file_progress(stream, state);
+        stream = track_delta_file_progress(stream, progress);
     }
     if let Some(provider_stats) = provider_stats {
         stream = Box::pin(FinalDeltaReadStatsRecorder::new(
@@ -203,57 +215,24 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
     stream
 }
 
-impl DeltaFileProgressCoordinator {
-    /// Samples the current counters and emits without holding the stats lock.
-    pub(super) fn emit_if_changed(&self) {
-        let event = {
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            state.pending_event()
-        };
-        if let Some(event) = event {
-            self.reporter.emit(&event);
-        }
-    }
-}
-
-impl DeltaFileProgressState {
-    fn pending_event(&mut self) -> Option<ProgressEvent> {
-        let snapshots = snapshot_delta_provider_read_stats(&self.read_stats_handles);
-        let event = ProgressEvent::file_progress_from_provider_stats(
-            self.phase,
-            self.output_name.as_deref(),
-            &snapshots,
-        )?;
-        let file_progress = event.files_handled().zip(event.files_total())?;
-        if self.last_file_progress == Some(file_progress) {
-            return None;
-        }
-        self.last_file_progress = Some(file_progress);
-        Some(event)
-    }
-}
-
 impl Stream for DeltaFileProgressTracker {
     type Item = Result<RecordBatch, DeltaFunnelError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(context) {
             Poll::Ready(None) => {
-                // Capture final progress before the shared counters are dropped.
-                self.state.emit_if_changed();
+                // Capture final progress before the provider counters are dropped.
+                self.progress.emit_if_changed();
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(error))) => {
                 // Keep the last partial progress when query execution fails.
-                self.state.emit_if_changed();
+                self.progress.emit_if_changed();
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(Some(Ok(batch))) => {
                 // A ready batch is the existing foreground sampling boundary.
-                self.state.emit_if_changed();
+                self.progress.emit_if_changed();
                 Poll::Ready(Some(Ok(batch)))
             }
             // Do not add a timer or wake the stream only to refresh progress.
@@ -323,14 +302,14 @@ impl DeltaFunnelSession {
             return Ok(stream);
         };
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-        let state = shared_delta_file_progress_state(
+        let progress = DeltaFileProgressCoordinator::new(
             read_stats_handles,
             reporter.clone(),
             ProgressPhase::Writing,
             Some(output_name.to_owned()),
         );
 
-        Ok(track_delta_file_progress(stream, state))
+        Ok(track_delta_file_progress(stream, progress))
     }
 
     /// Executes a bounded preview of a lazy table and returns DataFusion's
@@ -393,13 +372,13 @@ impl DeltaFunnelSession {
             Some(reporter) => {
                 let read_stats_handles =
                     collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-                let state = shared_delta_file_progress_state(
+                let progress = DeltaFileProgressCoordinator::new(
                     read_stats_handles,
                     reporter.clone(),
                     ProgressPhase::CollectingPreview,
                     None,
                 );
-                track_delta_file_progress(stream, state)
+                track_delta_file_progress(stream, progress)
             }
             None => stream,
         };
@@ -647,20 +626,18 @@ pub(super) async fn dataframe_for_lazy_table_from_session_parts(
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     };
-
-    use datafusion::{
-        arrow::datatypes::DataType,
-        logical_expr::{Volatility, create_udf},
-    };
-    use futures_util::StreamExt;
 
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, QueryOptions,
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         table_formats::RealParquetDeltaTable,
+    };
+    use datafusion::{
+        arrow::datatypes::DataType,
+        logical_expr::{Volatility, create_udf},
     };
 
     use super::super::{
@@ -786,67 +763,6 @@ mod tests {
         assert!(last.2 > 0);
         assert_eq!(last.1, last.2);
         assert!(events.windows(2).all(|events| events[0] != events[1]));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn file_progress_callback_runs_without_holding_stats_lock()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = RealParquetDeltaTable::new_default("orders")?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
-        let dataframe = session.dataframe_for_lazy_table(&source).await?;
-        let task_context = Arc::new(dataframe.task_ctx());
-        let physical_plan = dataframe
-            .create_physical_plan()
-            .await
-            .map_err(|error| super::datafusion_handoff_setup_error("physical_plan", error))?;
-        let read_stats_handles =
-            super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-        let callback_state = Arc::new(OnceLock::<super::SharedDeltaFileProgressState>::new());
-        let reporter_state = Arc::clone(&callback_state);
-        let callback_seen = Arc::new(AtomicBool::new(false));
-        let reporter_callback_seen = Arc::clone(&callback_seen);
-        let stats_lock_was_held = Arc::new(AtomicBool::new(false));
-        let reporter_stats_lock_was_held = Arc::clone(&stats_lock_was_held);
-        let reporter = ProgressReporter::new(move |event| {
-            if event.files_total().is_none() {
-                return;
-            }
-            let Some(state) = reporter_state.get() else {
-                return;
-            };
-            reporter_callback_seen.store(true, Ordering::SeqCst);
-            if state.state.try_lock().is_err() {
-                reporter_stats_lock_was_held.store(true, Ordering::SeqCst);
-            }
-        });
-        let progress = super::shared_delta_file_progress_state(
-            read_stats_handles,
-            reporter,
-            ProgressPhase::Writing,
-            Some("orders output".to_owned()),
-        );
-        if callback_state.set(progress.clone()).is_err() {
-            return Err("file progress state was already initialized".into());
-        }
-        let stream = crate::datafusion_query_output_stream(physical_plan, task_context)
-            .map_err(|error| super::datafusion_handoff_setup_error("query_output_stream", error))?;
-        let stream: crate::MssqlOutputBatchStream = Box::pin(stream.map(|batch| {
-            batch.map_err(|error| {
-                super::datafusion_handoff_setup_error("query_output_stream", error)
-            })
-        }));
-
-        let rows =
-            collect_stream_row_count(super::track_delta_file_progress(stream, progress)).await?;
-
-        assert_eq!(rows, table.rows());
-        assert!(callback_seen.load(Ordering::SeqCst));
-        assert!(!stats_lock_was_held.load(Ordering::SeqCst));
         Ok(())
     }
 
