@@ -379,7 +379,7 @@ mod tests {
 
         assert_eq!(markers, vec!["shared", "shared"]);
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-        let _restoration = replacement.restore().await?;
+        replacement.restore()?;
         Ok(())
     }
 
@@ -430,7 +430,7 @@ mod tests {
 
         assert_eq!(markers, vec!["unrelated"]);
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-        let _restoration = replacement.restore().await?;
+        replacement.restore()?;
         Ok(())
     }
 
@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(west_markers, vec!["shared"]);
         assert_eq!(east_markers, vec!["shared"]);
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
-        let _restoration = replacement.restore().await?;
+        replacement.restore()?;
         Ok(())
     }
 
@@ -563,8 +563,8 @@ mod tests {
         assert_eq!(markers, vec!["big"]);
         assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
         assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
-        let _names_restoration = names_replacement.restore().await?;
-        let _big_restoration = big_replacement.restore().await?;
+        names_replacement.restore()?;
+        big_replacement.restore()?;
         Ok(())
     }
 
@@ -623,7 +623,7 @@ mod tests {
                 if message.contains("cached output stream setup failed for `west_output`")
                     && message.contains("replanned output schema does not match")
         ));
-        let _restoration = replacement.restore().await?;
+        replacement.restore()?;
         Ok(())
     }
 
@@ -677,7 +677,7 @@ mod tests {
             Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
                 if message.contains("cached output stream setup failed for `west_output`")
         ));
-        let _restoration = replacement.restore().await?;
+        replacement.restore()?;
         Ok(())
     }
 }
