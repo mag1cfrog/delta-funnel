@@ -38,4 +38,5 @@ nav:
   - Reference:
       - API references: reference/api.md
   - Contributors:
+      - Local development: contributing/development.md
       - DataFusion and Delta internals: internals/datafusion-delta.md

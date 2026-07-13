@@ -175,5 +175,4 @@ For the full Rust API, see
 ## Development
 
 For local builds and test setup, see the
-[`installation guide`](https://mag1cfrog.github.io/delta-funnel/install/) and
-[`SQL Server guide`](https://mag1cfrog.github.io/delta-funnel/sql-server/).
+[`local development guide`](https://mag1cfrog.github.io/delta-funnel/contributing/development/).
