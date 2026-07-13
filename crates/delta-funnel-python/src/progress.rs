@@ -499,8 +499,12 @@ fn attachment_unavailable_for_test() -> bool {
     remaining == 1
 }
 
-/// Returns Rich's value, or saves the first interruption for `finish`.
-fn successful<T>(call: PythonCall<T>, pending_interruption: &mut Option<PyErr>) -> Option<T> {
+/// Returns Rich's value, ignores ordinary failures, or saves the first
+/// interruption for `finish`.
+fn python_value_or_save_interruption<T>(
+    call: PythonCall<T>,
+    pending_interruption: &mut Option<PyErr>,
+) -> Option<T> {
     match call {
         PythonCall::Succeeded(value) => Some(value),
         PythonCall::Failed => None,
@@ -533,7 +537,7 @@ fn flush_previous_metrics(
             Some(previous_visible),
         ) => {
             let description = previous_visible.description(ProgressEventKind::Progress);
-            let updates_enabled = successful(
+            let updates_enabled = python_value_or_save_interruption(
                 try_python(|py| update_renderer(py, &renderer, &description, previous_visible)),
                 pending_interruption,
             )
@@ -595,24 +599,26 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
     let render = match render {
         // Wait for Started before importing Rich. Requests rejected before the
         // action begins should not perform any progress-related Python work.
-        RenderState::Pending(settings) if event.kind() == ProgressEventKind::Started => successful(
-            try_python(|py| create_renderer(py, settings, event)),
-            &mut pending_interruption,
-        )
-        .flatten()
-        .map_or(RenderState::Done, |renderer| {
-            // Keep ownership even if start fails so finish can still make the
-            // one stop attempt after the Rust action returns.
-            let updates_enabled = successful(
-                try_python(|py| start_renderer(py, &renderer)),
+        RenderState::Pending(settings) if event.kind() == ProgressEventKind::Started => {
+            python_value_or_save_interruption(
+                try_python(|py| create_renderer(py, settings, event)),
                 &mut pending_interruption,
             )
-            .is_some();
-            RenderState::Active {
-                renderer,
-                updates_enabled,
-            }
-        }),
+            .flatten()
+            .map_or(RenderState::Done, |renderer| {
+                // Keep ownership even if start fails so finish can still make the
+                // one stop attempt after the Rust action returns.
+                let updates_enabled = python_value_or_save_interruption(
+                    try_python(|py| start_renderer(py, &renderer)),
+                    &mut pending_interruption,
+                )
+                .is_some();
+                RenderState::Active {
+                    renderer,
+                    updates_enabled,
+                }
+            })
+        }
         // Show the final result now, but keep the task open. `finish` stops it
         // only after the Rust action has returned and completed its cleanup.
         RenderState::Active {
@@ -621,7 +627,7 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
         } if ends_action(event.kind()) => {
             let updates_enabled = if updates_enabled {
                 let description = visible.description(event.kind());
-                successful(
+                python_value_or_save_interruption(
                     try_python(|py| update_renderer(py, &renderer, &description, &visible)),
                     &mut pending_interruption,
                 )
@@ -643,7 +649,7 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
         ) =>
         {
             let description = visible.description(event.kind());
-            let updated = successful(
+            let updated = python_value_or_save_interruption(
                 try_python(|py| update_renderer(py, &renderer, &description, &visible)),
                 &mut pending_interruption,
             )
