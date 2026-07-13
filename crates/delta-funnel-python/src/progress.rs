@@ -897,7 +897,7 @@ const fn terminal_label(kind: ProgressEventKind) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
         thread,
@@ -914,7 +914,7 @@ mod tests {
     const MODULE_NAMES: [&str; 3] = ["rich", "rich.console", "rich.progress"];
     type ModuleSnapshot = Vec<(&'static str, Option<Py<PyAny>>)>;
 
-    struct ModuleGuard {
+    pub(crate) struct ModuleGuard {
         originals: Vec<(&'static str, Option<Py<PyAny>>)>,
     }
 
@@ -1003,7 +1003,7 @@ mod tests {
                 .collect()
         }
 
-        fn install(
+        pub(crate) fn install(
             py: Python<'_>,
             interactive: bool,
             jupyter: bool,
@@ -1554,7 +1554,7 @@ sys.modules["rich.progress"] = progress_module
         Ok(())
     }
 
-    fn record_strings(records: &Bound<'_, PyList>, key: &str) -> PyResult<Vec<String>> {
+    pub(crate) fn record_strings(records: &Bound<'_, PyList>, key: &str) -> PyResult<Vec<String>> {
         records
             .iter()
             .map(|record| record.get_item(key)?.extract::<String>())

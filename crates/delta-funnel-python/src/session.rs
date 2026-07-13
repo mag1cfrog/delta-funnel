@@ -1068,8 +1068,14 @@ fn source_config_py_error(py: Python<'_>, kind: &'static str, message: String) -
 #[cfg(test)]
 mod tests {
     use super::{PySession, parse_storage_options};
-    use crate::deltafunnel;
-    use crate::progress::adapter_creation_count;
+    use crate::{
+        deltafunnel,
+        progress::{
+            adapter_creation_count,
+            tests::{ModuleGuard, record_strings},
+        },
+        test_support::python_state,
+    };
     use delta_funnel::{
         DeltaProviderScanExecutionOptions, DryRunScanSummaryMode, MssqlBinaryPolicy,
         MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy, MssqlFloatPolicy,
@@ -1414,6 +1420,83 @@ mod tests {
             assert_eq!(session.bind(py).borrow().inner.source_reports().len(), 2);
             Ok(())
         })
+    }
+
+    #[test]
+    fn delta_registration_entry_points_share_one_rich_lifecycle() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("registration-lifecycle")?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            let progress_kwargs = PyDict::new(py);
+            progress_kwargs.set_item("progress", true)?;
+            let named_kwargs = PyDict::new(py);
+            named_kwargs.set_item("name", "orders")?;
+            named_kwargs.set_item("progress", true)?;
+
+            session
+                .bind(py)
+                .call_method("delta_lake", (table.uri(),), Some(&named_kwargs))?;
+            let immediate_calls = record_strings(records.bind(py), "call")?;
+            let immediate_descriptions = registration_update_descriptions(records.bind(py))?;
+            records.bind(py).call_method0("clear")?;
+
+            let pending = session.bind(py).call_method(
+                "delta_lake",
+                (table.uri(),),
+                Some(&progress_kwargs),
+            )?;
+            assert!(records.bind(py).is_empty());
+            pending.call_method("alias", ("customers",), Some(&progress_kwargs))?;
+
+            assert_eq!(record_strings(records.bind(py), "call")?, immediate_calls);
+            assert_eq!(
+                registration_update_descriptions(records.bind(py))?,
+                immediate_descriptions
+            );
+            assert_eq!(
+                immediate_descriptions,
+                [
+                    "Loading Delta metadata",
+                    "Validating Delta protocol",
+                    "Preparing Delta provider",
+                    "Registering Delta source",
+                    "Completed",
+                ]
+            );
+            let add_task = records
+                .bind(py)
+                .iter()
+                .find(|record| {
+                    record
+                        .get_item("call")
+                        .and_then(|call| call.extract::<String>())
+                        .is_ok_and(|call| call == "add_task")
+                })
+                .ok_or_else(|| PyAssertionError::new_err("missing Rich add_task call"))?;
+            assert_eq!(
+                add_task.get_item("description")?.extract::<String>()?,
+                "Loading Delta source"
+            );
+            let rendered = records.bind(py).repr()?.extract::<String>()?;
+            assert!(!rendered.contains(table.uri().as_str()));
+            assert!(!rendered.contains("orders"));
+            assert!(!rendered.contains("customers"));
+            Ok(())
+        })
+    }
+
+    fn registration_update_descriptions(records: &Bound<'_, PyList>) -> PyResult<Vec<String>> {
+        let mut descriptions = Vec::new();
+        for record in records.iter() {
+            if record.get_item("call")?.extract::<String>()? == "update"
+                && let Ok(description) = record.get_item("description")
+            {
+                descriptions.push(description.extract::<String>()?);
+            }
+        }
+        Ok(descriptions)
     }
 
     #[test]
