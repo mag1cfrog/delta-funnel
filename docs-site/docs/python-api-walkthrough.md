@@ -27,39 +27,22 @@ require an ODBC DSN.
 ## Register a Delta source
 
 ```python
-orders = session.delta_lake(
-    "file:///path/to/orders-delta",
-    name="orders",
-    progress=None,
-)
+orders = session.delta_lake("file:///path/to/orders-delta", name="orders")
 ```
 
 Passing `name` registers the source immediately so SQL can reference it.
 Calling `session.delta_lake(...)` without `name` returns a pending source; call
 `.alias("orders")` before using it in SQL.
 
-Source registration uses an indeterminate Rich display because it loads Delta
-metadata but does not scan data files. The display follows metadata loading,
-protocol validation, provider preparation, and catalog registration. By
-default, it appears in interactive terminals and notebooks and stays quiet in
-scripts and CI. Pass `progress=True` to force it or `progress=False` to disable
-it for one registration.
-
-For a pending source, select progress when calling `alias(...)`:
+For a pending source, register the alias later:
 
 ```python
 pending = session.delta_lake("file:///path/to/orders-delta")
-orders = pending.alias("orders", progress=True)
+orders = pending.alias("orders")
 ```
 
-Creating the pending source performs no source loading and shows no progress,
-even if that earlier call receives `progress=True`. It does not save the value.
-Only the later `alias(..., progress=...)` argument controls registration.
-
-Registration progress has no file, byte, row, or percentage total and does not
-make extra object-store requests. Source locations, storage options,
-credentials, raw metadata, and raw errors are not displayed. Progress is a
-concise status view, not a replacement for detailed logging and tracing.
+For progress modes and source-registration behavior, see
+[Progress displays](progress.md).
 
 ## Read a private S3 Delta table from a local shell
 
@@ -138,8 +121,8 @@ terminal action reads or writes the table.
 ## Preview rows
 
 ```python
-preview = daily_orders.preview(limit=20, progress=None)
-daily_orders.show(limit=20, progress=False)
+preview = daily_orders.preview(limit=20)
+daily_orders.show(limit=20)
 ```
 
 `preview()` and `show()` execute the DataFusion query and read rows with the
@@ -147,17 +130,8 @@ limit applied before collection. They do not contact SQL Server or write rows.
 `preview()` returns a `Preview` object with text and notebook HTML
 representations. `show()` prints the text preview to Python stdout.
 
-By default, progress appears in interactive terminals and notebooks and stays
-quiet in scripts and CI. Pass `progress=True` to force it or `progress=False`
-to disable it for one call. Notebook progress finishes before the rich preview
-or `show()` output. In terminals, progress uses stderr, so `show()` keeps stdout
-table-only.
-
-Eligible Delta scans show selected files handled while the bounded query runs.
-A small limit can stop after only part of those files, so a successful preview
-does not force the file bar to 100%. Queries without a reliable Delta file
-total remain indeterminate. The limit is not a progress total, and progress
-does not run a count query or execute the preview twice.
+For preview progress and terminal or notebook rendering, see
+[Progress displays](progress.md).
 
 ## Write to SQL Server
 
@@ -173,43 +147,5 @@ The returned report is a plain Python `dict` converted from Rust report types.
 Report formatting is designed to avoid exposing connection strings,
 credentials, and raw row values.
 
-### Progress display
-
-`progress=None`, the default, shows a Rich progress display when Rich detects
-an interactive terminal or Jupyter. Use `progress=True` to force the display in
-scripts or CI, or `progress=False` to disable it.
-
-```python
-report = daily_orders.write_to_mssql(
-    schema="dbo",
-    table="daily_orders",
-    load_mode="create_and_load",
-    progress=True,
-)
-```
-
-The display starts without a percentage. When the query plan has complete
-statistics for at least one selected Delta file, the same display becomes a
-determinate bar. Its percentage measures selected Delta files handled. Files
-removed by Delta metadata pruning are outside that selected total. File sizes
-can differ, so the percentage is not an estimate of bytes read, elapsed time,
-or whole-action completion.
-
-The file line can show `Delta files 8/10 | pruned 3 at runtime, ~90 in
-planning`. Runtime pruning is the exact number of selected files skipped while
-the query ran. Planning pruning is an approximate count from Delta Kernel
-metadata selection, so the display prefixes it with `~`.
-
-The description also shows cumulative rows and batches after SQL Server accepts
-each batch. Dry runs do not have write counters. Queries without eligible Delta
-scan statistics, including queries with zero selected files, remain
-indeterminate.
-
-Rapid numeric updates are combined before rendering. Status changes and the
-final result still appear immediately. If an action fails, the final display
-keeps the latest actual file position and accepted write counters instead of
-filling the bar.
-
-Progress reuses statistics already maintained by the active query plan. It does
-not run an extra count query, expand Delta metadata again, or make additional
-object-store requests.
+For write progress, file counters, and row counters, see
+[Progress displays](progress.md).
