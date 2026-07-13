@@ -242,20 +242,20 @@ impl Stream for DeltaFileProgressTracker {
 }
 
 pub(super) async fn batch_stream_for_lazy_table_from_session_parts(
-    context: SessionContext,
-    table: LazyTable,
-    sources: Vec<RegisteredSessionSource>,
-    derived_tables: Vec<RegisteredDerivedTable>,
-    pending_derived_tables: Vec<PendingDerivedTable>,
+    context: &SessionContext,
+    table: &LazyTable,
+    sources: &[RegisteredSessionSource],
+    derived_tables: &[RegisteredDerivedTable],
+    pending_derived_tables: &[PendingDerivedTable],
     provider_stats: Option<SharedProviderReadStats>,
     progress: Option<(ProgressReporter, String)>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     let dataframe = dataframe_for_lazy_table_from_session_parts(
-        &context,
-        &table,
-        &sources,
-        &derived_tables,
-        &pending_derived_tables,
+        context,
+        table,
+        sources,
+        derived_tables,
+        pending_derived_tables,
     )
     .await?;
     let physical_plan = dataframe
@@ -287,29 +287,16 @@ impl DeltaFunnelSession {
         table: &LazyTable,
         progress: Option<(&ProgressReporter, &str)>,
     ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
-        let dataframe = self.dataframe_for_lazy_table(table).await?;
-        let physical_plan = dataframe
-            .create_physical_plan()
-            .await
-            .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
-        let stream =
-            datafusion_query_output_stream(Arc::clone(&physical_plan), self.context.task_ctx())
-                .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
-        let stream = Box::pin(stream.map(|batch| {
-            batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
-        }));
-        let Some((reporter, output_name)) = progress else {
-            return Ok(stream);
-        };
-        let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-        let progress = DeltaFileProgressCoordinator::new(
-            read_stats_handles,
-            reporter.clone(),
-            ProgressPhase::Writing,
-            Some(output_name.to_owned()),
-        );
-
-        Ok(track_delta_file_progress(stream, progress))
+        batch_stream_for_lazy_table_from_session_parts(
+            &self.context,
+            table,
+            &self.sources,
+            &self.derived_tables,
+            &self.pending_derived_tables,
+            None,
+            progress.map(|(reporter, output_name)| (reporter.clone(), output_name.to_owned())),
+        )
+        .await
     }
 
     /// Executes a bounded preview of a lazy table and returns DataFusion's
@@ -450,11 +437,11 @@ impl DeltaFunnelSession {
         Box::new(move || {
             Box::pin(async move {
                 batch_stream_for_lazy_table_from_session_parts(
-                    context,
-                    table,
-                    sources,
-                    derived_tables,
-                    pending_derived_tables,
+                    &context,
+                    &table,
+                    &sources,
+                    &derived_tables,
+                    &pending_derived_tables,
                     provider_stats,
                     progress,
                 )
