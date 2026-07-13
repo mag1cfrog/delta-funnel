@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
     DeltaFunnelError, MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter,
-    PhaseTimingReport, ReportReasonCode, observability,
+    MssqlWorkflowSinkWriter, PhaseTimingReport, ReportReasonCode, observability,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::{PhaseTimer, sql_server::WriteAllReport},
     support::sanitize_text_for_display,
@@ -13,10 +13,7 @@ use super::super::super::{
     DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode,
     query_handoff::{provider_read_stats_snapshot, shared_provider_read_stats},
 };
-use super::{
-    MssqlOutputCacheDecision, MssqlOutputCachePlan, WriteAllCacheMode, WriteAllOptions,
-    cache_report, workflow::MssqlWorkflowPublicOutputWriter,
-};
+use super::{MssqlOutputCacheDecision, WriteAllCacheMode, WriteAllOptions, cache_report};
 use tracing::Instrument;
 
 const OUTPUT_PLANNING_PHASE: &str = "output_planning";
@@ -25,7 +22,7 @@ const WORKFLOW_EXECUTION_PHASE: &str = "workflow_execution";
 const SOURCE_REPORTING_PHASE: &str = "source_reporting";
 
 impl DeltaFunnelSession {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn plan_write_all_outputs(
         &self,
         requests: &[OutputWritePlan],
@@ -45,24 +42,21 @@ impl DeltaFunnelSession {
             .iter()
             .enumerate()
             .map(|(output_index, request)| {
-                if let Some(reporter) = reporter
-                    && let Some(event) = ProgressEvent::phase_changed(
+                let output_index = usize_to_u64_saturating(output_index.saturating_add(1));
+                let output_reporter =
+                    reporter.and_then(|reporter| reporter.for_output(output_index, output_count));
+                if let Some(output_reporter) = output_reporter {
+                    output_reporter.emit(&ProgressEvent::phase_changed(
                         ProgressPhase::PlanningOutput,
                         Some(request.target().output_name()),
-                    )
-                    .with_output_position(
-                        usize_to_u64_saturating(output_index.saturating_add(1)),
-                        output_count,
-                    )
-                {
-                    reporter.emit(&event);
+                    ));
                 }
                 self.plan_mssql_output(request)
             })
             .collect()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn write_all_with_options_and_writer<W>(
         &self,
         requests: &[OutputWritePlan],
@@ -72,12 +66,16 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        validate_write_all_requests(requests)?;
-        self.build_write_all_report(requests, options, writer, None)
+        self.execute_write_all_with_writer(requests, options, writer, None)
             .await
     }
 
-    async fn build_write_all_report<W>(
+    /// Validates and executes one multi-output request with an injected writer.
+    ///
+    /// The optional reporter adds live progress to the same execution path.
+    /// Empty requests still return the normal empty report without emitting a
+    /// progress lifecycle.
+    async fn execute_write_all_with_writer<W>(
         &self,
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
@@ -87,63 +85,117 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
-        let planned_outputs = self.plan_write_outputs(requests, reporter)?;
-        let phase_timings = vec![planning_timer.completed()];
+        validate_write_all_requests(requests)?;
+        let active_reporter = if requests.is_empty() { None } else { reporter };
 
-        match options.cache_mode() {
-            WriteAllCacheMode::Auto => {
-                self.write_all_auto_with_writer(
-                    requests,
-                    &planned_outputs,
-                    writer,
-                    phase_timings,
-                    reporter,
-                )
-                .await
-            }
-            WriteAllCacheMode::Disabled => {
-                let mut phase_timings = phase_timings;
-                phase_timings.push(PhaseTimingReport::skipped(
-                    CACHE_PLANNING_PHASE,
-                    ReportReasonCode::NotExecuted,
-                ));
-                let provider_stats = shared_provider_read_stats();
-                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
-                let workflow = self
-                    .write_all_baseline_with_writer(
-                        &planned_outputs,
-                        writer,
-                        Some(Arc::clone(&provider_stats)),
-                        reporter,
-                    )
-                    .await?;
-                phase_timings.push(workflow_timer.completed());
-                if let Some(reporter) = reporter {
-                    reporter.emit(&ProgressEvent::phase_changed(
-                        ProgressPhase::ReportingSources,
-                        None,
-                    ));
-                }
-                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    &planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                phase_timings.push(source_timer.completed());
-                Ok(
-                    WriteAllReport::new(workflow, cache_report::disabled(), sources)
-                        .with_phase_timings(phase_timings),
-                )
-            }
+        if let Some(reporter) = active_reporter {
+            reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
         }
+
+        let result = async {
+            // Resolve every output before cache planning or execution starts.
+            let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
+            let planned_outputs = self.plan_write_outputs(requests, active_reporter)?;
+            let mut phase_timings = vec![planning_timer.completed()];
+
+            // Cache planning selects the execution route. Disabled mode records
+            // the skipped phase so reports keep the same phase structure.
+            let automatic_cache_plan = match options.cache_mode() {
+                WriteAllCacheMode::Auto => {
+                    let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
+                    let cache_plan = self.plan_mssql_output_cache(requests);
+                    phase_timings.push(cache_timer.completed());
+                    Some(cache_plan)
+                }
+                WriteAllCacheMode::Disabled => {
+                    phase_timings.push(PhaseTimingReport::skipped(
+                        CACHE_PLANNING_PHASE,
+                        ReportReasonCode::NotExecuted,
+                    ));
+                    None
+                }
+            };
+
+            // Run exactly one route while all outputs share the same source
+            // statistics recorder used by the final source report.
+            let provider_stats = shared_provider_read_stats();
+            let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
+            let (workflow, cache) = match automatic_cache_plan.as_ref() {
+                Some(cache_plan) => match cache_plan.decision() {
+                    MssqlOutputCacheDecision::NoCache { .. } => {
+                        let workflow = self
+                            .write_all_uncached_with_writer(
+                                &planned_outputs,
+                                writer,
+                                Some(Arc::clone(&provider_stats)),
+                                active_reporter,
+                            )
+                            .await?;
+                        (workflow, cache_report::from_plan(cache_plan))
+                    }
+                    MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
+                        let workflow = self
+                            .write_all_cached_with_writer(
+                                &planned_outputs,
+                                cache_aliases,
+                                writer,
+                                Some(Arc::clone(&provider_stats)),
+                                active_reporter,
+                            )
+                            .await?;
+                        (workflow, cache_report::from_executed_plan(cache_plan))
+                    }
+                },
+                None => {
+                    let workflow = self
+                        .write_all_uncached_with_writer(
+                            &planned_outputs,
+                            writer,
+                            Some(Arc::clone(&provider_stats)),
+                            active_reporter,
+                        )
+                        .await?;
+                    (workflow, cache_report::disabled())
+                }
+            };
+            phase_timings.push(workflow_timer.completed());
+
+            // Source reporting happens once after either execution route and
+            // uses the provider statistics collected above.
+            if let Some(reporter) = active_reporter {
+                reporter.emit(&ProgressEvent::phase_changed(
+                    ProgressPhase::ReportingSources,
+                    None,
+                ));
+            }
+            let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
+            let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+                &planned_outputs,
+                provider_read_stats_snapshot(&provider_stats),
+            )?;
+            phase_timings.push(source_timer.completed());
+
+            Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
+        }
+        .await;
+
+        if let Some(reporter) = active_reporter {
+            reporter.emit(&match &result {
+                Ok(report) if report.all_succeeded() => ProgressEvent::completed(),
+                Ok(_) => ProgressEvent::completed_with_failures(),
+                Err(_) => ProgressEvent::failed(),
+            });
+        }
+        result
     }
 
-    pub(crate) async fn write_all_with_options_and_writer_with_tracing<W>(
+    /// Runs the shared write path inside its tracing and observability boundary.
+    async fn write_all_with_observability<W>(
         &self,
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
         writer: W,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<WriteAllReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
@@ -152,7 +204,7 @@ impl DeltaFunnelSession {
         async move {
             observability::workflow_started(RunMode::Execute, output_count);
             let result = self
-                .write_all_with_options_and_writer(requests, options, writer)
+                .execute_write_all_with_writer(requests, options, writer, reporter)
                 .await;
             observability::workflow_finished(RunMode::Execute, output_count, &result);
             result
@@ -168,6 +220,7 @@ impl DeltaFunnelSession {
     /// contains the final per-output results. A report containing failed or
     /// skipped outputs is still returned successfully and ends with a
     /// completed-with-failures progress event.
+    #[cfg(test)]
     pub(crate) async fn write_all_with_progress_and_writer<W>(
         &self,
         requests: &[OutputWritePlan],
@@ -178,26 +231,11 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        validate_write_all_requests(requests)?;
-        if requests.is_empty() {
-            return self
-                .build_write_all_report(requests, options, writer, None)
-                .await;
-        }
-
-        reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
-        let result = self
-            .build_write_all_report(requests, options, writer, Some(&reporter))
-            .await;
-        reporter.emit(&match &result {
-            Ok(report) if report.all_succeeded() => ProgressEvent::completed(),
-            Ok(_) => ProgressEvent::completed_with_failures(),
-            Err(_) => ProgressEvent::failed(),
-        });
-        result
+        self.execute_write_all_with_writer(requests, options, writer, Some(&reporter))
+            .await
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn write_all_with_writer<W>(
         &self,
         requests: &[OutputWritePlan],
@@ -206,110 +244,8 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        self.write_all_with_options_and_writer_with_tracing(
-            requests,
-            WriteAllOptions::default(),
-            writer,
-        )
-        .await
-    }
-
-    #[allow(dead_code)]
-    async fn write_all_auto_with_writer<W>(
-        &self,
-        requests: &[OutputWritePlan],
-        planned_outputs: &[PlannedMssqlOutput],
-        writer: W,
-        phase_timings: Vec<PhaseTimingReport>,
-        reporter: Option<&ProgressReporter>,
-    ) -> Result<WriteAllReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
-        let cache_plan = self.plan_mssql_output_cache(requests);
-        let mut phase_timings = phase_timings;
-        phase_timings.push(cache_timer.completed());
-
-        self.write_all_auto_plan_with_writer(
-            planned_outputs,
-            &cache_plan,
-            writer,
-            phase_timings,
-            reporter,
-        )
-        .await
-    }
-
-    #[allow(dead_code)]
-    async fn write_all_auto_plan_with_writer<W>(
-        &self,
-        planned_outputs: &[PlannedMssqlOutput],
-        cache_plan: &MssqlOutputCachePlan,
-        writer: W,
-        mut phase_timings: Vec<PhaseTimingReport>,
-        reporter: Option<&ProgressReporter>,
-    ) -> Result<WriteAllReport, DeltaFunnelError>
-    where
-        W: MssqlWorkflowOutputWriter,
-    {
-        match cache_plan.decision() {
-            MssqlOutputCacheDecision::NoCache { .. } => {
-                let cache = cache_report::from_plan(cache_plan);
-                let provider_stats = shared_provider_read_stats();
-                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
-                let workflow = self
-                    .write_all_baseline_with_writer(
-                        planned_outputs,
-                        writer,
-                        Some(Arc::clone(&provider_stats)),
-                        reporter,
-                    )
-                    .await?;
-                phase_timings.push(workflow_timer.completed());
-                if let Some(reporter) = reporter {
-                    reporter.emit(&ProgressEvent::phase_changed(
-                        ProgressPhase::ReportingSources,
-                        None,
-                    ));
-                }
-                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                phase_timings.push(source_timer.completed());
-                Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
-            }
-            MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
-                let provider_stats = shared_provider_read_stats();
-                let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
-                let workflow = self
-                    .write_all_cached_with_writer(
-                        planned_outputs,
-                        cache_aliases,
-                        writer,
-                        Some(Arc::clone(&provider_stats)),
-                        reporter,
-                    )
-                    .await?;
-                phase_timings.push(workflow_timer.completed());
-                let cache = cache_report::from_executed_plan(cache_plan);
-                if let Some(reporter) = reporter {
-                    reporter.emit(&ProgressEvent::phase_changed(
-                        ProgressPhase::ReportingSources,
-                        None,
-                    ));
-                }
-                let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
-                let sources = self.source_reports_for_planned_outputs_with_provider_stats(
-                    planned_outputs,
-                    provider_read_stats_snapshot(&provider_stats),
-                )?;
-                phase_timings.push(source_timer.completed());
-                Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
-            }
-        }
+        self.execute_write_all_with_writer(requests, WriteAllOptions::default(), writer, None)
+            .await
     }
 
     /// Writes multiple selected lazy tables to SQL Server sequentially.
@@ -323,7 +259,6 @@ impl DeltaFunnelSession {
     ///
     /// Returns the first pre-execution validation/planning error, or a workflow
     /// execution error from the lower-level SQL Server workflow.
-    #[allow(dead_code)]
     pub async fn write_all(
         &self,
         requests: &[OutputWritePlan],
@@ -334,7 +269,7 @@ impl DeltaFunnelSession {
 
     /// Writes multiple selected lazy tables to SQL Server sequentially with explicit options.
     ///
-    /// `WriteAllCacheMode::Disabled` uses the baseline no-cache path. The
+    /// `WriteAllCacheMode::Disabled` uses the uncached path. The
     /// default `Auto` mode performs conservative shared-cache planning and
     /// reports the selected or skipped cache decision.
     ///
@@ -342,18 +277,13 @@ impl DeltaFunnelSession {
     ///
     /// Returns the first pre-execution validation/planning error, or a workflow
     /// execution error from the lower-level SQL Server workflow.
-    #[allow(dead_code)]
     pub async fn write_all_with_options(
         &self,
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
-        self.write_all_with_options_and_writer_with_tracing(
-            requests,
-            options,
-            MssqlWorkflowPublicOutputWriter,
-        )
-        .await
+        self.write_all_with_observability(requests, options, MssqlWorkflowSinkWriter, None)
+            .await
     }
 
     /// Writes multiple outputs and reports one consolidated progress lifecycle.
@@ -363,21 +293,12 @@ impl DeltaFunnelSession {
         options: WriteAllOptions,
         reporter: ProgressReporter,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
-        let output_count = requests.len();
-        async move {
-            observability::workflow_started(RunMode::Execute, output_count);
-            let result = self
-                .write_all_with_progress_and_writer(
-                    requests,
-                    options,
-                    reporter,
-                    MssqlWorkflowPublicOutputWriter,
-                )
-                .await;
-            observability::workflow_finished(RunMode::Execute, output_count, &result);
-            result
-        }
-        .instrument(observability::workflow_span(RunMode::Execute, output_count))
+        self.write_all_with_observability(
+            requests,
+            options,
+            MssqlWorkflowSinkWriter,
+            Some(&reporter),
+        )
         .await
     }
 
@@ -395,12 +316,8 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
         options: WriteAllOptions,
     ) -> Result<WriteAllReport, DeltaFunnelError> {
-        self.write_all_with_options_and_writer_with_tracing(
-            requests,
-            options,
-            MssqlStreamBenchmarkOutputWriter,
-        )
-        .await
+        self.write_all_with_observability(requests, options, MssqlStreamBenchmarkOutputWriter, None)
+            .await
     }
 }
 
@@ -490,6 +407,7 @@ mod tests {
         batches: Option<u64>,
         files_handled: Option<u64>,
         files_total: Option<u64>,
+        task_id: Option<tokio::task::Id>,
     }
 
     fn recording_progress() -> (ProgressReporter, Arc<Mutex<Vec<RecordedProgress>>>) {
@@ -508,6 +426,7 @@ mod tests {
                     batches: event.batches(),
                     files_handled: event.files_handled(),
                     files_total: event.files_total(),
+                    task_id: tokio::task::try_id(),
                 });
             }
         });
@@ -1079,6 +998,7 @@ mod tests {
                 LoadMode::AppendExisting,
             )?;
             let (reporter, events) = recording_progress();
+            let action_task_id = tokio::task::try_id();
 
             let report = session
                 .write_all_with_progress_and_writer(
@@ -1100,6 +1020,11 @@ mod tests {
                 .filter(|event| event.phase == Some(ProgressPhase::MaterializingCache))
                 .collect::<Vec<_>>();
             assert!(!cache_events.is_empty());
+            assert!(
+                cache_events
+                    .iter()
+                    .all(|event| event.task_id == action_task_id)
+            );
             assert!(cache_events.iter().all(|event| {
                 event.output_name.is_none()
                     && event.output_index.is_none()
@@ -1432,7 +1357,7 @@ mod tests {
         use super::*;
 
         #[tokio::test]
-        async fn write_all_auto_no_candidate_uses_baseline_path()
+        async fn write_all_auto_no_candidate_uses_uncached_path()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -1557,7 +1482,7 @@ mod tests {
                 WriteAllCacheAliasStatus::MaterializedAndRestored
             );
 
-            let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+            let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
             assert_eq!(restored_big_rows, 2);
             assert_eq!(source_scans.load(Ordering::SeqCst), 2);
@@ -1715,8 +1640,8 @@ mod tests {
                 WriteAllCacheAliasStatus::MaterializedAndRestored
             );
 
-            let restored_big_factory = session.lazy_table_batch_stream_factory(big);
-            let restored_names_factory = session.lazy_table_batch_stream_factory(names);
+            let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
+            let restored_names_factory = session.lazy_table_batch_stream_factory(names, None, None);
             assert_eq!(
                 collect_stream_row_count(restored_big_factory().await?).await?,
                 2
@@ -1795,7 +1720,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn write_all_disabled_cache_mode_uses_baseline_path()
+        async fn write_all_disabled_cache_mode_uses_uncached_path()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -1930,7 +1855,7 @@ mod tests {
                 WriteAllCacheAliasStatus::MaterializedAndRestored
             );
 
-            let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+            let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
             assert_eq!(restored_big_rows, 2);
             assert_eq!(source_scans.load(Ordering::SeqCst), 2);
@@ -2089,7 +2014,7 @@ mod tests {
                 assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
             }
 
-            let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+            let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             assert_eq!(
                 collect_stream_row_count(restored_big_factory().await?).await?,
                 2
@@ -2218,7 +2143,7 @@ mod tests {
                 WriteAllCacheAliasStatus::MaterializedAndRestored
             );
 
-            let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+            let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
             assert_eq!(restored_big_rows, 2);
             assert_eq!(source_scans.load(Ordering::SeqCst), 2);

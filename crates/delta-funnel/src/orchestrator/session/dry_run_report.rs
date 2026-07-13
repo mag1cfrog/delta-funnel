@@ -99,7 +99,7 @@ impl DeltaFunnelSession {
     /// returned report contains the final planned outputs and source summary.
     /// Invalid requests fail before progress starts, and empty requests emit no
     /// progress events.
-    pub(crate) fn dry_run_all_to_mssql_with_progress(
+    fn dry_run_all_to_mssql_with_progress(
         &self,
         requests: &[OutputWritePlan],
         reporter: ProgressReporter,
@@ -116,6 +116,27 @@ impl DeltaFunnelSession {
         } else {
             ProgressEvent::failed()
         });
+        result
+    }
+
+    /// Runs the multi-output dry run inside one workflow observability boundary.
+    ///
+    /// Passing a reporter adds live progress events without changing the
+    /// workflow tracing span or its start and finish events.
+    pub(crate) fn dry_run_all_to_mssql_with_observability(
+        &self,
+        requests: &[OutputWritePlan],
+        reporter: Option<ProgressReporter>,
+    ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
+        let output_count = requests.len();
+        let span = observability::workflow_span(RunMode::DryRun, output_count);
+        let _guard = span.enter();
+        observability::workflow_started(RunMode::DryRun, output_count);
+        let result = match reporter {
+            Some(reporter) => self.dry_run_all_to_mssql_with_progress(requests, reporter),
+            None => self.dry_run_all_to_mssql(requests),
+        };
+        observability::workflow_finished(RunMode::DryRun, output_count, &result);
         result
     }
 
@@ -154,13 +175,7 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
     ) -> Result<MssqlDryRunWorkflowReport, DeltaFunnelError> {
-        let output_count = requests.len();
-        let span = observability::workflow_span(RunMode::DryRun, output_count);
-        let _guard = span.enter();
-        observability::workflow_started(RunMode::DryRun, output_count);
-        let result = self.dry_run_all_to_mssql(requests);
-        observability::workflow_finished(RunMode::DryRun, output_count, &result);
-        result
+        self.dry_run_all_to_mssql_with_observability(requests, None)
     }
 
     /// Dry-runs multiple selected lazy tables and honors source scan-summary options.
@@ -247,17 +262,14 @@ impl DeltaFunnelSession {
             .iter()
             .enumerate()
             .map(|(output_index, request)| {
-                if let Some(reporter) = reporter
-                    && let Some(event) = ProgressEvent::phase_changed(
+                let output_index = usize_to_u64_saturating(output_index.saturating_add(1));
+                let output_reporter =
+                    reporter.and_then(|reporter| reporter.for_output(output_index, output_count));
+                if let Some(output_reporter) = output_reporter {
+                    output_reporter.emit(&ProgressEvent::phase_changed(
                         ProgressPhase::PlanningOutput,
                         Some(request.target().output_name()),
-                    )
-                    .with_output_position(
-                        usize_to_u64_saturating(output_index.saturating_add(1)),
-                        output_count,
-                    )
-                {
-                    reporter.emit(&event);
+                    ));
                 }
                 self.plan_dry_run_output(request)
             })

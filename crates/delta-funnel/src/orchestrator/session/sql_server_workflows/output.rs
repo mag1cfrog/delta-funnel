@@ -10,8 +10,7 @@ use crate::{
     observability, plan_mssql_target_for_resolved_output,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::PhaseTimer,
-    write_output_batches_to_mssql_with_reporter,
-    write_output_batches_to_mssql_with_validation_options,
+    write_output_batches_to_mssql_for_workflow,
 };
 
 use super::super::{DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode};
@@ -109,7 +108,7 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter, None)
+        self.run_mssql_write_with_tracing(request, &mut MssqlOneOutputSinkWriter, None)
             .await
     }
 
@@ -118,7 +117,7 @@ impl DeltaFunnelSession {
         request: &OutputWritePlan,
         reporter: ProgressReporter,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.run_mssql_write_with_tracing(request, &mut MssqlPublicOneOutputWriter, Some(&reporter))
+        self.run_mssql_write_with_tracing(request, &mut MssqlOneOutputSinkWriter, Some(&reporter))
             .await
     }
 
@@ -307,10 +306,10 @@ pub(crate) trait OrchestratorMssqlOutputWriter: Send {
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
-struct MssqlPublicOneOutputWriter;
+struct MssqlOneOutputSinkWriter;
 
 #[async_trait]
-impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
+impl OrchestratorMssqlOutputWriter for MssqlOneOutputSinkWriter {
     async fn write_output(
         &mut self,
         output_schema: SchemaRef,
@@ -321,31 +320,16 @@ impl OrchestratorMssqlOutputWriter for MssqlPublicOneOutputWriter {
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        match reporter {
-            Some(reporter) => {
-                write_output_batches_to_mssql_with_reporter(
-                    output_schema.as_ref(),
-                    resolved_target,
-                    output_plan.schema_plan_options(),
-                    batches,
-                    write_backend,
-                    validation_options,
-                    reporter,
-                )
-                .await
-            }
-            None => {
-                write_output_batches_to_mssql_with_validation_options(
-                    output_schema.as_ref(),
-                    resolved_target,
-                    output_plan.schema_plan_options(),
-                    batches,
-                    write_backend,
-                    validation_options,
-                )
-                .await
-            }
-        }
+        write_output_batches_to_mssql_for_workflow(
+            output_schema.as_ref(),
+            resolved_target,
+            output_plan.schema_plan_options(),
+            batches,
+            write_backend,
+            validation_options,
+            reporter,
+        )
+        .await
     }
 }
 

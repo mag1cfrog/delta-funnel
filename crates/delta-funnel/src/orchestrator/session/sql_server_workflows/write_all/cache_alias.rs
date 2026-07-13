@@ -6,7 +6,7 @@ use datafusion::{
     prelude::{DataFrame, SessionContext},
 };
 use futures_util::{StreamExt, TryStreamExt};
-use tokio::task::JoinSet;
+use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream,
@@ -18,134 +18,54 @@ use crate::{
 use super::super::super::{
     DeltaFunnelSession, LazyTable,
     errors::{mssql_scoped_cache_alias_error, unknown_cached_alias_error},
-    query_handoff::{
-        SharedDeltaFileProgressState, shared_delta_file_progress_state, track_delta_file_progress,
-    },
+    query_handoff::DeltaFileProgressSampler,
 };
 use super::MssqlDerivedCacheAliasPlan;
 
 /// Active replacement of one registered derived alias with a cached provider.
 ///
-/// The original provider is owned by this scope until `restore` is awaited.
+/// The original provider is owned by this scope until `restore` is called.
 /// Callers must not rely on `Drop` for restoration.
-#[allow(dead_code)]
 pub(crate) struct MssqlScopedCacheAliasReplacement<'a> {
     context: &'a SessionContext,
-    table_id: u64,
     alias_name: String,
-    original_provider: Option<Arc<dyn TableProvider>>,
+    original_provider: Arc<dyn TableProvider>,
 }
 
-#[allow(dead_code)]
 impl<'a> MssqlScopedCacheAliasReplacement<'a> {
     pub(super) fn new(
         context: &'a SessionContext,
-        table_id: u64,
         alias_name: String,
         original_provider: Arc<dyn TableProvider>,
     ) -> Self {
         Self {
             context,
-            table_id,
             alias_name,
-            original_provider: Some(original_provider),
+            original_provider,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn broken_for_test(
-        context: &'a SessionContext,
-        table_id: u64,
-        alias_name: String,
-    ) -> Self {
-        Self {
-            context,
-            table_id,
-            alias_name,
-            original_provider: None,
-        }
-    }
-
-    /// Returns the session table id for the replaced alias.
-    #[must_use]
-    pub(crate) const fn table_id(&self) -> u64 {
-        self.table_id
-    }
-
-    /// Returns the registered alias name currently backed by the cached provider.
-    #[must_use]
-    pub(crate) fn alias_name(&self) -> &str {
-        &self.alias_name
     }
 
     /// Restores the original provider under the alias and consumes the scope.
     ///
     /// This method transitions the catalog from "alias points at cached
-    /// provider" back to "alias points at the original provider". It is async
-    /// by design so later cache cleanup can remain awaitable even if DataFusion
-    /// changes or additional async cleanup is needed.
+    /// provider" back to "alias points at the original provider".
     ///
-    /// Callers should await this method on both success and error paths that
+    /// Callers should use this method on both success and error paths that
     /// leave the scoped replacement active.
-    pub(crate) async fn restore(
-        mut self,
-    ) -> Result<MssqlScopedCacheAliasRestoration, DeltaFunnelError> {
-        let Some(original_provider) = self.original_provider.take() else {
-            return Err(mssql_scoped_cache_alias_error(
-                "restore",
-                &self.alias_name,
-                "original provider was already restored",
-            ));
-        };
-
-        let removed_cached = self
-            .context
+    pub(crate) fn restore(self) -> Result<(), DeltaFunnelError> {
+        self.context
             .deregister_table(self.alias_name.as_str())
             .map_err(|error| {
                 mssql_scoped_cache_alias_error("restore_deregister", &self.alias_name, error)
             })?;
 
         self.context
-            .register_table(self.alias_name.as_str(), original_provider)
+            .register_table(self.alias_name.as_str(), self.original_provider)
             .map_err(|error| {
                 mssql_scoped_cache_alias_error("restore_register", &self.alias_name, error)
             })?;
 
-        Ok(MssqlScopedCacheAliasRestoration {
-            table_id: self.table_id,
-            alias_name: self.alias_name,
-            cached_alias_was_present: removed_cached.is_some(),
-        })
-    }
-}
-
-/// Report returned after a scoped cache alias replacement restores the original alias.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) struct MssqlScopedCacheAliasRestoration {
-    table_id: u64,
-    alias_name: String,
-    cached_alias_was_present: bool,
-}
-
-#[allow(dead_code)]
-impl MssqlScopedCacheAliasRestoration {
-    /// Returns the restored session table id.
-    #[must_use]
-    pub(crate) const fn table_id(&self) -> u64 {
-        self.table_id
-    }
-
-    /// Returns the restored alias name.
-    #[must_use]
-    pub(crate) fn alias_name(&self) -> &str {
-        &self.alias_name
-    }
-
-    /// Returns whether a cached alias was present when restoration started.
-    #[must_use]
-    pub(crate) const fn cached_alias_was_present(&self) -> bool {
-        self.cached_alias_was_present
+        Ok(())
     }
 }
 
@@ -159,14 +79,12 @@ impl DeltaFunnelSession {
     ///
     /// This is intentionally a one-alias primitive. It does not choose cache
     /// candidates, replan downstream SQL, or execute any outputs.
-    #[allow(dead_code)]
     pub(crate) async fn replace_registered_derived_alias_with_cache(
         &self,
         table: &LazyTable,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlScopedCacheAliasReplacement<'_>, DeltaFunnelError> {
         let registered = self.registered_derived_for_scoped_cache_alias(table)?;
-        let table_id = registered.table().id();
         let alias_name = registered.name().to_owned();
 
         if let Some(reporter) = reporter {
@@ -201,7 +119,6 @@ impl DeltaFunnelSession {
 
         Ok(MssqlScopedCacheAliasReplacement::new(
             &self.context,
-            table_id,
             alias_name,
             original_provider,
         ))
@@ -231,8 +148,7 @@ impl DeltaFunnelSession {
                         error,
                         replacements,
                         reporter,
-                    )
-                    .await);
+                    ));
                 }
             }
         }
@@ -259,7 +175,7 @@ impl DeltaFunnelSession {
             .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
         let schema = physical_plan.schema();
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-        let progress = shared_delta_file_progress_state(
+        let sampler = DeltaFileProgressSampler::new(
             read_stats_handles,
             reporter.clone(),
             ProgressPhase::MaterializingCache,
@@ -279,7 +195,7 @@ impl DeltaFunnelSession {
                 stream
             })
             .collect();
-        let partitions = collect_cache_partitions(streams, progress, alias_name).await?;
+        let partitions = collect_cache_partitions(streams, sampler, alias_name).await?;
         let cached_provider = MemTable::try_new(schema, partitions)
             .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
         Ok(Arc::new(cached_provider))
@@ -354,26 +270,48 @@ impl DeltaFunnelSession {
 /// Collects each cache partition in its own Tokio task and restores its order.
 async fn collect_cache_partitions(
     streams: Vec<MssqlOutputBatchStream>,
-    progress: SharedDeltaFileProgressState,
+    mut sampler: DeltaFileProgressSampler,
     alias_name: &str,
 ) -> Result<Vec<Vec<datafusion::arrow::record_batch::RecordBatch>>, DeltaFunnelError> {
     let mut tasks = JoinSet::new();
+    // Partition tasks only announce stream-consumption boundaries. The parent
+    // task samples counters and calls the reporter, so no callback needs a
+    // cross-task delivery lock.
+    let (progress_changed, mut progress_changes) = watch::channel(());
     for (partition_index, stream) in streams.into_iter().enumerate() {
-        let stream = track_delta_file_progress(stream, Arc::clone(&progress));
-        tasks.spawn(async move { (partition_index, stream.try_collect::<Vec<_>>().await) });
+        let progress_changed = progress_changed.clone();
+        tasks.spawn(async move {
+            let batches = stream
+                .inspect(move |_| {
+                    let _ = progress_changed.send(());
+                })
+                .try_collect::<Vec<_>>()
+                .await;
+            (partition_index, batches)
+        });
     }
+    drop(progress_changed);
 
     let mut partitions = Vec::new();
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok((partition_index, batches)) => partitions.push((partition_index, batches?)),
-            Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
-            Err(error) => {
-                return Err(mssql_scoped_cache_alias_error(
-                    "materialize",
-                    alias_name,
-                    error,
-                ));
+    while !tasks.is_empty() {
+        tokio::select! {
+            Ok(()) = progress_changes.changed() => sampler.emit_if_changed(),
+            Some(result) = tasks.join_next() => {
+                match result {
+                    Ok((partition_index, batches)) => {
+                        sampler.emit_if_changed();
+                        partitions.push((partition_index, batches?));
+                    }
+                    Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
+                    Err(error) => {
+                        sampler.emit_if_changed();
+                        return Err(mssql_scoped_cache_alias_error(
+                            "materialize",
+                            alias_name,
+                            error,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -381,10 +319,10 @@ async fn collect_cache_partitions(
     Ok(partitions.into_iter().map(|(_, batches)| batches).collect())
 }
 
-pub(super) async fn restore_mssql_cache_aliases(
+pub(super) fn restore_mssql_cache_aliases(
     replacements: Vec<MssqlScopedCacheAliasReplacement<'_>>,
     reporter: Option<&ProgressReporter>,
-) -> Result<Vec<MssqlScopedCacheAliasRestoration>, DeltaFunnelError> {
+) -> Result<(), DeltaFunnelError> {
     if !replacements.is_empty()
         && let Some(reporter) = reporter
     {
@@ -393,33 +331,29 @@ pub(super) async fn restore_mssql_cache_aliases(
             None,
         ));
     }
-    let mut restorations = Vec::new();
     let mut first_error = None;
 
     for replacement in replacements.into_iter().rev() {
-        match replacement.restore().await {
-            Ok(restoration) => restorations.push(restoration),
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
+        if let Err(error) = replacement.restore()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
     }
 
     match first_error {
         Some(error) => Err(error),
-        None => Ok(restorations),
+        None => Ok(()),
     }
 }
 
-pub(super) async fn restore_mssql_cache_aliases_after_error(
+pub(super) fn restore_mssql_cache_aliases_after_error(
     error: DeltaFunnelError,
     replacements: Vec<MssqlScopedCacheAliasReplacement<'_>>,
     reporter: Option<&ProgressReporter>,
 ) -> DeltaFunnelError {
-    match restore_mssql_cache_aliases(replacements, reporter).await {
-        Ok(_restorations) => error,
+    match restore_mssql_cache_aliases(replacements, reporter) {
+        Ok(()) => error,
         Err(restore_error) => cache_error_with_restore_error(error, restore_error),
     }
 }
@@ -473,14 +407,14 @@ mod tests {
                 Box::pin(stream) as MssqlOutputBatchStream
             })
             .collect();
-        let progress = shared_delta_file_progress_state(
+        let sampler = DeltaFileProgressSampler::new(
             Vec::new(),
             ProgressReporter::default(),
             ProgressPhase::MaterializingCache,
             None,
         );
 
-        let partitions = collect_cache_partitions(streams, progress, "big").await?;
+        let partitions = collect_cache_partitions(streams, sampler, "big").await?;
 
         assert_eq!(partitions.len(), 2);
         assert!(partitions.iter().all(|batches| batches.len() == 1));
@@ -508,8 +442,6 @@ mod tests {
             .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
 
-        assert_eq!(replacement.table_id(), big.id());
-        assert_eq!(replacement.alias_name(), "big");
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
         let direct_cached_big = session
@@ -524,11 +456,7 @@ mod tests {
         );
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
-        let restoration = replacement.restore().await?;
-
-        assert_eq!(restoration.table_id(), big.id());
-        assert_eq!(restoration.alias_name(), "big");
-        assert!(restoration.cached_alias_was_present());
+        replacement.restore()?;
 
         let direct_restored_big = session
             .context()
@@ -589,7 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_cache_alias_replacement_explicit_restore_cleans_up_after_later_error()
+    async fn restore_after_error_preserves_error_and_restores_original()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
@@ -608,15 +536,13 @@ mod tests {
         let later_error = DeltaFunnelError::MssqlWorkflowPlanning {
             message: "simulated downstream planning failure".to_owned(),
         };
-        let restoration = replacement.restore().await?;
+        let error = restore_mssql_cache_aliases_after_error(later_error, vec![replacement], None);
 
         assert!(matches!(
-            later_error,
+            error,
             DeltaFunnelError::MssqlWorkflowPlanning { message }
                 if message.contains("simulated downstream planning failure")
         ));
-        assert_eq!(restoration.alias_name(), "big");
-
         let direct_restored_big = session
             .context()
             .sql("select marker from big where region = 'west'")
@@ -651,10 +577,7 @@ mod tests {
         let removed_cached = session.context().deregister_table("big")?;
         assert!(removed_cached.is_some());
 
-        let restoration = replacement.restore().await?;
-
-        assert_eq!(restoration.alias_name(), "big");
-        assert!(!restoration.cached_alias_was_present());
+        replacement.restore()?;
 
         let direct_restored_big = session
             .context()
@@ -689,35 +612,5 @@ mod tests {
                     && message.contains("also failed to restore cache aliases")
                     && message.contains("simulated restore failure for alias big")
         ));
-    }
-
-    #[tokio::test]
-    async fn restore_mssql_cache_aliases_after_error_preserves_broken_restore_context()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let broken_replacement = MssqlScopedCacheAliasReplacement::broken_for_test(
-            session.context(),
-            42,
-            "big".to_owned(),
-        );
-        let primary_error = DeltaFunnelError::MssqlWorkflowPlanning {
-            message: "simulated cached workflow failure".to_owned(),
-        };
-
-        let error =
-            restore_mssql_cache_aliases_after_error(primary_error, vec![broken_replacement], None)
-                .await;
-
-        assert!(matches!(
-            error,
-            DeltaFunnelError::MssqlWorkflowPlanning { message }
-                if message.contains("write_all auto cache failed")
-                    && message.contains("simulated cached workflow failure")
-                    && message.contains("also failed to restore cache aliases")
-                    && message.contains("scoped MSSQL cache alias restore failed")
-                    && message.contains("big")
-                    && message.contains("original provider was already restored")
-        ));
-        Ok(())
     }
 }

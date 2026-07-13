@@ -62,7 +62,9 @@ impl PythonProgress {
         };
         #[cfg(test)]
         ADAPTER_CREATION_COUNT.set(ADAPTER_CREATION_COUNT.get().saturating_add(1));
-        let state = Arc::new(Mutex::new(ProgressState::new(mode, output)));
+        let state = Arc::new(Mutex::new(ProgressState::new(RenderState::Pending(
+            ProgressSettings { mode, output },
+        ))));
         let reporter_state = Arc::clone(&state);
         let reporter = ProgressReporter::new(move |event| {
             render_event(&reporter_state, event, Instant::now());
@@ -94,7 +96,7 @@ impl PythonProgress {
                 Ok(shared) => shared,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            std::mem::replace(&mut *shared, ProgressState::done())
+            std::mem::replace(&mut *shared, ProgressState::new(RenderState::Done))
         };
 
         if let RenderState::Active { renderer, .. } = state.render
@@ -173,29 +175,9 @@ struct ProgressState {
 }
 
 impl ProgressState {
-    const fn new(mode: ProgressMode, output: ProgressOutput) -> Self {
+    const fn new(render: RenderState) -> Self {
         Self {
-            render: RenderState::Pending(ProgressSettings { mode, output }),
-            pending_interruption: None,
-            final_event: None,
-            visible: VisibleProgress::new(),
-            metric_throttle: MetricRenderThrottle::new(),
-        }
-    }
-
-    const fn busy() -> Self {
-        Self {
-            render: RenderState::Busy,
-            pending_interruption: None,
-            final_event: None,
-            visible: VisibleProgress::new(),
-            metric_throttle: MetricRenderThrottle::new(),
-        }
-    }
-
-    const fn done() -> Self {
-        Self {
-            render: RenderState::Done,
+            render,
             pending_interruption: None,
             final_event: None,
             visible: VisibleProgress::new(),
@@ -499,8 +481,12 @@ fn attachment_unavailable_for_test() -> bool {
     remaining == 1
 }
 
-/// Returns Rich's value, or saves the first interruption for `finish`.
-fn successful<T>(call: PythonCall<T>, pending_interruption: &mut Option<PyErr>) -> Option<T> {
+/// Returns Rich's value, ignores ordinary failures, or saves the first
+/// interruption for `finish`.
+fn python_value_or_save_interruption<T>(
+    call: PythonCall<T>,
+    pending_interruption: &mut Option<PyErr>,
+) -> Option<T> {
     match call {
         PythonCall::Succeeded(value) => Some(value),
         PythonCall::Failed => None,
@@ -533,7 +519,7 @@ fn flush_previous_metrics(
             Some(previous_visible),
         ) => {
             let description = previous_visible.description(ProgressEventKind::Progress);
-            let updates_enabled = successful(
+            let updates_enabled = python_value_or_save_interruption(
                 try_python(|py| update_renderer(py, &renderer, &description, previous_visible)),
                 pending_interruption,
             )
@@ -568,7 +554,7 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
             return;
         }
         (
-            std::mem::replace(&mut *state, ProgressState::busy()),
+            std::mem::replace(&mut *state, ProgressState::new(RenderState::Busy)),
             previous_visible,
         )
     };
@@ -595,24 +581,26 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
     let render = match render {
         // Wait for Started before importing Rich. Requests rejected before the
         // action begins should not perform any progress-related Python work.
-        RenderState::Pending(settings) if event.kind() == ProgressEventKind::Started => successful(
-            try_python(|py| create_renderer(py, settings, event)),
-            &mut pending_interruption,
-        )
-        .flatten()
-        .map_or(RenderState::Done, |renderer| {
-            // Keep ownership even if start fails so finish can still make the
-            // one stop attempt after the Rust action returns.
-            let updates_enabled = successful(
-                try_python(|py| start_renderer(py, &renderer)),
+        RenderState::Pending(settings) if event.kind() == ProgressEventKind::Started => {
+            python_value_or_save_interruption(
+                try_python(|py| create_renderer(py, settings, event)),
                 &mut pending_interruption,
             )
-            .is_some();
-            RenderState::Active {
-                renderer,
-                updates_enabled,
-            }
-        }),
+            .flatten()
+            .map_or(RenderState::Done, |renderer| {
+                // Keep ownership even if start fails so finish can still make the
+                // one stop attempt after the Rust action returns.
+                let updates_enabled = python_value_or_save_interruption(
+                    try_python(|py| start_renderer(py, &renderer)),
+                    &mut pending_interruption,
+                )
+                .is_some();
+                RenderState::Active {
+                    renderer,
+                    updates_enabled,
+                }
+            })
+        }
         // Show the final result now, but keep the task open. `finish` stops it
         // only after the Rust action has returned and completed its cleanup.
         RenderState::Active {
@@ -621,7 +609,7 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
         } if ends_action(event.kind()) => {
             let updates_enabled = if updates_enabled {
                 let description = visible.description(event.kind());
-                successful(
+                python_value_or_save_interruption(
                     try_python(|py| update_renderer(py, &renderer, &description, &visible)),
                     &mut pending_interruption,
                 )
@@ -643,7 +631,7 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
         ) =>
         {
             let description = visible.description(event.kind());
-            let updated = successful(
+            let updated = python_value_or_save_interruption(
                 try_python(|py| update_renderer(py, &renderer, &description, &visible)),
                 &mut pending_interruption,
             )
@@ -899,6 +887,7 @@ const fn terminal_label(kind: ProgressEventKind) -> &'static str {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
+        ffi::CString,
         panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
         thread,
     };
@@ -1077,92 +1066,9 @@ pub(crate) mod tests {
                 "stop_failure",
                 py.get_type::<PySystemExit>().call1(("stop interrupted",))?,
             )?;
-            py.run(
-                c_str!(
-                    r#"
-import sys
-import threading
-import types
-
-owner_thread = threading.get_ident()
-
-def record(value):
-    if threading.get_ident() == owner_thread:
-        records.append(value)
-
-def maybe_fail(call):
-    if threading.get_ident() != owner_thread:
-        return
-    if fail_call == call:
-        raise failure
-    if stop_also_interrupts and call == "stop":
-        raise stop_failure
-
-class Console:
-    def __init__(self, **kwargs):
-        record({"call": "console", **kwargs})
-        maybe_fail("console")
-        self.stderr = kwargs.get("stderr", False)
-        maybe_fail("stderr_console" if self.stderr else "stdout_console")
-        stream_interactive = stderr_interactive if self.stderr else stdout_interactive
-        self.is_interactive = stream_interactive or kwargs.get("force_interactive", False)
-        self.is_jupyter = jupyter
-
-class Progress:
-    def __init__(self, *columns, **kwargs):
-        console = kwargs.get("console")
-        record({
-            "call": "progress",
-            "columns": len(columns),
-            "console_stderr": None if console is None else console.stderr,
-            "auto_refresh": kwargs.get("auto_refresh"),
-            "transient": kwargs.get("transient"),
-            "redirect_stdout": kwargs.get("redirect_stdout"),
-            "redirect_stderr": kwargs.get("redirect_stderr"),
-        })
-        maybe_fail("progress")
-
-    def add_task(self, description, **kwargs):
-        record({"call": "add_task", "description": description, "total": kwargs.get("total")})
-        maybe_fail("add_task")
-        return 7
-
-    def start(self):
-        record({"call": "start"})
-        maybe_fail("start")
-
-    def update(self, task_id, **kwargs):
-        record({"call": "update", "task_id": task_id, **kwargs})
-        description = kwargs.get("description", "")
-        terminal = any(description.startswith(label) for label in (
-            "Completed", "Completed with failures", "Failed", "Cancelled"
-        ))
-        maybe_fail("terminal" if terminal else "update")
-
-    def stop(self):
-        record({"call": "stop"})
-        maybe_fail("stop")
-
-rich = types.ModuleType("rich")
-rich.__path__ = []
-console_module = types.ModuleType("rich.console")
-console_module.Console = Console
-progress_module = types.ModuleType("rich.progress")
-progress_module.Progress = Progress
-progress_module.TimeElapsedColumn = object
-progress_module.BarColumn = object
-progress_module.TaskProgressColumn = object
-progress_module.TextColumn = lambda *args, **kwargs: object()
-rich.console = console_module
-rich.progress = progress_module
-sys.modules["rich"] = rich
-sys.modules["rich.console"] = console_module
-sys.modules["rich.progress"] = progress_module
-"#
-                ),
-                Some(&locals),
-                Some(&locals),
-            )?;
+            let fake_rich = CString::new(include_str!("../tests/fake_rich.py"))
+                .map_err(|_| PyRuntimeError::new_err("fake Rich fixture contains a null byte"))?;
+            py.run(&fake_rich, Some(&locals), Some(&locals))?;
             Ok((Self { originals }, records.unbind(), failure.unbind()))
         }
     }

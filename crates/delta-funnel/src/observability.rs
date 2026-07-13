@@ -713,6 +713,41 @@ mod tests {
     }
 
     #[test]
+    fn progress_dry_run_all_keeps_workflow_observability() -> Result<(), DeltaFunnelError> {
+        let runtime = crate::DeltaFunnelRuntime::new()?;
+        let session = crate::DeltaFunnelSession::new(crate::SessionOptions::default())?;
+        let reporter = crate::progress::ProgressReporter::new(|_| {});
+
+        let captured = capture_events(|| {
+            let result = runtime.dry_run_all_to_mssql_with_progress(&session, &[], reporter);
+            assert!(result.is_ok());
+        });
+
+        let spans = captured.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, WORKFLOW_SPAN);
+        assert_eq!(
+            spans[0].fields.get("run_mode").map(String::as_str),
+            Some("dry_run")
+        );
+        assert_eq!(
+            spans[0].fields.get("output_count").map(String::as_str),
+            Some("0")
+        );
+
+        let events = captured.events();
+        assert_eq!(events.len(), 2);
+        assert_workflow_event(&events[0], WORKFLOW_STARTED_EVENT, RunMode::DryRun, "0");
+        assert_workflow_event(&events[1], WORKFLOW_COMPLETED_EVENT, RunMode::DryRun, "0");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.span_names == [WORKFLOW_SPAN])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn scoped_capture_records_output_event_fields() -> Result<(), DeltaFunnelError> {
         let target_table = MssqlTargetTable::new("dbo", "orders")?;
 

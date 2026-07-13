@@ -25,8 +25,7 @@ use super::{
     LoadMode, MssqlBatchShapingReport, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteBackend,
     MssqlWriteFailureContext, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_backend,
-    drain_mssql_batches_for_stream_benchmark, write_output_batches_to_mssql_with_reporter,
-    write_output_batches_to_mssql_with_validation_options,
+    drain_mssql_batches_for_stream_benchmark, write_output_batches_to_mssql_for_workflow,
 };
 
 const OUTPUT_STREAM_SETUP_PHASE: &str = "output_stream_setup";
@@ -150,30 +149,6 @@ impl MssqlOutputWriteJob {
     #[must_use]
     pub fn phase_timings(&self) -> &[PhaseTimingReport] {
         &self.phase_timings
-    }
-
-    fn into_parts(
-        self,
-    ) -> (
-        SchemaRef,
-        ResolvedMssqlTarget,
-        MssqlSchemaPlanOptions,
-        MssqlOutputBatchStreamFactory,
-        MssqlWriteBackend,
-        ValidationOptions,
-        Vec<PhaseTimingReport>,
-        Option<ProgressReporter>,
-    ) {
-        (
-            self.output_schema,
-            self.resolved_target,
-            self.schema_options,
-            self.batches,
-            self.write_backend,
-            self.validation_options,
-            self.phase_timings,
-            self.progress_reporter,
-        )
     }
 }
 
@@ -675,7 +650,7 @@ pub async fn write_mssql_outputs_to_mssql(
     jobs: impl IntoIterator<Item = MssqlOutputWriteJob>,
     options: MssqlWorkflowWriteOptions,
 ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError> {
-    write_mssql_outputs_with_writer(jobs, options, MssqlPublicOneOutputWriter).await
+    write_mssql_outputs_with_writer(jobs, options, MssqlWorkflowSinkWriter).await
 }
 
 pub(crate) struct MssqlStreamBenchmarkOutputWriter;
@@ -698,10 +673,10 @@ pub(crate) trait MssqlWorkflowOutputWriter: Send {
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 }
 
-struct MssqlPublicOneOutputWriter;
+pub(crate) struct MssqlWorkflowSinkWriter;
 
 #[async_trait]
-impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
+impl MssqlWorkflowOutputWriter for MssqlWorkflowSinkWriter {
     async fn write_output(
         &mut self,
         output_schema: SchemaRef,
@@ -712,31 +687,16 @@ impl MssqlWorkflowOutputWriter for MssqlPublicOneOutputWriter {
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        match reporter {
-            Some(reporter) => {
-                write_output_batches_to_mssql_with_reporter(
-                    output_schema.as_ref(),
-                    resolved_target,
-                    schema_options,
-                    batches,
-                    write_backend,
-                    validation_options,
-                    reporter,
-                )
-                .await
-            }
-            None => {
-                write_output_batches_to_mssql_with_validation_options(
-                    output_schema.as_ref(),
-                    resolved_target,
-                    schema_options,
-                    batches,
-                    write_backend,
-                    validation_options,
-                )
-                .await
-            }
-        }
+        write_output_batches_to_mssql_for_workflow(
+            output_schema.as_ref(),
+            resolved_target,
+            schema_options,
+            batches,
+            write_backend,
+            validation_options,
+            reporter,
+        )
+        .await
     }
 }
 
@@ -872,17 +832,17 @@ where
     W: MssqlWorkflowOutputWriter,
 {
     let target = job.target_summary();
-    let (
+    let MssqlOutputWriteJob {
         output_schema,
         resolved_target,
         schema_options,
         batches,
         write_backend,
         validation_options,
-        planned_phase_timings,
-        reporter,
-    ) = job.into_parts();
-    if let Some(reporter) = reporter.as_ref() {
+        phase_timings: planned_phase_timings,
+        progress_reporter,
+    } = job;
+    if let Some(reporter) = progress_reporter.as_ref() {
         reporter.emit(&ProgressEvent::phase_changed(
             ProgressPhase::SettingUpStream,
             Some(target.output_name()),
@@ -913,7 +873,7 @@ where
             batches,
             write_backend,
             validation_options,
-            reporter.as_ref(),
+            progress_reporter.as_ref(),
         )
         .await
     {

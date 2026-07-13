@@ -5,8 +5,8 @@ mod cached_stream;
 mod request;
 mod workflow;
 pub(crate) use cache_plan::{
-    MssqlCacheCandidateSkip, MssqlCacheCandidateSkipReason, MssqlCachedOutputStreamRoute,
-    MssqlDerivedCacheAliasPlan, MssqlNoCacheReason, MssqlOutputCacheDecision, MssqlOutputCachePlan,
+    MssqlCacheCandidateSkip, MssqlCacheCandidateSkipReason, MssqlDerivedCacheAliasPlan,
+    MssqlNoCacheReason, MssqlOutputCacheDecision, MssqlOutputCachePlan,
 };
 pub(crate) use request::ensure_unique_write_all_output_names;
 

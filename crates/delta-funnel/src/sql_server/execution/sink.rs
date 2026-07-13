@@ -81,37 +81,18 @@ where
     write_mssql_output_connection_request(request, batches, write_backend).await
 }
 
-pub(crate) async fn write_output_batches_to_mssql_with_validation_options<S>(
+/// Internal sink used by one-output and multi-output workflows.
+///
+/// The optional reporter adds live progress without changing planning,
+/// validation, or write behavior.
+pub(crate) async fn write_output_batches_to_mssql_for_workflow<S>(
     output_schema: impl AsRef<arrow_schema::Schema>,
     resolved_target: ResolvedMssqlTarget,
     schema_options: MssqlSchemaPlanOptions,
     batches: S,
     write_backend: MssqlWriteBackend,
     validation_options: ValidationOptions,
-) -> Result<MssqlWriteReport, DeltaFunnelError>
-where
-    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
-{
-    let request =
-        plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
-
-    write_mssql_output_connection_request_with_validation_options(
-        request,
-        batches,
-        write_backend,
-        validation_options,
-    )
-    .await
-}
-
-pub(crate) async fn write_output_batches_to_mssql_with_reporter<S>(
-    output_schema: impl AsRef<arrow_schema::Schema>,
-    resolved_target: ResolvedMssqlTarget,
-    schema_options: MssqlSchemaPlanOptions,
-    batches: S,
-    write_backend: MssqlWriteBackend,
-    validation_options: ValidationOptions,
-    reporter: &ProgressReporter,
+    reporter: Option<&ProgressReporter>,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
@@ -119,7 +100,7 @@ where
     let request =
         plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
     emit_progress_phase(
-        Some(reporter),
+        reporter,
         ProgressPhase::Connecting,
         request.output_plan().output_name(),
     );
@@ -129,7 +110,7 @@ where
         batches,
         write_backend,
         validation_options,
-        Some(reporter),
+        reporter,
     )
     .await
 }
@@ -1586,14 +1567,14 @@ mod tests {
         let batches = stream::empty::<Result<RecordBatch, DeltaFunnelError>>();
         let (reporter, phases) = recording_reporter();
 
-        let error = write_output_batches_to_mssql_with_reporter(
+        let error = write_output_batches_to_mssql_for_workflow(
             unsupported_schema,
             resolved_target,
             MssqlSchemaPlanOptions::default(),
             batches,
             default_mssql_write_backend(),
             ValidationOptions::new(),
-            &reporter,
+            Some(&reporter),
         )
         .await
         .err()
