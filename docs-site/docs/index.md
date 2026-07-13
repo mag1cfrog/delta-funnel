@@ -126,6 +126,8 @@ Rust users can start with [Installation](install.md), then continue to the
   progress.
 - [Private S3 sources](advanced/private-s3.md): configure credentials and
   troubleshoot source access.
+- [Python logging](advanced/python-logging.md): route diagnostic events through
+  standard-library logging.
 - [API references](reference/api.md): find the Rust and Python API entry
   points.
 - [DataFusion and Delta internals](internals/datafusion-delta.md): explore

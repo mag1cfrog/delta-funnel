@@ -36,6 +36,7 @@ nav:
   - Advanced workflows:
       - Progress displays: progress.md
       - Private S3 sources: advanced/private-s3.md
+      - Python logging: advanced/python-logging.md
   - Reference:
       - API references: reference/api.md
   - Contributors:

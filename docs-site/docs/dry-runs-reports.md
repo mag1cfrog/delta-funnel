@@ -66,21 +66,4 @@ is delivered, so a restoration error supersedes any completed report.
 For failure-report and tracing rules, see
 [Failure Reports And Safe Tracing](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/failure-reports-and-tracing.md).
 
-## Python logging
-
-For Python diagnostics, route DeltaFunnel events into standard-library
-`logging` before running the workflow:
-
-```python
-import logging
-import deltafunnel
-
-logging.basicConfig(level=logging.INFO)
-deltafunnel.init_logging()
-```
-
-Use `DELTAFUNNEL_LOG` or an explicit filter string such as
-`delta_funnel=debug,delta_kernel=debug,object_store=debug` when you need more
-detail. DeltaFunnel does not configure handlers or exporters; existing Datadog,
-OpenTelemetry, JSON logging, file logging, pytest capture, and framework
-integrations continue to own Python logging output.
+For application diagnostics, see [Python logging](advanced/python-logging.md).

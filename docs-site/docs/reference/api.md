@@ -22,12 +22,16 @@ The current typed public surface is recorded in the package stub:
 
 Core Python entry points:
 
+- `init_logging`
 - `Session`
 - `PendingDeltaSource`
 - `Table`
 - `Preview`
 - `MssqlOutputSpec`
 - `DeltaFunnelError`
+
+For `init_logging` setup and filter behavior, see
+[Python logging](../advanced/python-logging.md).
 
 For progress modes and display behavior shared by the supported actions, see
 [Progress displays](../progress.md).
