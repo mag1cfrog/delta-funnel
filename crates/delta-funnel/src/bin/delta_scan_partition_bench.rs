@@ -41,8 +41,8 @@
 //!   --output target/delta-provider-exec-wide-event.csv
 //! ```
 //!
-//! See `docs/scan-partition-benchmark.md` for the full schema, workload, and
-//! storage-profile reference.
+//! See `docs-site/docs/contributing/scan-benchmarks.md` for the contributor
+//! guide.
 
 use std::collections::BTreeMap;
 use std::env;

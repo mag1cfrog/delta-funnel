@@ -49,3 +49,5 @@ nav:
           - DataFusion and Delta overview: internals/datafusion-delta.md
           - Scan partition planning: internals/scan-partition-planning.md
           - Provider read scheduling: internals/provider-read-scheduling.md
+      - Performance:
+          - Delta scan benchmarks: contributing/scan-benchmarks.md

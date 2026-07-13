@@ -58,9 +58,10 @@ Current conservative policy variables are:
 - `DEFAULT_FILE_DESCRIPTORS_PER_PARTITION = 16`
 - `DEFAULT_AVAILABLE_MEMORY_BYTES_PER_PARTITION = 256 MiB`
 
-These are guardrail values, not benchmark-proven optima. The benchmark matrix in
-`delta_scan_partition_bench` sweeps candidate values so they can be validated on
-different machines before changing the defaults.
+These are guardrail values, not benchmark-proven optima. The
+[Delta scan benchmark](../contributing/scan-benchmarks.md) sweeps candidate
+values so they can be validated on different machines before changing the
+defaults.
 
 There is no arbitrary fixed max such as 64 or 128. Fixed global caps are not
 machine-aware enough. The automatic fallback can only be reduced by DataFusion
