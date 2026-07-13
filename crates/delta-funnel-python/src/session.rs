@@ -1488,6 +1488,64 @@ mod tests {
     }
 
     #[test]
+    fn delta_registration_progress_does_not_render_source_secrets() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let table = DeltaLogFixture::new("registration-secrets")?;
+            fs::write(
+                table.path.join("_delta_log/00000000000000000000.json"),
+                "raw-metadata-secret",
+            )
+            .map_err(io_py_error)?;
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            let (_stderr, capture) = StderrGuard::capture(py)?;
+            let storage_options = PyDict::new(py);
+            storage_options.set_item("authorization", "storage-option-secret")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("name", "orders")?;
+            kwargs.set_item("progress", true)?;
+            kwargs.set_item("storage_options", storage_options)?;
+
+            let error = session
+                .bind(py)
+                .call_method(
+                    "delta_lake",
+                    (format!(
+                        "file://{}?token=uri-query-secret#uri-fragment-secret",
+                        table.uri()
+                    ),),
+                    Some(&kwargs),
+                )
+                .unwrap_err();
+
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "delta_snapshot_load"
+            );
+            let rendered = records.bind(py).repr()?.extract::<String>()?;
+            let stderr = capture
+                .bind(py)
+                .call_method0("getvalue")?
+                .extract::<String>()?;
+            for secret in [
+                "raw-metadata-secret",
+                "storage-option-secret",
+                "uri-query-secret",
+                "uri-fragment-secret",
+            ] {
+                assert!(!rendered.contains(secret));
+                assert!(!stderr.contains(secret));
+            }
+            assert!(
+                registration_update_descriptions(records.bind(py))?.contains(&"Failed".to_owned())
+            );
+            assert!(session.bind(py).borrow().inner.source_reports().is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
     fn delta_registration_entry_points_use_shared_progress_modes() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {

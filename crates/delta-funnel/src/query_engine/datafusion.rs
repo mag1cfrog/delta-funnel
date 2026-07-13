@@ -103,7 +103,10 @@ pub(crate) mod test_support {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use async_trait::async_trait;
@@ -315,9 +318,14 @@ pub(crate) mod test_support {
     #[derive(Debug, Default)]
     pub(crate) struct FailsOnCustomersSchemaProvider {
         tables: Mutex<HashMap<String, Arc<dyn TableProvider>>>,
+        allow_customers: AtomicBool,
     }
 
     impl FailsOnCustomersSchemaProvider {
+        pub(crate) fn allow_customers(&self) {
+            self.allow_customers.store(true, Ordering::Relaxed);
+        }
+
         fn tables(&self) -> MutexGuard<'_, HashMap<String, Arc<dyn TableProvider>>> {
             self.tables
                 .lock()
@@ -347,7 +355,7 @@ pub(crate) mod test_support {
             name: String,
             table: Arc<dyn TableProvider>,
         ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
-            if name == "customers" {
+            if name == "customers" && !self.allow_customers.load(Ordering::Relaxed) {
                 return Err(DataFusionError::Execution(
                     "forced customers registration failure".to_owned(),
                 ));

@@ -250,6 +250,7 @@ mod tests {
             FailsOnCustomersSchemaProvider, INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
             SingleSchemaCatalogProvider,
         },
+        table_formats::snapshot_metadata_load_attempt_count,
     };
 
     use super::super::super::{
@@ -269,6 +270,32 @@ mod tests {
             }
         });
         (reporter, events)
+    }
+
+    fn assert_source_loading_progress_failure(
+        source: DeltaSourceConfig,
+        error_matches: impl FnOnce(&DeltaFunnelError) -> bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source_name = source.name.clone();
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (reporter, events) = recording_reporter();
+
+        let result = session.delta_lake_with_progress(source, reporter);
+
+        let error = result
+            .as_ref()
+            .err()
+            .ok_or("expected source loading error")?;
+        assert!(error_matches(error));
+        let events = events.lock().map_err(|_| "progress events lock poisoned")?;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind(), ProgressEventKind::Started);
+        assert_eq!(events[1].phase(), Some(ProgressPhase::LoadingDeltaMetadata));
+        assert_eq!(events[2].kind(), ProgressEventKind::Failed);
+        assert!(session.sources().is_empty());
+        assert_eq!(session.next_table_id(), 0);
+        assert!(!session.context().table_exist(&source_name)?);
+        Ok(())
     }
 
     #[test]
@@ -325,12 +352,15 @@ mod tests {
                 SessionOptions::new().with_provider_scan_options(provider_options),
             )?;
             let source_uri = table.uri();
+            let load_attempts = snapshot_metadata_load_attempt_count();
 
             let ordinary_table =
                 ordinary.delta_lake(DeltaSourceConfig::new("orders", source_uri.clone()))?;
+            assert_eq!(snapshot_metadata_load_attempt_count(), load_attempts + 1);
             let (reporter, events) = recording_reporter();
             let reported_table = reported
                 .delta_lake_with_progress(DeltaSourceConfig::new("orders", source_uri), reporter)?;
+            assert_eq!(snapshot_metadata_load_attempt_count(), load_attempts + 2);
 
             assert_eq!(reported_table, ordinary_table);
             let ordinary_source = ordinary
@@ -372,23 +402,20 @@ mod tests {
     }
 
     #[test]
-    fn delta_lake_progress_fails_after_start_for_source_loading_error()
+    fn delta_lake_progress_covers_source_loading_failure_variants()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let (reporter, events) = recording_reporter();
-
-        let result =
-            session.delta_lake_with_progress(DeltaSourceConfig::new("orders", ""), reporter);
-
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::InvalidSourceUri { .. })
-        ));
-        let events = events.lock().map_err(|_| "progress events lock poisoned")?;
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0].kind(), ProgressEventKind::Started);
-        assert_eq!(events[1].phase(), Some(ProgressPhase::LoadingDeltaMetadata));
-        assert_eq!(events[2].kind(), ProgressEventKind::Failed);
+        assert_source_loading_progress_failure(DeltaSourceConfig::new("orders", ""), |error| {
+            matches!(error, DeltaFunnelError::InvalidSourceUri { .. })
+        })?;
+        assert_source_loading_progress_failure(
+            DeltaSourceConfig::new("orders", "ftp://example.com/table"),
+            |error| matches!(error, DeltaFunnelError::DeltaSourceEngine { .. }),
+        )?;
+        let table = DeltaLogTable::new("progress-missing-snapshot")?;
+        assert_source_loading_progress_failure(
+            DeltaSourceConfig::new("orders", table.uri()).with_version(Some(999)),
+            |error| matches!(error, DeltaFunnelError::DeltaSnapshotLoad { .. }),
+        )?;
         Ok(())
     }
 
@@ -454,18 +481,21 @@ mod tests {
     #[test]
     fn delta_lake_progress_reports_catalog_registration_failure()
     -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("progress-catalog")?;
+        let source_table = DeltaLogTable::new("progress-catalog")?;
+        let source_uri = source_table.uri();
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let failing_schema: Arc<dyn datafusion::catalog::SchemaProvider> =
-            Arc::new(FailsOnCustomersSchemaProvider::default());
+        let failing_schema = Arc::new(FailsOnCustomersSchemaProvider::default());
+        let schema: Arc<dyn datafusion::catalog::SchemaProvider> = failing_schema.clone();
         session.context().register_catalog(
             "datafusion",
-            Arc::new(SingleSchemaCatalogProvider::new(failing_schema)),
+            Arc::new(SingleSchemaCatalogProvider::new(schema)),
         );
         let (reporter, events) = recording_reporter();
 
-        let result = session
-            .delta_lake_with_progress(DeltaSourceConfig::new("customers", table.uri()), reporter);
+        let result = session.delta_lake_with_progress(
+            DeltaSourceConfig::new("customers", source_uri.clone()),
+            reporter,
+        );
 
         assert!(matches!(
             result,
@@ -480,6 +510,23 @@ mod tests {
         assert_eq!(events[5].kind(), ProgressEventKind::Failed);
         assert!(session.sources().is_empty());
         assert_eq!(session.next_table_id(), 0);
+        assert!(!session.context().table_exist("customers")?);
+        drop(events);
+
+        failing_schema.allow_customers();
+        let (reporter, retry_events) = recording_reporter();
+        let table = session
+            .delta_lake_with_progress(DeltaSourceConfig::new("customers", source_uri), reporter)?;
+
+        assert_eq!(table.id(), 0);
+        assert_eq!(session.sources().len(), 1);
+        assert!(session.context().table_exist("customers")?);
+        let retry_events = retry_events
+            .lock()
+            .map_err(|_| "progress events lock poisoned")?;
+        assert_eq!(retry_events.len(), 6);
+        assert_eq!(retry_events[0].kind(), ProgressEventKind::Started);
+        assert_eq!(retry_events[5].kind(), ProgressEventKind::Completed);
         Ok(())
     }
 
