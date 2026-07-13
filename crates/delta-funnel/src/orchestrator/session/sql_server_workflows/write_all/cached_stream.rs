@@ -127,18 +127,9 @@ impl DeltaFunnelSession {
     /// the normal lazy-table stream path. Dependent outputs replan from the
     /// retained SQL text so active scoped cache aliases can replace the
     /// registered providers referenced by that SQL.
-    #[cfg(test)]
+    /// Optional provider stats and progress reporting are attached to the
+    /// returned stream without changing how its cache route is selected.
     pub(crate) fn cached_output_batch_stream_factory(
-        &self,
-        request: &OutputWritePlan,
-        active_aliases: &[MssqlDerivedCacheAliasPlan],
-    ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
-        self.cached_output_batch_stream_factory_for_write_all(request, active_aliases, None, None)
-    }
-
-    /// Builds a cached output stream factory with write-all's optional final
-    /// stats and live file progress tracking.
-    pub(crate) fn cached_output_batch_stream_factory_for_write_all(
         &self,
         request: &OutputWritePlan,
         active_aliases: &[MssqlDerivedCacheAliasPlan],
@@ -149,7 +140,7 @@ impl DeltaFunnelSession {
         match route {
             MssqlCachedOutputStreamRoute::DirectCachedAlias(_)
             | MssqlCachedOutputStreamRoute::UncachedLazyTable => Ok(self
-                .lazy_table_batch_stream_factory_for_write_all(
+                .lazy_table_batch_stream_factory(
                     request.table().clone(),
                     provider_stats,
                     reporter.map(|reporter| (reporter, request.target().output_name().to_owned())),
@@ -382,7 +373,8 @@ mod tests {
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
-        let factory = session.cached_output_batch_stream_factory(&big_output, caches)?;
+        let factory =
+            session.cached_output_batch_stream_factory(&big_output, caches, None, None)?;
         let markers = collect_stream_marker_values(factory().await?).await?;
 
         assert_eq!(markers, vec!["shared", "shared"]);
@@ -432,7 +424,8 @@ mod tests {
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
-        let factory = session.cached_output_batch_stream_factory(&unrelated_output, caches)?;
+        let factory =
+            session.cached_output_batch_stream_factory(&unrelated_output, caches, None, None)?;
         let markers = collect_stream_marker_values(factory().await?).await?;
 
         assert_eq!(markers, vec!["unrelated"]);
@@ -490,9 +483,12 @@ mod tests {
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
-        let big_factory = session.cached_output_batch_stream_factory(&big_output, caches)?;
-        let west_factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
-        let east_factory = session.cached_output_batch_stream_factory(&east_output, caches)?;
+        let big_factory =
+            session.cached_output_batch_stream_factory(&big_output, caches, None, None)?;
+        let west_factory =
+            session.cached_output_batch_stream_factory(&west_output, caches, None, None)?;
+        let east_factory =
+            session.cached_output_batch_stream_factory(&east_output, caches, None, None)?;
         let big_markers = collect_stream_marker_values(big_factory().await?).await?;
         let west_markers = collect_stream_marker_values(west_factory().await?).await?;
         let east_markers = collect_stream_marker_values(east_factory().await?).await?;
@@ -560,7 +556,8 @@ mod tests {
         assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
         assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
 
-        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
+        let factory =
+            session.cached_output_batch_stream_factory(&west_output, caches, None, None)?;
         let markers = collect_stream_marker_values(factory().await?).await?;
 
         assert_eq!(markers, vec!["big"]);
@@ -616,7 +613,8 @@ mod tests {
             .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
 
-        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
+        let factory =
+            session.cached_output_batch_stream_factory(&west_output, caches, None, None)?;
         let error = factory().await;
 
         assert!(matches!(
@@ -670,7 +668,8 @@ mod tests {
             .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
 
-        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
+        let factory =
+            session.cached_output_batch_stream_factory(&west_output, caches, None, None)?;
         let error = factory().await;
 
         assert!(matches!(

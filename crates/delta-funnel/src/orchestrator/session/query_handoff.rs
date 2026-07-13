@@ -446,19 +446,11 @@ impl DeltaFunnelSession {
         .ok_or_else(|| unknown_lazy_table_error(table))
     }
 
-    #[cfg(test)]
-    pub(super) fn lazy_table_batch_stream_factory(
-        &self,
-        table: LazyTable,
-    ) -> MssqlOutputBatchStreamFactory {
-        self.lazy_table_batch_stream_factory_for_write_all(table, None, None)
-    }
-
-    /// Builds a deferred stream factory with write-all's optional final stats
-    /// and live file progress tracking.
+    /// Builds a deferred stream factory with optional final stats and live file
+    /// progress tracking.
     ///
     /// `progress` contains an output-scoped reporter and that output's name.
-    pub(super) fn lazy_table_batch_stream_factory_for_write_all(
+    pub(super) fn lazy_table_batch_stream_factory(
         &self,
         table: LazyTable,
         provider_stats: Option<SharedProviderReadStats>,

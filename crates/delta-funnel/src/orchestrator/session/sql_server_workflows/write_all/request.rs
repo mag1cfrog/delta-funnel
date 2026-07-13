@@ -1477,7 +1477,7 @@ mod tests {
                 WriteAllCacheAliasStatus::MaterializedAndRestored
             );
 
-            let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+            let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
             assert_eq!(restored_big_rows, 2);
             assert_eq!(source_scans.load(Ordering::SeqCst), 2);
@@ -1635,8 +1635,8 @@ mod tests {
                 WriteAllCacheAliasStatus::MaterializedAndRestored
             );
 
-            let restored_big_factory = session.lazy_table_batch_stream_factory(big);
-            let restored_names_factory = session.lazy_table_batch_stream_factory(names);
+            let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
+            let restored_names_factory = session.lazy_table_batch_stream_factory(names, None, None);
             assert_eq!(
                 collect_stream_row_count(restored_big_factory().await?).await?,
                 2
@@ -1850,7 +1850,7 @@ mod tests {
                 WriteAllCacheAliasStatus::MaterializedAndRestored
             );
 
-            let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+            let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
             assert_eq!(restored_big_rows, 2);
             assert_eq!(source_scans.load(Ordering::SeqCst), 2);
@@ -2009,7 +2009,7 @@ mod tests {
                 assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
             }
 
-            let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+            let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             assert_eq!(
                 collect_stream_row_count(restored_big_factory().await?).await?,
                 2
@@ -2138,7 +2138,7 @@ mod tests {
                 WriteAllCacheAliasStatus::MaterializedAndRestored
             );
 
-            let restored_big_factory = session.lazy_table_batch_stream_factory(big);
+            let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
             assert_eq!(restored_big_rows, 2);
             assert_eq!(source_scans.load(Ordering::SeqCst), 2);

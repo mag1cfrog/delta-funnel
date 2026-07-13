@@ -91,7 +91,7 @@ impl DeltaFunnelSession {
                         output_count,
                     )
                 });
-                let batches = self.lazy_table_batch_stream_factory_for_write_all(
+                let batches = self.lazy_table_batch_stream_factory(
                     planned.table().clone(),
                     provider_stats.clone(),
                     progress.clone().map(|reporter| {
@@ -125,7 +125,7 @@ impl DeltaFunnelSession {
                         output_count,
                     )
                 });
-                let batches = self.cached_output_batch_stream_factory_for_write_all(
+                let batches = self.cached_output_batch_stream_factory(
                     planned.request(),
                     active_aliases,
                     provider_stats.clone(),
