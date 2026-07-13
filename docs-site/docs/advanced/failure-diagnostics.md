@@ -1,4 +1,4 @@
-# Failure Reports And Safe Tracing
+# Diagnose Failed Workflows
 
 Use this guide when a real DeltaFunnel workload fails and you need to collect
 diagnostics without exposing credentials, raw SQL, or row values.
@@ -143,34 +143,9 @@ phase timings, and cleanup status.
 
 ## Enable Safe Tracing
 
-For Python, route DeltaFunnel tracing into standard-library `logging` before
-running the workflow:
-
-```python
-import logging
-import deltafunnel
-
-logging.basicConfig(level=logging.INFO)
-deltafunnel.init_logging()
-```
-
-`init_logging()` installs a process-global bridge from Rust `tracing` events to
-`logging.getLogger("deltafunnel")`. It returns `True` when it installs the
-bridge and `False` when another global Rust tracing subscriber is already
-installed. It does not configure Python handlers, formatters, levels, files, or
-external exporters; the application keeps owning normal Python logging setup.
-
-Use a filter string or `DELTAFUNNEL_LOG` for deeper diagnostics:
-
-```python
-deltafunnel.init_logging(
-    "delta_funnel=debug,delta_kernel=debug,object_store=debug,arrow_tiberius=debug"
-)
-```
-
-Datadog, OpenTelemetry, JSON logging, file logging, pytest capture, notebooks,
-and framework logging work through their normal Python `logging` integration
-when the application has configured them.
+For Python, follow [Python logging](python-logging.md) to route DeltaFunnel
+tracing through standard-library `logging`. The application remains responsible
+for handlers, formatters, levels, files, and external exporters.
 
 For private S3 Delta sources, `object_store=debug` is useful for local
 debugging because it can show which credential-provider path was selected. Keep

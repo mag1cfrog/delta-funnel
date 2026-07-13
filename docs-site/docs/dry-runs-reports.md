@@ -34,7 +34,7 @@ report = daily_orders.write_to_mssql(
 For multi-output dry runs, shared caching, and partial failure reports, see
 [Multiple outputs and shared caching](advanced/multiple-outputs.md).
 
-For failure-report and tracing rules, see
-[Failure Reports And Safe Tracing](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/failure-reports-and-tracing.md).
+For interpreting failures and collecting safe diagnostics, see
+[Diagnose failed workflows](advanced/failure-diagnostics.md).
 
 For application diagnostics, see [Python logging](advanced/python-logging.md).

@@ -45,5 +45,5 @@ external exporters. Existing Datadog, OpenTelemetry, JSON logging, file
 logging, pytest capture, notebook, and framework integrations continue to own
 Python logging output.
 
-For report and tracing fields, see
-[Failure Reports And Safe Tracing](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/failure-reports-and-tracing.md).
+For report fields and a safe bug-report checklist, see
+[Diagnose failed workflows](failure-diagnostics.md).
