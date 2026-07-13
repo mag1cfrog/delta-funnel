@@ -359,7 +359,7 @@ async fn collect_cache_partitions(
 ) -> Result<Vec<Vec<datafusion::arrow::record_batch::RecordBatch>>, DeltaFunnelError> {
     let mut tasks = JoinSet::new();
     for (partition_index, stream) in streams.into_iter().enumerate() {
-        let stream = track_delta_file_progress(stream, Arc::clone(&progress));
+        let stream = track_delta_file_progress(stream, progress.clone());
         tasks.spawn(async move { (partition_index, stream.try_collect::<Vec<_>>().await) });
     }
 
