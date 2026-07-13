@@ -1439,7 +1439,7 @@ mod tests {
                 .bind(py)
                 .call_method("delta_lake", (table.uri(),), Some(&named_kwargs))?;
             let immediate_calls = record_strings(records.bind(py), "call")?;
-            let immediate_descriptions = registration_update_descriptions(records.bind(py))?;
+            let immediate_descriptions = progress_update_descriptions(records.bind(py))?;
             records.bind(py).call_method0("clear")?;
 
             let pending = session.bind(py).call_method(
@@ -1452,7 +1452,7 @@ mod tests {
 
             assert_eq!(record_strings(records.bind(py), "call")?, immediate_calls);
             assert_eq!(
-                registration_update_descriptions(records.bind(py))?,
+                progress_update_descriptions(records.bind(py))?,
                 immediate_descriptions
             );
             assert_eq!(
@@ -1537,9 +1537,7 @@ mod tests {
                 assert!(!rendered.contains(secret));
                 assert!(!stderr.contains(secret));
             }
-            assert!(
-                registration_update_descriptions(records.bind(py))?.contains(&"Failed".to_owned())
-            );
+            assert!(progress_update_descriptions(records.bind(py))?.contains(&"Failed".to_owned()));
             assert!(session.bind(py).borrow().inner.source_reports().is_empty());
             Ok(())
         })
@@ -1734,7 +1732,7 @@ mod tests {
             .map(Bound::unbind)
     }
 
-    fn registration_update_descriptions(records: &Bound<'_, PyList>) -> PyResult<Vec<String>> {
+    fn progress_update_descriptions(records: &Bound<'_, PyList>) -> PyResult<Vec<String>> {
         let mut descriptions = Vec::new();
         for record in records.iter() {
             if record.get_item("call")?.extract::<String>()? == "update"
@@ -1744,6 +1742,20 @@ mod tests {
             }
         }
         Ok(descriptions)
+    }
+
+    fn assert_one_progress_lifecycle(records: &Bound<'_, PyList>) -> PyResult<Vec<String>> {
+        let calls = record_strings(records, "call")?;
+        for call in ["progress", "add_task", "start", "stop"] {
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|actual| actual.as_str() == call)
+                    .count(),
+                1
+            );
+        }
+        progress_update_descriptions(records)
     }
 
     #[test]
@@ -2351,8 +2363,71 @@ mod tests {
 
     #[test]
     #[ignore = "runs through cargo xtask sqlserver-test"]
+    fn table_write_to_mssql_execute_writes_delta_progress_when_configured() -> TestResult<()> {
+        let _state = python_state();
+        let Some(config) = MssqlIntegrationConfig::from_env() else {
+            return Ok(());
+        };
+        let target = unique_mssql_table_name(&config.schema)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        runtime.block_on(drop_tables(&config, &[&target]))?;
+        let write_result = Python::attach(|py| {
+            let source = DeltaLogFixture::new_with_parquet(py, "write-progress")?;
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session_kwargs = PyDict::new(py);
+            session_kwargs.set_item(
+                "default_mssql_connection_string",
+                config.connection_string.as_str(),
+            )?;
+            let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+            let registration_kwargs = PyDict::new(py);
+            registration_kwargs.set_item("name", "orders")?;
+            let table =
+                session.call_method("delta_lake", (source.uri(),), Some(&registration_kwargs))?;
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            let write_kwargs = PyDict::new(py);
+            write_kwargs.set_item("schema", config.schema.as_str())?;
+            write_kwargs.set_item("table", target.table().as_str())?;
+            write_kwargs.set_item("load_mode", "create_and_load")?;
+            write_kwargs.set_item("progress", true)?;
+
+            let report = table.call_method("write_to_mssql", (), Some(&write_kwargs))?;
+            let report = report.cast::<PyDict>()?;
+            let write_stats = required_item(report, "write_stats")?.cast_into::<PyDict>()?;
+            assert_eq!(
+                required_item(&write_stats, "rows_written")?.extract::<u64>()?,
+                3
+            );
+            assert!(required_item(&write_stats, "batches_written")?.extract::<u64>()? >= 1);
+
+            let rendered = records.bind(py).repr()?.extract::<String>()?;
+            assert!(rendered.contains("Delta files 1/1"));
+            assert!(rendered.contains("3 rows"));
+            assert!(rendered.contains("batch"));
+            assert!(rendered.contains("Completed"));
+            Ok::<(), PyErr>(())
+        });
+        let cleanup_result = runtime.block_on(drop_tables(&config, &[&target]));
+
+        match (write_result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_error), Ok(())) => Err(Box::new(write_error)),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(write_error), Err(cleanup_error)) => {
+                Err(format!("write failed: {write_error}; cleanup failed: {cleanup_error}").into())
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "runs through cargo xtask sqlserver-test"]
     fn write_all_execute_writes_default_and_override_connections_when_configured() -> TestResult<()>
     {
+        let _state = python_state();
         let Some(config) = MssqlIntegrationConfig::from_env() else {
             return Ok(());
         };
@@ -2405,8 +2480,11 @@ union all select cast(302 as bigint) as order_id",),
             east_kwargs.set_item("connection_string", config.connection_string.as_str())?;
             let east_spec = east.call_method("to_mssql", (), Some(&east_kwargs))?;
             let outputs = PyList::new(py, [&west_spec, &east_spec])?;
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
+            let progress_kwargs = PyDict::new(py);
+            progress_kwargs.set_item("progress", true)?;
 
-            let report = session.call_method("write_all", (outputs,), None)?;
+            let report = session.call_method("write_all", (outputs,), Some(&progress_kwargs))?;
             let report_repr = report.repr()?.extract::<String>()?;
             assert!(!report_repr.contains(config.connection_string.as_str()));
             let report = report.cast::<PyDict>()?;
@@ -2472,6 +2550,19 @@ union all select cast(302 as bigint) as order_id",),
             let east_output = east_output.cast::<PyDict>()?;
             assert_succeeded_output(east_output, "east_orders", "target_override", 1)?;
 
+            let descriptions = assert_one_progress_lifecycle(records.bind(py))?;
+            assert!(
+                descriptions
+                    .iter()
+                    .any(|value| value == "Caching shared data")
+            );
+            for output in ["Output 1/2", "Output 2/2"] {
+                assert!(descriptions.iter().any(|value| {
+                    value.starts_with(output) && value.contains("1 row") && value.contains("batch")
+                }));
+            }
+            assert_eq!(descriptions.last().map(String::as_str), Some("Completed"));
+
             Ok::<(), PyErr>(())
         });
         let cleanup_result = runtime.block_on(drop_tables(&config, &tables));
@@ -2490,6 +2581,7 @@ union all select cast(302 as bigint) as order_id",),
     #[ignore = "runs through cargo xtask sqlserver-test"]
     fn write_all_execute_writes_reports_failed_and_skipped_outputs_when_configured()
     -> TestResult<()> {
+        let _state = python_state();
         let Some(config) = MssqlIntegrationConfig::from_env() else {
             return Ok(());
         };
@@ -2552,6 +2644,7 @@ union all select cast(302 as bigint) as order_id",),
             kwargs.set_item("options", options)?;
             kwargs.set_item("progress", true)?;
             kwargs.set_item("dry_run", false)?;
+            let (_guard, records) = ModuleGuard::install(py, true, false)?;
 
             let report = session.call_method("write_all", (outputs,), Some(&kwargs))?;
             let report = report.cast::<PyDict>()?;
@@ -2615,6 +2708,22 @@ union all select cast(302 as bigint) as order_id",),
             assert_eq!(
                 required_item(reason, "failed_output_name")?.extract::<String>()?,
                 "failing_output"
+            );
+
+            let descriptions = assert_one_progress_lifecycle(records.bind(py))?;
+            assert!(descriptions.iter().any(|value| {
+                value.starts_with("Output 1/3")
+                    && value.contains("1 row")
+                    && value.contains("batch")
+            }));
+            assert!(
+                descriptions
+                    .iter()
+                    .any(|value| value.starts_with("Output 2/3"))
+            );
+            assert_eq!(
+                descriptions.last().map(String::as_str),
+                Some("Completed with failures")
             );
 
             Ok::<(), PyErr>(())
@@ -3980,11 +4089,29 @@ IF (SELECT COUNT(*) FROM {table}) <> 0
             .map_err(io_py_error)?;
             fs::write(
                 log_path.join("00000000000000000001.json"),
-                format!("{}\n", add_json("part-00000.parquet")),
+                format!("{}\n", add_json("part-00000.parquet", 0)),
             )
             .map_err(io_py_error)?;
 
             Ok(Self { path })
+        }
+
+        fn new_with_parquet(py: Python<'_>, name: &str) -> PyResult<Self> {
+            let fixture = Self::new(name)?;
+            let parquet = py
+                .import("base64")?
+                .call_method1(
+                    "b64decode",
+                    (include_str!("../tests/progress_smoke.parquet.b64"),),
+                )?
+                .extract::<Vec<u8>>()?;
+            fs::write(fixture.path.join("part-00000.parquet"), &parquet).map_err(io_py_error)?;
+            fs::write(
+                fixture.path.join("_delta_log/00000000000000000001.json"),
+                format!("{}\n", add_json("part-00000.parquet", parquet.len())),
+            )
+            .map_err(io_py_error)?;
+            Ok(fixture)
         }
 
         fn uri(&self) -> String {
@@ -4026,9 +4153,9 @@ IF (SELECT COUNT(*) FROM {table}) <> 0
         )
     }
 
-    fn add_json(path: &str) -> String {
+    fn add_json(path: &str, size: usize) -> String {
         format!(
-            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":1587968586000,"dataChange":true}}}}"#
         )
     }
 

@@ -180,7 +180,7 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
         .arg(&wheel)
         .current_dir(&repo_root)
         .env("TMPDIR", &tool_tmp);
-    run_command(&mut command, "verify Python wheel typing metadata")?;
+    run_command(&mut command, "verify Python wheel contents and metadata")?;
 
     let venv_dir = temp_dir.path().join("venv");
     let mut command = Command::new(&options.python);
@@ -238,10 +238,13 @@ fn run_python_package_check(options: &PythonPackageCheckOptions) -> Result<(), X
         .arg("pip")
         .arg("install")
         .arg("--no-cache-dir")
-        .arg("ipykernel")
+        .args(["ipykernel", "ipywidgets"])
         .env("PIP_CACHE_DIR", &pip_cache)
         .env("TMPDIR", &tool_tmp);
-    run_command(&mut command, "install ipykernel for progress smoke test")?;
+    run_command(
+        &mut command,
+        "install Jupyter runtime for progress smoke test",
+    )?;
 
     let mut command = Command::new(&venv_python);
     command
@@ -635,6 +638,9 @@ if metadata["Name"] != "deltafunnel":
     raise SystemExit(f"unexpected package name: {metadata['Name']}")
 if metadata["Version"] != expected_version:
     raise SystemExit(f"unexpected package version: {metadata['Version']}")
+requirements = metadata.get_all("Requires-Dist", [])
+if requirements != ["rich>=14,<15"]:
+    raise SystemExit(f"unexpected wheel dependencies: {requirements}")
 "#;
 
 #[cfg(test)]

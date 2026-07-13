@@ -1485,7 +1485,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn write_all_auto_caches_shared_alias_for_direct_and_dependent_outputs()
+        async fn write_all_progress_caches_shared_alias_once_for_direct_and_dependent_outputs()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -1515,9 +1515,15 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
+            let (reporter, _events) = recording_progress();
 
             let report = session
-                .write_all_with_writer(&[big_output, west_output], writer)
+                .write_all_with_progress_and_writer(
+                    &[big_output, west_output],
+                    WriteAllOptions::default(),
+                    reporter,
+                    writer,
+                )
                 .await?;
             {
                 let calls = calls

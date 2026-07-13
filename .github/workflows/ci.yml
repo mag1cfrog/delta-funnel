@@ -82,6 +82,15 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Check Rust API documentation
+        run: |
+          cargo doc --workspace --no-deps
+          test ! -e target/doc/delta_funnel/progress/index.html
+          if rg --quiet 'ProgressReporter|delta_lake_with_progress|preview_table_with_progress|dry_run_to_mssql_with_progress|dry_run_all_to_mssql_with_progress|write_to_mssql_with_progress|write_all_with_progress|write_all_for_stream_benchmark' target/doc/delta_funnel; then
+            echo "hidden host integration API appeared in normal rustdoc"
+            exit 1
+          fi
+
       - name: Check whitespace
         run: git diff --check
 
@@ -121,7 +130,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.10"
           cache: pip
           cache-dependency-path: crates/delta-funnel-python/pyproject.toml
 

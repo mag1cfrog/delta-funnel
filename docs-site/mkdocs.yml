@@ -29,6 +29,7 @@ nav:
       - Overview: index.md
       - Installation: install.md
       - Python API walkthrough: python-api-walkthrough.md
+      - Python progress: progress.md
       - Concepts: concepts.md
       - SQL Server: sql-server.md
       - Dry runs and reports: dry-runs-reports.md
