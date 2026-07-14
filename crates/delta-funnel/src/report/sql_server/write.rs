@@ -2,8 +2,8 @@ use std::fmt;
 
 use crate::{
     MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan, MssqlTargetTable,
-    MssqlWritePhase, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount, ValidationStatus,
-    sql_server::LoadMode, support::sanitize_text_for_display,
+    MssqlWritePhase, PhaseStatus, PhaseTimingReport, QueryExecutionProfile, ReportReasonCode,
+    RowCount, ValidationStatus, sql_server::LoadMode, support::sanitize_text_for_display,
 };
 
 /// Per-output SQL Server write statistics.
@@ -367,6 +367,7 @@ pub struct MssqlWriteReport {
     validation_status: ValidationStatus,
     batch_shaping: MssqlBatchShapingReport,
     phase_timings: Vec<PhaseTimingReport>,
+    execution_profile: Option<QueryExecutionProfile>,
     stats: MssqlWriteStats,
     partial_write_possible: bool,
     cleanup: MssqlTargetCleanupStatus,
@@ -426,6 +427,7 @@ impl MssqlWriteReport {
             validation_status: metrics.validation_status,
             batch_shaping: metrics.batch_shaping,
             phase_timings: metrics.phase_timings,
+            execution_profile: None,
             stats: MssqlWriteStats::new(
                 output_name,
                 metrics.rows_written,
@@ -569,6 +571,12 @@ impl MssqlWriteReport {
     #[must_use]
     pub fn phase_timings(&self) -> &[PhaseTimingReport] {
         &self.phase_timings
+    }
+
+    /// Returns the terminal query execution profile when collection was enabled.
+    #[must_use]
+    pub const fn execution_profile(&self) -> Option<&QueryExecutionProfile> {
+        self.execution_profile.as_ref()
     }
 
     /// Returns whether the target may contain a partial write after failure.

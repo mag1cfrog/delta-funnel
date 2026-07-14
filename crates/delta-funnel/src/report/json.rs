@@ -364,6 +364,9 @@ impl MssqlWriteReport {
             "validation_status": self.validation_status().to_json_value(),
             "batch_shaping": batch_shaping_value(self.batch_shaping()),
             "phase_timings": phase_timings_value(self.phase_timings()),
+            "execution_profile": self
+                .execution_profile()
+                .map(QueryExecutionProfile::to_json_value),
             "write_stats": self.stats().to_json_value(),
             "partial_write_possible": self.partial_write_possible(),
             "cleanup": cleanup_status(self.cleanup()),
@@ -1132,6 +1135,7 @@ mod tests {
             value["outputs"][0]["dry_run"]["sql_server_contacted"],
             false
         );
+        assert!(value["outputs"][0].get("execution_profile").is_none());
         assert_json_safe(&value)?;
         assert_no_secret_or_raw_sql_text(&value);
 
@@ -1187,6 +1191,8 @@ mod tests {
         assert_eq!(value["write_stats"]["rows_written"], 42);
         assert_eq!(value["write_stats"]["batches_written"], 3);
         assert_eq!(value["write_stats"]["elapsed_ms"], 125);
+        assert_eq!(report.execution_profile(), None);
+        assert!(value["execution_profile"].is_null());
         assert_eq!(value["cleanup"], "not_applicable");
         assert_json_safe(&value)?;
         assert_no_secret_or_raw_sql_text(&value);
@@ -1233,6 +1239,8 @@ mod tests {
             json!({"kind": "exact", "value": 7})
         );
         assert_eq!(value["report"]["write_stats"]["rows_written"], 7);
+        assert!(value.get("execution_profile").is_none());
+        assert!(value["report"]["execution_profile"].is_null());
         assert_json_safe(&value)?;
         assert_no_secret_or_raw_sql_text(&value);
 
@@ -1261,6 +1269,8 @@ mod tests {
         );
         assert_eq!(value["partial_write_possible"], true);
         assert_eq!(value["cleanup"], "failed");
+        assert!(value.get("execution_profile").is_none());
+        assert!(value["report"]["execution_profile"].is_null());
         assert!(value["report"].get("status").is_none());
         assert_json_safe(&value)?;
         assert_no_secret_or_raw_sql_text(&value);

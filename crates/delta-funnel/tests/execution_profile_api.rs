@@ -8,7 +8,7 @@ use datafusion::{
     physical_plan::{ExecutionPlan, SendableRecordBatchStream},
 };
 use delta_funnel::{
-    DeltaProviderReadStatsSnapshot, ExecutionProfileMode, QueryExecutionMetric,
+    DeltaProviderReadStatsSnapshot, ExecutionProfileMode, MssqlWriteReport, QueryExecutionMetric,
     QueryExecutionMetricCategory, QueryExecutionMetricValue, QueryExecutionOperatorProfile,
     QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope,
     datafusion_query_output_stream,
@@ -25,6 +25,8 @@ fn execution_profile_types_and_accessors_are_exported_from_the_crate_root() {
     let _: QueryOutputStreamFn = datafusion_query_output_stream;
 
     let _: ExecutionProfileMode = ExecutionProfileMode::default();
+    let _: for<'a> fn(&'a MssqlWriteReport) -> Option<&'a QueryExecutionProfile> =
+        MssqlWriteReport::execution_profile;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionScope = QueryExecutionProfile::scope;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionOutcome = QueryExecutionProfile::outcome;
     let _: fn(&QueryExecutionProfile) -> bool = QueryExecutionProfile::partial;
