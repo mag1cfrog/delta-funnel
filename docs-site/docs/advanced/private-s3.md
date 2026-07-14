@@ -5,9 +5,31 @@ S3-compatible sources. Explicit `storage_options` values override equivalent
 environment variables, which makes them useful for per-source credentials and
 regions.
 
-## Override credentials and region
+## Use shell credentials
 
-Use these keys:
+Set these variables in the environment that starts Python:
+
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `AWS_REGION`
+- `AWS_SESSION_TOKEN` when using temporary credentials
+
+Delta Funnel uses them automatically, so the source does not need explicit
+`storage_options`:
+
+```python
+from deltafunnel import Session
+
+source = Session().delta_lake(
+    "s3://<private-bucket>/<delta-table>",
+    name="source",
+)
+```
+
+## Override one source
+
+Pass `storage_options` when one source needs credentials or a region that
+differs from the process environment. Use these keys:
 
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
@@ -27,12 +49,12 @@ import os
 from deltafunnel import Session
 
 storage_options = {
-    "AWS_REGION": "us-east-1",
-    "AWS_ACCESS_KEY_ID": os.environ["AWS_ACCESS_KEY_ID"],
-    "AWS_SECRET_ACCESS_KEY": os.environ["AWS_SECRET_ACCESS_KEY"],
+    "AWS_REGION": os.environ["ORDERS_AWS_REGION"],
+    "AWS_ACCESS_KEY_ID": os.environ["ORDERS_AWS_ACCESS_KEY_ID"],
+    "AWS_SECRET_ACCESS_KEY": os.environ["ORDERS_AWS_SECRET_ACCESS_KEY"],
 }
-if os.environ.get("AWS_SESSION_TOKEN"):
-    storage_options["AWS_SESSION_TOKEN"] = os.environ["AWS_SESSION_TOKEN"]
+if os.environ.get("ORDERS_AWS_SESSION_TOKEN"):
+    storage_options["AWS_SESSION_TOKEN"] = os.environ["ORDERS_AWS_SESSION_TOKEN"]
 
 source = Session().delta_lake(
     "s3://<private-bucket>/<delta-table>",
