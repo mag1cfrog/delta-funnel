@@ -590,16 +590,15 @@ fn looks_like_raw_sql(value: &str) -> bool {
         .any(|marker| value.contains(marker))
 }
 
+/// Shared tracing capture support for unit tests in this crate.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_capture {
     use std::{
         collections::BTreeMap,
         fmt,
         sync::{Arc, Mutex, MutexGuard},
     };
 
-    use super::*;
-    use futures_util::StreamExt;
     use tracing::{
         Event, Level, Subscriber,
         field::{Field, Visit},
@@ -608,14 +607,8 @@ mod tests {
     use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*, registry::LookupSpan};
 
     static TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
-    const PARQUET_IO_FIELDS: [&str; 4] = [
-        "parquet_data_file_range_get_operations",
-        "parquet_data_file_full_get_operations",
-        "parquet_data_file_bytes_received",
-        "parquet_data_file_opened_bytes",
-    ];
 
-    struct TracingTestGuard {
+    pub(crate) struct TracingTestGuard {
         _guard: MutexGuard<'static, ()>,
     }
 
@@ -625,7 +618,7 @@ mod tests {
         }
     }
 
-    fn tracing_test_guard() -> TracingTestGuard {
+    pub(crate) fn tracing_test_guard() -> TracingTestGuard {
         let guard = match TRACING_TEST_LOCK.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -634,17 +627,187 @@ mod tests {
         TracingTestGuard { _guard: guard }
     }
 
-    fn capture_events(run: impl FnOnce()) -> CapturedEvents {
-        let _guard = tracing_test_guard();
-        let events = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: events.clone(),
-        });
-
-        tracing::subscriber::with_default(subscriber, run);
-
-        events
+    pub(crate) fn capture_events(run: impl FnOnce()) -> CapturedEvents {
+        let capture = TracingCapture::start();
+        run();
+        capture.captured.clone()
     }
+
+    /// Keeps one thread-local tracing subscriber active for an async test.
+    pub(crate) struct TracingCapture {
+        // Restore the subscriber before rebuilding the global callsite cache.
+        _subscriber_guard: tracing::subscriber::DefaultGuard,
+        _test_guard: TracingTestGuard,
+        captured: CapturedEvents,
+    }
+
+    impl TracingCapture {
+        pub(crate) fn start() -> Self {
+            let test_guard = tracing_test_guard();
+            let captured = CapturedEvents::default();
+            let subscriber = Registry::default().with(CaptureLayer::new(captured.clone()));
+            let subscriber_guard = tracing::subscriber::set_default(subscriber);
+            Self {
+                _subscriber_guard: subscriber_guard,
+                _test_guard: test_guard,
+                captured,
+            }
+        }
+
+        pub(crate) const fn captured(&self) -> &CapturedEvents {
+            &self.captured
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct CapturedEvent {
+        pub(crate) target: &'static str,
+        pub(crate) level: Level,
+        pub(crate) fields: BTreeMap<String, String>,
+        pub(crate) span_names: Vec<&'static str>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct CapturedSpan {
+        pub(crate) target: &'static str,
+        pub(crate) name: &'static str,
+        pub(crate) level: Level,
+        pub(crate) fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedEvents {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+        spans: Arc<Mutex<Vec<CapturedSpan>>>,
+    }
+
+    impl CapturedEvents {
+        pub(crate) fn events(&self) -> Vec<CapturedEvent> {
+            match self.events.lock() {
+                Ok(events) => events.clone(),
+                Err(_) => Vec::new(),
+            }
+        }
+
+        pub(crate) fn spans(&self) -> Vec<CapturedSpan> {
+            match self.spans.lock() {
+                Ok(spans) => spans.clone(),
+                Err(_) => Vec::new(),
+            }
+        }
+    }
+
+    struct CaptureLayer {
+        events: CapturedEvents,
+    }
+
+    impl CaptureLayer {
+        fn new(events: CapturedEvents) -> Self {
+            Self { events }
+        }
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            attrs.record(&mut visitor);
+            let captured = CapturedSpan {
+                target: attrs.metadata().target(),
+                name: attrs.metadata().name(),
+                level: *attrs.metadata().level(),
+                fields: visitor.fields,
+            };
+
+            if let Ok(mut spans) = self.events.spans.lock() {
+                spans.push(captured);
+            }
+        }
+
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            let span_names = ctx
+                .event_scope(event)
+                .map(|scope| {
+                    scope
+                        .from_root()
+                        .map(|span| span.metadata().name())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let captured = CapturedEvent {
+                target: event.metadata().target(),
+                level: *event.metadata().level(),
+                fields: visitor.fields,
+                span_names,
+            };
+
+            if let Ok(mut events) = self.events.events.lock() {
+                events.push(captured);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl FieldVisitor {
+        fn record_value(&mut self, field: &Field, value: impl Into<String>) {
+            self.fields.insert(field.name().to_owned(), value.into());
+        }
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.record_value(field, format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.record_value(field, value);
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.record_value(field, value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.record_value(field, value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.record_value(field, value.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_capture::{
+        CapturedEvent, CapturedEvents, CapturedSpan, TracingCapture, capture_events,
+        tracing_test_guard,
+    };
+    use super::*;
+    use futures_util::StreamExt;
+    use tracing::Level;
+
+    const PARQUET_IO_FIELDS: [&str; 4] = [
+        "parquet_data_file_range_get_operations",
+        "parquet_data_file_full_get_operations",
+        "parquet_data_file_bytes_received",
+        "parquet_data_file_opened_bytes",
+    ];
 
     #[test]
     fn observability_event_helpers_do_not_require_subscriber() -> Result<(), DeltaFunnelError> {
@@ -876,12 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn merged_stream_emits_one_summary_for_success_error_and_drop()
     -> Result<(), Box<dyn std::error::Error>> {
-        let _guard = tracing_test_guard();
-        let captured = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: captured.clone(),
-        });
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let capture = TracingCapture::start();
 
         let success_table =
             crate::table_formats::RealParquetDeltaTable::new_default("summary-success")?;
@@ -931,9 +1089,7 @@ mod tests {
         let error = error_stream.next().await.ok_or("expected upstream error")?;
         assert!(error.is_err());
         drop(error_stream);
-        drop(subscriber_guard);
-
-        let summaries = provider_io_events(&captured);
+        let summaries = provider_io_events(capture.captured());
         assert_eq!(summaries.len(), 3);
         for (event, (source_name, outcome)) in summaries.iter().zip([
             ("success_orders", "success"),
@@ -966,19 +1122,12 @@ mod tests {
     #[tokio::test]
     async fn partitioned_cache_emits_the_same_summary_with_and_without_progress()
     -> Result<(), Box<dyn std::error::Error>> {
-        let _guard = tracing_test_guard();
-        let captured = CapturedEvents::default();
-        let subscriber = Registry::default().with(CaptureLayer {
-            events: captured.clone(),
-        });
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let capture = TracingCapture::start();
 
         let reporter = crate::progress::ProgressReporter::default();
         materialize_cache_for_trace("cache-no-progress", "cache_no_progress", None).await?;
         materialize_cache_for_trace("cache-progress", "cache_progress", Some(&reporter)).await?;
-        drop(subscriber_guard);
-
-        let summaries = provider_io_events(&captured);
+        let summaries = provider_io_events(capture.captured());
         assert_eq!(summaries.len(), 2);
         for (event, source_name) in summaries
             .iter()
@@ -1724,132 +1873,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct CapturedEvent {
-        target: &'static str,
-        level: Level,
-        fields: BTreeMap<String, String>,
-        span_names: Vec<&'static str>,
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct CapturedSpan {
-        target: &'static str,
-        name: &'static str,
-        level: Level,
-        fields: BTreeMap<String, String>,
-    }
-
-    #[derive(Clone, Default)]
-    struct CapturedEvents {
-        events: Arc<Mutex<Vec<CapturedEvent>>>,
-        spans: Arc<Mutex<Vec<CapturedSpan>>>,
-    }
-
-    impl CapturedEvents {
-        fn events(&self) -> Vec<CapturedEvent> {
-            match self.events.lock() {
-                Ok(events) => events.clone(),
-                Err(_) => Vec::new(),
-            }
-        }
-
-        fn spans(&self) -> Vec<CapturedSpan> {
-            match self.spans.lock() {
-                Ok(spans) => spans.clone(),
-                Err(_) => Vec::new(),
-            }
-        }
-    }
-
-    struct CaptureLayer {
-        events: CapturedEvents,
-    }
-
-    impl<S> Layer<S> for CaptureLayer
-    where
-        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-    {
-        fn register_callsite(
-            &self,
-            _metadata: &'static tracing::Metadata<'static>,
-        ) -> tracing::subscriber::Interest {
-            tracing::subscriber::Interest::sometimes()
-        }
-
-        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
-            let mut visitor = FieldVisitor::default();
-            attrs.record(&mut visitor);
-            let captured = CapturedSpan {
-                target: attrs.metadata().target(),
-                name: attrs.metadata().name(),
-                level: *attrs.metadata().level(),
-                fields: visitor.fields,
-            };
-
-            if let Ok(mut spans) = self.events.spans.lock() {
-                spans.push(captured);
-            }
-        }
-
-        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-            let mut visitor = FieldVisitor::default();
-            event.record(&mut visitor);
-            let span_names = ctx
-                .event_scope(event)
-                .map(|scope| {
-                    scope
-                        .from_root()
-                        .map(|span| span.metadata().name())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let captured = CapturedEvent {
-                target: event.metadata().target(),
-                level: *event.metadata().level(),
-                fields: visitor.fields,
-                span_names,
-            };
-
-            if let Ok(mut events) = self.events.events.lock() {
-                events.push(captured);
-            }
-        }
-    }
-
-    #[derive(Default)]
-    struct FieldVisitor {
-        fields: BTreeMap<String, String>,
-    }
-
-    impl FieldVisitor {
-        fn record_value(&mut self, field: &Field, value: impl Into<String>) {
-            self.fields.insert(field.name().to_owned(), value.into());
-        }
-    }
-
-    impl Visit for FieldVisitor {
-        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-            self.record_value(field, format!("{value:?}"));
-        }
-
-        fn record_str(&mut self, field: &Field, value: &str) {
-            self.record_value(field, value);
-        }
-
-        fn record_i64(&mut self, field: &Field, value: i64) {
-            self.record_value(field, value.to_string());
-        }
-
-        fn record_u64(&mut self, field: &Field, value: u64) {
-            self.record_value(field, value.to_string());
-        }
-
-        fn record_bool(&mut self, field: &Field, value: bool) {
-            self.record_value(field, value.to_string());
         }
     }
 }

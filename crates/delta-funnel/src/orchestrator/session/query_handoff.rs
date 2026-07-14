@@ -804,6 +804,7 @@ mod tests {
 
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, QueryOptions,
+        observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         table_formats::RealParquetDeltaTable,
     };
@@ -816,6 +817,7 @@ mod tests {
         physical_plan::ExecutionPlan,
     };
     use futures_util::StreamExt;
+    use tracing::Level;
 
     use super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
@@ -833,6 +835,12 @@ mod tests {
         Option<ProgressOperation>,
         Option<ProgressPhase>,
     );
+    const PARQUET_IO_FIELDS: [&str; 4] = [
+        "parquet_data_file_range_get_operations",
+        "parquet_data_file_full_get_operations",
+        "parquet_data_file_bytes_received",
+        "parquet_data_file_opened_bytes",
+    ];
 
     async fn report_tracked_stream(
         session: &DeltaFunnelSession,
@@ -913,6 +921,17 @@ mod tests {
             Ok(events) => events.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    fn provider_io_events(events: &CapturedEvents) -> Vec<CapturedEvent> {
+        events
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some("delta_provider_parquet_io_summary")
+            })
+            .collect()
     }
 
     fn partition_stream(
@@ -1109,7 +1128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_setup_error_records_one_point_in_time_snapshot()
+    async fn stream_setup_error_records_one_snapshot_and_error_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("final-stats-stream-setup-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -1122,6 +1141,7 @@ mod tests {
         let failing_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSetupFailingPlan::new(physical_plan));
         let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let capture = TracingCapture::start();
 
         let result = super::batch_stream_for_physical_plan(
             &session.context,
@@ -1130,6 +1150,7 @@ mod tests {
             None,
         );
         let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
+        let summaries = provider_io_events(capture.captured());
 
         assert!(result.is_err());
         assert_eq!(snapshots.len(), 1);
@@ -1138,6 +1159,76 @@ mod tests {
         assert_eq!(snapshots[0].parquet_data_file_range_get_operations, Some(0));
         assert_eq!(snapshots[0].parquet_data_file_bytes_received, Some(0));
         assert_eq!(snapshots[0].parquet_data_file_opened_bytes, Some(0));
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].target, "delta_funnel");
+        assert_eq!(summaries[0].level, Level::DEBUG);
+        assert_eq!(
+            summaries[0].fields.get("source_name").map(String::as_str),
+            Some(snapshots[0].source_name.as_str())
+        );
+        assert_eq!(
+            summaries[0].fields.get("outcome").map(String::as_str),
+            Some("error")
+        );
+        for (field, expected) in PARQUET_IO_FIELDS.iter().zip([
+            snapshots[0].parquet_data_file_range_get_operations,
+            snapshots[0].parquet_data_file_full_get_operations,
+            snapshots[0].parquet_data_file_bytes_received,
+            snapshots[0].parquet_data_file_opened_bytes,
+        ]) {
+            assert_eq!(
+                summaries[0]
+                    .fields
+                    .get(*field)
+                    .and_then(|value| value.parse::<u64>().ok()),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_partition_tracking_emits_one_success_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("zero-partition-summary")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let handles = super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        assert_eq!(handles.len(), 1);
+
+        let capture = TracingCapture::start();
+        let streams = super::track_partitioned_scan_completion(Vec::new(), handles);
+        let summaries = provider_io_events(capture.captured());
+
+        assert!(streams.is_empty());
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].target, "delta_funnel");
+        assert_eq!(summaries[0].level, Level::DEBUG);
+        assert_eq!(
+            summaries[0].fields.get("source_name").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            summaries[0].fields.get("outcome").map(String::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            summaries[0]
+                .fields
+                .get("metrics_available")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            PARQUET_IO_FIELDS
+                .iter()
+                .all(|field| summaries[0].fields.contains_key(*field))
+        );
         Ok(())
     }
 
