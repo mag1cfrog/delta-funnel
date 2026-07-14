@@ -119,6 +119,7 @@ pub(crate) fn datafusion_query_output_stream_with_effective_root(
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
 ) -> Result<DFQueryExecution, DataFusionError> {
+    // Keep these branches in sync with DataFusion 53.1's `execute_stream`.
     match plan.properties().output_partitioning().partition_count() {
         // DataFusion returns an empty stream without executing a partition, but
         // profiling still needs the real planned root.
@@ -451,7 +452,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, sync::Arc};
+    use std::{error::Error, sync::Arc, time::Duration};
 
     use datafusion::{
         arrow::{
@@ -459,14 +460,24 @@ mod tests {
             datatypes::{DataType, Field, Schema, SchemaRef},
             record_batch::RecordBatch,
         },
+        common::DataFusionError,
         execution::TaskContext,
         physical_plan::{
-            ExecutionPlan, coalesce_partitions::CoalescePartitionsExec, execute_stream,
-            test::TestMemoryExec, union::UnionExec,
+            ExecutionPlan,
+            coalesce_partitions::CoalescePartitionsExec,
+            execute_stream,
+            test::{
+                TestMemoryExec, assert_is_pending,
+                exec::{
+                    BarrierExec, BlockingExec, ErrorExec, MockExec,
+                    assert_strong_count_converges_to_zero,
+                },
+            },
+            union::UnionExec,
         },
         prelude::SessionContext,
     };
-    use futures_util::StreamExt;
+    use futures_util::{FutureExt, StreamExt, TryStreamExt};
 
     use super::{
         collect_delta_provider_read_stats_handles, datafusion_query_output_stream,
@@ -525,7 +536,7 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()?;
             let plan: Arc<dyn ExecutionPlan> =
                 TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
-            let mut expected = collect_stream_values(execute_stream(
+            let mut expected = collect_stream_batch_values(execute_stream(
                 Arc::clone(&plan),
                 Arc::new(TaskContext::default()),
             )?)
@@ -536,7 +547,7 @@ mod tests {
                 Arc::new(TaskContext::default()),
             )?;
             let actual_schema = output.stream.schema();
-            let mut actual = collect_stream_values(output.stream).await?;
+            let mut actual = collect_stream_batch_values(output.stream).await?;
 
             if partition_values.len() < 2 {
                 assert!(Arc::ptr_eq(&output.effective_profile_root, &plan));
@@ -547,12 +558,64 @@ mod tests {
                     .downcast_ref::<CoalescePartitionsExec>()
                     .ok_or("expected CoalescePartitionsExec")?;
                 assert!(Arc::ptr_eq(effective_root.input(), &plan));
+                // DataFusion does not guarantee ordering between partitions.
+                expected.sort_unstable();
+                actual.sort_unstable();
             }
-            expected.sort_unstable();
-            actual.sort_unstable();
             assert_eq!(actual_schema, schema);
             assert_eq!(actual, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn query_output_stream_effective_root_matches_datafusion_setup_errors()
+    -> Result<(), Box<dyn Error>> {
+        let expected = setup_error_from_datafusion()?;
+        let actual = setup_error_from_delta_funnel()?;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_output_stream_effective_root_matches_datafusion_stream_errors()
+    -> Result<(), Box<dyn Error>> {
+        let expected = first_stream_error(execute_stream(
+            stream_error_plan()?,
+            Arc::new(TaskContext::default()),
+        )?)
+        .await?;
+        let actual = first_stream_error(
+            datafusion_query_output_stream_with_effective_root(
+                stream_error_plan()?,
+                Arc::new(TaskContext::default()),
+            )?
+            .stream,
+        )
+        .await?;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_output_stream_effective_root_preserves_backpressure_and_wakes()
+    -> Result<(), Box<dyn Error>> {
+        let mut expected = exercise_backpressure_and_wakes(false).await?;
+        let mut actual = exercise_backpressure_and_wakes(true).await?;
+
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_output_stream_effective_root_matches_datafusion_cancellation()
+    -> Result<(), Box<dyn Error>> {
+        assert_cancellation_releases_plan(false).await?;
+        assert_cancellation_releases_plan(true).await?;
         Ok(())
     }
 
@@ -618,13 +681,138 @@ mod tests {
     }
 
     async fn collect_stream_values(
-        mut stream: datafusion::physical_plan::SendableRecordBatchStream,
+        stream: datafusion::physical_plan::SendableRecordBatchStream,
     ) -> Result<Vec<i32>, Box<dyn Error>> {
-        let mut values = Vec::new();
+        Ok(collect_stream_batch_values(stream)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    async fn collect_stream_batch_values(
+        mut stream: datafusion::physical_plan::SendableRecordBatchStream,
+    ) -> Result<Vec<Vec<i32>>, Box<dyn Error>> {
+        let mut batches = Vec::new();
         while let Some(batch) = stream.next().await {
-            values.extend(batch_values(&batch?)?);
+            batches.push(batch_values(&batch?)?);
+        }
+        Ok(batches)
+    }
+
+    fn setup_error_from_datafusion() -> Result<String, Box<dyn Error>> {
+        match execute_stream(Arc::new(ErrorExec::new()), Arc::new(TaskContext::default())) {
+            Ok(_) => Err("expected DataFusion stream setup error".into()),
+            Err(error) => Ok(error.to_string()),
+        }
+    }
+
+    fn setup_error_from_delta_funnel() -> Result<String, Box<dyn Error>> {
+        match datafusion_query_output_stream_with_effective_root(
+            Arc::new(ErrorExec::new()),
+            Arc::new(TaskContext::default()),
+        ) {
+            Ok(_) => Err("expected Delta Funnel stream setup error".into()),
+            Err(error) => Ok(error.to_string()),
+        }
+    }
+
+    fn stream_error_plan() -> Result<Arc<dyn ExecutionPlan>, Box<dyn Error>> {
+        let schema = schema();
+        let success: Arc<dyn ExecutionPlan> = Arc::new(MockExec::new(
+            vec![Ok(int_batch(Arc::clone(&schema), &[1])?)],
+            Arc::clone(&schema),
+        ));
+        let failure: Arc<dyn ExecutionPlan> = Arc::new(MockExec::new(
+            vec![Err(DataFusionError::Execution(
+                "injected stream failure".to_owned(),
+            ))],
+            schema,
+        ));
+        Ok(UnionExec::try_new(vec![success, failure])?)
+    }
+
+    async fn first_stream_error(
+        mut stream: datafusion::physical_plan::SendableRecordBatchStream,
+    ) -> Result<String, Box<dyn Error>> {
+        while let Some(batch) = stream.next().await {
+            if let Err(error) = batch {
+                return Ok(error.to_string());
+            }
+        }
+        Err("expected stream error".into())
+    }
+
+    async fn exercise_backpressure_and_wakes(
+        delta_funnel: bool,
+    ) -> Result<Vec<i32>, Box<dyn Error>> {
+        let schema = schema();
+        let partitions = (0..2)
+            .map(|partition| {
+                (0..8)
+                    .map(|offset| int_batch(Arc::clone(&schema), &[partition * 8 + offset]))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = Arc::new(
+            BarrierExec::new(partitions, Arc::clone(&schema))
+                .with_log(false)
+                .with_finish_barrier(),
+        );
+        let execution_plan: Arc<dyn ExecutionPlan> = plan.clone();
+        let stream = if delta_funnel {
+            let execution = datafusion_query_output_stream_with_effective_root(
+                execution_plan,
+                Arc::new(TaskContext::default()),
+            )?;
+            execution.stream
+        } else {
+            execute_stream(execution_plan, Arc::new(TaskContext::default()))?
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), plan.wait()).await?;
+        let drained_without_consumer = tokio::time::timeout(Duration::from_millis(100), async {
+            while !plan.is_finish_barrier_reached() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(drained_without_consumer.is_err());
+
+        let collection = tokio::spawn(async move { stream.try_collect::<Vec<_>>().await });
+        tokio::time::timeout(Duration::from_secs(5), plan.wait_finish()).await?;
+        let batches = tokio::time::timeout(Duration::from_secs(5), collection).await???;
+        let mut values = Vec::new();
+        for batch in &batches {
+            values.extend(batch_values(batch)?);
         }
         Ok(values)
+    }
+
+    async fn assert_cancellation_releases_plan(delta_funnel: bool) -> Result<(), Box<dyn Error>> {
+        let plan = Arc::new(BlockingExec::new(schema(), 2));
+        let refs = plan.refs();
+        let execution_plan: Arc<dyn ExecutionPlan> = plan;
+        let (mut stream, effective_profile_root) = if delta_funnel {
+            let execution = datafusion_query_output_stream_with_effective_root(
+                execution_plan,
+                Arc::new(TaskContext::default()),
+            )?;
+            (execution.stream, Some(execution.effective_profile_root))
+        } else {
+            (
+                execute_stream(execution_plan, Arc::new(TaskContext::default()))?,
+                None,
+            )
+        };
+        let mut next = stream.next().boxed();
+
+        assert_is_pending(&mut next);
+        drop(next);
+        drop(stream);
+        drop(effective_profile_root);
+        assert_strong_count_converges_to_zero(refs).await;
+        Ok(())
     }
 
     fn schema() -> SchemaRef {

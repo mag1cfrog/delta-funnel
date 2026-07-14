@@ -88,8 +88,9 @@ pub(super) fn finalize_provider_scan_execution(
 
 /// Finalizes one merged query execution when its batch stream stops.
 ///
-/// The stream keeps only shared read counters and snapshots them when it ends,
-/// fails, or is dropped by its downstream consumer.
+/// The stream snapshots shared read counters when it ends, fails, or is dropped
+/// by its downstream consumer. An optional profile consumer retains the
+/// effective physical-plan root until that same terminal transition.
 struct DeltaProviderScanTerminalStream {
     inner: MssqlOutputBatchStream,
     // Taking these handles records the single terminal transition, including
@@ -384,11 +385,12 @@ fn track_delta_provider_scan_completion(
 
 /// Adds optional live file progress and terminal tracking to one plan stream.
 ///
-/// Both layers reuse the same live Delta scan counters. They do not execute
-/// another query or retain the physical plan. `progress` contains the reporter
-/// and output name used for live events. Callers collect the handles before
-/// merged stream construction so setup failures can snapshot the same handles.
-/// A profile consumer is called from the same terminal transition.
+/// The provider and progress layers reuse the same live Delta scan counters and
+/// do not execute another query. When present, the profile consumer retains the
+/// effective physical-plan root until the shared terminal transition.
+/// `progress` contains the reporter and output name used for live events.
+/// Callers collect the handles before merged stream construction so setup
+/// failures can snapshot the same handles.
 pub(super) fn wrap_stream_with_delta_read_tracking(
     mut stream: MssqlOutputBatchStream,
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
