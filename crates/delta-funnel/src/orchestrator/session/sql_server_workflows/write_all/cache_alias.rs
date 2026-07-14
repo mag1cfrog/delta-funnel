@@ -24,7 +24,7 @@ use super::super::super::{
     DeltaFunnelSession, LazyTable,
     errors::{mssql_scoped_cache_alias_error, unknown_cached_alias_error},
     query_handoff::{
-        DeltaFileProgressSampler, finalize_provider_scan_execution,
+        DeltaFileProgressSampler, finalize_tracked_query_execution,
         track_partitioned_scan_completion,
     },
 };
@@ -267,8 +267,9 @@ fn start_cache_partition_streams(
     let streams = match execute_stream_partitioned(physical_plan, task_ctx) {
         Ok(streams) => streams,
         Err(error) => {
-            finalize_provider_scan_execution(
+            finalize_tracked_query_execution(
                 &read_stats_handles,
+                None,
                 None,
                 DeltaProviderScanOutcome::Error,
             );

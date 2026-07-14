@@ -2,8 +2,10 @@
 
 use crate::{
     DeltaFunnelError, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, LoadMode,
-    MssqlBatchShapingReport, MssqlTargetTable, RunMode, ValidationStatus,
+    MssqlBatchShapingReport, MssqlTargetTable, QueryExecutionMetricValue, QueryExecutionOutcome,
+    QueryExecutionProfile, RunMode, ValidationStatus,
     support::{sanitize_text_for_display, sanitize_uri_for_display},
+    usize_to_u64_saturating,
 };
 
 pub(crate) const TRACING_TARGET: &str = "delta_funnel";
@@ -20,6 +22,7 @@ const DATAFUSION_REGISTRATION_COMPLETED_EVENT: &str = "datafusion_registration.c
 const DATAFUSION_REGISTRATION_FAILED_EVENT: &str = "datafusion_registration.failed";
 const DATAFUSION_REGISTRATION_STARTED_EVENT: &str = "datafusion_registration.started";
 const DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT: &str = "delta_provider_parquet_io_summary";
+const QUERY_EXECUTION_PROFILE_TERMINAL_EVENT: &str = "query_execution_profile_terminal";
 const PROTOCOL_PREFLIGHT_COMPLETED_EVENT: &str = "protocol_preflight.completed";
 const PROTOCOL_PREFLIGHT_FAILED_EVENT: &str = "protocol_preflight.failed";
 const PROTOCOL_PREFLIGHT_STARTED_EVENT: &str = "protocol_preflight.started";
@@ -52,6 +55,14 @@ impl DeltaProviderScanOutcome {
             Self::Success => "success",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub(crate) const fn query_execution_outcome(self) -> QueryExecutionOutcome {
+        match self {
+            Self::Success => QueryExecutionOutcome::Success,
+            Self::Error => QueryExecutionOutcome::Error,
+            Self::Cancelled => QueryExecutionOutcome::Cancelled,
         }
     }
 }
@@ -108,6 +119,54 @@ pub(crate) fn delta_provider_parquet_io_summary(
             message = DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT
         ),
     }
+}
+
+pub(crate) fn query_execution_profile_terminal(profile: &QueryExecutionProfile) {
+    let operator_count = usize_to_u64_saturating(profile.operators().len());
+    let operators_with_metrics = usize_to_u64_saturating(
+        profile
+            .operators()
+            .iter()
+            .filter(|operator| operator.metrics_available())
+            .count(),
+    );
+    let root_output_rows = profile.operators().first().and_then(|operator| {
+        operator.aggregated_metrics().iter().find_map(|metric| {
+            match (metric.name(), metric.value()) {
+                ("output_rows", QueryExecutionMetricValue::Count(value)) => Some(*value),
+                _ => None,
+            }
+        })
+    });
+    let mut max_elapsed_compute = None;
+    for operator in profile.operators() {
+        for metric in operator.aggregated_metrics() {
+            let ("elapsed_compute", QueryExecutionMetricValue::Nanoseconds(nanos)) =
+                (metric.name(), metric.value())
+            else {
+                continue;
+            };
+            if max_elapsed_compute.is_none_or(|(_, max_nanos)| *nanos > max_nanos) {
+                max_elapsed_compute = Some((operator.operator_name(), *nanos));
+            }
+        }
+    }
+    let max_elapsed_compute_operator = max_elapsed_compute.map(|(operator, _)| operator);
+    let max_elapsed_compute_nanos = max_elapsed_compute.map(|(_, nanos)| nanos);
+
+    tracing::debug!(
+        target: TRACING_TARGET,
+        telemetry_event = QUERY_EXECUTION_PROFILE_TERMINAL_EVENT,
+        scope = profile.scope().as_str(),
+        outcome = profile.outcome().as_str(),
+        partial = profile.partial(),
+        delta_funnel_row_limit = profile.delta_funnel_row_limit(),
+        operator_count,
+        operators_with_metrics,
+        root_output_rows,
+        max_elapsed_compute_operator,
+        max_elapsed_compute_nanos,
+    );
 }
 
 fn parquet_io_metrics(snapshot: &DeltaProviderReadStatsSnapshot) -> ParquetIoMetrics {
@@ -807,6 +866,10 @@ mod tests {
         tracing_test_guard,
     };
     use super::*;
+    use crate::{
+        QueryExecutionMetric, QueryExecutionMetricCategory, QueryExecutionOperatorProfile,
+        QueryExecutionOutcome,
+    };
     use futures_util::StreamExt;
     use tracing::Level;
 
@@ -856,6 +919,10 @@ mod tests {
             &provider_stats_snapshot(),
             DeltaProviderScanOutcome::Success,
         );
+        query_execution_profile_terminal(&QueryExecutionProfile::mssql_output(
+            QueryExecutionOutcome::Success,
+            Vec::new(),
+        ));
         source_loading_started("orders", None);
         source_loading_completed("orders", 7, None);
         protocol_preflight_started("orders", 7);
@@ -896,6 +963,10 @@ mod tests {
         assert_eq!(
             DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT,
             "delta_provider_parquet_io_summary"
+        );
+        assert_eq!(
+            QUERY_EXECUTION_PROFILE_TERMINAL_EVENT,
+            "query_execution_profile_terminal"
         );
         assert_eq!(
             DATAFUSION_BATCH_STREAM_COMPLETED_EVENT,
@@ -948,6 +1019,148 @@ mod tests {
         assert_eq!(DeltaProviderScanOutcome::Success.as_str(), "success");
         assert_eq!(DeltaProviderScanOutcome::Error.as_str(), "error");
         assert_eq!(DeltaProviderScanOutcome::Cancelled.as_str(), "cancelled");
+    }
+
+    #[test]
+    fn terminal_profile_summary_selects_exact_bounded_fields_and_first_maximum() {
+        let metric = |name, value| {
+            QueryExecutionMetric::new(
+                name,
+                QueryExecutionMetricCategory::Summary,
+                None,
+                None,
+                value,
+            )
+        };
+        let operator = |node_id, name, metrics_available, aggregated_metrics| {
+            QueryExecutionOperatorProfile::new(
+                node_id,
+                (node_id != 0).then_some(0),
+                name,
+                1,
+                metrics_available,
+                aggregated_metrics,
+                Vec::new(),
+                None,
+            )
+        };
+        let profile = QueryExecutionProfile::preview(
+            QueryExecutionOutcome::Error,
+            20,
+            vec![
+                operator(
+                    0,
+                    "RootExec",
+                    true,
+                    vec![
+                        metric("output_rows", QueryExecutionMetricValue::Count(42)),
+                        metric(
+                            "elapsed_compute",
+                            QueryExecutionMetricValue::Nanoseconds(50),
+                        ),
+                    ],
+                ),
+                operator(1, "NoMetricsExec", false, Vec::new()),
+                operator(
+                    2,
+                    "FirstSlowExec",
+                    true,
+                    vec![metric(
+                        "elapsed_compute",
+                        QueryExecutionMetricValue::Nanoseconds(100),
+                    )],
+                ),
+                operator(
+                    3,
+                    "TiedSlowExec",
+                    true,
+                    vec![metric(
+                        "elapsed_compute",
+                        QueryExecutionMetricValue::Nanoseconds(100),
+                    )],
+                ),
+            ],
+        );
+
+        let events = capture_events(|| query_execution_profile_terminal(&profile)).events();
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.target, TRACING_TARGET);
+        assert_eq!(event.level, Level::DEBUG);
+        let expected_fields = [
+            "telemetry_event",
+            "scope",
+            "outcome",
+            "partial",
+            "delta_funnel_row_limit",
+            "operator_count",
+            "operators_with_metrics",
+            "root_output_rows",
+            "max_elapsed_compute_operator",
+            "max_elapsed_compute_nanos",
+        ];
+        assert_eq!(event.fields.len(), expected_fields.len());
+        assert!(
+            expected_fields
+                .iter()
+                .all(|field| event.fields.contains_key(*field))
+        );
+        for (field, value) in [
+            ("telemetry_event", "query_execution_profile_terminal"),
+            ("scope", "preview"),
+            ("outcome", "error"),
+            ("partial", "true"),
+            ("delta_funnel_row_limit", "20"),
+            ("operator_count", "4"),
+            ("operators_with_metrics", "3"),
+            ("root_output_rows", "42"),
+            ("max_elapsed_compute_operator", "FirstSlowExec"),
+            ("max_elapsed_compute_nanos", "100"),
+        ] {
+            assert_eq!(event.fields.get(field).map(String::as_str), Some(value));
+        }
+    }
+
+    #[test]
+    fn terminal_profile_summary_omits_unavailable_optional_fields() {
+        let profile = QueryExecutionProfile::mssql_output(
+            QueryExecutionOutcome::Success,
+            vec![QueryExecutionOperatorProfile::new(
+                0,
+                None,
+                "RootExec",
+                1,
+                false,
+                Vec::new(),
+                Vec::new(),
+                None,
+            )],
+        );
+
+        let events = capture_events(|| query_execution_profile_terminal(&profile)).events();
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.fields.len(), 6);
+        for absent in [
+            "delta_funnel_row_limit",
+            "root_output_rows",
+            "max_elapsed_compute_operator",
+            "max_elapsed_compute_nanos",
+        ] {
+            assert!(!event.fields.contains_key(absent));
+        }
+        for (field, value) in [
+            ("telemetry_event", "query_execution_profile_terminal"),
+            ("scope", "mssql_output"),
+            ("outcome", "success"),
+            ("partial", "false"),
+            ("operator_count", "1"),
+            ("operators_with_metrics", "0"),
+        ] {
+            assert_eq!(event.fields.get(field).map(String::as_str), Some(value));
+        }
     }
 
     #[test]

@@ -16,8 +16,8 @@ use super::super::super::{
     DeltaFunnelSession, LazyTableKind, OutputWritePlan,
     errors::{cached_output_stream_setup_error, unknown_cached_alias_error},
     query_handoff::{
-        SharedProviderStatsSnapshots, finalize_provider_scan_execution,
-        wrap_stream_with_delta_read_tracking,
+        SharedProviderStatsSnapshots, finalize_tracked_query_execution,
+        wrap_stream_with_query_execution_tracking,
     },
     registry::{DerivedTableDependency, read_only_sql_options},
 };
@@ -76,9 +76,10 @@ fn cached_output_stream_from_physical_plan(
     let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
         Ok(stream) => stream,
         Err(error) => {
-            finalize_provider_scan_execution(
+            finalize_tracked_query_execution(
                 &read_stats_handles,
                 provider_stats_snapshots.as_ref(),
+                None,
                 DeltaProviderScanOutcome::Error,
             );
             return Err(cached_output_stream_setup_error(&output_name, error));
@@ -89,11 +90,12 @@ fn cached_output_stream_from_physical_plan(
         batch.map_err(|error| cached_output_stream_setup_error(&error_output_name, error))
     }));
 
-    Ok(wrap_stream_with_delta_read_tracking(
+    Ok(wrap_stream_with_query_execution_tracking(
         stream,
         read_stats_handles,
         provider_stats_snapshots,
         reporter.map(|reporter| (reporter, output_name)),
+        None,
     ))
 }
 

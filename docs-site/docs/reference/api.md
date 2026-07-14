@@ -63,9 +63,10 @@ documented AWS keys, examples, and troubleshooting guidance.
 
 The Rust crate exports one immutable execution-profile model for bounded
 previews, one-output SQL Server writes, and selected `write_all` cache aliases.
-This foundation defines the shared report contract only. It does not yet add a
-profile option to any operation, retain plans, emit terminal profile events, or
-change query execution.
+This foundation also supplies the reusable terminal consumer and bounded
+tracing summary. It does not by itself expose a profile option or attach the
+immutable result to an operation report. Individual operation APIs own that
+integration; the model itself does not change query execution.
 
 `ExecutionProfileMode` defaults to `Disabled`. Its other value is `Detailed`.
 The stable JSON spellings used by the remaining enums are:
