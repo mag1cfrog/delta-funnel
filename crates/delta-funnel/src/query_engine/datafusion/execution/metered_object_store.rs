@@ -481,6 +481,31 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn diagnostics_do_not_expose_get_request_details() -> Result<()> {
+        let result = test_get_result(GetResultPayload::Stream(stream::empty().boxed()), 0..0);
+        let read_stats = native_read_stats();
+        let store = scripted_store(result, Arc::clone(&read_stats));
+        let location = Path::from("private/user-password-secret-token.parquet");
+        let mut options = GetOptions::new().with_range(Some(987_654_321_u64..987_654_999_u64));
+        options.if_match = Some("secret-conditional-header".to_owned());
+        options.version = Some("secret-object-version".to_owned());
+
+        let _result = store.get_opts(&location, options).await?;
+        let diagnostics = format!("{store:?} {store} {:?}", read_stats.snapshot());
+
+        for request_detail in [
+            "user-password-secret-token",
+            "secret-conditional-header",
+            "secret-object-version",
+            "987654321",
+            "987654999",
+        ] {
+            assert!(!diagnostics.contains(request_detail));
+        }
+        Ok(())
+    }
+
     fn scripted_store(
         result: GetResult,
         read_stats: Arc<DeltaProviderReadStats>,
