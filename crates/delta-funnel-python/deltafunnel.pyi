@@ -112,6 +112,7 @@ class Table:
         name: str | None = None,
         connection_string: str | None = None,
         progress: bool | None = None,
+        profile: bool | None = False,
     ) -> Report: ...
 
 

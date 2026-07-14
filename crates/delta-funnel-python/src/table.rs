@@ -131,7 +131,8 @@ impl PyTable {
     /// Writes this table to SQL Server, or runs a dry-run plan when requested.
     ///
     /// Pass `dry_run=True` to plan without writing. Returns a plain Python
-    /// `dict` report.
+    /// `dict` report. Pass `profile=True` on execute calls to attach a detailed
+    /// query execution profile. Profiling is not available for dry runs.
     ///
     /// By default, shows an indeterminate phase display in interactive
     /// terminals and Jupyter, and stays quiet elsewhere. Pass `progress=True`
@@ -145,7 +146,7 @@ impl PyTable {
     /// cleanup before raising the interruption. When possible, the exception
     /// includes `deltafunnel_operation_status` and, for a failed action,
     /// `deltafunnel_operation_error`.
-    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None))]
+    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=false))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(
         &self,
@@ -157,7 +158,15 @@ impl PyTable {
         name: Option<String>,
         connection_string: Option<String>,
         progress: Option<bool>,
+        #[pyo3(from_py_with = parse_profile_arg)] profile: bool,
     ) -> PyResult<Py<PyAny>> {
+        if dry_run == Some(true) && profile {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                "`profile=True` is only supported for execute `write_to_mssql` calls".to_owned(),
+            ));
+        }
         let spec = PyMssqlOutputSpec::new(
             py,
             self.session.clone_ref(py),
@@ -177,9 +186,15 @@ impl PyTable {
             );
         }
 
+        let profile_mode = if profile {
+            delta_funnel::ExecutionProfileMode::Detailed
+        } else {
+            delta_funnel::ExecutionProfileMode::Disabled
+        };
         self.session.borrow(py).write_to_mssql(
             py,
             &spec.write_plan(delta_funnel::RunMode::Execute),
+            profile_mode,
             progress.as_ref(),
         )
     }
@@ -197,7 +212,7 @@ impl PyTable {
         py: Python<'_>,
         limit: usize,
         progress: Option<bool>,
-        #[pyo3(from_py_with = parse_preview_profile_arg)] profile: bool,
+        #[pyo3(from_py_with = parse_profile_arg)] profile: bool,
     ) -> PyResult<PyPreview> {
         let profile_mode = if profile {
             delta_funnel::ExecutionProfileMode::Detailed
@@ -254,7 +269,7 @@ impl PyTable {
     }
 }
 
-fn parse_preview_profile_arg(profile: &Bound<'_, PyAny>) -> PyResult<bool> {
+fn parse_profile_arg(profile: &Bound<'_, PyAny>) -> PyResult<bool> {
     if profile.is_none() {
         return Ok(false);
     }
