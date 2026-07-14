@@ -954,6 +954,77 @@ mod tests {
             .collect()
     }
 
+    fn assert_provider_io_event_matches_snapshot(
+        event: &CapturedEvent,
+        snapshot: &crate::DeltaProviderReadStatsSnapshot,
+        outcome: &str,
+    ) {
+        let reader_backend = match snapshot.reader_backend {
+            crate::DeltaProviderReaderBackend::OfficialKernel => "official_kernel",
+            crate::DeltaProviderReaderBackend::NativeAsync => "native_async",
+        };
+        let metrics = [
+            snapshot.parquet_data_file_range_get_operations,
+            snapshot.parquet_data_file_full_get_operations,
+            snapshot.parquet_data_file_bytes_received,
+            snapshot.parquet_data_file_opened_bytes,
+        ];
+        let metrics_available = metrics.iter().all(Option::is_some);
+
+        assert_eq!(event.target, "delta_funnel");
+        assert_eq!(event.level, Level::DEBUG);
+        assert_eq!(
+            event.fields.get("source_name").map(String::as_str),
+            Some(snapshot.source_name.as_str())
+        );
+        assert_eq!(
+            event
+                .fields
+                .get("snapshot_version")
+                .and_then(|value| value.parse::<u64>().ok()),
+            Some(snapshot.snapshot_version)
+        );
+        assert_eq!(
+            event.fields.get("reader_backend").map(String::as_str),
+            Some(reader_backend)
+        );
+        assert_eq!(
+            event.fields.get("outcome").map(String::as_str),
+            Some(outcome)
+        );
+        assert_eq!(
+            event.fields.get("metrics_available").map(String::as_str),
+            Some(if metrics_available { "true" } else { "false" })
+        );
+        for (field, expected) in PARQUET_IO_FIELDS.iter().zip(metrics) {
+            let expected = if metrics_available { expected } else { None };
+            assert_eq!(
+                event
+                    .fields
+                    .get(*field)
+                    .and_then(|value| value.parse::<u64>().ok()),
+                expected
+            );
+        }
+    }
+
+    async fn unexecuted_delta_read_stats_handles(
+        fixture_name: &str,
+        source_name: &str,
+    ) -> Result<Vec<super::DeltaProviderReadStatsHandle>, Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default(fixture_name)?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            source_name,
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let handles = super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        assert_eq!(handles.len(), 1);
+        Ok(handles)
+    }
+
     fn partition_stream(
         coordinator: &Arc<super::PartitionScanCoordinator>,
         batches: Vec<Result<RecordBatch, DeltaFunnelError>>,
@@ -1003,10 +1074,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partitioned_terminal_stream_keeps_error_when_cleanup_drops_other_streams() {
+    async fn partitioned_terminal_stream_emits_error_after_cleanup_drops_other_streams()
+    -> Result<(), Box<dyn std::error::Error>> {
         use crate::observability::DeltaProviderScanOutcome;
 
-        let coordinator = Arc::new(super::PartitionScanCoordinator::new(Vec::new(), 2));
+        let handles =
+            unexecuted_delta_read_stats_handles("partition-error-summary", "orders").await?;
+        let snapshots = super::snapshot_delta_provider_read_stats(&handles);
+        let expected = snapshots.first().ok_or("expected provider snapshot")?;
+        let coordinator = Arc::new(super::PartitionScanCoordinator::new(handles, 2));
         let mut errored = partition_stream(
             &coordinator,
             vec![Err(DeltaFunnelError::Config {
@@ -1014,6 +1090,7 @@ mod tests {
             })],
         );
         let unconsumed = partition_stream(&coordinator, Vec::new());
+        let capture = TracingCapture::start();
 
         assert!(errored.next().await.is_some_and(|batch| batch.is_err()));
         drop(errored);
@@ -1021,30 +1098,51 @@ mod tests {
             partitioned_coordinator_state(&coordinator),
             (1, DeltaProviderScanOutcome::Error)
         );
+        assert!(provider_io_events(capture.captured()).is_empty());
 
         drop(unconsumed);
         assert_eq!(
             partitioned_coordinator_state(&coordinator),
             (0, DeltaProviderScanOutcome::Error)
         );
+        let summaries = provider_io_events(capture.captured());
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], expected, "error");
+        drop(coordinator);
+        assert_eq!(provider_io_events(capture.captured()).len(), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn partitioned_terminal_stream_reports_unconsumed_stream_as_cancelled() {
+    async fn partitioned_terminal_stream_emits_cancelled_for_unconsumed_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
         use crate::observability::DeltaProviderScanOutcome;
 
-        let coordinator = Arc::new(super::PartitionScanCoordinator::new(Vec::new(), 2));
+        let handles =
+            unexecuted_delta_read_stats_handles("partition-cancelled-summary", "orders").await?;
+        let snapshots = super::snapshot_delta_provider_read_stats(&handles);
+        let expected = snapshots.first().ok_or("expected provider snapshot")?;
+        let coordinator = Arc::new(super::PartitionScanCoordinator::new(handles, 2));
         let mut completed = partition_stream(&coordinator, Vec::new());
         let unconsumed = partition_stream(&coordinator, Vec::new());
+        let capture = TracingCapture::start();
 
         assert!(completed.next().await.is_none());
+        assert!(completed.next().await.is_none());
         drop(completed);
+        assert!(provider_io_events(capture.captured()).is_empty());
         drop(unconsumed);
 
         assert_eq!(
             partitioned_coordinator_state(&coordinator),
             (0, DeltaProviderScanOutcome::Cancelled)
         );
+        let summaries = provider_io_events(capture.captured());
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], expected, "cancelled");
+        drop(coordinator);
+        assert_eq!(provider_io_events(capture.captured()).len(), 1);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1099,7 +1197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_provider_stats_are_recorded_once_after_eof_and_drop()
+    async fn eof_records_one_snapshot_and_matching_success_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("final-stats-eof")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -1108,13 +1206,17 @@ mod tests {
             table.path().to_string_lossy().to_string(),
         ))?;
         let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let capture = TracingCapture::start();
         let stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
 
         let rows = collect_stream_row_count(stream).await?;
         let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
+        let summaries = provider_io_events(capture.captured());
 
         assert_eq!(rows, table.rows());
         assert_eq!(snapshots.len(), 1);
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "success");
         assert_eq!(snapshots[0].files_completed, 1);
         assert!(
             snapshots[0]
@@ -1125,7 +1227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_downstream_stream_records_one_partial_provider_snapshot()
+    async fn downstream_drop_records_one_snapshot_and_matching_cancelled_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let table =
             RealParquetDeltaTable::new_with_two_large_files("final-stats-downstream-drop", 20_000)?;
@@ -1139,13 +1241,17 @@ mod tests {
             table.path().to_string_lossy().to_string(),
         ))?;
         let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let capture = TracingCapture::start();
         let mut stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
 
         assert!(stream.next().await.transpose()?.is_some());
         drop(stream);
         let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
+        let summaries = provider_io_events(capture.captured());
 
         assert_eq!(snapshots.len(), 1);
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "cancelled");
         assert!(snapshots[0].files_started > 0);
         assert!(snapshots[0].rows_produced > 0);
         assert!(
@@ -1162,20 +1268,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_error_then_drop_records_provider_stats_once()
+    async fn upstream_error_then_drop_records_one_snapshot_and_matching_error_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("final-stats-upstream-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
         let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let capture = TracingCapture::start();
         let mut stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
 
         let result = stream.next().await.ok_or("expected upstream error")?;
         assert!(result.is_err());
         drop(stream);
         let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
+        let summaries = provider_io_events(capture.captured());
 
         assert_eq!(snapshots.len(), 1);
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "error");
         assert_eq!(snapshots[0].files_started, 1);
         assert_eq!(snapshots[0].files_completed, 0);
         Ok(())
@@ -1214,30 +1324,7 @@ mod tests {
         assert_eq!(snapshots[0].parquet_data_file_bytes_received, Some(0));
         assert_eq!(snapshots[0].parquet_data_file_opened_bytes, Some(0));
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].target, "delta_funnel");
-        assert_eq!(summaries[0].level, Level::DEBUG);
-        assert_eq!(
-            summaries[0].fields.get("source_name").map(String::as_str),
-            Some(snapshots[0].source_name.as_str())
-        );
-        assert_eq!(
-            summaries[0].fields.get("outcome").map(String::as_str),
-            Some("error")
-        );
-        for (field, expected) in PARQUET_IO_FIELDS.iter().zip([
-            snapshots[0].parquet_data_file_range_get_operations,
-            snapshots[0].parquet_data_file_full_get_operations,
-            snapshots[0].parquet_data_file_bytes_received,
-            snapshots[0].parquet_data_file_opened_bytes,
-        ]) {
-            assert_eq!(
-                summaries[0]
-                    .fields
-                    .get(*field)
-                    .and_then(|value| value.parse::<u64>().ok()),
-                expected
-            );
-        }
+        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "error");
         Ok(())
     }
 
