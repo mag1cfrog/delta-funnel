@@ -1,24 +1,42 @@
 //! Python lazy table wrapper.
 
 use pyo3::prelude::*;
+use pyo3::types::{PyAnyMethods, PyBool};
 
+use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
 use crate::progress::PythonProgress;
-use crate::session::PySession;
+use crate::session::{PySession, config_py_error};
 
 /// Rendered preview of a Delta Funnel table.
 #[pyclass(name = "Preview", module = "deltafunnel")]
 pub(crate) struct PyPreview {
     text: String,
     html: String,
+    phase_timings: Py<PyAny>,
+    execution_profile: Py<PyAny>,
 }
 
 impl PyPreview {
-    fn new(preview: delta_funnel::TablePreview) -> Self {
-        Self {
+    fn new(py: Python<'_>, preview: delta_funnel::TablePreview) -> PyResult<Self> {
+        let phase_timings = serde_json::Value::Array(
+            preview
+                .phase_timings()
+                .iter()
+                .map(delta_funnel::PhaseTimingReport::to_json_value)
+                .collect(),
+        );
+        let execution_profile = preview
+            .execution_profile()
+            .map(delta_funnel::QueryExecutionProfile::to_json_value)
+            .unwrap_or(serde_json::Value::Null);
+
+        Ok(Self {
             text: preview.text().to_owned(),
             html: preview.html().to_owned(),
-        }
+            phase_timings: json_value_to_py(py, &phase_timings)?,
+            execution_profile: json_value_to_py(py, &execution_profile)?,
+        })
     }
 }
 
@@ -32,6 +50,16 @@ impl PyPreview {
     #[getter]
     fn html(&self) -> &str {
         &self.html
+    }
+
+    #[getter]
+    fn phase_timings(&self, py: Python<'_>) -> Py<PyAny> {
+        self.phase_timings.clone_ref(py)
+    }
+
+    #[getter]
+    fn execution_profile(&self, py: Python<'_>) -> Py<PyAny> {
+        self.execution_profile.clone_ref(py)
     }
 
     fn __str__(&self) -> &str {
@@ -160,15 +188,30 @@ impl PyTable {
     ///
     /// Progress appears automatically in interactive terminals and notebooks.
     /// Pass `progress=True` to force it or `progress=False` to disable it. The
-    /// progress display closes before the `Preview` object is returned.
-    #[pyo3(signature = (limit=20, *, progress=None))]
-    fn preview(&self, py: Python<'_>, limit: usize, progress: Option<bool>) -> PyResult<PyPreview> {
+    /// progress display closes before the `Preview` object is returned. Phase
+    /// timings are always attached. Pass `profile=True` to also attach the
+    /// detailed execution profile.
+    #[pyo3(signature = (limit=20, *, progress=None, profile=false))]
+    fn preview(
+        &self,
+        py: Python<'_>,
+        limit: usize,
+        progress: Option<bool>,
+        #[pyo3(from_py_with = parse_preview_profile_arg)] profile: bool,
+    ) -> PyResult<PyPreview> {
+        let profile_mode = if profile {
+            delta_funnel::ExecutionProfileMode::Detailed
+        } else {
+            delta_funnel::ExecutionProfileMode::Disabled
+        };
+        let options =
+            delta_funnel::PreviewOptions::new(limit).with_execution_profile_mode(profile_mode);
         let progress = PythonProgress::for_preview(progress);
         let preview =
             self.session
                 .borrow(py)
-                .preview_table(py, &self.inner, limit, progress.as_ref())?;
-        Ok(PyPreview::new(preview))
+                .preview_table(py, &self.inner, options, progress.as_ref())?;
+        PyPreview::new(py, preview)
     }
 
     /// Prints a bounded preview of this lazy table to Python stdout.
@@ -176,10 +219,16 @@ impl PyTable {
     /// Progress closes before the preview text is printed.
     #[pyo3(signature = (limit=20, *, progress=None))]
     fn show(&self, py: Python<'_>, limit: usize, progress: Option<bool>) -> PyResult<()> {
-        let preview = self.preview(py, limit, progress)?;
+        let progress = PythonProgress::for_preview(progress);
+        let preview = self.session.borrow(py).preview_table(
+            py,
+            &self.inner,
+            delta_funnel::PreviewOptions::new(limit),
+            progress.as_ref(),
+        )?;
         py.import("builtins")?
             .getattr("print")?
-            .call1((preview.text.as_str(),))?;
+            .call1((preview.text(),))?;
         Ok(())
     }
 
@@ -205,6 +254,20 @@ impl PyTable {
     }
 }
 
+fn parse_preview_profile_arg(profile: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if profile.is_none() {
+        return Ok(false);
+    }
+    if !profile.is_instance_of::<PyBool>() {
+        return Err(config_py_error(
+            profile.py(),
+            "invalid_option_value",
+            "`profile` must be a bool or None".to_owned(),
+        ));
+    }
+    profile.extract::<bool>()
+}
+
 pub(crate) fn add_table(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyPreview>()?;
     module.add_class::<PyTable>()
@@ -212,10 +275,23 @@ pub(crate) fn add_table(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{deltafunnel, progress::adapter_creation_count, test_support::python_state};
-    use pyo3::exceptions::PyTypeError;
+    use crate::{
+        deltafunnel, exception::DeltaFunnelError, progress::adapter_creation_count,
+        test_support::python_state,
+    };
+    use pyo3::exceptions::{PyAttributeError, PyKeyError, PyTypeError};
     use pyo3::prelude::*;
-    use pyo3::types::{PyAnyMethods, PyDict, PyModule};
+    use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
+
+    const PREVIEW_PHASES: [&str; 7] = [
+        "preview_dataframe_planning",
+        "preview_physical_planning",
+        "preview_stream_setup",
+        "preview_execute_collect",
+        "preview_format_text",
+        "preview_format_html",
+        "preview_total",
+    ];
 
     #[test]
     fn module_exports_table_type() -> PyResult<()> {
@@ -252,6 +328,10 @@ mod tests {
             let preview = table.call_method1("preview", (1,))?;
             let text = preview.getattr("text")?.extract::<String>()?;
             let html = preview.getattr("html")?.extract::<String>()?;
+            let preview_signature = py
+                .import("inspect")?
+                .call_method1("signature", (table.getattr("preview")?,))?
+                .to_string();
 
             assert_eq!(
                 preview
@@ -261,6 +341,11 @@ mod tests {
                 "Preview"
             );
             assert_eq!(preview.str()?.extract::<String>()?, text);
+            assert_eq!(preview.repr()?.extract::<String>()?, text);
+            assert_eq!(
+                preview_signature,
+                "(limit=20, *, progress=None, profile=False)"
+            );
             assert_eq!(
                 preview.call_method0("_repr_html_")?.extract::<String>()?,
                 html
@@ -274,6 +359,123 @@ mod tests {
             assert!(text.contains("| id |"));
             assert!(text.lines().any(|line| line.contains("| 1  |")));
             assert!(!text.lines().any(|line| line.contains("| 2  |")));
+            let phase_timings = preview.getattr("phase_timings")?;
+            let phase_timings = phase_timings.cast::<PyList>()?;
+            assert_eq!(phase_timings.len(), PREVIEW_PHASES.len());
+            for (timing, expected_phase) in phase_timings.iter().zip(PREVIEW_PHASES) {
+                let timing = timing.cast::<PyDict>()?;
+                assert_eq!(
+                    required_item(timing, "phase_name")?.extract::<String>()?,
+                    expected_phase
+                );
+                let status = required_item(timing, "status")?.cast_into::<PyDict>()?;
+                assert_eq!(
+                    required_item(&status, "kind")?.extract::<String>()?,
+                    "completed"
+                );
+            }
+            assert!(preview.getattr("execution_profile")?.is_none());
+            for field in ["phase_timings", "execution_profile"] {
+                assert!(
+                    preview
+                        .setattr(field, py.None())
+                        .is_err_and(|error| { error.is_instance_of::<PyAttributeError>(py) })
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn detailed_table_preview_returns_an_execution_profile() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1(
+                "table_from_sql",
+                ("select 1 as id union all select 2 as id",),
+            )?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("profile", true)?;
+
+            let preview = table.call_method("preview", (1,), Some(&kwargs))?;
+            let profile = preview
+                .getattr("execution_profile")?
+                .cast_into::<PyDict>()?;
+
+            assert_eq!(
+                required_item(&profile, "scope")?.extract::<String>()?,
+                "preview"
+            );
+            assert_eq!(
+                required_item(&profile, "outcome")?.extract::<String>()?,
+                "success"
+            );
+            assert!(!required_item(&profile, "partial")?.extract::<bool>()?);
+            assert_eq!(
+                required_item(&profile, "delta_funnel_row_limit")?.extract::<u64>()?,
+                1
+            );
+            assert!(
+                !required_item(&profile, "operators")?
+                    .cast::<PyList>()?
+                    .is_empty()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preview_failure_exposes_structured_python_context() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1(
+                "table_from_sql",
+                ("select cast(1 as bigint) / cast(0 as bigint) as value",),
+            )?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("profile", true)?;
+
+            let error = table.call_method("preview", (), Some(&kwargs)).unwrap_err();
+            assert!(error.is_instance_of::<DeltaFunnelError>(py));
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "preview"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "preview_failed"
+            );
+            let context = error.value(py).getattr("context")?.cast_into::<PyDict>()?;
+            assert!(context.get_item("source")?.is_none());
+            assert!(
+                !error
+                    .value(py)
+                    .getattr("message")?
+                    .extract::<String>()?
+                    .contains("select")
+            );
+            assert_eq!(
+                required_item(&context, "failed_phase")?.extract::<String>()?,
+                "preview_execute_collect"
+            );
+            assert_eq!(
+                required_item(&context, "phase_timings")?
+                    .cast::<PyList>()?
+                    .len(),
+                PREVIEW_PHASES.len()
+            );
+            let profile = required_item(&context, "execution_profile")?.cast_into::<PyDict>()?;
+            assert_eq!(
+                required_item(&profile, "outcome")?.extract::<String>()?,
+                "error"
+            );
+            assert!(required_item(&profile, "partial")?.extract::<bool>()?);
             Ok(())
         })
     }
@@ -314,6 +516,56 @@ mod tests {
             let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
             let initial_count = adapter_creation_count();
 
+            let invalid_profiles = PyList::empty(py);
+            invalid_profiles.append(0)?;
+            invalid_profiles.append(1)?;
+            invalid_profiles.append("detailed")?;
+            invalid_profiles.append(PyList::empty(py))?;
+            invalid_profiles.append(PyDict::new(py))?;
+            for profile in invalid_profiles.iter() {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("progress", true)?;
+                kwargs.set_item("profile", profile)?;
+                let error = table.call_method("preview", (), Some(&kwargs)).unwrap_err();
+                assert!(error.is_instance_of::<DeltaFunnelError>(py));
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "config"
+                );
+                assert_eq!(
+                    error.value(py).getattr("kind")?.extract::<String>()?,
+                    "invalid_option_value"
+                );
+            }
+            assert_eq!(adapter_creation_count(), initial_count);
+
+            let failing_table = session.call_method1(
+                "table_from_sql",
+                ("select cast(1 as bigint) / cast(0 as bigint) as value",),
+            )?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", true)?;
+            kwargs.set_item("profile", "detailed")?;
+            let error = failing_table
+                .call_method("preview", (), Some(&kwargs))
+                .unwrap_err();
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+            assert_eq!(adapter_creation_count(), initial_count);
+
+            for profile in [
+                py.None(),
+                false.into_pyobject(py)?.to_owned().unbind().into_any(),
+            ] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("progress", false)?;
+                kwargs.set_item("profile", profile)?;
+                let preview = table.call_method("preview", (), Some(&kwargs))?;
+                assert!(preview.getattr("execution_profile")?.is_none());
+            }
+
             for method in ["preview", "show"] {
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("progress", "always")?;
@@ -345,5 +597,10 @@ mod tests {
             assert_eq!(adapter_creation_count(), initial_count);
             Ok(())
         })
+    }
+
+    fn required_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+        dict.get_item(key)?
+            .ok_or_else(|| PyKeyError::new_err(key.to_owned()))
     }
 }

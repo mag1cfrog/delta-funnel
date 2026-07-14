@@ -64,6 +64,11 @@ fn delta_funnel_error_parts(
     error: &delta_funnel::DeltaFunnelError,
 ) -> PyResult<(&'static str, &'static str, Option<Py<PyAny>>)> {
     match error {
+        delta_funnel::DeltaFunnelError::PreviewFailed { context, .. } => Ok((
+            "preview",
+            "preview_failed",
+            Some(json_value_to_py(py, &context.to_json_value())?),
+        )),
         delta_funnel::DeltaFunnelError::Config { .. } => Ok(("config", "config", None)),
         delta_funnel::DeltaFunnelError::InvalidSourceName { .. } => {
             Ok(("source_config", "invalid_source_name", None))
