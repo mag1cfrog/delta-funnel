@@ -50,7 +50,10 @@ pub fn collect_delta_provider_read_stats(
     snapshot_delta_provider_read_stats(&collect_delta_provider_read_stats_handles(plan))
 }
 
-/// Collects shared read stats counters without retaining the physical plan.
+/// Collects distinct shared read stats counters without retaining the physical plan.
+///
+/// Repeated references to the same `Arc` identity are omitted while preserving
+/// the first-seen physical-plan traversal order.
 pub(crate) fn collect_delta_provider_read_stats_handles(
     plan: &dyn ExecutionPlan,
 ) -> Vec<DeltaProviderReadStatsHandle> {
@@ -67,7 +70,10 @@ fn collect_delta_provider_read_stats_handles_into(
         .as_any()
         .downcast_ref::<execution::DeltaScanPlanningExec>()
     {
-        found.push(scan.read_stats_handle());
+        let handle = scan.read_stats_handle();
+        if !found.iter().any(|found| Arc::ptr_eq(found, &handle)) {
+            found.push(handle);
+        }
     }
     for child in plan.children() {
         collect_delta_provider_read_stats_handles_into(child.as_ref(), found);
@@ -410,11 +416,54 @@ mod tests {
             record_batch::RecordBatch,
         },
         execution::TaskContext,
-        physical_plan::{ExecutionPlan, test::TestMemoryExec},
+        physical_plan::{ExecutionPlan, test::TestMemoryExec, union::UnionExec},
+        prelude::SessionContext,
     };
     use futures_util::StreamExt;
 
-    use super::datafusion_query_output_stream;
+    use super::{
+        collect_delta_provider_read_stats_handles, datafusion_query_output_stream,
+        test_support::register_fixture_source,
+    };
+
+    #[tokio::test]
+    async fn read_stats_handles_deduplicate_repeated_plan_identity() -> Result<(), Box<dyn Error>> {
+        let context = SessionContext::new();
+        let _table = register_fixture_source(&context, "orders", "shared-scan-handle")?;
+        let plan = delta_plan(&context).await?;
+        let original = collect_delta_provider_read_stats_handles(plan.as_ref());
+        let repeated_plan = UnionExec::try_new(vec![Arc::clone(&plan), plan])?;
+
+        let found = collect_delta_provider_read_stats_handles(repeated_plan.as_ref());
+
+        assert_eq!(original.len(), 1);
+        assert_eq!(found.len(), 1);
+        assert!(Arc::ptr_eq(&found[0], &original[0]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_stats_handles_keep_distinct_identities_in_first_seen_order()
+    -> Result<(), Box<dyn Error>> {
+        let context = SessionContext::new();
+        let _table = register_fixture_source(&context, "orders", "distinct-scan-handles")?;
+        let first_plan = delta_plan(&context).await?;
+        let second_plan = delta_plan(&context).await?;
+        let first = collect_delta_provider_read_stats_handles(first_plan.as_ref());
+        let second = collect_delta_provider_read_stats_handles(second_plan.as_ref());
+        let combined_plan =
+            UnionExec::try_new(vec![Arc::clone(&second_plan), first_plan, second_plan])?;
+
+        let found = collect_delta_provider_read_stats_handles(combined_plan.as_ref());
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert!(!Arc::ptr_eq(&first[0], &second[0]));
+        assert_eq!(found.len(), 2);
+        assert!(Arc::ptr_eq(&found[0], &second[0]));
+        assert!(Arc::ptr_eq(&found[1], &first[0]));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn query_output_stream_merges_multi_partition_plan() -> Result<(), Box<dyn Error>> {
@@ -440,6 +489,16 @@ mod tests {
 
         assert_eq!(values, vec![1, 2, 3, 4]);
         Ok(())
+    }
+
+    async fn delta_plan(
+        context: &SessionContext,
+    ) -> Result<Arc<dyn ExecutionPlan>, Box<dyn Error>> {
+        Ok(context
+            .sql("select * from orders")
+            .await?
+            .create_physical_plan()
+            .await?)
     }
 
     fn int_batch(schema: SchemaRef, values: &[i32]) -> Result<RecordBatch, Box<dyn Error>> {
