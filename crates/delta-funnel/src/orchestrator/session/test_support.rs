@@ -3,7 +3,7 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -319,7 +319,21 @@ struct StreamSetupFailingProvider {
     child: Arc<dyn TableProvider>,
 }
 
+#[derive(Debug)]
+struct PlanLifetimeTrackingProvider {
+    child: Arc<dyn TableProvider>,
+    last_plan_marker: PlanLifetimeMarker,
+}
+
+#[derive(Debug)]
+struct PlanLifetimeTrackingExec {
+    child: Arc<dyn ExecutionPlan>,
+    marker: Arc<()>,
+}
+
 type CountedProvider = (Arc<dyn TableProvider>, Arc<AtomicUsize>);
+type PlanLifetimeMarker = Arc<Mutex<Option<Weak<()>>>>;
+type PlanLifetimeTrackedProvider = (Arc<dyn TableProvider>, PlanLifetimeMarker);
 
 #[async_trait]
 impl TableProvider for ScanCountingProvider {
@@ -401,6 +415,88 @@ impl TableProvider for StreamSetupFailingProvider {
     }
 }
 
+impl DisplayAs for PlanLifetimeTrackingExec {
+    fn fmt_as(
+        &self,
+        _display_type: DisplayFormatType,
+        formatter: &mut fmt::Formatter,
+    ) -> fmt::Result {
+        formatter.write_str("PlanLifetimeTrackingExec")
+    }
+}
+
+impl ExecutionPlan for PlanLifetimeTrackingExec {
+    fn name(&self) -> &str {
+        "PlanLifetimeTrackingExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.child.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.child]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Plan(
+                "PlanLifetimeTrackingExec requires one child".to_owned(),
+            ));
+        }
+        Ok(Arc::new(Self {
+            child: Arc::clone(&children[0]),
+            marker: Arc::clone(&self.marker),
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        self.child.execute(partition, context)
+    }
+}
+
+#[async_trait]
+impl TableProvider for PlanLifetimeTrackingProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.child.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.child.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let child = self.child.scan(state, projection, filters, limit).await?;
+        let marker = Arc::new(());
+        match self.last_plan_marker.lock() {
+            Ok(mut last_plan_marker) => *last_plan_marker = Some(Arc::downgrade(&marker)),
+            Err(poisoned) => *poisoned.into_inner() = Some(Arc::downgrade(&marker)),
+        }
+        Ok(Arc::new(PlanLifetimeTrackingExec { child, marker }))
+    }
+}
+
 pub(super) fn scan_counting_marker_region_provider(
     marker: &str,
 ) -> Result<CountedProvider, Box<dyn std::error::Error>> {
@@ -443,4 +539,16 @@ pub(super) fn stream_setup_failing_marker_region_provider()
     Ok(Arc::new(StreamSetupFailingProvider {
         child: marker_region_provider("setup-failure")?,
     }))
+}
+
+pub(super) fn plan_lifetime_tracking_marker_region_provider(
+    marker: &str,
+) -> Result<PlanLifetimeTrackedProvider, Box<dyn std::error::Error>> {
+    let last_plan_marker = Arc::new(Mutex::new(None));
+    let provider = PlanLifetimeTrackingProvider {
+        child: marker_region_provider(marker)?,
+        last_plan_marker: Arc::clone(&last_plan_marker),
+    };
+
+    Ok((Arc::new(provider), last_plan_marker))
 }

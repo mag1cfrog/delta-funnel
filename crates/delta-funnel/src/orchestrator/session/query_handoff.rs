@@ -584,9 +584,10 @@ fn register_preview_execution_profile(
 }
 
 fn completed_execution_profile(
-    result: Option<&QueryExecutionProfileResult>,
+    result: Option<QueryExecutionProfileResult>,
 ) -> Option<QueryExecutionProfile> {
     result
+        .as_ref()
         .and_then(QueryExecutionProfileResult::profile)
         .cloned()
 }
@@ -728,11 +729,12 @@ impl DeltaFunnelSession {
                     profile_consumer,
                     DeltaProviderScanOutcome::Error,
                 );
-                let execution_profile = completed_execution_profile(profile_result.as_ref());
+                let execution_profile = completed_execution_profile(profile_result);
                 let source = datafusion_handoff_setup_error("preview_collect", error);
                 return Err(timings.failed(stream_setup_timer, execution_profile, source));
             }
         };
+        drop(physical_plan);
         let (profile_consumer, profile_result) =
             register_preview_execution_profile(effective_profile_root, options);
         let stream: MssqlOutputBatchStream = Box::pin(stream.map(|batch| {
@@ -758,12 +760,12 @@ impl DeltaFunnelSession {
         let batches = match stream.try_collect::<Vec<_>>().await {
             Ok(batches) => batches,
             Err(source) => {
-                let execution_profile = completed_execution_profile(profile_result.as_ref());
+                let execution_profile = completed_execution_profile(profile_result);
                 return Err(timings.failed(execute_collect_timer, execution_profile, source));
             }
         };
         timings.record_completed(execute_collect_timer);
-        let execution_profile = completed_execution_profile(profile_result.as_ref());
+        let execution_profile = completed_execution_profile(profile_result);
 
         emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
         format_preview_result(
@@ -1050,7 +1052,7 @@ async fn dataframe_for_lazy_table_from_session_parts(
 mod tests {
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use crate::{
@@ -1079,8 +1081,8 @@ mod tests {
         test_support::{
             DeltaLogTable, StreamSetupFailingPlan, collect_stream_marker_values,
             collect_stream_row_count, failing_scan_marker_region_provider, marker_region_provider,
-            marker_values_from_batches, scan_counting_marker_region_provider,
-            stream_setup_failing_marker_region_provider,
+            marker_values_from_batches, plan_lifetime_tracking_marker_region_provider,
+            scan_counting_marker_region_provider, stream_setup_failing_marker_region_provider,
         },
     };
 
@@ -2328,6 +2330,61 @@ mod tests {
         assert!(preview.text().contains("observed"));
         assert_eq!(scans.load(Ordering::SeqCst), 1);
         assert_eq!(udf_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_releases_the_execution_plan_before_formatting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for mode in [
+            ExecutionProfileMode::Disabled,
+            ExecutionProfileMode::Detailed,
+        ] {
+            let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+            let (provider, last_plan_marker) =
+                plan_lifetime_tracking_marker_region_provider("observed")?;
+            session
+                .context()
+                .register_table("preview_source", provider)?;
+            let table = session
+                .table_from_sql("select marker from preview_source")
+                .await?;
+            let formatting_observed = Arc::new(AtomicBool::new(false));
+            let plan_released = Arc::new(AtomicBool::new(false));
+            let callback_formatting_observed = Arc::clone(&formatting_observed);
+            let callback_plan_released = Arc::clone(&plan_released);
+            let reporter = ProgressReporter::new(move |event| {
+                if event.phase() != Some(ProgressPhase::FormattingPreview) {
+                    return;
+                }
+                callback_formatting_observed.store(true, Ordering::SeqCst);
+                let released = match last_plan_marker.lock() {
+                    Ok(last_plan_marker) => last_plan_marker
+                        .as_ref()
+                        .is_some_and(|marker| marker.upgrade().is_none()),
+                    Err(poisoned) => poisoned
+                        .into_inner()
+                        .as_ref()
+                        .is_some_and(|marker| marker.upgrade().is_none()),
+                };
+                callback_plan_released.store(released, Ordering::SeqCst);
+            });
+
+            let preview = session
+                .preview_table_with_options_and_progress(
+                    &table,
+                    PreviewOptions::new(1).with_execution_profile_mode(mode),
+                    reporter,
+                )
+                .await?;
+
+            assert!(preview.text().contains("observed"));
+            assert!(formatting_observed.load(Ordering::SeqCst));
+            assert!(
+                plan_released.load(Ordering::SeqCst),
+                "{mode:?} preview retained its execution plan during formatting"
+            );
+        }
         Ok(())
     }
 
