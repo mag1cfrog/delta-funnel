@@ -1,13 +1,156 @@
-use std::cmp::Ordering;
-
-use datafusion::physical_plan::metrics::{Metric, MetricType, MetricValue, MetricsSet};
-
-use crate::{
-    QueryExecutionMetric, QueryExecutionMetricCategory, QueryExecutionMetricValue,
-    usize_to_u64_saturating,
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
+use datafusion::physical_plan::{
+    ExecutionPlan,
+    metrics::{Metric, MetricType, MetricValue, MetricsSet},
+};
+
+use crate::{
+    DeltaProviderReadStatsSnapshot, QueryExecutionMetric, QueryExecutionMetricCategory,
+    QueryExecutionMetricValue, QueryExecutionOperatorProfile, QueryExecutionOutcome,
+    QueryExecutionProfile, QueryExecutionScope, usize_to_u64_saturating,
+};
+
+use super::{DeltaProviderReadStatsHandle, execution::DeltaScanPlanningExec};
+
+pub(crate) type DeltaProviderReadStatsSnapshotSet =
+    Vec<(DeltaProviderReadStatsHandle, DeltaProviderReadStatsSnapshot)>;
+
 #[allow(dead_code)]
+pub(crate) fn delta_provider_read_stats_snapshot_set(
+    handles: &[DeltaProviderReadStatsHandle],
+    snapshots: &[DeltaProviderReadStatsSnapshot],
+) -> DeltaProviderReadStatsSnapshotSet {
+    let mut seen = HashSet::new();
+
+    handles
+        .iter()
+        .zip(snapshots)
+        .filter(|(handle, _)| seen.insert(handle_identity(handle)))
+        .map(|(handle, snapshot)| (Arc::clone(handle), snapshot.clone()))
+        .collect()
+}
+
+#[allow(dead_code)]
+pub(crate) fn collect_query_execution_profile(
+    root: &Arc<dyn ExecutionPlan>,
+    scope: QueryExecutionScope,
+    outcome: QueryExecutionOutcome,
+    delta_funnel_row_limit: usize,
+    terminal_provider_snapshots: Option<&DeltaProviderReadStatsSnapshotSet>,
+) -> QueryExecutionProfile {
+    let supplied_snapshots = terminal_provider_snapshots.map(|snapshots| {
+        let mut supplied = HashMap::new();
+        for (handle, snapshot) in snapshots {
+            supplied.entry(handle_identity(handle)).or_insert(snapshot);
+        }
+        supplied
+    });
+    let mut fallback_snapshots = HashMap::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![(Arc::clone(root), None)];
+    let mut operators = Vec::new();
+
+    while let Some((plan, parent_node_id)) = stack.pop() {
+        if !seen.insert(plan_identity(&plan)) {
+            continue;
+        }
+
+        let node_id = usize_to_u64_saturating(operators.len());
+        let (metrics_available, aggregated_metrics, metrics) = match plan.metrics() {
+            Some(metrics) => {
+                let (aggregated, raw) = collect_query_execution_metrics(&metrics);
+                (true, aggregated, raw)
+            }
+            None => (false, Vec::new(), Vec::new()),
+        };
+        let provider_snapshot = provider_snapshot(
+            plan.as_ref(),
+            node_id,
+            supplied_snapshots.as_ref(),
+            &mut fallback_snapshots,
+        );
+
+        operators.push(QueryExecutionOperatorProfile::new(
+            node_id,
+            parent_node_id,
+            plan.name(),
+            usize_to_u64_saturating(plan.properties().output_partitioning().partition_count()),
+            metrics_available,
+            aggregated_metrics,
+            metrics,
+            provider_snapshot,
+        ));
+
+        let children = plan
+            .children()
+            .into_iter()
+            .map(Arc::clone)
+            .collect::<Vec<_>>();
+        stack.extend(
+            children
+                .into_iter()
+                .rev()
+                .map(|child| (child, Some(node_id))),
+        );
+    }
+
+    match scope {
+        QueryExecutionScope::Preview => {
+            QueryExecutionProfile::preview(outcome, delta_funnel_row_limit, operators)
+        }
+        QueryExecutionScope::MssqlOutput => QueryExecutionProfile::mssql_output(outcome, operators),
+        QueryExecutionScope::WriteAllCacheAlias => {
+            QueryExecutionProfile::write_all_cache_alias(outcome, operators)
+        }
+    }
+}
+
+fn provider_snapshot(
+    plan: &dyn ExecutionPlan,
+    node_id: u64,
+    supplied_snapshots: Option<&HashMap<usize, &DeltaProviderReadStatsSnapshot>>,
+    fallback_snapshots: &mut HashMap<usize, DeltaProviderReadStatsSnapshot>,
+) -> Option<DeltaProviderReadStatsSnapshot> {
+    let scan = plan.as_any().downcast_ref::<DeltaScanPlanningExec>()?;
+    let handle = scan.read_stats_handle();
+    let identity = handle_identity(&handle);
+
+    if let Some(supplied_snapshots) = supplied_snapshots {
+        let snapshot = supplied_snapshots.get(&identity).copied().cloned();
+        if snapshot.is_none() {
+            tracing::debug!(
+                target: "delta_funnel",
+                telemetry_event = "query_execution_profile_provider_snapshot_missing",
+                node_id,
+                operator_name = plan.name(),
+                "Delta scan profile omitted a missing terminal provider snapshot"
+            );
+        }
+        return snapshot;
+    }
+
+    if let Some(snapshot) = fallback_snapshots.get(&identity) {
+        return Some(snapshot.clone());
+    }
+
+    let snapshot = handle.snapshot();
+    fallback_snapshots.insert(identity, snapshot.clone());
+    Some(snapshot)
+}
+
+fn plan_identity(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    Arc::as_ptr(plan) as *const () as usize
+}
+
+fn handle_identity(handle: &DeltaProviderReadStatsHandle) -> usize {
+    Arc::as_ptr(handle) as *const () as usize
+}
+
 pub(super) fn collect_query_execution_metrics(
     metrics: &MetricsSet,
 ) -> (Vec<QueryExecutionMetric>, Vec<QueryExecutionMetric>) {
@@ -193,10 +336,29 @@ mod tests {
     };
 
     use chrono::{DateTime, Utc};
-    use datafusion::physical_plan::metrics::{
-        Count, CustomMetricValue, Gauge, Label, PruningMetrics, RatioMetrics, Time, Timestamp,
+    use datafusion::{
+        arrow::datatypes::Schema,
+        common::{DataFusionError, Result as DataFusionResult},
+        execution::TaskContext,
+        physical_plan::{
+            DisplayAs, DisplayFormatType, PlanProperties, SendableRecordBatchStream,
+            empty::EmptyExec,
+            metrics::{
+                Count, CustomMetricValue, Gauge, Label, PruningMetrics, RatioMetrics, Time,
+                Timestamp,
+            },
+            union::UnionExec,
+        },
+        prelude::SessionContext,
     };
+    use tracing::Level;
 
+    use crate::observability::test_capture::TracingCapture;
+
+    use super::super::{
+        collect_delta_provider_read_stats_handles, snapshot_delta_provider_read_stats,
+        test_support::register_fixture_source,
+    };
     use super::*;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -246,6 +408,355 @@ mod tests {
                 .downcast_ref::<Self>()
                 .is_some_and(|other| self.as_usize() == other.as_usize())
         }
+    }
+
+    #[derive(Debug)]
+    struct ProfileTestExec {
+        name: &'static str,
+        display_text: &'static str,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        properties: EmptyExec,
+        metrics: Option<MetricsSet>,
+        metrics_calls: Arc<AtomicUsize>,
+        execute_calls: Arc<AtomicUsize>,
+    }
+
+    impl ProfileTestExec {
+        fn new(
+            name: &'static str,
+            display_text: &'static str,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+            output_partition_count: usize,
+            metrics_available: bool,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                display_text,
+                children,
+                properties: EmptyExec::new(Arc::new(Schema::empty()))
+                    .with_partitions(output_partition_count),
+                metrics: metrics_available.then(MetricsSet::new),
+                metrics_calls: Arc::new(AtomicUsize::new(0)),
+                execute_calls: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+    }
+
+    impl DisplayAs for ProfileTestExec {
+        fn fmt_as(
+            &self,
+            _format_type: DisplayFormatType,
+            formatter: &mut fmt::Formatter<'_>,
+        ) -> fmt::Result {
+            formatter.write_str(self.display_text)
+        }
+    }
+
+    impl ExecutionPlan for ProfileTestExec {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.properties.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            self.children.iter().collect()
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                name: self.name,
+                display_text: self.display_text,
+                children,
+                properties: self.properties.clone(),
+                metrics: self.metrics.clone(),
+                metrics_calls: Arc::clone(&self.metrics_calls),
+                execute_calls: Arc::clone(&self.execute_calls),
+            }))
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            self.execute_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(DataFusionError::Execution(
+                "profile collection must not execute the plan".to_owned(),
+            ))
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            self.metrics_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.metrics.clone()
+        }
+    }
+
+    #[test]
+    fn collects_unique_plan_nodes_in_first_seen_preorder_without_execution() -> TestResult {
+        let first_leaf = ProfileTestExec::new(
+            "LeafExec",
+            "path=/secret/first.parquet",
+            Vec::new(),
+            1,
+            true,
+        );
+        let second_leaf =
+            ProfileTestExec::new("LeafExec", "credential=secret-second", Vec::new(), 2, false);
+        let first_leaf_plan: Arc<dyn ExecutionPlan> = first_leaf.clone();
+        let second_leaf_plan: Arc<dyn ExecutionPlan> = second_leaf.clone();
+        let branch = ProfileTestExec::new(
+            "BranchExec",
+            "filter=secret_column = 'token'",
+            vec![Arc::clone(&first_leaf_plan), second_leaf_plan],
+            3,
+            false,
+        );
+        let branch_plan: Arc<dyn ExecutionPlan> = branch.clone();
+        let root = ProfileTestExec::new(
+            "RootExec",
+            "sql=SELECT secret_column FROM secret_table",
+            vec![branch_plan, first_leaf_plan],
+            0,
+            true,
+        );
+        let root_plan: Arc<dyn ExecutionPlan> = root.clone();
+        let terminal_snapshots = Vec::new();
+
+        let profile = collect_query_execution_profile(
+            &root_plan,
+            QueryExecutionScope::Preview,
+            QueryExecutionOutcome::Error,
+            20,
+            Some(&terminal_snapshots),
+        );
+
+        assert_eq!(profile.scope(), QueryExecutionScope::Preview);
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Error);
+        assert!(profile.partial());
+        assert_eq!(profile.delta_funnel_row_limit(), Some(20));
+        assert_eq!(
+            profile
+                .operators()
+                .iter()
+                .map(|operator| {
+                    (
+                        operator.node_id(),
+                        operator.parent_node_id(),
+                        operator.operator_name(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                (0, None, "RootExec"),
+                (1, Some(0), "BranchExec"),
+                (2, Some(1), "LeafExec"),
+                (3, Some(1), "LeafExec"),
+            ]
+        );
+        assert_eq!(profile.operators()[0].output_partition_count(), 0);
+        assert_eq!(
+            profile
+                .operators()
+                .iter()
+                .map(QueryExecutionOperatorProfile::metrics_available)
+                .collect::<Vec<_>>(),
+            [true, false, true, false]
+        );
+        assert!(profile.operators().iter().all(|operator| {
+            operator.aggregated_metrics().is_empty()
+                && operator.metrics().is_empty()
+                && operator.delta_provider_read_stats().is_none()
+        }));
+        for plan in [&root, &branch, &first_leaf, &second_leaf] {
+            assert_eq!(plan.metrics_calls.load(AtomicOrdering::Relaxed), 1);
+            assert_eq!(plan.execute_calls.load(AtomicOrdering::Relaxed), 0);
+        }
+
+        let json = serde_json::to_string(&profile.to_json_value())?;
+        let debug = format!("{profile:?}");
+        for secret in [
+            "/secret/first.parquet",
+            "secret-second",
+            "secret_column",
+            "token",
+            "secret_table",
+        ] {
+            assert!(!json.contains(secret));
+            assert!(!debug.contains(secret));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_provider_snapshots_attach_by_exact_handle_identity() -> TestResult {
+        let context = SessionContext::new();
+        let _table = register_fixture_source(&context, "orders", "profile-provider-identity")?;
+        let first_plan = delta_plan(&context, "orders").await?;
+        let second_plan = delta_plan(&context, "orders").await?;
+        let first_handles = collect_delta_provider_read_stats_handles(first_plan.as_ref());
+        let second_handles = collect_delta_provider_read_stats_handles(second_plan.as_ref());
+        let first_handle = Arc::clone(first_handles.first().ok_or("expected first scan handle")?);
+        let second_handle = Arc::clone(
+            second_handles
+                .first()
+                .ok_or("expected second scan handle")?,
+        );
+        assert_eq!(first_handles.len(), 1);
+        assert_eq!(second_handles.len(), 1);
+        assert!(!Arc::ptr_eq(&first_handle, &second_handle));
+
+        let mut first_snapshot = snapshot_delta_provider_read_stats(&[Arc::clone(&first_handle)])
+            .into_iter()
+            .next()
+            .ok_or("expected first provider snapshot")?;
+        first_snapshot.rows_produced = 11;
+        first_snapshot.parquet_data_file_bytes_received = Some(111);
+        let mut second_snapshot = snapshot_delta_provider_read_stats(&[Arc::clone(&second_handle)])
+            .into_iter()
+            .next()
+            .ok_or("expected second provider snapshot")?;
+        second_snapshot.rows_produced = 22;
+        second_snapshot.parquet_data_file_bytes_received = Some(222);
+        let mut duplicate_first_snapshot = first_snapshot.clone();
+        duplicate_first_snapshot.rows_produced = 999;
+
+        let terminal_snapshots = delta_provider_read_stats_snapshot_set(
+            &[
+                Arc::clone(&second_handle),
+                Arc::clone(&first_handle),
+                Arc::clone(&first_handle),
+            ],
+            &[second_snapshot, first_snapshot, duplicate_first_snapshot],
+        );
+        assert_eq!(terminal_snapshots.len(), 2);
+        assert!(Arc::ptr_eq(&terminal_snapshots[0].0, &second_handle));
+        assert!(Arc::ptr_eq(&terminal_snapshots[1].0, &first_handle));
+
+        let root: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![first_plan, second_plan])?;
+        let profile = collect_query_execution_profile(
+            &root,
+            QueryExecutionScope::MssqlOutput,
+            QueryExecutionOutcome::Success,
+            0,
+            Some(&terminal_snapshots),
+        );
+        let scans = profile
+            .operators()
+            .iter()
+            .filter(|operator| operator.operator_name() == "DeltaScanPlanningExec")
+            .collect::<Vec<_>>();
+        assert_eq!(scans.len(), 2);
+        assert_eq!(
+            scans
+                .iter()
+                .filter_map(|operator| operator.delta_provider_read_stats())
+                .map(|stats| stats.rows_produced)
+                .collect::<Vec<_>>(),
+            [11, 22]
+        );
+        let json = profile.to_json_value();
+        assert_eq!(
+            json["operators"]
+                .as_array()
+                .ok_or("expected profile operators")?
+                .iter()
+                .filter(|operator| operator["operator_name"] == "DeltaScanPlanningExec")
+                .map(|operator| {
+                    operator["delta_provider_read_stats"]["parquet_data_file_bytes_received"]
+                        .as_u64()
+                })
+                .collect::<Vec<_>>(),
+            [Some(111), Some(222)]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_terminal_provider_snapshot_is_redacted_and_does_not_fallback() -> TestResult {
+        let context = SessionContext::new();
+        let _table = register_fixture_source(
+            &context,
+            "profile_secret_source",
+            "profile-provider-missing-secret",
+        )?;
+        let target_plan = delta_plan(&context, "profile_secret_source").await?;
+        let unrelated_plan = delta_plan(&context, "profile_secret_source").await?;
+        let target_handles = collect_delta_provider_read_stats_handles(target_plan.as_ref());
+        let unrelated_handles = collect_delta_provider_read_stats_handles(unrelated_plan.as_ref());
+        let unrelated_handle = Arc::clone(
+            unrelated_handles
+                .first()
+                .ok_or("expected unrelated scan handle")?,
+        );
+        assert_eq!(target_handles.len(), 1);
+        assert_eq!(unrelated_handles.len(), 1);
+        assert!(!Arc::ptr_eq(&target_handles[0], &unrelated_handle));
+        let terminal_snapshots = delta_provider_read_stats_snapshot_set(
+            &[unrelated_handle],
+            &snapshot_delta_provider_read_stats(&unrelated_handles),
+        );
+        let capture = TracingCapture::start();
+
+        let profile = collect_query_execution_profile(
+            &target_plan,
+            QueryExecutionScope::WriteAllCacheAlias,
+            QueryExecutionOutcome::Cancelled,
+            0,
+            Some(&terminal_snapshots),
+        );
+
+        let scan = profile
+            .operators()
+            .iter()
+            .find(|operator| operator.operator_name() == "DeltaScanPlanningExec")
+            .ok_or("expected target Delta scan profile")?;
+        assert!(scan.delta_provider_read_stats().is_none());
+        let diagnostics = capture
+            .captured()
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some("query_execution_profile_provider_snapshot_missing")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].target, "delta_funnel");
+        assert_eq!(diagnostics[0].level, Level::DEBUG);
+        let captured_text = format!("{:?}", diagnostics[0].fields);
+        assert!(!captured_text.contains("profile_secret_source"));
+        assert!(!captured_text.contains("profile-provider-missing-secret"));
+
+        let fallback_profile = collect_query_execution_profile(
+            &target_plan,
+            QueryExecutionScope::WriteAllCacheAlias,
+            QueryExecutionOutcome::Success,
+            0,
+            None,
+        );
+        assert_eq!(
+            fallback_profile
+                .operators()
+                .iter()
+                .find(|operator| operator.operator_name() == "DeltaScanPlanningExec")
+                .and_then(|operator| operator.delta_provider_read_stats())
+                .map(|stats| stats.source_name.as_str()),
+            Some("profile_secret_source")
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -654,6 +1165,17 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    async fn delta_plan(
+        context: &SessionContext,
+        source_name: &str,
+    ) -> Result<Arc<dyn ExecutionPlan>, Box<dyn Error>> {
+        Ok(context
+            .sql(&format!("select * from {source_name}"))
+            .await?
+            .create_physical_plan()
+            .await?)
     }
 
     fn metric(
