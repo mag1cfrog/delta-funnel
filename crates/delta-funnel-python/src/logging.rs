@@ -507,26 +507,100 @@ mod tests {
     }
 
     #[test]
-    fn parquet_io_summary_requires_both_rust_and_python_debug_levels() -> PyResult<()> {
+    fn execution_profile_summary_extras_preserve_the_python_string_contract() -> PyResult<()> {
         Python::attach(|py| {
             let (logger, handler, records) =
-                install_capture_handler(py, "deltafunnel.test.parquet_summary_gates")?;
+                install_capture_handler(py, "deltafunnel.test.execution_profile_summary")?;
+            let subscriber = filtered_logging_subscriber(
+                "deltafunnel.test.execution_profile_summary",
+                "delta_funnel=debug",
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                emit_available_execution_profile_summary();
+                emit_minimal_execution_profile_summary();
+            });
+
+            logger.call_method1("removeHandler", (&handler,))?;
+            assert_eq!(records.len(), 2);
+
+            let available = records.get_item(0)?;
+            assert_eq!(available.getattr("levelno")?.extract::<u8>()?, 10);
+            assert_eq!(
+                available.getattr("msg")?.extract::<String>()?,
+                "query_execution_profile_terminal"
+            );
+            for (field, value) in [
+                (
+                    "deltafunnel_telemetry_event",
+                    "query_execution_profile_terminal",
+                ),
+                ("deltafunnel_scope", "preview"),
+                ("deltafunnel_outcome", "error"),
+                ("deltafunnel_partial", "true"),
+                ("deltafunnel_delta_funnel_row_limit", "20"),
+                ("deltafunnel_operator_count", "4"),
+                ("deltafunnel_operators_with_metrics", "3"),
+                ("deltafunnel_root_output_rows", "42"),
+                ("deltafunnel_max_elapsed_compute_operator", "HashJoinExec"),
+                ("deltafunnel_max_elapsed_compute_nanos", "100"),
+            ] {
+                assert_eq!(available.getattr(field)?.extract::<String>()?, value);
+            }
+
+            let minimal = records.get_item(1)?;
+            for (field, value) in [
+                (
+                    "deltafunnel_telemetry_event",
+                    "query_execution_profile_terminal",
+                ),
+                ("deltafunnel_scope", "mssql_output"),
+                ("deltafunnel_outcome", "success"),
+                ("deltafunnel_partial", "false"),
+                ("deltafunnel_operator_count", "1"),
+                ("deltafunnel_operators_with_metrics", "0"),
+            ] {
+                assert_eq!(minimal.getattr(field)?.extract::<String>()?, value);
+            }
+            for field in [
+                "deltafunnel_delta_funnel_row_limit",
+                "deltafunnel_root_output_rows",
+                "deltafunnel_max_elapsed_compute_operator",
+                "deltafunnel_max_elapsed_compute_nanos",
+            ] {
+                assert!(!minimal.hasattr(field)?);
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn debug_summaries_require_both_rust_and_python_debug_levels() -> PyResult<()> {
+        Python::attach(|py| {
+            let (logger, handler, records) =
+                install_capture_handler(py, "deltafunnel.test.debug_summary_gates")?;
 
             // Python admits DEBUG, but the Rust filter rejects the event first.
             let info_subscriber = filtered_logging_subscriber(
-                "deltafunnel.test.parquet_summary_gates",
+                "deltafunnel.test.debug_summary_gates",
                 "delta_funnel=info",
             );
-            tracing::subscriber::with_default(info_subscriber, emit_available_parquet_io_summary);
+            tracing::subscriber::with_default(info_subscriber, || {
+                emit_available_parquet_io_summary();
+                emit_available_execution_profile_summary();
+            });
             assert!(records.is_empty());
 
             // Rust admits DEBUG, but the Python handler rejects the forwarded record.
             handler.call_method1("setLevel", (20,))?;
             let debug_subscriber = filtered_logging_subscriber(
-                "deltafunnel.test.parquet_summary_gates",
+                "deltafunnel.test.debug_summary_gates",
                 "delta_funnel=debug",
             );
-            tracing::subscriber::with_default(debug_subscriber, emit_available_parquet_io_summary);
+            tracing::subscriber::with_default(debug_subscriber, || {
+                emit_available_parquet_io_summary();
+                emit_available_execution_profile_summary();
+            });
             assert!(records.is_empty());
 
             logger.call_method1("removeHandler", (&handler,))?;
@@ -614,6 +688,38 @@ class FailingHandler(logging.Handler):
             outcome = "success",
             metrics_available = false,
             message = "delta_provider_parquet_io_summary"
+        );
+    }
+
+    fn emit_available_execution_profile_summary() {
+        tracing::debug!(
+            target: "delta_funnel",
+            telemetry_event = "query_execution_profile_terminal",
+            scope = "preview",
+            outcome = "error",
+            partial = true,
+            delta_funnel_row_limit = Some(20_u64),
+            operator_count = 4_u64,
+            operators_with_metrics = 3_u64,
+            root_output_rows = Some(42_u64),
+            max_elapsed_compute_operator = Some("HashJoinExec"),
+            max_elapsed_compute_nanos = Some(100_u64),
+        );
+    }
+
+    fn emit_minimal_execution_profile_summary() {
+        tracing::debug!(
+            target: "delta_funnel",
+            telemetry_event = "query_execution_profile_terminal",
+            scope = "mssql_output",
+            outcome = "success",
+            partial = false,
+            delta_funnel_row_limit = None::<u64>,
+            operator_count = 1_u64,
+            operators_with_metrics = 0_u64,
+            root_output_rows = None::<u64>,
+            max_elapsed_compute_operator = None::<&str>,
+            max_elapsed_compute_nanos = None::<u64>,
         );
     }
 

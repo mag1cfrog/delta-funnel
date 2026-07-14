@@ -155,6 +155,59 @@ rows, file paths, table URIs, object URLs, credentials, storage options,
 headers, and byte ranges. It is not exact network billing or a replacement for
 CPU, syscall, scheduler, stack, or kernel profiling.
 
+## Inspect Terminal Execution Profiles
+
+`query_execution_profile_terminal` is one bounded `DEBUG` summary on the
+`delta_funnel` tracing target for an execution that registered a detailed
+profile consumer. Profiling is opt-in. When `ExecutionProfileMode` remains at
+its default `Disabled` value, DeltaFunnel does not allocate a profile result,
+retain a plan for profiling, collect DataFusion metrics, or emit this event.
+
+The event fields are:
+
+| Field | Value |
+| --- | --- |
+| `telemetry_event` | Always `query_execution_profile_terminal`. |
+| `scope` | `preview`, `mssql_output`, or `write_all_cache_alias`. |
+| `outcome` | `success`, `error`, or `cancelled`. |
+| `partial` | `false` only for `success`. |
+| `delta_funnel_row_limit` | Exact saturated preview limit; absent for write scopes. |
+| `operator_count` | Saturated count of profiled physical-plan operators. |
+| `operators_with_metrics` | Count of operators for which DataFusion exposed a metric set, including empty sets. |
+| `root_output_rows` | Aggregated root `output_rows`; absent when unavailable. |
+| `max_elapsed_compute_operator` | Exact short operator name for the first operator with the largest aggregated `elapsed_compute`; absent when unavailable. |
+| `max_elapsed_compute_nanos` | That largest aggregated duration in nanoseconds; absent when unavailable. |
+
+The event is derived only from the stored immutable profile. It emits no
+operator list, raw metrics, plan text, SQL, expressions, schemas, row values,
+source or object names, paths, URLs, aliases, credentials, storage options,
+headers, or byte ranges. See the
+[execution profile model](../reference/api.md#execution-profile-model) for the
+full profile content instead of treating this event as a replacement schema.
+
+One profile event represents one query execution, including a plan with no
+Delta scan. By contrast, `delta_provider_parquet_io_summary` emits once for
+each distinct Delta provider scan. When both are enabled, they use the same
+authoritative terminal outcome and provider snapshot set. Neither event
+changes a successful limited execution because of later formatting, SQL
+finalization, validation, swap, or cleanup work.
+
+The public `datafusion_query_output_stream` function keeps its existing stream
+return type. Internally, profiling retains the exact root used for execution:
+the planned root for zero or one output partition, and DataFusion's
+`CoalescePartitionsExec` root for multiple output partitions. The retained root
+is released immediately after terminal profile collection.
+
+DataFusion metrics and Delta provider counters are cumulative within a physical
+plan. Production code must create a fresh physical plan for each invocation;
+reusing one plan for multiple profiles is unsupported.
+
+The Python bridge exposes these fields as string-valued `deltafunnel_*`
+`LogRecord` attributes. Integers use decimal strings, `partial` uses lowercase
+`"true"` or `"false"`, and unavailable optional attributes are absent. Both
+the Rust `delta_funnel=debug` filter and the selected Python logger and handler
+must admit DEBUG records.
+
 ## What Not To Share
 
 Do not include these values in public issues, chat, logs, or pasted reports:

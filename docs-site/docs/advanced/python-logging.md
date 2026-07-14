@@ -39,7 +39,8 @@ a filter. An explicit filter argument takes precedence. When neither is set,
 Delta Funnel uses `delta_funnel=info,arrow_tiberius=info`.
 
 DEBUG events must pass both the Rust tracing filter and Python logging levels.
-For example, this configuration enables the terminal Parquet I/O summary:
+For example, this configuration enables terminal Parquet I/O and execution
+profile summaries:
 
 ```python
 import logging
@@ -60,8 +61,10 @@ deltafunnel.init_logging("delta_funnel=debug")
 Rust tracing filter. They do not lower the selected Python logger or handler
 level. A Python INFO threshold still discards forwarded DEBUG records.
 
-For the event fields and terminal outcome rules, see
-[Inspect terminal Parquet I/O](tracing-and-diagnostics.md#inspect-terminal-parquet-io).
+For event fields and terminal outcome rules, see
+[Inspect terminal Parquet I/O](tracing-and-diagnostics.md#inspect-terminal-parquet-io)
+and
+[Inspect terminal execution profiles](tracing-and-diagnostics.md#inspect-terminal-execution-profiles).
 
 ## Keep Python in control
 
