@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -19,8 +19,12 @@ use datafusion::{
     catalog::Session,
     datasource::{MemTable, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
+    execution::TaskContext,
     logical_expr::{Expr, TableType},
-    physical_plan::ExecutionPlan,
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        test::exec::ErrorExec,
+    },
 };
 use futures_util::StreamExt;
 
@@ -30,6 +34,70 @@ use crate::{
 };
 
 use super::{LazyTable, MssqlOutputTarget, OutputWritePlan, RunMode};
+
+/// Keeps a real plan as a child but fails before returning its output stream.
+#[derive(Debug)]
+pub(super) struct StreamSetupFailingPlan {
+    child: Arc<dyn ExecutionPlan>,
+    error: ErrorExec,
+}
+
+impl StreamSetupFailingPlan {
+    pub(super) fn new(child: Arc<dyn ExecutionPlan>) -> Self {
+        Self {
+            child,
+            error: ErrorExec::new(),
+        }
+    }
+}
+
+impl DisplayAs for StreamSetupFailingPlan {
+    fn fmt_as(
+        &self,
+        _display_type: DisplayFormatType,
+        formatter: &mut fmt::Formatter,
+    ) -> fmt::Result {
+        formatter.write_str("StreamSetupFailingPlan")
+    }
+}
+
+impl ExecutionPlan for StreamSetupFailingPlan {
+    fn name(&self) -> &str {
+        "StreamSetupFailingPlan"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.error.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.child]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Plan(
+                "StreamSetupFailingPlan requires one child".to_owned(),
+            ));
+        }
+        Ok(Arc::new(Self::new(Arc::clone(&children[0]))))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        self.error.execute(partition, context)
+    }
+}
 
 pub(super) struct DeltaLogTable {
     path: PathBuf,

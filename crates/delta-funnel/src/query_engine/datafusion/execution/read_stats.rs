@@ -30,6 +30,14 @@ pub struct DeltaProviderReadStatsSnapshot {
     pub estimated_rows: Option<u64>,
     /// Estimated bytes from planning when every selected file had a byte size.
     pub estimated_bytes: Option<u64>,
+    /// Non-head Parquet data-file GET operations started with `range = Some(...)`.
+    pub parquet_data_file_range_get_operations: Option<u64>,
+    /// Non-head Parquet data-file GET operations started with `range = None`.
+    pub parquet_data_file_full_get_operations: Option<u64>,
+    /// Bytes delivered through successful Parquet data-file payload chunks.
+    pub parquet_data_file_bytes_received: Option<u64>,
+    /// Known full sizes of admitted NativeAsync Parquet data files.
+    pub parquet_data_file_opened_bytes: Option<u64>,
     /// Effective DataFusion task batch size observed when execution starts.
     ///
     /// This records the upstream query-engine setting. It does not claim every
@@ -111,6 +119,10 @@ pub(crate) struct DeltaProviderReadStats {
     files_filtered_during_planning: Option<u64>,
     estimated_rows: Option<u64>,
     estimated_bytes: Option<u64>,
+    parquet_data_file_range_get_operations: AtomicU64,
+    parquet_data_file_full_get_operations: AtomicU64,
+    parquet_data_file_bytes_received: AtomicU64,
+    parquet_data_file_opened_bytes: AtomicU64,
     datafusion_output_batch_size: AtomicU64,
     scan_partitions_started: AtomicU64,
     scan_partitions_completed: AtomicU64,
@@ -149,6 +161,10 @@ impl DeltaProviderReadStats {
             files_filtered_during_planning: config.files_filtered_during_planning,
             estimated_rows: config.estimated_rows,
             estimated_bytes: config.estimated_bytes,
+            parquet_data_file_range_get_operations: AtomicU64::new(0),
+            parquet_data_file_full_get_operations: AtomicU64::new(0),
+            parquet_data_file_bytes_received: AtomicU64::new(0),
+            parquet_data_file_opened_bytes: AtomicU64::new(0),
             datafusion_output_batch_size: AtomicU64::new(0),
             scan_partitions_started: AtomicU64::new(0),
             scan_partitions_completed: AtomicU64::new(0),
@@ -186,6 +202,14 @@ impl DeltaProviderReadStats {
             files_filtered_during_planning: self.files_filtered_during_planning,
             estimated_rows: self.estimated_rows,
             estimated_bytes: self.estimated_bytes,
+            parquet_data_file_range_get_operations: self
+                .parquet_data_file_metric_snapshot(&self.parquet_data_file_range_get_operations),
+            parquet_data_file_full_get_operations: self
+                .parquet_data_file_metric_snapshot(&self.parquet_data_file_full_get_operations),
+            parquet_data_file_bytes_received: self
+                .parquet_data_file_metric_snapshot(&self.parquet_data_file_bytes_received),
+            parquet_data_file_opened_bytes: self
+                .parquet_data_file_metric_snapshot(&self.parquet_data_file_opened_bytes),
             datafusion_output_batch_size: nonzero_atomic_snapshot(
                 &self.datafusion_output_batch_size,
             ),
@@ -217,6 +241,32 @@ impl DeltaProviderReadStats {
             deletion_vector_failures: self.deletion_vector_failures.load(Ordering::Relaxed),
             deletion_vector_rejections: self.deletion_vector_rejections.load(Ordering::Relaxed),
         }
+    }
+
+    fn parquet_data_file_metric_snapshot(&self, counter: &AtomicU64) -> Option<u64> {
+        match self.reader_backend {
+            DeltaProviderReaderBackend::OfficialKernel => None,
+            DeltaProviderReaderBackend::NativeAsync => Some(counter.load(Ordering::Relaxed)),
+        }
+    }
+
+    pub(crate) fn record_parquet_data_file_range_get_operation(&self) {
+        saturating_fetch_add(&self.parquet_data_file_range_get_operations, 1);
+    }
+
+    pub(crate) fn record_parquet_data_file_full_get_operation(&self) {
+        saturating_fetch_add(&self.parquet_data_file_full_get_operations, 1);
+    }
+
+    pub(crate) fn record_parquet_data_file_bytes_received(&self, bytes: usize) {
+        saturating_fetch_add(
+            &self.parquet_data_file_bytes_received,
+            usize_to_u64_saturating(bytes),
+        );
+    }
+
+    pub(crate) fn record_parquet_data_file_opened_bytes(&self, bytes: u64) {
+        saturating_fetch_add(&self.parquet_data_file_opened_bytes, bytes);
     }
 
     pub(crate) fn record_scan_partition_started(&self) {
@@ -374,6 +424,10 @@ mod tests {
         assert_eq!(snapshot.files_filtered_during_planning, Some(12));
         assert_eq!(snapshot.estimated_rows, Some(99));
         assert_eq!(snapshot.estimated_bytes, Some(42));
+        assert_eq!(snapshot.parquet_data_file_range_get_operations, None);
+        assert_eq!(snapshot.parquet_data_file_full_get_operations, None);
+        assert_eq!(snapshot.parquet_data_file_bytes_received, None);
+        assert_eq!(snapshot.parquet_data_file_opened_bytes, None);
         assert_eq!(snapshot.datafusion_output_batch_size, None);
         assert_eq!(snapshot.scan_partitions_started, 0);
         assert_eq!(snapshot.scan_partitions_completed, 0);
@@ -400,6 +454,38 @@ mod tests {
         assert_eq!(snapshot.deletion_vector_rows_deleted, 0);
         assert_eq!(snapshot.deletion_vector_failures, 0);
         assert_eq!(snapshot.deletion_vector_rejections, 0);
+    }
+
+    #[test]
+    fn native_read_stats_expose_zero_and_recorded_parquet_data_file_metrics() {
+        let stats = DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
+            source_name: "orders".to_owned(),
+            snapshot_version: 7,
+            reader_backend: DeltaProviderReaderBackend::NativeAsync,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 1,
+            files_planned: 1,
+            files_filtered_during_planning: None,
+            estimated_rows: None,
+            estimated_bytes: Some(100),
+        });
+
+        let empty = stats.snapshot();
+        assert_eq!(empty.parquet_data_file_range_get_operations, Some(0));
+        assert_eq!(empty.parquet_data_file_full_get_operations, Some(0));
+        assert_eq!(empty.parquet_data_file_bytes_received, Some(0));
+        assert_eq!(empty.parquet_data_file_opened_bytes, Some(0));
+
+        stats.record_parquet_data_file_range_get_operation();
+        stats.record_parquet_data_file_full_get_operation();
+        stats.record_parquet_data_file_bytes_received(25);
+        stats.record_parquet_data_file_opened_bytes(100);
+
+        let recorded = stats.snapshot();
+        assert_eq!(recorded.parquet_data_file_range_get_operations, Some(1));
+        assert_eq!(recorded.parquet_data_file_full_get_operations, Some(1));
+        assert_eq!(recorded.parquet_data_file_bytes_received, Some(25));
+        assert_eq!(recorded.parquet_data_file_opened_bytes, Some(100));
     }
 
     #[test]
@@ -470,7 +556,7 @@ mod tests {
         let stats = Arc::new(DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
             source_name: "orders".to_owned(),
             snapshot_version: 7,
-            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
+            reader_backend: DeltaProviderReaderBackend::NativeAsync,
             scan_metadata_exhausted: None,
             scan_partitions_planned: THREADS,
             files_planned: THREADS,
@@ -486,6 +572,10 @@ mod tests {
                 for _ in 0..ITERATIONS {
                     stats.record_scan_partition_started();
                     stats.record_scan_partition_completed();
+                    stats.record_parquet_data_file_range_get_operation();
+                    stats.record_parquet_data_file_full_get_operation();
+                    stats.record_parquet_data_file_bytes_received(2);
+                    stats.record_parquet_data_file_opened_bytes(3);
                     stats.record_file_started();
                     stats.record_file_completed();
                     stats.record_dynamic_partition_file_pruned();
@@ -512,6 +602,19 @@ mod tests {
         let expected = u64::try_from(THREADS * ITERATIONS)?;
 
         assert_eq!(snapshot.scan_metadata_exhausted, None);
+        assert_eq!(
+            snapshot.parquet_data_file_range_get_operations,
+            Some(expected)
+        );
+        assert_eq!(
+            snapshot.parquet_data_file_full_get_operations,
+            Some(expected)
+        );
+        assert_eq!(
+            snapshot.parquet_data_file_bytes_received,
+            Some(expected * 2)
+        );
+        assert_eq!(snapshot.parquet_data_file_opened_bytes, Some(expected * 3));
         assert_eq!(snapshot.scan_partitions_started, expected);
         assert_eq!(snapshot.scan_partitions_completed, expected);
         assert_eq!(snapshot.files_started, expected);

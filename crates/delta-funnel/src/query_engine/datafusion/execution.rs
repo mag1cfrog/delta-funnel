@@ -3,6 +3,7 @@
 pub(crate) mod async_scheduler;
 pub(crate) mod environment;
 pub(crate) mod file_reader;
+pub(crate) mod metered_object_store;
 pub(crate) mod native_async_reader;
 pub(crate) mod native_async_row_group_pruning;
 mod planning_exec;

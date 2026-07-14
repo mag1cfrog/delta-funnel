@@ -1,17 +1,23 @@
 use std::sync::Arc;
 
-use datafusion::{arrow::datatypes::SchemaRef, prelude::SessionContext};
+use datafusion::{
+    arrow::datatypes::SchemaRef, physical_plan::ExecutionPlan, prelude::SessionContext,
+};
 use futures_util::StreamExt;
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
     datafusion_query_output_stream, progress::ProgressReporter,
+    query_engine::datafusion::collect_delta_provider_read_stats_handles,
 };
 
 use super::super::super::{
     DeltaFunnelSession, LazyTableKind, OutputWritePlan,
     errors::{cached_output_stream_setup_error, unknown_cached_alias_error},
-    query_handoff::{SharedProviderReadStats, wrap_stream_with_delta_read_tracking},
+    query_handoff::{
+        SharedProviderStatsSnapshots, record_provider_stats_snapshots,
+        wrap_stream_with_delta_read_tracking,
+    },
     registry::{DerivedTableDependency, read_only_sql_options},
 };
 use super::MssqlDerivedCacheAliasPlan;
@@ -25,12 +31,12 @@ pub(super) fn failing_cached_output_batch_stream_factory(
     })
 }
 
-pub(super) async fn replanned_sql_batch_stream(
+pub(super) async fn cached_output_stream_from_retained_sql(
     context: SessionContext,
     output_name: String,
     sql_text: String,
     expected_schema: SchemaRef,
-    provider_stats: Option<SharedProviderReadStats>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     reporter: Option<ProgressReporter>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     let dataframe = context
@@ -46,8 +52,39 @@ pub(super) async fn replanned_sql_batch_stream(
         .create_physical_plan()
         .await
         .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
-    let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
-        .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
+
+    cached_output_stream_from_physical_plan(
+        &context,
+        output_name,
+        physical_plan,
+        provider_stats_snapshots,
+        reporter,
+    )
+}
+
+/// Builds a tracked cached output stream from a completed physical plan.
+fn cached_output_stream_from_physical_plan(
+    context: &SessionContext,
+    output_name: String,
+    physical_plan: Arc<dyn ExecutionPlan>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
+    reporter: Option<ProgressReporter>,
+) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
+    // Retain scan handles before merged stream setup can fail.
+    let read_stats_handles = if provider_stats_snapshots.is_some() || reporter.is_some() {
+        collect_delta_provider_read_stats_handles(physical_plan.as_ref())
+    } else {
+        Vec::new()
+    };
+    let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            if let Some(provider_stats_snapshots) = provider_stats_snapshots.as_ref() {
+                record_provider_stats_snapshots(provider_stats_snapshots, &read_stats_handles);
+            }
+            return Err(cached_output_stream_setup_error(&output_name, error));
+        }
+    };
     let error_output_name = output_name.clone();
     let stream = Box::pin(stream.map(move |batch| {
         batch.map_err(|error| cached_output_stream_setup_error(&error_output_name, error))
@@ -55,8 +92,8 @@ pub(super) async fn replanned_sql_batch_stream(
 
     Ok(wrap_stream_with_delta_read_tracking(
         stream,
-        physical_plan.as_ref(),
-        provider_stats,
+        read_stats_handles,
+        provider_stats_snapshots,
         reporter.map(|reporter| (reporter, output_name)),
     ))
 }
@@ -118,13 +155,13 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
         active_aliases: &[MssqlDerivedCacheAliasPlan],
-        provider_stats: Option<SharedProviderReadStats>,
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<ProgressReporter>,
     ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
         if !self.output_requires_cache_replan(request, active_aliases)? {
             return Ok(self.lazy_table_batch_stream_factory(
                 request.table().clone(),
-                provider_stats,
+                provider_stats_snapshots,
                 reporter.map(|reporter| (reporter, request.target().output_name().to_owned())),
             ));
         }
@@ -151,12 +188,12 @@ impl DeltaFunnelSession {
         let context = self.context.clone();
         Ok(Box::new(move || {
             Box::pin(async move {
-                replanned_sql_batch_stream(
+                cached_output_stream_from_retained_sql(
                     context,
                     output_name,
                     sql_text,
                     expected_schema,
-                    provider_stats,
+                    provider_stats_snapshots,
                     reporter,
                 )
                 .await
@@ -186,16 +223,56 @@ mod tests {
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
-    use crate::{DeltaFunnelError, DeltaSourceConfig, LoadMode};
+    use crate::{
+        DeltaFunnelError, DeltaSourceConfig, LoadMode, table_formats::RealParquetDeltaTable,
+    };
 
     use super::super::super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
+        query_handoff::{provider_stats_snapshots, shared_provider_stats_snapshots},
         test_support::{
-            DeltaLogTable, collect_stream_marker_values, output_request,
+            DeltaLogTable, StreamSetupFailingPlan, collect_stream_marker_values, output_request,
             scan_counting_marker_region_provider,
         },
     };
     use super::super::{MssqlDerivedCacheAliasPlan, MssqlOutputCacheDecision};
+
+    #[tokio::test]
+    async fn cached_output_stream_setup_error_records_one_provider_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("cached-stream-setup-error")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let shared_provider_stats = shared_provider_stats_snapshots();
+
+        let result = super::cached_output_stream_from_physical_plan(
+            &session.context,
+            "orders_output".to_owned(),
+            Arc::new(StreamSetupFailingPlan::new(physical_plan)),
+            Some(Arc::clone(&shared_provider_stats)),
+            None,
+        );
+        let snapshots = provider_stats_snapshots(&shared_provider_stats);
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
+                if message.contains("cached output stream setup failed for `orders_output`")
+        ));
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].source_name, "orders");
+        assert_eq!(snapshots[0].files_started, 0);
+        assert_eq!(snapshots[0].parquet_data_file_range_get_operations, Some(0));
+        assert_eq!(snapshots[0].parquet_data_file_full_get_operations, Some(0));
+        assert_eq!(snapshots[0].parquet_data_file_bytes_received, Some(0));
+        assert_eq!(snapshots[0].parquet_data_file_opened_bytes, Some(0));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn output_requires_cache_replan_classifies_direct_dependent_and_unrelated_outputs()
