@@ -1446,6 +1446,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_delta_execution_emits_no_provider_summary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let derived = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let capture = TracingCapture::start();
+
+        let stream = session.batch_stream_for_lazy_table(&derived, None).await?;
+        let rows = collect_stream_row_count(stream).await?;
+        let summaries = provider_io_events(capture.captured());
+
+        assert_eq!(rows, 2);
+        assert!(summaries.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn preview_table_returns_limited_formatted_rows() -> Result<(), DeltaFunnelError> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let table = session
