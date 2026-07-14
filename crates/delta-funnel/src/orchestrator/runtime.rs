@@ -12,9 +12,9 @@ use super::session::OrchestratorMssqlOutputWriter;
 #[cfg(test)]
 use crate::MssqlWorkflowOutputWriter;
 use crate::{
-    DeltaFunnelError, DeltaFunnelSession, DeltaSourceConfig, LazyTable, MssqlDryRunOutputReport,
-    MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, PreviewOptions, TablePreview,
-    WriteAllOptions, WriteAllReport, progress::ProgressReporter,
+    DeltaFunnelError, DeltaFunnelSession, DeltaSourceConfig, ExecutionProfileMode, LazyTable,
+    MssqlDryRunOutputReport, MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan,
+    PreviewOptions, TablePreview, WriteAllOptions, WriteAllReport, progress::ProgressReporter,
 };
 
 /// Blocking runtime boundary for high-level Delta Funnel session actions.
@@ -218,8 +218,24 @@ impl DeltaFunnelRuntime {
         session: &DeltaFunnelSession,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        self.write_to_mssql_with_profile_mode(session, request, ExecutionProfileMode::Disabled)
+    }
+
+    /// Blocks on one selected output write with optional detailed query profiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as
+    /// [`DeltaFunnelSession::write_to_mssql_with_profile_mode`].
+    pub fn write_to_mssql_with_profile_mode(
+        &self,
+        session: &DeltaFunnelSession,
+        request: &OutputWritePlan,
+        profile_mode: ExecutionProfileMode,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         reject_nested_runtime()?;
-        self.runtime.block_on(session.write_to_mssql(request))
+        self.runtime
+            .block_on(session.write_to_mssql_with_profile_mode(request, profile_mode))
     }
 
     /// Blocks on one selected output write with a workspace host progress reporter.
@@ -230,9 +246,30 @@ impl DeltaFunnelRuntime {
         request: &OutputWritePlan,
         reporter: ProgressReporter,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        self.write_to_mssql_with_profile_mode_and_progress(
+            session,
+            request,
+            ExecutionProfileMode::Disabled,
+            reporter,
+        )
+    }
+
+    /// Blocks on one profiled output write with a workspace host progress reporter.
+    #[doc(hidden)]
+    pub fn write_to_mssql_with_profile_mode_and_progress(
+        &self,
+        session: &DeltaFunnelSession,
+        request: &OutputWritePlan,
+        profile_mode: ExecutionProfileMode,
+        reporter: ProgressReporter,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         reject_nested_runtime()?;
         self.runtime
-            .block_on(session.write_to_mssql_with_reporter(request, reporter))
+            .block_on(session.write_to_mssql_with_profile_mode_and_reporter(
+                request,
+                profile_mode,
+                reporter,
+            ))
     }
 
     #[cfg(test)]

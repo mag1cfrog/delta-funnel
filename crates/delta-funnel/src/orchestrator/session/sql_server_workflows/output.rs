@@ -5,10 +5,10 @@ use datafusion::arrow::datatypes::SchemaRef;
 use tracing::Instrument;
 
 use crate::{
-    DeltaFunnelError, MssqlOutputBatchStream, MssqlTargetOutputPlan, MssqlWriteBackend,
-    MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport, PhaseTimingReport,
-    ReportReasonCode, ResolvedMssqlTarget, ValidationOptions, observability,
-    plan_mssql_target_for_resolved_output,
+    DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStream, MssqlTargetOutputPlan,
+    MssqlWriteBackend, MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport,
+    PhaseTimingReport, QueryExecutionProfile, QueryExecutionScope, ReportReasonCode,
+    ResolvedMssqlTarget, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::PhaseTimer,
     write_output_batches_to_mssql_for_workflow,
@@ -16,7 +16,8 @@ use crate::{
 
 use super::super::{
     DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode,
-    errors::datafusion_handoff_setup_error, query_handoff::batch_stream_for_physical_plan,
+    errors::datafusion_handoff_setup_error,
+    query_handoff::{QueryStreamSetup, batch_stream_for_physical_plan},
 };
 
 pub(in crate::orchestrator::session) const OUTPUT_SCHEMA_PLANNING_PHASE: &str =
@@ -120,23 +121,66 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.run_mssql_write_with_tracing(request, &mut MssqlOneOutputSinkWriter, None)
+        self.write_to_mssql_with_profile_mode(request, ExecutionProfileMode::Disabled)
             .await
     }
 
+    /// Writes one selected lazy table with optional detailed query profiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`DeltaFunnelSession::write_to_mssql`].
+    pub async fn write_to_mssql_with_profile_mode(
+        &self,
+        request: &OutputWritePlan,
+        profile_mode: ExecutionProfileMode,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        self.run_mssql_write_with_tracing(
+            request,
+            &mut MssqlOneOutputSinkWriter,
+            profile_mode,
+            None,
+        )
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "kept as the default-disabled session progress route"
+    )]
     pub(crate) async fn write_to_mssql_with_reporter(
         &self,
         request: &OutputWritePlan,
         reporter: ProgressReporter,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.run_mssql_write_with_tracing(request, &mut MssqlOneOutputSinkWriter, Some(&reporter))
-            .await
+        self.write_to_mssql_with_profile_mode_and_reporter(
+            request,
+            ExecutionProfileMode::Disabled,
+            reporter,
+        )
+        .await
+    }
+
+    pub(crate) async fn write_to_mssql_with_profile_mode_and_reporter(
+        &self,
+        request: &OutputWritePlan,
+        profile_mode: ExecutionProfileMode,
+        reporter: ProgressReporter,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        self.run_mssql_write_with_tracing(
+            request,
+            &mut MssqlOneOutputSinkWriter,
+            profile_mode,
+            Some(&reporter),
+        )
+        .await
     }
 
     async fn run_mssql_write_with_tracing<W>(
         &self,
         request: &OutputWritePlan,
         writer: &mut W,
+        profile_mode: ExecutionProfileMode,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>
     where
@@ -159,11 +203,11 @@ impl DeltaFunnelSession {
             );
             let result = match reporter {
                 Some(reporter) => {
-                    self.run_mssql_write_with_reporter(request, writer, reporter)
+                    self.run_mssql_write_with_reporter(request, writer, profile_mode, reporter)
                         .await
                 }
                 None => {
-                    self.plan_and_write_mssql_output(request, writer, None)
+                    self.plan_and_write_mssql_output(request, writer, profile_mode, None)
                         .await
                 }
             };
@@ -196,8 +240,26 @@ impl DeltaFunnelSession {
     where
         W: OrchestratorMssqlOutputWriter,
     {
+        self.write_to_mssql_with_writer_and_profile_mode(
+            request,
+            writer,
+            ExecutionProfileMode::Disabled,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn write_to_mssql_with_writer_and_profile_mode<W>(
+        &self,
+        request: &OutputWritePlan,
+        writer: &mut W,
+        profile_mode: ExecutionProfileMode,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError>
+    where
+        W: OrchestratorMssqlOutputWriter,
+    {
         ensure_execute_run_mode(request.target().run_mode())?;
-        self.plan_and_write_mssql_output(request, writer, None)
+        self.plan_and_write_mssql_output(request, writer, profile_mode, None)
             .await
     }
 
@@ -212,14 +274,20 @@ impl DeltaFunnelSession {
         W: OrchestratorMssqlOutputWriter,
     {
         ensure_execute_run_mode(request.target().run_mode())?;
-        self.run_mssql_write_with_reporter(request, writer, &reporter)
-            .await
+        self.run_mssql_write_with_reporter(
+            request,
+            writer,
+            ExecutionProfileMode::Disabled,
+            &reporter,
+        )
+        .await
     }
 
     async fn run_mssql_write_with_reporter<W>(
         &self,
         request: &OutputWritePlan,
         writer: &mut W,
+        profile_mode: ExecutionProfileMode,
         reporter: &ProgressReporter,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>
     where
@@ -227,7 +295,7 @@ impl DeltaFunnelSession {
     {
         reporter.emit(&ProgressEvent::started(ProgressOperation::WriteToMssql));
         let result = self
-            .plan_and_write_mssql_output(request, writer, Some(reporter))
+            .plan_and_write_mssql_output(request, writer, profile_mode, Some(reporter))
             .await;
         reporter.emit(&if result.is_ok() {
             ProgressEvent::completed()
@@ -241,6 +309,7 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
         writer: &mut W,
+        profile_mode: ExecutionProfileMode,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>
     where
@@ -272,6 +341,7 @@ impl DeltaFunnelSession {
                     query_phase_timings,
                     dataframe_timer,
                     source,
+                    None,
                 ));
             }
         };
@@ -289,26 +359,36 @@ impl DeltaFunnelSession {
                     query_phase_timings,
                     physical_plan_timer,
                     source,
+                    None,
                 ));
             }
         };
         query_phase_timings.push(physical_plan_timer.completed());
 
         let stream_setup_timer = PhaseTimer::start(QUERY_STREAM_SETUP_PHASE);
-        let batches = match batch_stream_for_physical_plan(
+        let profile_scope = match profile_mode {
+            ExecutionProfileMode::Disabled => None,
+            ExecutionProfileMode::Detailed => Some(QueryExecutionScope::MssqlOutput),
+        };
+        let QueryStreamSetup {
+            stream: batches,
+            profile_result,
+        } = match batch_stream_for_physical_plan(
             self.context(),
             physical_plan,
             None,
             reporter.map(|reporter| (reporter.clone(), request.target().output_name().to_owned())),
+            profile_scope,
         ) {
-            Ok(batches) => batches,
-            Err(source) => {
+            Ok(setup) => setup,
+            Err(failure) => {
                 return Err(mssql_query_phase_error(
                     &planned,
                     MssqlWritePhase::QueryStreamSetup,
                     query_phase_timings,
                     stream_setup_timer,
-                    source,
+                    *failure.source,
+                    failure.execution_profile,
                 ));
             }
         };
@@ -326,14 +406,15 @@ impl DeltaFunnelSession {
                 reporter,
             )
             .await;
+        let execution_profile = profile_result.and_then(|result| result.profile().cloned());
         match result {
-            Ok(report) => {
-                Ok(ensure_validation_phase_timing(report).with_phase_timings(query_phase_timings))
+            Ok(report) => Ok(ensure_validation_phase_timing(report)
+                .with_phase_timings(query_phase_timings)
+                .with_execution_profile(execution_profile)),
+            Err(error) => {
+                let error = prepend_mssql_write_phase_timings(error, query_phase_timings);
+                Err(with_mssql_write_execution_profile(error, execution_profile))
             }
-            Err(error) => Err(prepend_mssql_write_phase_timings(
-                error,
-                query_phase_timings,
-            )),
         }
     }
 }
@@ -344,6 +425,7 @@ fn mssql_query_phase_error(
     mut phase_timings: Vec<PhaseTimingReport>,
     timer: PhaseTimer,
     source: DeltaFunnelError,
+    execution_profile: Option<QueryExecutionProfile>,
 ) -> DeltaFunnelError {
     phase_timings.push(timer.failed());
     let next_phase_index = phase_timings.len();
@@ -366,10 +448,38 @@ fn mssql_query_phase_error(
         false,
         crate::MssqlTargetCleanupStatus::NotApplicable,
     )
-    .with_phase_timings(phase_timings);
+    .with_phase_timings(phase_timings)
+    .with_execution_profile(execution_profile);
     DeltaFunnelError::MssqlQueryPhase {
         context: Box::new(context),
         source: Box::new(source),
+    }
+}
+
+fn with_mssql_write_execution_profile(
+    error: DeltaFunnelError,
+    execution_profile: Option<QueryExecutionProfile>,
+) -> DeltaFunnelError {
+    match error {
+        DeltaFunnelError::MssqlWritePhase { context, message } => {
+            DeltaFunnelError::MssqlWritePhase {
+                context: Box::new((*context).with_execution_profile(execution_profile)),
+                message,
+            }
+        }
+        DeltaFunnelError::MssqlQueryPhase { context, source } => {
+            DeltaFunnelError::MssqlQueryPhase {
+                context: Box::new((*context).with_execution_profile(execution_profile)),
+                source,
+            }
+        }
+        DeltaFunnelError::MssqlBatchSchemaValidation { context, source } => {
+            DeltaFunnelError::MssqlBatchSchemaValidation {
+                context: Box::new((*context).with_execution_profile(execution_profile)),
+                source,
+            }
+        }
+        other => other,
     }
 }
 
@@ -478,12 +588,13 @@ mod tests {
     use futures_util::StreamExt;
 
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlConnectionSource,
+        DeltaFunnelError, DeltaSourceConfig, ExecutionProfileMode, LoadMode, MssqlConnectionSource,
         MssqlOutputBatchStream, MssqlOutputTarget, MssqlTargetCleanupStatus, MssqlTargetConfig,
-        MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteBackend, MssqlWritePhase,
-        MssqlWriteReport, PhaseStatus, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget,
-        TargetValidationMode, ValidationOptions,
-        observability::test_capture::TracingCapture,
+        MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteBackend, MssqlWriteFailureContext,
+        MssqlWritePhase, MssqlWriteReport, PhaseStatus, PhaseTimingReport, QueryExecutionOutcome,
+        QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget, TargetValidationMode,
+        ValidationOptions,
+        observability::test_capture::{CapturedEvent, TracingCapture},
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         table_formats::RealParquetDeltaTable,
     };
@@ -526,6 +637,18 @@ mod tests {
             Ok(events) => events.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    fn execution_profile_events(capture: &TracingCapture) -> Vec<CapturedEvent> {
+        capture
+            .captured()
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some("query_execution_profile_terminal")
+            })
+            .collect()
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -603,6 +726,73 @@ mod tests {
                 false,
                 MssqlTargetCleanupStatus::NotApplicable,
             ))
+        }
+    }
+
+    struct EarlyFailureWriter;
+
+    #[async_trait]
+    impl OrchestratorMssqlOutputWriter for EarlyFailureWriter {
+        async fn write_output(
+            &mut self,
+            _output_schema: SchemaRef,
+            output_plan: MssqlTargetOutputPlan,
+            _resolved_target: ResolvedMssqlTarget,
+            batches: MssqlOutputBatchStream,
+            _write_backend: MssqlWriteBackend,
+            _validation_options: ValidationOptions,
+            _reporter: Option<&ProgressReporter>,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+            drop(batches);
+            Err(DeltaFunnelError::MssqlWritePhase {
+                context: Box::new(MssqlWriteFailureContext::from_output_plan(
+                    &output_plan,
+                    MssqlWritePhase::InitializeWriter,
+                    0,
+                    0,
+                    0,
+                    false,
+                    MssqlTargetCleanupStatus::NotApplicable,
+                )),
+                message: "injected writer initialization failure".to_owned(),
+            })
+        }
+    }
+
+    struct PostEofFailureWriter;
+
+    #[async_trait]
+    impl OrchestratorMssqlOutputWriter for PostEofFailureWriter {
+        async fn write_output(
+            &mut self,
+            _output_schema: SchemaRef,
+            output_plan: MssqlTargetOutputPlan,
+            _resolved_target: ResolvedMssqlTarget,
+            mut batches: MssqlOutputBatchStream,
+            _write_backend: MssqlWriteBackend,
+            _validation_options: ValidationOptions,
+            _reporter: Option<&ProgressReporter>,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+            let mut rows = 0_u64;
+            let mut batch_count = 0_u64;
+            while let Some(batch) = batches.next().await {
+                let batch = batch?;
+                rows = rows.saturating_add(crate::usize_to_u64_saturating(batch.num_rows()));
+                batch_count = batch_count.saturating_add(1);
+            }
+
+            Err(DeltaFunnelError::MssqlWritePhase {
+                context: Box::new(MssqlWriteFailureContext::from_output_plan(
+                    &output_plan,
+                    MssqlWritePhase::Finalize,
+                    rows,
+                    batch_count,
+                    0,
+                    false,
+                    MssqlTargetCleanupStatus::NotApplicable,
+                )),
+                message: "injected finalization failure".to_owned(),
+            })
         }
     }
 
@@ -1018,6 +1208,7 @@ mod tests {
         )?;
         let mut writer = FakeOrchestratorWriter::default();
         let (reporter, events) = recording_reporter();
+        let capture = TracingCapture::start();
 
         let report = session
             .write_to_mssql_with_writer_and_reporter(&request, &mut writer, reporter)
@@ -1043,6 +1234,8 @@ mod tests {
         assert_eq!(report.stats().rows_written(), 2);
         assert_eq!(report.stats().batches_written(), call.batches);
         assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
+        assert_eq!(report.execution_profile(), None);
+        assert!(execution_profile_events(&capture).is_empty());
         assert_eq!(
             report
                 .phase_timings()
@@ -1097,6 +1290,203 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn detailed_write_attaches_one_successful_terminal_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let derived = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let request = execute_output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+        let mut writer = FakeOrchestratorWriter::default();
+        let capture = TracingCapture::start();
+
+        let report = session
+            .write_to_mssql_with_writer_and_profile_mode(
+                &request,
+                &mut writer,
+                ExecutionProfileMode::Detailed,
+            )
+            .await?;
+
+        let profile = report.execution_profile().ok_or("expected profile")?;
+        assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+        assert!(!profile.partial());
+        assert_eq!(profile.delta_funnel_row_limit(), None);
+        assert!(!profile.operators().is_empty());
+        let events = execution_profile_events(&capture);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].fields.get("scope").map(String::as_str),
+            Some("mssql_output")
+        );
+        assert_eq!(
+            events[0].fields.get("outcome").map(String::as_str),
+            Some("success")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_write_with_progress_keeps_the_same_profile_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let derived = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let request = execute_output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+        let mut writer = FakeOrchestratorWriter::default();
+        let (reporter, progress) = recording_reporter();
+        let capture = TracingCapture::start();
+
+        let report = session
+            .run_mssql_write_with_reporter(
+                &request,
+                &mut writer,
+                ExecutionProfileMode::Detailed,
+                &reporter,
+            )
+            .await?;
+
+        let profile = report.execution_profile().ok_or("expected profile")?;
+        assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+        assert!(!profile.partial());
+        assert_eq!(profile.delta_funnel_row_limit(), None);
+        assert!(!profile.operators().is_empty());
+        assert_eq!(execution_profile_events(&capture).len(), 1);
+        assert_eq!(
+            progress_events(&progress),
+            vec![
+                (
+                    ProgressEventKind::Started,
+                    Some(ProgressOperation::WriteToMssql),
+                    None,
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::PlanningOutput),
+                ),
+                (
+                    ProgressEventKind::PhaseChanged,
+                    None,
+                    Some(ProgressPhase::SettingUpStream),
+                ),
+                (ProgressEventKind::Completed, None, None),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_write_attaches_cancelled_profile_when_writer_never_polls_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let derived = session.table_from_sql("select 1 as id").await?;
+        let request = execute_output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+        let capture = TracingCapture::start();
+
+        let error = session
+            .write_to_mssql_with_writer_and_profile_mode(
+                &request,
+                &mut EarlyFailureWriter,
+                ExecutionProfileMode::Detailed,
+            )
+            .await
+            .err()
+            .ok_or("expected writer failure")?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err("expected MSSQL write phase failure".into());
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::InitializeWriter);
+        assert!(!context.partial_write_possible());
+        let profile = context
+            .report()
+            .execution_profile()
+            .ok_or("expected failure profile")?;
+        assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Cancelled);
+        assert!(profile.partial());
+        let events = execution_profile_events(&capture);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].fields.get("outcome").map(String::as_str),
+            Some("cancelled")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_write_keeps_successful_profile_for_failure_after_eof()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let derived = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let request = execute_output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::CreateAndLoad,
+        )?;
+        let capture = TracingCapture::start();
+
+        let error = session
+            .write_to_mssql_with_writer_and_profile_mode(
+                &request,
+                &mut PostEofFailureWriter,
+                ExecutionProfileMode::Detailed,
+            )
+            .await
+            .err()
+            .ok_or("expected finalization failure")?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+            return Err("expected MSSQL write phase failure".into());
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::Finalize);
+        let profile = context
+            .report()
+            .execution_profile()
+            .ok_or("expected failure profile")?;
+        assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+        assert!(!profile.partial());
+        let events = execution_profile_events(&capture);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].fields.get("outcome").map(String::as_str),
+            Some("success")
+        );
+        Ok(())
+    }
+
     #[test]
     fn query_phase_failures_keep_source_and_mark_remaining_phases_not_started()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1132,6 +1522,7 @@ mod tests {
                 DeltaFunnelError::Config {
                     message: "query preparation failed".to_owned(),
                 },
+                None,
             );
 
             assert!(Error::source(&error).is_some());

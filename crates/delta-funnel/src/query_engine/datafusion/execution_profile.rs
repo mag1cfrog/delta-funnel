@@ -26,7 +26,6 @@ pub(crate) struct QueryExecutionProfileResult {
 }
 
 impl QueryExecutionProfileResult {
-    #[allow(dead_code)]
     pub(crate) fn profile(&self) -> Option<&QueryExecutionProfile> {
         self.profile.get()
     }
@@ -40,7 +39,6 @@ pub(crate) struct QueryExecutionProfileConsumer {
 }
 
 impl QueryExecutionProfileConsumer {
-    #[allow(dead_code)]
     pub(crate) fn register(
         root: Arc<dyn ExecutionPlan>,
         scope: QueryExecutionScope,

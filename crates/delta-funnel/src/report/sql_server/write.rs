@@ -2,8 +2,9 @@ use std::fmt;
 
 use crate::{
     MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan, MssqlTargetTable,
-    MssqlWritePhase, PhaseStatus, PhaseTimingReport, QueryExecutionProfile, ReportReasonCode,
-    RowCount, ValidationStatus, sql_server::LoadMode, support::sanitize_text_for_display,
+    MssqlWritePhase, PhaseStatus, PhaseTimingReport, QueryExecutionProfile, QueryExecutionScope,
+    ReportReasonCode, RowCount, ValidationStatus, sql_server::LoadMode,
+    support::sanitize_text_for_display,
 };
 
 /// Per-output SQL Server write statistics.
@@ -447,6 +448,19 @@ impl MssqlWriteReport {
         self
     }
 
+    pub(crate) fn with_execution_profile(
+        mut self,
+        execution_profile: Option<QueryExecutionProfile>,
+    ) -> Self {
+        debug_assert!(
+            execution_profile
+                .as_ref()
+                .is_none_or(|profile| profile.scope() == QueryExecutionScope::MssqlOutput)
+        );
+        self.execution_profile = execution_profile;
+        self
+    }
+
     pub(crate) fn with_target_delta_validation(
         mut self,
         target_row_count_before_write: RowCount,
@@ -816,6 +830,14 @@ impl MssqlWriteFailureContext {
 
     pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
         self.report = self.report.with_phase_timings(phase_timings);
+        self
+    }
+
+    pub(crate) fn with_execution_profile(
+        mut self,
+        execution_profile: Option<QueryExecutionProfile>,
+    ) -> Self {
+        self.report = self.report.with_execution_profile(execution_profile);
         self
     }
 
