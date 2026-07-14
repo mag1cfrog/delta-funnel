@@ -16,13 +16,11 @@ use object_store::{
 use super::read_stats::DeltaProviderReadStats;
 
 /// Measures Parquet data-file GET operations without exposing request details.
-#[allow(dead_code)]
 pub(crate) struct MeteredParquetObjectStore {
     inner: Arc<dyn ObjectStore>,
     read_stats: Arc<DeltaProviderReadStats>,
 }
 
-#[allow(dead_code)]
 impl MeteredParquetObjectStore {
     /// Wraps one data-file store with counters from the containing scan.
     pub(crate) fn new(
@@ -119,7 +117,6 @@ impl ObjectStore for MeteredParquetObjectStore {
     }
 }
 
-#[allow(dead_code)]
 fn meter_get_result(result: GetResult, read_stats: Arc<DeltaProviderReadStats>) -> GetResult {
     let GetResult {
         payload,

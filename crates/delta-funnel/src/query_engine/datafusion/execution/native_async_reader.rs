@@ -42,6 +42,7 @@ use crate::{
 use super::super::planning::file_task::DeltaScanFileTask;
 use super::async_scheduler::{DeltaProviderAsyncFileReadFuture, DeltaProviderAsyncFileReader};
 use super::file_reader::DeltaFileReadDeletionVectorStats;
+use super::metered_object_store::MeteredParquetObjectStore;
 use super::native_async_row_group_pruning::native_async_pruned_row_groups;
 use super::read_stats::DeltaProviderReadStats;
 use super::scheduling::DeltaProviderAsyncFileReadPermit;
@@ -187,6 +188,12 @@ impl DeltaNativeAsyncFileReader {
             data_file_reader,
             deletion_vector_reader,
         })
+    }
+
+    /// Meters only the store supplied to Parquet data-file readers.
+    fn with_metered_data_file_store(mut self, read_stats: Arc<DeltaProviderReadStats>) -> Self {
+        self.store = Arc::new(MeteredParquetObjectStore::new(self.store, read_stats));
+        self
     }
 
     /// Resolves a Delta file task into the object-store input for Parquet reads.
@@ -1731,14 +1738,15 @@ fn is_file_path_metadata_field(field: &KernelStructField) -> bool {
 }
 
 impl DeltaNativeAsyncPartitionFileReader {
-    /// Builds a native async scheduler adapter for one execution partition.
+    /// Builds a partition reader whose Parquet store reports into this scan.
     #[allow(dead_code)]
     pub(crate) fn new(
-        reader: Arc<DeltaNativeAsyncFileReader>,
+        reader: DeltaNativeAsyncFileReader,
         read_schema: KernelScanReadSchema,
         read_stats: Arc<DeltaProviderReadStats>,
         output_batch_size: usize,
     ) -> Self {
+        let reader = Arc::new(reader.with_metered_data_file_store(Arc::clone(&read_stats)));
         Self {
             reader,
             read_schema,
@@ -1759,7 +1767,13 @@ impl DeltaProviderAsyncFileReader<DeltaScanFileTask, DeltaNativeAsyncFileReadStr
         let reader = Arc::clone(&self.reader);
         let read_schema = self.read_schema.clone();
         let output_batch_size = self.output_batch_size;
+        // The scheduler calls this once after admission and permit acquisition.
+        // Keep both start counters outside the polled future so prefetch cannot
+        // count the same task again when its setup future is polled repeatedly.
         self.read_stats.record_file_started();
+        if let Some(bytes) = task.estimated_bytes {
+            self.read_stats.record_parquet_data_file_opened_bytes(bytes);
+        }
 
         Box::pin(async move {
             reader

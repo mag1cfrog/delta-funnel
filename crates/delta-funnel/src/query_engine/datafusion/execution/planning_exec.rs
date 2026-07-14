@@ -319,14 +319,13 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                 ))
             }
             DeltaProviderReaderBackend::NativeAsync => {
-                let file_reader = Arc::new(DeltaNativeAsyncFileReader::try_new(
-                    DeltaNativeAsyncFileReaderConfig {
+                let file_reader =
+                    DeltaNativeAsyncFileReader::try_new(DeltaNativeAsyncFileReaderConfig {
                         source_name: &self.scan_plan.source_name,
                         table_uri: &self.scan_plan.table_uri,
                         snapshot_version: self.scan_plan.snapshot_version,
                         storage_options: &self.scan_plan.storage_options,
-                    },
-                )?);
+                    })?;
                 let partition_reader = Arc::new(DeltaNativeAsyncPartitionFileReader::new(
                     file_reader,
                     read_schema,
@@ -1547,6 +1546,16 @@ mod tests {
         }
         let formatted = pretty_format_batches(&batches)?.to_string();
         let stats = updated_scan.read_stats_snapshot();
+        let kept_file_bytes = updated_scan
+            .partition_plan()
+            .partitions
+            .iter()
+            .flat_map(|partition| &partition.file_tasks)
+            .filter(|task| {
+                task.partition_values.get("region").map(String::as_str) == Some("us-west")
+            })
+            .filter_map(|task| task.estimated_bytes)
+            .sum::<u64>();
 
         assert_eq!(
             formatted,
@@ -1563,6 +1572,12 @@ mod tests {
         assert_eq!(stats.files_planned, 2);
         assert_eq!(stats.files_started, 1);
         assert_eq!(stats.files_completed, 1);
+        assert_eq!(stats.parquet_data_file_opened_bytes, Some(kept_file_bytes));
+        assert!(
+            stats
+                .estimated_bytes
+                .is_some_and(|planned_bytes| kept_file_bytes < planned_bytes)
+        );
         assert_eq!(stats.dynamic_filters_received, 1);
         assert_eq!(stats.dynamic_filters_accepted, 1);
         assert_eq!(stats.dynamic_filters_unsupported, 0);
@@ -3231,6 +3246,22 @@ mod tests {
         assert_eq!(read_stats.files_started, 1);
         assert_eq!(read_stats.files_completed, 1);
         assert_eq!(read_stats.rows_produced, 3);
+        assert!(
+            read_stats
+                .parquet_data_file_range_get_operations
+                .is_some_and(|operations| operations > 0)
+        );
+        assert_eq!(read_stats.parquet_data_file_full_get_operations, Some(0));
+        assert!(
+            read_stats
+                .parquet_data_file_bytes_received
+                .zip(read_stats.parquet_data_file_opened_bytes)
+                .is_some_and(|(received, opened)| received < opened)
+        );
+        assert_eq!(
+            read_stats.parquet_data_file_opened_bytes,
+            read_stats.estimated_bytes
+        );
 
         Ok(())
     }
@@ -5063,6 +5094,14 @@ mod tests {
         let read_stats = scans[0].read_stats_snapshot();
         assert_eq!(read_stats.files_started, 1);
         assert_eq!(read_stats.files_completed, 0);
+        assert_eq!(read_stats.parquet_data_file_opened_bytes, Some(123));
+        assert!(
+            read_stats
+                .parquet_data_file_range_get_operations
+                .is_some_and(|operations| operations > 0)
+        );
+        assert_eq!(read_stats.parquet_data_file_full_get_operations, Some(0));
+        assert_eq!(read_stats.parquet_data_file_bytes_received, Some(0));
         assert_eq!(read_stats.batches_produced, 0);
         assert_eq!(read_stats.rows_produced, 0);
 
@@ -5344,6 +5383,7 @@ mod tests {
         assert_eq!(stats.scan_partitions_completed, 1);
         assert_eq!(stats.files_started, 2);
         assert_eq!(stats.files_completed, 2);
+        assert_eq!(stats.parquet_data_file_opened_bytes, stats.estimated_bytes);
         assert_eq!(stats.rows_produced, 18_000);
         assert_eq!(scans[0].active_async_file_reads(), 0);
 
