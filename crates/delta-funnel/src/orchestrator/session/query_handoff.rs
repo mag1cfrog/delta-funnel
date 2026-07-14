@@ -346,6 +346,22 @@ fn track_delta_file_progress(
     })
 }
 
+/// Finalizes one merged execution when its stream ends, fails, or is dropped.
+fn track_delta_provider_scan_completion(
+    stream: MssqlOutputBatchStream,
+    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
+) -> MssqlOutputBatchStream {
+    if read_stats_handles.is_empty() {
+        return stream;
+    }
+    Box::pin(DeltaProviderScanTerminalStream::new(
+        stream,
+        read_stats_handles,
+        provider_stats_snapshots,
+    ))
+}
+
 /// Adds optional live file progress and terminal provider scan tracking to one
 /// physical-plan stream.
 ///
@@ -372,11 +388,7 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
         );
         stream = track_delta_file_progress(stream, sampler);
     }
-    Box::pin(DeltaProviderScanTerminalStream::new(
-        stream,
-        read_stats_handles,
-        provider_stats_snapshots,
-    ))
+    track_delta_provider_scan_completion(stream, read_stats_handles, provider_stats_snapshots)
 }
 
 impl Stream for DeltaFileProgressStream {
@@ -534,18 +546,26 @@ impl DeltaFunnelSession {
             .create_physical_plan()
             .await
             .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
+        let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
         emit_preview_phase(reporter, ProgressPhase::CollectingPreview);
-        let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), task_context)
-            .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
+        let stream = match datafusion_query_output_stream(physical_plan, task_context) {
+            Ok(stream) => stream,
+            Err(error) => {
+                finalize_provider_scan_execution(
+                    &read_stats_handles,
+                    None,
+                    DeltaProviderScanOutcome::Error,
+                );
+                return Err(datafusion_handoff_setup_error("preview_collect", error));
+            }
+        };
         let stream: MssqlOutputBatchStream = Box::pin(stream.map(|batch| {
             batch.map_err(|error| datafusion_handoff_setup_error("preview_collect", error))
         }));
         let stream = match reporter {
             Some(reporter) => {
-                let read_stats_handles =
-                    collect_delta_provider_read_stats_handles(physical_plan.as_ref());
                 let sampler = DeltaFileProgressSampler::new(
-                    read_stats_handles,
+                    read_stats_handles.clone(),
                     reporter.clone(),
                     ProgressPhase::CollectingPreview,
                     None,
@@ -554,6 +574,7 @@ impl DeltaFunnelSession {
             }
             None => stream,
         };
+        let stream = track_delta_provider_scan_completion(stream, read_stats_handles, None);
         let batches = stream.try_collect::<Vec<_>>().await?;
         emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
         let text = pretty_format_batches(&batches)
@@ -1411,6 +1432,37 @@ mod tests {
         );
         assert!(preview.html().contains("<td class=\"df-num\">1</td>"));
         assert!(!preview.html().contains("<td class=\"df-num\">2</td>"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn limited_delta_preview_emits_one_successful_terminal_summary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_two_files("limited-preview-summary")?;
+        let mut session =
+            DeltaFunnelSession::new(SessionOptions::new().with_query_options(QueryOptions {
+                target_partitions: Some(1),
+                output_batch_size: Some(1),
+            }))?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let capture = TracingCapture::start();
+
+        let preview = session.preview_table(&source, 1).await?;
+        let summaries = provider_io_events(capture.captured());
+
+        assert!(preview.text().lines().any(|line| line.contains("| 1  |")));
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].fields.get("source_name").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            summaries[0].fields.get("outcome").map(String::as_str),
+            Some("success")
+        );
         Ok(())
     }
 
