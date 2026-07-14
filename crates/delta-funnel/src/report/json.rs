@@ -711,6 +711,10 @@ fn provider_read_stats_value(stats: &DeltaProviderReadStatsSnapshot) -> Value {
         "approximate_files_filtered_during_planning": stats.files_filtered_during_planning,
         "estimated_rows": stats.estimated_rows,
         "estimated_bytes": stats.estimated_bytes,
+        "parquet_data_file_range_get_operations": stats.parquet_data_file_range_get_operations,
+        "parquet_data_file_full_get_operations": stats.parquet_data_file_full_get_operations,
+        "parquet_data_file_bytes_received": stats.parquet_data_file_bytes_received,
+        "parquet_data_file_opened_bytes": stats.parquet_data_file_opened_bytes,
         "datafusion_output_batch_size": stats.datafusion_output_batch_size,
         "scan_partitions_started": stats.scan_partitions_started,
         "scan_partitions_completed": stats.scan_partitions_completed,
@@ -1299,6 +1303,22 @@ mod tests {
         );
         assert_eq!(value["provider_read_stats"]["files_planned"], 5);
         assert_eq!(
+            value["provider_read_stats"]["parquet_data_file_range_get_operations"],
+            4
+        );
+        assert_eq!(
+            value["provider_read_stats"]["parquet_data_file_full_get_operations"],
+            0
+        );
+        assert_eq!(
+            value["provider_read_stats"]["parquet_data_file_bytes_received"],
+            512
+        );
+        assert_eq!(
+            value["provider_read_stats"]["parquet_data_file_opened_bytes"],
+            2048
+        );
+        assert_eq!(
             value["provider_read_stats"]["approximate_files_filtered_during_planning"],
             8
         );
@@ -1311,6 +1331,23 @@ mod tests {
         assert_no_secret_or_raw_sql_text(&value);
 
         Ok(())
+    }
+
+    #[test]
+    fn provider_read_stats_json_preserves_unavailable_parquet_io_metrics() {
+        let mut stats = provider_read_stats_snapshot();
+        stats.reader_backend = DeltaProviderReaderBackend::OfficialKernel;
+        stats.parquet_data_file_range_get_operations = None;
+        stats.parquet_data_file_full_get_operations = None;
+        stats.parquet_data_file_bytes_received = None;
+        stats.parquet_data_file_opened_bytes = None;
+
+        let value = provider_read_stats_value(&stats);
+
+        assert_eq!(value["parquet_data_file_range_get_operations"], Value::Null);
+        assert_eq!(value["parquet_data_file_full_get_operations"], Value::Null);
+        assert_eq!(value["parquet_data_file_bytes_received"], Value::Null);
+        assert_eq!(value["parquet_data_file_opened_bytes"], Value::Null);
     }
 
     fn session_with_default_connection() -> Result<DeltaFunnelSession, crate::DeltaFunnelError> {
@@ -1399,6 +1436,10 @@ mod tests {
             files_filtered_during_planning: Some(8),
             estimated_rows: Some(99),
             estimated_bytes: Some(2048),
+            parquet_data_file_range_get_operations: Some(4),
+            parquet_data_file_full_get_operations: Some(0),
+            parquet_data_file_bytes_received: Some(512),
+            parquet_data_file_opened_bytes: Some(2048),
             datafusion_output_batch_size: Some(128),
             scan_partitions_started: 4,
             scan_partitions_completed: 4,
