@@ -69,7 +69,7 @@ Rust users can follow the same path through [Installation](install.md), the
   troubleshoot source access.
 - [Python logging](advanced/python-logging.md): route diagnostic events through
   standard-library logging.
-- [Failure diagnostics](advanced/failure-diagnostics.md): interpret reports and
-  collect safe information for troubleshooting.
+- [Tracing and diagnostics](advanced/tracing-and-diagnostics.md): observe lifecycle
+  events, interpret reports, and collect safe troubleshooting information.
 - [API references](reference/api.md): find the Rust and Python API entry
   points.
