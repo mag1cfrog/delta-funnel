@@ -441,6 +441,100 @@ mod tests {
     }
 
     #[test]
+    fn parquet_io_summary_extras_preserve_the_python_string_contract() -> PyResult<()> {
+        Python::attach(|py| {
+            let (logger, handler, records) =
+                install_capture_handler(py, "deltafunnel.test.parquet_summary")?;
+            let subscriber = filtered_logging_subscriber(
+                "deltafunnel.test.parquet_summary",
+                "delta_funnel=debug",
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                emit_available_parquet_io_summary();
+                emit_unavailable_parquet_io_summary();
+            });
+
+            logger.call_method1("removeHandler", (&handler,))?;
+            assert_eq!(records.len(), 2);
+
+            let available = records.get_item(0)?;
+            assert_eq!(
+                available
+                    .getattr("deltafunnel_telemetry_event")?
+                    .extract::<String>()?,
+                "delta_provider_parquet_io_summary"
+            );
+            assert_eq!(
+                available
+                    .getattr("deltafunnel_outcome")?
+                    .extract::<String>()?,
+                "success"
+            );
+            assert_eq!(
+                available
+                    .getattr("deltafunnel_metrics_available")?
+                    .extract::<String>()?,
+                "true"
+            );
+            for (field, value) in [
+                ("deltafunnel_snapshot_version", "7"),
+                ("deltafunnel_parquet_data_file_range_get_operations", "0"),
+                ("deltafunnel_parquet_data_file_full_get_operations", "2"),
+                ("deltafunnel_parquet_data_file_bytes_received", "512"),
+                ("deltafunnel_parquet_data_file_opened_bytes", "2048"),
+            ] {
+                assert_eq!(available.getattr(field)?.extract::<String>()?, value);
+            }
+
+            let unavailable = records.get_item(1)?;
+            assert_eq!(
+                unavailable
+                    .getattr("deltafunnel_metrics_available")?
+                    .extract::<String>()?,
+                "false"
+            );
+            for field in [
+                "deltafunnel_parquet_data_file_range_get_operations",
+                "deltafunnel_parquet_data_file_full_get_operations",
+                "deltafunnel_parquet_data_file_bytes_received",
+                "deltafunnel_parquet_data_file_opened_bytes",
+            ] {
+                assert!(!unavailable.hasattr(field)?);
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn parquet_io_summary_requires_both_rust_and_python_debug_levels() -> PyResult<()> {
+        Python::attach(|py| {
+            let (logger, handler, records) =
+                install_capture_handler(py, "deltafunnel.test.parquet_summary_gates")?;
+
+            // Python admits DEBUG, but the Rust filter rejects the event first.
+            let info_subscriber = filtered_logging_subscriber(
+                "deltafunnel.test.parquet_summary_gates",
+                "delta_funnel=info",
+            );
+            tracing::subscriber::with_default(info_subscriber, emit_available_parquet_io_summary);
+            assert!(records.is_empty());
+
+            // Rust admits DEBUG, but the Python handler rejects the forwarded record.
+            handler.call_method1("setLevel", (20,))?;
+            let debug_subscriber = filtered_logging_subscriber(
+                "deltafunnel.test.parquet_summary_gates",
+                "delta_funnel=debug",
+            );
+            tracing::subscriber::with_default(debug_subscriber, emit_available_parquet_io_summary);
+            assert!(records.is_empty());
+
+            logger.call_method1("removeHandler", (&handler,))?;
+            Ok(())
+        })
+    }
+
+    #[test]
     fn scoped_logging_layer_ignores_python_handler_failures() -> PyResult<()> {
         Python::attach(|py| {
             let logging = py.import("logging")?;
@@ -480,6 +574,47 @@ class FailingHandler(logging.Handler):
         tracing_subscriber::registry().with(PythonLoggingLayer {
             logger_name: logger_name.to_owned(),
         })
+    }
+
+    fn filtered_logging_subscriber(
+        logger_name: &str,
+        filter: &str,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::registry()
+            .with(EnvFilter::new(filter))
+            .with(PythonLoggingLayer {
+                logger_name: logger_name.to_owned(),
+            })
+    }
+
+    fn emit_available_parquet_io_summary() {
+        tracing::debug!(
+            target: "delta_funnel",
+            telemetry_event = "delta_provider_parquet_io_summary",
+            source_name = "orders",
+            snapshot_version = 7_u64,
+            reader_backend = "native_async",
+            outcome = "success",
+            metrics_available = true,
+            parquet_data_file_range_get_operations = 0_u64,
+            parquet_data_file_full_get_operations = 2_u64,
+            parquet_data_file_bytes_received = 512_u64,
+            parquet_data_file_opened_bytes = 2048_u64,
+            message = "delta_provider_parquet_io_summary"
+        );
+    }
+
+    fn emit_unavailable_parquet_io_summary() {
+        tracing::debug!(
+            target: "delta_funnel",
+            telemetry_event = "delta_provider_parquet_io_summary",
+            source_name = "orders",
+            snapshot_version = 7_u64,
+            reader_backend = "official_kernel",
+            outcome = "success",
+            metrics_available = false,
+            message = "delta_provider_parquet_io_summary"
+        );
     }
 
     fn install_capture_handler<'py>(

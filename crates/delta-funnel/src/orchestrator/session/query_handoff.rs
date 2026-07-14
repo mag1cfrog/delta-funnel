@@ -21,6 +21,7 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
     datafusion_query_output_stream,
+    observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
         DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
@@ -50,67 +51,77 @@ pub(super) fn provider_stats_snapshots(
     }
 }
 
-/// Records one point-in-time snapshot for every retained scan handle.
-pub(super) fn record_provider_stats_snapshots(
-    provider_stats_snapshots: &SharedProviderStatsSnapshots,
+/// Finalizes every retained Delta scan from one point-in-time snapshot set.
+pub(super) fn finalize_provider_scan_execution(
     read_stats_handles: &[DeltaProviderReadStatsHandle],
+    provider_stats_snapshots: Option<&SharedProviderStatsSnapshots>,
+    outcome: DeltaProviderScanOutcome,
 ) {
     let snapshots = snapshot_delta_provider_read_stats(read_stats_handles);
     if snapshots.is_empty() {
         return;
     }
-    match provider_stats_snapshots.lock() {
-        Ok(mut provider_stats_snapshots) => provider_stats_snapshots.extend(snapshots),
-        Err(poisoned) => poisoned.into_inner().extend(snapshots),
+
+    if let Some(provider_stats_snapshots) = provider_stats_snapshots {
+        match provider_stats_snapshots.lock() {
+            Ok(mut retained) => retained.extend(snapshots.iter().cloned()),
+            Err(poisoned) => poisoned.into_inner().extend(snapshots.iter().cloned()),
+        }
+    }
+    for snapshot in &snapshots {
+        delta_provider_parquet_io_summary(snapshot, outcome);
     }
 }
 
-/// Records the latest Delta provider statistics when a batch stream stops.
+/// Finalizes one merged Delta provider execution when its batch stream stops.
 ///
 /// The stream keeps only shared read counters and snapshots them when it ends,
 /// fails, or is dropped by its downstream consumer.
-struct ProviderReadStatsRecordingStream {
+struct DeltaProviderScanTerminalStream {
     inner: MssqlOutputBatchStream,
-    // One live counter handle for each Delta scan in the output plan.
-    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
-    provider_stats_snapshots: SharedProviderStatsSnapshots,
-    recorded: bool,
+    // Taking these handles records the single terminal transition and releases
+    // the counters as soon as that transition completes.
+    read_stats_handles: Option<Vec<DeltaProviderReadStatsHandle>>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
 }
 
-impl ProviderReadStatsRecordingStream {
+impl DeltaProviderScanTerminalStream {
     fn new(
         inner: MssqlOutputBatchStream,
         read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
-        provider_stats_snapshots: SharedProviderStatsSnapshots,
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     ) -> Self {
         Self {
             inner,
-            read_stats_handles,
+            read_stats_handles: Some(read_stats_handles),
             provider_stats_snapshots,
-            recorded: false,
         }
     }
 
-    fn record_if_needed(&mut self) {
-        if self.recorded {
+    fn finalize_if_needed(&mut self, outcome: DeltaProviderScanOutcome) {
+        let Some(read_stats_handles) = self.read_stats_handles.take() else {
             return;
-        }
-        self.recorded = true;
-        record_provider_stats_snapshots(&self.provider_stats_snapshots, &self.read_stats_handles);
+        };
+        let provider_stats_snapshots = self.provider_stats_snapshots.take();
+        finalize_provider_scan_execution(
+            &read_stats_handles,
+            provider_stats_snapshots.as_ref(),
+            outcome,
+        );
     }
 }
 
-impl Stream for ProviderReadStatsRecordingStream {
+impl Stream for DeltaProviderScanTerminalStream {
     type Item = Result<RecordBatch, DeltaFunnelError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(context) {
             Poll::Ready(None) => {
-                self.record_if_needed();
+                self.finalize_if_needed(DeltaProviderScanOutcome::Success);
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(error))) => {
-                self.record_if_needed();
+                self.finalize_if_needed(DeltaProviderScanOutcome::Error);
                 Poll::Ready(Some(Err(error)))
             }
             other => other,
@@ -118,10 +129,150 @@ impl Stream for ProviderReadStatsRecordingStream {
     }
 }
 
-impl Drop for ProviderReadStatsRecordingStream {
+impl Drop for DeltaProviderScanTerminalStream {
     fn drop(&mut self) {
-        self.record_if_needed();
+        self.finalize_if_needed(DeltaProviderScanOutcome::Cancelled);
     }
+}
+
+/// Coordinates one terminal outcome across all partitions of one execution.
+struct PartitionScanCoordinator {
+    state: Mutex<PartitionScanState>,
+}
+
+struct PartitionScanState {
+    // Finalization waits until every returned partition stream is terminal.
+    remaining_streams: usize,
+    // Each terminal result can only strengthen success -> cancelled -> error.
+    outcome: DeltaProviderScanOutcome,
+    // The last terminal stream takes these handles and releases them after use.
+    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+}
+
+impl PartitionScanCoordinator {
+    fn new(read_stats_handles: Vec<DeltaProviderReadStatsHandle>, stream_count: usize) -> Self {
+        Self {
+            state: Mutex::new(PartitionScanState {
+                remaining_streams: stream_count,
+                outcome: DeltaProviderScanOutcome::Success,
+                read_stats_handles,
+            }),
+        }
+    }
+
+    fn record_stream_terminal(&self, outcome: DeltaProviderScanOutcome) {
+        let finalization = match self.state.lock() {
+            Ok(mut state) => state.record_stream_terminal(outcome),
+            Err(poisoned) => poisoned.into_inner().record_stream_terminal(outcome),
+        };
+        if let Some((read_stats_handles, outcome)) = finalization {
+            finalize_provider_scan_execution(&read_stats_handles, None, outcome);
+        }
+    }
+}
+
+impl PartitionScanState {
+    fn record_stream_terminal(
+        &mut self,
+        outcome: DeltaProviderScanOutcome,
+    ) -> Option<(Vec<DeltaProviderReadStatsHandle>, DeltaProviderScanOutcome)> {
+        if self.remaining_streams == 0 {
+            return None;
+        }
+
+        self.outcome = strongest_provider_scan_outcome(self.outcome, outcome);
+        self.remaining_streams -= 1;
+        if self.remaining_streams != 0 {
+            return None;
+        }
+
+        Some((std::mem::take(&mut self.read_stats_handles), self.outcome))
+    }
+}
+
+const fn strongest_provider_scan_outcome(
+    current: DeltaProviderScanOutcome,
+    next: DeltaProviderScanOutcome,
+) -> DeltaProviderScanOutcome {
+    match (current, next) {
+        (DeltaProviderScanOutcome::Error, _) | (_, DeltaProviderScanOutcome::Error) => {
+            DeltaProviderScanOutcome::Error
+        }
+        (DeltaProviderScanOutcome::Cancelled, _) | (_, DeltaProviderScanOutcome::Cancelled) => {
+            DeltaProviderScanOutcome::Cancelled
+        }
+        _ => DeltaProviderScanOutcome::Success,
+    }
+}
+
+/// Reports one partition's terminal state to its shared execution coordinator.
+struct PartitionScanStream {
+    inner: MssqlOutputBatchStream,
+    coordinator: Option<Arc<PartitionScanCoordinator>>,
+}
+
+impl PartitionScanStream {
+    fn record_terminal_once(&mut self, outcome: DeltaProviderScanOutcome) {
+        if let Some(coordinator) = self.coordinator.take() {
+            coordinator.record_stream_terminal(outcome);
+        }
+    }
+}
+
+impl Stream for PartitionScanStream {
+    type Item = Result<RecordBatch, DeltaFunnelError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(context) {
+            Poll::Ready(None) => {
+                self.record_terminal_once(DeltaProviderScanOutcome::Success);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.record_terminal_once(DeltaProviderScanOutcome::Error);
+                Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl Drop for PartitionScanStream {
+    fn drop(&mut self) {
+        self.record_terminal_once(DeltaProviderScanOutcome::Cancelled);
+    }
+}
+
+/// Adds one shared terminal outcome tracker to a partitioned execution.
+pub(super) fn track_partitioned_scan_completion(
+    streams: Vec<MssqlOutputBatchStream>,
+    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+) -> Vec<MssqlOutputBatchStream> {
+    if read_stats_handles.is_empty() {
+        return streams;
+    }
+    if streams.is_empty() {
+        finalize_provider_scan_execution(
+            &read_stats_handles,
+            None,
+            DeltaProviderScanOutcome::Success,
+        );
+        return streams;
+    }
+
+    let coordinator = Arc::new(PartitionScanCoordinator::new(
+        read_stats_handles,
+        streams.len(),
+    ));
+    streams
+        .into_iter()
+        .map(|inner| {
+            Box::pin(PartitionScanStream {
+                inner,
+                coordinator: Some(Arc::clone(&coordinator)),
+            }) as MssqlOutputBatchStream
+        })
+        .collect()
 }
 
 /// Reports Delta file progress while forwarding one batch stream.
@@ -194,10 +345,26 @@ fn track_delta_file_progress(
     })
 }
 
-/// Adds optional live file progress and final provider statistics tracking to
-/// one physical-plan stream.
+/// Finalizes one merged execution when its stream ends, fails, or is dropped.
+fn track_delta_provider_scan_completion(
+    stream: MssqlOutputBatchStream,
+    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
+) -> MssqlOutputBatchStream {
+    if read_stats_handles.is_empty() {
+        return stream;
+    }
+    Box::pin(DeltaProviderScanTerminalStream::new(
+        stream,
+        read_stats_handles,
+        provider_stats_snapshots,
+    ))
+}
+
+/// Adds optional live file progress and terminal provider scan tracking to one
+/// physical-plan stream.
 ///
-/// Both trackers reuse the same live Delta scan counters. They do not execute
+/// Both layers reuse the same live Delta scan counters. They do not execute
 /// another query or retain the physical plan. `progress` contains the reporter
 /// and output name used for live events. Callers collect the handles before
 /// merged stream construction so setup failures can snapshot the same handles.
@@ -207,7 +374,7 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<(ProgressReporter, String)>,
 ) -> MssqlOutputBatchStream {
-    if provider_stats_snapshots.is_none() && progress.is_none() {
+    if read_stats_handles.is_empty() {
         return stream;
     }
 
@@ -220,14 +387,7 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
         );
         stream = track_delta_file_progress(stream, sampler);
     }
-    if let Some(provider_stats_snapshots) = provider_stats_snapshots {
-        stream = Box::pin(ProviderReadStatsRecordingStream::new(
-            stream,
-            read_stats_handles,
-            provider_stats_snapshots,
-        ));
-    }
-    stream
+    track_delta_provider_scan_completion(stream, read_stats_handles, provider_stats_snapshots)
 }
 
 impl Stream for DeltaFileProgressStream {
@@ -288,17 +448,15 @@ fn batch_stream_for_physical_plan(
     progress: Option<(ProgressReporter, String)>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     // These handles must exist before merged stream setup can fail.
-    let read_stats_handles = if provider_stats_snapshots.is_some() || progress.is_some() {
-        collect_delta_provider_read_stats_handles(physical_plan.as_ref())
-    } else {
-        Vec::new()
-    };
+    let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
     let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
         Ok(stream) => stream,
         Err(error) => {
-            if let Some(provider_stats_snapshots) = provider_stats_snapshots.as_ref() {
-                record_provider_stats_snapshots(provider_stats_snapshots, &read_stats_handles);
-            }
+            finalize_provider_scan_execution(
+                &read_stats_handles,
+                provider_stats_snapshots.as_ref(),
+                DeltaProviderScanOutcome::Error,
+            );
             return Err(datafusion_handoff_setup_error("query_output_stream", error));
         }
     };
@@ -387,18 +545,26 @@ impl DeltaFunnelSession {
             .create_physical_plan()
             .await
             .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
+        let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
         emit_preview_phase(reporter, ProgressPhase::CollectingPreview);
-        let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), task_context)
-            .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
+        let stream = match datafusion_query_output_stream(physical_plan, task_context) {
+            Ok(stream) => stream,
+            Err(error) => {
+                finalize_provider_scan_execution(
+                    &read_stats_handles,
+                    None,
+                    DeltaProviderScanOutcome::Error,
+                );
+                return Err(datafusion_handoff_setup_error("preview_collect", error));
+            }
+        };
         let stream: MssqlOutputBatchStream = Box::pin(stream.map(|batch| {
             batch.map_err(|error| datafusion_handoff_setup_error("preview_collect", error))
         }));
         let stream = match reporter {
             Some(reporter) => {
-                let read_stats_handles =
-                    collect_delta_provider_read_stats_handles(physical_plan.as_ref());
                 let sampler = DeltaFileProgressSampler::new(
-                    read_stats_handles,
+                    read_stats_handles.clone(),
                     reporter.clone(),
                     ProgressPhase::CollectingPreview,
                     None,
@@ -407,6 +573,7 @@ impl DeltaFunnelSession {
             }
             None => stream,
         };
+        let stream = track_delta_provider_scan_completion(stream, read_stats_handles, None);
         let batches = stream.try_collect::<Vec<_>>().await?;
         emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
         let text = pretty_format_batches(&batches)
@@ -657,15 +824,20 @@ mod tests {
 
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, QueryOptions,
+        observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         table_formats::RealParquetDeltaTable,
     };
     use datafusion::{
-        arrow::datatypes::DataType,
+        arrow::{
+            datatypes::{DataType, Schema},
+            record_batch::RecordBatch,
+        },
         logical_expr::{Volatility, create_udf},
-        physical_plan::ExecutionPlan,
+        physical_plan::{ExecutionPlan, union::UnionExec},
     };
     use futures_util::StreamExt;
+    use tracing::Level;
 
     use super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
@@ -683,6 +855,12 @@ mod tests {
         Option<ProgressOperation>,
         Option<ProgressPhase>,
     );
+    const PARQUET_IO_FIELDS: [&str; 4] = [
+        "parquet_data_file_range_get_operations",
+        "parquet_data_file_full_get_operations",
+        "parquet_data_file_bytes_received",
+        "parquet_data_file_opened_bytes",
+    ];
 
     async fn report_tracked_stream(
         session: &DeltaFunnelSession,
@@ -765,6 +943,242 @@ mod tests {
         }
     }
 
+    fn provider_io_events(events: &CapturedEvents) -> Vec<CapturedEvent> {
+        events
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some("delta_provider_parquet_io_summary")
+            })
+            .collect()
+    }
+
+    fn assert_provider_io_event_matches_snapshot(
+        event: &CapturedEvent,
+        snapshot: &crate::DeltaProviderReadStatsSnapshot,
+        outcome: &str,
+    ) {
+        let reader_backend = match snapshot.reader_backend {
+            crate::DeltaProviderReaderBackend::OfficialKernel => "official_kernel",
+            crate::DeltaProviderReaderBackend::NativeAsync => "native_async",
+        };
+        let metrics = [
+            snapshot.parquet_data_file_range_get_operations,
+            snapshot.parquet_data_file_full_get_operations,
+            snapshot.parquet_data_file_bytes_received,
+            snapshot.parquet_data_file_opened_bytes,
+        ];
+        let metrics_available = metrics.iter().all(Option::is_some);
+
+        assert_eq!(event.target, "delta_funnel");
+        assert_eq!(event.level, Level::DEBUG);
+        assert_eq!(
+            event.fields.get("source_name").map(String::as_str),
+            Some(snapshot.source_name.as_str())
+        );
+        assert_eq!(
+            event
+                .fields
+                .get("snapshot_version")
+                .and_then(|value| value.parse::<u64>().ok()),
+            Some(snapshot.snapshot_version)
+        );
+        assert_eq!(
+            event.fields.get("reader_backend").map(String::as_str),
+            Some(reader_backend)
+        );
+        assert_eq!(
+            event.fields.get("outcome").map(String::as_str),
+            Some(outcome)
+        );
+        assert_eq!(
+            event.fields.get("metrics_available").map(String::as_str),
+            Some(if metrics_available { "true" } else { "false" })
+        );
+        for (field, expected) in PARQUET_IO_FIELDS.iter().zip(metrics) {
+            let expected = if metrics_available { expected } else { None };
+            assert_eq!(
+                event
+                    .fields
+                    .get(*field)
+                    .and_then(|value| value.parse::<u64>().ok()),
+                expected
+            );
+        }
+    }
+
+    async fn unexecuted_delta_read_stats_handles(
+        fixture_name: &str,
+        source_name: &str,
+    ) -> Result<Vec<super::DeltaProviderReadStatsHandle>, Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default(fixture_name)?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            source_name,
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let handles = super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        assert_eq!(handles.len(), 1);
+        Ok(handles)
+    }
+
+    fn partition_stream(
+        coordinator: &Arc<super::PartitionScanCoordinator>,
+        batches: Vec<Result<RecordBatch, DeltaFunnelError>>,
+    ) -> crate::MssqlOutputBatchStream {
+        Box::pin(super::PartitionScanStream {
+            inner: Box::pin(futures_util::stream::iter(batches)),
+            coordinator: Some(Arc::clone(coordinator)),
+        })
+    }
+
+    fn partitioned_coordinator_state(
+        coordinator: &super::PartitionScanCoordinator,
+    ) -> (usize, crate::observability::DeltaProviderScanOutcome) {
+        match coordinator.state.lock() {
+            Ok(state) => (state.remaining_streams, state.outcome),
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                (state.remaining_streams, state.outcome)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partitioned_terminal_stream_finishes_once_after_repeated_eof_and_drop() {
+        use crate::observability::DeltaProviderScanOutcome;
+
+        let coordinator = Arc::new(super::PartitionScanCoordinator::new(Vec::new(), 2));
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let mut first = partition_stream(&coordinator, vec![Ok(batch)]);
+        let mut second = partition_stream(&coordinator, Vec::new());
+
+        assert!(first.next().await.is_some_and(|batch| batch.is_ok()));
+        assert!(first.next().await.is_none());
+        assert!(first.next().await.is_none());
+        drop(first);
+        assert_eq!(
+            partitioned_coordinator_state(&coordinator),
+            (1, DeltaProviderScanOutcome::Success)
+        );
+
+        assert!(second.next().await.is_none());
+        drop(second);
+        assert_eq!(
+            partitioned_coordinator_state(&coordinator),
+            (0, DeltaProviderScanOutcome::Success)
+        );
+    }
+
+    #[tokio::test]
+    async fn partitioned_terminal_stream_emits_error_after_cleanup_drops_other_streams()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::observability::DeltaProviderScanOutcome;
+
+        let handles =
+            unexecuted_delta_read_stats_handles("partition-error-summary", "orders").await?;
+        let snapshots = super::snapshot_delta_provider_read_stats(&handles);
+        let expected = snapshots.first().ok_or("expected provider snapshot")?;
+        let coordinator = Arc::new(super::PartitionScanCoordinator::new(handles, 2));
+        let mut errored = partition_stream(
+            &coordinator,
+            vec![Err(DeltaFunnelError::Config {
+                message: "injected partition failure".to_owned(),
+            })],
+        );
+        let unconsumed = partition_stream(&coordinator, Vec::new());
+        let capture = TracingCapture::start();
+
+        assert!(errored.next().await.is_some_and(|batch| batch.is_err()));
+        drop(errored);
+        assert_eq!(
+            partitioned_coordinator_state(&coordinator),
+            (1, DeltaProviderScanOutcome::Error)
+        );
+        assert!(provider_io_events(capture.captured()).is_empty());
+
+        drop(unconsumed);
+        assert_eq!(
+            partitioned_coordinator_state(&coordinator),
+            (0, DeltaProviderScanOutcome::Error)
+        );
+        let summaries = provider_io_events(capture.captured());
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], expected, "error");
+        drop(coordinator);
+        assert_eq!(provider_io_events(capture.captured()).len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partitioned_terminal_stream_emits_cancelled_for_unconsumed_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::observability::DeltaProviderScanOutcome;
+
+        let handles =
+            unexecuted_delta_read_stats_handles("partition-cancelled-summary", "orders").await?;
+        let snapshots = super::snapshot_delta_provider_read_stats(&handles);
+        let expected = snapshots.first().ok_or("expected provider snapshot")?;
+        let coordinator = Arc::new(super::PartitionScanCoordinator::new(handles, 2));
+        let mut completed = partition_stream(&coordinator, Vec::new());
+        let unconsumed = partition_stream(&coordinator, Vec::new());
+        let capture = TracingCapture::start();
+
+        assert!(completed.next().await.is_none());
+        assert!(completed.next().await.is_none());
+        drop(completed);
+        assert!(provider_io_events(capture.captured()).is_empty());
+        drop(unconsumed);
+
+        assert_eq!(
+            partitioned_coordinator_state(&coordinator),
+            (0, DeltaProviderScanOutcome::Cancelled)
+        );
+        let summaries = provider_io_events(capture.captured());
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], expected, "cancelled");
+        drop(coordinator);
+        assert_eq!(provider_io_events(capture.captured()).len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merged_terminal_stream_releases_finalization_ownership_after_eof()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("terminal-ownership-release")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let handles = super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        assert_eq!(handles.len(), 1);
+        let handle = Arc::downgrade(&handles[0]);
+        drop(physical_plan);
+
+        let retained = super::shared_provider_stats_snapshots();
+        let inner: crate::MssqlOutputBatchStream = Box::pin(futures_util::stream::empty());
+        let mut stream = super::DeltaProviderScanTerminalStream::new(
+            inner,
+            handles,
+            Some(Arc::clone(&retained)),
+        );
+
+        assert!(stream.next().await.is_none());
+        assert!(stream.read_stats_handles.is_none());
+        assert!(stream.provider_stats_snapshots.is_none());
+        assert!(handle.upgrade().is_none());
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        assert_eq!(super::provider_stats_snapshots(&retained).len(), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn batch_stream_for_lazy_table_reads_registered_delta_source()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -783,7 +1197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_provider_stats_are_recorded_once_after_eof_and_drop()
+    async fn eof_records_one_snapshot_and_matching_success_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("final-stats-eof")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -792,13 +1206,17 @@ mod tests {
             table.path().to_string_lossy().to_string(),
         ))?;
         let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let capture = TracingCapture::start();
         let stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
 
         let rows = collect_stream_row_count(stream).await?;
         let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
+        let summaries = provider_io_events(capture.captured());
 
         assert_eq!(rows, table.rows());
         assert_eq!(snapshots.len(), 1);
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "success");
         assert_eq!(snapshots[0].files_completed, 1);
         assert!(
             snapshots[0]
@@ -809,7 +1227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_downstream_stream_records_one_partial_provider_snapshot()
+    async fn downstream_drop_records_one_snapshot_and_matching_cancelled_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let table =
             RealParquetDeltaTable::new_with_two_large_files("final-stats-downstream-drop", 20_000)?;
@@ -823,13 +1241,17 @@ mod tests {
             table.path().to_string_lossy().to_string(),
         ))?;
         let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let capture = TracingCapture::start();
         let mut stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
 
         assert!(stream.next().await.transpose()?.is_some());
         drop(stream);
         let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
+        let summaries = provider_io_events(capture.captured());
 
         assert_eq!(snapshots.len(), 1);
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "cancelled");
         assert!(snapshots[0].files_started > 0);
         assert!(snapshots[0].rows_produced > 0);
         assert!(
@@ -846,27 +1268,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_error_then_drop_records_provider_stats_once()
+    async fn upstream_error_then_drop_records_one_snapshot_and_matching_error_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("final-stats-upstream-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
         let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let capture = TracingCapture::start();
         let mut stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
 
         let result = stream.next().await.ok_or("expected upstream error")?;
         assert!(result.is_err());
         drop(stream);
         let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
+        let summaries = provider_io_events(capture.captured());
 
         assert_eq!(snapshots.len(), 1);
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "error");
         assert_eq!(snapshots[0].files_started, 1);
         assert_eq!(snapshots[0].files_completed, 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn stream_setup_error_records_one_point_in_time_snapshot()
+    async fn stream_setup_error_records_one_snapshot_and_error_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("final-stats-stream-setup-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -879,6 +1305,7 @@ mod tests {
         let failing_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSetupFailingPlan::new(physical_plan));
         let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let capture = TracingCapture::start();
 
         let result = super::batch_stream_for_physical_plan(
             &session.context,
@@ -887,6 +1314,7 @@ mod tests {
             None,
         );
         let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
+        let summaries = provider_io_events(capture.captured());
 
         assert!(result.is_err());
         assert_eq!(snapshots.len(), 1);
@@ -895,6 +1323,90 @@ mod tests {
         assert_eq!(snapshots[0].parquet_data_file_range_get_operations, Some(0));
         assert_eq!(snapshots[0].parquet_data_file_bytes_received, Some(0));
         assert_eq!(snapshots[0].parquet_data_file_opened_bytes, Some(0));
+        assert_eq!(summaries.len(), 1);
+        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "error");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_partition_tracking_emits_one_success_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("zero-partition-summary")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let handles = super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        assert_eq!(handles.len(), 1);
+
+        let capture = TracingCapture::start();
+        let streams = super::track_partitioned_scan_completion(Vec::new(), handles);
+        let summaries = provider_io_events(capture.captured());
+
+        assert!(streams.is_empty());
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].target, "delta_funnel");
+        assert_eq!(summaries[0].level, Level::DEBUG);
+        assert_eq!(
+            summaries[0].fields.get("source_name").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            summaries[0].fields.get("outcome").map(String::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            summaries[0]
+                .fields
+                .get("metrics_available")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            PARQUET_IO_FIELDS
+                .iter()
+                .all(|field| summaries[0].fields.contains_key(*field))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merged_execution_emits_one_summary_per_distinct_scan_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("distinct-summary-identities")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let first_plan = dataframe.clone().create_physical_plan().await?;
+        let second_plan = dataframe.create_physical_plan().await?;
+
+        // The second scan appears through two child paths. Its shared handle
+        // must still produce one event, while the first scan remains distinct.
+        let combined_plan =
+            UnionExec::try_new(vec![Arc::clone(&second_plan), first_plan, second_plan])?;
+        assert_eq!(
+            super::collect_delta_provider_read_stats_handles(combined_plan.as_ref()).len(),
+            2
+        );
+
+        let capture = TracingCapture::start();
+        let stream =
+            super::batch_stream_for_physical_plan(&session.context, combined_plan, None, None)?;
+        let rows = collect_stream_row_count(stream).await?;
+        let summaries = provider_io_events(capture.captured());
+
+        assert_eq!(rows, table.rows() * 3);
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().all(|event| {
+            event.fields.get("source_name").map(String::as_str) == Some("orders")
+                && event.fields.get("outcome").map(String::as_str) == Some("success")
+        }));
         Ok(())
     }
 
@@ -1021,6 +1533,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_delta_execution_emits_no_provider_summary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let derived = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let capture = TracingCapture::start();
+
+        let stream = session.batch_stream_for_lazy_table(&derived, None).await?;
+        let rows = collect_stream_row_count(stream).await?;
+        let summaries = provider_io_events(capture.captured());
+
+        assert_eq!(rows, 2);
+        assert!(summaries.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn preview_table_returns_limited_formatted_rows() -> Result<(), DeltaFunnelError> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let table = session
@@ -1040,6 +1570,37 @@ mod tests {
         );
         assert!(preview.html().contains("<td class=\"df-num\">1</td>"));
         assert!(!preview.html().contains("<td class=\"df-num\">2</td>"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn limited_delta_preview_emits_one_successful_terminal_summary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_two_files("limited-preview-summary")?;
+        let mut session =
+            DeltaFunnelSession::new(SessionOptions::new().with_query_options(QueryOptions {
+                target_partitions: Some(1),
+                output_batch_size: Some(1),
+            }))?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let capture = TracingCapture::start();
+
+        let preview = session.preview_table(&source, 1).await?;
+        let summaries = provider_io_events(capture.captured());
+
+        assert!(preview.text().lines().any(|line| line.contains("| 1  |")));
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].fields.get("source_name").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            summaries[0].fields.get("outcome").map(String::as_str),
+            Some("success")
+        );
         Ok(())
     }
 

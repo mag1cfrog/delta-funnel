@@ -357,6 +357,7 @@ mod tests {
         MssqlOutputBatchStream, MssqlOutputTarget, MssqlTargetCleanupStatus, MssqlTargetConfig,
         MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteBackend, MssqlWriteReport,
         ResolvedMssqlTarget, TargetValidationMode, ValidationOptions,
+        observability::test_capture::TracingCapture,
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         table_formats::RealParquetDeltaTable,
     };
@@ -1061,6 +1062,60 @@ mod tests {
         assert_eq!(call.schema_fields, 2);
         assert_eq!(report.stats().rows_written(), u64::try_from(table.rows())?);
         assert_eq!(report.stats().batches_written(), call.batches);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_stream_writer_failure_keeps_successful_provider_scan_outcome()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("post-stream-writer-failure")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let selected_orders = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let request = execute_output_request(
+            selected_orders,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        // This writer drains the batch stream to EOF before returning its
+        // injected failure, matching a later SQL finalization failure.
+        let mut writer = FakeOrchestratorWriter::failing_with("post-stream failure");
+        let capture = TracingCapture::start();
+
+        let result = session
+            .write_to_mssql_with_writer(&request, &mut writer)
+            .await;
+        let summaries = capture
+            .captured()
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some("delta_provider_parquet_io_summary")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::Config { message }) if message == "post-stream failure"
+        ));
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].fields.get("source_name").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            summaries[0].fields.get("outcome").map(String::as_str),
+            Some("success")
+        );
         Ok(())
     }
 
