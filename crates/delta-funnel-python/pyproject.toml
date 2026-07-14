@@ -33,4 +33,3 @@ PyPI = "https://pypi.org/project/deltafunnel/"
 [tool.maturin]
 bindings = "pyo3"
 module-name = "deltafunnel"
-features = ["extension-module"]
