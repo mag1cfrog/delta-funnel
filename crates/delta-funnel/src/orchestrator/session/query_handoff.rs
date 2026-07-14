@@ -136,6 +136,146 @@ impl Drop for DeltaProviderScanTerminalStream {
     }
 }
 
+/// Coordinates one terminal outcome across all partitions of one execution.
+struct PartitionScanCoordinator {
+    state: Mutex<PartitionScanState>,
+}
+
+struct PartitionScanState {
+    // Finalization waits until every returned partition stream is terminal.
+    remaining_streams: usize,
+    // Each terminal result can only strengthen success -> cancelled -> error.
+    outcome: DeltaProviderScanOutcome,
+    // The last terminal stream takes these handles and releases them after use.
+    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+}
+
+impl PartitionScanCoordinator {
+    fn new(read_stats_handles: Vec<DeltaProviderReadStatsHandle>, stream_count: usize) -> Self {
+        Self {
+            state: Mutex::new(PartitionScanState {
+                remaining_streams: stream_count,
+                outcome: DeltaProviderScanOutcome::Success,
+                read_stats_handles,
+            }),
+        }
+    }
+
+    fn record_stream_terminal(&self, outcome: DeltaProviderScanOutcome) {
+        let finalization = match self.state.lock() {
+            Ok(mut state) => state.record_stream_terminal(outcome),
+            Err(poisoned) => poisoned.into_inner().record_stream_terminal(outcome),
+        };
+        if let Some((read_stats_handles, outcome)) = finalization {
+            finalize_provider_scan_execution(&read_stats_handles, None, outcome);
+        }
+    }
+}
+
+impl PartitionScanState {
+    fn record_stream_terminal(
+        &mut self,
+        outcome: DeltaProviderScanOutcome,
+    ) -> Option<(Vec<DeltaProviderReadStatsHandle>, DeltaProviderScanOutcome)> {
+        if self.remaining_streams == 0 {
+            return None;
+        }
+
+        self.outcome = strongest_provider_scan_outcome(self.outcome, outcome);
+        self.remaining_streams -= 1;
+        if self.remaining_streams != 0 {
+            return None;
+        }
+
+        Some((std::mem::take(&mut self.read_stats_handles), self.outcome))
+    }
+}
+
+const fn strongest_provider_scan_outcome(
+    current: DeltaProviderScanOutcome,
+    next: DeltaProviderScanOutcome,
+) -> DeltaProviderScanOutcome {
+    match (current, next) {
+        (DeltaProviderScanOutcome::Error, _) | (_, DeltaProviderScanOutcome::Error) => {
+            DeltaProviderScanOutcome::Error
+        }
+        (DeltaProviderScanOutcome::Cancelled, _) | (_, DeltaProviderScanOutcome::Cancelled) => {
+            DeltaProviderScanOutcome::Cancelled
+        }
+        _ => DeltaProviderScanOutcome::Success,
+    }
+}
+
+/// Reports one partition's terminal state to its shared execution coordinator.
+struct PartitionScanStream {
+    inner: MssqlOutputBatchStream,
+    coordinator: Option<Arc<PartitionScanCoordinator>>,
+}
+
+impl PartitionScanStream {
+    fn record_terminal_once(&mut self, outcome: DeltaProviderScanOutcome) {
+        if let Some(coordinator) = self.coordinator.take() {
+            coordinator.record_stream_terminal(outcome);
+        }
+    }
+}
+
+impl Stream for PartitionScanStream {
+    type Item = Result<RecordBatch, DeltaFunnelError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(context) {
+            Poll::Ready(None) => {
+                self.record_terminal_once(DeltaProviderScanOutcome::Success);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.record_terminal_once(DeltaProviderScanOutcome::Error);
+                Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl Drop for PartitionScanStream {
+    fn drop(&mut self) {
+        self.record_terminal_once(DeltaProviderScanOutcome::Cancelled);
+    }
+}
+
+/// Adds one shared terminal outcome tracker to a partitioned execution.
+pub(super) fn track_partitioned_scan_completion(
+    streams: Vec<MssqlOutputBatchStream>,
+    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+) -> Vec<MssqlOutputBatchStream> {
+    if read_stats_handles.is_empty() {
+        return streams;
+    }
+    if streams.is_empty() {
+        finalize_provider_scan_execution(
+            &read_stats_handles,
+            None,
+            DeltaProviderScanOutcome::Success,
+        );
+        return streams;
+    }
+
+    let coordinator = Arc::new(PartitionScanCoordinator::new(
+        read_stats_handles,
+        streams.len(),
+    ));
+    streams
+        .into_iter()
+        .map(|inner| {
+            Box::pin(PartitionScanStream {
+                inner,
+                coordinator: Some(Arc::clone(&coordinator)),
+            }) as MssqlOutputBatchStream
+        })
+        .collect()
+}
+
 /// Reports Delta file progress while forwarding one batch stream.
 ///
 /// The stream owns the progress coordinator. It samples the
@@ -668,7 +808,10 @@ mod tests {
         table_formats::RealParquetDeltaTable,
     };
     use datafusion::{
-        arrow::datatypes::DataType,
+        arrow::{
+            datatypes::{DataType, Schema},
+            record_batch::RecordBatch,
+        },
         logical_expr::{Volatility, create_udf},
         physical_plan::ExecutionPlan,
     };
@@ -770,6 +913,99 @@ mod tests {
             Ok(events) => events.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    fn partition_stream(
+        coordinator: &Arc<super::PartitionScanCoordinator>,
+        batches: Vec<Result<RecordBatch, DeltaFunnelError>>,
+    ) -> crate::MssqlOutputBatchStream {
+        Box::pin(super::PartitionScanStream {
+            inner: Box::pin(futures_util::stream::iter(batches)),
+            coordinator: Some(Arc::clone(coordinator)),
+        })
+    }
+
+    fn partitioned_coordinator_state(
+        coordinator: &super::PartitionScanCoordinator,
+    ) -> (usize, crate::observability::DeltaProviderScanOutcome) {
+        match coordinator.state.lock() {
+            Ok(state) => (state.remaining_streams, state.outcome),
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                (state.remaining_streams, state.outcome)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partitioned_terminal_stream_finishes_once_after_repeated_eof_and_drop() {
+        use crate::observability::DeltaProviderScanOutcome;
+
+        let coordinator = Arc::new(super::PartitionScanCoordinator::new(Vec::new(), 2));
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let mut first = partition_stream(&coordinator, vec![Ok(batch)]);
+        let mut second = partition_stream(&coordinator, Vec::new());
+
+        assert!(first.next().await.is_some_and(|batch| batch.is_ok()));
+        assert!(first.next().await.is_none());
+        assert!(first.next().await.is_none());
+        drop(first);
+        assert_eq!(
+            partitioned_coordinator_state(&coordinator),
+            (1, DeltaProviderScanOutcome::Success)
+        );
+
+        assert!(second.next().await.is_none());
+        drop(second);
+        assert_eq!(
+            partitioned_coordinator_state(&coordinator),
+            (0, DeltaProviderScanOutcome::Success)
+        );
+    }
+
+    #[tokio::test]
+    async fn partitioned_terminal_stream_keeps_error_when_cleanup_drops_other_streams() {
+        use crate::observability::DeltaProviderScanOutcome;
+
+        let coordinator = Arc::new(super::PartitionScanCoordinator::new(Vec::new(), 2));
+        let mut errored = partition_stream(
+            &coordinator,
+            vec![Err(DeltaFunnelError::Config {
+                message: "injected partition failure".to_owned(),
+            })],
+        );
+        let unconsumed = partition_stream(&coordinator, Vec::new());
+
+        assert!(errored.next().await.is_some_and(|batch| batch.is_err()));
+        drop(errored);
+        assert_eq!(
+            partitioned_coordinator_state(&coordinator),
+            (1, DeltaProviderScanOutcome::Error)
+        );
+
+        drop(unconsumed);
+        assert_eq!(
+            partitioned_coordinator_state(&coordinator),
+            (0, DeltaProviderScanOutcome::Error)
+        );
+    }
+
+    #[tokio::test]
+    async fn partitioned_terminal_stream_reports_unconsumed_stream_as_cancelled() {
+        use crate::observability::DeltaProviderScanOutcome;
+
+        let coordinator = Arc::new(super::PartitionScanCoordinator::new(Vec::new(), 2));
+        let mut completed = partition_stream(&coordinator, Vec::new());
+        let unconsumed = partition_stream(&coordinator, Vec::new());
+
+        assert!(completed.next().await.is_none());
+        drop(completed);
+        drop(unconsumed);
+
+        assert_eq!(
+            partitioned_coordinator_state(&coordinator),
+            (0, DeltaProviderScanOutcome::Cancelled)
+        );
     }
 
     #[tokio::test]

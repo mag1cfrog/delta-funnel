@@ -10,6 +10,7 @@ use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream,
+    observability::DeltaProviderScanOutcome,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     query_engine::datafusion::collect_delta_provider_read_stats_handles,
     support::sanitize_text_for_display,
@@ -18,7 +19,10 @@ use crate::{
 use super::super::super::{
     DeltaFunnelSession, LazyTable,
     errors::{mssql_scoped_cache_alias_error, unknown_cached_alias_error},
-    query_handoff::DeltaFileProgressSampler,
+    query_handoff::{
+        DeltaFileProgressSampler, finalize_provider_scan_execution,
+        track_partitioned_scan_completion,
+    },
 };
 use super::MssqlDerivedCacheAliasPlan;
 
@@ -176,13 +180,26 @@ impl DeltaFunnelSession {
         let schema = physical_plan.schema();
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
         let sampler = DeltaFileProgressSampler::new(
-            read_stats_handles,
+            read_stats_handles.clone(),
             reporter.clone(),
             ProgressPhase::MaterializingCache,
             None,
         );
-        let streams = execute_stream_partitioned(physical_plan, task_ctx)
-            .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
+        let streams = match execute_stream_partitioned(physical_plan, task_ctx) {
+            Ok(streams) => streams,
+            Err(error) => {
+                finalize_provider_scan_execution(
+                    &read_stats_handles,
+                    None,
+                    DeltaProviderScanOutcome::Error,
+                );
+                return Err(mssql_scoped_cache_alias_error(
+                    "materialize",
+                    alias_name,
+                    error,
+                ));
+            }
+        };
         let streams = streams
             .into_iter()
             .map(|stream| {
@@ -194,7 +211,8 @@ impl DeltaFunnelSession {
                 }));
                 stream
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let streams = track_partitioned_scan_completion(streams, read_stats_handles);
         let partitions = collect_cache_partitions(streams, sampler, alias_name).await?;
         let cached_provider = MemTable::try_new(schema, partitions)
             .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
