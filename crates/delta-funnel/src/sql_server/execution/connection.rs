@@ -25,6 +25,17 @@ pub(crate) struct MssqlOutputConnectionRequest {
 }
 
 impl MssqlOutputConnectionRequest {
+    /// Pairs an existing output plan with its original resolved connection.
+    pub(super) fn from_planned_output(
+        output_plan: MssqlTargetOutputPlan,
+        resolved_target: ResolvedMssqlTarget,
+    ) -> Self {
+        Self {
+            output_plan,
+            connection: resolved_target.connection().clone(),
+        }
+    }
+
     /// Returns the redacted target output plan.
     #[must_use]
     pub(crate) const fn output_plan(&self) -> &MssqlTargetOutputPlan {
@@ -371,13 +382,19 @@ mod tests {
     fn connection_request_pairs_raw_connection_with_redacted_output_plan()
     -> Result<(), DeltaFunnelError> {
         let connection = secret_connection("warehouse-primary", "secret-token")?;
+        let target = resolved_target("orders", LoadMode::AppendExisting, &connection)?;
         let request = plan_mssql_output_connection_request(
             orders_schema(),
-            resolved_target("orders", LoadMode::AppendExisting, &connection)?,
+            target.clone(),
             PlanOptions::default(),
         )?;
+        let planned_request = MssqlOutputConnectionRequest::from_planned_output(
+            request.output_plan().clone(),
+            target,
+        );
 
         assert_eq!(request.output_plan().output_name(), "orders");
+        assert_eq!(planned_request.output_plan(), request.output_plan());
         assert_eq!(
             request.output_plan().connection_source(),
             MssqlConnectionSource::ContextDefault
@@ -386,6 +403,7 @@ mod tests {
             request.connection.connection_string(),
             connection.connection_string()
         );
+        assert_eq!(planned_request.connection, request.connection);
         assert_eq!(
             request.cleanup_before_target_creation(),
             MssqlTargetCleanupStatus::NotApplicable

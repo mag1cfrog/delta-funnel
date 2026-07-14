@@ -11,7 +11,7 @@ use crate::{
     ResolvedMssqlTarget, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::PhaseTimer,
-    write_output_batches_to_mssql_for_workflow,
+    sql_server::write_planned_output_batches_to_mssql_for_workflow,
 };
 
 use super::super::{
@@ -543,7 +543,7 @@ struct MssqlOneOutputSinkWriter;
 impl OrchestratorMssqlOutputWriter for MssqlOneOutputSinkWriter {
     async fn write_output(
         &mut self,
-        output_schema: SchemaRef,
+        _output_schema: SchemaRef,
         output_plan: MssqlTargetOutputPlan,
         resolved_target: ResolvedMssqlTarget,
         batches: MssqlOutputBatchStream,
@@ -551,10 +551,9 @@ impl OrchestratorMssqlOutputWriter for MssqlOneOutputSinkWriter {
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql_for_workflow(
-            output_schema.as_ref(),
+        write_planned_output_batches_to_mssql_for_workflow(
+            output_plan,
             resolved_target,
-            output_plan.schema_plan_options(),
             batches,
             write_backend,
             validation_options,
