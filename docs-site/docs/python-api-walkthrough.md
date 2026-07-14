@@ -1,8 +1,19 @@
-# Python API Walkthrough
+# Python Quickstart
 
-This walkthrough uses the `deltafunnel` package. Install it from PyPI, or build
-the local wheel first with `cargo xtask python-package-check` when developing
-the repository.
+This quickstart uses the `deltafunnel` package. Install it from PyPI as
+described in [Installation](install.md) before continuing.
+
+## Before you start
+
+You need:
+
+- an accessible Delta table with the columns used below, or a query adjusted
+  to match your table
+- a SQL Server database and login
+- permission to create a table in the target schema
+
+The example uses `create_and_load`, so `[dbo].[daily_orders]` must not already
+exist.
 
 ## Create a session
 
@@ -27,100 +38,10 @@ require an ODBC DSN.
 ## Register a Delta source
 
 ```python
-orders = session.delta_lake(
-    "file:///path/to/orders-delta",
-    name="orders",
-    progress=None,
-)
+orders = session.delta_lake("file:///path/to/orders-delta", name="orders")
 ```
 
 Passing `name` registers the source immediately so SQL can reference it.
-Calling `session.delta_lake(...)` without `name` returns a pending source; call
-`.alias("orders")` before using it in SQL.
-
-Source registration uses an indeterminate Rich display because it loads Delta
-metadata but does not scan data files. The display follows metadata loading,
-protocol validation, provider preparation, and catalog registration. By
-default, it appears in interactive terminals and notebooks and stays quiet in
-scripts and CI. Pass `progress=True` to force it or `progress=False` to disable
-it for one registration.
-
-For a pending source, select progress when calling `alias(...)`:
-
-```python
-pending = session.delta_lake("file:///path/to/orders-delta")
-orders = pending.alias("orders", progress=True)
-```
-
-Creating the pending source performs no source loading and shows no progress,
-even if that earlier call receives `progress=True`. It does not save the value.
-Only the later `alias(..., progress=...)` argument controls registration.
-
-Registration progress has no file, byte, row, or percentage total and does not
-make extra object-store requests. Source locations, storage options,
-credentials, raw metadata, and raw errors are not displayed. Progress is a
-concise status view, not a replacement for detailed logging and tracing.
-
-## Read a private S3 Delta table from a local shell
-
-`storage_options` are forwarded to the underlying object-store builder that
-Delta Funnel uses for S3 access. On the current S3 path, Delta Funnel does not
-auto-load shell `AWS_*` variables, `AWS_PROFILE`, or shared AWS config and
-credentials files.
-
-For a private S3 Delta table from a local shell, pass explicit credentials and
-region in `storage_options`:
-
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- `AWS_SESSION_TOKEN` as optional
-- `AWS_REGION`
-
-Delta Funnel also accepts these common lowercase aliases:
-
-- `aws_access_key_id`
-- `aws_secret_access_key`
-- `aws_session_token`
-- `aws_region`
-- `region`
-
-This works reliably:
-
-```python
-import os
-from deltafunnel import Session
-
-storage_options = {
-    "AWS_REGION": "us-east-1",
-    "AWS_ACCESS_KEY_ID": os.environ["AWS_ACCESS_KEY_ID"],
-    "AWS_SECRET_ACCESS_KEY": os.environ["AWS_SECRET_ACCESS_KEY"],
-}
-if os.environ.get("AWS_SESSION_TOKEN"):
-    storage_options["AWS_SESSION_TOKEN"] = os.environ["AWS_SESSION_TOKEN"]
-
-source = Session().delta_lake(
-    "s3://<private-bucket>/<delta-table>",
-    storage_options=storage_options,
-    name="source",
-)
-```
-
-This is not enough by itself:
-
-```python
-Session().delta_lake(
-    "s3://<private-bucket>/<delta-table>",
-    storage_options={"region": "us-east-1"},
-    name="source",
-)
-```
-
-`region` is a supported key, but `region` alone only sets region. It does not
-provide credentials.
-
-If the same table works in `deltalake` but fails in `deltafunnel`, the likely
-cause is a credential-discovery path mismatch, not a Delta snapshot or protocol
-problem.
 
 ## Transform rows with SQL
 
@@ -138,26 +59,14 @@ terminal action reads or writes the table.
 ## Preview rows
 
 ```python
-preview = daily_orders.preview(limit=20, progress=None)
-daily_orders.show(limit=20, progress=False)
+preview = daily_orders.preview(limit=20)
+daily_orders.show(limit=20)
 ```
 
 `preview()` and `show()` execute the DataFusion query and read rows with the
 limit applied before collection. They do not contact SQL Server or write rows.
 `preview()` returns a `Preview` object with text and notebook HTML
 representations. `show()` prints the text preview to Python stdout.
-
-By default, progress appears in interactive terminals and notebooks and stays
-quiet in scripts and CI. Pass `progress=True` to force it or `progress=False`
-to disable it for one call. Notebook progress finishes before the rich preview
-or `show()` output. In terminals, progress uses stderr, so `show()` keeps stdout
-table-only.
-
-Eligible Delta scans show selected files handled while the bounded query runs.
-A small limit can stop after only part of those files, so a successful preview
-does not force the file bar to 100%. Queries without a reliable Delta file
-total remain indeterminate. The limit is not a progress total, and progress
-does not run a count query or execute the preview twice.
 
 ## Write to SQL Server
 
@@ -167,49 +76,29 @@ report = daily_orders.write_to_mssql(
     table="daily_orders",
     load_mode="create_and_load",
 )
+
+print(report["output_name"])
+print(report["write_stats"]["rows_written"])
+print(report["validation_status"]["kind"])
 ```
 
 The returned report is a plain Python `dict` converted from Rust report types.
 Report formatting is designed to avoid exposing connection strings,
 credentials, and raw row values.
 
-### Progress display
+A successful call returns without raising an exception and creates
+`[dbo].[daily_orders]`. The first printed value is `daily_orders`; the row count
+and validation status depend on the data and available target validation.
 
-`progress=None`, the default, shows a Rich progress display when Rich detects
-an interactive terminal or Jupyter. Use `progress=True` to force the display in
-scripts or CI, or `progress=False` to disable it.
+## Next steps
 
-```python
-report = daily_orders.write_to_mssql(
-    schema="dbo",
-    table="daily_orders",
-    load_mode="create_and_load",
-    progress=True,
-)
-```
-
-The display starts without a percentage. When the query plan has complete
-statistics for at least one selected Delta file, the same display becomes a
-determinate bar. Its percentage measures selected Delta files handled. Files
-removed by Delta metadata pruning are outside that selected total. File sizes
-can differ, so the percentage is not an estimate of bytes read, elapsed time,
-or whole-action completion.
-
-The file line can show `Delta files 8/10 | pruned 3 at runtime, ~90 in
-planning`. Runtime pruning is the exact number of selected files skipped while
-the query ran. Planning pruning is an approximate count from Delta Kernel
-metadata selection, so the display prefixes it with `~`.
-
-The description also shows cumulative rows and batches after SQL Server accepts
-each batch. Dry runs do not have write counters. Queries without eligible Delta
-scan statistics, including queries with zero selected files, remain
-indeterminate.
-
-Rapid numeric updates are combined before rendering. Status changes and the
-final result still appear immediately. If an action fails, the final display
-keeps the latest actual file position and accepted write counters instead of
-filling the bar.
-
-Progress reuses statistics already maintained by the active query plan. It does
-not run an extra count query, expand Delta metadata again, or make additional
-object-store requests.
+- [Core concepts](concepts.md) explains sessions, sources, tables, outputs, and
+  reports.
+- [SQL Server writes](sql-server.md) explains connection and load-mode choices.
+- [Dry runs and reports](dry-runs-reports.md) explains how to validate this plan
+  before writing.
+- [Progress displays](progress.md) explains terminal and notebook progress.
+- [Private S3 sources](advanced/private-s3.md) explains credentials and source
+  access.
+- [API references](reference/api.md) covers deferred source registration and
+  the complete typed surface.

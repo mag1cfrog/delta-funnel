@@ -22,6 +22,7 @@ The current typed public surface is recorded in the package stub:
 
 Core Python entry points:
 
+- `init_logging`
 - `Session`
 - `PendingDeltaSource`
 - `Table`
@@ -29,21 +30,21 @@ Core Python entry points:
 - `MssqlOutputSpec`
 - `DeltaFunnelError`
 
+For `init_logging` setup and filter behavior, see
+[Python logging](../advanced/python-logging.md).
+
+For progress modes and display behavior shared by the supported actions, see
+[Progress displays](../progress.md).
+
 `Session.delta_lake(source_uri, *, version=None, storage_options=None,
 name=None, progress=None)` registers a named Delta source immediately when
 `name` is present. Without `name`, it returns a lazy `PendingDeltaSource` and
 does not load or register the source.
 
 `PendingDeltaSource.alias(name, *, progress=None)` performs the deferred
-registration. For both registration forms, `progress=None` enables automatic
-terminal and notebook progress, `True` forces it, and `False` disables it.
-Progress is selected per registration call. A `progress` value passed while
-creating an unnamed pending source is not saved or reused by `alias(...)`.
-
-Delta source registration progress is indeterminate and reports metadata,
-protocol, provider, and catalog phases. Registration does not scan data files,
-so it does not show file, byte, row, or percentage progress. The display omits
-source locations, storage options, credentials, raw metadata, and raw errors.
+registration. Progress is selected by the call that performs registration. A
+value passed while creating an unnamed pending source is not reused by
+`alias(...)`.
 
 `Table.preview(limit=20, *, progress=None)` returns a `Preview` object.
 `Table.show(limit=20, *, progress=None)` executes the same preview and prints
@@ -52,15 +53,8 @@ applied before collection, read rows, and do not contact or write to SQL Server.
 `Preview.text` is the plain text table and `Preview.html` backs notebook
 `_repr_html_()` display.
 
-For both methods, `progress=None` enables automatic terminal and notebook
-progress, `True` forces progress, and `False` disables it. Eligible Delta plans
-show selected-file progress, which may remain partial when the limit ends the
-query early. Other plans stay indeterminate. The limit is not used as a
-progress total. Notebook progress finishes before preview output; terminal
-progress uses stderr and leaves `show()` stdout table-only.
-
 For Delta sources, `Session.delta_lake(..., storage_options=...)` accepts a
 mapping of string keys and values and forwards them to the underlying
 object-store builder used by Delta Funnel. For private S3 tables, see the
-[Python API walkthrough](../python-api-walkthrough.md) for the exact
+[Private S3 sources](../advanced/private-s3.md) guide for the exact
 documented AWS keys, examples, and troubleshooting guidance.

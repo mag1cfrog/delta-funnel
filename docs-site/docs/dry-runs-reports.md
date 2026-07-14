@@ -1,10 +1,11 @@
 # Dry Runs, Validation, And Reports
 
-Use dry runs to validate a plan before writing rows to SQL Server.
+Use dry runs to validate a plan before writing rows to SQL Server. Use execute
+reports to confirm what the workflow wrote and whether target validation
+succeeded.
 
-The examples below continue from the [Python API walkthrough](python-api-walkthrough.md):
-`session` is a `Session`, `daily_orders` is a lazy table, and `west` and `east`
-are lazy tables created from SQL.
+The examples below continue from the [Python quickstart](python-api-walkthrough.md):
+`daily_orders` is a lazy table created from SQL.
 
 ## Single-output dry run
 
@@ -17,105 +18,124 @@ dry_run_report = daily_orders.write_to_mssql(
 )
 ```
 
-## Multi-output dry run
+Dry-run calls do not contact SQL Server, produce rows, construct a bulk writer,
+or change a target table. They check source planning, target identity,
+lifecycle choices, and output shape.
 
-```python
-outputs = [
-    west.to_mssql(
-        schema="dbo",
-        table="active_orders_west",
-        load_mode="append_existing",
-        name="west_active_orders",
-    ),
-    east.to_mssql(
-        schema="dbo",
-        table="active_orders_east",
-        load_mode="append_existing",
-        name="east_active_orders",
-    ),
-]
+## Collect detailed source statistics in Rust
 
-dry_run_report = session.write_all(outputs, dry_run=True)
+The default `metadata_only` dry-run mode avoids DataFusion physical planning.
+Choose `exhaust_scan_metadata` when a Rust workflow also needs provider scan
+statistics and fuller source file-count evidence:
+
+```rust
+use delta_funnel::{
+    DeltaFunnelRuntime, DeltaFunnelSession, DryRunScanSummaryMode, SessionOptions,
+    ValidationOptions,
+};
+
+let session_options = SessionOptions::new().with_validation_options(
+    ValidationOptions::new()
+        .with_dry_run_scan_summary_mode(DryRunScanSummaryMode::ExhaustScanMetadata),
+);
+
+let session = DeltaFunnelSession::new(session_options)?;
+let runtime = DeltaFunnelRuntime::new()?;
+
+// Register sources, plan SQL, and build dry-run OutputWritePlan values here.
+
+let report = runtime.dry_run_all_to_mssql_with_scan_summary(&session, &outputs)?;
+let report_json = report.to_json_value();
 ```
 
-Dry-run calls do not write rows. They are meant to check source planning,
-target identity, lifecycle choices, and output shape.
+This mode can perform extra Delta metadata and DataFusion physical-planning
+work, but it still stops before row production and SQL Server work.
 
-### Multi-output progress
+## Configure execute validation
 
-One `write_all` call uses one consolidated progress display for planning,
-shared cache work, and each sequential output. Active outputs are identified as
-`Output 1/2`, `Output 2/2`, and so on. Pass `progress=False` to suppress the
-display for one call, or `progress=True` to force it in scripts and CI.
+Target validation has three modes:
 
-Each active physical plan gets its own selected-Delta-file total. The display
-resets when cache work or another output activates, and becomes indeterminate
-when that plan has no reliable file total. Row and batch counts belong only to
-the active output. Dry runs show planning phases but no file, row, or batch
-counters.
+- `validate_if_possible` is the default. Delta Funnel validates target-side
+  row counts when the selected workflow supports it.
+- `disabled` skips target-side validation.
+- `require` fails when target-side validation cannot be completed.
 
-The display reuses the active plans and shared-dependency cache. It does not
-repeat shared work or run a separate count query. A report containing failed or
-skipped outputs finishes as `Completed with failures`. A top-level planning,
-cache, orchestration, or cache-restoration error raises an exception and
-finishes as `Failed`. Cache restoration happens before the result is delivered,
-so a restoration error supersedes either a successful report or a report with
-failed outputs.
+For Python, select the mode when creating the session used by the workflow:
+
+```python
+from deltafunnel import Session
+
+session = Session(
+    default_mssql_connection_string=connection_string,
+    validation_options={"target_validation_mode": "require"},
+)
+```
+
+For Rust, configure `ValidationOptions` on the session:
+
+```rust
+use delta_funnel::{
+    DeltaFunnelSession, SessionOptions, TargetValidationMode, ValidationOptions,
+};
+
+let session_options = SessionOptions::new().with_validation_options(
+    ValidationOptions::new()
+        .with_target_validation_mode(TargetValidationMode::Require),
+);
+let session = DeltaFunnelSession::new(session_options)?;
+```
+
+Validation proves row-count facts reported by the workflow. It is not full data
+equality, checksum, ordering, or SQL Server performance validation.
 
 ## Execute reports
 
 Execute calls return report dictionaries too:
 
 ```python
-report = session.write_all(outputs, options={"cache_mode": "auto"})
-```
-
-`options={"cache_mode": "auto"}` is the default execute behavior. Use
-`options={"cache_mode": "disabled"}` to force the baseline path.
-
-!!! important
-    `options` is only accepted for execute `write_all` calls, not dry runs.
-
-For failure-report and tracing rules, see
-[Failure Reports And Safe Tracing](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/failure-reports-and-tracing.md).
-
-## Python logging
-
-For Python diagnostics, route DeltaFunnel events into standard-library
-`logging` before running the workflow:
-
-```python
-import logging
-import deltafunnel
-
-logging.basicConfig(level=logging.INFO)
-deltafunnel.init_logging()
-```
-
-Use `DELTAFUNNEL_LOG` or an explicit filter string such as
-`delta_funnel=debug,delta_kernel=debug,object_store=debug` when you need more
-detail. DeltaFunnel does not configure handlers or exporters; existing Datadog,
-OpenTelemetry, JSON logging, file logging, pytest capture, and framework
-integrations continue to own Python logging output.
-
-For private S3 Delta sources, look for `object_store` messages that show which
-credential-provider path was selected.
-
-## Private S3 source troubleshooting
-
-If a private S3 Delta table fails in `deltafunnel` from a local shell, but the
-same table works in `deltalake`, the likely cause is a credential-discovery
-path mismatch rather than a Delta snapshot or protocol problem.
-
-Start with the explicit `storage_options` example in the
-[Python API walkthrough](python-api-walkthrough.md#read-a-private-s3-delta-table-from-a-local-shell).
-Then rerun with:
-
-```python
-deltafunnel.init_logging(
-    "delta_funnel=debug,delta_kernel=debug,object_store=debug"
+report = daily_orders.write_to_mssql(
+    schema="dbo",
+    table="daily_orders",
+    load_mode="create_and_load",
 )
 ```
 
-On the current S3 path, Delta Funnel does not auto-load shell `AWS_*`
-variables, `AWS_PROFILE`, or shared AWS config and credentials files.
+Python returns reports as dictionaries. Rust report types provide
+`to_json_value()` when a JSON-compatible representation is needed.
+
+## Read report values
+
+Counts carry both a `kind` and a `value`. Check `kind` before using `value`:
+
+| Field family | Kinds | How to read it |
+| --- | --- | --- |
+| `RowCount` | `exact`, `estimated`, `partial`, `unavailable` | `exact` proves the count for that scope. `estimated` comes from metadata or planning. `partial` is an observed prefix from a failed or incomplete path. `unavailable` has no numeric value. |
+| `FileCount` | `exact`, `estimated`, `unavailable`, `skipped`, `not_executed` | `skipped` means Delta Funnel intentionally avoided the count. `not_executed` means the workflow step that would count files never ran. |
+
+Statuses carry stable `kind` strings and optional `reason` strings:
+
+| Status | Kinds | Notes |
+| --- | --- | --- |
+| `WorkflowStatus` | `success`, `partial_success`, `failure`, `skipped`, `no_op` | Dry-run workflow reports use this shape. Execute multi-output reports expose workflow counts and per-output status instead. |
+| `OutputStatus` | `planned`, `succeeded`, `failed`, `skipped`, `dry_run_planned`, `validation_failed` | A validation failure nests a `validation` status. |
+| `PhaseStatus` | `completed`, `failed`, `skipped`, `not_started`, `unavailable` | Phase timings include `elapsed_micros` only when measured. |
+| `ValidationStatus` | `disabled`, `passed`, `failed`, `skipped`, `unavailable`, `required_but_failed` | `required_but_failed` means the caller required validation and Delta Funnel could not prove a pass. |
+
+Common reason strings include `validation_disabled`, `dry_run`,
+`capability_unavailable`, `permission_unavailable`, `prior_failure`,
+`unsupported_load_mode`, `missing_target_access`,
+`missing_exact_output_rows`, `cost_avoidance`, `not_executed`, and
+`failure_before_validation`.
+
+Source reports can include sanitized source and protocol facts, file-count
+evidence, provider scheduling, and provider read statistics. Batch-shaping
+reports compare rows and batches before and after SQL Server shaping. Write
+statistics report rows and batches accepted by the SQL Server write path.
+
+For multi-output dry runs, shared caching, and partial failure reports, see
+[Multiple outputs and shared caching](advanced/multiple-outputs.md).
+
+For interpreting failures and collecting safe diagnostics, see
+[Diagnose failed workflows](advanced/failure-diagnostics.md).
+
+For application diagnostics, see [Python logging](advanced/python-logging.md).

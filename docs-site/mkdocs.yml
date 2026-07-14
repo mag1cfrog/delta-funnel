@@ -25,15 +25,30 @@ markdown_extensions:
       anchor_linenums: true
 
 nav:
-  - User guide:
+  - Start here:
       - Overview: index.md
       - Installation: install.md
-      - Python API walkthrough: python-api-walkthrough.md
-      - Python progress: progress.md
-      - Concepts: concepts.md
-      - SQL Server: sql-server.md
+      - Python quickstart: python-api-walkthrough.md
+      - Rust quickstart: rust-quickstart.md
+      - Core concepts: concepts.md
+  - Core workflows:
+      - SQL Server writes: sql-server.md
       - Dry runs and reports: dry-runs-reports.md
-  - Internals:
-      - DataFusion and Delta: internals/datafusion-delta.md
+  - Advanced workflows:
+      - Multiple outputs and shared caching: advanced/multiple-outputs.md
+      - Progress displays: progress.md
+      - Private S3 sources: advanced/private-s3.md
+      - Python logging: advanced/python-logging.md
+      - Failure diagnostics: advanced/failure-diagnostics.md
   - Reference:
       - API references: reference/api.md
+  - Contributors:
+      - Development:
+          - Local development: contributing/development.md
+          - SQL Server integration tests: contributing/sql-server-tests.md
+      - Delta internals:
+          - DataFusion and Delta overview: internals/datafusion-delta.md
+          - Scan partition planning: internals/scan-partition-planning.md
+          - Provider read scheduling: internals/provider-read-scheduling.md
+      - Performance:
+          - Delta scan benchmarks: contributing/scan-benchmarks.md

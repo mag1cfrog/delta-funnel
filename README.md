@@ -87,13 +87,13 @@ daily_orders.preview(limit=20)
 report = daily_orders.write_to_mssql(
     schema="dbo",
     table="daily_orders",
-    load_mode="create_and_load",  # use "replace" only to rebuild an existing target
+    load_mode="create_and_load",  # "replace" also supports a missing target
     # dry_run=True,  # validate the load plan without writing rows
 )
 ```
 
 For private S3 sources, SQL Server load modes, dry runs, and reports, see the
-[`Python API walkthrough`](https://mag1cfrog.github.io/delta-funnel/python-api-walkthrough/),
+[`private S3 sources`](https://mag1cfrog.github.io/delta-funnel/advanced/private-s3/),
 [`SQL Server guide`](https://mag1cfrog.github.io/delta-funnel/sql-server/), and
 [`dry runs and reports`](https://mag1cfrog.github.io/delta-funnel/dry-runs-reports/).
 
@@ -105,8 +105,8 @@ execute them together. Shared lazy SQL dependencies can be cached during the
 workflow so common upstream work is not repeated for each output.
 
 See the
-[`dry runs and reports`](https://mag1cfrog.github.io/delta-funnel/dry-runs-reports/)
-guide for multi-output dry runs and cache options.
+[`multiple outputs and shared caching`](https://mag1cfrog.github.io/delta-funnel/advanced/multiple-outputs/)
+guide for setup, dry runs, cache options, and failure behavior.
 
 ## Rust Quickstart
 
@@ -168,6 +168,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+For a guided version of this workflow, see the
+[`Rust quickstart`](https://mag1cfrog.github.io/delta-funnel/rust-quickstart/).
 For the full Rust API, see
 [`docs.rs/delta-funnel`](https://docs.rs/delta-funnel) and the
 [`query_load_dry_run` example](crates/delta-funnel/examples/query_load_dry_run.rs).
@@ -175,5 +177,4 @@ For the full Rust API, see
 ## Development
 
 For local builds and test setup, see the
-[`installation guide`](https://mag1cfrog.github.io/delta-funnel/install/) and
-[`SQL Server guide`](https://mag1cfrog.github.io/delta-funnel/sql-server/).
+[`local development guide`](https://mag1cfrog.github.io/delta-funnel/contributing/development/).

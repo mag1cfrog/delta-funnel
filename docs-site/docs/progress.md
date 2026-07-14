@@ -152,6 +152,9 @@ Progress reads statistics from work that the workflow already performs. It
 does not execute the query twice, run a count query, repeat shared cache work,
 or make extra source requests.
 
+For workflow setup and cache options, see
+[Multiple outputs and shared caching](advanced/multiple-outputs.md).
+
 ## Understand completion and interruption
 
 `Completed` means the top-level action succeeded. For `write_all`, `Completed
@@ -178,7 +181,7 @@ Progress shows stable phase names, sanitized logical output names, and numeric
 counters. It does not display source locations, storage options, credentials,
 connection strings, raw metadata, raw rows, or raw internal errors.
 
-Use `deltafunnel.init_logging()` when you need diagnostic details. Logging and
-progress are independent and may be enabled together. See the
-[Python API walkthrough](python-api-walkthrough.md) for complete workflows and
+Logging and progress are independent and may be enabled together. See
+[Python logging](advanced/python-logging.md) for diagnostic setup, the
+[Python quickstart](python-api-walkthrough.md) for a complete workflow and
 [Dry runs and reports](dry-runs-reports.md) for report semantics.
