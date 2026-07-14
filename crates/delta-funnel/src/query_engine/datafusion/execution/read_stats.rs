@@ -30,9 +30,9 @@ pub struct DeltaProviderReadStatsSnapshot {
     pub estimated_rows: Option<u64>,
     /// Estimated bytes from planning when every selected file had a byte size.
     pub estimated_bytes: Option<u64>,
-    /// Bounded Parquet data-file GET operations started after range coalescing.
+    /// Non-head Parquet data-file GET operations started with `range = Some(...)`.
     pub parquet_data_file_range_get_operations: Option<u64>,
-    /// Unbounded Parquet data-file GET operations started.
+    /// Non-head Parquet data-file GET operations started with `range = None`.
     pub parquet_data_file_full_get_operations: Option<u64>,
     /// Bytes delivered through successful Parquet data-file payload chunks.
     pub parquet_data_file_bytes_received: Option<u64>,

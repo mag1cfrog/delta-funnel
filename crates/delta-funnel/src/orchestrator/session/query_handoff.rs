@@ -649,13 +649,9 @@ async fn dataframe_for_lazy_table_from_session_parts(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        any::Any,
-        fmt,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use crate::{
@@ -665,21 +661,16 @@ mod tests {
     };
     use datafusion::{
         arrow::datatypes::DataType,
-        common::{DataFusionError, Result as DataFusionResult},
-        execution::TaskContext,
         logical_expr::{Volatility, create_udf},
-        physical_plan::{
-            DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-            test::exec::ErrorExec,
-        },
+        physical_plan::ExecutionPlan,
     };
     use futures_util::StreamExt;
 
     use super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
         test_support::{
-            DeltaLogTable, collect_stream_marker_values, collect_stream_row_count,
-            failing_scan_marker_region_provider, marker_region_provider,
+            DeltaLogTable, FailingMergedStreamPlan, collect_stream_marker_values,
+            collect_stream_row_count, failing_scan_marker_region_provider, marker_region_provider,
             marker_values_from_batches, scan_counting_marker_region_provider,
         },
     };
@@ -691,70 +682,6 @@ mod tests {
         Option<ProgressOperation>,
         Option<ProgressPhase>,
     );
-
-    /// Keeps a real Delta plan as a child but fails before returning its stream.
-    #[derive(Debug)]
-    struct FailingMergedStreamPlan {
-        child: Arc<dyn ExecutionPlan>,
-        error: ErrorExec,
-    }
-
-    impl FailingMergedStreamPlan {
-        fn new(child: Arc<dyn ExecutionPlan>) -> Self {
-            Self {
-                child,
-                error: ErrorExec::new(),
-            }
-        }
-    }
-
-    impl DisplayAs for FailingMergedStreamPlan {
-        fn fmt_as(
-            &self,
-            _display_type: DisplayFormatType,
-            formatter: &mut fmt::Formatter,
-        ) -> fmt::Result {
-            formatter.write_str("FailingMergedStreamPlan")
-        }
-    }
-
-    impl ExecutionPlan for FailingMergedStreamPlan {
-        fn name(&self) -> &str {
-            "FailingMergedStreamPlan"
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn properties(&self) -> &Arc<PlanProperties> {
-            self.error.properties()
-        }
-
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![&self.child]
-        }
-
-        fn with_new_children(
-            self: Arc<Self>,
-            children: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            if children.len() != 1 {
-                return Err(DataFusionError::Plan(
-                    "FailingMergedStreamPlan requires one child".to_owned(),
-                ));
-            }
-            Ok(Arc::new(Self::new(Arc::clone(&children[0]))))
-        }
-
-        fn execute(
-            &self,
-            partition: usize,
-            context: Arc<TaskContext>,
-        ) -> DataFusionResult<SendableRecordBatchStream> {
-            self.error.execute(partition, context)
-        }
-    }
 
     async fn report_tracked_stream(
         session: &DeltaFunnelSession,

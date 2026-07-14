@@ -109,17 +109,17 @@ coupling.
 ## Parquet Data-File IO Metrics
 
 Native async provider read stats expose four counters for the Parquet data-file
-object-store handle. These counters report the reads that parquet-rs requests
-after its own range coalescing. They do not describe the smaller ranges that
-parquet-rs may have considered before combining nearby reads.
+object-store handle. These counters report the requests that reach `get_opts`
+after the default `object_store` range helper has combined nearby logical
+ranges. They do not describe the smaller ranges that existed before that
+coalescing step.
 
-- `parquet_data_file_range_get_operations`: payload GET operations whose
-  `get_opts` call contains a byte range. The counter advances immediately
-  before the request is passed to the underlying object store, so a failed
-  request still counts as an operation.
-- `parquet_data_file_full_get_operations`: payload GET operations whose
-  `get_opts` call does not contain a byte range. Metadata-only HEAD operations
-  are excluded. As with range GETs, the counter advances before the underlying
+- `parquet_data_file_range_get_operations`: non-head `get_opts` operations with
+  `range = Some(...)`. The counter advances immediately before the request is
+  passed to the underlying object store, so a failed request still counts as an
+  operation.
+- `parquet_data_file_full_get_operations`: non-head `get_opts` operations with
+  `range = None`. As with range GETs, the counter advances before the underlying
   call and therefore includes failed requests.
 - `parquet_data_file_bytes_received`: bytes from successful response chunks
   delivered by the object store. This includes Parquet metadata, footers,
@@ -137,9 +137,10 @@ that behavior without changing how files are read.
 
 Each `provider_read_stats` object in a JSON source report describes one retained
 physical Delta scan. It is not a total across repeated executions, multiple
-outputs, or cache materialization. Partitioned cache-materialization values are
-available through terminal tracing, but the current report envelope cannot
-represent them as one scan snapshot without losing their boundaries.
+outputs, or cache materialization. The current report envelope cannot represent
+partitioned cache-materialization scans as one snapshot without losing their
+boundaries. Terminal tracing for those executions belongs to a separate
+implementation slice.
 
 ## Backpressure And Cancellation
 
@@ -179,4 +180,6 @@ system calls. Received bytes can exceed opened bytes when the visible object
 store layer delivers repeated or overlapping reads. For a local
 `GetResultPayload::File`, received bytes are recorded at the range-result
 boundary, so that result contributes either its full delivered length or zero
-if it fails.
+if it fails or is dropped before delivery. The counter can remain zero even if
+an underlying blocking read had already started because it measures delivery
+through the wrapper, not local disk activity.
