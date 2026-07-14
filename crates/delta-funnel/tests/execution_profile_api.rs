@@ -1,14 +1,29 @@
 //! Compile-time coverage for the public execution-profile API.
 
+use std::sync::Arc;
+
+use datafusion::{
+    common::DataFusionError,
+    execution::TaskContext,
+    physical_plan::{ExecutionPlan, SendableRecordBatchStream},
+};
 use delta_funnel::{
     DeltaProviderReadStatsSnapshot, ExecutionProfileMode, QueryExecutionMetric,
     QueryExecutionMetricCategory, QueryExecutionMetricValue, QueryExecutionOperatorProfile,
     QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope,
+    datafusion_query_output_stream,
 };
 use serde_json::Value;
 
+type QueryOutputStreamFn = fn(
+    Arc<dyn ExecutionPlan>,
+    Arc<TaskContext>,
+) -> Result<SendableRecordBatchStream, DataFusionError>;
+
 #[test]
 fn execution_profile_types_and_accessors_are_exported_from_the_crate_root() {
+    let _: QueryOutputStreamFn = datafusion_query_output_stream;
+
     let _: ExecutionProfileMode = ExecutionProfileMode::default();
     let _: fn(&QueryExecutionProfile) -> QueryExecutionScope = QueryExecutionProfile::scope;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionOutcome = QueryExecutionProfile::outcome;

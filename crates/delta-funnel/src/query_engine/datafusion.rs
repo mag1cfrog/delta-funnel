@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use datafusion::common::DataFusionError;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
+use datafusion::physical_plan::{
+    EmptyRecordBatchStream, ExecutionPlan, SendableRecordBatchStream,
+    coalesce_partitions::CoalescePartitionsExec,
+};
 
 use crate::DeltaFunnelError;
 
@@ -99,7 +102,47 @@ pub fn datafusion_query_output_stream(
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream, DataFusionError> {
-    datafusion::physical_plan::execute_stream(plan, task_context)
+    let DFQueryExecution {
+        stream,
+        effective_profile_root,
+    } = datafusion_query_output_stream_with_effective_root(plan, task_context)?;
+    drop(effective_profile_root);
+    Ok(stream)
+}
+
+pub(crate) struct DFQueryExecution {
+    stream: SendableRecordBatchStream,
+    effective_profile_root: Arc<dyn ExecutionPlan>,
+}
+
+pub(crate) fn datafusion_query_output_stream_with_effective_root(
+    plan: Arc<dyn ExecutionPlan>,
+    task_context: Arc<TaskContext>,
+) -> Result<DFQueryExecution, DataFusionError> {
+    match plan.properties().output_partitioning().partition_count() {
+        // DataFusion returns an empty stream without executing a partition, but
+        // profiling still needs the real planned root.
+        0 => Ok(DFQueryExecution {
+            stream: Box::pin(EmptyRecordBatchStream::new(plan.schema())),
+            effective_profile_root: plan,
+        }),
+        // The only output partition has the zero-based index 0.
+        1 => Ok(DFQueryExecution {
+            stream: plan.execute(0, task_context)?,
+            effective_profile_root: plan,
+        }),
+        2.. => {
+            // The wrapper exposes one output partition at index 0 and consumes
+            // every output partition from the original plan.
+            let effective_profile_root: Arc<dyn ExecutionPlan> =
+                Arc::new(CoalescePartitionsExec::new(plan));
+            let stream = effective_profile_root.execute(0, task_context)?;
+            Ok(DFQueryExecution {
+                stream,
+                effective_profile_root,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -417,14 +460,17 @@ mod tests {
             record_batch::RecordBatch,
         },
         execution::TaskContext,
-        physical_plan::{ExecutionPlan, test::TestMemoryExec, union::UnionExec},
+        physical_plan::{
+            ExecutionPlan, coalesce_partitions::CoalescePartitionsExec, execute_stream,
+            test::TestMemoryExec, union::UnionExec,
+        },
         prelude::SessionContext,
     };
     use futures_util::StreamExt;
 
     use super::{
         collect_delta_provider_read_stats_handles, datafusion_query_output_stream,
-        test_support::register_fixture_source,
+        datafusion_query_output_stream_with_effective_root, test_support::register_fixture_source,
     };
 
     #[tokio::test]
@@ -467,25 +513,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_output_stream_merges_multi_partition_plan() -> Result<(), Box<dyn Error>> {
+    async fn query_output_stream_effective_root_matches_datafusion_for_all_partition_counts()
+    -> Result<(), Box<dyn Error>> {
+        let schema = schema();
+        let cases: [Vec<Vec<i32>>; 3] = [vec![], vec![vec![1, 2]], vec![vec![1, 2], vec![3, 4]]];
+
+        for partition_values in cases {
+            let partitions = partition_values
+                .iter()
+                .map(|values| int_batch(Arc::clone(&schema), values).map(|batch| vec![batch]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let plan: Arc<dyn ExecutionPlan> =
+                TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+            let mut expected = collect_stream_values(execute_stream(
+                Arc::clone(&plan),
+                Arc::new(TaskContext::default()),
+            )?)
+            .await?;
+
+            let output = datafusion_query_output_stream_with_effective_root(
+                Arc::clone(&plan),
+                Arc::new(TaskContext::default()),
+            )?;
+            let actual_schema = output.stream.schema();
+            let mut actual = collect_stream_values(output.stream).await?;
+
+            if partition_values.len() < 2 {
+                assert!(Arc::ptr_eq(&output.effective_profile_root, &plan));
+            } else {
+                let effective_root = output
+                    .effective_profile_root
+                    .as_any()
+                    .downcast_ref::<CoalescePartitionsExec>()
+                    .ok_or("expected CoalescePartitionsExec")?;
+                assert!(Arc::ptr_eq(effective_root.input(), &plan));
+            }
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual_schema, schema);
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_query_output_stream_still_merges_multiple_partitions()
+    -> Result<(), Box<dyn Error>> {
         let schema = schema();
         let plan = TestMemoryExec::try_new_exec(
             &[
                 vec![int_batch(Arc::clone(&schema), &[1, 2])?],
                 vec![int_batch(Arc::clone(&schema), &[3, 4])?],
             ],
-            Arc::clone(&schema),
+            schema,
             None,
         )?;
-        assert_eq!(plan.properties().output_partitioning().partition_count(), 2);
+        let stream = datafusion_query_output_stream(plan, Arc::new(TaskContext::default()))?;
+        let mut values = collect_stream_values(stream).await?;
 
-        let plan: Arc<dyn ExecutionPlan> = plan;
-        let mut stream = datafusion_query_output_stream(plan, Arc::new(TaskContext::default()))?;
-        let mut values = Vec::new();
-
-        while let Some(batch) = stream.next().await {
-            values.extend(batch_values(&batch?)?);
-        }
         values.sort_unstable();
 
         assert_eq!(values, vec![1, 2, 3, 4]);
@@ -515,6 +600,16 @@ mod tests {
             .ok_or("expected Int32Array")?;
 
         Ok((0..values.len()).map(|index| values.value(index)).collect())
+    }
+
+    async fn collect_stream_values(
+        mut stream: datafusion::physical_plan::SendableRecordBatchStream,
+    ) -> Result<Vec<i32>, Box<dyn Error>> {
+        let mut values = Vec::new();
+        while let Some(batch) = stream.next().await {
+            values.extend(batch_values(&batch?)?);
+        }
+        Ok(values)
     }
 
     fn schema() -> SchemaRef {
