@@ -13,28 +13,8 @@ Start with a dry run before executing a write. Dry runs plan the source, query,
 target schema, target lifecycle, and output shape without contacting SQL Server,
 starting row production, constructing a bulk writer, or writing rows.
 
-For fuller source/provider metrics, enable scan-summary collection and call the
-scan-summary dry-run method:
-
-```rust
-use delta_funnel::{
-    DeltaFunnelRuntime, DeltaFunnelSession, DryRunScanSummaryMode, SessionOptions,
-    ValidationOptions,
-};
-
-let session_options = SessionOptions::new().with_validation_options(
-    ValidationOptions::new()
-        .with_dry_run_scan_summary_mode(DryRunScanSummaryMode::ExhaustScanMetadata),
-);
-
-let mut session = DeltaFunnelSession::new(session_options)?;
-let runtime = DeltaFunnelRuntime::new()?;
-
-// Register sources, plan SQL, and build OutputWritePlan values here.
-
-let report = runtime.dry_run_all_to_mssql_with_scan_summary(&session, &outputs)?;
-let report_json = report.to_json_value();
-```
+For dry-run setup, scan-summary collection, validation modes, and the report
+field vocabulary, see [Dry runs and reports](../dry-runs-reports.md).
 
 Collect these dry-run sections for a failure report:
 
@@ -45,78 +25,11 @@ Collect these dry-run sections for a failure report:
 - `dry_run` booleans proving that SQL Server, row production, table lifecycle,
   and bulk writer work did not start
 
-## Run Execute Mode With Validation
-
-Use execute mode only after the dry-run report looks correct. Target validation
-is controlled by `TargetValidationMode`:
-
-- `validate_if_possible` is the default. DeltaFunnel runs target-side row-count
-  validation when the selected workflow supports it.
-- `disabled` skips target-side validation.
-- `require` fails when target-side validation cannot be completed.
-
-```rust
-use delta_funnel::{
-    DeltaFunnelRuntime, DeltaFunnelSession, SessionOptions, TargetValidationMode,
-    ValidationOptions,
-};
-
-let session_options = SessionOptions::new().with_validation_options(
-    ValidationOptions::new()
-        .with_target_validation_mode(TargetValidationMode::Require),
-);
-
-let mut session = DeltaFunnelSession::new(session_options)?;
-let runtime = DeltaFunnelRuntime::new()?;
-
-// Register sources, plan SQL, and build Execute OutputWritePlan values here.
-
-let report = runtime.write_all(&session, &outputs)?;
-let report_json = report.to_json_value();
-```
-
-Validation currently proves row-count facts reported by the workflow. It is not
-full data equality validation, checksum validation, ordering validation, or a
-SQL Server performance profile.
-
-## Report Field Reference
-
-Counts carry both a `kind` and a `value`. Do not read `value` without checking
-`kind`.
-
-| Field family | Kinds | How to read it |
-| --- | --- | --- |
-| `RowCount` | `exact`, `estimated`, `partial`, `unavailable` | `exact` proves the count for that scope. `estimated` comes from metadata or planning. `partial` is an observed prefix from a failed or incomplete path. `unavailable` has no numeric value. |
-| `FileCount` | `exact`, `estimated`, `unavailable`, `skipped`, `not_executed` | `skipped` means DeltaFunnel intentionally avoided the count. `not_executed` means the workflow step that would count files never ran. |
-
-Statuses also carry stable `kind` strings and optional `reason` strings:
-
-| Status | Kinds | Notes |
-| --- | --- | --- |
-| `WorkflowStatus` | `success`, `partial_success`, `failure`, `skipped`, `no_op` | Dry-run workflow reports use this shape. Execute multi-output reports expose workflow counts and per-output status instead. |
-| `OutputStatus` | `planned`, `succeeded`, `failed`, `skipped`, `dry_run_planned`, `validation_failed` | A validation failure nests a `validation` status. |
-| `PhaseStatus` | `completed`, `failed`, `skipped`, `not_started`, `unavailable` | Phase timings include `elapsed_micros` only when measured. |
-| `ValidationStatus` | `disabled`, `passed`, `failed`, `skipped`, `unavailable`, `required_but_failed` | `required_but_failed` means the caller required validation and DeltaFunnel could not prove a pass. |
-
-Common reason strings include `validation_disabled`, `dry_run`,
-`capability_unavailable`, `permission_unavailable`, `prior_failure`,
-`unsupported_load_mode`, `missing_target_access`,
-`missing_exact_output_rows`, `cost_avoidance`, `not_executed`, and
-`failure_before_validation`.
-
-Source reports contain sanitized `source_uri` and `protocol.table_uri` fields.
-They also report source usage, file-count evidence, provider scheduling, and
-provider read stats. Provider stats can be absent when the report stayed on the
-metadata-only path, when a provider capability was unavailable, or when the
-workflow failed before scan metadata could be collected.
-
-Batch shaping reports compare input batches/rows from the selected output stream
-with output batches/rows after DeltaFunnel shapes data for SQL Server. Write
-stats report rows and batches accepted by the SQL Server write path.
-
 ## Read The Failure Report
 
-When a workflow fails, start at the highest-level report and then drill down:
+When a workflow fails, use the report vocabulary described in
+[Dry runs and reports](../dry-runs-reports.md). Start at the highest-level
+report and then drill down:
 
 - `workflow` or workflow-level counts show how many outputs succeeded, failed,
   or were skipped.
