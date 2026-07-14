@@ -596,7 +596,7 @@ pub(crate) mod test_capture {
     use std::{
         collections::BTreeMap,
         fmt,
-        sync::{Arc, Mutex, MutexGuard},
+        sync::{Arc, Mutex, MutexGuard, Once},
     };
 
     use tracing::{
@@ -607,6 +607,7 @@ pub(crate) mod test_capture {
     use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*, registry::LookupSpan};
 
     static TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static TRACING_TEST_GLOBAL_SUBSCRIBER: Once = Once::new();
 
     pub(crate) struct TracingTestGuard {
         _guard: MutexGuard<'static, ()>,
@@ -644,6 +645,13 @@ pub(crate) mod test_capture {
     impl TracingCapture {
         pub(crate) fn start() -> Self {
             let test_guard = tracing_test_guard();
+            // A no-layer global registry keeps callsites enabled when an
+            // ordinary parallel test is the first thread to reach them.
+            // Captures replace it only on their own serialized thread.
+            TRACING_TEST_GLOBAL_SUBSCRIBER.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(Registry::default());
+            });
+            tracing::callsite::rebuild_interest_cache();
             let captured = CapturedEvents::default();
             let subscriber = Registry::default().with(CaptureLayer::new(captured.clone()));
             let subscriber_guard = tracing::subscriber::set_default(subscriber);
@@ -810,7 +818,7 @@ mod tests {
     ];
 
     #[test]
-    fn observability_event_helpers_do_not_require_subscriber() -> Result<(), DeltaFunnelError> {
+    fn observability_event_helpers_do_not_require_capture_layer() -> Result<(), DeltaFunnelError> {
         let _guard = tracing_test_guard();
         workflow_started(RunMode::Execute, 2);
         workflow_started(RunMode::DryRun, 0);
