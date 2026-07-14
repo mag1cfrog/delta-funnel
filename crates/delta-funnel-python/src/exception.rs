@@ -178,6 +178,11 @@ fn delta_funnel_error_parts(
             "mssql_write_phase",
             Some(json_value_to_py(py, &context.to_json_value())?),
         )),
+        delta_funnel::DeltaFunnelError::MssqlQueryPhase { context, .. } => Ok((
+            mssql_write_phase(context.phase()),
+            "mssql_write_phase",
+            Some(json_value_to_py(py, &context.to_json_value())?),
+        )),
         delta_funnel::DeltaFunnelError::MssqlBatchSchemaValidation { context, .. } => Ok((
             mssql_write_phase(context.phase()),
             "mssql_batch_schema_validation",
@@ -191,6 +196,9 @@ fn delta_funnel_error_parts(
 
 fn mssql_write_phase(phase: delta_funnel::MssqlWritePhase) -> &'static str {
     match phase {
+        delta_funnel::MssqlWritePhase::QueryDataFramePlanning => "query_dataframe_planning",
+        delta_funnel::MssqlWritePhase::QueryPhysicalPlanning => "query_physical_planning",
+        delta_funnel::MssqlWritePhase::QueryStreamSetup => "query_stream_setup",
         delta_funnel::MssqlWritePhase::Connect => "connect",
         delta_funnel::MssqlWritePhase::PrepareTargetLifecycle => "prepare_target_lifecycle",
         delta_funnel::MssqlWritePhase::InitializeWriter => "initialize_writer",
@@ -543,6 +551,62 @@ mod tests {
                 "order_id"
             );
             assert!(required_item(diagnostic, "row")?.is_none());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn rust_query_phase_error_keeps_existing_python_write_error_shape() -> PyResult<()> {
+        Python::attach(|py| {
+            let connection = delta_funnel::MssqlConnectionConfig::new(
+                "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
+            )
+            .map_err(|error| py_error(py, error))?;
+            let target_config = delta_funnel::MssqlTargetConfig::new(
+                delta_funnel::MssqlTargetTable::new("dbo", "orders")
+                    .map_err(|error| py_error(py, error))?,
+            );
+            let output_plan = delta_funnel::plan_mssql_target_for_output(
+                Schema::new(vec![Field::new("order_id", DataType::Int64, false)]),
+                "orders_output",
+                &target_config,
+                Some(&connection),
+                delta_funnel::MssqlSchemaPlanOptions::default(),
+            )
+            .map_err(|error| py_error(py, error))?;
+            let context = delta_funnel::MssqlWriteFailureContext::from_output_plan(
+                &output_plan,
+                delta_funnel::MssqlWritePhase::QueryStreamSetup,
+                0,
+                0,
+                0,
+                false,
+                delta_funnel::MssqlTargetCleanupStatus::NotApplicable,
+            );
+            let error = delta_funnel_error_to_py(
+                py,
+                delta_funnel::DeltaFunnelError::MssqlQueryPhase {
+                    context: Box::new(context),
+                    source: Box::new(delta_funnel::DeltaFunnelError::Config {
+                        message: "stream setup failed".to_owned(),
+                    }),
+                },
+            )?;
+
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "query_stream_setup"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "mssql_write_phase"
+            );
+            let context = error.value(py).getattr("context")?;
+            assert_eq!(
+                context.get_item("phase")?.extract::<String>()?,
+                "query_stream_setup"
+            );
 
             Ok(())
         })

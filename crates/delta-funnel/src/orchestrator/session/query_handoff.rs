@@ -477,7 +477,7 @@ async fn batch_stream_for_lazy_table_from_session_parts(
     batch_stream_for_physical_plan(context, physical_plan, provider_stats_snapshots, progress)
 }
 
-fn batch_stream_for_physical_plan(
+pub(super) fn batch_stream_for_physical_plan(
     context: &SessionContext,
     physical_plan: Arc<dyn ExecutionPlan>,
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
@@ -598,6 +598,7 @@ impl DeltaFunnelSession {
     ///
     /// `progress` contains the reporter and output name used for emitted
     /// events. `None` returns the normal stream without progress sampling.
+    #[cfg(test)]
     pub(crate) async fn batch_stream_for_lazy_table(
         &self,
         table: &LazyTable,

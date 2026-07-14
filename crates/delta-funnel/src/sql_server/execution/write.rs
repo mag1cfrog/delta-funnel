@@ -202,6 +202,12 @@ impl MssqlBulkWriterInitializationRequest {
 /// Phase of one-output SQL Server write execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MssqlWritePhase {
+    /// Resolve the selected lazy table into the DataFusion DataFrame to execute.
+    QueryDataFramePlanning,
+    /// Build the DataFusion physical plan for the selected output query.
+    QueryPhysicalPlanning,
+    /// Create the output stream from the DataFusion physical plan.
+    QueryStreamSetup,
     /// Establish the SQL Server connection.
     Connect,
     /// Execute target lifecycle preparation before writer construction.
@@ -227,6 +233,9 @@ pub enum MssqlWritePhase {
 impl fmt::Display for MssqlWritePhase {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::QueryDataFramePlanning => "query_dataframe_planning",
+            Self::QueryPhysicalPlanning => "query_physical_planning",
+            Self::QueryStreamSetup => "query_stream_setup",
             Self::Connect => "connect",
             Self::PrepareTargetLifecycle => "prepare target lifecycle",
             Self::InitializeWriter => "initialize writer",
@@ -2165,6 +2174,15 @@ mod tests {
     #[test]
     fn write_phase_display_is_stable() {
         let phases = [
+            (
+                MssqlWritePhase::QueryDataFramePlanning,
+                "query_dataframe_planning",
+            ),
+            (
+                MssqlWritePhase::QueryPhysicalPlanning,
+                "query_physical_planning",
+            ),
+            (MssqlWritePhase::QueryStreamSetup, "query_stream_setup"),
             (MssqlWritePhase::Connect, "connect"),
             (
                 MssqlWritePhase::PrepareTargetLifecycle,

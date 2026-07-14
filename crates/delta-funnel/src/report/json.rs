@@ -700,6 +700,9 @@ fn cleanup_status(status: MssqlTargetCleanupStatus) -> &'static str {
 
 fn write_phase(phase: MssqlWritePhase) -> &'static str {
     match phase {
+        MssqlWritePhase::QueryDataFramePlanning => "query_dataframe_planning",
+        MssqlWritePhase::QueryPhysicalPlanning => "query_physical_planning",
+        MssqlWritePhase::QueryStreamSetup => "query_stream_setup",
         MssqlWritePhase::Connect => "connect",
         MssqlWritePhase::PrepareTargetLifecycle => "prepare_target_lifecycle",
         MssqlWritePhase::InitializeWriter => "initialize_writer",

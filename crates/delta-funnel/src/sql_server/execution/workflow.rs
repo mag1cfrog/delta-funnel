@@ -907,6 +907,7 @@ fn ensure_sequential_options(options: MssqlWorkflowWriteOptions) -> Result<(), D
 fn failure_context(error: &DeltaFunnelError) -> Option<&MssqlWriteFailureContext> {
     match error {
         DeltaFunnelError::MssqlWritePhase { context, .. }
+        | DeltaFunnelError::MssqlQueryPhase { context, .. }
         | DeltaFunnelError::MssqlBatchSchemaValidation { context, .. } => Some(context.as_ref()),
         _ => None,
     }
