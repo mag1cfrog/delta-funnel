@@ -814,7 +814,7 @@ mod tests {
             record_batch::RecordBatch,
         },
         logical_expr::{Volatility, create_udf},
-        physical_plan::ExecutionPlan,
+        physical_plan::{ExecutionPlan, union::UnionExec},
     };
     use futures_util::StreamExt;
     use tracing::Level;
@@ -1229,6 +1229,43 @@ mod tests {
                 .iter()
                 .all(|field| summaries[0].fields.contains_key(*field))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merged_execution_emits_one_summary_per_distinct_scan_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("distinct-summary-identities")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let first_plan = dataframe.clone().create_physical_plan().await?;
+        let second_plan = dataframe.create_physical_plan().await?;
+
+        // The second scan appears through two child paths. Its shared handle
+        // must still produce one event, while the first scan remains distinct.
+        let combined_plan =
+            UnionExec::try_new(vec![Arc::clone(&second_plan), first_plan, second_plan])?;
+        assert_eq!(
+            super::collect_delta_provider_read_stats_handles(combined_plan.as_ref()).len(),
+            2
+        );
+
+        let capture = TracingCapture::start();
+        let stream =
+            super::batch_stream_for_physical_plan(&session.context, combined_plan, None, None)?;
+        let rows = collect_stream_row_count(stream).await?;
+        let summaries = provider_io_events(capture.captured());
+
+        assert_eq!(rows, table.rows() * 3);
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().all(|event| {
+            event.fields.get("source_name").map(String::as_str) == Some("orders")
+                && event.fields.get("outcome").map(String::as_str) == Some("success")
+        }));
         Ok(())
     }
 
