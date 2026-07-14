@@ -20,20 +20,18 @@ use super::{DeltaProviderReadStatsHandle, execution::DeltaScanPlanningExec};
 pub(crate) type DeltaProviderReadStatsSnapshotSet =
     Vec<(DeltaProviderReadStatsHandle, DeltaProviderReadStatsSnapshot)>;
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct QueryExecutionProfileResult {
     profile: Arc<OnceLock<QueryExecutionProfile>>,
 }
 
-#[allow(dead_code)]
 impl QueryExecutionProfileResult {
+    #[allow(dead_code)]
     pub(crate) fn profile(&self) -> Option<&QueryExecutionProfile> {
         self.profile.get()
     }
 }
 
-#[allow(dead_code)]
 pub(crate) struct QueryExecutionProfileConsumer {
     root: Arc<dyn ExecutionPlan>,
     scope: QueryExecutionScope,
@@ -41,8 +39,8 @@ pub(crate) struct QueryExecutionProfileConsumer {
     result: QueryExecutionProfileResult,
 }
 
-#[allow(dead_code)]
 impl QueryExecutionProfileConsumer {
+    #[allow(dead_code)]
     pub(crate) fn register(
         root: Arc<dyn ExecutionPlan>,
         scope: QueryExecutionScope,
@@ -86,7 +84,6 @@ impl QueryExecutionProfileConsumer {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn delta_provider_read_stats_snapshot_set(
     handles: &[DeltaProviderReadStatsHandle],
     snapshots: &[DeltaProviderReadStatsSnapshot],

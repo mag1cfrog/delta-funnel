@@ -2,8 +2,8 @@
 
 use crate::{
     DeltaFunnelError, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, LoadMode,
-    MssqlBatchShapingReport, MssqlTargetTable, QueryExecutionMetricValue, QueryExecutionProfile,
-    RunMode, ValidationStatus,
+    MssqlBatchShapingReport, MssqlTargetTable, QueryExecutionMetricValue, QueryExecutionOutcome,
+    QueryExecutionProfile, RunMode, ValidationStatus,
     support::{sanitize_text_for_display, sanitize_uri_for_display},
     usize_to_u64_saturating,
 };
@@ -22,7 +22,6 @@ const DATAFUSION_REGISTRATION_COMPLETED_EVENT: &str = "datafusion_registration.c
 const DATAFUSION_REGISTRATION_FAILED_EVENT: &str = "datafusion_registration.failed";
 const DATAFUSION_REGISTRATION_STARTED_EVENT: &str = "datafusion_registration.started";
 const DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT: &str = "delta_provider_parquet_io_summary";
-#[allow(dead_code)]
 const QUERY_EXECUTION_PROFILE_TERMINAL_EVENT: &str = "query_execution_profile_terminal";
 const PROTOCOL_PREFLIGHT_COMPLETED_EVENT: &str = "protocol_preflight.completed";
 const PROTOCOL_PREFLIGHT_FAILED_EVENT: &str = "protocol_preflight.failed";
@@ -56,6 +55,14 @@ impl DeltaProviderScanOutcome {
             Self::Success => "success",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub(crate) const fn query_execution_outcome(self) -> QueryExecutionOutcome {
+        match self {
+            Self::Success => QueryExecutionOutcome::Success,
+            Self::Error => QueryExecutionOutcome::Error,
+            Self::Cancelled => QueryExecutionOutcome::Cancelled,
         }
     }
 }
@@ -114,7 +121,6 @@ pub(crate) fn delta_provider_parquet_io_summary(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn query_execution_profile_terminal(profile: &QueryExecutionProfile) {
     let operator_count = usize_to_u64_saturating(profile.operators().len());
     let operators_with_metrics = usize_to_u64_saturating(

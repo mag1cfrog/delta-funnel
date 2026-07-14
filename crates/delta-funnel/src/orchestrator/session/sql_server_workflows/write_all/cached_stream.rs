@@ -79,6 +79,7 @@ fn cached_output_stream_from_physical_plan(
             finalize_provider_scan_execution(
                 &read_stats_handles,
                 provider_stats_snapshots.as_ref(),
+                None,
                 DeltaProviderScanOutcome::Error,
             );
             return Err(cached_output_stream_setup_error(&output_name, error));
@@ -94,6 +95,7 @@ fn cached_output_stream_from_physical_plan(
         read_stats_handles,
         provider_stats_snapshots,
         reporter.map(|reporter| (reporter, output_name)),
+        None,
     ))
 }
 

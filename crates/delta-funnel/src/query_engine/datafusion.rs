@@ -111,8 +111,8 @@ pub fn datafusion_query_output_stream(
 }
 
 pub(crate) struct DFQueryExecution {
-    stream: SendableRecordBatchStream,
-    effective_profile_root: Arc<dyn ExecutionPlan>,
+    pub(crate) stream: SendableRecordBatchStream,
+    pub(crate) effective_profile_root: Arc<dyn ExecutionPlan>,
 }
 
 pub(crate) fn datafusion_query_output_stream_with_effective_root(
@@ -574,6 +574,21 @@ mod tests {
         values.sort_unstable();
 
         assert_eq!(values, vec![1, 2, 3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn public_query_output_stream_does_not_retain_zero_partition_root() -> Result<(), Box<dyn Error>>
+    {
+        let partitions: Vec<Vec<RecordBatch>> = Vec::new();
+        let plan: Arc<dyn ExecutionPlan> =
+            TestMemoryExec::try_new_exec(&partitions, schema(), None)?;
+        let weak_plan = Arc::downgrade(&plan);
+
+        let stream = datafusion_query_output_stream(plan, Arc::new(TaskContext::default()))?;
+
+        assert!(weak_plan.upgrade().is_none());
+        drop(stream);
         Ok(())
     }
 

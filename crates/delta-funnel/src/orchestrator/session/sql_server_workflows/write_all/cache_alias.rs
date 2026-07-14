@@ -270,6 +270,7 @@ fn start_cache_partition_streams(
             finalize_provider_scan_execution(
                 &read_stats_handles,
                 None,
+                None,
                 DeltaProviderScanOutcome::Error,
             );
             return Err(mssql_scoped_cache_alias_error(
