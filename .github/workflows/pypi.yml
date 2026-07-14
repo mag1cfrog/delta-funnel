@@ -149,7 +149,6 @@ jobs:
             --release
             --out dist
             --manifest-path crates/delta-funnel-python/Cargo.toml
-            --features extension-module
             --compatibility pypi
             -i ${{ matrix.interpreter }}
 
