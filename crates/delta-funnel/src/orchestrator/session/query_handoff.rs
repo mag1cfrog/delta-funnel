@@ -55,7 +55,7 @@ pub(super) fn provider_stats_snapshots(
 }
 
 /// Finalizes retained Delta scans and an optional profile from one snapshot set.
-pub(super) fn finalize_provider_scan_execution(
+pub(super) fn finalize_tracked_query_execution(
     read_stats_handles: &[DeltaProviderReadStatsHandle],
     provider_stats_snapshots: Option<&SharedProviderStatsSnapshots>,
     profile_consumer: Option<QueryExecutionProfileConsumer>,
@@ -91,7 +91,7 @@ pub(super) fn finalize_provider_scan_execution(
 /// The stream snapshots shared read counters when it ends, fails, or is dropped
 /// by its downstream consumer. An optional profile consumer retains the
 /// effective physical-plan root until that same terminal transition.
-struct DeltaProviderScanTerminalStream {
+struct QueryExecutionTerminalStream {
     inner: MssqlOutputBatchStream,
     // Taking these handles records the single terminal transition, including
     // executions whose handle set is empty.
@@ -100,7 +100,7 @@ struct DeltaProviderScanTerminalStream {
     profile_consumer: Option<QueryExecutionProfileConsumer>,
 }
 
-impl DeltaProviderScanTerminalStream {
+impl QueryExecutionTerminalStream {
     fn new(
         inner: MssqlOutputBatchStream,
         read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
@@ -121,7 +121,7 @@ impl DeltaProviderScanTerminalStream {
         };
         let provider_stats_snapshots = self.provider_stats_snapshots.take();
         let profile_consumer = self.profile_consumer.take();
-        finalize_provider_scan_execution(
+        finalize_tracked_query_execution(
             &read_stats_handles,
             provider_stats_snapshots.as_ref(),
             profile_consumer,
@@ -130,7 +130,7 @@ impl DeltaProviderScanTerminalStream {
     }
 }
 
-impl Stream for DeltaProviderScanTerminalStream {
+impl Stream for QueryExecutionTerminalStream {
     type Item = Result<RecordBatch, DeltaFunnelError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -148,7 +148,7 @@ impl Stream for DeltaProviderScanTerminalStream {
     }
 }
 
-impl Drop for DeltaProviderScanTerminalStream {
+impl Drop for QueryExecutionTerminalStream {
     fn drop(&mut self) {
         self.finalize_if_needed(DeltaProviderScanOutcome::Cancelled);
     }
@@ -185,7 +185,7 @@ impl PartitionScanCoordinator {
             Err(poisoned) => poisoned.into_inner().record_stream_terminal(outcome),
         };
         if let Some((read_stats_handles, outcome)) = finalization {
-            finalize_provider_scan_execution(&read_stats_handles, None, None, outcome);
+            finalize_tracked_query_execution(&read_stats_handles, None, None, outcome);
         }
     }
 }
@@ -271,7 +271,7 @@ pub(super) fn track_partitioned_scan_completion(
         return streams;
     }
     if streams.is_empty() {
-        finalize_provider_scan_execution(
+        finalize_tracked_query_execution(
             &read_stats_handles,
             None,
             None,
@@ -365,8 +365,8 @@ fn track_delta_file_progress(
     })
 }
 
-/// Attaches #449's one terminal transition to a merged execution.
-fn track_delta_provider_scan_completion(
+/// Attaches one shared terminal transition to a merged execution.
+fn track_query_execution_completion(
     stream: MssqlOutputBatchStream,
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
@@ -375,7 +375,7 @@ fn track_delta_provider_scan_completion(
     if read_stats_handles.is_empty() && profile_consumer.is_none() {
         return stream;
     }
-    Box::pin(DeltaProviderScanTerminalStream::new(
+    Box::pin(QueryExecutionTerminalStream::new(
         stream,
         read_stats_handles,
         provider_stats_snapshots,
@@ -391,17 +391,13 @@ fn track_delta_provider_scan_completion(
 /// `progress` contains the reporter and output name used for live events.
 /// Callers collect the handles before merged stream construction so setup
 /// failures can snapshot the same handles.
-pub(super) fn wrap_stream_with_delta_read_tracking(
+pub(super) fn wrap_stream_with_query_execution_tracking(
     mut stream: MssqlOutputBatchStream,
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<(ProgressReporter, String)>,
     profile_consumer: Option<QueryExecutionProfileConsumer>,
 ) -> MssqlOutputBatchStream {
-    if read_stats_handles.is_empty() && profile_consumer.is_none() {
-        return stream;
-    }
-
     if let Some((reporter, output_name)) = progress.filter(|_| !read_stats_handles.is_empty()) {
         let sampler = DeltaFileProgressSampler::new(
             read_stats_handles.clone(),
@@ -411,7 +407,7 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
         );
         stream = track_delta_file_progress(stream, sampler);
     }
-    track_delta_provider_scan_completion(
+    track_query_execution_completion(
         stream,
         read_stats_handles,
         provider_stats_snapshots,
@@ -481,7 +477,7 @@ fn batch_stream_for_physical_plan(
     let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
         Ok(stream) => stream,
         Err(error) => {
-            finalize_provider_scan_execution(
+            finalize_tracked_query_execution(
                 &read_stats_handles,
                 provider_stats_snapshots.as_ref(),
                 None,
@@ -494,7 +490,7 @@ fn batch_stream_for_physical_plan(
         batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
     }));
 
-    Ok(wrap_stream_with_delta_read_tracking(
+    Ok(wrap_stream_with_query_execution_tracking(
         stream,
         read_stats_handles,
         provider_stats_snapshots,
@@ -581,7 +577,7 @@ impl DeltaFunnelSession {
         let stream = match datafusion_query_output_stream(physical_plan, task_context) {
             Ok(stream) => stream,
             Err(error) => {
-                finalize_provider_scan_execution(
+                finalize_tracked_query_execution(
                     &read_stats_handles,
                     None,
                     None,
@@ -605,7 +601,7 @@ impl DeltaFunnelSession {
             }
             None => stream,
         };
-        let stream = track_delta_provider_scan_completion(stream, read_stats_handles, None, None);
+        let stream = track_query_execution_completion(stream, read_stats_handles, None, None);
         let batches = stream.try_collect::<Vec<_>>().await?;
         emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
         let text = pretty_format_batches(&batches)
@@ -1208,7 +1204,7 @@ mod tests {
 
         let retained = super::shared_provider_stats_snapshots();
         let inner: crate::MssqlOutputBatchStream = Box::pin(futures_util::stream::empty());
-        let mut stream = super::DeltaProviderScanTerminalStream::new(
+        let mut stream = super::QueryExecutionTerminalStream::new(
             inner,
             handles,
             Some(Arc::clone(&retained)),
@@ -1249,7 +1245,7 @@ mod tests {
         let inner: crate::MssqlOutputBatchStream = Box::pin(execution.stream.map(|batch| {
             batch.map_err(|error| super::datafusion_handoff_setup_error("profile_test", error))
         }));
-        let mut success = super::wrap_stream_with_delta_read_tracking(
+        let mut success = super::wrap_stream_with_query_execution_tracking(
             inner,
             Vec::new(),
             None,
@@ -1267,14 +1263,14 @@ mod tests {
             },
         )]));
         let mut error =
-            super::DeltaProviderScanTerminalStream::new(inner, Vec::new(), None, Some(consumer));
+            super::QueryExecutionTerminalStream::new(inner, Vec::new(), None, Some(consumer));
         assert!(error.next().await.is_some_and(|batch| batch.is_err()));
         drop(error);
 
         let (consumer, cancelled_result) = register(QueryExecutionScope::WriteAllCacheAlias, None);
         let inner: crate::MssqlOutputBatchStream = Box::pin(futures_util::stream::pending());
         let cancelled =
-            super::DeltaProviderScanTerminalStream::new(inner, Vec::new(), None, Some(consumer));
+            super::QueryExecutionTerminalStream::new(inner, Vec::new(), None, Some(consumer));
         drop(cancelled);
 
         let success_profile = success_result.profile().ok_or("expected success profile")?;
@@ -1335,7 +1331,7 @@ mod tests {
         let stream =
             crate::datafusion_query_output_stream(failing_plan, session.context.task_ctx());
         assert!(stream.is_err());
-        super::finalize_provider_scan_execution(
+        super::finalize_tracked_query_execution(
             &handles,
             Some(&retained),
             Some(consumer),

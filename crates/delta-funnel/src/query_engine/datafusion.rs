@@ -571,8 +571,14 @@ mod tests {
     #[test]
     fn query_output_stream_effective_root_matches_datafusion_setup_errors()
     -> Result<(), Box<dyn Error>> {
-        let expected = setup_error_from_datafusion()?;
-        let actual = setup_error_from_delta_funnel()?;
+        let expected = setup_error_message(execute_stream(
+            Arc::new(ErrorExec::new()),
+            Arc::new(TaskContext::default()),
+        ))?;
+        let actual = setup_error_message(datafusion_query_output_stream_with_effective_root(
+            Arc::new(ErrorExec::new()),
+            Arc::new(TaskContext::default()),
+        ))?;
 
         assert_eq!(actual, expected);
         Ok(())
@@ -602,8 +608,8 @@ mod tests {
     #[tokio::test]
     async fn query_output_stream_effective_root_preserves_backpressure_and_wakes()
     -> Result<(), Box<dyn Error>> {
-        let mut expected = exercise_backpressure_and_wakes(false).await?;
-        let mut actual = exercise_backpressure_and_wakes(true).await?;
+        let mut expected = exercise_backpressure_and_wakes(ExecutionPath::DataFusion).await?;
+        let mut actual = exercise_backpressure_and_wakes(ExecutionPath::DeltaFunnel).await?;
 
         expected.sort_unstable();
         actual.sort_unstable();
@@ -614,8 +620,8 @@ mod tests {
     #[tokio::test]
     async fn query_output_stream_effective_root_matches_datafusion_cancellation()
     -> Result<(), Box<dyn Error>> {
-        assert_cancellation_releases_plan(false).await?;
-        assert_cancellation_releases_plan(true).await?;
+        assert_cancellation_releases_plan(ExecutionPath::DataFusion).await?;
+        assert_cancellation_releases_plan(ExecutionPath::DeltaFunnel).await?;
         Ok(())
     }
 
@@ -700,19 +706,11 @@ mod tests {
         Ok(batches)
     }
 
-    fn setup_error_from_datafusion() -> Result<String, Box<dyn Error>> {
-        match execute_stream(Arc::new(ErrorExec::new()), Arc::new(TaskContext::default())) {
-            Ok(_) => Err("expected DataFusion stream setup error".into()),
-            Err(error) => Ok(error.to_string()),
-        }
-    }
-
-    fn setup_error_from_delta_funnel() -> Result<String, Box<dyn Error>> {
-        match datafusion_query_output_stream_with_effective_root(
-            Arc::new(ErrorExec::new()),
-            Arc::new(TaskContext::default()),
-        ) {
-            Ok(_) => Err("expected Delta Funnel stream setup error".into()),
+    fn setup_error_message<T>(
+        result: Result<T, DataFusionError>,
+    ) -> Result<String, Box<dyn Error>> {
+        match result {
+            Ok(_) => Err("expected stream setup error".into()),
             Err(error) => Ok(error.to_string()),
         }
     }
@@ -743,8 +741,13 @@ mod tests {
         Err("expected stream error".into())
     }
 
+    enum ExecutionPath {
+        DataFusion,
+        DeltaFunnel,
+    }
+
     async fn exercise_backpressure_and_wakes(
-        delta_funnel: bool,
+        path: ExecutionPath,
     ) -> Result<Vec<i32>, Box<dyn Error>> {
         let schema = schema();
         let partitions = (0..2)
@@ -760,14 +763,17 @@ mod tests {
                 .with_finish_barrier(),
         );
         let execution_plan: Arc<dyn ExecutionPlan> = plan.clone();
-        let stream = if delta_funnel {
-            let execution = datafusion_query_output_stream_with_effective_root(
-                execution_plan,
-                Arc::new(TaskContext::default()),
-            )?;
-            execution.stream
-        } else {
-            execute_stream(execution_plan, Arc::new(TaskContext::default()))?
+        let stream = match path {
+            ExecutionPath::DataFusion => {
+                execute_stream(execution_plan, Arc::new(TaskContext::default()))?
+            }
+            ExecutionPath::DeltaFunnel => {
+                datafusion_query_output_stream_with_effective_root(
+                    execution_plan,
+                    Arc::new(TaskContext::default()),
+                )?
+                .stream
+            }
         };
 
         tokio::time::timeout(Duration::from_secs(5), plan.wait()).await?;
@@ -789,21 +795,22 @@ mod tests {
         Ok(values)
     }
 
-    async fn assert_cancellation_releases_plan(delta_funnel: bool) -> Result<(), Box<dyn Error>> {
+    async fn assert_cancellation_releases_plan(path: ExecutionPath) -> Result<(), Box<dyn Error>> {
         let plan = Arc::new(BlockingExec::new(schema(), 2));
         let refs = plan.refs();
         let execution_plan: Arc<dyn ExecutionPlan> = plan;
-        let (mut stream, effective_profile_root) = if delta_funnel {
-            let execution = datafusion_query_output_stream_with_effective_root(
-                execution_plan,
-                Arc::new(TaskContext::default()),
-            )?;
-            (execution.stream, Some(execution.effective_profile_root))
-        } else {
-            (
+        let (mut stream, effective_profile_root) = match path {
+            ExecutionPath::DataFusion => (
                 execute_stream(execution_plan, Arc::new(TaskContext::default()))?,
                 None,
-            )
+            ),
+            ExecutionPath::DeltaFunnel => {
+                let execution = datafusion_query_output_stream_with_effective_root(
+                    execution_plan,
+                    Arc::new(TaskContext::default()),
+                )?;
+                (execution.stream, Some(execution.effective_profile_root))
+            }
         };
         let mut next = stream.next().boxed();
 
