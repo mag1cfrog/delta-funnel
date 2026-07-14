@@ -314,6 +314,11 @@ struct FailingScanProvider {
     scans: Arc<AtomicUsize>,
 }
 
+#[derive(Debug)]
+struct StreamSetupFailingProvider {
+    child: Arc<dyn TableProvider>,
+}
+
 type CountedProvider = (Arc<dyn TableProvider>, Arc<AtomicUsize>);
 
 #[async_trait]
@@ -370,6 +375,32 @@ impl TableProvider for FailingScanProvider {
     }
 }
 
+#[async_trait]
+impl TableProvider for StreamSetupFailingProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.child.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.child.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let child = self.child.scan(state, projection, filters, limit).await?;
+        Ok(Arc::new(StreamSetupFailingPlan::new(child)))
+    }
+}
+
 pub(super) fn scan_counting_marker_region_provider(
     marker: &str,
 ) -> Result<CountedProvider, Box<dyn std::error::Error>> {
@@ -405,4 +436,11 @@ pub(super) fn failing_scan_marker_region_provider() -> CountedProvider {
     };
 
     (Arc::new(provider), scans)
+}
+
+pub(super) fn stream_setup_failing_marker_region_provider()
+-> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error>> {
+    Ok(Arc::new(StreamSetupFailingProvider {
+        child: marker_region_provider("setup-failure")?,
+    }))
 }

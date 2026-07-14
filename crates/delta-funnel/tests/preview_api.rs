@@ -2,7 +2,7 @@
 
 use delta_funnel::{
     DeltaFunnelRuntime, DeltaFunnelSession, ExecutionProfileMode, PhaseTimingReport,
-    PreviewOptions, QueryExecutionProfile, SessionOptions, TablePreview,
+    PreviewFailureContext, PreviewOptions, QueryExecutionProfile, SessionOptions, TablePreview,
     progress::ProgressReporter,
 };
 
@@ -16,6 +16,12 @@ fn preview_options_and_result_accessors_are_exported_from_the_crate_root() {
     let _: for<'a> fn(&'a TablePreview) -> &'a [PhaseTimingReport] = TablePreview::phase_timings;
     let _: for<'a> fn(&'a TablePreview) -> Option<&'a QueryExecutionProfile> =
         TablePreview::execution_profile;
+    let _: for<'a> fn(&'a PreviewFailureContext) -> &'a str = PreviewFailureContext::failed_phase;
+    let _: for<'a> fn(&'a PreviewFailureContext) -> &'a [PhaseTimingReport] =
+        PreviewFailureContext::phase_timings;
+    let _: for<'a> fn(&'a PreviewFailureContext) -> Option<&'a QueryExecutionProfile> =
+        PreviewFailureContext::execution_profile;
+    let _: fn(&PreviewFailureContext) -> serde_json::Value = PreviewFailureContext::to_json_value;
 
     assert_eq!(options.limit(), 20);
     assert_eq!(

@@ -97,6 +97,19 @@ pub enum DeltaFunnelError {
         message: String,
     },
 
+    /// A bounded preview failed after its operation lifecycle began.
+    #[snafu(display(
+        "preview failed during {}: {}",
+        context.failed_phase(),
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    PreviewFailed {
+        /// Structured, redacted preview failure context.
+        context: Box<crate::PreviewFailureContext>,
+        /// Original Delta Funnel failure with its source chain preserved.
+        source: Box<DeltaFunnelError>,
+    },
+
     /// A Delta source name is not valid for registration.
     #[snafu(display(
         "invalid Delta source name `{}`: {reason}",
@@ -587,6 +600,30 @@ mod tests {
             error.to_string(),
             "configuration error: max_concurrent_file_reads_per_scan must be greater than zero"
         );
+    }
+
+    #[test]
+    fn preview_failure_sanitizes_display_and_preserves_source() {
+        let context = crate::PreviewFailureContext::new(
+            "preview_dataframe_planning".to_owned(),
+            vec![crate::PhaseTimingReport::failed(
+                "preview_dataframe_planning",
+                std::time::Duration::ZERO,
+            )],
+            None,
+        );
+        let error = DeltaFunnelError::PreviewFailed {
+            context: Box::new(context),
+            source: Box::new(DeltaFunnelError::Config {
+                message: "planning failed\nfor test".to_owned(),
+            }),
+        };
+
+        let display = error.to_string();
+
+        assert!(!display.contains('\n'));
+        assert!(display.contains(r"planning failed\nfor test"));
+        assert!(Error::source(&error).is_some());
     }
 
     #[test]

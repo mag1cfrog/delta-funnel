@@ -24,7 +24,7 @@ use crate::{DeltaFunnelError, datafusion_session_context};
 pub use crate::report::delta::SourceUsageStatus;
 pub use handles::{
     LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, PlannedMssqlOutput,
-    PreviewOptions, RunMode, TablePreview,
+    PreviewFailureContext, PreviewOptions, RunMode, TablePreview,
 };
 pub use options::SessionOptions;
 pub use registry::{RegisteredDerivedTable, RegisteredSessionSource};

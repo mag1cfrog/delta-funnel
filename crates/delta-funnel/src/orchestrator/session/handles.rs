@@ -14,7 +14,7 @@ pub(crate) const PREVIEW_FORMAT_TEXT_PHASE: &str = "preview_format_text";
 pub(crate) const PREVIEW_FORMAT_HTML_PHASE: &str = "preview_format_html";
 pub(crate) const PREVIEW_TOTAL_PHASE: &str = "preview_total";
 
-const PREVIEW_PHASE_NAMES: [&str; 7] = [
+pub(crate) const PREVIEW_PHASE_NAMES: [&str; 7] = [
     PREVIEW_DATAFRAME_PLANNING_PHASE,
     PREVIEW_PHYSICAL_PLANNING_PHASE,
     PREVIEW_STREAM_SETUP_PHASE,
@@ -143,6 +143,46 @@ impl PreviewOptions {
     #[must_use]
     pub const fn execution_profile_mode(&self) -> ExecutionProfileMode {
         self.execution_profile_mode
+    }
+}
+
+/// Structured diagnostics retained when a bounded preview fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewFailureContext {
+    failed_phase: String,
+    phase_timings: Vec<PhaseTimingReport>,
+    execution_profile: Option<QueryExecutionProfile>,
+}
+
+impl PreviewFailureContext {
+    pub(crate) fn new(
+        failed_phase: String,
+        phase_timings: Vec<PhaseTimingReport>,
+        execution_profile: Option<QueryExecutionProfile>,
+    ) -> Self {
+        Self {
+            failed_phase,
+            phase_timings,
+            execution_profile,
+        }
+    }
+
+    /// Returns the stable name of the phase that failed.
+    #[must_use]
+    pub fn failed_phase(&self) -> &str {
+        &self.failed_phase
+    }
+
+    /// Returns the complete ordered preview phase timings.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
+    }
+
+    /// Returns the terminal execution profile when query execution started.
+    #[must_use]
+    pub const fn execution_profile(&self) -> Option<&QueryExecutionProfile> {
+        self.execution_profile.as_ref()
     }
 }
 
