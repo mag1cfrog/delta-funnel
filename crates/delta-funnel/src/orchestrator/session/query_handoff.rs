@@ -7,6 +7,7 @@ use std::{
 use datafusion::{
     arrow::{
         datatypes::{DataType, SchemaRef},
+        error::ArrowError,
         record_batch::RecordBatch,
         util::{
             display::{ArrayFormatter, FormatOptions},
@@ -19,23 +20,33 @@ use datafusion::{
 use futures_util::{Stream, StreamExt, TryStreamExt};
 
 use crate::{
-    DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
-    datafusion_query_output_stream,
+    DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
+    PhaseTimingReport, PreviewFailureContext, QueryExecutionProfile, QueryExecutionScope,
+    ReportReasonCode, datafusion_query_output_stream,
     observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
-        DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
+        DFQueryExecution, DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
+        datafusion_query_output_stream_with_effective_root,
         execution_profile::{
-            QueryExecutionProfileConsumer, delta_provider_read_stats_snapshot_set,
+            QueryExecutionProfileConsumer, QueryExecutionProfileResult,
+            delta_provider_read_stats_snapshot_set,
         },
         snapshot_delta_provider_read_stats,
     },
+    report::PhaseTimer,
+    usize_to_u64_saturating,
 };
 
 use super::{
-    DeltaFunnelSession, LazyTable, LazyTableKind, PendingDerivedTable, RegisteredDerivedTable,
-    RegisteredSessionSource, TablePreview,
+    DeltaFunnelSession, LazyTable, LazyTableKind, PendingDerivedTable, PreviewOptions,
+    RegisteredDerivedTable, RegisteredSessionSource, TablePreview,
     errors::{datafusion_handoff_setup_error, unknown_lazy_table_error},
+    handles::{
+        PREVIEW_DATAFRAME_PLANNING_PHASE, PREVIEW_EXECUTE_COLLECT_PHASE, PREVIEW_FORMAT_HTML_PHASE,
+        PREVIEW_FORMAT_TEXT_PHASE, PREVIEW_PHASE_NAMES, PREVIEW_PHYSICAL_PLANNING_PHASE,
+        PREVIEW_STREAM_SETUP_PHASE, PREVIEW_TOTAL_PHASE,
+    },
 };
 
 pub(super) type SharedProviderStatsSnapshots =
@@ -499,6 +510,88 @@ fn batch_stream_for_physical_plan(
     ))
 }
 
+struct PreviewTimingTracker {
+    phase_timings: Vec<PhaseTimingReport>,
+    total_timer: PhaseTimer,
+}
+
+impl PreviewTimingTracker {
+    fn start() -> Self {
+        Self {
+            phase_timings: Vec::with_capacity(PREVIEW_PHASE_NAMES.len()),
+            total_timer: PhaseTimer::start(PREVIEW_TOTAL_PHASE),
+        }
+    }
+
+    fn record_completed(&mut self, timer: PhaseTimer) {
+        self.phase_timings.push(timer.completed());
+    }
+
+    fn completed(mut self) -> Vec<PhaseTimingReport> {
+        self.phase_timings.push(self.total_timer.completed());
+        self.phase_timings
+    }
+
+    fn failed(
+        mut self,
+        timer: PhaseTimer,
+        execution_profile: Option<QueryExecutionProfile>,
+        source: DeltaFunnelError,
+    ) -> DeltaFunnelError {
+        let failed_timing = timer.failed();
+        let failed_phase = failed_timing.phase_name().to_owned();
+        self.phase_timings.push(failed_timing);
+        let next_phase_index = self.phase_timings.len();
+        let non_total_phases = &PREVIEW_PHASE_NAMES[..PREVIEW_PHASE_NAMES.len() - 1];
+        debug_assert!(next_phase_index <= non_total_phases.len());
+        let remaining_non_total_phases =
+            non_total_phases.get(next_phase_index..).unwrap_or_default();
+        self.phase_timings
+            .extend(remaining_non_total_phases.iter().map(|phase_name| {
+                PhaseTimingReport::not_started(*phase_name, ReportReasonCode::PriorFailure)
+            }));
+        self.phase_timings.push(self.total_timer.failed());
+
+        DeltaFunnelError::PreviewFailed {
+            context: Box::new(PreviewFailureContext::new(
+                failed_phase,
+                self.phase_timings,
+                execution_profile,
+            )),
+            source: Box::new(source),
+        }
+    }
+}
+
+fn register_preview_execution_profile(
+    root: Arc<dyn ExecutionPlan>,
+    options: PreviewOptions,
+) -> (
+    Option<QueryExecutionProfileConsumer>,
+    Option<QueryExecutionProfileResult>,
+) {
+    match options.execution_profile_mode() {
+        ExecutionProfileMode::Disabled => (None, None),
+        ExecutionProfileMode::Detailed => {
+            let (consumer, result) = QueryExecutionProfileConsumer::register(
+                root,
+                QueryExecutionScope::Preview,
+                Some(usize_to_u64_saturating(options.limit())),
+            );
+            (Some(consumer), Some(result))
+        }
+    }
+}
+
+fn clone_terminal_execution_profile(
+    result: Option<QueryExecutionProfileResult>,
+) -> Option<QueryExecutionProfile> {
+    result
+        .as_ref()
+        .and_then(QueryExecutionProfileResult::profile)
+        .cloned()
+}
+
 impl DeltaFunnelSession {
     /// Builds a batch stream and optionally reports Delta file progress while
     /// that stream is consumed.
@@ -534,7 +627,22 @@ impl DeltaFunnelSession {
         table: &LazyTable,
         limit: usize,
     ) -> Result<TablePreview, DeltaFunnelError> {
-        self.build_preview(table, limit, None).await
+        self.preview_table_with_options(table, PreviewOptions::new(limit))
+            .await
+    }
+
+    /// Executes a bounded preview with explicit profiling options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lazy table is unknown, DataFusion cannot apply
+    /// the limit, or preview execution or formatting fails.
+    pub async fn preview_table_with_options(
+        &self,
+        table: &LazyTable,
+        options: PreviewOptions,
+    ) -> Result<TablePreview, DeltaFunnelError> {
+        self.build_preview(table, options, None).await
     }
 
     /// Executes the same bounded preview while reporting its live lifecycle.
@@ -544,8 +652,19 @@ impl DeltaFunnelSession {
         limit: usize,
         reporter: ProgressReporter,
     ) -> Result<TablePreview, DeltaFunnelError> {
+        self.preview_table_with_options_and_progress(table, PreviewOptions::new(limit), reporter)
+            .await
+    }
+
+    /// Executes the same option-bearing preview while reporting its lifecycle.
+    pub(crate) async fn preview_table_with_options_and_progress(
+        &self,
+        table: &LazyTable,
+        options: PreviewOptions,
+        reporter: ProgressReporter,
+    ) -> Result<TablePreview, DeltaFunnelError> {
         reporter.emit(&ProgressEvent::started(ProgressOperation::PreviewTable));
-        let result = self.build_preview(table, limit, Some(&reporter)).await;
+        let result = self.build_preview(table, options, Some(&reporter)).await;
         reporter.emit(&if result.is_ok() {
             ProgressEvent::completed()
         } else {
@@ -554,38 +673,74 @@ impl DeltaFunnelSession {
         result
     }
 
-    /// Runs the existing preview steps and optionally announces each boundary.
+    /// Runs preview phases and optionally announces each live boundary.
+    ///
+    /// This future owns phase timing and rendering. After stream setup, the
+    /// terminal stream owns profile and provider finalization on EOF, error, or
+    /// cancellation.
     async fn build_preview(
         &self,
         table: &LazyTable,
-        limit: usize,
+        options: PreviewOptions,
         reporter: Option<&ProgressReporter>,
     ) -> Result<TablePreview, DeltaFunnelError> {
+        let mut timings = PreviewTimingTracker::start();
+
         emit_preview_phase(reporter, ProgressPhase::PreparingPreview);
-        let dataframe = self.dataframe_for_lazy_table(table).await?;
+        let dataframe_timer = PhaseTimer::start(PREVIEW_DATAFRAME_PLANNING_PHASE);
+        let dataframe = match self.dataframe_for_lazy_table(table).await {
+            Ok(dataframe) => dataframe,
+            Err(source) => return Err(timings.failed(dataframe_timer, None, source)),
+        };
         let schema = Arc::new(dataframe.schema().as_arrow().clone());
-        let dataframe = dataframe
-            .limit(0, Some(limit))
-            .map_err(|error| datafusion_handoff_setup_error("preview_limit", error))?;
+        let dataframe = match dataframe.limit(0, Some(options.limit())) {
+            Ok(dataframe) => dataframe,
+            Err(error) => {
+                let source = datafusion_handoff_setup_error("preview_limit", error);
+                return Err(timings.failed(dataframe_timer, None, source));
+            }
+        };
         let task_context = Arc::new(dataframe.task_ctx());
-        let physical_plan = dataframe
-            .create_physical_plan()
-            .await
-            .map_err(|error| datafusion_handoff_setup_error("preview_collect", error))?;
+        timings.record_completed(dataframe_timer);
+
+        let physical_plan_timer = PhaseTimer::start(PREVIEW_PHYSICAL_PLANNING_PHASE);
+        let physical_plan = match dataframe.create_physical_plan().await {
+            Ok(physical_plan) => physical_plan,
+            Err(error) => {
+                let source = datafusion_handoff_setup_error("preview_collect", error);
+                return Err(timings.failed(physical_plan_timer, None, source));
+            }
+        };
+        timings.record_completed(physical_plan_timer);
+
+        let stream_setup_timer = PhaseTimer::start(PREVIEW_STREAM_SETUP_PHASE);
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
         emit_preview_phase(reporter, ProgressPhase::CollectingPreview);
-        let stream = match datafusion_query_output_stream(physical_plan, task_context) {
-            Ok(stream) => stream,
+        let DFQueryExecution {
+            stream,
+            effective_profile_root,
+        } = match datafusion_query_output_stream_with_effective_root(
+            Arc::clone(&physical_plan),
+            task_context,
+        ) {
+            Ok(execution) => execution,
             Err(error) => {
+                let (profile_consumer, profile_result) =
+                    register_preview_execution_profile(physical_plan, options);
                 finalize_tracked_query_execution(
                     &read_stats_handles,
                     None,
-                    None,
+                    profile_consumer,
                     DeltaProviderScanOutcome::Error,
                 );
-                return Err(datafusion_handoff_setup_error("preview_collect", error));
+                let execution_profile = clone_terminal_execution_profile(profile_result);
+                let source = datafusion_handoff_setup_error("preview_collect", error);
+                return Err(timings.failed(stream_setup_timer, execution_profile, source));
             }
         };
+        drop(physical_plan);
+        let (profile_consumer, profile_result) =
+            register_preview_execution_profile(effective_profile_root, options);
         let stream: MssqlOutputBatchStream = Box::pin(stream.map(|batch| {
             batch.map_err(|error| datafusion_handoff_setup_error("preview_collect", error))
         }));
@@ -601,16 +756,30 @@ impl DeltaFunnelSession {
             }
             None => stream,
         };
-        let stream = track_query_execution_completion(stream, read_stats_handles, None, None);
-        let batches = stream.try_collect::<Vec<_>>().await?;
-        emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
-        let text = pretty_format_batches(&batches)
-            .map_err(|error| datafusion_handoff_setup_error("preview_text", error))?
-            .to_string();
-        let html = preview_batches_to_html(&schema, &batches)
-            .map_err(|error| datafusion_handoff_setup_error("preview_html", error))?;
+        let stream =
+            track_query_execution_completion(stream, read_stats_handles, None, profile_consumer);
+        timings.record_completed(stream_setup_timer);
 
-        Ok(TablePreview::new(text, html))
+        let execute_collect_timer = PhaseTimer::start(PREVIEW_EXECUTE_COLLECT_PHASE);
+        let batches = match stream.try_collect::<Vec<_>>().await {
+            Ok(batches) => batches,
+            Err(source) => {
+                let execution_profile = clone_terminal_execution_profile(profile_result);
+                return Err(timings.failed(execute_collect_timer, execution_profile, source));
+            }
+        };
+        timings.record_completed(execute_collect_timer);
+        let execution_profile = clone_terminal_execution_profile(profile_result);
+
+        emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
+        format_preview_result(
+            &schema,
+            &batches,
+            timings,
+            execution_profile,
+            preview_batches_to_text,
+            preview_batches_to_html,
+        )
     }
 
     pub(super) async fn dataframe_for_lazy_table(
@@ -690,10 +859,50 @@ fn emit_preview_phase(reporter: Option<&ProgressReporter>, phase: ProgressPhase)
     }
 }
 
+fn format_preview_result(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    mut timings: PreviewTimingTracker,
+    execution_profile: Option<QueryExecutionProfile>,
+    text_formatter: fn(&[RecordBatch]) -> Result<String, ArrowError>,
+    html_formatter: fn(&SchemaRef, &[RecordBatch]) -> Result<String, ArrowError>,
+) -> Result<TablePreview, DeltaFunnelError> {
+    let format_text_timer = PhaseTimer::start(PREVIEW_FORMAT_TEXT_PHASE);
+    let text = match text_formatter(batches) {
+        Ok(text) => text,
+        Err(error) => {
+            let source = datafusion_handoff_setup_error("preview_text", error);
+            return Err(timings.failed(format_text_timer, execution_profile, source));
+        }
+    };
+    timings.record_completed(format_text_timer);
+
+    let format_html_timer = PhaseTimer::start(PREVIEW_FORMAT_HTML_PHASE);
+    let html = match html_formatter(schema, batches) {
+        Ok(html) => html,
+        Err(error) => {
+            let source = datafusion_handoff_setup_error("preview_html", error);
+            return Err(timings.failed(format_html_timer, execution_profile, source));
+        }
+    };
+    timings.record_completed(format_html_timer);
+
+    Ok(TablePreview::from_execution(
+        text,
+        html,
+        timings.completed(),
+        execution_profile,
+    ))
+}
+
+fn preview_batches_to_text(batches: &[RecordBatch]) -> Result<String, ArrowError> {
+    pretty_format_batches(batches).map(|text| text.to_string())
+}
+
 fn preview_batches_to_html(
     schema: &SchemaRef,
     batches: &[RecordBatch],
-) -> Result<String, datafusion::arrow::error::ArrowError> {
+) -> Result<String, ArrowError> {
     let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
     let column_count = schema.fields().len();
     let mut html = String::new();
@@ -847,12 +1056,14 @@ async fn dataframe_for_lazy_table_from_session_parts(
 mod tests {
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig, QueryExecutionOutcome, QueryExecutionScope,
-        QueryOptions,
+        DeltaFunnelError, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
+        DeltaSourceConfig, ExecutionProfileMode, PhaseStatus, PreviewFailureContext,
+        PreviewOptions, QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope,
+        QueryOptions, ReportReasonCode,
         observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         query_engine::datafusion::execution_profile::QueryExecutionProfileConsumer,
@@ -861,6 +1072,7 @@ mod tests {
     use datafusion::{
         arrow::{
             datatypes::{DataType, Schema},
+            error::ArrowError,
             record_batch::RecordBatch,
         },
         logical_expr::{Volatility, create_udf},
@@ -872,9 +1084,11 @@ mod tests {
     use super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
         test_support::{
-            DeltaLogTable, StreamSetupFailingPlan, collect_stream_marker_values,
-            collect_stream_row_count, failing_scan_marker_region_provider, marker_region_provider,
-            marker_values_from_batches, scan_counting_marker_region_provider,
+            DeltaLogTable, StreamSetupFailingPlan, blocking_marker_provider,
+            collect_stream_marker_values, collect_stream_row_count,
+            failing_scan_marker_region_provider, marker_region_provider,
+            marker_values_from_batches, plan_lifetime_tracking_marker_region_provider,
+            scan_counting_marker_region_provider, stream_setup_failing_marker_region_provider,
         },
     };
 
@@ -891,6 +1105,84 @@ mod tests {
         "parquet_data_file_bytes_received",
         "parquet_data_file_opened_bytes",
     ];
+    const PREVIEW_PHASES: [&str; 7] = [
+        "preview_dataframe_planning",
+        "preview_physical_planning",
+        "preview_stream_setup",
+        "preview_execute_collect",
+        "preview_format_text",
+        "preview_format_html",
+        "preview_total",
+    ];
+
+    fn preview_failure_parts(
+        error: &DeltaFunnelError,
+    ) -> Result<(&PreviewFailureContext, &DeltaFunnelError), Box<dyn std::error::Error>> {
+        match error {
+            DeltaFunnelError::PreviewFailed { context, source } => Ok((context, source)),
+            other => Err(format!("expected PreviewFailed, got {other:?}").into()),
+        }
+    }
+
+    fn assert_preview_failure_context(
+        context: &PreviewFailureContext,
+        failed_phase: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let failed_index = PREVIEW_PHASES
+            .iter()
+            .position(|phase| *phase == failed_phase)
+            .ok_or("unknown preview failure phase")?;
+
+        assert_eq!(context.failed_phase(), failed_phase);
+        assert_eq!(context.phase_timings().len(), PREVIEW_PHASES.len());
+        for (index, timing) in context.phase_timings().iter().enumerate() {
+            assert_eq!(timing.phase_name(), PREVIEW_PHASES[index]);
+            let expected_status = if index < failed_index {
+                PhaseStatus::completed()
+            } else if index == failed_index || index == PREVIEW_PHASES.len() - 1 {
+                PhaseStatus::failed()
+            } else {
+                PhaseStatus::not_started(ReportReasonCode::PriorFailure)
+            };
+            assert_eq!(timing.status(), expected_status);
+            assert_eq!(
+                timing.elapsed_micros().is_some(),
+                !expected_status.is_not_started()
+            );
+        }
+        Ok(())
+    }
+
+    fn preview_timings_before_formatting() -> super::PreviewTimingTracker {
+        let mut timings = super::PreviewTimingTracker::start();
+        for &phase_name in &PREVIEW_PHASES[..4] {
+            timings.record_completed(super::PhaseTimer::start(phase_name));
+        }
+        timings
+    }
+
+    fn successful_preview_profile() -> QueryExecutionProfile {
+        QueryExecutionProfile::preview(QueryExecutionOutcome::Success, 1, Vec::new())
+    }
+
+    fn fail_preview_text(_batches: &[RecordBatch]) -> Result<String, ArrowError> {
+        Err(ArrowError::ComputeError(
+            "text formatting failed".to_owned(),
+        ))
+    }
+
+    fn keep_preview_text(_batches: &[RecordBatch]) -> Result<String, ArrowError> {
+        Ok("preview text".to_owned())
+    }
+
+    fn fail_preview_html(
+        _schema: &datafusion::arrow::datatypes::SchemaRef,
+        _batches: &[RecordBatch],
+    ) -> Result<String, ArrowError> {
+        Err(ArrowError::ComputeError(
+            "HTML formatting failed".to_owned(),
+        ))
+    }
 
     async fn report_tracked_stream(
         session: &DeltaFunnelSession,
@@ -1744,6 +2036,7 @@ mod tests {
         let table = session
             .table_from_sql("select 1 as id union all select 2 as id order by id")
             .await?;
+        let capture = TracingCapture::start();
 
         let preview = session.preview_table(&table, 1).await?;
 
@@ -1758,6 +2051,145 @@ mod tests {
         );
         assert!(preview.html().contains("<td class=\"df-num\">1</td>"));
         assert!(!preview.html().contains("<td class=\"df-num\">2</td>"));
+        assert_eq!(
+            preview
+                .phase_timings()
+                .iter()
+                .map(crate::PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>(),
+            PREVIEW_PHASES
+        );
+        assert!(preview.phase_timings().iter().all(|timing| {
+            timing.status() == PhaseStatus::completed() && timing.elapsed_micros().is_some()
+        }));
+        assert_eq!(preview.execution_profile(), None);
+        assert!(execution_profile_events(capture.captured()).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_unknown_table_returns_dataframe_failure_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let result = session
+            .preview_table_with_options(
+                &LazyTable::placeholder(42, LazyTableKind::DerivedSql),
+                PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => return Err("expected preview failure".into()),
+            Err(error) => error,
+        };
+        let (context, source) = preview_failure_parts(&error)?;
+
+        assert_preview_failure_context(context, "preview_dataframe_planning")?;
+        assert_eq!(context.execution_profile(), None);
+        assert!(matches!(
+            source,
+            DeltaFunnelError::MssqlWorkflowPlanning { .. }
+        ));
+        assert!(std::error::Error::source(&error).is_some());
+        let context_json = context.to_json_value();
+        assert_eq!(context_json["failed_phase"], "preview_dataframe_planning");
+        assert_eq!(context_json.as_object().map(serde_json::Map::len), Some(3));
+        assert!(context_json.get("source").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn preview_text_failure_retains_the_completed_execution_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::empty());
+        let expected_profile = successful_preview_profile();
+
+        let result = super::format_preview_result(
+            &schema,
+            &[],
+            preview_timings_before_formatting(),
+            Some(expected_profile.clone()),
+            fail_preview_text,
+            super::preview_batches_to_html,
+        );
+        let error = match result {
+            Ok(_) => return Err("expected text formatting failure".into()),
+            Err(error) => error,
+        };
+        let (context, _) = preview_failure_parts(&error)?;
+
+        assert_preview_failure_context(context, "preview_format_text")?;
+        assert_eq!(context.execution_profile(), Some(&expected_profile));
+        assert_eq!(expected_profile.outcome(), QueryExecutionOutcome::Success);
+        assert!(!expected_profile.partial());
+        Ok(())
+    }
+
+    #[test]
+    fn preview_html_failure_retains_the_completed_execution_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::empty());
+        let expected_profile = successful_preview_profile();
+
+        let result = super::format_preview_result(
+            &schema,
+            &[],
+            preview_timings_before_formatting(),
+            Some(expected_profile.clone()),
+            keep_preview_text,
+            fail_preview_html,
+        );
+        let error = match result {
+            Ok(_) => return Err("expected HTML formatting failure".into()),
+            Err(error) => error,
+        };
+        let (context, _) = preview_failure_parts(&error)?;
+
+        assert_preview_failure_context(context, "preview_format_html")?;
+        assert_eq!(context.execution_profile(), Some(&expected_profile));
+        assert_eq!(expected_profile.outcome(), QueryExecutionOutcome::Success);
+        assert!(!expected_profile.partial());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_preview_attaches_one_success_profile_with_the_exact_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let capture = TracingCapture::start();
+
+        for limit in [0, 1] {
+            let preview = session
+                .preview_table_with_options(
+                    &table,
+                    PreviewOptions::new(limit)
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                )
+                .await?;
+            let profile = preview
+                .execution_profile()
+                .ok_or("expected detailed preview profile")?;
+
+            assert_eq!(profile.scope(), QueryExecutionScope::Preview);
+            assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+            assert!(!profile.partial());
+            assert_eq!(
+                profile.delta_funnel_row_limit(),
+                Some(crate::usize_to_u64_saturating(limit))
+            );
+            assert!(!profile.operators().is_empty());
+            assert!(
+                preview
+                    .phase_timings()
+                    .iter()
+                    .all(|timing| timing.status() == PhaseStatus::completed())
+            );
+        }
+
+        assert_eq!(execution_profile_events(capture.captured()).len(), 2);
         Ok(())
     }
 
@@ -1789,6 +2221,142 @@ mod tests {
             summaries[0].fields.get("outcome").map(String::as_str),
             Some("success")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_delta_preview_attaches_the_terminal_provider_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_two_files("detailed-preview-profile")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let capture = TracingCapture::start();
+
+        let preview = session
+            .preview_table_with_options(
+                &source,
+                PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed),
+            )
+            .await?;
+        let profile = preview
+            .execution_profile()
+            .ok_or("expected detailed Delta preview profile")?;
+        let snapshot = profile
+            .operators()
+            .iter()
+            .find_map(crate::QueryExecutionOperatorProfile::delta_provider_read_stats)
+            .ok_or("expected terminal provider snapshot")?;
+
+        assert_eq!(snapshot.source_name, "orders");
+        assert!(snapshot.files_planned > 0);
+        assert!(snapshot.rows_produced > 0);
+        let provider_events = provider_io_events(capture.captured());
+        assert_eq!(provider_events.len(), 1);
+        assert_provider_io_event_matches_snapshot(&provider_events[0], snapshot, "success");
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_preview_progress_preserves_profile_and_timing_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_two_files("detailed-progress-parity")?;
+        let provider_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new()
+                .with_query_options(QueryOptions {
+                    target_partitions: Some(1),
+                    output_batch_size: Some(1),
+                })
+                .with_provider_scan_options(provider_options),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let options =
+            PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed);
+        let capture = TracingCapture::start();
+
+        let unreported = session.preview_table_with_options(&source, options).await?;
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+        assert_eq!(provider_io_events(capture.captured()).len(), 1);
+        let (reporter, progress_events) = recording_preview_progress();
+        let reported = session
+            .preview_table_with_options_and_progress(&source, options, reporter)
+            .await?;
+
+        assert_eq!(reported.text(), unreported.text());
+        assert_eq!(reported.html(), unreported.html());
+        assert_eq!(
+            reported.phase_timings().len(),
+            unreported.phase_timings().len()
+        );
+        for (reported, unreported) in reported
+            .phase_timings()
+            .iter()
+            .zip(unreported.phase_timings())
+        {
+            assert_eq!(reported.phase_name(), unreported.phase_name());
+            assert_eq!(reported.status(), unreported.status());
+            assert_eq!(
+                reported.elapsed_micros().is_some(),
+                unreported.elapsed_micros().is_some()
+            );
+        }
+
+        let reported_profile = reported
+            .execution_profile()
+            .ok_or("expected reported detailed preview profile")?;
+        let unreported_profile = unreported
+            .execution_profile()
+            .ok_or("expected unreported detailed preview profile")?;
+        assert_eq!(reported_profile.scope(), unreported_profile.scope());
+        assert_eq!(reported_profile.outcome(), unreported_profile.outcome());
+        assert_eq!(reported_profile.partial(), unreported_profile.partial());
+        assert_eq!(
+            reported_profile.delta_funnel_row_limit(),
+            unreported_profile.delta_funnel_row_limit()
+        );
+        assert_eq!(
+            reported_profile.operators().len(),
+            unreported_profile.operators().len()
+        );
+        for (reported, unreported) in reported_profile
+            .operators()
+            .iter()
+            .zip(unreported_profile.operators())
+        {
+            assert_eq!(reported.node_id(), unreported.node_id());
+            assert_eq!(reported.parent_node_id(), unreported.parent_node_id());
+            assert_eq!(reported.operator_name(), unreported.operator_name());
+            assert_eq!(
+                reported.output_partition_count(),
+                unreported.output_partition_count()
+            );
+            assert_eq!(reported.metrics_available(), unreported.metrics_available());
+            assert_eq!(
+                reported.delta_provider_read_stats(),
+                unreported.delta_provider_read_stats()
+            );
+        }
+
+        assert_eq!(execution_profile_events(capture.captured()).len(), 2);
+        assert_eq!(provider_io_events(capture.captured()).len(), 2);
+        let progress_events = progress_events
+            .lock()
+            .map_err(|_| "preview event lock poisoned")?;
+        assert!(progress_events.iter().any(|event| {
+            event.0 == ProgressEventKind::PhaseChanged
+                && event.2 == Some(ProgressPhase::FormattingPreview)
+        }));
         Ok(())
     }
 
@@ -1872,6 +2440,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_releases_the_execution_plan_before_formatting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for mode in [
+            ExecutionProfileMode::Disabled,
+            ExecutionProfileMode::Detailed,
+        ] {
+            let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+            let (provider, last_plan_marker) =
+                plan_lifetime_tracking_marker_region_provider("observed")?;
+            session
+                .context()
+                .register_table("preview_source", provider)?;
+            let table = session
+                .table_from_sql("select marker from preview_source")
+                .await?;
+            let formatting_observed = Arc::new(AtomicBool::new(false));
+            let plan_released = Arc::new(AtomicBool::new(false));
+            let callback_formatting_observed = Arc::clone(&formatting_observed);
+            let callback_plan_released = Arc::clone(&plan_released);
+            let reporter = ProgressReporter::new(move |event| {
+                if event.phase() != Some(ProgressPhase::FormattingPreview) {
+                    return;
+                }
+                callback_formatting_observed.store(true, Ordering::SeqCst);
+                let released = match last_plan_marker.lock() {
+                    Ok(last_plan_marker) => last_plan_marker
+                        .as_ref()
+                        .is_some_and(|marker| marker.upgrade().is_none()),
+                    Err(poisoned) => poisoned
+                        .into_inner()
+                        .as_ref()
+                        .is_some_and(|marker| marker.upgrade().is_none()),
+                };
+                callback_plan_released.store(released, Ordering::SeqCst);
+            });
+
+            let preview = session
+                .preview_table_with_options_and_progress(
+                    &table,
+                    PreviewOptions::new(1).with_execution_profile_mode(mode),
+                    reporter,
+                )
+                .await?;
+
+            assert!(preview.text().contains("observed"));
+            assert!(formatting_observed.load(Ordering::SeqCst));
+            assert!(
+                plan_released.load(Ordering::SeqCst),
+                "{mode:?} preview retained its execution plan during formatting"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_detailed_preview_after_stream_setup_emits_one_cancelled_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (provider, execution_refs) = blocking_marker_provider();
+        session
+            .context()
+            .register_table("blocking_source", provider)?;
+        let table = session
+            .table_from_sql("select marker from blocking_source")
+            .await?;
+        let capture = TracingCapture::start();
+
+        {
+            let preview = session.preview_table_with_options(
+                &table,
+                PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed),
+            );
+            tokio::pin!(preview);
+            let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if execution_refs.strong_count() > 1 {
+                        return None;
+                    }
+                    tokio::select! {
+                        result = &mut preview => return Some(result),
+                        () = tokio::task::yield_now() => {}
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "preview stream setup timed out")?;
+            if let Some(result) = completed {
+                return Err(format!("preview completed before cancellation: {result:?}").into());
+            }
+        }
+
+        let events = execution_profile_events(capture.captured());
+        assert_eq!(events.len(), 1);
+        for (field, value) in [
+            ("scope", "preview"),
+            ("outcome", "cancelled"),
+            ("partial", "true"),
+            ("delta_funnel_row_limit", "1"),
+        ] {
+            assert_eq!(events[0].fields.get(field).map(String::as_str), Some(value));
+        }
+        assert!(provider_io_events(capture.captured()).is_empty());
+        tokio::task::yield_now().await;
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn preview_progress_keeps_physical_planning_in_the_preparing_phase_on_failure()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -1885,10 +2561,20 @@ mod tests {
         let (reporter, events) = recording_preview_progress();
 
         let result = session
-            .preview_table_with_progress(&table, 1, reporter)
+            .preview_table_with_options_and_progress(
+                &table,
+                PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                reporter,
+            )
             .await;
+        let error = match result {
+            Ok(_) => return Err("expected physical planning failure".into()),
+            Err(error) => error,
+        };
+        let (context, _) = preview_failure_parts(&error)?;
 
-        assert!(result.is_err());
+        assert_preview_failure_context(context, "preview_physical_planning")?;
+        assert_eq!(context.execution_profile(), None);
         assert_eq!(scans.load(Ordering::SeqCst), 1);
         let events = events.lock().map_err(|_| "preview event lock poisoned")?;
         assert_eq!(
@@ -1911,6 +2597,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detailed_preview_stream_setup_failure_attaches_an_error_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.context().register_table(
+            "setup_failure_source",
+            stream_setup_failing_marker_region_provider()?,
+        )?;
+        let table = session
+            .table_from_sql("select marker from setup_failure_source")
+            .await?;
+        let capture = TracingCapture::start();
+
+        let result = session
+            .preview_table_with_options(
+                &table,
+                PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => return Err("expected stream setup failure".into()),
+            Err(error) => error,
+        };
+        let (context, _) = preview_failure_parts(&error)?;
+        let profile = context
+            .execution_profile()
+            .ok_or("expected stream setup failure profile")?;
+
+        assert_preview_failure_context(context, "preview_stream_setup")?;
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Error);
+        assert!(profile.partial());
+        assert!(
+            profile
+                .operators()
+                .iter()
+                .any(|operator| operator.operator_name() == "StreamSetupFailingPlan")
+        );
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+        assert!(provider_io_events(capture.captured()).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn preview_progress_stops_before_formatting_when_execution_fails()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -1918,12 +2646,28 @@ mod tests {
             .table_from_sql("select cast(1 as bigint) / cast(0 as bigint) as value")
             .await?;
         let (reporter, events) = recording_preview_progress();
+        let capture = TracingCapture::start();
 
         let result = session
-            .preview_table_with_progress(&table, 1, reporter)
+            .preview_table_with_options_and_progress(
+                &table,
+                PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                reporter,
+            )
             .await;
+        let error = match result {
+            Ok(_) => return Err("expected preview execution failure".into()),
+            Err(error) => error,
+        };
+        let (context, _) = preview_failure_parts(&error)?;
+        let profile = context
+            .execution_profile()
+            .ok_or("expected execution failure profile")?;
 
-        assert!(result.is_err());
+        assert_preview_failure_context(context, "preview_execute_collect")?;
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Error);
+        assert!(profile.partial());
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
         let events = events.lock().map_err(|_| "preview event lock poisoned")?;
         assert_eq!(
             events.as_slice(),

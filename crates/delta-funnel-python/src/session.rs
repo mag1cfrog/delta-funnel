@@ -284,17 +284,19 @@ impl PySession {
         &self,
         py: Python<'_>,
         table: &delta_funnel::LazyTable,
-        limit: usize,
+        options: delta_funnel::PreviewOptions,
         progress: Option<&PythonProgress>,
     ) -> PyResult<delta_funnel::TablePreview> {
         let preview = py.detach(|| match progress {
-            Some(progress) => self.runtime.preview_table_with_progress(
+            Some(progress) => self.runtime.preview_table_with_options_and_progress(
                 &self.inner,
                 table,
-                limit,
+                options,
                 progress.reporter(),
             ),
-            None => self.runtime.preview_table(&self.inner, table, limit),
+            None => self
+                .runtime
+                .preview_table_with_options(&self.inner, table, options),
         });
         let preview = preview.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
@@ -1051,7 +1053,7 @@ fn unknown_option_error(py: Python<'_>, group: &str, key: &str) -> PyErr {
     )
 }
 
-fn config_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr {
+pub(crate) fn config_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr {
     match delta_funnel_py_error(py, "config", kind, message, None) {
         Ok(error) => error,
         Err(error) => error,

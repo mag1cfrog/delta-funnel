@@ -13,8 +13,8 @@ use super::session::OrchestratorMssqlOutputWriter;
 use crate::MssqlWorkflowOutputWriter;
 use crate::{
     DeltaFunnelError, DeltaFunnelSession, DeltaSourceConfig, LazyTable, MssqlDryRunOutputReport,
-    MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, TablePreview, WriteAllOptions,
-    WriteAllReport, progress::ProgressReporter,
+    MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, PreviewOptions, TablePreview,
+    WriteAllOptions, WriteAllReport, progress::ProgressReporter,
 };
 
 /// Blocking runtime boundary for high-level Delta Funnel session actions.
@@ -89,8 +89,23 @@ impl DeltaFunnelRuntime {
         table: &LazyTable,
         limit: usize,
     ) -> Result<TablePreview, DeltaFunnelError> {
+        self.preview_table_with_options(session, table, PreviewOptions::new(limit))
+    }
+
+    /// Runs a bounded preview with explicit profiling options.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as [`DeltaFunnelSession::preview_table_with_options`].
+    pub fn preview_table_with_options(
+        &self,
+        session: &DeltaFunnelSession,
+        table: &LazyTable,
+        options: PreviewOptions,
+    ) -> Result<TablePreview, DeltaFunnelError> {
         reject_nested_runtime()?;
-        self.runtime.block_on(session.preview_table(table, limit))
+        self.runtime
+            .block_on(session.preview_table_with_options(table, options))
     }
 
     /// Runs a bounded preview and reports its live lifecycle to the caller.
@@ -105,6 +120,20 @@ impl DeltaFunnelRuntime {
         reject_nested_runtime()?;
         self.runtime
             .block_on(session.preview_table_with_progress(table, limit, reporter))
+    }
+
+    /// Runs an option-bearing bounded preview with live progress reporting.
+    #[doc(hidden)]
+    pub fn preview_table_with_options_and_progress(
+        &self,
+        session: &DeltaFunnelSession,
+        table: &LazyTable,
+        options: PreviewOptions,
+        reporter: ProgressReporter,
+    ) -> Result<TablePreview, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.preview_table_with_options_and_progress(table, options, reporter))
     }
 
     /// Runs a single-output dry run through the high-level session API.

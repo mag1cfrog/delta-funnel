@@ -71,6 +71,8 @@ class PendingDeltaSource:
 class Preview:
     text: str
     html: str
+    phase_timings: list[dict[str, object]]
+    execution_profile: dict[str, object] | None
 
     def __str__(self) -> str: ...
 
@@ -80,7 +82,13 @@ class Preview:
 class Table:
     def alias(self, name: str) -> Table: ...
 
-    def preview(self, limit: int = 20, *, progress: bool | None = None) -> Preview: ...
+    def preview(
+        self,
+        limit: int = 20,
+        *,
+        progress: bool | None = None,
+        profile: bool | None = False,
+    ) -> Preview: ...
 
     def show(self, limit: int = 20, *, progress: bool | None = None) -> None: ...
 

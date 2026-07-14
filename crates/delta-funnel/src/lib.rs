@@ -105,8 +105,9 @@ mod table_formats;
 pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
     DeltaFunnelRuntime, DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget,
-    OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable, RegisteredSessionSource, RunMode,
-    SessionOptions, TablePreview, WriteAllCacheMode, WriteAllOptions,
+    OutputWritePlan, PlannedMssqlOutput, PreviewFailureContext, PreviewOptions,
+    RegisteredDerivedTable, RegisteredSessionSource, RunMode, SessionOptions, TablePreview,
+    WriteAllCacheMode, WriteAllOptions,
 };
 pub use pipeline::{
     BatchHandoffError, BatchHandoffOutcome, BatchHandoffStats, BatchPipelinePhase,

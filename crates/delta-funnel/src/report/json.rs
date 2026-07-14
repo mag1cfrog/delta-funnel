@@ -103,6 +103,24 @@ impl QueryExecutionProfile {
     }
 }
 
+impl crate::PreviewFailureContext {
+    /// Returns this preview failure context as a stable JSON-compatible value.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "failed_phase": self.failed_phase(),
+            "phase_timings": self
+                .phase_timings()
+                .iter()
+                .map(PhaseTimingReport::to_json_value)
+                .collect::<Vec<_>>(),
+            "execution_profile": self
+                .execution_profile()
+                .map(QueryExecutionProfile::to_json_value),
+        })
+    }
+}
+
 impl QueryExecutionOperatorProfile {
     /// Returns this operator profile as a stable JSON-compatible value.
     #[must_use]
