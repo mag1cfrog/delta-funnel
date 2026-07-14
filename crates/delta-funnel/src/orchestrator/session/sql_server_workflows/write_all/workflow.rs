@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::super::super::{
-    DeltaFunnelSession, PlannedMssqlOutput, query_handoff::SharedProviderReadStats,
+    DeltaFunnelSession, PlannedMssqlOutput, query_handoff::SharedProviderStatsSnapshots,
 };
 use super::{
     MssqlDerivedCacheAliasPlan,
@@ -46,7 +46,7 @@ impl DeltaFunnelSession {
     pub(crate) fn build_write_all_uncached_jobs(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
-        provider_stats: Option<SharedProviderReadStats>,
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
         let output_count = usize_to_u64_saturating(planned_outputs.len());
@@ -63,7 +63,7 @@ impl DeltaFunnelSession {
                 });
                 let batches = self.lazy_table_batch_stream_factory(
                     planned.table().clone(),
-                    provider_stats.clone(),
+                    provider_stats_snapshots.clone(),
                     progress.clone().map(|reporter| {
                         (reporter, planned.resolved_target().output_name().to_owned())
                     }),
@@ -80,7 +80,7 @@ impl DeltaFunnelSession {
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         active_aliases: &[MssqlDerivedCacheAliasPlan],
-        provider_stats: Option<SharedProviderReadStats>,
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
         let output_count = usize_to_u64_saturating(planned_outputs.len());
@@ -98,7 +98,7 @@ impl DeltaFunnelSession {
                 let batches = self.cached_output_batch_stream_factory(
                     planned.request(),
                     active_aliases,
-                    provider_stats.clone(),
+                    provider_stats_snapshots.clone(),
                     progress.clone(),
                 )?;
 
@@ -113,13 +113,17 @@ impl DeltaFunnelSession {
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         writer: W,
-        provider_stats: Option<SharedProviderReadStats>,
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let jobs = self.build_write_all_uncached_jobs(planned_outputs, provider_stats, reporter)?;
+        let jobs = self.build_write_all_uncached_jobs(
+            planned_outputs,
+            provider_stats_snapshots,
+            reporter,
+        )?;
 
         write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
     }
@@ -131,7 +135,7 @@ impl DeltaFunnelSession {
         planned_outputs: &[PlannedMssqlOutput],
         cache_aliases: &[MssqlDerivedCacheAliasPlan],
         writer: W,
-        provider_stats: Option<SharedProviderReadStats>,
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
     where
@@ -143,7 +147,7 @@ impl DeltaFunnelSession {
         let jobs = match self.build_write_all_cached_jobs(
             planned_outputs,
             cache_aliases,
-            provider_stats,
+            provider_stats_snapshots,
             reporter,
         ) {
             Ok(jobs) => jobs,

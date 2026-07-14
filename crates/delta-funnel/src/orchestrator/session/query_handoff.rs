@@ -34,58 +34,59 @@ use super::{
     errors::{datafusion_handoff_setup_error, unknown_lazy_table_error},
 };
 
-pub(super) type SharedProviderReadStats = Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
+pub(super) type SharedProviderStatsSnapshots =
+    Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
 
-pub(super) fn shared_provider_read_stats() -> SharedProviderReadStats {
+pub(super) fn shared_provider_stats_snapshots() -> SharedProviderStatsSnapshots {
     Arc::new(Mutex::new(Vec::new()))
 }
 
-pub(super) fn provider_read_stats_snapshot(
-    provider_stats: &SharedProviderReadStats,
+pub(super) fn provider_stats_snapshots(
+    provider_stats_snapshots: &SharedProviderStatsSnapshots,
 ) -> Vec<crate::DeltaProviderReadStatsSnapshot> {
-    match provider_stats.lock() {
-        Ok(provider_stats) => provider_stats.clone(),
+    match provider_stats_snapshots.lock() {
+        Ok(provider_stats_snapshots) => provider_stats_snapshots.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
 }
 
-/// Adds one point-in-time snapshot for every retained scan handle.
-pub(super) fn append_provider_read_stats(
-    provider_stats: &SharedProviderReadStats,
+/// Records one point-in-time snapshot for every retained scan handle.
+pub(super) fn record_provider_stats_snapshots(
+    provider_stats_snapshots: &SharedProviderStatsSnapshots,
     read_stats_handles: &[DeltaProviderReadStatsHandle],
 ) {
     let snapshots = snapshot_delta_provider_read_stats(read_stats_handles);
     if snapshots.is_empty() {
         return;
     }
-    match provider_stats.lock() {
-        Ok(mut provider_stats) => provider_stats.extend(snapshots),
+    match provider_stats_snapshots.lock() {
+        Ok(mut provider_stats_snapshots) => provider_stats_snapshots.extend(snapshots),
         Err(poisoned) => poisoned.into_inner().extend(snapshots),
     }
 }
 
-/// Records final Delta provider statistics for a write-all report.
+/// Records the latest Delta provider statistics when a batch stream stops.
 ///
-/// The recorder keeps only shared read counters and snapshots them when the
-/// wrapped stream ends, fails, or is dropped by its downstream consumer.
-struct FinalDeltaReadStatsRecorder {
+/// The stream keeps only shared read counters and snapshots them when it ends,
+/// fails, or is dropped by its downstream consumer.
+struct ProviderReadStatsRecordingStream {
     inner: MssqlOutputBatchStream,
     // One live counter handle for each Delta scan in the output plan.
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
-    provider_stats: SharedProviderReadStats,
+    provider_stats_snapshots: SharedProviderStatsSnapshots,
     recorded: bool,
 }
 
-impl FinalDeltaReadStatsRecorder {
+impl ProviderReadStatsRecordingStream {
     fn new(
         inner: MssqlOutputBatchStream,
         read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
-        provider_stats: SharedProviderReadStats,
+        provider_stats_snapshots: SharedProviderStatsSnapshots,
     ) -> Self {
         Self {
             inner,
             read_stats_handles,
-            provider_stats,
+            provider_stats_snapshots,
             recorded: false,
         }
     }
@@ -95,11 +96,11 @@ impl FinalDeltaReadStatsRecorder {
             return;
         }
         self.recorded = true;
-        append_provider_read_stats(&self.provider_stats, &self.read_stats_handles);
+        record_provider_stats_snapshots(&self.provider_stats_snapshots, &self.read_stats_handles);
     }
 }
 
-impl Stream for FinalDeltaReadStatsRecorder {
+impl Stream for ProviderReadStatsRecordingStream {
     type Item = Result<RecordBatch, DeltaFunnelError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -117,7 +118,7 @@ impl Stream for FinalDeltaReadStatsRecorder {
     }
 }
 
-impl Drop for FinalDeltaReadStatsRecorder {
+impl Drop for ProviderReadStatsRecordingStream {
     fn drop(&mut self) {
         self.record_if_needed();
     }
@@ -125,10 +126,10 @@ impl Drop for FinalDeltaReadStatsRecorder {
 
 /// Reports Delta file progress while forwarding one batch stream.
 ///
-/// The tracker owns the progress coordinator for this stream. It samples the
+/// The stream owns the progress coordinator. It samples the
 /// existing provider counters without retaining the plan, running another
 /// query, or reading Delta metadata again.
-struct DeltaFileProgressTracker {
+struct DeltaFileProgressStream {
     inner: MssqlOutputBatchStream,
     sampler: DeltaFileProgressSampler,
 }
@@ -187,7 +188,7 @@ fn track_delta_file_progress(
     stream: MssqlOutputBatchStream,
     sampler: DeltaFileProgressSampler,
 ) -> MssqlOutputBatchStream {
-    Box::pin(DeltaFileProgressTracker {
+    Box::pin(DeltaFileProgressStream {
         inner: stream,
         sampler,
     })
@@ -203,10 +204,10 @@ fn track_delta_file_progress(
 pub(super) fn wrap_stream_with_delta_read_tracking(
     mut stream: MssqlOutputBatchStream,
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
-    provider_stats: Option<SharedProviderReadStats>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<(ProgressReporter, String)>,
 ) -> MssqlOutputBatchStream {
-    if provider_stats.is_none() && progress.is_none() {
+    if provider_stats_snapshots.is_none() && progress.is_none() {
         return stream;
     }
 
@@ -219,17 +220,17 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
         );
         stream = track_delta_file_progress(stream, sampler);
     }
-    if let Some(provider_stats) = provider_stats {
-        stream = Box::pin(FinalDeltaReadStatsRecorder::new(
+    if let Some(provider_stats_snapshots) = provider_stats_snapshots {
+        stream = Box::pin(ProviderReadStatsRecordingStream::new(
             stream,
             read_stats_handles,
-            provider_stats,
+            provider_stats_snapshots,
         ));
     }
     stream
 }
 
-impl Stream for DeltaFileProgressTracker {
+impl Stream for DeltaFileProgressStream {
     type Item = Result<RecordBatch, DeltaFunnelError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -261,7 +262,7 @@ async fn batch_stream_for_lazy_table_from_session_parts(
     sources: &[RegisteredSessionSource],
     derived_tables: &[RegisteredDerivedTable],
     pending_derived_tables: &[PendingDerivedTable],
-    provider_stats: Option<SharedProviderReadStats>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<(ProgressReporter, String)>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     let dataframe = dataframe_for_lazy_table_from_session_parts(
@@ -277,17 +278,17 @@ async fn batch_stream_for_lazy_table_from_session_parts(
         .await
         .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
 
-    batch_stream_for_physical_plan(context, physical_plan, provider_stats, progress)
+    batch_stream_for_physical_plan(context, physical_plan, provider_stats_snapshots, progress)
 }
 
 fn batch_stream_for_physical_plan(
     context: &SessionContext,
     physical_plan: Arc<dyn ExecutionPlan>,
-    provider_stats: Option<SharedProviderReadStats>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<(ProgressReporter, String)>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     // These handles must exist before merged stream setup can fail.
-    let read_stats_handles = if provider_stats.is_some() || progress.is_some() {
+    let read_stats_handles = if provider_stats_snapshots.is_some() || progress.is_some() {
         collect_delta_provider_read_stats_handles(physical_plan.as_ref())
     } else {
         Vec::new()
@@ -295,8 +296,8 @@ fn batch_stream_for_physical_plan(
     let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
         Ok(stream) => stream,
         Err(error) => {
-            if let Some(provider_stats) = provider_stats.as_ref() {
-                append_provider_read_stats(provider_stats, &read_stats_handles);
+            if let Some(provider_stats_snapshots) = provider_stats_snapshots.as_ref() {
+                record_provider_stats_snapshots(provider_stats_snapshots, &read_stats_handles);
             }
             return Err(datafusion_handoff_setup_error("query_output_stream", error));
         }
@@ -308,7 +309,7 @@ fn batch_stream_for_physical_plan(
     Ok(wrap_stream_with_delta_read_tracking(
         stream,
         read_stats_handles,
-        provider_stats,
+        provider_stats_snapshots,
         progress,
     ))
 }
@@ -463,7 +464,7 @@ impl DeltaFunnelSession {
     pub(super) fn lazy_table_batch_stream_factory(
         &self,
         table: LazyTable,
-        provider_stats: Option<SharedProviderReadStats>,
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         progress: Option<(ProgressReporter, String)>,
     ) -> MssqlOutputBatchStreamFactory {
         let context = self.context.clone();
@@ -479,7 +480,7 @@ impl DeltaFunnelSession {
                     &sources,
                     &derived_tables,
                     &pending_derived_tables,
-                    provider_stats,
+                    provider_stats_snapshots,
                     progress,
                 )
                 .await
@@ -669,7 +670,7 @@ mod tests {
     use super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
         test_support::{
-            DeltaLogTable, FailingMergedStreamPlan, collect_stream_marker_values,
+            DeltaLogTable, StreamSetupFailingPlan, collect_stream_marker_values,
             collect_stream_row_count, failing_scan_marker_region_provider, marker_region_provider,
             marker_values_from_batches, scan_counting_marker_region_provider,
         },
@@ -686,7 +687,7 @@ mod tests {
     async fn report_tracked_stream(
         session: &DeltaFunnelSession,
         table: &LazyTable,
-        provider_stats: &super::SharedProviderReadStats,
+        provider_stats_snapshots: &super::SharedProviderStatsSnapshots,
     ) -> Result<crate::MssqlOutputBatchStream, DeltaFunnelError> {
         super::batch_stream_for_lazy_table_from_session_parts(
             &session.context,
@@ -694,7 +695,7 @@ mod tests {
             &session.sources,
             &session.derived_tables,
             &session.pending_derived_tables,
-            Some(Arc::clone(provider_stats)),
+            Some(Arc::clone(provider_stats_snapshots)),
             None,
         )
         .await
@@ -790,11 +791,11 @@ mod tests {
             "orders",
             table.path().to_string_lossy().to_string(),
         ))?;
-        let provider_stats = super::shared_provider_read_stats();
-        let stream = report_tracked_stream(&session, &source, &provider_stats).await?;
+        let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
 
         let rows = collect_stream_row_count(stream).await?;
-        let snapshots = super::provider_read_stats_snapshot(&provider_stats);
+        let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
 
         assert_eq!(rows, table.rows());
         assert_eq!(snapshots.len(), 1);
@@ -821,12 +822,12 @@ mod tests {
             "orders",
             table.path().to_string_lossy().to_string(),
         ))?;
-        let provider_stats = super::shared_provider_read_stats();
-        let mut stream = report_tracked_stream(&session, &source, &provider_stats).await?;
+        let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let mut stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
 
         assert!(stream.next().await.transpose()?.is_some());
         drop(stream);
-        let snapshots = super::provider_read_stats_snapshot(&provider_stats);
+        let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
 
         assert_eq!(snapshots.len(), 1);
         assert!(snapshots[0].files_started > 0);
@@ -850,13 +851,13 @@ mod tests {
         let table = DeltaLogTable::new("final-stats-upstream-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
-        let provider_stats = super::shared_provider_read_stats();
-        let mut stream = report_tracked_stream(&session, &source, &provider_stats).await?;
+        let shared_provider_stats = super::shared_provider_stats_snapshots();
+        let mut stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
 
         let result = stream.next().await.ok_or("expected upstream error")?;
         assert!(result.is_err());
         drop(stream);
-        let snapshots = super::provider_read_stats_snapshot(&provider_stats);
+        let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
 
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].files_started, 1);
@@ -865,7 +866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merged_stream_construction_error_records_one_point_in_time_snapshot()
+    async fn stream_setup_error_records_one_point_in_time_snapshot()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("final-stats-stream-setup-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -876,16 +877,16 @@ mod tests {
         let dataframe = session.dataframe_for_lazy_table(&source).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
         let failing_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(FailingMergedStreamPlan::new(physical_plan));
-        let provider_stats = super::shared_provider_read_stats();
+            Arc::new(StreamSetupFailingPlan::new(physical_plan));
+        let shared_provider_stats = super::shared_provider_stats_snapshots();
 
         let result = super::batch_stream_for_physical_plan(
             &session.context,
             failing_plan,
-            Some(Arc::clone(&provider_stats)),
+            Some(Arc::clone(&shared_provider_stats)),
             None,
         );
-        let snapshots = super::provider_read_stats_snapshot(&provider_stats);
+        let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
 
         assert!(result.is_err());
         assert_eq!(snapshots.len(), 1);
@@ -908,13 +909,13 @@ mod tests {
         let table = session
             .table_from_sql("select marker from broken_source")
             .await?;
-        let provider_stats = super::shared_provider_read_stats();
+        let shared_provider_stats = super::shared_provider_stats_snapshots();
 
-        let result = report_tracked_stream(&session, &table, &provider_stats).await;
+        let result = report_tracked_stream(&session, &table, &shared_provider_stats).await;
 
         assert!(result.is_err());
         assert_eq!(scans.load(Ordering::SeqCst), 1);
-        assert!(super::provider_read_stats_snapshot(&provider_stats).is_empty());
+        assert!(super::provider_stats_snapshots(&shared_provider_stats).is_empty());
         Ok(())
     }
 

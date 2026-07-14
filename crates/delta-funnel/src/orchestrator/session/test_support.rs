@@ -37,12 +37,12 @@ use super::{LazyTable, MssqlOutputTarget, OutputWritePlan, RunMode};
 
 /// Keeps a real plan as a child but fails before returning its output stream.
 #[derive(Debug)]
-pub(super) struct FailingMergedStreamPlan {
+pub(super) struct StreamSetupFailingPlan {
     child: Arc<dyn ExecutionPlan>,
     error: ErrorExec,
 }
 
-impl FailingMergedStreamPlan {
+impl StreamSetupFailingPlan {
     pub(super) fn new(child: Arc<dyn ExecutionPlan>) -> Self {
         Self {
             child,
@@ -51,19 +51,19 @@ impl FailingMergedStreamPlan {
     }
 }
 
-impl DisplayAs for FailingMergedStreamPlan {
+impl DisplayAs for StreamSetupFailingPlan {
     fn fmt_as(
         &self,
         _display_type: DisplayFormatType,
         formatter: &mut fmt::Formatter,
     ) -> fmt::Result {
-        formatter.write_str("FailingMergedStreamPlan")
+        formatter.write_str("StreamSetupFailingPlan")
     }
 }
 
-impl ExecutionPlan for FailingMergedStreamPlan {
+impl ExecutionPlan for StreamSetupFailingPlan {
     fn name(&self) -> &str {
-        "FailingMergedStreamPlan"
+        "StreamSetupFailingPlan"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -84,7 +84,7 @@ impl ExecutionPlan for FailingMergedStreamPlan {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Plan(
-                "FailingMergedStreamPlan requires one child".to_owned(),
+                "StreamSetupFailingPlan requires one child".to_owned(),
             ));
         }
         Ok(Arc::new(Self::new(Arc::clone(&children[0]))))

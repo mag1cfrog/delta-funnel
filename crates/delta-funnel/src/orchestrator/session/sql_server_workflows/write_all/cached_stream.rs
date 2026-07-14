@@ -15,7 +15,8 @@ use super::super::super::{
     DeltaFunnelSession, LazyTableKind, OutputWritePlan,
     errors::{cached_output_stream_setup_error, unknown_cached_alias_error},
     query_handoff::{
-        SharedProviderReadStats, append_provider_read_stats, wrap_stream_with_delta_read_tracking,
+        SharedProviderStatsSnapshots, record_provider_stats_snapshots,
+        wrap_stream_with_delta_read_tracking,
     },
     registry::{DerivedTableDependency, read_only_sql_options},
 };
@@ -30,12 +31,12 @@ pub(super) fn failing_cached_output_batch_stream_factory(
     })
 }
 
-pub(super) async fn replanned_sql_batch_stream(
+pub(super) async fn cached_output_stream_from_retained_sql(
     context: SessionContext,
     output_name: String,
     sql_text: String,
     expected_schema: SchemaRef,
-    provider_stats: Option<SharedProviderReadStats>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     reporter: Option<ProgressReporter>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     let dataframe = context
@@ -52,25 +53,25 @@ pub(super) async fn replanned_sql_batch_stream(
         .await
         .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
 
-    replanned_output_stream_from_plan(
+    cached_output_stream_from_physical_plan(
         &context,
         output_name,
         physical_plan,
-        provider_stats,
+        provider_stats_snapshots,
         reporter,
     )
 }
 
 /// Builds a tracked cached output stream from a completed physical plan.
-fn replanned_output_stream_from_plan(
+fn cached_output_stream_from_physical_plan(
     context: &SessionContext,
     output_name: String,
     physical_plan: Arc<dyn ExecutionPlan>,
-    provider_stats: Option<SharedProviderReadStats>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     reporter: Option<ProgressReporter>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     // Retain scan handles before merged stream setup can fail.
-    let read_stats_handles = if provider_stats.is_some() || reporter.is_some() {
+    let read_stats_handles = if provider_stats_snapshots.is_some() || reporter.is_some() {
         collect_delta_provider_read_stats_handles(physical_plan.as_ref())
     } else {
         Vec::new()
@@ -78,8 +79,8 @@ fn replanned_output_stream_from_plan(
     let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
         Ok(stream) => stream,
         Err(error) => {
-            if let Some(provider_stats) = provider_stats.as_ref() {
-                append_provider_read_stats(provider_stats, &read_stats_handles);
+            if let Some(provider_stats_snapshots) = provider_stats_snapshots.as_ref() {
+                record_provider_stats_snapshots(provider_stats_snapshots, &read_stats_handles);
             }
             return Err(cached_output_stream_setup_error(&output_name, error));
         }
@@ -92,7 +93,7 @@ fn replanned_output_stream_from_plan(
     Ok(wrap_stream_with_delta_read_tracking(
         stream,
         read_stats_handles,
-        provider_stats,
+        provider_stats_snapshots,
         reporter.map(|reporter| (reporter, output_name)),
     ))
 }
@@ -154,13 +155,13 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
         active_aliases: &[MssqlDerivedCacheAliasPlan],
-        provider_stats: Option<SharedProviderReadStats>,
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<ProgressReporter>,
     ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
         if !self.output_requires_cache_replan(request, active_aliases)? {
             return Ok(self.lazy_table_batch_stream_factory(
                 request.table().clone(),
-                provider_stats,
+                provider_stats_snapshots,
                 reporter.map(|reporter| (reporter, request.target().output_name().to_owned())),
             ));
         }
@@ -187,12 +188,12 @@ impl DeltaFunnelSession {
         let context = self.context.clone();
         Ok(Box::new(move || {
             Box::pin(async move {
-                replanned_sql_batch_stream(
+                cached_output_stream_from_retained_sql(
                     context,
                     output_name,
                     sql_text,
                     expected_schema,
-                    provider_stats,
+                    provider_stats_snapshots,
                     reporter,
                 )
                 .await
@@ -228,16 +229,16 @@ mod tests {
 
     use super::super::super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
-        query_handoff::{provider_read_stats_snapshot, shared_provider_read_stats},
+        query_handoff::{provider_stats_snapshots, shared_provider_stats_snapshots},
         test_support::{
-            DeltaLogTable, FailingMergedStreamPlan, collect_stream_marker_values, output_request,
+            DeltaLogTable, StreamSetupFailingPlan, collect_stream_marker_values, output_request,
             scan_counting_marker_region_provider,
         },
     };
     use super::super::{MssqlDerivedCacheAliasPlan, MssqlOutputCacheDecision};
 
     #[tokio::test]
-    async fn replanned_output_stream_setup_error_records_one_provider_snapshot()
+    async fn cached_output_stream_setup_error_records_one_provider_snapshot()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("cached-stream-setup-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -247,16 +248,16 @@ mod tests {
         ))?;
         let dataframe = session.dataframe_for_lazy_table(&source).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
-        let provider_stats = shared_provider_read_stats();
+        let shared_provider_stats = shared_provider_stats_snapshots();
 
-        let result = super::replanned_output_stream_from_plan(
+        let result = super::cached_output_stream_from_physical_plan(
             &session.context,
             "orders_output".to_owned(),
-            Arc::new(FailingMergedStreamPlan::new(physical_plan)),
-            Some(Arc::clone(&provider_stats)),
+            Arc::new(StreamSetupFailingPlan::new(physical_plan)),
+            Some(Arc::clone(&shared_provider_stats)),
             None,
         );
-        let snapshots = provider_read_stats_snapshot(&provider_stats);
+        let snapshots = provider_stats_snapshots(&shared_provider_stats);
 
         assert!(matches!(
             result,

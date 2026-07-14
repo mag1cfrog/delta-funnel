@@ -11,7 +11,7 @@ use crate::{
 
 use super::super::super::{
     DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode,
-    query_handoff::{provider_read_stats_snapshot, shared_provider_read_stats},
+    query_handoff::{provider_stats_snapshots, shared_provider_stats_snapshots},
 };
 use super::{MssqlOutputCacheDecision, WriteAllCacheMode, WriteAllOptions, cache_report};
 use tracing::Instrument;
@@ -117,8 +117,8 @@ impl DeltaFunnelSession {
             };
 
             // Run exactly one route while all outputs share the same source
-            // statistics recorder used by the final source report.
-            let provider_stats = shared_provider_read_stats();
+            // statistics snapshot collection used by the final source report.
+            let shared_provider_stats = shared_provider_stats_snapshots();
             let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
             let (workflow, cache) = match automatic_cache_plan.as_ref() {
                 Some(cache_plan) => match cache_plan.decision() {
@@ -127,7 +127,7 @@ impl DeltaFunnelSession {
                             .write_all_uncached_with_writer(
                                 &planned_outputs,
                                 writer,
-                                Some(Arc::clone(&provider_stats)),
+                                Some(Arc::clone(&shared_provider_stats)),
                                 active_reporter,
                             )
                             .await?;
@@ -139,7 +139,7 @@ impl DeltaFunnelSession {
                                 &planned_outputs,
                                 cache_aliases,
                                 writer,
-                                Some(Arc::clone(&provider_stats)),
+                                Some(Arc::clone(&shared_provider_stats)),
                                 active_reporter,
                             )
                             .await?;
@@ -151,7 +151,7 @@ impl DeltaFunnelSession {
                         .write_all_uncached_with_writer(
                             &planned_outputs,
                             writer,
-                            Some(Arc::clone(&provider_stats)),
+                            Some(Arc::clone(&shared_provider_stats)),
                             active_reporter,
                         )
                         .await?;
@@ -171,7 +171,7 @@ impl DeltaFunnelSession {
             let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
             let sources = self.source_reports_for_planned_outputs_with_provider_stats(
                 &planned_outputs,
-                provider_read_stats_snapshot(&provider_stats),
+                provider_stats_snapshots(&shared_provider_stats),
             )?;
             phase_timings.push(source_timer.completed());
 
