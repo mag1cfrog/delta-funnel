@@ -1,6 +1,7 @@
 use std::{fmt, panic::resume_unwind, sync::Arc};
 
 use datafusion::{
+    arrow::record_batch::RecordBatch,
     datasource::{MemTable, TableProvider},
     physical_plan::execute_stream_partitioned,
     prelude::{DataFrame, SessionContext},
@@ -279,47 +280,85 @@ impl DeltaFunnelSession {
 /// Collects each cache partition in its own Tokio task and restores its order.
 async fn collect_cache_partitions(
     streams: Vec<MssqlOutputBatchStream>,
-    mut sampler: Option<DeltaFileProgressSampler>,
+    sampler: Option<DeltaFileProgressSampler>,
     alias_name: &str,
-) -> Result<Vec<Vec<datafusion::arrow::record_batch::RecordBatch>>, DeltaFunnelError> {
+) -> Result<Vec<Vec<RecordBatch>>, DeltaFunnelError> {
+    let (progress_changed, progress_changes) = watch::channel(());
+    let task_progress_signal = sampler.as_ref().map(|_| progress_changed.clone());
+    let tasks = spawn_cache_partition_tasks(streams, task_progress_signal);
+    // Once the tasks start, only their senders should keep this channel open.
+    drop(progress_changed);
+
+    let mut partitions =
+        join_cache_partition_tasks(tasks, progress_changes, sampler, alias_name).await?;
+    partitions.sort_by_key(|(partition_index, _)| *partition_index);
+    Ok(partitions.into_iter().map(|(_, batches)| batches).collect())
+}
+
+type CachePartitionTaskOutput = (usize, Result<Vec<RecordBatch>, DeltaFunnelError>);
+
+/// Starts one collector task per partition and retains each partition index.
+fn spawn_cache_partition_tasks(
+    streams: Vec<MssqlOutputBatchStream>,
+    progress_signal: Option<watch::Sender<()>>,
+) -> JoinSet<CachePartitionTaskOutput> {
     let mut tasks = JoinSet::new();
     // Partition tasks only announce stream-consumption boundaries. The parent
     // task samples counters and calls the reporter, so no callback needs a
     // cross-task delivery lock.
-    let (progress_changed, mut progress_changes) = watch::channel(());
     for (partition_index, stream) in streams.into_iter().enumerate() {
-        let progress_changed = sampler.is_some().then(|| progress_changed.clone());
+        let progress_signal = progress_signal.clone();
         tasks.spawn(async move {
-            let batches = match progress_changed {
-                Some(progress_changed) => {
+            let batches = match progress_signal {
+                Some(progress_signal) => {
+                    // Notify the parent after each ready item. It samples
+                    // counters and delivers callbacks serially.
                     stream
                         .inspect(move |_| {
-                            let _ = progress_changed.send(());
+                            let _ = progress_signal.send(());
                         })
                         .try_collect::<Vec<_>>()
                         .await
                 }
+                // Avoid per-batch channel work when progress is disabled.
                 None => stream.try_collect::<Vec<_>>().await,
             };
             (partition_index, batches)
         });
     }
-    drop(progress_changed);
 
+    tasks
+}
+
+/// Joins partition collectors while sampling progress on the parent task.
+///
+/// Stream errors remain attached to their partition result. Task panics resume
+/// unwinding, while other join failures become normal cache materialization
+/// errors.
+async fn join_cache_partition_tasks(
+    mut tasks: JoinSet<CachePartitionTaskOutput>,
+    mut progress_changes: watch::Receiver<()>,
+    mut sampler: Option<DeltaFileProgressSampler>,
+    alias_name: &str,
+) -> Result<Vec<(usize, Vec<RecordBatch>)>, DeltaFunnelError> {
     let mut partitions = Vec::new();
     while !tasks.is_empty() {
         tokio::select! {
             Ok(()) = progress_changes.changed(), if sampler.is_some() => {
+                // A partition consumed another stream item, so its shared
+                // provider counters may now have changed.
                 emit_cache_progress(&mut sampler);
             }
             Some(result) = tasks.join_next() => {
-                match result {
-                    Ok((partition_index, batches)) => {
-                        emit_cache_progress(&mut sampler);
-                        partitions.push((partition_index, batches?));
-                    }
+                // One collector stopped. Settle its task result before keeping
+                // the partition batches.
+                let (partition_index, batches) = match result {
+                    Ok(partition) => partition,
+                    // Preserve the existing panic instead of hiding it inside
+                    // a workflow error.
                     Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
                     Err(error) => {
+                        // A cancelled task has no partition result to retain.
                         emit_cache_progress(&mut sampler);
                         return Err(mssql_scoped_cache_alias_error(
                             "materialize",
@@ -327,12 +366,16 @@ async fn collect_cache_partitions(
                             error,
                         ));
                     }
-                }
+                };
+                emit_cache_progress(&mut sampler);
+                // The partition wrapper already recorded an upstream error.
+                // Returning here drops the JoinSet and cancels its siblings.
+                let batches = batches?;
+                partitions.push((partition_index, batches));
             }
         }
     }
-    partitions.sort_by_key(|(partition_index, _)| *partition_index);
-    Ok(partitions.into_iter().map(|(_, batches)| batches).collect())
+    Ok(partitions)
 }
 
 fn emit_cache_progress(sampler: &mut Option<DeltaFileProgressSampler>) {

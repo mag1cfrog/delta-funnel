@@ -933,14 +933,7 @@ mod tests {
         drop(error_stream);
         drop(subscriber_guard);
 
-        let summaries = captured
-            .events()
-            .into_iter()
-            .filter(|event| {
-                event.fields.get("telemetry_event").map(String::as_str)
-                    == Some(DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT)
-            })
-            .collect::<Vec<_>>();
+        let summaries = provider_io_events(&captured);
         assert_eq!(summaries.len(), 3);
         for (event, (source_name, outcome)) in summaries.iter().zip([
             ("success_orders", "success"),
@@ -965,6 +958,56 @@ mod tests {
                 PARQUET_IO_FIELDS
                     .iter()
                     .all(|field| event.fields.contains_key(*field))
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partitioned_cache_emits_the_same_summary_with_and_without_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = tracing_test_guard();
+        let captured = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: captured.clone(),
+        });
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let reporter = crate::progress::ProgressReporter::default();
+        materialize_cache_for_trace("cache-no-progress", "cache_no_progress", None).await?;
+        materialize_cache_for_trace("cache-progress", "cache_progress", Some(&reporter)).await?;
+        drop(subscriber_guard);
+
+        let summaries = provider_io_events(&captured);
+        assert_eq!(summaries.len(), 2);
+        for (event, source_name) in summaries
+            .iter()
+            .zip(["cache_no_progress", "cache_progress"])
+        {
+            assert_eq!(event.target, TRACING_TARGET);
+            assert_eq!(event.level, Level::DEBUG);
+            assert_eq!(
+                event.fields.get("source_name").map(String::as_str),
+                Some(source_name)
+            );
+            assert_eq!(
+                event.fields.get("outcome").map(String::as_str),
+                Some("success")
+            );
+            assert_eq!(
+                event.fields.get("metrics_available").map(String::as_str),
+                Some("true")
+            );
+            assert!(
+                PARQUET_IO_FIELDS
+                    .iter()
+                    .all(|field| event.fields.contains_key(*field))
+            );
+        }
+        for field in PARQUET_IO_FIELDS {
+            assert_eq!(
+                summaries[0].fields.get(field),
+                summaries[1].fields.get(field)
             );
         }
         Ok(())
@@ -1570,6 +1613,40 @@ mod tests {
             event.fields.get("metrics_available").map(String::as_str),
             Some(metrics_available)
         );
+    }
+
+    fn provider_io_events(events: &CapturedEvents) -> Vec<CapturedEvent> {
+        events
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some(DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT)
+            })
+            .collect()
+    }
+
+    async fn materialize_cache_for_trace(
+        fixture_name: &str,
+        source_name: &str,
+        reporter: Option<&crate::progress::ProgressReporter>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table = crate::table_formats::RealParquetDeltaTable::new_default(fixture_name)?;
+        let mut session = native_async_session(crate::QueryOptions::default())?;
+        session.delta_lake(crate::DeltaSourceConfig::new(
+            source_name,
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let sql = format!("select * from {source_name}");
+        let query = session.table_from_sql(&sql).await?;
+        let alias_name = format!("cached_{source_name}");
+        let alias = session.register_alias(&alias_name, &query)?;
+
+        session
+            .replace_registered_derived_alias_with_cache(&alias, reporter)
+            .await?
+            .restore()?;
+        Ok(())
     }
 
     fn provider_stats_snapshot() -> DeltaProviderReadStatsSnapshot {
