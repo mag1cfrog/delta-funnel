@@ -1,9 +1,28 @@
 use std::fmt;
 
 use crate::{
-    MssqlTargetConfig, MssqlTargetOutputPlan, PhaseTimingReport, ResolvedMssqlTarget,
+    ExecutionProfileMode, MssqlTargetConfig, MssqlTargetOutputPlan, PhaseTimingReport,
+    QueryExecutionProfile, ReportReasonCode, ResolvedMssqlTarget,
     support::sanitize_text_for_display,
 };
+
+pub(crate) const PREVIEW_DATAFRAME_PLANNING_PHASE: &str = "preview_dataframe_planning";
+pub(crate) const PREVIEW_PHYSICAL_PLANNING_PHASE: &str = "preview_physical_planning";
+pub(crate) const PREVIEW_STREAM_SETUP_PHASE: &str = "preview_stream_setup";
+pub(crate) const PREVIEW_EXECUTE_COLLECT_PHASE: &str = "preview_execute_collect";
+pub(crate) const PREVIEW_FORMAT_TEXT_PHASE: &str = "preview_format_text";
+pub(crate) const PREVIEW_FORMAT_HTML_PHASE: &str = "preview_format_html";
+pub(crate) const PREVIEW_TOTAL_PHASE: &str = "preview_total";
+
+const PREVIEW_PHASE_NAMES: [&str; 7] = [
+    PREVIEW_DATAFRAME_PLANNING_PHASE,
+    PREVIEW_PHYSICAL_PLANNING_PHASE,
+    PREVIEW_STREAM_SETUP_PHASE,
+    PREVIEW_EXECUTE_COLLECT_PHASE,
+    PREVIEW_FORMAT_TEXT_PHASE,
+    PREVIEW_FORMAT_HTML_PHASE,
+    PREVIEW_TOTAL_PHASE,
+];
 
 /// Query-load action mode requested by a caller.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -90,18 +109,81 @@ pub enum LazyTableKind {
     DerivedSql,
 }
 
+/// Options for a bounded lazy-table preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewOptions {
+    limit: usize,
+    execution_profile_mode: ExecutionProfileMode,
+}
+
+impl PreviewOptions {
+    /// Creates preview options with detailed execution profiling disabled.
+    #[must_use]
+    pub const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            execution_profile_mode: ExecutionProfileMode::Disabled,
+        }
+    }
+
+    /// Selects whether the preview collects a detailed execution profile.
+    #[must_use]
+    pub const fn with_execution_profile_mode(mut self, mode: ExecutionProfileMode) -> Self {
+        self.execution_profile_mode = mode;
+        self
+    }
+
+    /// Returns the requested preview row limit.
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Returns the selected execution-profile mode.
+    #[must_use]
+    pub const fn execution_profile_mode(&self) -> ExecutionProfileMode {
+        self.execution_profile_mode
+    }
+}
+
 /// Rendered bounded preview of a lazy table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TablePreview {
     text: String,
     html: String,
+    phase_timings: Vec<PhaseTimingReport>,
+    execution_profile: Option<QueryExecutionProfile>,
 }
 
 impl TablePreview {
     /// Creates a rendered lazy table preview.
     #[must_use]
     pub fn new(text: String, html: String) -> Self {
-        Self { text, html }
+        Self::from_execution(
+            text,
+            html,
+            PREVIEW_PHASE_NAMES
+                .into_iter()
+                .map(|phase_name| {
+                    PhaseTimingReport::unavailable(phase_name, ReportReasonCode::NotExecuted)
+                })
+                .collect(),
+            None,
+        )
+    }
+
+    pub(crate) fn from_execution(
+        text: String,
+        html: String,
+        phase_timings: Vec<PhaseTimingReport>,
+        execution_profile: Option<QueryExecutionProfile>,
+    ) -> Self {
+        Self {
+            text,
+            html,
+            phase_timings,
+            execution_profile,
+        }
     }
 
     /// Returns the plain text table preview.
@@ -114,6 +196,18 @@ impl TablePreview {
     #[must_use]
     pub fn html(&self) -> &str {
         &self.html
+    }
+
+    /// Returns phase timings captured for this preview operation.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
+    }
+
+    /// Returns the detailed execution profile when collection was enabled.
+    #[must_use]
+    pub const fn execution_profile(&self) -> Option<&QueryExecutionProfile> {
+        self.execution_profile.as_ref()
     }
 }
 
@@ -261,10 +355,49 @@ impl PlannedMssqlOutput {
 #[cfg(test)]
 mod tests {
     use crate::{
-        DeltaFunnelError, LoadMode, MssqlConnectionConfig, MssqlTargetConfig, MssqlTargetTable,
+        DeltaFunnelError, ExecutionProfileMode, LoadMode, MssqlConnectionConfig, MssqlTargetConfig,
+        MssqlTargetTable, PhaseStatus, ReportReasonCode,
     };
 
-    use super::{LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, RunMode};
+    use super::{
+        LazyTable, LazyTableKind, MssqlOutputTarget, OutputWritePlan, PREVIEW_PHASE_NAMES,
+        PreviewOptions, RunMode, TablePreview,
+    };
+
+    #[test]
+    fn preview_options_default_to_disabled_profiling() {
+        let default = PreviewOptions::new(20);
+        let detailed = default.with_execution_profile_mode(ExecutionProfileMode::Detailed);
+
+        assert_eq!(default.limit(), 20);
+        assert_eq!(
+            default.execution_profile_mode(),
+            ExecutionProfileMode::Disabled
+        );
+        assert_eq!(detailed.limit(), 20);
+        assert_eq!(
+            detailed.execution_profile_mode(),
+            ExecutionProfileMode::Detailed
+        );
+    }
+
+    #[test]
+    fn legacy_table_preview_has_unavailable_timings_and_no_profile() {
+        let preview = TablePreview::new("text".to_owned(), "html".to_owned());
+
+        assert_eq!(preview.text(), "text");
+        assert_eq!(preview.html(), "html");
+        assert_eq!(preview.phase_timings().len(), PREVIEW_PHASE_NAMES.len());
+        for (timing, phase_name) in preview.phase_timings().iter().zip(PREVIEW_PHASE_NAMES) {
+            assert_eq!(timing.phase_name(), phase_name);
+            assert_eq!(
+                timing.status(),
+                PhaseStatus::unavailable(ReportReasonCode::NotExecuted)
+            );
+            assert_eq!(timing.elapsed_micros(), None);
+        }
+        assert_eq!(preview.execution_profile(), None);
+    }
 
     #[test]
     fn output_request_shapes_preserve_table_target_and_run_mode() -> Result<(), DeltaFunnelError> {
