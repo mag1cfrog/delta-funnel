@@ -52,7 +52,7 @@ pub(super) fn provider_read_stats_snapshot(
 /// Records final Delta provider statistics for a write-all report.
 ///
 /// The recorder keeps only shared read counters and snapshots them when the
-/// wrapped stream ends or fails.
+/// wrapped stream ends, fails, or is dropped by its downstream consumer.
 struct FinalDeltaReadStatsRecorder {
     inner: MssqlOutputBatchStream,
     // One live counter handle for each Delta scan in the output plan.
@@ -106,6 +106,12 @@ impl Stream for FinalDeltaReadStatsRecorder {
             }
             other => other,
         }
+    }
+}
+
+impl Drop for FinalDeltaReadStatsRecorder {
+    fn drop(&mut self) {
+        self.record_if_needed();
     }
 }
 
@@ -626,6 +632,7 @@ mod tests {
         arrow::datatypes::DataType,
         logical_expr::{Volatility, create_udf},
     };
+    use futures_util::StreamExt;
 
     use super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
@@ -643,6 +650,23 @@ mod tests {
         Option<ProgressOperation>,
         Option<ProgressPhase>,
     );
+
+    async fn report_tracked_stream(
+        session: &DeltaFunnelSession,
+        table: &LazyTable,
+        provider_stats: &super::SharedProviderReadStats,
+    ) -> Result<crate::MssqlOutputBatchStream, DeltaFunnelError> {
+        super::batch_stream_for_lazy_table_from_session_parts(
+            &session.context,
+            table,
+            &session.sources,
+            &session.derived_tables,
+            &session.pending_derived_tables,
+            Some(Arc::clone(provider_stats)),
+            None,
+        )
+        .await
+    }
 
     fn recording_preview_progress() -> (ProgressReporter, Arc<Mutex<Vec<RecordedPreviewProgress>>>)
     {
@@ -722,6 +746,89 @@ mod tests {
         let rows = collect_stream_row_count(stream).await?;
 
         assert_eq!(rows, table.rows());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_provider_stats_are_recorded_once_after_eof_and_drop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("final-stats-eof")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let provider_stats = super::shared_provider_read_stats();
+        let stream = report_tracked_stream(&session, &source, &provider_stats).await?;
+
+        let rows = collect_stream_row_count(stream).await?;
+        let snapshots = super::provider_read_stats_snapshot(&provider_stats);
+
+        assert_eq!(rows, table.rows());
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].files_completed, 1);
+        assert!(
+            snapshots[0]
+                .parquet_data_file_bytes_received
+                .is_some_and(|bytes| bytes > 0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_downstream_stream_records_one_partial_provider_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table =
+            RealParquetDeltaTable::new_with_two_large_files("final-stats-downstream-drop", 20_000)?;
+        let mut session =
+            DeltaFunnelSession::new(SessionOptions::new().with_query_options(QueryOptions {
+                target_partitions: Some(1),
+                output_batch_size: Some(1),
+            }))?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let provider_stats = super::shared_provider_read_stats();
+        let mut stream = report_tracked_stream(&session, &source, &provider_stats).await?;
+
+        assert!(stream.next().await.transpose()?.is_some());
+        drop(stream);
+        let snapshots = super::provider_read_stats_snapshot(&provider_stats);
+
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0].files_started > 0);
+        assert!(snapshots[0].rows_produced > 0);
+        assert!(
+            snapshots[0]
+                .parquet_data_file_bytes_received
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(
+            snapshots[0]
+                .parquet_data_file_opened_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upstream_error_then_drop_records_provider_stats_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("final-stats-upstream-error")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let provider_stats = super::shared_provider_read_stats();
+        let mut stream = report_tracked_stream(&session, &source, &provider_stats).await?;
+
+        let result = stream.next().await.ok_or("expected upstream error")?;
+        assert!(result.is_err());
+        drop(stream);
+        let snapshots = super::provider_read_stats_snapshot(&provider_stats);
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].files_started, 1);
+        assert_eq!(snapshots[0].files_completed, 0);
         Ok(())
     }
 
