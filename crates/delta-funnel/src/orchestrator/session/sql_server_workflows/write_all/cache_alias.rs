@@ -104,19 +104,9 @@ impl DeltaFunnelSession {
             .map_err(|error| {
                 mssql_scoped_cache_alias_error("resolve", alias_name.as_str(), error)
             })?;
-        let cached_provider = match reporter {
-            Some(reporter) => {
-                self.materialize_cache_with_progress(dataframe, alias_name.as_str(), reporter)
-                    .await?
-            }
-            None => dataframe
-                .cache()
-                .await
-                .map_err(|error| {
-                    mssql_scoped_cache_alias_error("materialize", alias_name.as_str(), error)
-                })?
-                .into_view(),
-        };
+        let cached_provider = self
+            .materialize_cache(dataframe, alias_name.as_str(), reporter)
+            .await?;
 
         let original_provider =
             self.install_scoped_cache_alias_provider(alias_name.as_str(), cached_provider)?;
@@ -160,17 +150,16 @@ impl DeltaFunnelSession {
         Ok(replacements)
     }
 
-    /// Materializes the default DataFusion memory cache while sampling the
-    /// physical plan's Delta file counters.
+    /// Materializes the default DataFusion memory cache.
     ///
     /// This preserves the physical plan's partition layout and concurrent
-    /// partition collection. Progress is action-level and has no output name or
-    /// position.
-    async fn materialize_cache_with_progress(
+    /// partition collection. When supplied, progress is action-level and has
+    /// no output name or position.
+    async fn materialize_cache(
         &self,
         dataframe: DataFrame,
         alias_name: &str,
-        reporter: &ProgressReporter,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<Arc<dyn TableProvider>, DeltaFunnelError> {
         let task_ctx = Arc::new(dataframe.task_ctx());
         let physical_plan = dataframe
@@ -179,12 +168,14 @@ impl DeltaFunnelSession {
             .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
         let schema = physical_plan.schema();
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-        let sampler = DeltaFileProgressSampler::new(
-            read_stats_handles.clone(),
-            reporter.clone(),
-            ProgressPhase::MaterializingCache,
-            None,
-        );
+        let sampler = reporter.map(|reporter| {
+            DeltaFileProgressSampler::new(
+                read_stats_handles.clone(),
+                reporter.clone(),
+                ProgressPhase::MaterializingCache,
+                None,
+            )
+        });
         let streams = match execute_stream_partitioned(physical_plan, task_ctx) {
             Ok(streams) => streams,
             Err(error) => {
@@ -288,7 +279,7 @@ impl DeltaFunnelSession {
 /// Collects each cache partition in its own Tokio task and restores its order.
 async fn collect_cache_partitions(
     streams: Vec<MssqlOutputBatchStream>,
-    mut sampler: DeltaFileProgressSampler,
+    mut sampler: Option<DeltaFileProgressSampler>,
     alias_name: &str,
 ) -> Result<Vec<Vec<datafusion::arrow::record_batch::RecordBatch>>, DeltaFunnelError> {
     let mut tasks = JoinSet::new();
@@ -297,14 +288,19 @@ async fn collect_cache_partitions(
     // cross-task delivery lock.
     let (progress_changed, mut progress_changes) = watch::channel(());
     for (partition_index, stream) in streams.into_iter().enumerate() {
-        let progress_changed = progress_changed.clone();
+        let progress_changed = sampler.is_some().then(|| progress_changed.clone());
         tasks.spawn(async move {
-            let batches = stream
-                .inspect(move |_| {
-                    let _ = progress_changed.send(());
-                })
-                .try_collect::<Vec<_>>()
-                .await;
+            let batches = match progress_changed {
+                Some(progress_changed) => {
+                    stream
+                        .inspect(move |_| {
+                            let _ = progress_changed.send(());
+                        })
+                        .try_collect::<Vec<_>>()
+                        .await
+                }
+                None => stream.try_collect::<Vec<_>>().await,
+            };
             (partition_index, batches)
         });
     }
@@ -313,16 +309,18 @@ async fn collect_cache_partitions(
     let mut partitions = Vec::new();
     while !tasks.is_empty() {
         tokio::select! {
-            Ok(()) = progress_changes.changed() => sampler.emit_if_changed(),
+            Ok(()) = progress_changes.changed(), if sampler.is_some() => {
+                emit_cache_progress(&mut sampler);
+            }
             Some(result) = tasks.join_next() => {
                 match result {
                     Ok((partition_index, batches)) => {
-                        sampler.emit_if_changed();
+                        emit_cache_progress(&mut sampler);
                         partitions.push((partition_index, batches?));
                     }
                     Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
                     Err(error) => {
-                        sampler.emit_if_changed();
+                        emit_cache_progress(&mut sampler);
                         return Err(mssql_scoped_cache_alias_error(
                             "materialize",
                             alias_name,
@@ -335,6 +333,12 @@ async fn collect_cache_partitions(
     }
     partitions.sort_by_key(|(partition_index, _)| *partition_index);
     Ok(partitions.into_iter().map(|(_, batches)| batches).collect())
+}
+
+fn emit_cache_progress(sampler: &mut Option<DeltaFileProgressSampler>) {
+    if let Some(sampler) = sampler {
+        sampler.emit_if_changed();
+    }
 }
 
 pub(super) fn restore_mssql_cache_aliases(
@@ -432,7 +436,7 @@ mod tests {
             None,
         );
 
-        let partitions = collect_cache_partitions(streams, sampler, "big").await?;
+        let partitions = collect_cache_partitions(streams, Some(sampler), "big").await?;
 
         assert_eq!(partitions.len(), 2);
         assert!(partitions.iter().all(|batches| batches.len() == 1));
