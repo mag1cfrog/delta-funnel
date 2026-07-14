@@ -3,7 +3,8 @@ use std::{fmt, panic::resume_unwind, sync::Arc};
 use datafusion::{
     arrow::record_batch::RecordBatch,
     datasource::{MemTable, TableProvider},
-    physical_plan::execute_stream_partitioned,
+    execution::TaskContext,
+    physical_plan::{ExecutionPlan, execute_stream_partitioned},
     prelude::{DataFrame, SessionContext},
 };
 use futures_util::{StreamExt, TryStreamExt};
@@ -13,7 +14,9 @@ use crate::{
     DeltaFunnelError, MssqlOutputBatchStream,
     observability::DeltaProviderScanOutcome,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
-    query_engine::datafusion::collect_delta_provider_read_stats_handles,
+    query_engine::datafusion::{
+        DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
+    },
     support::sanitize_text_for_display,
 };
 
@@ -177,34 +180,8 @@ impl DeltaFunnelSession {
                 None,
             )
         });
-        let streams = match execute_stream_partitioned(physical_plan, task_ctx) {
-            Ok(streams) => streams,
-            Err(error) => {
-                finalize_provider_scan_execution(
-                    &read_stats_handles,
-                    None,
-                    DeltaProviderScanOutcome::Error,
-                );
-                return Err(mssql_scoped_cache_alias_error(
-                    "materialize",
-                    alias_name,
-                    error,
-                ));
-            }
-        };
-        let streams = streams
-            .into_iter()
-            .map(|stream| {
-                let alias_name = alias_name.to_owned();
-                let stream: MssqlOutputBatchStream = Box::pin(stream.map(move |batch| {
-                    batch.map_err(|error| {
-                        mssql_scoped_cache_alias_error("materialize", alias_name.as_str(), error)
-                    })
-                }));
-                stream
-            })
-            .collect::<Vec<_>>();
-        let streams = track_partitioned_scan_completion(streams, read_stats_handles);
+        let streams =
+            start_cache_partition_streams(physical_plan, task_ctx, read_stats_handles, alias_name)?;
         let partitions = collect_cache_partitions(streams, sampler, alias_name).await?;
         let cached_provider = MemTable::try_new(schema, partitions)
             .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
@@ -275,6 +252,49 @@ impl DeltaFunnelSession {
 
         DeltaFunnelError::MssqlWorkflowPlanning { message }
     }
+}
+
+/// Starts partitioned cache execution and attaches one shared terminal tracker.
+///
+/// If DataFusion fails before returning stream ownership, the already collected
+/// Delta scan handles are finalized immediately with an error outcome.
+fn start_cache_partition_streams(
+    physical_plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+    alias_name: &str,
+) -> Result<Vec<MssqlOutputBatchStream>, DeltaFunnelError> {
+    let streams = match execute_stream_partitioned(physical_plan, task_ctx) {
+        Ok(streams) => streams,
+        Err(error) => {
+            finalize_provider_scan_execution(
+                &read_stats_handles,
+                None,
+                DeltaProviderScanOutcome::Error,
+            );
+            return Err(mssql_scoped_cache_alias_error(
+                "materialize",
+                alias_name,
+                error,
+            ));
+        }
+    };
+    let streams = streams
+        .into_iter()
+        .map(|stream| {
+            let alias_name = alias_name.to_owned();
+            let stream: MssqlOutputBatchStream = Box::pin(stream.map(move |batch| {
+                batch.map_err(|error| {
+                    mssql_scoped_cache_alias_error("materialize", alias_name.as_str(), error)
+                })
+            }));
+            stream
+        })
+        .collect();
+    Ok(track_partitioned_scan_completion(
+        streams,
+        read_stats_handles,
+    ))
 }
 
 /// Collects each cache partition in its own Tokio task and restores its order.
@@ -446,12 +466,83 @@ mod tests {
     use super::*;
 
     use crate::{
-        DeltaFunnelError,
+        DeltaFunnelError, DeltaSourceConfig,
+        observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         orchestrator::session::{
             DeltaFunnelSession, SessionOptions,
-            test_support::{marker_values_from_batches, scan_counting_marker_region_provider},
+            test_support::{
+                StreamSetupFailingPlan, marker_values_from_batches,
+                scan_counting_marker_region_provider,
+            },
         },
+        table_formats::RealParquetDeltaTable,
     };
+    use tracing::Level;
+
+    fn provider_io_events(events: &CapturedEvents) -> Vec<CapturedEvent> {
+        events
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some("delta_provider_parquet_io_summary")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cache_stream_setup_error_emits_one_error_summary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("cache-stream-setup-error")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let task_ctx = Arc::new(dataframe.task_ctx());
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let failing_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamSetupFailingPlan::new(physical_plan));
+        let handles = collect_delta_provider_read_stats_handles(failing_plan.as_ref());
+        assert_eq!(handles.len(), 1);
+
+        let capture = TracingCapture::start();
+        let result = start_cache_partition_streams(failing_plan, task_ctx, handles, "orders_cache");
+        let summaries = provider_io_events(capture.captured());
+
+        assert!(result.is_err());
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].target, "delta_funnel");
+        assert_eq!(summaries[0].level, Level::DEBUG);
+        assert_eq!(
+            summaries[0].fields.get("source_name").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            summaries[0].fields.get("outcome").map(String::as_str),
+            Some("error")
+        );
+        assert_eq!(
+            summaries[0]
+                .fields
+                .get("metrics_available")
+                .map(String::as_str),
+            Some("true")
+        );
+        for field in [
+            "parquet_data_file_range_get_operations",
+            "parquet_data_file_full_get_operations",
+            "parquet_data_file_bytes_received",
+            "parquet_data_file_opened_bytes",
+        ] {
+            assert_eq!(
+                summaries[0].fields.get(field).map(String::as_str),
+                Some("0")
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn cache_partition_collection_uses_one_task_per_partition()
