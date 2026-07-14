@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use datafusion::physical_plan::{
@@ -19,6 +19,72 @@ use super::{DeltaProviderReadStatsHandle, execution::DeltaScanPlanningExec};
 
 pub(crate) type DeltaProviderReadStatsSnapshotSet =
     Vec<(DeltaProviderReadStatsHandle, DeltaProviderReadStatsSnapshot)>;
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct QueryExecutionProfileResult {
+    profile: Arc<OnceLock<QueryExecutionProfile>>,
+}
+
+#[allow(dead_code)]
+impl QueryExecutionProfileResult {
+    pub(crate) fn profile(&self) -> Option<&QueryExecutionProfile> {
+        self.profile.get()
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct QueryExecutionProfileConsumer {
+    root: Arc<dyn ExecutionPlan>,
+    scope: QueryExecutionScope,
+    delta_funnel_row_limit: Option<u64>,
+    result: QueryExecutionProfileResult,
+}
+
+#[allow(dead_code)]
+impl QueryExecutionProfileConsumer {
+    pub(crate) fn register(
+        root: Arc<dyn ExecutionPlan>,
+        scope: QueryExecutionScope,
+        delta_funnel_row_limit: Option<u64>,
+    ) -> (Self, QueryExecutionProfileResult) {
+        let result = QueryExecutionProfileResult {
+            profile: Arc::new(OnceLock::new()),
+        };
+        (
+            Self {
+                root,
+                scope,
+                delta_funnel_row_limit,
+                result: result.clone(),
+            },
+            result,
+        )
+    }
+
+    pub(crate) fn consume_terminal(
+        self,
+        outcome: QueryExecutionOutcome,
+        terminal_provider_snapshots: &DeltaProviderReadStatsSnapshotSet,
+    ) {
+        let Self {
+            root,
+            scope,
+            delta_funnel_row_limit,
+            result,
+        } = self;
+        let profile = collect_query_execution_profile(
+            &root,
+            scope,
+            outcome,
+            delta_funnel_row_limit.unwrap_or_default(),
+            Some(terminal_provider_snapshots),
+        );
+        drop(root);
+        let profile = result.profile.get_or_init(|| profile);
+        crate::observability::query_execution_profile_terminal(profile);
+    }
+}
 
 #[allow(dead_code)]
 pub(crate) fn delta_provider_read_stats_snapshot_set(
@@ -40,7 +106,7 @@ pub(crate) fn collect_query_execution_profile(
     root: &Arc<dyn ExecutionPlan>,
     scope: QueryExecutionScope,
     outcome: QueryExecutionOutcome,
-    delta_funnel_row_limit: usize,
+    delta_funnel_row_limit: u64,
     terminal_provider_snapshots: Option<&DeltaProviderReadStatsSnapshotSet>,
 ) -> QueryExecutionProfile {
     let supplied_snapshots = terminal_provider_snapshots.map(|snapshots| {
@@ -499,6 +565,81 @@ mod tests {
             self.metrics_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.metrics.clone()
         }
+    }
+
+    #[test]
+    fn terminal_consumer_collects_once_stores_result_and_releases_root() -> TestResult {
+        let root = ProfileTestExec::new("RootExec", "secret plan text", Vec::new(), 1, true);
+        let metrics_calls = Arc::clone(&root.metrics_calls);
+        let root: Arc<dyn ExecutionPlan> = root;
+        let weak_root = Arc::downgrade(&root);
+        let (consumer, result) = QueryExecutionProfileConsumer::register(
+            Arc::clone(&root),
+            QueryExecutionScope::Preview,
+            Some(20),
+        );
+        let terminal_snapshots = Vec::new();
+        assert!(result.profile().is_none());
+        drop(root);
+        let capture = TracingCapture::start();
+
+        consumer.consume_terminal(QueryExecutionOutcome::Cancelled, &terminal_snapshots);
+
+        let profile = result.profile().ok_or("expected terminal profile")?;
+        assert_eq!(profile.scope(), QueryExecutionScope::Preview);
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Cancelled);
+        assert_eq!(profile.delta_funnel_row_limit(), Some(20));
+        assert_eq!(profile.operators().len(), 1);
+        assert_eq!(metrics_calls.load(AtomicOrdering::Relaxed), 1);
+        assert!(weak_root.upgrade().is_none());
+        let events = capture
+            .captured()
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some("query_execution_profile_terminal")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target, "delta_funnel");
+        assert_eq!(events[0].level, Level::DEBUG);
+
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_consumer_registrations_keep_scope_limit_and_outcome_distinct() -> TestResult {
+        for (scope, limit, outcome) in [
+            (
+                QueryExecutionScope::Preview,
+                Some(25),
+                QueryExecutionOutcome::Success,
+            ),
+            (
+                QueryExecutionScope::MssqlOutput,
+                None,
+                QueryExecutionOutcome::Error,
+            ),
+            (
+                QueryExecutionScope::WriteAllCacheAlias,
+                None,
+                QueryExecutionOutcome::Cancelled,
+            ),
+        ] {
+            let root: Arc<dyn ExecutionPlan> =
+                ProfileTestExec::new("RootExec", "redacted", Vec::new(), 1, false);
+            let (consumer, result) = QueryExecutionProfileConsumer::register(root, scope, limit);
+
+            consumer.consume_terminal(outcome, &Vec::new());
+
+            let profile = result.profile().ok_or("expected terminal profile")?;
+            assert_eq!(profile.scope(), scope);
+            assert_eq!(profile.delta_funnel_row_limit(), limit);
+            assert_eq!(profile.outcome(), outcome);
+        }
+
+        Ok(())
     }
 
     #[test]

@@ -285,13 +285,13 @@ pub struct QueryExecutionProfile {
 impl QueryExecutionProfile {
     pub(crate) fn preview(
         outcome: QueryExecutionOutcome,
-        delta_funnel_row_limit: usize,
+        delta_funnel_row_limit: u64,
         operators: Vec<QueryExecutionOperatorProfile>,
     ) -> Self {
         Self::new(
             QueryExecutionScope::Preview,
             outcome,
-            Some(crate::usize_to_u64_saturating(delta_funnel_row_limit)),
+            Some(delta_funnel_row_limit),
             operators,
         )
     }
