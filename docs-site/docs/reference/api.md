@@ -46,12 +46,50 @@ registration. Progress is selected by the call that performs registration. A
 value passed while creating an unnamed pending source is not reused by
 `alias(...)`.
 
-`Table.preview(limit=20, *, progress=None)` returns a `Preview` object.
-`Table.show(limit=20, *, progress=None)` executes the same preview and prints
-the text form to Python stdout. Both execute the DataFusion query with the limit
-applied before collection, read rows, and do not contact or write to SQL Server.
-`Preview.text` is the plain text table and `Preview.html` backs notebook
-`_repr_html_()` display.
+`Table.preview(limit=20, *, progress=None, profile=False)` returns a `Preview`
+object. Phase timings are always available through the read-only
+`Preview.phase_timings` list. Pass `profile=True` to also populate the read-only
+`Preview.execution_profile` dictionary. Omission, `None`, and `False` disable
+detailed profiling; other values except the actual Boolean `True` are rejected.
+
+`Table.show(limit=20, *, progress=None)` executes the same bounded query and
+prints the text form to Python stdout. It keeps detailed profiling disabled
+because it discards the `Preview` object. Both methods apply the limit before
+collection, read rows, and do not contact or write to SQL Server. `Preview.text`
+is the plain text table and `Preview.html` backs notebook `_repr_html_()`
+display.
+
+Rust callers opt in with `PreviewOptions` and the option-bearing session or
+runtime method:
+
+```rust
+use delta_funnel::{ExecutionProfileMode, PreviewOptions};
+
+let options = PreviewOptions::new(20)
+    .with_execution_profile_mode(ExecutionProfileMode::Detailed);
+let preview = runtime.preview_table_with_options(&session, &table, options)?;
+
+for timing in preview.phase_timings() {
+    println!("{}: {:?}", timing.phase_name(), timing.status());
+}
+if let Some(profile) = preview.execution_profile() {
+    println!("profiled {} operators", profile.operators().len());
+}
+```
+
+The legacy Rust `preview_table` methods remain available. They return phase
+timings with detailed profiling disabled.
+
+When preview execution fails, Rust returns
+`DeltaFunnelError::PreviewFailed { context, source }`. The redacted context
+identifies the failed phase and retains the ordered phase timings plus any
+terminal execution profile that was available. Python exposes the same data on
+`DeltaFunnelError` with `phase="preview"`, `kind="preview_failed"`, and the
+JSON-compatible `context` dictionary.
+
+See [Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-preview-diagnostics)
+for phase boundaries and interpretation. See the execution profile model below
+for the profile schema.
 
 For Delta sources, `Session.delta_lake(..., storage_options=...)` accepts a
 mapping of string keys and values and forwards them to the underlying

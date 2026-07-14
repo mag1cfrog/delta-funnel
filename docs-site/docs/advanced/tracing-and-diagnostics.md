@@ -208,6 +208,79 @@ The Python bridge exposes these fields as string-valued `deltafunnel_*`
 the Rust `delta_funnel=debug` filter and the selected Python logger and handler
 must admit DEBUG records.
 
+## Inspect Returned Preview Diagnostics
+
+Bounded previews always return seven ordered phase timings. Detailed execution
+profiles are opt-in and reuse the same immutable terminal result that supplies
+`query_execution_profile_terminal`.
+
+Enable the full profile from Python:
+
+```python
+preview = table.preview(limit=20, profile=True)
+
+for timing in preview.phase_timings:
+    print(timing["phase_name"], timing["status"], timing["elapsed_micros"])
+
+profile = preview.execution_profile
+```
+
+Omitting `profile`, or passing `None` or `False`, still returns all phase
+timings but leaves `execution_profile` as `None`. `Table.show()` always uses
+this disabled mode because it does not return the preview diagnostics.
+
+Rust callers use `PreviewOptions` with
+`ExecutionProfileMode::Detailed`, then read `TablePreview::phase_timings()` and
+`TablePreview::execution_profile()`. See [API references](../reference/api.md)
+for the option-bearing call.
+
+The phases are:
+
+| Phase | Boundary |
+| --- | --- |
+| `preview_dataframe_planning` | Resolve the session-owned lazy table, capture its schema, and apply the requested Delta Funnel limit. |
+| `preview_physical_planning` | Create the DataFusion physical plan. |
+| `preview_stream_setup` | Construct the effective merged stream and install progress and terminal observers. |
+| `preview_execute_collect` | Poll the merged stream to its terminal state and collect record batches. |
+| `preview_format_text` | Format only the plain text table. |
+| `preview_format_html` | Format only the HTML table. |
+| `preview_total` | Measure the whole preview operation, including every phase above and orchestration between them. |
+
+`preview_total` overlaps every child phase. Do not add the phase durations or
+operator durations and treat the result as wall time. Executing operators and
+partitions can also overlap.
+
+On success, every phase is `completed`. On failure, the phase returning the
+error is `failed`, every later unstarted phase is `not_started` with reason
+`prior_failure`, and `preview_total` is `failed`. No elapsed time is invented
+for an unstarted phase.
+
+Detailed mode records the requested preview limit in
+`delta_funnel_row_limit`. A `success` outcome means the limited execution
+reached normal end-of-stream. It does not mean an unbounded query was executed.
+The query outcome and the final preview result are intentionally separate: a
+text or HTML formatting failure can retain a successful, non-partial execution
+profile. A failure before a physical plan exists has no profile.
+
+Rust exposes failure diagnostics through `PreviewFailureContext`. Python maps
+them to a `DeltaFunnelError` whose `phase` is `preview`, whose `kind` is
+`preview_failed`, and whose `context` contains `failed_phase`, `phase_timings`,
+and `execution_profile`. These fields follow the same redaction rules as a
+successful profile.
+
+The returned diagnostics and terminal tracing event serve different uses:
+
+| Surface | Availability | Content |
+| --- | --- | --- |
+| Preview phase timings | Every real preview result or returned preview failure. | Full ordered logical phase timings. |
+| Preview execution profile | Returned result or failure context when `profile=True` or Rust detailed mode is enabled. | Full operator profile described by the [execution profile model](../reference/api.md#execution-profile-model). |
+| `query_execution_profile_terminal` | One `DEBUG` tracing event when detailed mode reaches the terminal execution transition. | Bounded summary fields for live tracing and logging systems. |
+
+The terminal event is not a serialized copy of the returned profile. It omits
+the operator list and can be observed before later preview formatting finishes.
+Both surfaces derive execution facts from the same immutable profile; preview
+orchestration does not recollect metrics or emit a second profile event.
+
 ## What Not To Share
 
 Do not include these values in public issues, chat, logs, or pasted reports:
