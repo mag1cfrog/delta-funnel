@@ -1350,6 +1350,22 @@ mod tests {
         assert_eq!(value["parquet_data_file_opened_bytes"], Value::Null);
     }
 
+    #[test]
+    fn provider_read_stats_json_preserves_available_parquet_io_metric_zeros() {
+        let mut stats = provider_read_stats_snapshot();
+        stats.parquet_data_file_range_get_operations = Some(0);
+        stats.parquet_data_file_full_get_operations = Some(0);
+        stats.parquet_data_file_bytes_received = Some(0);
+        stats.parquet_data_file_opened_bytes = Some(0);
+
+        let value = provider_read_stats_value(&stats);
+
+        assert_eq!(value["parquet_data_file_range_get_operations"], 0);
+        assert_eq!(value["parquet_data_file_full_get_operations"], 0);
+        assert_eq!(value["parquet_data_file_bytes_received"], 0);
+        assert_eq!(value["parquet_data_file_opened_bytes"], 0);
+    }
+
     fn session_with_default_connection() -> Result<DeltaFunnelSession, crate::DeltaFunnelError> {
         let connection = MssqlConnectionConfig::new(
             "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",

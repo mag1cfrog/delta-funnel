@@ -283,4 +283,36 @@ mod tests {
         }
         Ok(())
     }
+
+    #[tokio::test]
+    async fn multiple_scan_snapshots_remain_one_unsummed_json_object()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders-multiple-snapshots")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let planned_reports = session.source_reports_for_lazy_table_plan(&source).await?;
+        let mut first = planned_reports
+            .first()
+            .and_then(|report| report.provider_read_stats())
+            .ok_or("expected planned provider read stats")?
+            .clone();
+        first.parquet_data_file_range_get_operations = Some(11);
+        let mut second = first.clone();
+        second.parquet_data_file_range_get_operations = Some(29);
+
+        let reports = session.source_reports_with_provider_read_stats(vec![first, second]);
+        let value = reports
+            .first()
+            .ok_or("expected source report")?
+            .to_json_value();
+        let provider_stats = &value["provider_read_stats"];
+        let retained_operations = provider_stats["parquet_data_file_range_get_operations"]
+            .as_u64()
+            .ok_or("expected retained range GET count")?;
+
+        assert!(provider_stats.is_object());
+        assert!([11, 29].contains(&retained_operations));
+        assert_ne!(retained_operations, 40);
+        Ok(())
+    }
 }
