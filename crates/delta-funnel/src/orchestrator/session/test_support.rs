@@ -23,7 +23,7 @@ use datafusion::{
     logical_expr::{Expr, TableType},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-        test::exec::ErrorExec,
+        test::exec::{BlockingExec, ErrorExec},
     },
 };
 use futures_util::StreamExt;
@@ -320,6 +320,17 @@ struct StreamSetupFailingProvider {
 }
 
 #[derive(Debug)]
+struct BlockingProvider {
+    plan: Arc<BlockingPlan>,
+}
+
+/// Exposes DataFusion's blocking test executor as an optimizer-rebuildable leaf.
+#[derive(Debug)]
+struct BlockingPlan {
+    inner: BlockingExec,
+}
+
+#[derive(Debug)]
 struct PlanLifetimeTrackingProvider {
     child: Arc<dyn TableProvider>,
     last_plan_marker: PlanLifetimeMarker,
@@ -412,6 +423,79 @@ impl TableProvider for StreamSetupFailingProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let child = self.child.scan(state, projection, filters, limit).await?;
         Ok(Arc::new(StreamSetupFailingPlan::new(child)))
+    }
+}
+
+#[async_trait]
+impl TableProvider for BlockingProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.plan.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self.plan.clone())
+    }
+}
+
+impl DisplayAs for BlockingPlan {
+    fn fmt_as(
+        &self,
+        _display_type: DisplayFormatType,
+        formatter: &mut fmt::Formatter,
+    ) -> fmt::Result {
+        formatter.write_str("BlockingPlan")
+    }
+}
+
+impl ExecutionPlan for BlockingPlan {
+    fn name(&self) -> &str {
+        "BlockingPlan"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.inner.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(DataFusionError::Plan(
+                "BlockingPlan requires no children".to_owned(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        self.inner.execute(partition, context)
     }
 }
 
@@ -539,6 +623,20 @@ pub(super) fn stream_setup_failing_marker_region_provider()
     Ok(Arc::new(StreamSetupFailingProvider {
         child: marker_region_provider("setup-failure")?,
     }))
+}
+
+pub(super) fn blocking_marker_provider() -> (Arc<dyn TableProvider>, Weak<()>) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "marker",
+        DataType::Utf8,
+        false,
+    )]));
+    let plan = Arc::new(BlockingPlan {
+        inner: BlockingExec::new(schema, 1),
+    });
+    let refs = plan.inner.refs();
+
+    (Arc::new(BlockingProvider { plan }), refs)
 }
 
 pub(super) fn plan_lifetime_tracking_marker_region_provider(

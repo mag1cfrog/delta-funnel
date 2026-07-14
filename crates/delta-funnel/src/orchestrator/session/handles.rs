@@ -179,7 +179,8 @@ impl PreviewFailureContext {
         &self.phase_timings
     }
 
-    /// Returns the terminal execution profile when query execution started.
+    /// Returns the terminal execution profile when detailed profiling reached
+    /// a terminal transition, including stream-setup failure.
     #[must_use]
     pub const fn execution_profile(&self) -> Option<&QueryExecutionProfile> {
         self.execution_profile.as_ref()
@@ -196,7 +197,10 @@ pub struct TablePreview {
 }
 
 impl TablePreview {
-    /// Creates a rendered lazy table preview.
+    /// Creates a rendered lazy table preview without execution diagnostics.
+    ///
+    /// All seven preview phase timings are marked unavailable with
+    /// [`ReportReasonCode::NotExecuted`], and no execution profile is attached.
     #[must_use]
     pub fn new(text: String, html: String) -> Self {
         Self::from_execution(

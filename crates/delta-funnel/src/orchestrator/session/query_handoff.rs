@@ -541,15 +541,15 @@ impl PreviewTimingTracker {
         let failed_timing = timer.failed();
         let failed_phase = failed_timing.phase_name().to_owned();
         self.phase_timings.push(failed_timing);
-        self.phase_timings.extend(
-            PREVIEW_PHASE_NAMES
-                .iter()
-                .take(PREVIEW_PHASE_NAMES.len() - 1)
-                .skip(self.phase_timings.len())
-                .map(|phase_name| {
-                    PhaseTimingReport::not_started(*phase_name, ReportReasonCode::PriorFailure)
-                }),
-        );
+        let next_phase_index = self.phase_timings.len();
+        let non_total_phases = &PREVIEW_PHASE_NAMES[..PREVIEW_PHASE_NAMES.len() - 1];
+        debug_assert!(next_phase_index <= non_total_phases.len());
+        let remaining_non_total_phases =
+            non_total_phases.get(next_phase_index..).unwrap_or_default();
+        self.phase_timings
+            .extend(remaining_non_total_phases.iter().map(|phase_name| {
+                PhaseTimingReport::not_started(*phase_name, ReportReasonCode::PriorFailure)
+            }));
         self.phase_timings.push(self.total_timer.failed());
 
         DeltaFunnelError::PreviewFailed {
@@ -583,7 +583,7 @@ fn register_preview_execution_profile(
     }
 }
 
-fn completed_execution_profile(
+fn clone_terminal_execution_profile(
     result: Option<QueryExecutionProfileResult>,
 ) -> Option<QueryExecutionProfile> {
     result
@@ -673,7 +673,11 @@ impl DeltaFunnelSession {
         result
     }
 
-    /// Runs the existing preview steps and optionally announces each boundary.
+    /// Runs preview phases and optionally announces each live boundary.
+    ///
+    /// This future owns phase timing and rendering. After stream setup, the
+    /// terminal stream owns profile and provider finalization on EOF, error, or
+    /// cancellation.
     async fn build_preview(
         &self,
         table: &LazyTable,
@@ -729,7 +733,7 @@ impl DeltaFunnelSession {
                     profile_consumer,
                     DeltaProviderScanOutcome::Error,
                 );
-                let execution_profile = completed_execution_profile(profile_result);
+                let execution_profile = clone_terminal_execution_profile(profile_result);
                 let source = datafusion_handoff_setup_error("preview_collect", error);
                 return Err(timings.failed(stream_setup_timer, execution_profile, source));
             }
@@ -760,12 +764,12 @@ impl DeltaFunnelSession {
         let batches = match stream.try_collect::<Vec<_>>().await {
             Ok(batches) => batches,
             Err(source) => {
-                let execution_profile = completed_execution_profile(profile_result);
+                let execution_profile = clone_terminal_execution_profile(profile_result);
                 return Err(timings.failed(execute_collect_timer, execution_profile, source));
             }
         };
         timings.record_completed(execute_collect_timer);
-        let execution_profile = completed_execution_profile(profile_result);
+        let execution_profile = clone_terminal_execution_profile(profile_result);
 
         emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
         format_preview_result(
@@ -1056,9 +1060,10 @@ mod tests {
     };
 
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig, ExecutionProfileMode, PhaseStatus,
-        PreviewFailureContext, PreviewOptions, QueryExecutionOutcome, QueryExecutionProfile,
-        QueryExecutionScope, QueryOptions, ReportReasonCode,
+        DeltaFunnelError, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
+        DeltaSourceConfig, ExecutionProfileMode, PhaseStatus, PreviewFailureContext,
+        PreviewOptions, QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope,
+        QueryOptions, ReportReasonCode,
         observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         query_engine::datafusion::execution_profile::QueryExecutionProfileConsumer,
@@ -1079,8 +1084,9 @@ mod tests {
     use super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
         test_support::{
-            DeltaLogTable, StreamSetupFailingPlan, collect_stream_marker_values,
-            collect_stream_row_count, failing_scan_marker_region_provider, marker_region_provider,
+            DeltaLogTable, StreamSetupFailingPlan, blocking_marker_provider,
+            collect_stream_marker_values, collect_stream_row_count,
+            failing_scan_marker_region_provider, marker_region_provider,
             marker_values_from_batches, plan_lifetime_tracking_marker_region_provider,
             scan_counting_marker_region_provider, stream_setup_failing_marker_region_provider,
         },
@@ -2255,6 +2261,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detailed_preview_progress_preserves_profile_and_timing_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_two_files("detailed-progress-parity")?;
+        let provider_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new()
+                .with_query_options(QueryOptions {
+                    target_partitions: Some(1),
+                    output_batch_size: Some(1),
+                })
+                .with_provider_scan_options(provider_options),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let options =
+            PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed);
+        let capture = TracingCapture::start();
+
+        let unreported = session.preview_table_with_options(&source, options).await?;
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+        assert_eq!(provider_io_events(capture.captured()).len(), 1);
+        let (reporter, progress_events) = recording_preview_progress();
+        let reported = session
+            .preview_table_with_options_and_progress(&source, options, reporter)
+            .await?;
+
+        assert_eq!(reported.text(), unreported.text());
+        assert_eq!(reported.html(), unreported.html());
+        assert_eq!(
+            reported.phase_timings().len(),
+            unreported.phase_timings().len()
+        );
+        for (reported, unreported) in reported
+            .phase_timings()
+            .iter()
+            .zip(unreported.phase_timings())
+        {
+            assert_eq!(reported.phase_name(), unreported.phase_name());
+            assert_eq!(reported.status(), unreported.status());
+            assert_eq!(
+                reported.elapsed_micros().is_some(),
+                unreported.elapsed_micros().is_some()
+            );
+        }
+
+        let reported_profile = reported
+            .execution_profile()
+            .ok_or("expected reported detailed preview profile")?;
+        let unreported_profile = unreported
+            .execution_profile()
+            .ok_or("expected unreported detailed preview profile")?;
+        assert_eq!(reported_profile.scope(), unreported_profile.scope());
+        assert_eq!(reported_profile.outcome(), unreported_profile.outcome());
+        assert_eq!(reported_profile.partial(), unreported_profile.partial());
+        assert_eq!(
+            reported_profile.delta_funnel_row_limit(),
+            unreported_profile.delta_funnel_row_limit()
+        );
+        assert_eq!(
+            reported_profile.operators().len(),
+            unreported_profile.operators().len()
+        );
+        for (reported, unreported) in reported_profile
+            .operators()
+            .iter()
+            .zip(unreported_profile.operators())
+        {
+            assert_eq!(reported.node_id(), unreported.node_id());
+            assert_eq!(reported.parent_node_id(), unreported.parent_node_id());
+            assert_eq!(reported.operator_name(), unreported.operator_name());
+            assert_eq!(
+                reported.output_partition_count(),
+                unreported.output_partition_count()
+            );
+            assert_eq!(reported.metrics_available(), unreported.metrics_available());
+            assert_eq!(
+                reported.delta_provider_read_stats(),
+                unreported.delta_provider_read_stats()
+            );
+        }
+
+        assert_eq!(execution_profile_events(capture.captured()).len(), 2);
+        assert_eq!(provider_io_events(capture.captured()).len(), 2);
+        let progress_events = progress_events
+            .lock()
+            .map_err(|_| "preview event lock poisoned")?;
+        assert!(progress_events.iter().any(|event| {
+            event.0 == ProgressEventKind::PhaseChanged
+                && event.2 == Some(ProgressPhase::FormattingPreview)
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn preview_progress_follows_existing_preview_boundaries()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -2385,6 +2491,59 @@ mod tests {
                 "{mode:?} preview retained its execution plan during formatting"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_detailed_preview_after_stream_setup_emits_one_cancelled_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (provider, execution_refs) = blocking_marker_provider();
+        session
+            .context()
+            .register_table("blocking_source", provider)?;
+        let table = session
+            .table_from_sql("select marker from blocking_source")
+            .await?;
+        let capture = TracingCapture::start();
+
+        {
+            let preview = session.preview_table_with_options(
+                &table,
+                PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed),
+            );
+            tokio::pin!(preview);
+            let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if execution_refs.strong_count() > 1 {
+                        return None;
+                    }
+                    tokio::select! {
+                        result = &mut preview => return Some(result),
+                        () = tokio::task::yield_now() => {}
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "preview stream setup timed out")?;
+            if let Some(result) = completed {
+                return Err(format!("preview completed before cancellation: {result:?}").into());
+            }
+        }
+
+        let events = execution_profile_events(capture.captured());
+        assert_eq!(events.len(), 1);
+        for (field, value) in [
+            ("scope", "preview"),
+            ("outcome", "cancelled"),
+            ("partial", "true"),
+            ("delta_funnel_row_limit", "1"),
+        ] {
+            assert_eq!(events[0].fields.get(field).map(String::as_str), Some(value));
+        }
+        assert!(provider_io_events(capture.captured()).is_empty());
+        tokio::task::yield_now().await;
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
         Ok(())
     }
 
