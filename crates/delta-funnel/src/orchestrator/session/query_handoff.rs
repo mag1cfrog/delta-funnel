@@ -79,10 +79,10 @@ pub(super) fn finalize_provider_scan_execution(
 /// fails, or is dropped by its downstream consumer.
 struct DeltaProviderScanTerminalStream {
     inner: MssqlOutputBatchStream,
-    // One live counter handle for each Delta scan in the output plan.
-    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+    // Taking these handles records the single terminal transition and releases
+    // the counters as soon as that transition completes.
+    read_stats_handles: Option<Vec<DeltaProviderReadStatsHandle>>,
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
-    finalized: bool,
 }
 
 impl DeltaProviderScanTerminalStream {
@@ -93,20 +93,19 @@ impl DeltaProviderScanTerminalStream {
     ) -> Self {
         Self {
             inner,
-            read_stats_handles,
+            read_stats_handles: Some(read_stats_handles),
             provider_stats_snapshots,
-            finalized: false,
         }
     }
 
     fn finalize_if_needed(&mut self, outcome: DeltaProviderScanOutcome) {
-        if self.finalized {
+        let Some(read_stats_handles) = self.read_stats_handles.take() else {
             return;
-        }
-        self.finalized = true;
+        };
+        let provider_stats_snapshots = self.provider_stats_snapshots.take();
         finalize_provider_scan_execution(
-            &self.read_stats_handles,
-            self.provider_stats_snapshots.as_ref(),
+            &read_stats_handles,
+            provider_stats_snapshots.as_ref(),
             outcome,
         );
     }
@@ -1046,6 +1045,40 @@ mod tests {
             partitioned_coordinator_state(&coordinator),
             (0, DeltaProviderScanOutcome::Cancelled)
         );
+    }
+
+    #[tokio::test]
+    async fn merged_terminal_stream_releases_finalization_ownership_after_eof()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("terminal-ownership-release")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let handles = super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        assert_eq!(handles.len(), 1);
+        let handle = Arc::downgrade(&handles[0]);
+        drop(physical_plan);
+
+        let retained = super::shared_provider_stats_snapshots();
+        let inner: crate::MssqlOutputBatchStream = Box::pin(futures_util::stream::empty());
+        let mut stream = super::DeltaProviderScanTerminalStream::new(
+            inner,
+            handles,
+            Some(Arc::clone(&retained)),
+        );
+
+        assert!(stream.next().await.is_none());
+        assert!(stream.read_stats_handles.is_none());
+        assert!(stream.provider_stats_snapshots.is_none());
+        assert!(handle.upgrade().is_none());
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        assert_eq!(super::provider_stats_snapshots(&retained).len(), 1);
+        Ok(())
     }
 
     #[tokio::test]
