@@ -106,6 +106,41 @@ dynamic filter became newly useful only after a task had already been opened or
 prefetched; the current design intentionally avoids that producer-state
 coupling.
 
+## Parquet Data-File IO Metrics
+
+Native async provider read stats expose four counters for the Parquet data-file
+object-store handle. These counters report the reads that parquet-rs requests
+after its own range coalescing. They do not describe the smaller ranges that
+parquet-rs may have considered before combining nearby reads.
+
+- `parquet_data_file_range_get_operations`: payload GET operations whose
+  `get_opts` call contains a byte range. The counter advances immediately
+  before the request is passed to the underlying object store, so a failed
+  request still counts as an operation.
+- `parquet_data_file_full_get_operations`: payload GET operations whose
+  `get_opts` call does not contain a byte range. Metadata-only HEAD operations
+  are excluded. As with range GETs, the counter advances before the underlying
+  call and therefore includes failed requests.
+- `parquet_data_file_bytes_received`: bytes from successful response chunks
+  delivered by the object store. This includes Parquet metadata, footers,
+  column data, gaps included by range coalescing, and any data delivered again
+  by repeated reads.
+- `parquet_data_file_opened_bytes`: sum of the full data-file sizes for native
+  async tasks admitted to a reader. Each admitted task contributes once, even
+  if opening or reading the file later fails.
+
+All four fields are numeric for `native_async`, including when their value is
+zero. They are `null` for `official_kernel`, whose object-store calls are hidden
+behind the kernel reader and cannot be measured at this boundary. Range reads
+already existed in the native async reader; these counters expose evidence of
+that behavior without changing how files are read.
+
+Each `provider_read_stats` object in a JSON source report describes one retained
+physical Delta scan. It is not a total across repeated executions, multiple
+outputs, or cache materialization. Partitioned cache-materialization values are
+available through terminal tracing, but the current report envelope cannot
+represent them as one scan snapshot without losing their boundaries.
+
 ## Backpressure And Cancellation
 
 Provider execution builds a DataFusion `RecordBatchReceiverStream` with bounded
@@ -138,8 +173,10 @@ into multiple object-store requests. DeltaFunnel does not claim request-level,
 range-level, or row-group-level fairness for that hidden work. The provider
 keeps file-level bounds conservative for this backend.
 
-The native async backend routes Parquet reads through the selected
-`object_store` handle and bounds active file streams with async semaphore
-permits. The current public scheduling surface is file-stream admission plus
-bounded file setup prefetch; request-level or range-level counters are not yet
-exported as provider metrics.
+The native async IO counters observe `object_store` calls, not lower-level HTTP
+retries, wire traffic, compressed transfer sizes, billing units, or local disk
+system calls. Received bytes can exceed opened bytes when the visible object
+store layer delivers repeated or overlapping reads. For a local
+`GetResultPayload::File`, received bytes are recorded at the range-result
+boundary, so that result contributes either its full delivered length or zero
+if it fails.
