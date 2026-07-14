@@ -13,11 +13,17 @@ use std::{
 use crate::error::DeltaFunnelError;
 
 pub mod delta;
+mod execution_profile;
 mod json;
 pub mod sql_server;
 
 pub use delta::{
     DeltaProtocolReport, DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus,
+};
+pub use execution_profile::{
+    ExecutionProfileMode, QueryExecutionMetric, QueryExecutionMetricCategory,
+    QueryExecutionMetricValue, QueryExecutionOperatorProfile, QueryExecutionOutcome,
+    QueryExecutionProfile, QueryExecutionScope,
 };
 pub use sql_server::{
     MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,

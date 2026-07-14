@@ -14,7 +14,8 @@ use crate::{
     MssqlOutputFieldReport, MssqlOutputWriteStatus, MssqlTargetCleanupStatus, MssqlTargetTable,
     MssqlWorkflowWriteReport, MssqlWriteFailureContext, MssqlWriteFailureReport, MssqlWritePhase,
     MssqlWriteReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport, MssqlWriteStats,
-    OutputStatus, PhaseStatus, PhaseTimingReport, ReportReasonCode, RowCount, RunMode,
+    OutputStatus, PhaseStatus, PhaseTimingReport, QueryExecutionMetric, QueryExecutionMetricValue,
+    QueryExecutionOperatorProfile, QueryExecutionProfile, ReportReasonCode, RowCount, RunMode,
     ValidationStatus, WorkflowStatus, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
     WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheReport,
     WriteAllNoCacheReason, WriteAllReport,
@@ -80,6 +81,69 @@ impl PhaseTimingReport {
             "phase_name": self.phase_name(),
             "status": self.status().to_json_value(),
             "elapsed_micros": self.elapsed_micros(),
+        })
+    }
+}
+
+impl QueryExecutionProfile {
+    /// Returns this execution profile as a stable JSON-compatible value.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "scope": self.scope().as_str(),
+            "outcome": self.outcome().as_str(),
+            "partial": self.partial(),
+            "delta_funnel_row_limit": self.delta_funnel_row_limit(),
+            "operators": self
+                .operators()
+                .iter()
+                .map(QueryExecutionOperatorProfile::to_json_value)
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+impl QueryExecutionOperatorProfile {
+    /// Returns this operator profile as a stable JSON-compatible value.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "node_id": self.node_id(),
+            "parent_node_id": self.parent_node_id(),
+            "operator_name": self.operator_name(),
+            "output_partition_count": self.output_partition_count(),
+            "metrics_available": self.metrics_available(),
+            "aggregated_metrics": self
+                .aggregated_metrics()
+                .iter()
+                .map(QueryExecutionMetric::to_json_value)
+                .collect::<Vec<_>>(),
+            "metrics": self
+                .metrics()
+                .iter()
+                .map(QueryExecutionMetric::to_json_value)
+                .collect::<Vec<_>>(),
+            "delta_provider_read_stats": self
+                .delta_provider_read_stats()
+                .map(provider_read_stats_value),
+        })
+    }
+}
+
+impl QueryExecutionMetric {
+    /// Returns this redacted metric as a stable JSON-compatible value.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        let (value, components) = execution_metric_value(self.value());
+
+        json!({
+            "name": self.name(),
+            "category": self.category().as_str(),
+            "partition": self.partition(),
+            "output_partition": self.output_partition(),
+            "value_kind": self.value().value_kind(),
+            "value": value,
+            "components": components,
         })
     }
 }
@@ -736,6 +800,38 @@ fn provider_read_stats_value(stats: &DeltaProviderReadStatsSnapshot) -> Value {
         "deletion_vector_failures": stats.deletion_vector_failures,
         "deletion_vector_rejections": stats.deletion_vector_rejections,
     })
+}
+
+fn execution_metric_value(value: &QueryExecutionMetricValue) -> (Value, Value) {
+    let no_components = Value::Null;
+
+    match value {
+        QueryExecutionMetricValue::Count(value)
+        | QueryExecutionMetricValue::Bytes(value)
+        | QueryExecutionMetricValue::Nanoseconds(value)
+        | QueryExecutionMetricValue::Gauge(value)
+        | QueryExecutionMetricValue::Custom(value) => (json!(value), no_components),
+        QueryExecutionMetricValue::TimestampNanoseconds(value) => (json!(value), no_components),
+        QueryExecutionMetricValue::Pruning {
+            pruned,
+            matched,
+            fully_matched,
+        } => (
+            Value::Null,
+            json!({
+                "pruned": pruned,
+                "matched": matched,
+                "fully_matched": fully_matched,
+            }),
+        ),
+        QueryExecutionMetricValue::Ratio { part, total } => (
+            Value::Null,
+            json!({
+                "part": part,
+                "total": total,
+            }),
+        ),
+    }
 }
 
 fn skipped_reason_value(reason: &MssqlWriteSkippedReason) -> Value {

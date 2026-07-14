@@ -125,14 +125,17 @@ pub use query_engine::{
 };
 pub use report::{
     DeltaProtocolReport, DeltaProviderSchedulingReport, DeltaSourceReport, DryRunScanSummaryMode,
-    FileCount, FileCountKind, MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport,
-    MssqlDryRunSqlIdentityReport, MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport,
-    OutputStatus, OutputStatusKind, PhaseStatus, PhaseStatusKind, PhaseTimingReport,
-    ReportReasonCode, RowCount, RowCountKind, SourceUsageStatus, TargetValidationMode,
-    ValidationOptions, ValidationStatus, ValidationStatusKind, WorkflowStatus, WorkflowStatusKind,
-    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
-    WriteAllCacheCandidateSkipReason, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
-    duration_to_micros_saturating, u128_to_u64_saturating, usize_to_u64_saturating,
+    ExecutionProfileMode, FileCount, FileCountKind, MssqlDryRunOutputFieldReport,
+    MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport, MssqlDryRunSqlIdentityState,
+    MssqlDryRunWorkflowReport, OutputStatus, OutputStatusKind, PhaseStatus, PhaseStatusKind,
+    PhaseTimingReport, QueryExecutionMetric, QueryExecutionMetricCategory,
+    QueryExecutionMetricValue, QueryExecutionOperatorProfile, QueryExecutionOutcome,
+    QueryExecutionProfile, QueryExecutionScope, ReportReasonCode, RowCount, RowCountKind,
+    SourceUsageStatus, TargetValidationMode, ValidationOptions, ValidationStatus,
+    ValidationStatusKind, WorkflowStatus, WorkflowStatusKind, WriteAllCacheAliasReport,
+    WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
+    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport, duration_to_micros_saturating,
+    u128_to_u64_saturating, usize_to_u64_saturating,
 };
 pub use sql_server::{
     LoadMode, MssqlBatchShapingReport, MssqlBinaryPolicy, MssqlConnectionConfig,

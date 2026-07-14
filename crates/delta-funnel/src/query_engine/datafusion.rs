@@ -10,6 +10,7 @@ use crate::DeltaFunnelError;
 
 mod catalog;
 mod execution;
+pub(crate) mod execution_profile;
 mod planning;
 mod session;
 
