@@ -49,6 +49,21 @@ pub(super) fn provider_read_stats_snapshot(
     }
 }
 
+/// Adds one point-in-time snapshot for every retained scan handle.
+pub(super) fn append_provider_read_stats(
+    provider_stats: &SharedProviderReadStats,
+    read_stats_handles: &[DeltaProviderReadStatsHandle],
+) {
+    let snapshots = snapshot_delta_provider_read_stats(read_stats_handles);
+    if snapshots.is_empty() {
+        return;
+    }
+    match provider_stats.lock() {
+        Ok(mut provider_stats) => provider_stats.extend(snapshots),
+        Err(poisoned) => poisoned.into_inner().extend(snapshots),
+    }
+}
+
 /// Records final Delta provider statistics for a write-all report.
 ///
 /// The recorder keeps only shared read counters and snapshots them when the
@@ -80,14 +95,7 @@ impl FinalDeltaReadStatsRecorder {
             return;
         }
         self.recorded = true;
-        let snapshots = snapshot_delta_provider_read_stats(&self.read_stats_handles);
-        if snapshots.is_empty() {
-            return;
-        }
-        match self.provider_stats.lock() {
-            Ok(mut provider_stats) => provider_stats.extend(snapshots),
-            Err(poisoned) => poisoned.into_inner().extend(snapshots),
-        }
+        append_provider_read_stats(&self.provider_stats, &self.read_stats_handles);
     }
 }
 
@@ -190,10 +198,11 @@ fn track_delta_file_progress(
 ///
 /// Both trackers reuse the same live Delta scan counters. They do not execute
 /// another query or retain the physical plan. `progress` contains the reporter
-/// and output name used for live events.
+/// and output name used for live events. Callers collect the handles before
+/// merged stream construction so setup failures can snapshot the same handles.
 pub(super) fn wrap_stream_with_delta_read_tracking(
     mut stream: MssqlOutputBatchStream,
-    physical_plan: &dyn ExecutionPlan,
+    read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
     provider_stats: Option<SharedProviderReadStats>,
     progress: Option<(ProgressReporter, String)>,
 ) -> MssqlOutputBatchStream {
@@ -201,7 +210,6 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
         return stream;
     }
 
-    let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan);
     if let Some((reporter, output_name)) = progress {
         let sampler = DeltaFileProgressSampler::new(
             read_stats_handles.clone(),
@@ -268,15 +276,38 @@ async fn batch_stream_for_lazy_table_from_session_parts(
         .create_physical_plan()
         .await
         .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
-    let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
-        .map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))?;
+
+    batch_stream_for_physical_plan(context, physical_plan, provider_stats, progress)
+}
+
+fn batch_stream_for_physical_plan(
+    context: &SessionContext,
+    physical_plan: Arc<dyn ExecutionPlan>,
+    provider_stats: Option<SharedProviderReadStats>,
+    progress: Option<(ProgressReporter, String)>,
+) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
+    // These handles must exist before merged stream setup can fail.
+    let read_stats_handles = if provider_stats.is_some() || progress.is_some() {
+        collect_delta_provider_read_stats_handles(physical_plan.as_ref())
+    } else {
+        Vec::new()
+    };
+    let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            if let Some(provider_stats) = provider_stats.as_ref() {
+                append_provider_read_stats(provider_stats, &read_stats_handles);
+            }
+            return Err(datafusion_handoff_setup_error("query_output_stream", error));
+        }
+    };
     let stream = Box::pin(stream.map(|batch| {
         batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
     }));
 
     Ok(wrap_stream_with_delta_read_tracking(
         stream,
-        physical_plan.as_ref(),
+        read_stats_handles,
         provider_stats,
         progress,
     ))
@@ -618,9 +649,13 @@ async fn dataframe_for_lazy_table_from_session_parts(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        any::Any,
+        fmt,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use crate::{
@@ -630,7 +665,13 @@ mod tests {
     };
     use datafusion::{
         arrow::datatypes::DataType,
+        common::{DataFusionError, Result as DataFusionResult},
+        execution::TaskContext,
         logical_expr::{Volatility, create_udf},
+        physical_plan::{
+            DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+            test::exec::ErrorExec,
+        },
     };
     use futures_util::StreamExt;
 
@@ -650,6 +691,70 @@ mod tests {
         Option<ProgressOperation>,
         Option<ProgressPhase>,
     );
+
+    /// Keeps a real Delta plan as a child but fails before returning its stream.
+    #[derive(Debug)]
+    struct FailingMergedStreamPlan {
+        child: Arc<dyn ExecutionPlan>,
+        error: ErrorExec,
+    }
+
+    impl FailingMergedStreamPlan {
+        fn new(child: Arc<dyn ExecutionPlan>) -> Self {
+            Self {
+                child,
+                error: ErrorExec::new(),
+            }
+        }
+    }
+
+    impl DisplayAs for FailingMergedStreamPlan {
+        fn fmt_as(
+            &self,
+            _display_type: DisplayFormatType,
+            formatter: &mut fmt::Formatter,
+        ) -> fmt::Result {
+            formatter.write_str("FailingMergedStreamPlan")
+        }
+    }
+
+    impl ExecutionPlan for FailingMergedStreamPlan {
+        fn name(&self) -> &str {
+            "FailingMergedStreamPlan"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.error.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.child]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if children.len() != 1 {
+                return Err(DataFusionError::Plan(
+                    "FailingMergedStreamPlan requires one child".to_owned(),
+                ));
+            }
+            Ok(Arc::new(Self::new(Arc::clone(&children[0]))))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            self.error.execute(partition, context)
+        }
+    }
 
     async fn report_tracked_stream(
         session: &DeltaFunnelSession,
@@ -829,6 +934,60 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].files_started, 1);
         assert_eq!(snapshots[0].files_completed, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merged_stream_construction_error_records_one_point_in_time_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("final-stats-stream-setup-error")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let failing_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(FailingMergedStreamPlan::new(physical_plan));
+        let provider_stats = super::shared_provider_read_stats();
+
+        let result = super::batch_stream_for_physical_plan(
+            &session.context,
+            failing_plan,
+            Some(Arc::clone(&provider_stats)),
+            None,
+        );
+        let snapshots = super::provider_read_stats_snapshot(&provider_stats);
+
+        assert!(result.is_err());
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].source_name, "orders");
+        assert_eq!(snapshots[0].files_started, 0);
+        assert_eq!(snapshots[0].parquet_data_file_range_get_operations, Some(0));
+        assert_eq!(snapshots[0].parquet_data_file_bytes_received, Some(0));
+        assert_eq!(snapshots[0].parquet_data_file_opened_bytes, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planning_error_before_handles_exist_records_no_provider_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (provider, scans) = failing_scan_marker_region_provider();
+        session
+            .context()
+            .register_table("broken_source", provider)?;
+        let table = session
+            .table_from_sql("select marker from broken_source")
+            .await?;
+        let provider_stats = super::shared_provider_read_stats();
+
+        let result = report_tracked_stream(&session, &table, &provider_stats).await;
+
+        assert!(result.is_err());
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        assert!(super::provider_read_stats_snapshot(&provider_stats).is_empty());
         Ok(())
     }
 

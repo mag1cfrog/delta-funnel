@@ -6,12 +6,15 @@ use futures_util::StreamExt;
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
     datafusion_query_output_stream, progress::ProgressReporter,
+    query_engine::datafusion::collect_delta_provider_read_stats_handles,
 };
 
 use super::super::super::{
     DeltaFunnelSession, LazyTableKind, OutputWritePlan,
     errors::{cached_output_stream_setup_error, unknown_cached_alias_error},
-    query_handoff::{SharedProviderReadStats, wrap_stream_with_delta_read_tracking},
+    query_handoff::{
+        SharedProviderReadStats, append_provider_read_stats, wrap_stream_with_delta_read_tracking,
+    },
     registry::{DerivedTableDependency, read_only_sql_options},
 };
 use super::MssqlDerivedCacheAliasPlan;
@@ -46,8 +49,21 @@ pub(super) async fn replanned_sql_batch_stream(
         .create_physical_plan()
         .await
         .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
-    let stream = datafusion_query_output_stream(Arc::clone(&physical_plan), context.task_ctx())
-        .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
+    // Retain scan handles before merged stream setup can fail.
+    let read_stats_handles = if provider_stats.is_some() || reporter.is_some() {
+        collect_delta_provider_read_stats_handles(physical_plan.as_ref())
+    } else {
+        Vec::new()
+    };
+    let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            if let Some(provider_stats) = provider_stats.as_ref() {
+                append_provider_read_stats(provider_stats, &read_stats_handles);
+            }
+            return Err(cached_output_stream_setup_error(&output_name, error));
+        }
+    };
     let error_output_name = output_name.clone();
     let stream = Box::pin(stream.map(move |batch| {
         batch.map_err(|error| cached_output_stream_setup_error(&error_output_name, error))
@@ -55,7 +71,7 @@ pub(super) async fn replanned_sql_batch_stream(
 
     Ok(wrap_stream_with_delta_read_tracking(
         stream,
-        physical_plan.as_ref(),
+        read_stats_handles,
         provider_stats,
         reporter.map(|reporter| (reporter, output_name)),
     ))
