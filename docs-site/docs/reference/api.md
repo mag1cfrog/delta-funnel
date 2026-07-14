@@ -41,6 +41,12 @@ name=None, progress=None)` registers a named Delta source immediately when
 `name` is present. Without `name`, it returns a lazy `PendingDeltaSource` and
 does not load or register the source.
 
+For Delta sources, `Session.delta_lake(..., storage_options=...)` accepts a
+mapping of string keys and values and forwards them to the underlying
+object-store builder used by Delta Funnel. For private S3 tables, see the
+[Private S3 sources](../advanced/private-s3.md) guide for the exact
+documented AWS keys, examples, and troubleshooting guidance.
+
 `PendingDeltaSource.alias(name, *, progress=None)` performs the deferred
 registration. Progress is selected by the call that performs registration. A
 value passed while creating an unnamed pending source is not reused by
@@ -131,12 +137,6 @@ if let Some(profile) = report.execution_profile() {
 The existing `write_to_mssql` methods remain default-disabled. For query phase
 boundaries, outcome interpretation, and failure-context access, see
 [returned SQL Server output diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-sql-server-output-diagnostics).
-
-For Delta sources, `Session.delta_lake(..., storage_options=...)` accepts a
-mapping of string keys and values and forwards them to the underlying
-object-store builder used by Delta Funnel. For private S3 tables, see the
-[Private S3 sources](../advanced/private-s3.md) guide for the exact
-documented AWS keys, examples, and troubleshooting guidance.
 
 ## Execution Profile Model
 

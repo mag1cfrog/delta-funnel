@@ -463,7 +463,6 @@ mod tests {
     impl OrchestratorMssqlOutputWriter for FakeRuntimeWriter {
         async fn write_output(
             &mut self,
-            output_schema: SchemaRef,
             output_plan: MssqlTargetOutputPlan,
             resolved_target: ResolvedMssqlTarget,
             mut batches: MssqlOutputBatchStream,
@@ -490,7 +489,7 @@ mod tests {
                 connection_source: resolved_target.connection_source(),
                 rows,
                 batches: batch_count,
-                schema_fields: output_schema.fields().len(),
+                schema_fields: output_plan.schema_mappings().len(),
             });
 
             Ok(MssqlWriteReport::from_output_plan(
@@ -524,7 +523,6 @@ mod tests {
 
             OrchestratorMssqlOutputWriter::write_output(
                 self,
-                output_schema,
                 output_plan,
                 resolved_target,
                 batches,

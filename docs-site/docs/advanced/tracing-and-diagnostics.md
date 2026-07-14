@@ -294,7 +294,7 @@ The query phases are:
 
 | Phase | Boundary |
 | --- | --- |
-| `query_dataframe_planning` | Resolve the session-owned lazy table into the DataFusion `DataFrame` to execute and capture its logical Arrow schema. |
+| `query_dataframe_planning` | Resolve the session-owned lazy table into the DataFusion `DataFrame` to execute. |
 | `query_physical_planning` | Run `DataFrame::create_physical_plan` for that output query. |
 | `query_stream_setup` | Create the physical-plan partition streams, construct the effective merged stream, and install progress, terminal-state, and optional profile observers. It does not poll the stream. |
 

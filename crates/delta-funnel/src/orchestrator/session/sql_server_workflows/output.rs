@@ -1,14 +1,12 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
 use tracing::Instrument;
 
 use crate::{
-    DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStream, MssqlTargetOutputPlan,
-    MssqlWriteBackend, MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport,
-    PhaseTimingReport, QueryExecutionProfile, QueryExecutionScope, ReportReasonCode,
-    ResolvedMssqlTarget, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
+    DeltaFunnelError, ExecutionProfileMode, LoadMode, MssqlOutputBatchStream,
+    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteBackend, MssqlWriteFailureContext,
+    MssqlWritePhase, MssqlWriteReport, PhaseTimingReport, QueryExecutionProfile,
+    QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget, ValidationOptions, observability,
+    plan_mssql_target_for_resolved_output,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::PhaseTimer,
     sql_server::write_planned_output_batches_to_mssql_for_workflow,
@@ -140,23 +138,6 @@ impl DeltaFunnelSession {
             &mut MssqlOneOutputSinkWriter,
             profile_mode,
             None,
-        )
-        .await
-    }
-
-    #[allow(
-        dead_code,
-        reason = "kept as the default-disabled session progress route"
-    )]
-    pub(crate) async fn write_to_mssql_with_reporter(
-        &self,
-        request: &OutputWritePlan,
-        reporter: ProgressReporter,
-    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.write_to_mssql_with_profile_mode_and_reporter(
-            request,
-            ExecutionProfileMode::Disabled,
-            reporter,
         )
         .await
     }
@@ -345,7 +326,6 @@ impl DeltaFunnelSession {
                 ));
             }
         };
-        let output_schema = Arc::new(dataframe.schema().as_arrow().clone());
         query_phase_timings.push(dataframe_timer.completed());
 
         let physical_plan_timer = PhaseTimer::start(QUERY_PHYSICAL_PLANNING_PHASE);
@@ -394,10 +374,10 @@ impl DeltaFunnelSession {
         };
         query_phase_timings.push(stream_setup_timer.completed());
 
-        query_phase_timings.extend_from_slice(planned.phase_timings());
+        let mut phase_timings = planned.phase_timings().to_vec();
+        phase_timings.extend(query_phase_timings);
         let result = writer
             .write_output(
-                output_schema,
                 planned.output_plan().clone(),
                 planned.resolved_target().clone(),
                 batches,
@@ -409,10 +389,10 @@ impl DeltaFunnelSession {
         let execution_profile = profile_result.and_then(|result| result.profile().cloned());
         match result {
             Ok(report) => Ok(ensure_validation_phase_timing(report)
-                .with_phase_timings(query_phase_timings)
+                .with_phase_timings(phase_timings)
                 .with_execution_profile(execution_profile)),
             Err(error) => {
-                let error = prepend_mssql_write_phase_timings(error, query_phase_timings);
+                let error = prepend_mssql_write_phase_timings(error, phase_timings);
                 Err(with_mssql_write_execution_profile(error, execution_profile))
             }
         }
@@ -422,22 +402,27 @@ impl DeltaFunnelSession {
 fn mssql_query_phase_error(
     planned: &PlannedMssqlOutput,
     phase: MssqlWritePhase,
-    mut phase_timings: Vec<PhaseTimingReport>,
+    mut query_phase_timings: Vec<PhaseTimingReport>,
     timer: PhaseTimer,
     source: DeltaFunnelError,
     execution_profile: Option<QueryExecutionProfile>,
 ) -> DeltaFunnelError {
-    phase_timings.push(timer.failed());
-    let next_phase_index = phase_timings.len();
+    query_phase_timings.push(timer.failed());
+    let next_phase_index = query_phase_timings.len();
     debug_assert!(next_phase_index <= QUERY_PHASE_NAMES.len());
-    phase_timings.extend(
+    query_phase_timings.extend(
         QUERY_PHASE_NAMES
             .get(next_phase_index..)
             .unwrap_or_default()
             .iter()
             .map(|name| PhaseTimingReport::not_started(*name, ReportReasonCode::PriorFailure)),
     );
-    phase_timings.extend_from_slice(planned.phase_timings());
+    let mut phase_timings = planned.phase_timings().to_vec();
+    phase_timings.extend(query_phase_timings);
+    let cleanup = match planned.output_plan().load_mode() {
+        LoadMode::AppendExisting => MssqlTargetCleanupStatus::NotApplicable,
+        LoadMode::CreateAndLoad | LoadMode::Replace => MssqlTargetCleanupStatus::NotAttempted,
+    };
 
     let context = MssqlWriteFailureContext::from_output_plan(
         planned.output_plan(),
@@ -446,7 +431,7 @@ fn mssql_query_phase_error(
         0,
         0,
         false,
-        crate::MssqlTargetCleanupStatus::NotApplicable,
+        cleanup,
     )
     .with_phase_timings(phase_timings)
     .with_execution_profile(execution_profile);
@@ -521,13 +506,8 @@ fn ensure_validation_phase_timing(report: MssqlWriteReport) -> MssqlWriteReport 
 
 #[async_trait]
 pub(crate) trait OrchestratorMssqlOutputWriter: Send {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the injected writer boundary receives one planned write plus its reporter"
-    )]
     async fn write_output(
         &mut self,
-        output_schema: SchemaRef,
         output_plan: MssqlTargetOutputPlan,
         resolved_target: ResolvedMssqlTarget,
         batches: MssqlOutputBatchStream,
@@ -543,7 +523,6 @@ struct MssqlOneOutputSinkWriter;
 impl OrchestratorMssqlOutputWriter for MssqlOneOutputSinkWriter {
     async fn write_output(
         &mut self,
-        _output_schema: SchemaRef,
         output_plan: MssqlTargetOutputPlan,
         resolved_target: ResolvedMssqlTarget,
         batches: MssqlOutputBatchStream,
@@ -583,7 +562,6 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use datafusion::arrow::datatypes::SchemaRef;
     use futures_util::StreamExt;
 
     use crate::{
@@ -682,7 +660,6 @@ mod tests {
     impl OrchestratorMssqlOutputWriter for FakeOrchestratorWriter {
         async fn write_output(
             &mut self,
-            output_schema: SchemaRef,
             output_plan: MssqlTargetOutputPlan,
             resolved_target: ResolvedMssqlTarget,
             mut batches: MssqlOutputBatchStream,
@@ -713,7 +690,7 @@ mod tests {
                 connection_source: resolved_target.connection_source(),
                 rows,
                 batches: batch_count,
-                schema_fields: output_schema.fields().len(),
+                schema_fields: output_plan.schema_mappings().len(),
                 validation_options,
             });
 
@@ -734,7 +711,6 @@ mod tests {
     impl OrchestratorMssqlOutputWriter for EarlyFailureWriter {
         async fn write_output(
             &mut self,
-            _output_schema: SchemaRef,
             output_plan: MssqlTargetOutputPlan,
             _resolved_target: ResolvedMssqlTarget,
             batches: MssqlOutputBatchStream,
@@ -764,7 +740,6 @@ mod tests {
     impl OrchestratorMssqlOutputWriter for PostEofFailureWriter {
         async fn write_output(
             &mut self,
-            _output_schema: SchemaRef,
             output_plan: MssqlTargetOutputPlan,
             _resolved_target: ResolvedMssqlTarget,
             mut batches: MssqlOutputBatchStream,
@@ -1158,7 +1133,11 @@ mod tests {
         let (reporter, events) = recording_reporter();
 
         let error = session
-            .write_to_mssql_with_reporter(&request, reporter)
+            .write_to_mssql_with_profile_mode_and_reporter(
+                &request,
+                ExecutionProfileMode::Disabled,
+                reporter,
+            )
             .await;
 
         assert!(matches!(
@@ -1243,16 +1222,16 @@ mod tests {
                 .map(crate::PhaseTimingReport::phase_name)
                 .collect::<Vec<_>>(),
             vec![
+                "lazy_sql_planning",
+                OUTPUT_SCHEMA_PLANNING_PHASE,
+                SQL_TARGET_PLANNING_PHASE,
                 QUERY_DATAFRAME_PLANNING_PHASE,
                 QUERY_PHYSICAL_PLANNING_PHASE,
                 QUERY_STREAM_SETUP_PHASE,
-                "lazy_sql_planning",
-                OUTPUT_SCHEMA_PLANNING_PHASE,
-                SQL_TARGET_PLANNING_PHASE
             ]
         );
         assert!(
-            report.phase_timings()[..3]
+            report.phase_timings()[3..6]
                 .iter()
                 .all(|timing| timing.status().is_completed() && timing.elapsed_micros().is_some())
         );
@@ -1542,14 +1521,14 @@ mod tests {
                     .map(PhaseTimingReport::phase_name)
                     .collect::<Vec<_>>(),
                 vec![
+                    OUTPUT_SCHEMA_PLANNING_PHASE,
+                    SQL_TARGET_PLANNING_PHASE,
                     QUERY_DATAFRAME_PLANNING_PHASE,
                     QUERY_PHYSICAL_PLANNING_PHASE,
                     QUERY_STREAM_SETUP_PHASE,
-                    OUTPUT_SCHEMA_PLANNING_PHASE,
-                    SQL_TARGET_PLANNING_PHASE,
                 ]
             );
-            for (index, timing) in context.phase_timings()[..3].iter().enumerate() {
+            for (index, timing) in context.phase_timings()[2..].iter().enumerate() {
                 let expected = if index < failed_index {
                     PhaseStatus::completed()
                 } else if index == failed_index {
@@ -1560,10 +1539,53 @@ mod tests {
                 assert_eq!(timing.status(), expected);
             }
             assert!(
-                context.phase_timings()[3..]
+                context.phase_timings()[..2]
                     .iter()
                     .all(|timing| timing.status().is_completed())
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn query_phase_failure_reports_cleanup_status_for_each_load_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+
+        for (load_mode, expected_cleanup) in [
+            (
+                LoadMode::AppendExisting,
+                MssqlTargetCleanupStatus::NotApplicable,
+            ),
+            (
+                LoadMode::CreateAndLoad,
+                MssqlTargetCleanupStatus::NotAttempted,
+            ),
+            (LoadMode::Replace, MssqlTargetCleanupStatus::NotAttempted),
+        ] {
+            let request =
+                output_request(source.clone(), "orders_output", "orders_sink", load_mode)?;
+            let planned = session.plan_mssql_output(&request)?;
+            let error = mssql_query_phase_error(
+                &planned,
+                MssqlWritePhase::QueryDataFramePlanning,
+                Vec::new(),
+                crate::report::PhaseTimer::start(QUERY_DATAFRAME_PLANNING_PHASE),
+                DeltaFunnelError::Config {
+                    message: "query preparation failed".to_owned(),
+                },
+                None,
+            );
+
+            let DeltaFunnelError::MssqlQueryPhase { context, .. } = error else {
+                return Err("expected MSSQL query phase error".into());
+            };
+            assert_eq!(context.cleanup(), expected_cleanup);
+            assert!(!context.partial_write_possible());
         }
         Ok(())
     }
@@ -1600,11 +1622,12 @@ mod tests {
             context: Box::new(context),
             message: "write failed".to_owned(),
         };
-        let mut planning_timings = QUERY_PHASE_NAMES
-            .iter()
-            .map(|name| PhaseTimingReport::completed(*name, Duration::ZERO))
-            .collect::<Vec<_>>();
-        planning_timings.extend_from_slice(planned.phase_timings());
+        let mut planning_timings = planned.phase_timings().to_vec();
+        planning_timings.extend(
+            QUERY_PHASE_NAMES
+                .iter()
+                .map(|name| PhaseTimingReport::completed(*name, Duration::ZERO)),
+        );
 
         let error = prepend_mssql_write_phase_timings(error, planning_timings);
 
@@ -1621,11 +1644,11 @@ mod tests {
                 .map(PhaseTimingReport::phase_name)
                 .collect::<Vec<_>>(),
             vec![
+                OUTPUT_SCHEMA_PLANNING_PHASE,
+                SQL_TARGET_PLANNING_PHASE,
                 QUERY_DATAFRAME_PLANNING_PHASE,
                 QUERY_PHYSICAL_PLANNING_PHASE,
                 QUERY_STREAM_SETUP_PHASE,
-                OUTPUT_SCHEMA_PLANNING_PHASE,
-                SQL_TARGET_PLANNING_PHASE,
                 "write_batch",
             ]
         );
