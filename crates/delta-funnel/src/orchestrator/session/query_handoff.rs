@@ -21,6 +21,7 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
     datafusion_query_output_stream,
+    observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
         DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
@@ -50,67 +51,78 @@ pub(super) fn provider_stats_snapshots(
     }
 }
 
-/// Records one point-in-time snapshot for every retained scan handle.
-pub(super) fn record_provider_stats_snapshots(
-    provider_stats_snapshots: &SharedProviderStatsSnapshots,
+/// Finalizes every retained Delta scan from one point-in-time snapshot set.
+pub(super) fn finalize_provider_scan_execution(
     read_stats_handles: &[DeltaProviderReadStatsHandle],
+    provider_stats_snapshots: Option<&SharedProviderStatsSnapshots>,
+    outcome: DeltaProviderScanOutcome,
 ) {
     let snapshots = snapshot_delta_provider_read_stats(read_stats_handles);
     if snapshots.is_empty() {
         return;
     }
-    match provider_stats_snapshots.lock() {
-        Ok(mut provider_stats_snapshots) => provider_stats_snapshots.extend(snapshots),
-        Err(poisoned) => poisoned.into_inner().extend(snapshots),
+
+    if let Some(provider_stats_snapshots) = provider_stats_snapshots {
+        match provider_stats_snapshots.lock() {
+            Ok(mut retained) => retained.extend(snapshots.iter().cloned()),
+            Err(poisoned) => poisoned.into_inner().extend(snapshots.iter().cloned()),
+        }
+    }
+    for snapshot in &snapshots {
+        delta_provider_parquet_io_summary(snapshot, outcome);
     }
 }
 
-/// Records the latest Delta provider statistics when a batch stream stops.
+/// Finalizes one merged Delta provider execution when its batch stream stops.
 ///
 /// The stream keeps only shared read counters and snapshots them when it ends,
 /// fails, or is dropped by its downstream consumer.
-struct ProviderReadStatsRecordingStream {
+struct DeltaProviderScanTerminalStream {
     inner: MssqlOutputBatchStream,
     // One live counter handle for each Delta scan in the output plan.
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
-    provider_stats_snapshots: SharedProviderStatsSnapshots,
-    recorded: bool,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
+    finalized: bool,
 }
 
-impl ProviderReadStatsRecordingStream {
+impl DeltaProviderScanTerminalStream {
     fn new(
         inner: MssqlOutputBatchStream,
         read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
-        provider_stats_snapshots: SharedProviderStatsSnapshots,
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     ) -> Self {
         Self {
             inner,
             read_stats_handles,
             provider_stats_snapshots,
-            recorded: false,
+            finalized: false,
         }
     }
 
-    fn record_if_needed(&mut self) {
-        if self.recorded {
+    fn finalize_if_needed(&mut self, outcome: DeltaProviderScanOutcome) {
+        if self.finalized {
             return;
         }
-        self.recorded = true;
-        record_provider_stats_snapshots(&self.provider_stats_snapshots, &self.read_stats_handles);
+        self.finalized = true;
+        finalize_provider_scan_execution(
+            &self.read_stats_handles,
+            self.provider_stats_snapshots.as_ref(),
+            outcome,
+        );
     }
 }
 
-impl Stream for ProviderReadStatsRecordingStream {
+impl Stream for DeltaProviderScanTerminalStream {
     type Item = Result<RecordBatch, DeltaFunnelError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(context) {
             Poll::Ready(None) => {
-                self.record_if_needed();
+                self.finalize_if_needed(DeltaProviderScanOutcome::Success);
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(error))) => {
-                self.record_if_needed();
+                self.finalize_if_needed(DeltaProviderScanOutcome::Error);
                 Poll::Ready(Some(Err(error)))
             }
             other => other,
@@ -118,9 +130,9 @@ impl Stream for ProviderReadStatsRecordingStream {
     }
 }
 
-impl Drop for ProviderReadStatsRecordingStream {
+impl Drop for DeltaProviderScanTerminalStream {
     fn drop(&mut self) {
-        self.record_if_needed();
+        self.finalize_if_needed(DeltaProviderScanOutcome::Cancelled);
     }
 }
 
@@ -194,10 +206,10 @@ fn track_delta_file_progress(
     })
 }
 
-/// Adds optional live file progress and final provider statistics tracking to
-/// one physical-plan stream.
+/// Adds optional live file progress and terminal provider scan tracking to one
+/// physical-plan stream.
 ///
-/// Both trackers reuse the same live Delta scan counters. They do not execute
+/// Both layers reuse the same live Delta scan counters. They do not execute
 /// another query or retain the physical plan. `progress` contains the reporter
 /// and output name used for live events. Callers collect the handles before
 /// merged stream construction so setup failures can snapshot the same handles.
@@ -207,7 +219,7 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<(ProgressReporter, String)>,
 ) -> MssqlOutputBatchStream {
-    if provider_stats_snapshots.is_none() && progress.is_none() {
+    if read_stats_handles.is_empty() {
         return stream;
     }
 
@@ -220,14 +232,11 @@ pub(super) fn wrap_stream_with_delta_read_tracking(
         );
         stream = track_delta_file_progress(stream, sampler);
     }
-    if let Some(provider_stats_snapshots) = provider_stats_snapshots {
-        stream = Box::pin(ProviderReadStatsRecordingStream::new(
-            stream,
-            read_stats_handles,
-            provider_stats_snapshots,
-        ));
-    }
-    stream
+    Box::pin(DeltaProviderScanTerminalStream::new(
+        stream,
+        read_stats_handles,
+        provider_stats_snapshots,
+    ))
 }
 
 impl Stream for DeltaFileProgressStream {
@@ -288,17 +297,15 @@ fn batch_stream_for_physical_plan(
     progress: Option<(ProgressReporter, String)>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     // These handles must exist before merged stream setup can fail.
-    let read_stats_handles = if provider_stats_snapshots.is_some() || progress.is_some() {
-        collect_delta_provider_read_stats_handles(physical_plan.as_ref())
-    } else {
-        Vec::new()
-    };
+    let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
     let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
         Ok(stream) => stream,
         Err(error) => {
-            if let Some(provider_stats_snapshots) = provider_stats_snapshots.as_ref() {
-                record_provider_stats_snapshots(provider_stats_snapshots, &read_stats_handles);
-            }
+            finalize_provider_scan_execution(
+                &read_stats_handles,
+                provider_stats_snapshots.as_ref(),
+                DeltaProviderScanOutcome::Error,
+            );
             return Err(datafusion_handoff_setup_error("query_output_stream", error));
         }
     };

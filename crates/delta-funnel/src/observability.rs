@@ -1,8 +1,8 @@
 //! Internal tracing vocabulary for DeltaFunnel workflow observability.
 
 use crate::{
-    DeltaFunnelError, LoadMode, MssqlBatchShapingReport, MssqlTargetTable, RunMode,
-    ValidationStatus,
+    DeltaFunnelError, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, LoadMode,
+    MssqlBatchShapingReport, MssqlTargetTable, RunMode, ValidationStatus,
     support::{sanitize_text_for_display, sanitize_uri_for_display},
 };
 
@@ -19,6 +19,7 @@ const DATAFUSION_BATCH_STREAM_STARTED_EVENT: &str = "datafusion_batch_stream.sta
 const DATAFUSION_REGISTRATION_COMPLETED_EVENT: &str = "datafusion_registration.completed";
 const DATAFUSION_REGISTRATION_FAILED_EVENT: &str = "datafusion_registration.failed";
 const DATAFUSION_REGISTRATION_STARTED_EVENT: &str = "datafusion_registration.started";
+const DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT: &str = "delta_provider_parquet_io_summary";
 const PROTOCOL_PREFLIGHT_COMPLETED_EVENT: &str = "protocol_preflight.completed";
 const PROTOCOL_PREFLIGHT_FAILED_EVENT: &str = "protocol_preflight.failed";
 const PROTOCOL_PREFLIGHT_STARTED_EVENT: &str = "protocol_preflight.started";
@@ -33,6 +34,106 @@ const WORKFLOW_COMPLETED_EVENT: &str = "workflow.completed";
 const WORKFLOW_FAILED_EVENT: &str = "workflow.failed";
 const WORKFLOW_SPAN: &str = "delta_funnel.workflow";
 const WORKFLOW_STARTED_EVENT: &str = "workflow.started";
+
+/// Terminal outcome for one Delta provider-scan execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeltaProviderScanOutcome {
+    /// Every required output stream reached normal end-of-stream.
+    Success,
+    /// At least one required output stream yielded an upstream error.
+    Error,
+    /// A required output stream was dropped before normal end-of-stream.
+    Cancelled,
+}
+
+impl DeltaProviderScanOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParquetIoMetrics {
+    Available {
+        range_get_operations: u64,
+        full_get_operations: u64,
+        bytes_received: u64,
+        opened_bytes: u64,
+    },
+    Unavailable,
+    Mixed,
+}
+
+/// Emits one bounded terminal Parquet I/O summary for a Delta provider scan.
+pub(crate) fn delta_provider_parquet_io_summary(
+    snapshot: &DeltaProviderReadStatsSnapshot,
+    outcome: DeltaProviderScanOutcome,
+) {
+    let source_name = sanitize_observability_summary(&snapshot.source_name);
+    let reader_backend = provider_reader_backend_as_str(snapshot.reader_backend);
+    let outcome = outcome.as_str();
+
+    match parquet_io_metrics(snapshot) {
+        ParquetIoMetrics::Available {
+            range_get_operations,
+            full_get_operations,
+            bytes_received,
+            opened_bytes,
+        } => tracing::debug!(
+            target: TRACING_TARGET,
+            telemetry_event = DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT,
+            source_name,
+            snapshot_version = snapshot.snapshot_version,
+            reader_backend,
+            outcome,
+            metrics_available = true,
+            parquet_data_file_range_get_operations = range_get_operations,
+            parquet_data_file_full_get_operations = full_get_operations,
+            parquet_data_file_bytes_received = bytes_received,
+            parquet_data_file_opened_bytes = opened_bytes,
+            message = DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT
+        ),
+        ParquetIoMetrics::Unavailable | ParquetIoMetrics::Mixed => tracing::debug!(
+            target: TRACING_TARGET,
+            telemetry_event = DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT,
+            source_name,
+            snapshot_version = snapshot.snapshot_version,
+            reader_backend,
+            outcome,
+            metrics_available = false,
+            message = DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT
+        ),
+    }
+}
+
+fn parquet_io_metrics(snapshot: &DeltaProviderReadStatsSnapshot) -> ParquetIoMetrics {
+    match (
+        snapshot.parquet_data_file_range_get_operations,
+        snapshot.parquet_data_file_full_get_operations,
+        snapshot.parquet_data_file_bytes_received,
+        snapshot.parquet_data_file_opened_bytes,
+    ) {
+        (Some(range), Some(full), Some(received), Some(opened)) => ParquetIoMetrics::Available {
+            range_get_operations: range,
+            full_get_operations: full,
+            bytes_received: received,
+            opened_bytes: opened,
+        },
+        (None, None, None, None) => ParquetIoMetrics::Unavailable,
+        _ => ParquetIoMetrics::Mixed,
+    }
+}
+
+const fn provider_reader_backend_as_str(backend: DeltaProviderReaderBackend) -> &'static str {
+    match backend {
+        DeltaProviderReaderBackend::OfficialKernel => "official_kernel",
+        DeltaProviderReaderBackend::NativeAsync => "native_async",
+    }
+}
 
 pub(crate) fn workflow_span(run_mode: RunMode, output_count: usize) -> tracing::Span {
     tracing::info_span!(
@@ -498,6 +599,7 @@ mod tests {
     };
 
     use super::*;
+    use futures_util::StreamExt;
     use tracing::{
         Event, Level, Subscriber,
         field::{Field, Visit},
@@ -506,6 +608,12 @@ mod tests {
     use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*, registry::LookupSpan};
 
     static TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
+    const PARQUET_IO_FIELDS: [&str; 4] = [
+        "parquet_data_file_range_get_operations",
+        "parquet_data_file_full_get_operations",
+        "parquet_data_file_bytes_received",
+        "parquet_data_file_opened_bytes",
+    ];
 
     struct TracingTestGuard {
         _guard: MutexGuard<'static, ()>,
@@ -573,6 +681,10 @@ mod tests {
             LoadMode::AppendExisting,
             MssqlBatchShapingReport::completed(2, 5, 2, 5),
         );
+        delta_provider_parquet_io_summary(
+            &provider_stats_snapshot(),
+            DeltaProviderScanOutcome::Success,
+        );
         source_loading_started("orders", None);
         source_loading_completed("orders", 7, None);
         protocol_preflight_started("orders", 7);
@@ -610,6 +722,10 @@ mod tests {
         assert_eq!(OUTPUT_SKIPPED_EVENT, "output.skipped");
         assert_eq!(OUTPUT_SPAN, "delta_funnel.output");
         assert_eq!(OUTPUT_STARTED_EVENT, "output.started");
+        assert_eq!(
+            DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT,
+            "delta_provider_parquet_io_summary"
+        );
         assert_eq!(
             DATAFUSION_BATCH_STREAM_COMPLETED_EVENT,
             "datafusion_batch_stream.completed"
@@ -658,6 +774,225 @@ mod tests {
         );
         assert_eq!(load_mode_as_str(LoadMode::CreateAndLoad), "create_and_load");
         assert_eq!(load_mode_as_str(LoadMode::Replace), "replace");
+        assert_eq!(DeltaProviderScanOutcome::Success.as_str(), "success");
+        assert_eq!(DeltaProviderScanOutcome::Error.as_str(), "error");
+        assert_eq!(DeltaProviderScanOutcome::Cancelled.as_str(), "cancelled");
+    }
+
+    #[test]
+    fn parquet_io_metric_classifier_distinguishes_complete_unavailable_and_mixed() {
+        let available = provider_stats_snapshot();
+        assert_eq!(
+            parquet_io_metrics(&available),
+            ParquetIoMetrics::Available {
+                range_get_operations: 0,
+                full_get_operations: 2,
+                bytes_received: 512,
+                opened_bytes: 2048,
+            }
+        );
+
+        let mut unavailable = available.clone();
+        unavailable.parquet_data_file_range_get_operations = None;
+        unavailable.parquet_data_file_full_get_operations = None;
+        unavailable.parquet_data_file_bytes_received = None;
+        unavailable.parquet_data_file_opened_bytes = None;
+        assert_eq!(
+            parquet_io_metrics(&unavailable),
+            ParquetIoMetrics::Unavailable
+        );
+
+        unavailable.parquet_data_file_range_get_operations = Some(0);
+        assert_eq!(parquet_io_metrics(&unavailable), ParquetIoMetrics::Mixed);
+
+        let mut mixed = available;
+        mixed.parquet_data_file_bytes_received = None;
+        assert_eq!(parquet_io_metrics(&mixed), ParquetIoMetrics::Mixed);
+    }
+
+    #[test]
+    fn native_async_summary_records_typed_metrics_for_every_outcome() {
+        let snapshot = provider_stats_snapshot();
+        let events = capture_events(|| {
+            for outcome in [
+                DeltaProviderScanOutcome::Success,
+                DeltaProviderScanOutcome::Error,
+                DeltaProviderScanOutcome::Cancelled,
+            ] {
+                delta_provider_parquet_io_summary(&snapshot, outcome);
+            }
+        })
+        .events();
+
+        assert_eq!(events.len(), 3);
+        for (event, outcome) in events.iter().zip(["success", "error", "cancelled"]) {
+            assert_provider_io_event(event, outcome, "native_async", "true");
+            assert_eq!(
+                event.fields.get(PARQUET_IO_FIELDS[0]).map(String::as_str),
+                Some("0")
+            );
+            assert_eq!(
+                event.fields.get(PARQUET_IO_FIELDS[1]).map(String::as_str),
+                Some("2")
+            );
+            assert_eq!(
+                event.fields.get(PARQUET_IO_FIELDS[2]).map(String::as_str),
+                Some("512")
+            );
+            assert_eq!(
+                event.fields.get(PARQUET_IO_FIELDS[3]).map(String::as_str),
+                Some("2048")
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_and_mixed_summaries_emit_no_numeric_subset() {
+        let mut unavailable = provider_stats_snapshot();
+        unavailable.reader_backend = DeltaProviderReaderBackend::OfficialKernel;
+        unavailable.parquet_data_file_range_get_operations = None;
+        unavailable.parquet_data_file_full_get_operations = None;
+        unavailable.parquet_data_file_bytes_received = None;
+        unavailable.parquet_data_file_opened_bytes = None;
+        let mut mixed = provider_stats_snapshot();
+        mixed.parquet_data_file_bytes_received = None;
+
+        let events = capture_events(|| {
+            delta_provider_parquet_io_summary(&unavailable, DeltaProviderScanOutcome::Success);
+            delta_provider_parquet_io_summary(&mixed, DeltaProviderScanOutcome::Error);
+        })
+        .events();
+
+        assert_eq!(events.len(), 2);
+        assert_provider_io_event(&events[0], "success", "official_kernel", "false");
+        assert_provider_io_event(&events[1], "error", "native_async", "false");
+        assert!(events.iter().all(|event| {
+            PARQUET_IO_FIELDS
+                .iter()
+                .all(|field| !event.fields.contains_key(*field))
+        }));
+    }
+
+    #[tokio::test]
+    async fn merged_stream_emits_one_summary_for_success_error_and_drop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = tracing_test_guard();
+        let captured = CapturedEvents::default();
+        let subscriber = Registry::default().with(CaptureLayer {
+            events: captured.clone(),
+        });
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let success_table =
+            crate::table_formats::RealParquetDeltaTable::new_default("summary-success")?;
+        let mut success_session = native_async_session(crate::QueryOptions::default())?;
+        let success_source = success_session.delta_lake(crate::DeltaSourceConfig::new(
+            "success_orders",
+            success_table.path().to_string_lossy().to_string(),
+        ))?;
+        let mut success_stream = success_session
+            .batch_stream_for_lazy_table(&success_source, None)
+            .await?;
+        while let Some(batch) = success_stream.next().await {
+            batch?;
+        }
+        assert!(success_stream.next().await.is_none());
+        drop(success_stream);
+
+        let cancelled_table =
+            crate::table_formats::RealParquetDeltaTable::new_with_two_large_files(
+                "summary-cancelled",
+                20_000,
+            )?;
+        let mut cancelled_session = native_async_session(crate::QueryOptions {
+            target_partitions: Some(1),
+            output_batch_size: Some(1),
+        })?;
+        let cancelled_source = cancelled_session.delta_lake(crate::DeltaSourceConfig::new(
+            "cancelled_orders",
+            cancelled_table.path().to_string_lossy().to_string(),
+        ))?;
+        let mut cancelled_stream = cancelled_session
+            .batch_stream_for_lazy_table(&cancelled_source, None)
+            .await?;
+        assert!(cancelled_stream.next().await.transpose()?.is_some());
+        drop(cancelled_stream);
+
+        let error_table =
+            crate::query_engine::datafusion::test_support::DeltaLogTable::new("summary-error")?;
+        let mut error_session = native_async_session(crate::QueryOptions::default())?;
+        let error_source = error_session.delta_lake(crate::DeltaSourceConfig::new(
+            "error_orders",
+            error_table.path().to_string_lossy().to_string(),
+        ))?;
+        let mut error_stream = error_session
+            .batch_stream_for_lazy_table(&error_source, None)
+            .await?;
+        let error = error_stream.next().await.ok_or("expected upstream error")?;
+        assert!(error.is_err());
+        drop(error_stream);
+        drop(subscriber_guard);
+
+        let summaries = captured
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some(DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 3);
+        for (event, (source_name, outcome)) in summaries.iter().zip([
+            ("success_orders", "success"),
+            ("cancelled_orders", "cancelled"),
+            ("error_orders", "error"),
+        ]) {
+            assert_eq!(event.target, TRACING_TARGET);
+            assert_eq!(event.level, Level::DEBUG);
+            assert_eq!(
+                event.fields.get("source_name").map(String::as_str),
+                Some(source_name)
+            );
+            assert_eq!(
+                event.fields.get("outcome").map(String::as_str),
+                Some(outcome)
+            );
+            assert_eq!(
+                event.fields.get("metrics_available").map(String::as_str),
+                Some("true")
+            );
+            assert!(
+                PARQUET_IO_FIELDS
+                    .iter()
+                    .all(|field| event.fields.contains_key(*field))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_io_summary_sanitizes_hostile_source_names() {
+        let mut uri = provider_stats_snapshot();
+        uri.source_name = "s3://user:password@example.com/table?token=secret#debug".to_owned();
+        let mut control = provider_stats_snapshot();
+        control.source_name = "orders\nsource".to_owned();
+
+        let events = capture_events(|| {
+            delta_provider_parquet_io_summary(&uri, DeltaProviderScanOutcome::Success);
+            delta_provider_parquet_io_summary(&control, DeltaProviderScanOutcome::Success);
+        })
+        .events();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].fields.get("source_name").map(String::as_str),
+            Some("s3://example.com/table")
+        );
+        assert_eq!(
+            events[1].fields.get("source_name").map(String::as_str),
+            Some("orders\\nsource")
+        );
+        assert_no_forbidden_tracing_text(&events);
     }
 
     #[test]
@@ -1201,6 +1536,94 @@ mod tests {
             event.fields.get("validation_reason").map(String::as_str),
             Some(validation_reason)
         );
+    }
+
+    fn assert_provider_io_event(
+        event: &CapturedEvent,
+        outcome: &str,
+        reader_backend: &str,
+        metrics_available: &str,
+    ) {
+        assert_eq!(event.target, TRACING_TARGET);
+        assert_eq!(event.level, Level::DEBUG);
+        assert_eq!(
+            event.fields.get("telemetry_event").map(String::as_str),
+            Some(DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT)
+        );
+        assert_eq!(
+            event.fields.get("source_name").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            event.fields.get("snapshot_version").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            event.fields.get("reader_backend").map(String::as_str),
+            Some(reader_backend)
+        );
+        assert_eq!(
+            event.fields.get("outcome").map(String::as_str),
+            Some(outcome)
+        );
+        assert_eq!(
+            event.fields.get("metrics_available").map(String::as_str),
+            Some(metrics_available)
+        );
+    }
+
+    fn provider_stats_snapshot() -> DeltaProviderReadStatsSnapshot {
+        DeltaProviderReadStatsSnapshot {
+            source_name: "orders".to_owned(),
+            snapshot_version: 3,
+            reader_backend: DeltaProviderReaderBackend::NativeAsync,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 1,
+            files_planned: 2,
+            files_filtered_during_planning: Some(4),
+            estimated_rows: Some(10),
+            estimated_bytes: Some(2048),
+            parquet_data_file_range_get_operations: Some(0),
+            parquet_data_file_full_get_operations: Some(2),
+            parquet_data_file_bytes_received: Some(512),
+            parquet_data_file_opened_bytes: Some(2048),
+            datafusion_output_batch_size: Some(8192),
+            scan_partitions_started: 1,
+            scan_partitions_completed: 1,
+            files_started: 2,
+            files_completed: 2,
+            dynamic_partition_files_pruned: 0,
+            dynamic_partition_files_kept: 2,
+            dynamic_filters_received: 0,
+            dynamic_filters_accepted: 0,
+            dynamic_filters_unsupported: 0,
+            dynamic_filter_snapshots: 0,
+            dynamic_partition_files_not_pruned_missing_metadata: 0,
+            dynamic_partition_files_not_pruned_unsupported_expression: 0,
+            batches_produced: 1,
+            rows_produced: 10,
+            deletion_vector_payloads_loaded: 0,
+            deletion_vectors_applied: 0,
+            deletion_vector_rows_deleted: 0,
+            deletion_vector_failures: 0,
+            deletion_vector_rejections: 0,
+        }
+    }
+
+    fn native_async_session(
+        query_options: crate::QueryOptions,
+    ) -> Result<crate::DeltaFunnelSession, DeltaFunnelError> {
+        let provider_scan_options =
+            crate::DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+                DeltaProviderReaderBackend::NativeAsync,
+                1,
+                1,
+            )?;
+        crate::DeltaFunnelSession::new(
+            crate::SessionOptions::new()
+                .with_query_options(query_options)
+                .with_provider_scan_options(provider_scan_options),
+        )
     }
 
     fn assert_no_forbidden_tracing_text(events: &[CapturedEvent]) {

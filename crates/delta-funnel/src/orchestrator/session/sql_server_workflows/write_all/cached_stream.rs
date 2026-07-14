@@ -7,7 +7,8 @@ use futures_util::StreamExt;
 
 use crate::{
     DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
-    datafusion_query_output_stream, progress::ProgressReporter,
+    datafusion_query_output_stream, observability::DeltaProviderScanOutcome,
+    progress::ProgressReporter,
     query_engine::datafusion::collect_delta_provider_read_stats_handles,
 };
 
@@ -15,7 +16,7 @@ use super::super::super::{
     DeltaFunnelSession, LazyTableKind, OutputWritePlan,
     errors::{cached_output_stream_setup_error, unknown_cached_alias_error},
     query_handoff::{
-        SharedProviderStatsSnapshots, record_provider_stats_snapshots,
+        SharedProviderStatsSnapshots, finalize_provider_scan_execution,
         wrap_stream_with_delta_read_tracking,
     },
     registry::{DerivedTableDependency, read_only_sql_options},
@@ -71,17 +72,15 @@ fn cached_output_stream_from_physical_plan(
     reporter: Option<ProgressReporter>,
 ) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
     // Retain scan handles before merged stream setup can fail.
-    let read_stats_handles = if provider_stats_snapshots.is_some() || reporter.is_some() {
-        collect_delta_provider_read_stats_handles(physical_plan.as_ref())
-    } else {
-        Vec::new()
-    };
+    let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
     let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
         Ok(stream) => stream,
         Err(error) => {
-            if let Some(provider_stats_snapshots) = provider_stats_snapshots.as_ref() {
-                record_provider_stats_snapshots(provider_stats_snapshots, &read_stats_handles);
-            }
+            finalize_provider_scan_execution(
+                &read_stats_handles,
+                provider_stats_snapshots.as_ref(),
+                DeltaProviderScanOutcome::Error,
+            );
             return Err(cached_output_stream_setup_error(&output_name, error));
         }
     };
