@@ -10,6 +10,8 @@ pub(crate) use cache_plan::{
 };
 pub(crate) use request::ensure_unique_write_all_output_names;
 
+use crate::ExecutionProfileMode;
+
 /// Cache policy for one multi-output `write_all` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WriteAllCacheMode {
@@ -24,6 +26,7 @@ pub enum WriteAllCacheMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriteAllOptions {
     cache_mode: WriteAllCacheMode,
+    execution_profile_mode: ExecutionProfileMode,
 }
 
 impl WriteAllOptions {
@@ -32,6 +35,7 @@ impl WriteAllOptions {
     pub const fn new() -> Self {
         Self {
             cache_mode: WriteAllCacheMode::Auto,
+            execution_profile_mode: ExecutionProfileMode::Disabled,
         }
     }
 
@@ -47,22 +51,51 @@ impl WriteAllOptions {
     pub const fn cache_mode(&self) -> WriteAllCacheMode {
         self.cache_mode
     }
+
+    /// Sets detailed execution profiling for each attempted output.
+    #[must_use]
+    pub const fn with_execution_profile_mode(mut self, mode: ExecutionProfileMode) -> Self {
+        self.execution_profile_mode = mode;
+        self
+    }
+
+    /// Returns the per-output execution profile mode.
+    #[must_use]
+    pub const fn execution_profile_mode(&self) -> ExecutionProfileMode {
+        self.execution_profile_mode
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{WriteAllCacheMode, WriteAllOptions};
+    use crate::ExecutionProfileMode;
 
     #[test]
-    fn write_all_options_default_to_auto_cache_mode() {
+    fn write_all_options_default_and_builders_compose() {
         let options = WriteAllOptions::default();
 
         assert_eq!(options.cache_mode(), WriteAllCacheMode::Auto);
         assert_eq!(
-            WriteAllOptions::new()
-                .with_cache_mode(WriteAllCacheMode::Disabled)
-                .cache_mode(),
-            WriteAllCacheMode::Disabled
+            options.execution_profile_mode(),
+            ExecutionProfileMode::Disabled
         );
+
+        for cache_mode in [WriteAllCacheMode::Auto, WriteAllCacheMode::Disabled] {
+            for options in [
+                WriteAllOptions::new()
+                    .with_cache_mode(cache_mode)
+                    .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                WriteAllOptions::new()
+                    .with_execution_profile_mode(ExecutionProfileMode::Detailed)
+                    .with_cache_mode(cache_mode),
+            ] {
+                assert_eq!(options.cache_mode(), cache_mode);
+                assert_eq!(
+                    options.execution_profile_mode(),
+                    ExecutionProfileMode::Detailed
+                );
+            }
+        }
     }
 }

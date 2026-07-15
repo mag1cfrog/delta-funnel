@@ -43,6 +43,31 @@ pub type MssqlOutputBatchStreamFuture =
 /// Async factory that constructs a direct batch stream for one attempted output.
 pub type MssqlOutputBatchStreamFactory = Box<dyn FnOnce() -> MssqlOutputBatchStreamFuture + Send>;
 
+/// One output query execution and its terminal reporting state.
+pub(crate) struct MssqlOutputQueryExecution {
+    pub(crate) stream: MssqlOutputBatchStream,
+    pub(crate) query_phase_timings: Vec<PhaseTimingReport>,
+    pub(crate) attach_profile_to_result: Option<MssqlOutputProfileCallback>,
+}
+
+/// Callback that attaches a terminal query profile to one writer result.
+pub(crate) type MssqlOutputProfileCallback = Box<
+    dyn FnOnce(
+            Result<MssqlWriteReport, DeltaFunnelError>,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError>
+        + Send,
+>;
+
+/// Failed output query plus timings completed before the failure.
+pub(crate) struct MssqlOutputQueryError {
+    pub(crate) error: DeltaFunnelError,
+    pub(crate) query_phase_timings: Vec<PhaseTimingReport>,
+}
+
+/// Future returned when an orchestrated write-all output starts its query.
+pub(crate) type MssqlOutputQueryFuture =
+    Pin<Box<dyn Future<Output = Result<MssqlOutputQueryExecution, MssqlOutputQueryError>> + Send>>;
+
 /// One deferred SQL Server output write job.
 ///
 /// The job owns an already resolved SQL Server target plus a lazy batch stream
@@ -55,7 +80,7 @@ pub struct MssqlOutputWriteJob {
     output_schema: SchemaRef,
     resolved_target: ResolvedMssqlTarget,
     schema_options: MssqlSchemaPlanOptions,
-    batches: MssqlOutputBatchStreamFactory,
+    create_query_execution: Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send>,
     write_backend: MssqlWriteBackend,
     validation_options: ValidationOptions,
     phase_timings: Vec<PhaseTimingReport>,
@@ -68,7 +93,7 @@ impl MssqlOutputWriteJob {
         output_schema: SchemaRef,
         resolved_target: ResolvedMssqlTarget,
         schema_options: MssqlSchemaPlanOptions,
-        batches: F,
+        stream_factory: F,
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
     ) -> Self
@@ -77,16 +102,45 @@ impl MssqlOutputWriteJob {
         Fut: Future<Output = Result<S, DeltaFunnelError>> + Send + 'static,
         S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send + 'static,
     {
+        Self::new_with_query_execution_factory(
+            output_schema,
+            resolved_target,
+            schema_options,
+            Box::new(move || {
+                Box::pin(async move {
+                    let stream = stream_factory()
+                        .await
+                        .map_err(|error| MssqlOutputQueryError {
+                            error,
+                            query_phase_timings: Vec::new(),
+                        })?;
+                    Ok(MssqlOutputQueryExecution {
+                        stream: Box::pin(stream),
+                        query_phase_timings: Vec::new(),
+                        attach_profile_to_result: None,
+                    })
+                })
+            }),
+            write_backend,
+            validation_options,
+        )
+    }
+
+    /// Creates an internal job whose query execution carries its stream,
+    /// phase timings, and terminal profile callback.
+    pub(crate) fn new_with_query_execution_factory(
+        output_schema: SchemaRef,
+        resolved_target: ResolvedMssqlTarget,
+        schema_options: MssqlSchemaPlanOptions,
+        create_query_execution: Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send>,
+        write_backend: MssqlWriteBackend,
+        validation_options: ValidationOptions,
+    ) -> Self {
         Self {
             output_schema,
             resolved_target,
             schema_options,
-            batches: Box::new(move || {
-                Box::pin(async move {
-                    let stream = batches().await?;
-                    Ok(Box::pin(stream) as MssqlOutputBatchStream)
-                })
-            }),
+            create_query_execution,
             write_backend,
             validation_options,
             phase_timings: Vec::new(),
@@ -836,10 +890,10 @@ where
         output_schema,
         resolved_target,
         schema_options,
-        batches,
+        create_query_execution,
         write_backend,
         validation_options,
-        phase_timings: planned_phase_timings,
+        phase_timings: mut planned_phase_timings,
         progress_reporter,
     } = job;
     if let Some(reporter) = progress_reporter.as_ref() {
@@ -849,12 +903,13 @@ where
         ));
     }
     let stream_setup_timer = PhaseTimer::start(OUTPUT_STREAM_SETUP_PHASE);
-    let (batches, stream_setup_timing) = match batches().await {
-        Ok(batches) => (batches, stream_setup_timer.completed()),
-        Err(error) => {
+    let (query_execution, stream_setup_timing) = match create_query_execution().await {
+        Ok(query_execution) => (query_execution, stream_setup_timer.completed()),
+        Err(failure) => {
+            planned_phase_timings.extend(failure.query_phase_timings);
             let failure = MssqlWriteFailureReport::from_error(
                 target,
-                error,
+                failure.error,
                 stream_setup_failure_phase_timings(
                     planned_phase_timings,
                     stream_setup_timer.failed(),
@@ -863,20 +918,32 @@ where
             return MssqlOutputWriteStatus::Failed(failure);
         }
     };
+    let MssqlOutputQueryExecution {
+        stream,
+        query_phase_timings,
+        attach_profile_to_result,
+    } = query_execution;
+    planned_phase_timings.extend(query_phase_timings);
 
     let write_timer = PhaseTimer::start(SQL_WRITE_PHASE);
-    match writer
+    let write_result = writer
         .write_output(
             output_schema,
             resolved_target,
             schema_options,
-            batches,
+            stream,
             write_backend,
             validation_options,
             progress_reporter.as_ref(),
         )
-        .await
-    {
+        .await;
+    // The writer has now drained, failed, or dropped the stream, so the
+    // callback can attach the terminal query profile.
+    let write_result = match attach_profile_to_result {
+        Some(attach_profile) => attach_profile(write_result),
+        None => write_result,
+    };
+    match write_result {
         Ok(report) => {
             let report = report.with_phase_timings(output_write_phase_timings(
                 planned_phase_timings,
@@ -977,6 +1044,7 @@ mod tests {
     };
 
     const PLANNED_PHASE: &str = "planned_phase";
+    const DEFERRED_QUERY_PHASE: &str = "deferred_query_phase";
 
     #[derive(Default)]
     struct FakeWorkflowWriter {
@@ -1463,6 +1531,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_query_execution_metadata_follows_writer_results()
+    -> Result<(), DeltaFunnelError> {
+        let first = output_plan("first", LoadMode::AppendExisting)?;
+        let second = output_plan("second", LoadMode::AppendExisting)?;
+        let first_report =
+            write_report(&first, 1, 1, false, MssqlTargetCleanupStatus::NotApplicable);
+        let second_failure = phase_error(
+            &second,
+            MssqlWritePhase::Connect,
+            0,
+            0,
+            false,
+            MssqlTargetCleanupStatus::NotApplicable,
+            "connect failed",
+        );
+        let attachment_calls = Arc::new(Mutex::new(Vec::new()));
+        let writer = FakeWorkflowWriter::new(vec![Ok(first_report), Err(second_failure)]);
+
+        let report = write_mssql_outputs_with_writer(
+            vec![
+                query_execution_job(first, Arc::clone(&attachment_calls))?,
+                query_execution_job(second, Arc::clone(&attachment_calls))?,
+            ],
+            MssqlWorkflowWriteOptions::default(),
+            writer,
+        )
+        .await?;
+
+        assert_eq!(
+            locked(&attachment_calls)?.as_slice(),
+            ["first:succeeded".to_owned(), "second:failed".to_owned()]
+        );
+        for status in report.outputs() {
+            let phase_names = status
+                .phase_timings()
+                .iter()
+                .map(PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                &phase_names[..4],
+                [
+                    PLANNED_PHASE,
+                    DEFERRED_QUERY_PHASE,
+                    OUTPUT_STREAM_SETUP_PHASE,
+                    SQL_WRITE_PHASE,
+                ]
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_query_failure_keeps_its_timings_before_workflow_failure_timings()
+    -> Result<(), DeltaFunnelError> {
+        let output = output_plan("failed_setup", LoadMode::AppendExisting)?;
+        let writer = FakeWorkflowWriter::default();
+        let job = failed_query_execution_job(output)?;
+
+        let report = write_mssql_outputs_with_writer(
+            vec![job],
+            MssqlWorkflowWriteOptions::default(),
+            writer,
+        )
+        .await?;
+
+        let [status] = report.outputs() else {
+            return Err(test_error("expected one output status"));
+        };
+        assert!(status.is_failed());
+        let phase_names = status
+            .phase_timings()
+            .iter()
+            .map(PhaseTimingReport::phase_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phase_names,
+            [
+                PLANNED_PHASE,
+                DEFERRED_QUERY_PHASE,
+                OUTPUT_STREAM_SETUP_PHASE,
+                SQL_WRITE_PHASE,
+                VALIDATION_PHASE,
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn skipped_outputs_do_not_reach_one_output_writer() -> Result<(), DeltaFunnelError> {
         let first = output_plan("first", LoadMode::AppendExisting)?;
         let second = output_plan("second", LoadMode::AppendExisting)?;
@@ -1750,6 +1908,67 @@ mod tests {
                 }
                 async { Ok(stream::empty()) }
             },
+        )
+        .with_phase_timings(planned_phase_timings()))
+    }
+
+    fn query_execution_job(
+        output_plan: MssqlTargetOutputPlan,
+        attachment_calls: Arc<Mutex<Vec<String>>>,
+    ) -> Result<MssqlOutputWriteJob, DeltaFunnelError> {
+        let attachment_output_name = output_plan.output_name().to_owned();
+        Ok(MssqlOutputWriteJob::new_with_query_execution_factory(
+            output_schema(),
+            resolved_target(output_plan)?,
+            MssqlSchemaPlanOptions::default(),
+            Box::new(move || {
+                Box::pin(async move {
+                    Ok(MssqlOutputQueryExecution {
+                        stream: Box::pin(stream::empty()),
+                        query_phase_timings: vec![PhaseTimingReport::completed(
+                            DEFERRED_QUERY_PHASE,
+                            Duration::from_micros(1),
+                        )],
+                        attach_profile_to_result: Some(Box::new(move |result| {
+                            if let Ok(mut calls) = attachment_calls.lock() {
+                                let outcome = if result.is_ok() {
+                                    "succeeded"
+                                } else {
+                                    "failed"
+                                };
+                                calls.push(format!("{attachment_output_name}:{outcome}"));
+                            }
+                            result
+                        })),
+                    })
+                })
+            }),
+            default_mssql_write_backend(),
+            ValidationOptions::default(),
+        )
+        .with_phase_timings(planned_phase_timings()))
+    }
+
+    fn failed_query_execution_job(
+        output_plan: MssqlTargetOutputPlan,
+    ) -> Result<MssqlOutputWriteJob, DeltaFunnelError> {
+        Ok(MssqlOutputWriteJob::new_with_query_execution_factory(
+            output_schema(),
+            resolved_target(output_plan)?,
+            MssqlSchemaPlanOptions::default(),
+            Box::new(|| {
+                Box::pin(async {
+                    Err(MssqlOutputQueryError {
+                        error: test_error("deferred setup failed"),
+                        query_phase_timings: vec![PhaseTimingReport::failed(
+                            DEFERRED_QUERY_PHASE,
+                            Duration::from_micros(1),
+                        )],
+                    })
+                })
+            }),
+            default_mssql_write_backend(),
+            ValidationOptions::default(),
         )
         .with_phase_timings(planned_phase_timings()))
     }

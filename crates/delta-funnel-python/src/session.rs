@@ -119,7 +119,8 @@ impl PySession {
     /// Writes multiple SQL Server outputs, or runs a dry-run plan when requested.
     ///
     /// Pass `dry_run=True` to plan without writing. Execute calls accept
-    /// `options={"cache_mode": "auto"}` or `options={"cache_mode": "disabled"}`.
+    /// `cache_mode` and `profile` options. Pass `profile=True` to attach a
+    /// detailed execution profile to each attempted output.
     /// Returns a plain Python `dict` report. One consolidated progress display
     /// follows output planning, shared cache work, and sequential writes. Pass
     /// `progress=False` to disable it for this call.
@@ -637,6 +638,13 @@ fn parse_write_all_options(
                 options =
                     options.with_cache_mode(parse_write_all_cache_mode(py, &value, key.as_str())?);
             }
+            "profile" => {
+                options = options.with_execution_profile_mode(parse_write_all_profile_mode(
+                    py,
+                    &value,
+                    key.as_str(),
+                )?);
+            }
             _ => {
                 return Err(unknown_option_error(py, "write_all", key.as_str()));
             }
@@ -727,6 +735,28 @@ fn parse_write_all_cache_mode(
             "invalid_option_value",
             format!("invalid `{option_name}` value"),
         )),
+    }
+}
+
+fn parse_write_all_profile_mode(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<delta_funnel::ExecutionProfileMode> {
+    if value.is_none() {
+        return Ok(delta_funnel::ExecutionProfileMode::Disabled);
+    }
+    if !value.is_instance_of::<PyBool>() {
+        return Err(config_py_error(
+            py,
+            "invalid_option_value",
+            format!("`{option_name}` must be a bool or None"),
+        ));
+    }
+    if value.extract::<bool>()? {
+        Ok(delta_funnel::ExecutionProfileMode::Detailed)
+    } else {
+        Ok(delta_funnel::ExecutionProfileMode::Disabled)
     }
 }
 
@@ -1075,7 +1105,7 @@ fn source_config_py_error(py: Python<'_>, kind: &'static str, message: String) -
 
 #[cfg(test)]
 mod tests {
-    use super::{PySession, parse_storage_options};
+    use super::{PySession, parse_storage_options, parse_write_all_options};
     use crate::{
         deltafunnel,
         progress::{
@@ -1085,10 +1115,10 @@ mod tests {
         test_support::python_state,
     };
     use delta_funnel::{
-        DeltaProviderScanExecutionOptions, DryRunScanSummaryMode, MssqlBinaryPolicy,
-        MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy, MssqlFloatPolicy,
-        MssqlNanosecondPolicy, MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTableName,
-        MssqlTimestampPolicy, MssqlTimezonePolicy, MssqlUInt64Policy, QueryOptions,
+        DeltaProviderScanExecutionOptions, DryRunScanSummaryMode, ExecutionProfileMode,
+        MssqlBinaryPolicy, MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy,
+        MssqlFloatPolicy, MssqlNanosecondPolicy, MssqlSchemaPlanOptions, MssqlStringPolicy,
+        MssqlTableName, MssqlTimestampPolicy, MssqlTimezonePolicy, MssqlUInt64Policy, QueryOptions,
         TargetValidationMode, connect_mssql_client_from_ado_string,
     };
     use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError};
@@ -1181,6 +1211,21 @@ mod tests {
     }
 
     #[test]
+    fn pyi_stub_exposes_write_all_execution_options() {
+        let stub = include_str!("../deltafunnel.pyi");
+        assert!(stub.contains(
+            "class WriteAllExecutionOptions(TypedDict, total=False):\n    cache_mode: WriteAllCacheMode\n    profile: bool | None"
+        ));
+
+        let signature = stub
+            .split_once("def write_all(")
+            .and_then(|(_, tail)| tail.split_once(") -> Report:"))
+            .map_or("", |(signature, _)| signature);
+        assert!(signature.contains("options: WriteAllExecutionOptions | None = None"));
+        assert!(!signature.contains("options: Options"));
+    }
+
+    #[test]
     fn pyo3_detach_allows_another_thread_to_run_python() -> PyResult<()> {
         Python::attach(|py| {
             let barrier = Arc::new(Barrier::new(2));
@@ -1258,6 +1303,7 @@ mod tests {
                 .extract::<String>()?;
             assert!(write_all_doc.contains("dry_run=True"));
             assert!(write_all_doc.contains("cache_mode"));
+            assert!(write_all_doc.contains("profile=True"));
             assert!(write_all_doc.contains("plain Python `dict` report"));
 
             let table_type = module.getattr("Table")?;
@@ -3030,7 +3076,6 @@ union all select cast(902 as bigint) as order_id",),
             assert_config_error(py, &error, "invalid_option_value")?;
 
             let options = PyDict::new(py);
-            options.set_item("cache_mode", "disabled")?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("options", options)?;
             kwargs.set_item("dry_run", true)?;
@@ -3043,6 +3088,52 @@ union all select cast(902 as bigint) as order_id",),
             assert_config_error(py, &error, "invalid_option_value")?;
 
             assert_eq!(adapter_creation_count(), initial_adapter_count);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_profile_option_accepts_only_bool_or_none() -> PyResult<()> {
+        Python::attach(|py| {
+            assert_eq!(
+                parse_write_all_options(py, None)?.execution_profile_mode(),
+                ExecutionProfileMode::Disabled
+            );
+
+            let options = PyDict::new(py);
+            options.set_item("profile", py.None())?;
+            assert_eq!(
+                parse_write_all_options(py, Some(&options))?.execution_profile_mode(),
+                ExecutionProfileMode::Disabled
+            );
+
+            options.set_item("profile", false)?;
+            assert_eq!(
+                parse_write_all_options(py, Some(&options))?.execution_profile_mode(),
+                ExecutionProfileMode::Disabled
+            );
+
+            options.set_item("profile", true)?;
+            assert_eq!(
+                parse_write_all_options(py, Some(&options))?.execution_profile_mode(),
+                ExecutionProfileMode::Detailed
+            );
+
+            let invalid_profiles = PyList::empty(py);
+            invalid_profiles.append(0)?;
+            invalid_profiles.append(1)?;
+            invalid_profiles.append("detailed")?;
+            invalid_profiles.append(PyList::new(py, [true])?)?;
+            let truthy_dict = PyDict::new(py);
+            truthy_dict.set_item("enabled", true)?;
+            invalid_profiles.append(truthy_dict)?;
+
+            for profile in invalid_profiles.iter() {
+                options.set_item("profile", profile)?;
+                let error = parse_write_all_options(py, Some(&options)).unwrap_err();
+                assert_config_error(py, &error, "invalid_option_value")?;
+            }
 
             Ok(())
         })

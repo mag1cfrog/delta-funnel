@@ -129,6 +129,7 @@ impl DeltaFunnelSession {
                                 writer,
                                 Some(Arc::clone(&shared_provider_stats)),
                                 active_reporter,
+                                options.execution_profile_mode(),
                             )
                             .await?;
                         (workflow, cache_report::from_plan(cache_plan))
@@ -141,6 +142,7 @@ impl DeltaFunnelSession {
                                 writer,
                                 Some(Arc::clone(&shared_provider_stats)),
                                 active_reporter,
+                                options.execution_profile_mode(),
                             )
                             .await?;
                         (workflow, cache_report::from_executed_plan(cache_plan))
@@ -153,6 +155,7 @@ impl DeltaFunnelSession {
                             writer,
                             Some(Arc::clone(&shared_provider_stats)),
                             active_reporter,
+                            options.execution_profile_mode(),
                         )
                         .await?;
                     (workflow, cache_report::disabled())
@@ -373,7 +376,7 @@ mod tests {
         test_support::{
             collect_stream_row_count, execute_output_request, failing_scan_marker_region_provider,
             output_request, override_connection, scan_counting_marker_region_provider,
-            secret_connection,
+            secret_connection, stream_setup_failing_marker_region_provider,
         },
     };
     use super::super::{WriteAllCacheMode, WriteAllOptions};
@@ -382,12 +385,14 @@ mod tests {
         WORKFLOW_EXECUTION_PHASE,
     };
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlBatchShapingReport,
-        MssqlOutputBatchStream, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus,
-        MssqlTargetConfig, MssqlTargetTable, MssqlTargetTableState, MssqlWorkflowOutputWriter,
-        MssqlWriteBackend, MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport,
-        PhaseStatus, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, RowCount,
+        DeltaFunnelError, DeltaSourceConfig, ExecutionProfileMode, LoadMode,
+        MssqlBatchShapingReport, MssqlOutputBatchStream, MssqlSchemaPlanOptions,
+        MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetTable, MssqlTargetTableState,
+        MssqlWorkflowOutputWriter, MssqlWriteBackend, MssqlWriteFailureContext, MssqlWritePhase,
+        MssqlWriteReport, PhaseStatus, PhaseTimingReport, QueryExecutionOutcome,
+        QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget, RowCount,
         WriteAllCacheAliasStatus, WriteAllCacheReport, WriteAllNoCacheReason,
+        observability::test_capture::{CapturedEvent, TracingCapture},
         plan_mssql_target_for_resolved_output,
         progress::{
             ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
@@ -445,12 +450,20 @@ mod tests {
     struct FakeWorkflowWriter {
         calls: Arc<Mutex<Vec<FakeOrchestratorWriteCall>>>,
         fail_output_name: Option<String>,
+        fail_before_poll_output_name: Option<String>,
     }
 
     impl FakeWorkflowWriter {
         fn failing_on(output_name: &str) -> Self {
             Self {
                 fail_output_name: Some(output_name.to_owned()),
+                ..Self::default()
+            }
+        }
+
+        fn failing_before_poll_on(output_name: &str) -> Self {
+            Self {
+                fail_before_poll_output_name: Some(output_name.to_owned()),
                 ..Self::default()
             }
         }
@@ -472,11 +485,53 @@ mod tests {
             _validation_options: crate::ValidationOptions,
             reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+            let output_plan = plan_mssql_target_for_resolved_output(
+                output_schema.as_ref(),
+                &resolved_target,
+                schema_options,
+            )?;
+            if self
+                .fail_before_poll_output_name
+                .as_deref()
+                .is_some_and(|output_name| output_name == resolved_target.output_name())
+            {
+                drop(batches);
+                return Err(DeltaFunnelError::MssqlWritePhase {
+                    context: Box::new(MssqlWriteFailureContext::from_output_plan(
+                        &output_plan,
+                        MssqlWritePhase::Connect,
+                        0,
+                        0,
+                        0,
+                        false,
+                        MssqlTargetCleanupStatus::NotApplicable,
+                    )),
+                    message: format!(
+                        "fake workflow writer failed before polling `{}`",
+                        resolved_target.output_name()
+                    ),
+                });
+            }
+
             let mut rows = 0_u64;
             let mut batch_count = 0_u64;
 
             while let Some(batch) = batches.next().await {
-                let batch = batch?;
+                let batch = batch.map_err(|error| DeltaFunnelError::MssqlWritePhase {
+                    context: Box::new(MssqlWriteFailureContext::from_output_plan(
+                        &output_plan,
+                        MssqlWritePhase::PollBatchStream,
+                        rows,
+                        batch_count,
+                        0,
+                        false,
+                        MssqlTargetCleanupStatus::NotApplicable,
+                    )),
+                    message: format!(
+                        "fake workflow writer failed while polling `{}`: {error}",
+                        resolved_target.output_name()
+                    ),
+                })?;
                 rows = rows.saturating_add(u64::try_from(batch.num_rows()).map_err(|_| {
                     DeltaFunnelError::Config {
                         message: "fake workflow writer row count overflowed u64".to_owned(),
@@ -485,11 +540,6 @@ mod tests {
                 batch_count = batch_count.saturating_add(1);
             }
 
-            let output_plan = plan_mssql_target_for_resolved_output(
-                output_schema.as_ref(),
-                &resolved_target,
-                schema_options,
-            )?;
             self.calls
                 .lock()
                 .map_err(|_| DeltaFunnelError::Config {
@@ -565,10 +615,15 @@ mod tests {
         phase_name: &str,
         expected_status: PhaseStatus,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let timing = timings
+        let mut matching = timings
             .iter()
-            .find(|timing| timing.phase_name() == phase_name)
+            .filter(|timing| timing.phase_name() == phase_name);
+        let timing = matching
+            .next()
             .ok_or_else(|| format!("missing phase timing {phase_name}"))?;
+        if matching.next().is_some() {
+            return Err(format!("duplicate phase timing {phase_name}").into());
+        }
 
         assert_eq!(timing.status(), expected_status);
         if expected_status.is_completed() || expected_status.is_failed() {
@@ -576,6 +631,73 @@ mod tests {
         } else {
             assert_eq!(timing.elapsed_micros(), None);
         }
+        Ok(())
+    }
+
+    fn execution_profile_events(capture: &TracingCapture) -> Vec<CapturedEvent> {
+        capture
+            .captured()
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some("query_execution_profile_terminal")
+            })
+            .collect()
+    }
+
+    const fn detailed_uncached_write_all_options() -> WriteAllOptions {
+        WriteAllOptions::new()
+            .with_cache_mode(WriteAllCacheMode::Disabled)
+            .with_execution_profile_mode(ExecutionProfileMode::Detailed)
+    }
+
+    async fn run_two_output_failure_case(
+        session: &mut DeltaFunnelSession,
+        failing_sql: &str,
+        writer: FakeWorkflowWriter,
+    ) -> Result<crate::WriteAllReport, Box<dyn std::error::Error>> {
+        let failing = session.table_from_sql(failing_sql).await?;
+        let skipped = session.table_from_sql("select 2 as id").await?;
+        let failing = execute_output_request(
+            failing,
+            "failing_output",
+            "failing_orders",
+            LoadMode::AppendExisting,
+        )?;
+        let skipped = execute_output_request(
+            skipped,
+            "skipped_output",
+            "skipped_orders",
+            LoadMode::AppendExisting,
+        )?;
+
+        Ok(session
+            .write_all_with_options_and_writer(
+                &[failing, skipped],
+                detailed_uncached_write_all_options(),
+                writer,
+            )
+            .await?)
+    }
+
+    fn assert_profiled_failure(
+        report: &crate::WriteAllReport,
+        phase: MssqlWritePhase,
+        outcome: QueryExecutionOutcome,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let [crate::MssqlOutputWriteStatus::Failed(failure), skipped] = report.outputs() else {
+            return Err("expected one failed and one skipped output".into());
+        };
+        let context = failure.context().ok_or("expected write failure context")?;
+        assert_eq!(context.phase(), phase);
+        let profile = context
+            .report()
+            .execution_profile()
+            .ok_or("expected failed output profile")?;
+        assert_eq!(profile.outcome(), outcome);
+        assert!(profile.partial());
+        assert!(skipped.is_skipped());
         Ok(())
     }
 
@@ -815,14 +937,96 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn write_all_progress_preserves_profile_shape_and_event_count()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let output = session
+                .table_from_sql("select 1 as id union all select 2 as id")
+                .await?;
+            let output = execute_output_request(
+                output,
+                "orders_output",
+                "orders",
+                LoadMode::AppendExisting,
+            )?;
+            let options = detailed_uncached_write_all_options();
+
+            let capture = TracingCapture::start();
+            let without_progress = session
+                .write_all_with_options_and_writer(
+                    std::slice::from_ref(&output),
+                    options,
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+            assert_eq!(execution_profile_events(&capture).len(), 1);
+            drop(capture);
+
+            let (reporter, _progress_events) = recording_progress();
+            let capture = TracingCapture::start();
+            let with_progress = session
+                .write_all_with_progress_and_writer(
+                    &[output],
+                    options,
+                    reporter,
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+            assert_eq!(execution_profile_events(&capture).len(), 1);
+
+            let [crate::MssqlOutputWriteStatus::Succeeded(without_progress)] =
+                without_progress.outputs()
+            else {
+                return Err("expected successful output without progress".into());
+            };
+            let [crate::MssqlOutputWriteStatus::Succeeded(with_progress)] = with_progress.outputs()
+            else {
+                return Err("expected successful output with progress".into());
+            };
+            let without_progress = without_progress
+                .execution_profile()
+                .ok_or("expected profile without progress")?;
+            let with_progress = with_progress
+                .execution_profile()
+                .ok_or("expected profile with progress")?;
+            assert_eq!(without_progress.scope(), with_progress.scope());
+            assert_eq!(without_progress.outcome(), with_progress.outcome());
+            assert_eq!(
+                without_progress.delta_funnel_row_limit(),
+                with_progress.delta_funnel_row_limit()
+            );
+            let operator_shape = |profile: &crate::QueryExecutionProfile| {
+                profile
+                    .operators()
+                    .iter()
+                    .map(|operator| {
+                        (
+                            operator.operator_name().to_owned(),
+                            operator.parent_node_id(),
+                            operator.output_partition_count(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                operator_shape(without_progress),
+                operator_shape(with_progress)
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn empty_write_all_emits_no_progress() -> Result<(), Box<dyn std::error::Error>> {
             let session = DeltaFunnelSession::new(SessionOptions::new())?;
             let (reporter, events) = recording_progress();
+            let capture = TracingCapture::start();
 
             let report = session
                 .write_all_with_progress_and_writer(
                     &[],
-                    WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Disabled),
+                    detailed_uncached_write_all_options(),
                     reporter,
                     FakeWorkflowWriter::default(),
                 )
@@ -835,6 +1039,7 @@ mod tests {
                     .map_err(|_| "progress event lock poisoned")?
                     .is_empty()
             );
+            assert!(execution_profile_events(&capture).is_empty());
             Ok(())
         }
 
@@ -1152,6 +1357,7 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
+            let capture = TracingCapture::start();
 
             let report = session.write_all_with_writer(&[west, east], writer).await?;
             let calls = calls
@@ -1179,6 +1385,18 @@ mod tests {
             };
             assert_eq!(west_report.stats().rows_written(), 2);
             assert_eq!(west_report.stats().batches_written(), calls[0].batches);
+            assert_eq!(west_report.execution_profile(), None);
+            for phase_name in [
+                "query_dataframe_planning",
+                "query_physical_planning",
+                "query_stream_setup",
+            ] {
+                assert_phase_timing(
+                    west_report.phase_timings(),
+                    phase_name,
+                    PhaseStatus::completed(),
+                )?;
+            }
             assert_eq!(report.outputs()[0].output_row_count(), RowCount::exact(2));
             assert_batch_shaping(
                 report.outputs()[0].batch_shaping(),
@@ -1201,6 +1419,7 @@ mod tests {
                 west_report.cleanup(),
                 MssqlTargetCleanupStatus::NotApplicable
             );
+            assert!(execution_profile_events(&capture).is_empty());
             assert_phase_timing(
                 report.phase_timings(),
                 OUTPUT_PLANNING_PHASE,
@@ -1221,6 +1440,168 @@ mod tests {
                 SOURCE_REPORTING_PHASE,
                 PhaseStatus::completed(),
             )?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn uncached_detailed_mode_profiles_each_output_query()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let (provider, scans) = scan_counting_marker_region_provider("shared")?;
+            session
+                .context()
+                .register_table("shared_source", provider)?;
+            let shared = session
+                .table_from_sql("select marker from shared_source")
+                .await?;
+            let first = execute_output_request(
+                shared.clone(),
+                "first_output",
+                "first_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let second = execute_output_request(
+                shared,
+                "second_output",
+                "second_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let capture = TracingCapture::start();
+
+            let report = session
+                .write_all_with_options_and_writer(
+                    &[first, second],
+                    detailed_uncached_write_all_options(),
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+
+            assert_eq!(
+                report
+                    .outputs()
+                    .iter()
+                    .map(crate::MssqlOutputWriteStatus::output_name)
+                    .collect::<Vec<_>>(),
+                vec!["first_output", "second_output"]
+            );
+            for status in report.outputs() {
+                let crate::MssqlOutputWriteStatus::Succeeded(output_report) = status else {
+                    return Err(format!("expected succeeded status, got {status:?}").into());
+                };
+                let profile = output_report
+                    .execution_profile()
+                    .ok_or("expected output query profile")?;
+                assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+                assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+                assert!(!profile.partial());
+                assert!(!profile.operators().is_empty());
+                for phase_name in [
+                    "query_dataframe_planning",
+                    "query_physical_planning",
+                    "query_stream_setup",
+                ] {
+                    assert_phase_timing(
+                        output_report.phase_timings(),
+                        phase_name,
+                        PhaseStatus::completed(),
+                    )?;
+                }
+            }
+            assert_eq!(scans.load(Ordering::SeqCst), 2);
+            let events = execution_profile_events(&capture);
+            assert_eq!(events.len(), 2);
+            assert!(events.iter().all(|event| {
+                event.fields.get("scope").map(String::as_str) == Some("mssql_output")
+                    && event.fields.get("outcome").map(String::as_str) == Some("success")
+            }));
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn uncached_detailed_mode_nests_failed_profile_and_skipped_null_once()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let first = session.table_from_sql("select 1 as id").await?;
+            let second = session.table_from_sql("select 2 as id").await?;
+            let third = session.table_from_sql("select 3 as id").await?;
+            let first = execute_output_request(
+                first,
+                "first_output",
+                "first_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let second = execute_output_request(
+                second,
+                "second_output",
+                "second_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let third = execute_output_request(
+                third,
+                "third_output",
+                "third_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let capture = TracingCapture::start();
+
+            let report = session
+                .write_all_with_options_and_writer(
+                    &[first, second, third],
+                    detailed_uncached_write_all_options(),
+                    FakeWorkflowWriter::failing_on("second_output"),
+                )
+                .await?;
+
+            let [
+                crate::MssqlOutputWriteStatus::Succeeded(success),
+                crate::MssqlOutputWriteStatus::Failed(failure),
+                skipped,
+            ] = report.outputs()
+            else {
+                return Err("expected one succeeded, one failed, and one skipped output".into());
+            };
+            assert_eq!(
+                success
+                    .execution_profile()
+                    .ok_or("expected successful output profile")?
+                    .outcome(),
+                QueryExecutionOutcome::Success
+            );
+            let context = failure.context().ok_or("expected failure context")?;
+            let profile = context
+                .report()
+                .execution_profile()
+                .ok_or("expected failed output query profile")?;
+            assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+            assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+            assert!(!profile.partial());
+            assert!(skipped.is_skipped());
+            assert_eq!(execution_profile_events(&capture).len(), 2);
+
+            let value = report.to_json_value();
+            let failed = &value["workflow"]["outputs"][1];
+            assert!(value.get("execution_profile").is_none());
+            assert!(value["workflow"].get("execution_profile").is_none());
+            assert!(failed.get("execution_profile").is_none());
+            assert!(failed["failure"].get("execution_profile").is_none());
+            assert!(
+                failed["failure"]["context"]
+                    .get("execution_profile")
+                    .is_none()
+            );
+            assert_eq!(
+                failed["failure"]["context"]["report"]["execution_profile"]["outcome"],
+                "success"
+            );
+            let skipped = &value["workflow"]["outputs"][2];
+            assert!(skipped.get("execution_profile").is_none());
+            assert!(skipped["skipped"]["execution_profile"].is_null());
+
             Ok(())
         }
 
@@ -1614,6 +1995,12 @@ mod tests {
                 assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
                 assert!(report.all_succeeded());
             }
+            for status in report.outputs() {
+                let crate::MssqlOutputWriteStatus::Succeeded(output_report) = status else {
+                    return Err(format!("expected succeeded status, got {status:?}").into());
+                };
+                assert_eq!(output_report.execution_profile(), None);
+            }
             let WriteAllCacheReport::CacheAliases {
                 aliases,
                 skipped_candidates,
@@ -1656,7 +2043,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn write_all_auto_keeps_unrelated_output_on_normal_stream_path()
+        async fn write_all_auto_profiles_direct_replanned_and_unrelated_output_queries()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -1698,7 +2085,12 @@ mod tests {
             let calls = writer.calls();
 
             let report = session
-                .write_all_with_writer(&[big_output, unrelated_output, west_output], writer)
+                .write_all_with_options_and_writer(
+                    &[big_output, unrelated_output, west_output],
+                    WriteAllOptions::new()
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                    writer,
+                )
                 .await?;
             {
                 let calls = calls
@@ -1715,6 +2107,29 @@ mod tests {
                 assert_eq!(shared_scans.load(Ordering::SeqCst), 1);
                 assert_eq!(unrelated_scans.load(Ordering::SeqCst), 1);
                 assert!(report.all_succeeded());
+            }
+            for status in report.outputs() {
+                let crate::MssqlOutputWriteStatus::Succeeded(output_report) = status else {
+                    return Err(format!("expected succeeded status, got {status:?}").into());
+                };
+                let profile = output_report
+                    .execution_profile()
+                    .ok_or("expected cached output query profile")?;
+                assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+                assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+                assert!(!profile.partial());
+                assert!(!profile.operators().is_empty());
+                for phase_name in [
+                    "query_dataframe_planning",
+                    "query_physical_planning",
+                    "query_stream_setup",
+                ] {
+                    assert_phase_timing(
+                        output_report.phase_timings(),
+                        phase_name,
+                        PhaseStatus::completed(),
+                    )?;
+                }
             }
             Ok(())
         }
@@ -2197,6 +2612,7 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::failing_on("second_output");
             let calls = writer.calls();
+            let capture = TracingCapture::start();
 
             let report = session
                 .write_all_with_writer(&[first, second, third], writer)
@@ -2218,6 +2634,17 @@ mod tests {
             assert_eq!(report.outputs()[0].output_name(), "first_output");
             assert!(report.outputs()[1].is_failed());
             assert_eq!(report.outputs()[1].output_name(), "second_output");
+            let crate::MssqlOutputWriteStatus::Failed(failure) = &report.outputs()[1] else {
+                return Err("expected failed second output".into());
+            };
+            assert_eq!(
+                failure
+                    .context()
+                    .ok_or("expected failure context")?
+                    .report()
+                    .execution_profile(),
+                None
+            );
             assert_eq!(
                 report.outputs()[1].output_row_count(),
                 RowCount::partial(calls[1].rows)
@@ -2244,11 +2671,12 @@ mod tests {
                 0,
                 0,
             );
+            assert!(execution_profile_events(&capture).is_empty());
             Ok(())
         }
 
         #[tokio::test]
-        async fn write_all_with_writer_reports_stream_setup_failure_before_writer()
+        async fn write_all_with_writer_reports_physical_planning_failure_before_writer()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -2294,9 +2722,14 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
+            let capture = TracingCapture::start();
 
             let report = session
-                .write_all_with_writer(&[first, failing, third], writer)
+                .write_all_with_options_and_writer(
+                    &[first, failing, third],
+                    detailed_uncached_write_all_options(),
+                    writer,
+                )
                 .await?;
             let calls = calls
                 .lock()
@@ -2312,26 +2745,55 @@ mod tests {
             assert_eq!(report.skipped_count(), 1);
             assert!(report.outputs()[0].is_succeeded());
             assert_eq!(report.outputs()[0].output_name(), "first_output");
-            assert!(report.outputs()[1].is_failed());
-            assert_eq!(report.outputs()[1].output_name(), "failing_output");
+            let crate::MssqlOutputWriteStatus::Succeeded(first_report) = &report.outputs()[0]
+            else {
+                return Err("expected succeeded first output".into());
+            };
             assert_eq!(
-                report.outputs()[1].output_row_count(),
-                RowCount::unavailable()
+                first_report
+                    .execution_profile()
+                    .ok_or("expected first output profile")?
+                    .outcome(),
+                QueryExecutionOutcome::Success
             );
+            let crate::MssqlOutputWriteStatus::Failed(failure) = &report.outputs()[1] else {
+                return Err("expected failed output status".into());
+            };
+            assert_eq!(failure.output_name(), "failing_output");
+            let context = failure.context().ok_or("expected query failure context")?;
+            assert_eq!(context.phase(), MssqlWritePhase::QueryPhysicalPlanning);
+            assert_eq!(context.report().execution_profile(), None);
+            assert_eq!(report.outputs()[1].output_row_count(), RowCount::partial(0));
             assert_batch_shaping(
                 report.outputs()[1].batch_shaping(),
-                PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+                PhaseStatus::failed(),
                 0,
                 0,
                 0,
                 0,
             );
+            assert_phase_timing(
+                report.outputs()[1].phase_timings(),
+                "query_dataframe_planning",
+                PhaseStatus::completed(),
+            )?;
+            assert_phase_timing(
+                report.outputs()[1].phase_timings(),
+                "query_physical_planning",
+                PhaseStatus::failed(),
+            )?;
+            assert_phase_timing(
+                report.outputs()[1].phase_timings(),
+                "query_stream_setup",
+                PhaseStatus::not_started(ReportReasonCode::PriorFailure),
+            )?;
             assert!(report.outputs()[2].is_skipped());
             assert_eq!(report.outputs()[2].output_name(), "third_output");
             assert_eq!(
                 report.outputs()[2].output_row_count(),
                 RowCount::unavailable()
             );
+            assert_eq!(execution_profile_events(&capture).len(), 1);
             assert_batch_shaping(
                 report.outputs()[2].batch_shaping(),
                 PhaseStatus::skipped(ReportReasonCode::PriorFailure),
@@ -2339,6 +2801,100 @@ mod tests {
                 0,
                 0,
                 0,
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn detailed_write_all_profiles_stream_setup_failure_as_error()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            session.context().register_table(
+                "setup_failure_source",
+                stream_setup_failing_marker_region_provider()?,
+            )?;
+            let writer = FakeWorkflowWriter::default();
+            let calls = writer.calls();
+            let capture = TracingCapture::start();
+
+            let report = run_two_output_failure_case(
+                &mut session,
+                "select marker from setup_failure_source",
+                writer,
+            )
+            .await?;
+
+            assert_profiled_failure(
+                &report,
+                MssqlWritePhase::QueryStreamSetup,
+                QueryExecutionOutcome::Error,
+            )?;
+            assert!(
+                calls
+                    .lock()
+                    .map_err(|_| "fake workflow call lock poisoned")?
+                    .is_empty()
+            );
+            let events = execution_profile_events(&capture);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].fields.get("outcome").map(String::as_str),
+                Some("error")
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn detailed_write_all_profiles_upstream_failure_as_error()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let capture = TracingCapture::start();
+
+            let report = run_two_output_failure_case(
+                &mut session,
+                "select cast(1 as bigint) / cast(0 as bigint) as value",
+                FakeWorkflowWriter::default(),
+            )
+            .await?;
+
+            assert_profiled_failure(
+                &report,
+                MssqlWritePhase::PollBatchStream,
+                QueryExecutionOutcome::Error,
+            )?;
+            assert_eq!(execution_profile_events(&capture).len(), 1);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn detailed_write_all_profiles_early_writer_stop_as_cancelled()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let capture = TracingCapture::start();
+
+            let report = run_two_output_failure_case(
+                &mut session,
+                "select 1 as id",
+                FakeWorkflowWriter::failing_before_poll_on("failing_output"),
+            )
+            .await?;
+
+            assert_profiled_failure(
+                &report,
+                MssqlWritePhase::Connect,
+                QueryExecutionOutcome::Cancelled,
+            )?;
+            let events = execution_profile_events(&capture);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].fields.get("outcome").map(String::as_str),
+                Some("cancelled")
             );
             Ok(())
         }

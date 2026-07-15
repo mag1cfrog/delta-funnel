@@ -524,6 +524,7 @@ impl MssqlWriteSkippedReport {
             "validation_status": self.validation_status().to_json_value(),
             "batch_shaping": batch_shaping_value(self.batch_shaping()),
             "phase_timings": phase_timings_value(self.phase_timings()),
+            "execution_profile": Value::Null,
         })
     }
 }
@@ -1332,6 +1333,8 @@ mod tests {
             json!({"kind": "partial", "value": 4})
         );
         assert_eq!(value["outputs"][2]["kind"], "skipped");
+        assert!(value["outputs"][2].get("execution_profile").is_none());
+        assert!(value["outputs"][2]["skipped"]["execution_profile"].is_null());
         assert_eq!(
             value["outputs"][2]["skipped"]["reason"],
             json!({

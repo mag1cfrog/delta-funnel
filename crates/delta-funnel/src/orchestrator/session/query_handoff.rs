@@ -19,10 +19,11 @@ use datafusion::{
 };
 use futures_util::{Stream, StreamExt, TryStreamExt};
 
+#[cfg(test)]
+use crate::MssqlOutputBatchStreamFactory;
 use crate::{
-    DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
-    PhaseTimingReport, PreviewFailureContext, QueryExecutionProfile, QueryExecutionScope,
-    ReportReasonCode,
+    DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStream, PhaseTimingReport,
+    PreviewFailureContext, QueryExecutionProfile, QueryExecutionScope, ReportReasonCode,
     observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
@@ -452,6 +453,7 @@ impl Stream for DeltaFileProgressStream {
     }
 }
 
+#[cfg(test)]
 async fn batch_stream_for_lazy_table_from_session_parts(
     context: &SessionContext,
     table: &LazyTable,
@@ -879,6 +881,7 @@ impl DeltaFunnelSession {
     /// progress tracking.
     ///
     /// `progress` contains an output-scoped reporter and that output's name.
+    #[cfg(test)]
     pub(super) fn lazy_table_batch_stream_factory(
         &self,
         table: LazyTable,
@@ -1064,7 +1067,7 @@ fn push_html_escaped(output: &mut String, value: &str) {
     }
 }
 
-async fn dataframe_for_lazy_table_from_session_parts(
+pub(super) async fn dataframe_for_lazy_table_from_session_parts(
     context: &SessionContext,
     table: &LazyTable,
     sources: &[RegisteredSessionSource],

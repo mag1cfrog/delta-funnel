@@ -1,102 +1,93 @@
 use std::sync::Arc;
 
-use datafusion::{
-    arrow::datatypes::SchemaRef, physical_plan::ExecutionPlan, prelude::SessionContext,
-};
-use futures_util::StreamExt;
+use datafusion::{arrow::datatypes::SchemaRef, prelude::SessionContext};
 
+#[cfg(test)]
+use crate::MssqlOutputBatchStreamFactory;
 use crate::{
-    DeltaFunnelError, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
-    datafusion_query_output_stream, observability::DeltaProviderScanOutcome,
-    progress::ProgressReporter,
-    query_engine::datafusion::collect_delta_provider_read_stats_handles,
+    DeltaFunnelError, ExecutionProfileMode, MssqlOutputQueryError, MssqlOutputQueryExecution,
+    MssqlOutputQueryFuture, MssqlWritePhase, progress::ProgressReporter, report::PhaseTimer,
 };
 
 use super::super::super::{
-    DeltaFunnelSession, LazyTableKind, OutputWritePlan,
+    DeltaFunnelSession, LazyTableKind, OutputWritePlan, PlannedMssqlOutput,
     errors::{cached_output_stream_setup_error, unknown_cached_alias_error},
-    query_handoff::{
-        SharedProviderStatsSnapshots, finalize_tracked_query_execution,
-        wrap_stream_with_query_execution_tracking,
-    },
+    query_handoff::SharedProviderStatsSnapshots,
     registry::{DerivedTableDependency, read_only_sql_options},
+};
+use super::super::output::{
+    QUERY_DATAFRAME_PLANNING_PHASE, create_mssql_output_query_execution_from_dataframe,
+    mssql_output_query_error,
 };
 use super::MssqlDerivedCacheAliasPlan;
 
-pub(super) fn failing_cached_output_batch_stream_factory(
+fn failing_cached_output_query_factory(
     output_name: String,
     error: DeltaFunnelError,
-) -> MssqlOutputBatchStreamFactory {
+) -> Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send> {
     Box::new(move || {
-        Box::pin(async move { Err(cached_output_stream_setup_error(&output_name, error)) })
+        Box::pin(async move {
+            Err(MssqlOutputQueryError {
+                error: cached_output_stream_setup_error(&output_name, error),
+                query_phase_timings: Vec::new(),
+            })
+        })
     })
 }
 
-pub(super) async fn cached_output_stream_from_retained_sql(
+async fn create_cached_output_query_execution_from_retained_sql(
     context: SessionContext,
-    output_name: String,
+    planned: PlannedMssqlOutput,
     sql_text: String,
     expected_schema: SchemaRef,
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     reporter: Option<ProgressReporter>,
-) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
-    let dataframe = context
+    profile_mode: ExecutionProfileMode,
+) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
+    let output_name = planned.resolved_target().output_name();
+    let dataframe_timer = PhaseTimer::start(QUERY_DATAFRAME_PLANNING_PHASE);
+    let dataframe = match context
         .sql_with_options(sql_text.as_str(), read_only_sql_options())
         .await
-        .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
-    validate_replanned_output_schema(
-        &output_name,
-        dataframe.schema().as_arrow(),
-        &expected_schema,
-    )?;
-    let physical_plan = dataframe
-        .create_physical_plan()
-        .await
-        .map_err(|error| cached_output_stream_setup_error(&output_name, error))?;
-
-    cached_output_stream_from_physical_plan(
-        &context,
-        output_name,
-        physical_plan,
-        provider_stats_snapshots,
-        reporter,
-    )
-}
-
-/// Builds a tracked cached output stream from a completed physical plan.
-fn cached_output_stream_from_physical_plan(
-    context: &SessionContext,
-    output_name: String,
-    physical_plan: Arc<dyn ExecutionPlan>,
-    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
-    reporter: Option<ProgressReporter>,
-) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
-    // Retain scan handles before merged stream setup can fail.
-    let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-    let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
-        Ok(stream) => stream,
+    {
+        Ok(dataframe) => dataframe,
         Err(error) => {
-            finalize_tracked_query_execution(
-                &read_stats_handles,
-                provider_stats_snapshots.as_ref(),
+            return Err(mssql_output_query_error(
+                &planned,
+                MssqlWritePhase::QueryDataFramePlanning,
+                Vec::new(),
+                dataframe_timer,
+                cached_output_stream_setup_error(output_name, error),
                 None,
-                DeltaProviderScanOutcome::Error,
-            );
-            return Err(cached_output_stream_setup_error(&output_name, error));
+            ));
         }
     };
-    let error_output_name = output_name.clone();
-    let stream = Box::pin(stream.map(move |batch| {
-        batch.map_err(|error| cached_output_stream_setup_error(&error_output_name, error))
-    }));
+    if let Err(error) = validate_replanned_output_schema(
+        output_name,
+        dataframe.schema().as_arrow(),
+        &expected_schema,
+    ) {
+        return Err(mssql_output_query_error(
+            &planned,
+            MssqlWritePhase::QueryDataFramePlanning,
+            Vec::new(),
+            dataframe_timer,
+            error,
+            None,
+        ));
+    }
+    let query_phase_timings = vec![dataframe_timer.completed()];
 
-    Ok(wrap_stream_with_query_execution_tracking(
-        stream,
-        read_stats_handles,
+    create_mssql_output_query_execution_from_dataframe(
+        &context,
+        &planned,
+        dataframe,
+        query_phase_timings,
         provider_stats_snapshots,
-        reporter.map(|reporter| (reporter, output_name)),
-        None,
-    ))
+        reporter,
+        profile_mode,
+    )
+    .await
 }
 
 impl DeltaFunnelSession {
@@ -143,27 +134,30 @@ impl DeltaFunnelSession {
         }))
     }
 
-    /// Builds an async stream factory for one output while cache aliases are active.
+    /// Builds a deferred query factory for one output while cache aliases are active.
     ///
-    /// The returned factory performs DataFusion stream setup when the workflow
-    /// attempts this output. Direct cached aliases and unrelated outputs reuse
-    /// the normal lazy-table stream path. Dependent outputs replan from the
-    /// retained SQL text so active scoped cache aliases can replace the
-    /// registered providers referenced by that SQL.
-    /// Optional provider stats and progress reporting are attached to the
-    /// returned stream without changing how its cache route is selected.
-    pub(crate) fn cached_output_batch_stream_factory(
+    /// The returned factory performs DataFusion query planning and stream setup
+    /// when the workflow attempts this output. Direct cached aliases and
+    /// unrelated outputs reuse the normal lazy-table query path. Dependent
+    /// outputs replan from the retained SQL text so active scoped cache aliases
+    /// can replace the registered providers referenced by that SQL.
+    /// Optional provider stats, progress, and profiling are attached without
+    /// changing how the cache route is selected.
+    pub(crate) fn cached_output_query_factory(
         &self,
-        request: &OutputWritePlan,
+        planned: &PlannedMssqlOutput,
         active_aliases: &[MssqlDerivedCacheAliasPlan],
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<ProgressReporter>,
-    ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
+        profile_mode: ExecutionProfileMode,
+    ) -> Result<Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send>, DeltaFunnelError> {
+        let request = planned.request();
         if !self.output_requires_cache_replan(request, active_aliases)? {
-            return Ok(self.lazy_table_batch_stream_factory(
-                request.table().clone(),
+            return Ok(self.mssql_output_query_factory(
+                planned.clone(),
                 provider_stats_snapshots,
-                reporter.map(|reporter| (reporter, request.target().output_name().to_owned())),
+                reporter,
+                profile_mode,
             ));
         }
 
@@ -171,33 +165,53 @@ impl DeltaFunnelSession {
         let sql_text = match self.sql_text_for_derived_table(request.table()) {
             Ok(sql_text) => sql_text.to_owned(),
             Err(error) => {
-                return Ok(failing_cached_output_batch_stream_factory(
-                    output_name,
-                    error,
-                ));
+                return Ok(failing_cached_output_query_factory(output_name, error));
             }
         };
         let expected_schema = match self.schema_for_lazy_table(request.table()) {
             Ok(schema) => Arc::clone(schema),
             Err(error) => {
-                return Ok(failing_cached_output_batch_stream_factory(
-                    output_name,
-                    error,
-                ));
+                return Ok(failing_cached_output_query_factory(output_name, error));
             }
         };
         let context = self.context.clone();
+        let planned = planned.clone();
         Ok(Box::new(move || {
             Box::pin(async move {
-                cached_output_stream_from_retained_sql(
+                create_cached_output_query_execution_from_retained_sql(
                     context,
-                    output_name,
+                    planned,
                     sql_text,
                     expected_schema,
                     provider_stats_snapshots,
                     reporter,
+                    profile_mode,
                 )
                 .await
+            })
+        }))
+    }
+
+    #[cfg(test)]
+    fn cached_output_batch_stream_factory(
+        &self,
+        request: &OutputWritePlan,
+        active_aliases: &[MssqlDerivedCacheAliasPlan],
+    ) -> Result<MssqlOutputBatchStreamFactory, DeltaFunnelError> {
+        let planned = self.plan_mssql_output(request)?;
+        let create_query_execution = self.cached_output_query_factory(
+            &planned,
+            active_aliases,
+            None,
+            None,
+            ExecutionProfileMode::Disabled,
+        )?;
+        Ok(Box::new(move || {
+            Box::pin(async move {
+                create_query_execution()
+                    .await
+                    .map(|execution| execution.stream)
+                    .map_err(|failure| failure.error)
             })
         }))
     }
@@ -224,56 +238,16 @@ mod tests {
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
-    use crate::{
-        DeltaFunnelError, DeltaSourceConfig, LoadMode, table_formats::RealParquetDeltaTable,
-    };
+    use crate::{DeltaFunnelError, DeltaSourceConfig, LoadMode};
 
     use super::super::super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
-        query_handoff::{provider_stats_snapshots, shared_provider_stats_snapshots},
         test_support::{
-            DeltaLogTable, StreamSetupFailingPlan, collect_stream_marker_values, output_request,
-            scan_counting_marker_region_provider,
+            DeltaLogTable, collect_stream_marker_values, output_request,
+            scan_counting_marker_region_provider, secret_connection,
         },
     };
     use super::super::{MssqlDerivedCacheAliasPlan, MssqlOutputCacheDecision};
-
-    #[tokio::test]
-    async fn cached_output_stream_setup_error_records_one_provider_snapshot()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = RealParquetDeltaTable::new_default("cached-stream-setup-error")?;
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
-        let dataframe = session.dataframe_for_lazy_table(&source).await?;
-        let physical_plan = dataframe.create_physical_plan().await?;
-        let shared_provider_stats = shared_provider_stats_snapshots();
-
-        let result = super::cached_output_stream_from_physical_plan(
-            &session.context,
-            "orders_output".to_owned(),
-            Arc::new(StreamSetupFailingPlan::new(physical_plan)),
-            Some(Arc::clone(&shared_provider_stats)),
-            None,
-        );
-        let snapshots = provider_stats_snapshots(&shared_provider_stats);
-
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
-                if message.contains("cached output stream setup failed for `orders_output`")
-        ));
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].source_name, "orders");
-        assert_eq!(snapshots[0].files_started, 0);
-        assert_eq!(snapshots[0].parquet_data_file_range_get_operations, Some(0));
-        assert_eq!(snapshots[0].parquet_data_file_full_get_operations, Some(0));
-        assert_eq!(snapshots[0].parquet_data_file_bytes_received, Some(0));
-        assert_eq!(snapshots[0].parquet_data_file_opened_bytes, Some(0));
-        Ok(())
-    }
 
     #[tokio::test]
     async fn output_requires_cache_replan_classifies_direct_dependent_and_unrelated_outputs()
@@ -345,7 +319,9 @@ mod tests {
     #[tokio::test]
     async fn cached_output_stream_factory_direct_alias_reads_active_cache()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
         let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
         session
             .context()
@@ -374,8 +350,7 @@ mod tests {
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
-        let factory =
-            session.cached_output_batch_stream_factory(&big_output, caches, None, None)?;
+        let factory = session.cached_output_batch_stream_factory(&big_output, caches)?;
         let markers = collect_stream_marker_values(factory().await?).await?;
 
         assert_eq!(markers, vec!["shared", "shared"]);
@@ -387,7 +362,9 @@ mod tests {
     #[tokio::test]
     async fn cached_output_stream_factory_unrelated_output_uses_existing_lazy_table_path()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
         let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
         session
             .context()
@@ -425,8 +402,7 @@ mod tests {
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
-        let factory =
-            session.cached_output_batch_stream_factory(&unrelated_output, caches, None, None)?;
+        let factory = session.cached_output_batch_stream_factory(&unrelated_output, caches)?;
         let markers = collect_stream_marker_values(factory().await?).await?;
 
         assert_eq!(markers, vec!["unrelated"]);
@@ -438,7 +414,9 @@ mod tests {
     #[tokio::test]
     async fn cached_output_stream_factory_replans_dependent_outputs_against_active_cache()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
         let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
         session
             .context()
@@ -484,12 +462,9 @@ mod tests {
             .await?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
-        let big_factory =
-            session.cached_output_batch_stream_factory(&big_output, caches, None, None)?;
-        let west_factory =
-            session.cached_output_batch_stream_factory(&west_output, caches, None, None)?;
-        let east_factory =
-            session.cached_output_batch_stream_factory(&east_output, caches, None, None)?;
+        let big_factory = session.cached_output_batch_stream_factory(&big_output, caches)?;
+        let west_factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
+        let east_factory = session.cached_output_batch_stream_factory(&east_output, caches)?;
         let big_markers = collect_stream_marker_values(big_factory().await?).await?;
         let west_markers = collect_stream_marker_values(west_factory().await?).await?;
         let east_markers = collect_stream_marker_values(east_factory().await?).await?;
@@ -505,7 +480,9 @@ mod tests {
     #[tokio::test]
     async fn cached_output_stream_factory_replans_dependent_output_against_multiple_active_caches()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
         let (big_source_provider, big_source_scans) = scan_counting_marker_region_provider("big")?;
         let (names_source_provider, names_source_scans) =
             scan_counting_marker_region_provider("name")?;
@@ -557,8 +534,7 @@ mod tests {
         assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
         assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
 
-        let factory =
-            session.cached_output_batch_stream_factory(&west_output, caches, None, None)?;
+        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
         let markers = collect_stream_marker_values(factory().await?).await?;
 
         assert_eq!(markers, vec!["big"]);
@@ -572,7 +548,9 @@ mod tests {
     #[tokio::test]
     async fn cached_output_stream_factory_rejects_replanned_schema_mismatch()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
         let (source_provider, _source_scans) = scan_counting_marker_region_provider("shared")?;
         session
             .context()
@@ -614,15 +592,18 @@ mod tests {
             .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
 
-        let factory =
-            session.cached_output_batch_stream_factory(&west_output, caches, None, None)?;
+        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
         let error = factory().await;
 
         assert!(matches!(
             error,
-            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
-                if message.contains("cached output stream setup failed for `west_output`")
-                    && message.contains("replanned output schema does not match")
+            Err(DeltaFunnelError::MssqlQueryPhase { source, .. })
+                if matches!(
+                    &*source,
+                    DeltaFunnelError::MssqlWorkflowPlanning { message }
+                        if message.contains("cached output stream setup failed for `west_output`")
+                            && message.contains("replanned output schema does not match")
+                )
         ));
         replacement.restore()?;
         Ok(())
@@ -631,7 +612,9 @@ mod tests {
     #[tokio::test]
     async fn cached_output_stream_factory_returns_async_error_for_unreplayable_sql()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
         let (source_provider, _source_scans) = scan_counting_marker_region_provider("shared")?;
         session
             .context()
@@ -669,14 +652,17 @@ mod tests {
             .replace_registered_derived_alias_with_cache(&big, None)
             .await?;
 
-        let factory =
-            session.cached_output_batch_stream_factory(&west_output, caches, None, None)?;
+        let factory = session.cached_output_batch_stream_factory(&west_output, caches)?;
         let error = factory().await;
 
         assert!(matches!(
             error,
-            Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
-                if message.contains("cached output stream setup failed for `west_output`")
+            Err(DeltaFunnelError::MssqlQueryPhase { source, .. })
+                if matches!(
+                    &*source,
+                    DeltaFunnelError::MssqlWorkflowPlanning { message }
+                        if message.contains("cached output stream setup failed for `west_output`")
+                )
         ));
         replacement.restore()?;
         Ok(())
