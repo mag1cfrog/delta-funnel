@@ -1593,12 +1593,16 @@ mod tests {
         let default_schema = default_plan.schema();
         let default_partitions = collect_partitioned(default_plan, default_task_ctx).await?;
 
-        let capture = TracingCapture::start();
+        let without_progress_capture = TracingCapture::start();
         let without_progress = session
-            .materialize_cache("cache_source", None, ExecutionProfileMode::Disabled)
+            .materialize_cache("cache_source", None, ExecutionProfileMode::Detailed)
             .await
             .map_err(CacheAliasPhaseFailure::into_source)?;
+        let without_progress_events = execution_profile_events(without_progress_capture.captured());
+        drop(without_progress_capture);
+
         let reporter = ProgressReporter::default();
+        let with_progress_capture = TracingCapture::start();
         let with_progress = session
             .materialize_cache(
                 "cache_source",
@@ -1607,6 +1611,7 @@ mod tests {
             )
             .await
             .map_err(CacheAliasPhaseFailure::into_source)?;
+        let with_progress_events = execution_profile_events(with_progress_capture.captured());
 
         let expected_phase_names = [
             CACHE_ALIAS_DATAFRAME_RESOLUTION_PHASE,
@@ -1629,25 +1634,48 @@ mod tests {
                 timing.status() == PhaseStatus::completed() && timing.elapsed_micros().is_some()
             }));
         }
-        assert_eq!(without_progress.execution_profile, None);
-        let profile = with_progress
+        let without_progress_profile = without_progress
             .execution_profile
             .as_ref()
-            .ok_or("expected cache execution profile")?;
-        assert_eq!(profile.scope(), QueryExecutionScope::WriteAllCacheAlias);
-        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
-        assert_eq!(profile.delta_funnel_row_limit(), None);
-        assert!(!profile.operators().is_empty());
-        let events = execution_profile_events(capture.captured());
-        assert_eq!(events.len(), 1);
+            .ok_or("expected cache execution profile without progress")?;
+        let with_progress_profile = with_progress
+            .execution_profile
+            .as_ref()
+            .ok_or("expected cache execution profile with progress")?;
+        for profile in [without_progress_profile, with_progress_profile] {
+            assert_eq!(profile.scope(), QueryExecutionScope::WriteAllCacheAlias);
+            assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+            assert_eq!(profile.delta_funnel_row_limit(), None);
+            assert!(!profile.operators().is_empty());
+        }
+        let operator_shape = |profile: &QueryExecutionProfile| {
+            profile
+                .operators()
+                .iter()
+                .map(|operator| {
+                    (
+                        operator.operator_name().to_owned(),
+                        operator.parent_node_id(),
+                        operator.output_partition_count(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            events[0].fields.get("scope").map(String::as_str),
-            Some("write_all_cache_alias")
+            operator_shape(without_progress_profile),
+            operator_shape(with_progress_profile)
         );
-        assert_eq!(
-            events[0].fields.get("outcome").map(String::as_str),
-            Some("success")
-        );
+        for events in [&without_progress_events, &with_progress_events] {
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].fields.get("scope").map(String::as_str),
+                Some("write_all_cache_alias")
+            );
+            assert_eq!(
+                events[0].fields.get("outcome").map(String::as_str),
+                Some("success")
+            );
+        }
 
         assert_eq!(without_progress.provider.schema(), default_schema);
         assert_eq!(with_progress.provider.schema(), default_schema);
