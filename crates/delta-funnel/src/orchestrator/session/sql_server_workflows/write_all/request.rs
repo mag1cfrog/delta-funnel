@@ -2311,9 +2311,15 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::failing_on("west_output");
             let calls = writer.calls();
+            let capture = TracingCapture::start();
 
             let report = session
-                .write_all_with_writer(&[big_output, west_output, east_output], writer)
+                .write_all_with_options_and_writer(
+                    &[big_output, west_output, east_output],
+                    WriteAllOptions::new()
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                    writer,
+                )
                 .await?;
             {
                 let calls = calls
@@ -2353,6 +2359,23 @@ mod tests {
             assert_eq!(
                 aliases[0].status(),
                 WriteAllCacheAliasStatus::MaterializedAndRestored
+            );
+            let profile = aliases[0]
+                .execution_profile()
+                .ok_or("expected cache profile after output failure")?;
+            assert_eq!(profile.scope(), QueryExecutionScope::WriteAllCacheAlias);
+            assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+            assert!(!profile.partial());
+            assert_eq!(
+                execution_profile_event_count(
+                    &execution_profile_events(&capture),
+                    "write_all_cache_alias",
+                ),
+                1
+            );
+            assert_eq!(
+                report.to_json_value()["cache"]["aliases"][0]["execution_profile"]["outcome"],
+                "success"
             );
 
             let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
@@ -2467,14 +2490,14 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn write_all_auto_restores_replaced_alias_after_later_cache_materialization_failure()
+        async fn write_all_auto_retains_profiles_after_later_cache_stream_setup_failure()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
             )?;
             let (big_source_provider, big_source_scans) =
                 scan_counting_marker_region_provider("big")?;
-            let (names_source_provider, names_source_scans) = failing_scan_marker_region_provider();
+            let names_source_provider = stream_setup_failing_marker_region_provider()?;
             session
                 .context()
                 .register_table("big_source", big_source_provider)?;
@@ -2544,7 +2567,6 @@ mod tests {
 
                 assert!(calls.is_empty());
                 assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
-                assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
             }
             let DeltaFunnelError::WriteAllCache { failure, source } = error else {
                 return Err("expected structured write_all cache failure".into());
@@ -2577,21 +2599,25 @@ mod tests {
             );
             assert_eq!(
                 failure.aliases()[1].failed_phase(),
-                Some("cache_alias_physical_planning")
+                Some("cache_alias_stream_setup")
             );
-            assert_eq!(failure.aliases()[1].execution_profile(), None);
-            let profile_events = execution_profile_events(&capture);
-            assert_eq!(profile_events.len(), 1);
             assert_eq!(
-                profile_events[0].fields.get("scope").map(String::as_str),
-                Some("write_all_cache_alias")
+                failure.aliases()[1]
+                    .execution_profile()
+                    .map(|profile| profile.outcome()),
+                Some(QueryExecutionOutcome::Error)
+            );
+            let profile_events = execution_profile_events(&capture);
+            assert_eq!(
+                execution_profile_event_count(&profile_events, "write_all_cache_alias"),
+                2
             );
             let value = failure.to_json_value();
             assert_eq!(
                 value["aliases"][0]["execution_profile"]["outcome"],
                 "success"
             );
-            assert!(value["aliases"][1]["execution_profile"].is_null());
+            assert_eq!(value["aliases"][1]["execution_profile"]["outcome"], "error");
             assert!(matches!(
                 *source,
                 DeltaFunnelError::MssqlWorkflowPlanning { message }
@@ -2619,12 +2645,14 @@ mod tests {
                 },
                 Err(error) => error,
             };
-            assert!(matches!(
-                &restored_names_error,
-                DeltaFunnelError::BatchPipeline { message, .. }
-                    if message.contains("forced scan planning failure")
-            ));
-            assert_eq!(names_source_scans.load(Ordering::SeqCst), 2);
+            assert!(
+                matches!(
+                    &restored_names_error,
+                    DeltaFunnelError::BatchPipeline { message, .. }
+                        if message.contains("ErrorExec")
+                ),
+                "unexpected restored names error: {restored_names_error:?}"
+            );
             Ok(())
         }
 

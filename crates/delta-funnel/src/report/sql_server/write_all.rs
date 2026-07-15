@@ -264,7 +264,11 @@ impl WriteAllCacheAliasReport {
         self.failed_phase.as_deref()
     }
 
-    /// Returns the terminal cache materialization profile when collection was enabled.
+    /// Returns the terminal profile for this alias's cache materialization.
+    ///
+    /// Disabled profiling and failures before physical-plan creation return
+    /// `None`. Selected plan metadata is not executed and also returns `None`.
+    /// Output query profiles remain separate from this cache profile.
     #[must_use]
     pub const fn execution_profile(&self) -> Option<&QueryExecutionProfile> {
         self.execution_profile.as_ref()

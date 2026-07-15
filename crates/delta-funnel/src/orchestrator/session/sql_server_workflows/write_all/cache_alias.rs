@@ -851,7 +851,10 @@ mod tests {
         common::{DataFusionError, Result as DataFusionResult},
         execution::session_state::{CacheFactory, SessionState},
         logical_expr::LogicalPlan,
-        physical_plan::{collect_partitioned, test::exec::MockExec},
+        physical_plan::{
+            DisplayAs, DisplayFormatType, PlanProperties, SendableRecordBatchStream,
+            collect_partitioned, test::exec::MockExec,
+        },
     };
     use futures_util::stream;
     use tokio::sync::Notify;
@@ -878,6 +881,94 @@ mod tests {
     #[derive(Debug)]
     struct RecordingCacheFactory {
         calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct MismatchedBatchProvider {
+        declared_schema: SchemaRef,
+        batch: RecordBatch,
+    }
+
+    #[derive(Debug)]
+    struct MismatchedBatchExec(MockExec);
+
+    impl DisplayAs for MismatchedBatchExec {
+        fn fmt_as(
+            &self,
+            display_type: DisplayFormatType,
+            formatter: &mut fmt::Formatter,
+        ) -> fmt::Result {
+            self.0.fmt_as(display_type, formatter)
+        }
+    }
+
+    impl ExecutionPlan for MismatchedBatchExec {
+        fn name(&self) -> &str {
+            "MismatchedBatchExec"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.0.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            Vec::new()
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if !children.is_empty() {
+                return Err(DataFusionError::Plan(
+                    "MismatchedBatchExec requires no children".to_owned(),
+                ));
+            }
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            self.0.execute(partition, context)
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for MismatchedBatchProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.declared_schema)
+        }
+
+        fn table_type(&self) -> datafusion::logical_expr::TableType {
+            datafusion::logical_expr::TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[datafusion::logical_expr::Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(MismatchedBatchExec(
+                MockExec::new(
+                    vec![Ok(self.batch.clone())],
+                    Arc::clone(&self.declared_schema),
+                )
+                .with_use_task(false),
+            )))
+        }
     }
 
     struct DropFlag(Arc<AtomicBool>);
@@ -1212,6 +1303,65 @@ mod tests {
         let value = report.to_json_value();
         assert_eq!(value["execution_profile"]["scope"], "write_all_cache_alias");
         assert_eq!(value["execution_profile"]["outcome"], "error");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memtable_failure_retains_successful_execution_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let declared_schema = Arc::new(Schema::new(vec![Field::new(
+            "declared",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "actual",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = marker_batch(&batch_schema, vec!["value"])?;
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.context().register_table(
+            "mismatched_cache",
+            Arc::new(MismatchedBatchProvider {
+                declared_schema,
+                batch,
+            }),
+        )?;
+        let capture = TracingCapture::start();
+
+        let failure = session
+            .materialize_cache("mismatched_cache", None, ExecutionProfileMode::Detailed)
+            .await
+            .err()
+            .ok_or("expected MemTable schema failure")?
+            .into_alias_failure(7, "mismatched_cache".to_owned(), vec![0]);
+        let report = failure.report.ok_or("expected failed cache alias report")?;
+
+        assert_eq!(report.status(), WriteAllCacheAliasStatus::Failed);
+        assert_eq!(
+            report.failed_phase(),
+            Some(CACHE_ALIAS_MEMTABLE_BUILD_PHASE)
+        );
+        let profile = report
+            .execution_profile()
+            .ok_or("expected completed cache execution profile")?;
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+        assert!(!profile.partial());
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+        assert_cache_phase_statuses(
+            &report,
+            [
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::failed(),
+                PhaseStatus::failed(),
+                PhaseStatus::not_started(ReportReasonCode::PriorFailure),
+                PhaseStatus::not_started(ReportReasonCode::PriorFailure),
+            ],
+        );
         Ok(())
     }
 

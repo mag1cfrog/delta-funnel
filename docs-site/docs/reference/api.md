@@ -151,7 +151,8 @@ class WriteAllExecutionOptions(TypedDict, total=False):
     profile: bool | None
 ```
 
-Enable one independent detailed profile for every attempted output:
+Enable one independent detailed profile for every attempted output and every
+executed auto-cache alias:
 
 ```python
 report = session.write_all(outputs, options={"profile": True})
@@ -170,6 +171,19 @@ Returned profiles are nested under the output report that owns them:
 | `failed` | `output["failure"]["context"]["report"]["execution_profile"]`, when context exists | `MssqlOutputWriteStatus::Failed(failure)`, then `failure.context()` and `context.report().execution_profile()` |
 | `skipped` | `output["skipped"]["execution_profile"]`, always `None` | No profile because the output was not attempted |
 
+Cache materialization profiles are nested under the attempted alias that owns
+them:
+
+| Result | Python profile location | Rust profile location |
+| --- | --- | --- |
+| Normal `write_all` report | `report["cache"]["aliases"][i]["execution_profile"]` | Match `WriteAllCacheReport::CacheAliases`, then call `alias.execution_profile()` |
+| Cache orchestration failure | `error.context["aliases"][i]["execution_profile"]` | Match `DeltaFunnelError::WriteAllCache`, then call `failure.aliases()[i].execution_profile()` |
+
+An executed alias has `None` when profiling is disabled or failure happens
+before its physical plan exists. Dry-run and other `selected` cache metadata
+omit `execution_profile` because no alias was executed. Multi-alias results keep
+one profile per attempt in cache-selection order.
+
 An attempted output that fails before its physical plan or profile observer
 exists has no profile. Each attempt uses a fresh physical plan, so repeated
 writes of the same lazy table still produce separate profiles. The
@@ -182,6 +196,14 @@ is `error`, and dropping the stream before end-of-stream is `cancelled`. A
 later SQL Server failure can therefore retain a `success` profile. See
 [returned SQL Server output diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-sql-server-output-diagnostics)
 for the shared stream-outcome semantics.
+
+A cache profile has `scope="write_all_cache_alias"` and describes only the
+physical-plan execution that materialized that alias. It does not include later
+reads from the cached `MemTable` or any output query. A successful cache
+execution therefore remains `success` when `MemTable` construction, cache
+installation, a later alias, output execution, or restoration fails. A
+post-plan setup or collection failure keeps its exact `error` or `cancelled`
+outcome. Output profiles remain separate with `scope="mssql_output"`.
 
 Rust callers select the same mode with `WriteAllOptions`:
 
@@ -198,7 +220,15 @@ disabled. Profiling composes with either `WriteAllCacheMode`; cache selection
 does not change per-output profile ownership. Each available profile also
 supplies one bounded `query_execution_profile_terminal` event. See
 [terminal execution profiles](../advanced/tracing-and-diagnostics.md#inspect-terminal-execution-profiles)
-for its tracing contract.
+for its tracing contract and
+[returned write-all cache diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-write-all-cache-diagnostics)
+for cache lifecycle and failure interpretation. The shared profile model,
+terminal consumer, and cache lifecycle are owned by
+[#450](https://github.com/mag1cfrog/delta-funnel/issues/450),
+[#457](https://github.com/mag1cfrog/delta-funnel/issues/457), and
+[#458](https://github.com/mag1cfrog/delta-funnel/issues/458), respectively.
+The shared partition terminal transition comes from
+[#449](https://github.com/mag1cfrog/delta-funnel/issues/449).
 
 ## Execution Profile Model
 
