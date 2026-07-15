@@ -1,6 +1,6 @@
 use crate::{
-    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
-    WriteAllCacheCandidateSkipReason, WriteAllCacheReport, WriteAllNoCacheReason,
+    WriteAllCacheAliasReport, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
+    WriteAllCacheReport, WriteAllNoCacheReason,
 };
 
 use super::{
@@ -13,22 +13,7 @@ pub(super) fn disabled() -> WriteAllCacheReport {
 }
 
 pub(super) fn from_plan(plan: &MssqlOutputCachePlan) -> WriteAllCacheReport {
-    from_plan_with_alias_status(plan, WriteAllCacheAliasStatus::Selected)
-}
-
-pub(super) fn from_executed_plan(plan: &MssqlOutputCachePlan) -> WriteAllCacheReport {
-    from_plan_with_alias_status(plan, WriteAllCacheAliasStatus::MaterializedAndRestored)
-}
-
-fn from_plan_with_alias_status(
-    plan: &MssqlOutputCachePlan,
-    alias_status: WriteAllCacheAliasStatus,
-) -> WriteAllCacheReport {
-    let skipped_candidates = plan
-        .skipped_candidates()
-        .iter()
-        .map(candidate_skip_report)
-        .collect::<Vec<_>>();
+    let skipped_candidates = skipped_candidate_reports(plan);
 
     match plan.decision() {
         MssqlOutputCacheDecision::NoCache { reason } => {
@@ -38,11 +23,10 @@ fn from_plan_with_alias_status(
             let aliases = aliases
                 .iter()
                 .map(|alias| {
-                    WriteAllCacheAliasReport::new(
+                    WriteAllCacheAliasReport::selected(
                         alias.table_id(),
                         alias.alias(),
                         alias.output_indexes().to_vec(),
-                        alias_status,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -50,6 +34,31 @@ fn from_plan_with_alias_status(
             WriteAllCacheReport::cache_aliases(aliases, skipped_candidates)
         }
     }
+}
+
+pub(super) fn from_executed_plan(
+    plan: &MssqlOutputCachePlan,
+    aliases: Vec<WriteAllCacheAliasReport>,
+) -> WriteAllCacheReport {
+    let skipped_candidates = skipped_candidate_reports(plan);
+
+    match plan.decision() {
+        MssqlOutputCacheDecision::NoCache { reason } => {
+            debug_assert!(aliases.is_empty());
+            WriteAllCacheReport::no_cache(no_cache_reason_report(reason), skipped_candidates)
+        }
+        MssqlOutputCacheDecision::CacheAliases(planned_aliases) => {
+            debug_assert_eq!(aliases.len(), planned_aliases.len());
+            WriteAllCacheReport::cache_aliases(aliases, skipped_candidates)
+        }
+    }
+}
+
+fn skipped_candidate_reports(plan: &MssqlOutputCachePlan) -> Vec<WriteAllCacheCandidateSkip> {
+    plan.skipped_candidates()
+        .iter()
+        .map(candidate_skip_report)
+        .collect()
 }
 
 fn no_cache_reason_report(reason: &MssqlNoCacheReason) -> WriteAllNoCacheReason {

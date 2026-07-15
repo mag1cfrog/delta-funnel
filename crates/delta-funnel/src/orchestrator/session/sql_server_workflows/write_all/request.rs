@@ -135,7 +135,7 @@ impl DeltaFunnelSession {
                         (workflow, cache_report::from_plan(cache_plan))
                     }
                     MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
-                        let workflow = self
+                        let (workflow, alias_reports) = self
                             .write_all_cached_with_writer(
                                 &planned_outputs,
                                 cache_aliases,
@@ -145,7 +145,10 @@ impl DeltaFunnelSession {
                                 options.execution_profile_mode(),
                             )
                             .await?;
-                        (workflow, cache_report::from_executed_plan(cache_plan))
+                        (
+                            workflow,
+                            cache_report::from_executed_plan(cache_plan, alias_reports),
+                        )
                     }
                 },
                 None => {
@@ -1862,6 +1865,27 @@ mod tests {
                 aliases[0].status(),
                 WriteAllCacheAliasStatus::MaterializedAndRestored
             );
+            assert_eq!(aliases[0].failed_phase(), None);
+            assert_eq!(
+                aliases[0]
+                    .phase_timings()
+                    .iter()
+                    .map(PhaseTimingReport::phase_name)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "cache_alias_dataframe_resolution",
+                    "cache_alias_physical_planning",
+                    "cache_alias_stream_setup",
+                    "cache_alias_execute_collect",
+                    "cache_alias_memtable_build",
+                    "cache_alias_materialization_total",
+                    "cache_alias_install",
+                    "cache_alias_restore",
+                ]
+            );
+            assert!(aliases[0].phase_timings().iter().all(|timing| {
+                timing.status() == PhaseStatus::completed() && timing.elapsed_micros().is_some()
+            }));
 
             let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;

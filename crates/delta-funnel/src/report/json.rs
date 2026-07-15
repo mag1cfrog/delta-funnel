@@ -596,12 +596,23 @@ impl WriteAllCacheAliasReport {
     /// Returns one selected write-all cache alias as a JSON-compatible Python shape.
     #[must_use]
     pub fn to_json_value(&self) -> Value {
-        json!({
-            "table_id": self.table_id(),
-            "alias": self.alias(),
-            "output_indexes": self.output_indexes(),
-            "status": cache_alias_status(self.status()),
-        })
+        match self.status() {
+            WriteAllCacheAliasStatus::Selected => json!({
+                "table_id": self.table_id(),
+                "alias": self.alias(),
+                "output_indexes": self.output_indexes(),
+                "status": self.status().as_str(),
+            }),
+            WriteAllCacheAliasStatus::MaterializedAndRestored
+            | WriteAllCacheAliasStatus::Failed => json!({
+                "table_id": self.table_id(),
+                "alias": self.alias(),
+                "output_indexes": self.output_indexes(),
+                "status": self.status().as_str(),
+                "phase_timings": phase_timings_value(self.phase_timings()),
+                "failed_phase": self.failed_phase(),
+            }),
+        }
     }
 }
 
@@ -882,13 +893,6 @@ fn no_cache_reason(reason: WriteAllNoCacheReason) -> &'static str {
             "no_shared_registered_derived_alias"
         }
         WriteAllNoCacheReason::AmbiguousSharedDerivedAlias => "ambiguous_shared_derived_alias",
-    }
-}
-
-fn cache_alias_status(status: WriteAllCacheAliasStatus) -> &'static str {
-    match status {
-        WriteAllCacheAliasStatus::Selected => "selected",
-        WriteAllCacheAliasStatus::MaterializedAndRestored => "materialized_and_restored",
     }
 }
 
@@ -1351,11 +1355,16 @@ mod tests {
     #[test]
     fn write_all_cache_json_preserves_decision_aliases_and_skip_reasons() -> TestResult<()> {
         let value = WriteAllCacheReport::CacheAliases {
-            aliases: vec![WriteAllCacheAliasReport::new(
+            aliases: vec![WriteAllCacheAliasReport::executed(
                 9,
                 "shared_orders",
                 vec![0, 2],
                 WriteAllCacheAliasStatus::MaterializedAndRestored,
+                vec![PhaseTimingReport::completed(
+                    "cache_alias_restore",
+                    Duration::from_micros(3),
+                )],
+                None,
             )],
             skipped_candidates: vec![
                 WriteAllCacheCandidateSkip::new(
@@ -1376,6 +1385,11 @@ mod tests {
         assert_eq!(value["aliases"][0]["alias"], "shared_orders");
         assert_eq!(value["aliases"][0]["status"], "materialized_and_restored");
         assert_eq!(
+            value["aliases"][0]["phase_timings"][0]["phase_name"],
+            "cache_alias_restore"
+        );
+        assert!(value["aliases"][0]["failed_phase"].is_null());
+        assert_eq!(
             value["skipped_candidates"][0]["reason"],
             json!({"kind": "not_shared", "output_count": 1})
         );
@@ -1387,6 +1401,34 @@ mod tests {
         assert_no_secret_or_raw_sql_text(&value);
 
         Ok(())
+    }
+
+    #[test]
+    fn write_all_cache_alias_json_separates_plan_and_failed_execution_fields() {
+        let selected = WriteAllCacheAliasReport::selected(9, "shared_orders", vec![0, 2]);
+        let selected_value = selected.to_json_value();
+        assert_eq!(selected.status().to_string(), "selected");
+        assert!(selected.phase_timings().is_empty());
+        assert_eq!(selected.failed_phase(), None);
+        assert!(selected_value.get("phase_timings").is_none());
+        assert!(selected_value.get("failed_phase").is_none());
+
+        let failed = WriteAllCacheAliasReport::executed(
+            9,
+            "shared_orders",
+            vec![0, 2],
+            WriteAllCacheAliasStatus::Failed,
+            vec![PhaseTimingReport::failed(
+                "cache_alias_install",
+                Duration::from_micros(4),
+            )],
+            Some("cache_alias_install"),
+        );
+        let failed_value = failed.to_json_value();
+        assert_eq!(failed.status().to_string(), "failed");
+        assert_eq!(failed_value["status"], "failed");
+        assert_eq!(failed_value["failed_phase"], "cache_alias_install");
+        assert_eq!(failed_value["phase_timings"][0]["status"]["kind"], "failed");
     }
 
     #[test]

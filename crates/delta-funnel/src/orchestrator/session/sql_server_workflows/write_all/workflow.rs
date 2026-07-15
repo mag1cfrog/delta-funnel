@@ -4,8 +4,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlOutputQueryFuture, MssqlOutputWriteJob,
-    MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, progress::ProgressReporter,
-    usize_to_u64_saturating, write_mssql_outputs_with_writer,
+    MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, WriteAllCacheAliasReport,
+    progress::ProgressReporter, usize_to_u64_saturating, write_mssql_outputs_with_writer,
 };
 
 use super::super::super::{
@@ -14,8 +14,8 @@ use super::super::super::{
 use super::{
     MssqlDerivedCacheAliasPlan,
     cache_alias::{
-        cache_error_with_restore_error, restore_mssql_cache_aliases,
-        restore_mssql_cache_aliases_after_error,
+        cache_error_with_restore_error, restore_mssql_cache_aliases_after_error,
+        restore_mssql_cache_aliases_with_reports,
     },
 };
 
@@ -152,7 +152,7 @@ impl DeltaFunnelSession {
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    ) -> Result<(MssqlWorkflowWriteReport, Vec<WriteAllCacheAliasReport>), DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
@@ -178,10 +178,11 @@ impl DeltaFunnelSession {
         let write_result =
             write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer)
                 .await;
-        let restore_result = restore_mssql_cache_aliases(replacements, reporter);
+        let (alias_reports, restore_result) =
+            restore_mssql_cache_aliases_with_reports(replacements, reporter);
 
         match (write_result, restore_result) {
-            (Ok(report), Ok(())) => Ok(report),
+            (Ok(report), Ok(())) => Ok((report, alias_reports)),
             (Ok(_report), Err(restore_error)) => Err(restore_error),
             (Err(write_error), Ok(())) => Err(write_error),
             (Err(write_error), Err(restore_error)) => {
