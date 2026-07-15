@@ -1140,7 +1140,9 @@ mod tests {
         QueryOptions, ReportReasonCode,
         observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
-        query_engine::datafusion::execution_profile::QueryExecutionProfileConsumer,
+        query_engine::datafusion::execution_profile::{
+            QueryExecutionProfileConsumer, QueryExecutionProfileResult,
+        },
         table_formats::RealParquetDeltaTable,
     };
     use datafusion::{
@@ -1454,18 +1456,26 @@ mod tests {
         }
     }
 
+    fn cache_alias_profile_consumer() -> (QueryExecutionProfileConsumer, QueryExecutionProfileResult)
+    {
+        let root: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+        QueryExecutionProfileConsumer::register(root, QueryExecutionScope::WriteAllCacheAlias, None)
+    }
+
     #[tokio::test]
     async fn partitioned_terminal_stream_finishes_once_after_repeated_eof_and_drop() {
         use crate::observability::DeltaProviderScanOutcome;
 
+        let (consumer, profile_result) = cache_alias_profile_consumer();
         let coordinator = Arc::new(super::PartitionExecutionCoordinator::new(
             Vec::new(),
-            None,
+            Some(consumer),
             2,
         ));
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
         let mut first = partition_stream(&coordinator, vec![Ok(batch)]);
         let mut second = partition_stream(&coordinator, Vec::new());
+        let capture = TracingCapture::start();
 
         assert!(first.next().await.is_some_and(|batch| batch.is_ok()));
         assert!(first.next().await.is_none());
@@ -1475,6 +1485,7 @@ mod tests {
             partitioned_coordinator_state(&coordinator),
             (1, DeltaProviderScanOutcome::Success)
         );
+        assert_eq!(profile_result.profile(), None);
 
         assert!(second.next().await.is_none());
         drop(second);
@@ -1482,6 +1493,11 @@ mod tests {
             partitioned_coordinator_state(&coordinator),
             (0, DeltaProviderScanOutcome::Success)
         );
+        assert_eq!(
+            profile_result.profile().map(QueryExecutionProfile::outcome),
+            Some(QueryExecutionOutcome::Success)
+        );
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
     }
 
     #[tokio::test]
@@ -1493,7 +1509,12 @@ mod tests {
             unexecuted_delta_read_stats_handles("partition-error-summary", "orders").await?;
         let snapshots = super::snapshot_delta_provider_read_stats(&handles);
         let expected = snapshots.first().ok_or("expected provider snapshot")?;
-        let coordinator = Arc::new(super::PartitionExecutionCoordinator::new(handles, None, 2));
+        let (consumer, profile_result) = cache_alias_profile_consumer();
+        let coordinator = Arc::new(super::PartitionExecutionCoordinator::new(
+            handles,
+            Some(consumer),
+            2,
+        ));
         let mut errored = partition_stream(
             &coordinator,
             vec![Err(DeltaFunnelError::Config {
@@ -1510,6 +1531,7 @@ mod tests {
             (1, DeltaProviderScanOutcome::Error)
         );
         assert!(provider_io_events(capture.captured()).is_empty());
+        assert_eq!(profile_result.profile(), None);
 
         drop(unconsumed);
         assert_eq!(
@@ -1519,8 +1541,14 @@ mod tests {
         let summaries = provider_io_events(capture.captured());
         assert_eq!(summaries.len(), 1);
         assert_provider_io_event_matches_snapshot(&summaries[0], expected, "error");
+        assert_eq!(
+            profile_result.profile().map(QueryExecutionProfile::outcome),
+            Some(QueryExecutionOutcome::Error)
+        );
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
         drop(coordinator);
         assert_eq!(provider_io_events(capture.captured()).len(), 1);
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
         Ok(())
     }
 
@@ -1533,7 +1561,12 @@ mod tests {
             unexecuted_delta_read_stats_handles("partition-cancelled-summary", "orders").await?;
         let snapshots = super::snapshot_delta_provider_read_stats(&handles);
         let expected = snapshots.first().ok_or("expected provider snapshot")?;
-        let coordinator = Arc::new(super::PartitionExecutionCoordinator::new(handles, None, 2));
+        let (consumer, profile_result) = cache_alias_profile_consumer();
+        let coordinator = Arc::new(super::PartitionExecutionCoordinator::new(
+            handles,
+            Some(consumer),
+            2,
+        ));
         let mut completed = partition_stream(&coordinator, Vec::new());
         let unconsumed = partition_stream(&coordinator, Vec::new());
         let capture = TracingCapture::start();
@@ -1542,6 +1575,7 @@ mod tests {
         assert!(completed.next().await.is_none());
         drop(completed);
         assert!(provider_io_events(capture.captured()).is_empty());
+        assert_eq!(profile_result.profile(), None);
         drop(unconsumed);
 
         assert_eq!(
@@ -1551,8 +1585,14 @@ mod tests {
         let summaries = provider_io_events(capture.captured());
         assert_eq!(summaries.len(), 1);
         assert_provider_io_event_matches_snapshot(&summaries[0], expected, "cancelled");
+        assert_eq!(
+            profile_result.profile().map(QueryExecutionProfile::outcome),
+            Some(QueryExecutionOutcome::Cancelled)
+        );
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
         drop(coordinator);
         assert_eq!(provider_io_events(capture.captured()).len(), 1);
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
         Ok(())
     }
 
