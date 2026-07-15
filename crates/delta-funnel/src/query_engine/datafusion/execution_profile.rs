@@ -96,7 +96,6 @@ pub(crate) fn delta_provider_read_stats_snapshot_set(
         .collect()
 }
 
-#[allow(dead_code)]
 pub(crate) fn collect_query_execution_profile(
     root: &Arc<dyn ExecutionPlan>,
     scope: QueryExecutionScope,

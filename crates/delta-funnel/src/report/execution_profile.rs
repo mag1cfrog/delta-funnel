@@ -136,7 +136,6 @@ pub struct QueryExecutionMetric {
     value: QueryExecutionMetricValue,
 }
 
-#[allow(dead_code)]
 impl QueryExecutionMetric {
     pub(crate) fn new(
         name: impl Into<String>,
@@ -198,7 +197,6 @@ pub struct QueryExecutionOperatorProfile {
     delta_provider_read_stats: Option<DeltaProviderReadStatsSnapshot>,
 }
 
-#[allow(dead_code)]
 impl QueryExecutionOperatorProfile {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -281,7 +279,6 @@ pub struct QueryExecutionProfile {
     operators: Vec<QueryExecutionOperatorProfile>,
 }
 
-#[allow(dead_code)]
 impl QueryExecutionProfile {
     pub(crate) fn preview(
         outcome: QueryExecutionOutcome,
