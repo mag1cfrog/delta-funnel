@@ -110,6 +110,18 @@ pub enum DeltaFunnelError {
         source: Box<DeltaFunnelError>,
     },
 
+    /// A cache-enabled `write_all` call failed after cache selection.
+    #[snafu(display(
+        "write_all cache failed: {}",
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    WriteAllCache {
+        /// Failed cache attempts and any completed output workflow.
+        failure: Box<crate::WriteAllCacheFailure>,
+        /// Original primary failure with its source chain preserved.
+        source: Box<DeltaFunnelError>,
+    },
+
     /// A Delta source name is not valid for registration.
     #[snafu(display(
         "invalid Delta source name `{}`: {reason}",

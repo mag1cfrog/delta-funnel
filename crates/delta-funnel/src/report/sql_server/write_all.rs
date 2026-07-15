@@ -295,6 +295,46 @@ pub enum WriteAllCacheAliasStatus {
     Failed,
 }
 
+/// Structured details retained when a cache-enabled `write_all` call fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAllCacheFailure {
+    aliases: Vec<WriteAllCacheAliasReport>,
+    primary_failed_alias_table_id: Option<u64>,
+    workflow: Option<MssqlWorkflowWriteReport>,
+}
+
+impl WriteAllCacheFailure {
+    pub(crate) fn new(
+        aliases: Vec<WriteAllCacheAliasReport>,
+        primary_failed_alias_table_id: Option<u64>,
+        workflow: Option<MssqlWorkflowWriteReport>,
+    ) -> Self {
+        Self {
+            aliases,
+            primary_failed_alias_table_id,
+            workflow,
+        }
+    }
+
+    /// Returns every attempted cache alias in deterministic selection order.
+    #[must_use]
+    pub fn aliases(&self) -> &[WriteAllCacheAliasReport] {
+        &self.aliases
+    }
+
+    /// Returns the table id whose cache phase caused the primary failure.
+    #[must_use]
+    pub const fn primary_failed_alias_table_id(&self) -> Option<u64> {
+        self.primary_failed_alias_table_id
+    }
+
+    /// Returns the completed output workflow when restoration later failed.
+    #[must_use]
+    pub const fn workflow(&self) -> Option<&MssqlWorkflowWriteReport> {
+        self.workflow.as_ref()
+    }
+}
+
 impl WriteAllCacheAliasStatus {
     /// Returns the stable lower-snake-case report value.
     #[must_use]

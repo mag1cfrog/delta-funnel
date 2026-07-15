@@ -11,8 +11,8 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
-    DeltaFunnelError, MssqlOutputBatchStream, PhaseTimingReport, WriteAllCacheAliasReport,
-    WriteAllCacheAliasStatus,
+    DeltaFunnelError, MssqlOutputBatchStream, MssqlWorkflowWriteReport, PhaseTimingReport,
+    ReportReasonCode, WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheFailure,
     observability::DeltaProviderScanOutcome,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
@@ -40,10 +40,68 @@ const CACHE_ALIAS_MEMTABLE_BUILD_PHASE: &str = "cache_alias_memtable_build";
 const CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE: &str = "cache_alias_materialization_total";
 const CACHE_ALIAS_INSTALL_PHASE: &str = "cache_alias_install";
 const CACHE_ALIAS_RESTORE_PHASE: &str = "cache_alias_restore";
+const CACHE_ALIAS_MATERIALIZATION_PHASES: [&str; 5] = [
+    CACHE_ALIAS_DATAFRAME_RESOLUTION_PHASE,
+    CACHE_ALIAS_PHYSICAL_PLANNING_PHASE,
+    CACHE_ALIAS_STREAM_SETUP_PHASE,
+    CACHE_ALIAS_EXECUTE_COLLECT_PHASE,
+    CACHE_ALIAS_MEMTABLE_BUILD_PHASE,
+];
 
 struct MaterializedCache {
     provider: Arc<dyn TableProvider>,
     phase_timings: Vec<PhaseTimingReport>,
+}
+
+struct CacheAliasPhaseFailure {
+    source: DeltaFunnelError,
+    phase_timings: Vec<PhaseTimingReport>,
+    failed_phase: &'static str,
+}
+
+impl CacheAliasPhaseFailure {
+    #[cfg(test)]
+    fn into_source(self) -> DeltaFunnelError {
+        self.source
+    }
+
+    fn into_alias_failure(
+        self,
+        table_id: u64,
+        alias: String,
+        output_indexes: Vec<usize>,
+    ) -> CacheAliasReplacementFailure {
+        CacheAliasReplacementFailure {
+            source: self.source,
+            report: Some(WriteAllCacheAliasReport::executed(
+                table_id,
+                alias,
+                output_indexes,
+                WriteAllCacheAliasStatus::Failed,
+                self.phase_timings,
+                Some(self.failed_phase),
+            )),
+        }
+    }
+}
+
+struct CacheAliasReplacementFailure {
+    source: DeltaFunnelError,
+    report: Option<WriteAllCacheAliasReport>,
+}
+
+impl CacheAliasReplacementFailure {
+    fn before_attempt(source: DeltaFunnelError) -> Self {
+        Self {
+            source,
+            report: None,
+        }
+    }
+}
+
+struct CacheAliasInstallFailure {
+    source: Box<DeltaFunnelError>,
+    restore_timing: Option<PhaseTimingReport>,
 }
 
 /// Active replacement of one registered derived alias with a cached provider.
@@ -64,6 +122,7 @@ impl<'a> MssqlScopedCacheAliasReplacement<'a> {
         context: &'a SessionContext,
         table_id: u64,
         alias_name: String,
+        output_indexes: Vec<usize>,
         original_provider: Arc<dyn TableProvider>,
         phase_timings: Vec<PhaseTimingReport>,
     ) -> Self {
@@ -71,15 +130,10 @@ impl<'a> MssqlScopedCacheAliasReplacement<'a> {
             context,
             table_id,
             alias_name,
-            output_indexes: Vec::new(),
+            output_indexes,
             original_provider,
             phase_timings,
         }
-    }
-
-    fn with_output_indexes(mut self, output_indexes: Vec<usize>) -> Self {
-        self.output_indexes = output_indexes;
-        self
     }
 
     /// Restores the original provider under the alias and consumes the scope.
@@ -153,18 +207,34 @@ impl DeltaFunnelSession {
     ///
     /// This is intentionally a one-alias primitive. It does not choose cache
     /// candidates, replan downstream SQL, or execute any outputs.
+    #[cfg(test)]
     pub(crate) async fn replace_registered_derived_alias_with_cache(
         &self,
         table: &LazyTable,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlScopedCacheAliasReplacement<'_>, DeltaFunnelError> {
-        let registered = self.registered_derived_for_scoped_cache_alias(table)?;
+        self.replace_registered_derived_alias_with_cache_attempt(table, Vec::new(), reporter)
+            .await
+            .map_err(|failure| failure.source)
+    }
+
+    async fn replace_registered_derived_alias_with_cache_attempt(
+        &self,
+        table: &LazyTable,
+        output_indexes: Vec<usize>,
+        reporter: Option<&ProgressReporter>,
+    ) -> Result<MssqlScopedCacheAliasReplacement<'_>, CacheAliasReplacementFailure> {
+        let registered = self
+            .registered_derived_for_scoped_cache_alias(table)
+            .map_err(CacheAliasReplacementFailure::before_attempt)?;
         let alias_name = registered.name().to_owned();
         if self.context.state_ref().read().cache_factory().is_some() {
-            return Err(DeltaFunnelError::MssqlWorkflowPlanning {
-                message: "`write_all` cache alias materialization requires DataFusion's default cache behavior; custom cache factories are not supported"
-                    .to_owned(),
-            });
+            return Err(CacheAliasReplacementFailure::before_attempt(
+                DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: "`write_all` cache alias materialization requires DataFusion's default cache behavior; custom cache factories are not supported"
+                        .to_owned(),
+                },
+            ));
         }
 
         if let Some(reporter) = reporter {
@@ -178,17 +248,40 @@ impl DeltaFunnelSession {
             mut phase_timings,
         } = self
             .materialize_cache(alias_name.as_str(), reporter)
-            .await?;
+            .await
+            .map_err(|failure| {
+                failure.into_alias_failure(table.id(), alias_name.clone(), output_indexes.clone())
+            })?;
 
         let install_timer = PhaseTimer::start(CACHE_ALIAS_INSTALL_PHASE);
         let original_provider =
-            self.install_scoped_cache_alias_provider(alias_name.as_str(), provider)?;
-        phase_timings.push(install_timer.completed());
+            match self.install_scoped_cache_alias_provider(alias_name.as_str(), provider) {
+                Ok(original_provider) => {
+                    phase_timings.push(install_timer.completed());
+                    original_provider
+                }
+                Err(failure) => {
+                    phase_timings.push(install_timer.failed());
+                    phase_timings.push(failure.restore_timing.unwrap_or_else(|| {
+                        PhaseTimingReport::not_started(
+                            CACHE_ALIAS_RESTORE_PHASE,
+                            ReportReasonCode::PriorFailure,
+                        )
+                    }));
+                    return Err(CacheAliasPhaseFailure {
+                        source: *failure.source,
+                        phase_timings,
+                        failed_phase: CACHE_ALIAS_INSTALL_PHASE,
+                    }
+                    .into_alias_failure(table.id(), alias_name, output_indexes));
+                }
+            };
 
         Ok(MssqlScopedCacheAliasReplacement::new(
             &self.context,
             table.id(),
             alias_name,
+            output_indexes,
             original_provider,
             phase_timings,
         ))
@@ -202,22 +295,31 @@ impl DeltaFunnelSession {
         let mut replacements = Vec::new();
 
         for cache_alias in cache_aliases {
-            let table = self
-                .registered_derived_table_by_id(cache_alias.table_id())
-                .ok_or_else(|| unknown_cached_alias_error(cache_alias))?
-                .table()
-                .clone();
+            let Some(registered) = self.registered_derived_table_by_id(cache_alias.table_id())
+            else {
+                return Err(restore_cache_aliases_after_failure(
+                    unknown_cached_alias_error(cache_alias),
+                    replacements,
+                    None,
+                    reporter,
+                ));
+            };
+            let table = registered.table().clone();
 
             match self
-                .replace_registered_derived_alias_with_cache(&table, reporter)
+                .replace_registered_derived_alias_with_cache_attempt(
+                    &table,
+                    cache_alias.output_indexes().to_vec(),
+                    reporter,
+                )
                 .await
             {
-                Ok(replacement) => replacements
-                    .push(replacement.with_output_indexes(cache_alias.output_indexes().to_vec())),
-                Err(error) => {
-                    return Err(restore_mssql_cache_aliases_after_error(
-                        error,
+                Ok(replacement) => replacements.push(replacement),
+                Err(failure) => {
+                    return Err(restore_cache_aliases_after_failure(
+                        failure.source,
                         replacements,
+                        failure.report,
                         reporter,
                     ));
                 }
@@ -236,28 +338,44 @@ impl DeltaFunnelSession {
         &self,
         alias_name: &str,
         reporter: Option<&ProgressReporter>,
-    ) -> Result<MaterializedCache, DeltaFunnelError> {
+    ) -> Result<MaterializedCache, CacheAliasPhaseFailure> {
         let materialization_timer = PhaseTimer::start(CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE);
         let mut phase_timings = Vec::with_capacity(8);
 
         let resolution_timer = PhaseTimer::start(CACHE_ALIAS_DATAFRAME_RESOLUTION_PHASE);
-        let dataframe = self
-            .context
-            .table(alias_name)
-            .await
-            .map_err(|error| mssql_scoped_cache_alias_error("resolve", alias_name, error))?;
+        let dataframe = match self.context.table(alias_name).await {
+            Ok(dataframe) => dataframe,
+            Err(error) => {
+                return Err(cache_alias_materialization_failure(
+                    mssql_scoped_cache_alias_error("resolve", alias_name, error),
+                    phase_timings,
+                    resolution_timer,
+                    0,
+                    materialization_timer,
+                ));
+            }
+        };
         phase_timings.push(resolution_timer.completed());
 
         let task_ctx = Arc::new(dataframe.task_ctx());
         let planning_timer = PhaseTimer::start(CACHE_ALIAS_PHYSICAL_PLANNING_PHASE);
-        let physical_plan = dataframe
-            .create_physical_plan()
-            .await
-            .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
+        let physical_plan = match dataframe.create_physical_plan().await {
+            Ok(physical_plan) => physical_plan,
+            Err(error) => {
+                return Err(cache_alias_materialization_failure(
+                    mssql_scoped_cache_alias_error("materialize", alias_name, error),
+                    phase_timings,
+                    planning_timer,
+                    1,
+                    materialization_timer,
+                ));
+            }
+        };
         phase_timings.push(planning_timer.completed());
 
         let schema = physical_plan.schema();
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        let stream_setup_timer = PhaseTimer::start(CACHE_ALIAS_STREAM_SETUP_PHASE);
         let sampler = reporter.map(|reporter| {
             DeltaFileProgressSampler::new(
                 read_stats_handles.clone(),
@@ -266,23 +384,59 @@ impl DeltaFunnelSession {
                 None,
             )
         });
-        let stream_setup_timer = PhaseTimer::start(CACHE_ALIAS_STREAM_SETUP_PHASE);
-        let streams =
-            start_cache_partition_streams(physical_plan, task_ctx, read_stats_handles, alias_name)?;
+        let streams = match start_cache_partition_streams(
+            physical_plan,
+            task_ctx,
+            read_stats_handles,
+            alias_name,
+        ) {
+            Ok(streams) => streams,
+            Err(error) => {
+                return Err(cache_alias_materialization_failure(
+                    error,
+                    phase_timings,
+                    stream_setup_timer,
+                    2,
+                    materialization_timer,
+                ));
+            }
+        };
         phase_timings.push(stream_setup_timer.completed());
 
         let collect_timer = PhaseTimer::start(CACHE_ALIAS_EXECUTE_COLLECT_PHASE);
-        let partitions = collect_cache_partitions(streams, sampler, alias_name).await?;
+        let partitions = match collect_cache_partitions(streams, sampler, alias_name).await {
+            Ok(partitions) => partitions,
+            Err(error) => {
+                return Err(cache_alias_materialization_failure(
+                    error,
+                    phase_timings,
+                    collect_timer,
+                    3,
+                    materialization_timer,
+                ));
+            }
+        };
         phase_timings.push(collect_timer.completed());
 
         let memtable_timer = PhaseTimer::start(CACHE_ALIAS_MEMTABLE_BUILD_PHASE);
-        let cached_provider = MemTable::try_new(schema, partitions)
-            .map_err(|error| mssql_scoped_cache_alias_error("materialize", alias_name, error))?;
+        let cached_provider = match MemTable::try_new(schema, partitions) {
+            Ok(cached_provider) => cached_provider,
+            Err(error) => {
+                return Err(cache_alias_materialization_failure(
+                    mssql_scoped_cache_alias_error("materialize", alias_name, error),
+                    phase_timings,
+                    memtable_timer,
+                    4,
+                    materialization_timer,
+                ));
+            }
+        };
+        let provider: Arc<dyn TableProvider> = Arc::new(cached_provider);
         phase_timings.push(memtable_timer.completed());
         phase_timings.push(materialization_timer.completed());
 
         Ok(MaterializedCache {
-            provider: Arc::new(cached_provider),
+            provider,
             phase_timings,
         })
     }
@@ -298,17 +452,25 @@ impl DeltaFunnelSession {
         &self,
         alias_name: &str,
         cached_provider: Arc<dyn TableProvider>,
-    ) -> Result<Arc<dyn TableProvider>, DeltaFunnelError> {
+    ) -> Result<Arc<dyn TableProvider>, CacheAliasInstallFailure> {
         let original_provider = self
             .context
             .deregister_table(alias_name)
-            .map_err(|error| mssql_scoped_cache_alias_error("deregister", alias_name, error))?
-            .ok_or_else(|| {
-                mssql_scoped_cache_alias_error(
+            .map_err(|error| CacheAliasInstallFailure {
+                source: Box::new(mssql_scoped_cache_alias_error(
+                    "deregister",
+                    alias_name,
+                    error,
+                )),
+                restore_timing: None,
+            })?
+            .ok_or_else(|| CacheAliasInstallFailure {
+                source: Box::new(mssql_scoped_cache_alias_error(
                     "deregister",
                     alias_name,
                     "registered alias was missing from the catalog",
-                )
+                )),
+                restore_timing: None,
             })?;
 
         if let Err(register_error) = self.context.register_table(alias_name, cached_provider) {
@@ -327,29 +489,61 @@ impl DeltaFunnelSession {
     /// This helper is used only for the narrow failure window where the
     /// original provider has already been deregistered but the cached provider
     /// could not be registered. The returned error reports the cached register
-    /// failure and, if restoration also fails, includes that cleanup failure.
-    pub(super) fn restore_original_after_cached_register_failure(
+    /// failure while the separate restore timing records cleanup success or failure.
+    fn restore_original_after_cached_register_failure(
         &self,
         alias_name: &str,
         original_provider: Arc<dyn TableProvider>,
         register_error: impl fmt::Display,
-    ) -> DeltaFunnelError {
+    ) -> CacheAliasInstallFailure {
+        let restore_timer = PhaseTimer::start(CACHE_ALIAS_RESTORE_PHASE);
         let restore_result = self.context.register_table(alias_name, original_provider);
-        let message = match restore_result {
-            Ok(_) => format!(
-                "failed to register cached provider for alias `{}`: {}",
-                sanitize_text_for_display(alias_name),
-                sanitize_text_for_display(&register_error.to_string())
-            ),
-            Err(restore_error) => format!(
-                "failed to register cached provider for alias `{}`: {}; also failed to restore original provider: {}",
-                sanitize_text_for_display(alias_name),
-                sanitize_text_for_display(&register_error.to_string()),
-                sanitize_text_for_display(&restore_error.to_string())
-            ),
+        let restore_timing = match restore_result {
+            Ok(_) => restore_timer.completed(),
+            Err(_) => restore_timer.failed(),
         };
+        CacheAliasInstallFailure {
+            source: Box::new(DeltaFunnelError::MssqlWorkflowPlanning {
+                message: format!(
+                    "failed to register cached provider for alias `{}`: {}",
+                    sanitize_text_for_display(alias_name),
+                    sanitize_text_for_display(&register_error.to_string())
+                ),
+            }),
+            restore_timing: Some(restore_timing),
+        }
+    }
+}
 
-        DeltaFunnelError::MssqlWorkflowPlanning { message }
+fn cache_alias_materialization_failure(
+    source: DeltaFunnelError,
+    mut phase_timings: Vec<PhaseTimingReport>,
+    failed_timer: PhaseTimer,
+    failed_phase_index: usize,
+    materialization_timer: PhaseTimer,
+) -> CacheAliasPhaseFailure {
+    let failed_phase = CACHE_ALIAS_MATERIALIZATION_PHASES[failed_phase_index];
+    phase_timings.push(failed_timer.failed());
+    phase_timings.extend(
+        CACHE_ALIAS_MATERIALIZATION_PHASES
+            .iter()
+            .skip(failed_phase_index.saturating_add(1))
+            .map(|phase_name| {
+                PhaseTimingReport::not_started(*phase_name, ReportReasonCode::PriorFailure)
+            }),
+    );
+    phase_timings.push(materialization_timer.failed());
+    phase_timings.extend(
+        [CACHE_ALIAS_INSTALL_PHASE, CACHE_ALIAS_RESTORE_PHASE]
+            .into_iter()
+            .map(|phase_name| {
+                PhaseTimingReport::not_started(phase_name, ReportReasonCode::PriorFailure)
+            }),
+    );
+    CacheAliasPhaseFailure {
+        source,
+        phase_timings,
+        failed_phase,
     }
 }
 
@@ -504,17 +698,13 @@ fn emit_cache_progress(sampler: &mut Option<DeltaFileProgressSampler>) {
     }
 }
 
-pub(super) fn restore_mssql_cache_aliases(
-    replacements: Vec<MssqlScopedCacheAliasReplacement<'_>>,
-    reporter: Option<&ProgressReporter>,
-) -> Result<(), DeltaFunnelError> {
-    restore_mssql_cache_aliases_with_reports(replacements, reporter).1
-}
-
 pub(super) fn restore_mssql_cache_aliases_with_reports(
     replacements: Vec<MssqlScopedCacheAliasReplacement<'_>>,
     reporter: Option<&ProgressReporter>,
-) -> (Vec<WriteAllCacheAliasReport>, Result<(), DeltaFunnelError>) {
+) -> (
+    Vec<WriteAllCacheAliasReport>,
+    Result<(), (u64, DeltaFunnelError)>,
+) {
     if !replacements.is_empty()
         && let Some(reporter) = reporter
     {
@@ -528,12 +718,12 @@ pub(super) fn restore_mssql_cache_aliases_with_reports(
 
     for replacement in replacements.into_iter().rev() {
         let (report, restore_result) = replacement.restore_with_report();
-        reports.push(report);
         if let Err(error) = restore_result
             && first_error.is_none()
         {
-            first_error = Some(error);
+            first_error = Some((report.table_id(), error));
         }
+        reports.push(report);
     }
     reports.reverse();
 
@@ -544,27 +734,36 @@ pub(super) fn restore_mssql_cache_aliases_with_reports(
     (reports, result)
 }
 
-pub(super) fn restore_mssql_cache_aliases_after_error(
-    error: DeltaFunnelError,
+pub(super) fn restore_cache_aliases_after_failure(
+    source: DeltaFunnelError,
     replacements: Vec<MssqlScopedCacheAliasReplacement<'_>>,
+    failed_alias: Option<WriteAllCacheAliasReport>,
     reporter: Option<&ProgressReporter>,
 ) -> DeltaFunnelError {
-    match restore_mssql_cache_aliases(replacements, reporter) {
-        Ok(()) => error,
-        Err(restore_error) => cache_error_with_restore_error(error, restore_error),
+    let primary_failed_alias_table_id = failed_alias
+        .as_ref()
+        .map(WriteAllCacheAliasReport::table_id);
+    let (mut reports, _restore_result) =
+        restore_mssql_cache_aliases_with_reports(replacements, reporter);
+    if let Some(failed_alias) = failed_alias {
+        reports.push(failed_alias);
     }
+    write_all_cache_failure(source, reports, primary_failed_alias_table_id, None)
 }
 
-pub(super) fn cache_error_with_restore_error(
-    error: DeltaFunnelError,
-    restore_error: DeltaFunnelError,
+pub(super) fn write_all_cache_failure(
+    source: DeltaFunnelError,
+    aliases: Vec<WriteAllCacheAliasReport>,
+    primary_failed_alias_table_id: Option<u64>,
+    workflow: Option<MssqlWorkflowWriteReport>,
 ) -> DeltaFunnelError {
-    DeltaFunnelError::MssqlWorkflowPlanning {
-        message: format!(
-            "write_all auto cache failed: {}; also failed to restore cache aliases: {}",
-            sanitize_text_for_display(&error.to_string()),
-            sanitize_text_for_display(&restore_error.to_string())
-        ),
+    DeltaFunnelError::WriteAllCache {
+        failure: Box::new(WriteAllCacheFailure::new(
+            aliases,
+            primary_failed_alias_table_id,
+            workflow,
+        )),
+        source: Box::new(source),
     }
 }
 
@@ -590,7 +789,7 @@ mod tests {
     use super::*;
 
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig,
+        DeltaFunnelError, DeltaSourceConfig, PhaseStatus,
         observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         orchestrator::session::{
             DeltaFunnelSession, SessionOptions,
@@ -798,12 +997,14 @@ mod tests {
 
         let without_progress = session
             .materialize_cache("cache_source", None)
-            .await?
+            .await
+            .map_err(CacheAliasPhaseFailure::into_source)?
             .provider;
         let reporter = ProgressReporter::default();
         let with_progress = session
             .materialize_cache("cache_source", Some(&reporter))
-            .await?
+            .await
+            .map_err(CacheAliasPhaseFailure::into_source)?
             .provider;
 
         assert_eq!(without_progress.schema(), default_schema);
@@ -923,18 +1124,22 @@ mod tests {
             .deregister_table("big")?
             .ok_or("expected original provider")?;
 
-        let error = session.restore_original_after_cached_register_failure(
+        let failure = session.restore_original_after_cached_register_failure(
             "big",
             original_provider,
             "injected cached register failure",
         );
 
         assert!(matches!(
-            &error,
+            &*failure.source,
             DeltaFunnelError::MssqlWorkflowPlanning { message }
                 if message.contains("failed to register cached provider")
                     && message.contains("injected cached register failure")
         ));
+        assert_eq!(
+            failure.restore_timing.map(|timing| timing.status()),
+            Some(PhaseStatus::completed())
+        );
 
         let direct_restored_big = session
             .context()
@@ -970,10 +1175,20 @@ mod tests {
         let later_error = DeltaFunnelError::MssqlWorkflowPlanning {
             message: "simulated downstream planning failure".to_owned(),
         };
-        let error = restore_mssql_cache_aliases_after_error(later_error, vec![replacement], None);
+        let error = restore_cache_aliases_after_failure(later_error, vec![replacement], None, None);
 
+        let DeltaFunnelError::WriteAllCache { failure, source } = error else {
+            return Err("expected structured write_all cache failure".into());
+        };
+        assert_eq!(failure.aliases().len(), 1);
+        assert_eq!(
+            failure.aliases()[0].status(),
+            WriteAllCacheAliasStatus::MaterializedAndRestored
+        );
+        assert_eq!(failure.primary_failed_alias_table_id(), None);
+        assert_eq!(failure.workflow(), None);
         assert!(matches!(
-            error,
+            *source,
             DeltaFunnelError::MssqlWorkflowPlanning { message }
                 if message.contains("simulated downstream planning failure")
         ));
@@ -1028,23 +1243,24 @@ mod tests {
     }
 
     #[test]
-    fn cache_error_with_restore_error_preserves_both_contexts() {
+    fn write_all_cache_failure_preserves_the_primary_source()
+    -> Result<(), Box<dyn std::error::Error>> {
         let primary_error = DeltaFunnelError::MssqlWorkflowPlanning {
             message: "simulated output workflow failure".to_owned(),
         };
-        let restore_error = DeltaFunnelError::MssqlWorkflowPlanning {
-            message: "simulated restore failure for alias big".to_owned(),
+        let error = write_all_cache_failure(primary_error, Vec::new(), None, None);
+
+        let DeltaFunnelError::WriteAllCache { failure, source } = error else {
+            return Err("expected structured write_all cache failure".into());
         };
-
-        let error = cache_error_with_restore_error(primary_error, restore_error);
-
+        assert!(failure.aliases().is_empty());
+        assert_eq!(failure.primary_failed_alias_table_id(), None);
+        assert_eq!(failure.workflow(), None);
         assert!(matches!(
-            error,
+            *source,
             DeltaFunnelError::MssqlWorkflowPlanning { message }
-                if message.contains("write_all auto cache failed")
-                    && message.contains("simulated output workflow failure")
-                    && message.contains("also failed to restore cache aliases")
-                    && message.contains("simulated restore failure for alias big")
+                if message.contains("simulated output workflow failure")
         ));
+        Ok(())
     }
 }

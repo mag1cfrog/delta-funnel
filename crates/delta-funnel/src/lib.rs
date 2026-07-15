@@ -135,8 +135,8 @@ pub use report::{
     SourceUsageStatus, TargetValidationMode, ValidationOptions, ValidationStatus,
     ValidationStatusKind, WorkflowStatus, WorkflowStatusKind, WriteAllCacheAliasReport,
     WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
-    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport, duration_to_micros_saturating,
-    u128_to_u64_saturating, usize_to_u64_saturating,
+    WriteAllCacheFailure, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
+    duration_to_micros_saturating, u128_to_u64_saturating, usize_to_u64_saturating,
 };
 pub use sql_server::{
     LoadMode, MssqlBatchShapingReport, MssqlBinaryPolicy, MssqlConnectionConfig,

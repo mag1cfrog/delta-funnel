@@ -17,8 +17,8 @@ use crate::{
     OutputStatus, PhaseStatus, PhaseTimingReport, QueryExecutionMetric, QueryExecutionMetricValue,
     QueryExecutionOperatorProfile, QueryExecutionProfile, ReportReasonCode, RowCount, RunMode,
     ValidationStatus, WorkflowStatus, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
-    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheReport,
-    WriteAllNoCacheReason, WriteAllReport,
+    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheFailure,
+    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
 };
 
 impl RowCount {
@@ -613,6 +613,22 @@ impl WriteAllCacheAliasReport {
                 "failed_phase": self.failed_phase(),
             }),
         }
+    }
+}
+
+impl WriteAllCacheFailure {
+    /// Returns cache failure context as a JSON-compatible Python shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "aliases": self
+                .aliases()
+                .iter()
+                .map(WriteAllCacheAliasReport::to_json_value)
+                .collect::<Vec<_>>(),
+            "primary_failed_alias_table_id": self.primary_failed_alias_table_id(),
+            "workflow": self.workflow().map(MssqlWorkflowWriteReport::to_json_value),
+        })
     }
 }
 
@@ -1429,6 +1445,20 @@ mod tests {
         assert_eq!(failed_value["status"], "failed");
         assert_eq!(failed_value["failed_phase"], "cache_alias_install");
         assert_eq!(failed_value["phase_timings"][0]["status"]["kind"], "failed");
+    }
+
+    #[test]
+    fn empty_write_all_cache_failure_has_the_exact_json_shape() {
+        let failure = WriteAllCacheFailure::new(Vec::new(), None, None);
+
+        assert_eq!(
+            failure.to_json_value(),
+            json!({
+                "aliases": [],
+                "primary_failed_alias_table_id": null,
+                "workflow": null,
+            })
+        );
     }
 
     #[test]

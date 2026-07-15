@@ -2338,21 +2338,43 @@ mod tests {
 
             let error = session
                 .write_all_with_writer(&[west_output, east_output], writer)
-                .await;
+                .await
+                .err()
+                .ok_or("expected cache materialization failure")?;
             {
                 let calls = calls
                     .lock()
                     .map_err(|_| "fake workflow call lock poisoned")?;
 
-                assert!(matches!(
-                    error,
-                    Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
-                        if message.contains("scoped MSSQL cache alias materialize failed")
-                            && message.contains("big")
-                ));
                 assert!(calls.is_empty());
                 assert_eq!(source_scans.load(Ordering::SeqCst), 1);
             }
+            let DeltaFunnelError::WriteAllCache { failure, source } = error else {
+                return Err("expected structured write_all cache failure".into());
+            };
+            assert_eq!(failure.primary_failed_alias_table_id(), Some(big.id()));
+            assert_eq!(failure.workflow(), None);
+            assert_eq!(failure.aliases().len(), 1);
+            let alias = &failure.aliases()[0];
+            assert_eq!(alias.table_id(), big.id());
+            assert_eq!(alias.status(), WriteAllCacheAliasStatus::Failed);
+            assert_eq!(alias.failed_phase(), Some("cache_alias_physical_planning"));
+            assert_eq!(alias.phase_timings().len(), 8);
+            assert_eq!(alias.phase_timings()[0].status(), PhaseStatus::completed());
+            assert_eq!(alias.phase_timings()[1].status(), PhaseStatus::failed());
+            assert_eq!(alias.phase_timings()[5].status(), PhaseStatus::failed());
+            assert!(alias.phase_timings()[2..5].iter().all(|timing| {
+                timing.status() == PhaseStatus::not_started(ReportReasonCode::PriorFailure)
+            }));
+            assert!(alias.phase_timings()[6..].iter().all(|timing| {
+                timing.status() == PhaseStatus::not_started(ReportReasonCode::PriorFailure)
+            }));
+            assert!(matches!(
+                *source,
+                DeltaFunnelError::MssqlWorkflowPlanning { message }
+                    if message.contains("scoped MSSQL cache alias materialize failed")
+                        && message.contains("big")
+            ));
 
             let restored_error = match session.batch_stream_for_lazy_table(&big, None).await {
                 Ok(stream) => match collect_stream_row_count(stream).await {
@@ -2436,22 +2458,51 @@ mod tests {
 
             let error = session
                 .write_all_with_writer(&[west_output, east_output], writer)
-                .await;
+                .await
+                .err()
+                .ok_or("expected later cache materialization failure")?;
             {
                 let calls = calls
                     .lock()
                     .map_err(|_| "fake workflow call lock poisoned")?;
 
-                assert!(matches!(
-                    error,
-                    Err(DeltaFunnelError::MssqlWorkflowPlanning { message })
-                        if message.contains("scoped MSSQL cache alias materialize failed")
-                            && message.contains("names")
-                ));
                 assert!(calls.is_empty());
                 assert_eq!(big_source_scans.load(Ordering::SeqCst), 1);
                 assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
             }
+            let DeltaFunnelError::WriteAllCache { failure, source } = error else {
+                return Err("expected structured write_all cache failure".into());
+            };
+            assert_eq!(failure.primary_failed_alias_table_id(), Some(names.id()));
+            assert_eq!(failure.workflow(), None);
+            assert_eq!(failure.aliases().len(), 2);
+            assert_eq!(failure.aliases()[0].table_id(), big.id());
+            assert_eq!(
+                failure.aliases()[0].status(),
+                WriteAllCacheAliasStatus::MaterializedAndRestored
+            );
+            assert_eq!(
+                failure.aliases()[0]
+                    .phase_timings()
+                    .last()
+                    .map(PhaseTimingReport::status),
+                Some(PhaseStatus::completed())
+            );
+            assert_eq!(failure.aliases()[1].table_id(), names.id());
+            assert_eq!(
+                failure.aliases()[1].status(),
+                WriteAllCacheAliasStatus::Failed
+            );
+            assert_eq!(
+                failure.aliases()[1].failed_phase(),
+                Some("cache_alias_physical_planning")
+            );
+            assert!(matches!(
+                *source,
+                DeltaFunnelError::MssqlWorkflowPlanning { message }
+                    if message.contains("scoped MSSQL cache alias materialize failed")
+                        && message.contains("names")
+            ));
 
             let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             assert_eq!(

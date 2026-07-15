@@ -14,8 +14,8 @@ use super::super::super::{
 use super::{
     MssqlDerivedCacheAliasPlan,
     cache_alias::{
-        cache_error_with_restore_error, restore_mssql_cache_aliases_after_error,
-        restore_mssql_cache_aliases_with_reports,
+        restore_cache_aliases_after_failure, restore_mssql_cache_aliases_with_reports,
+        write_all_cache_failure,
     },
 };
 
@@ -168,9 +168,10 @@ impl DeltaFunnelSession {
         ) {
             Ok(jobs) => jobs,
             Err(error) => {
-                return Err(restore_mssql_cache_aliases_after_error(
+                return Err(restore_cache_aliases_after_failure(
                     error,
                     replacements,
+                    None,
                     reporter,
                 ));
             }
@@ -183,11 +184,18 @@ impl DeltaFunnelSession {
 
         match (write_result, restore_result) {
             (Ok(report), Ok(())) => Ok((report, alias_reports)),
-            (Ok(_report), Err(restore_error)) => Err(restore_error),
-            (Err(write_error), Ok(())) => Err(write_error),
-            (Err(write_error), Err(restore_error)) => {
-                Err(cache_error_with_restore_error(write_error, restore_error))
-            }
+            (Ok(report), Err((table_id, restore_error))) => Err(write_all_cache_failure(
+                restore_error,
+                alias_reports,
+                Some(table_id),
+                Some(report),
+            )),
+            (Err(write_error), _) => Err(write_all_cache_failure(
+                write_error,
+                alias_reports,
+                None,
+                None,
+            )),
         }
     }
 }
