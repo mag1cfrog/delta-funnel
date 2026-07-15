@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
-    DeltaFunnelError, MssqlOutputBatchStreamFactory, MssqlOutputWriteJob,
+    DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStreamFactory, MssqlOutputWriteJob,
     MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, progress::ProgressReporter,
     usize_to_u64_saturating, write_mssql_outputs_with_writer,
 };
@@ -48,6 +48,7 @@ impl DeltaFunnelSession {
         planned_outputs: &[PlannedMssqlOutput],
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
+        profile_mode: ExecutionProfileMode,
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
         let output_count = usize_to_u64_saturating(planned_outputs.len());
         planned_outputs
@@ -61,15 +62,23 @@ impl DeltaFunnelSession {
                         output_count,
                     )
                 });
-                let batches = self.lazy_table_batch_stream_factory(
-                    planned.table().clone(),
+                let create_query_execution = self.mssql_output_query_factory(
+                    planned.clone(),
                     provider_stats_snapshots.clone(),
-                    progress.clone().map(|reporter| {
-                        (reporter, planned.resolved_target().output_name().to_owned())
-                    }),
+                    progress.clone(),
+                    profile_mode,
                 );
 
-                Ok(self.build_write_all_job(planned, output_schema, batches, progress))
+                Ok(MssqlOutputWriteJob::new_with_query_execution_factory(
+                    output_schema,
+                    planned.resolved_target().clone(),
+                    planned.output_plan().schema_plan_options(),
+                    create_query_execution,
+                    self.options.mssql_write_backend(),
+                    self.options.validation_options(),
+                )
+                .with_phase_timings(planned.phase_timings().to_vec())
+                .with_progress_reporter(progress))
             })
             .collect()
     }
@@ -115,6 +124,7 @@ impl DeltaFunnelSession {
         writer: W,
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
+        profile_mode: ExecutionProfileMode,
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
@@ -123,6 +133,7 @@ impl DeltaFunnelSession {
             planned_outputs,
             provider_stats_snapshots,
             reporter,
+            profile_mode,
         )?;
 
         write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
@@ -185,7 +196,7 @@ mod tests {
             execute_output_request, scan_counting_marker_region_provider, secret_connection,
         },
     };
-    use crate::LoadMode;
+    use crate::{ExecutionProfileMode, LoadMode};
 
     #[tokio::test]
     async fn build_write_all_uncached_jobs_preserves_output_metadata_without_stream_setup()
@@ -210,7 +221,12 @@ mod tests {
         let planned = session.plan_write_all_outputs(&[west, east])?;
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
 
-        let jobs = session.build_write_all_uncached_jobs(&planned, None, None)?;
+        let jobs = session.build_write_all_uncached_jobs(
+            &planned,
+            None,
+            None,
+            ExecutionProfileMode::Disabled,
+        )?;
 
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
         assert_eq!(jobs.len(), 2);

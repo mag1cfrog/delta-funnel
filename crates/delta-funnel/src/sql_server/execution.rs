@@ -24,8 +24,9 @@ pub use workflow::{
     write_mssql_outputs_to_mssql,
 };
 pub(crate) use workflow::{
-    MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter, MssqlWorkflowSinkWriter,
-    write_mssql_outputs_with_writer,
+    MssqlOutputProfileCallback, MssqlOutputQueryError, MssqlOutputQueryExecution,
+    MssqlOutputQueryFuture, MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter,
+    MssqlWorkflowSinkWriter, write_mssql_outputs_with_writer,
 };
 pub(crate) use write::{MssqlBulkLoadWriter, drain_mssql_batches_for_stream_benchmark};
 pub use write::{

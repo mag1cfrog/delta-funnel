@@ -43,14 +43,20 @@ pub type MssqlOutputBatchStreamFuture =
 /// Async factory that constructs a direct batch stream for one attempted output.
 pub type MssqlOutputBatchStreamFactory = Box<dyn FnOnce() -> MssqlOutputBatchStreamFuture + Send>;
 
-pub(crate) type WriteResult = Result<MssqlWriteReport, DeltaFunnelError>;
-
 /// One output query execution and its terminal reporting state.
 pub(crate) struct MssqlOutputQueryExecution {
     pub(crate) stream: MssqlOutputBatchStream,
     pub(crate) query_phase_timings: Vec<PhaseTimingReport>,
-    pub(crate) attach_profile_to_result: Option<Box<dyn FnOnce(WriteResult) -> WriteResult + Send>>,
+    pub(crate) attach_profile_to_result: Option<MssqlOutputProfileCallback>,
 }
+
+/// Callback that attaches a terminal query profile to one writer result.
+pub(crate) type MssqlOutputProfileCallback = Box<
+    dyn FnOnce(
+            Result<MssqlWriteReport, DeltaFunnelError>,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError>
+        + Send,
+>;
 
 /// Failed output query plus timings completed before the failure.
 pub(crate) struct MssqlOutputQueryError {

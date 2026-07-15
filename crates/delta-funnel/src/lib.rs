@@ -160,8 +160,9 @@ pub use sql_server::{
     write_mssql_outputs_to_mssql, write_output_batches_to_mssql,
 };
 pub(crate) use sql_server::{
-    MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter, MssqlWorkflowSinkWriter,
-    write_mssql_outputs_with_writer,
+    MssqlOutputProfileCallback, MssqlOutputQueryError, MssqlOutputQueryExecution,
+    MssqlOutputQueryFuture, MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter,
+    MssqlWorkflowSinkWriter, write_mssql_outputs_with_writer,
 };
 pub use support::sanitize_uri_for_display;
 pub use table_formats::{

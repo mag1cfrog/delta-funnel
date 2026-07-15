@@ -1,21 +1,28 @@
 use async_trait::async_trait;
+use datafusion::prelude::SessionContext;
 use tracing::Instrument;
 
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, LoadMode, MssqlOutputBatchStream,
-    MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteBackend, MssqlWriteFailureContext,
-    MssqlWritePhase, MssqlWriteReport, PhaseTimingReport, QueryExecutionProfile,
-    QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget, ValidationOptions, observability,
-    plan_mssql_target_for_resolved_output,
+    MssqlOutputProfileCallback, MssqlOutputQueryError, MssqlOutputQueryExecution,
+    MssqlOutputQueryFuture, MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteBackend,
+    MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport, PhaseTimingReport,
+    QueryExecutionProfile, QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget,
+    ValidationOptions, observability, plan_mssql_target_for_resolved_output,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::PhaseTimer,
     sql_server::write_planned_output_batches_to_mssql_for_workflow,
 };
 
 use super::super::{
-    DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RunMode,
+    DeltaFunnelSession, OutputWritePlan, PlannedMssqlOutput, RegisteredDerivedTable,
+    RegisteredSessionSource, RunMode,
     errors::datafusion_handoff_setup_error,
-    query_handoff::{QueryStreamSetup, batch_stream_for_physical_plan},
+    query_handoff::{
+        QueryStreamSetup, SharedProviderStatsSnapshots, batch_stream_for_physical_plan,
+        dataframe_for_lazy_table_from_session_parts,
+    },
+    registry::PendingDerivedTable,
 };
 
 pub(in crate::orchestrator::session) const OUTPUT_SCHEMA_PLANNING_PHASE: &str =
@@ -299,6 +306,35 @@ impl DeltaFunnelSession {
         result
     }
 
+    pub(super) fn mssql_output_query_factory(
+        &self,
+        planned: PlannedMssqlOutput,
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
+        progress: Option<ProgressReporter>,
+        profile_mode: ExecutionProfileMode,
+    ) -> Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send> {
+        let context = self.context.clone();
+        let sources = self.sources.clone();
+        let derived_tables = self.derived_tables.clone();
+        let pending_derived_tables = self.pending_derived_tables.clone();
+
+        Box::new(move || {
+            Box::pin(async move {
+                create_mssql_output_query_execution(
+                    &context,
+                    &sources,
+                    &derived_tables,
+                    &pending_derived_tables,
+                    &planned,
+                    provider_stats_snapshots,
+                    progress,
+                    profile_mode,
+                )
+                .await
+            })
+        })
+    }
+
     async fn plan_and_write_mssql_output<W>(
         &self,
         request: &OutputWritePlan,
@@ -323,69 +359,22 @@ impl DeltaFunnelSession {
                 output_name,
             ));
         }
-        let mut query_phase_timings = Vec::with_capacity(QUERY_PHASE_NAMES.len());
-
-        let dataframe_timer = PhaseTimer::start(QUERY_DATAFRAME_PLANNING_PHASE);
-        let dataframe = match self.dataframe_for_lazy_table(planned.table()).await {
-            Ok(dataframe) => dataframe,
-            Err(source) => {
-                return Err(mssql_query_phase_error(
-                    &planned,
-                    MssqlWritePhase::QueryDataFramePlanning,
-                    query_phase_timings,
-                    dataframe_timer,
-                    source,
-                    None,
-                ));
-            }
-        };
-        query_phase_timings.push(dataframe_timer.completed());
-
-        let physical_plan_timer = PhaseTimer::start(QUERY_PHYSICAL_PLANNING_PHASE);
-        let physical_plan = match dataframe.create_physical_plan().await {
-            Ok(physical_plan) => physical_plan,
-            Err(error) => {
-                let source = datafusion_handoff_setup_error("physical_plan", error);
-                return Err(mssql_query_phase_error(
-                    &planned,
-                    MssqlWritePhase::QueryPhysicalPlanning,
-                    query_phase_timings,
-                    physical_plan_timer,
-                    source,
-                    None,
-                ));
-            }
-        };
-        query_phase_timings.push(physical_plan_timer.completed());
-
-        let stream_setup_timer = PhaseTimer::start(QUERY_STREAM_SETUP_PHASE);
-        let profile_scope = match profile_mode {
-            ExecutionProfileMode::Disabled => None,
-            ExecutionProfileMode::Detailed => Some(QueryExecutionScope::MssqlOutput),
-        };
-        let QueryStreamSetup {
+        let MssqlOutputQueryExecution {
             stream: batches,
-            profile_result,
-        } = match batch_stream_for_physical_plan(
-            self.context(),
-            physical_plan,
+            query_phase_timings,
+            attach_profile_to_result,
+        } = create_mssql_output_query_execution(
+            &self.context,
+            &self.sources,
+            &self.derived_tables,
+            &self.pending_derived_tables,
+            &planned,
             None,
-            reporter.map(|reporter| (reporter.clone(), request.target().output_name().to_owned())),
-            profile_scope,
-        ) {
-            Ok(setup) => setup,
-            Err(failure) => {
-                return Err(mssql_query_phase_error(
-                    &planned,
-                    MssqlWritePhase::QueryStreamSetup,
-                    query_phase_timings,
-                    stream_setup_timer,
-                    *failure.source,
-                    failure.execution_profile,
-                ));
-            }
-        };
-        query_phase_timings.push(stream_setup_timer.completed());
+            reporter.cloned(),
+            profile_mode,
+        )
+        .await
+        .map_err(|failure| failure.error)?;
 
         let mut phase_timings = planned.phase_timings().to_vec();
         phase_timings.extend(query_phase_timings);
@@ -399,27 +388,152 @@ impl DeltaFunnelSession {
                 reporter,
             )
             .await;
-        let execution_profile = profile_result.and_then(|result| result.profile().cloned());
+        let result = match attach_profile_to_result {
+            Some(attach_profile) => attach_profile(result),
+            None => result,
+        };
         match result {
-            Ok(report) => Ok(ensure_validation_phase_timing(report)
-                .with_phase_timings(phase_timings)
-                .with_execution_profile(execution_profile)),
+            Ok(report) => {
+                Ok(ensure_validation_phase_timing(report).with_phase_timings(phase_timings))
+            }
             Err(error) => {
                 let error = prepend_mssql_write_phase_timings(error, phase_timings);
-                Err(with_mssql_write_execution_profile(error, execution_profile))
+                Err(error)
             }
         }
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "query creation needs the session registries plus per-output reporting state"
+)]
+async fn create_mssql_output_query_execution(
+    context: &SessionContext,
+    sources: &[RegisteredSessionSource],
+    derived_tables: &[RegisteredDerivedTable],
+    pending_derived_tables: &[PendingDerivedTable],
+    planned: &PlannedMssqlOutput,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
+    progress: Option<ProgressReporter>,
+    profile_mode: ExecutionProfileMode,
+) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
+    let mut query_phase_timings = Vec::with_capacity(QUERY_PHASE_NAMES.len());
+
+    let dataframe_timer = PhaseTimer::start(QUERY_DATAFRAME_PLANNING_PHASE);
+    let dataframe = match dataframe_for_lazy_table_from_session_parts(
+        context,
+        planned.table(),
+        sources,
+        derived_tables,
+        pending_derived_tables,
+    )
+    .await
+    {
+        Ok(dataframe) => dataframe,
+        Err(source) => {
+            return Err(mssql_output_query_error(
+                planned,
+                MssqlWritePhase::QueryDataFramePlanning,
+                query_phase_timings,
+                dataframe_timer,
+                source,
+                None,
+            ));
+        }
+    };
+    query_phase_timings.push(dataframe_timer.completed());
+
+    let physical_plan_timer = PhaseTimer::start(QUERY_PHYSICAL_PLANNING_PHASE);
+    let physical_plan = match dataframe.create_physical_plan().await {
+        Ok(physical_plan) => physical_plan,
+        Err(error) => {
+            return Err(mssql_output_query_error(
+                planned,
+                MssqlWritePhase::QueryPhysicalPlanning,
+                query_phase_timings,
+                physical_plan_timer,
+                datafusion_handoff_setup_error("physical_plan", error),
+                None,
+            ));
+        }
+    };
+    query_phase_timings.push(physical_plan_timer.completed());
+
+    let stream_setup_timer = PhaseTimer::start(QUERY_STREAM_SETUP_PHASE);
+    let profile_scope = match profile_mode {
+        ExecutionProfileMode::Disabled => None,
+        ExecutionProfileMode::Detailed => Some(QueryExecutionScope::MssqlOutput),
+    };
+    let QueryStreamSetup {
+        stream,
+        profile_result,
+    } = match batch_stream_for_physical_plan(
+        context,
+        physical_plan,
+        provider_stats_snapshots,
+        progress.map(|reporter| (reporter, planned.resolved_target().output_name().to_owned())),
+        profile_scope,
+    ) {
+        Ok(execution) => execution,
+        Err(failure) => {
+            return Err(mssql_output_query_error(
+                planned,
+                MssqlWritePhase::QueryStreamSetup,
+                query_phase_timings,
+                stream_setup_timer,
+                *failure.source,
+                failure.execution_profile,
+            ));
+        }
+    };
+    query_phase_timings.push(stream_setup_timer.completed());
+
+    let attach_profile_to_result = profile_result.map(|profile_result| {
+        Box::new(move |result: Result<MssqlWriteReport, DeltaFunnelError>| {
+            let execution_profile = profile_result.profile().cloned();
+            match result {
+                Ok(report) => Ok(report.with_execution_profile(execution_profile)),
+                Err(error) => Err(with_mssql_write_execution_profile(error, execution_profile)),
+            }
+        }) as MssqlOutputProfileCallback
+    });
+
+    Ok(MssqlOutputQueryExecution {
+        stream,
+        query_phase_timings,
+        attach_profile_to_result,
+    })
+}
+
+#[cfg(test)]
 fn mssql_query_phase_error(
+    planned: &PlannedMssqlOutput,
+    phase: MssqlWritePhase,
+    query_phase_timings: Vec<PhaseTimingReport>,
+    timer: PhaseTimer,
+    source: DeltaFunnelError,
+    execution_profile: Option<QueryExecutionProfile>,
+) -> DeltaFunnelError {
+    mssql_output_query_error(
+        planned,
+        phase,
+        query_phase_timings,
+        timer,
+        source,
+        execution_profile,
+    )
+    .error
+}
+
+fn mssql_output_query_error(
     planned: &PlannedMssqlOutput,
     phase: MssqlWritePhase,
     mut query_phase_timings: Vec<PhaseTimingReport>,
     timer: PhaseTimer,
     source: DeltaFunnelError,
     execution_profile: Option<QueryExecutionProfile>,
-) -> DeltaFunnelError {
+) -> MssqlOutputQueryError {
     query_phase_timings.push(timer.failed());
     let next_phase_index = query_phase_timings.len();
     debug_assert!(next_phase_index <= QUERY_PHASE_NAMES.len());
@@ -431,7 +545,7 @@ fn mssql_query_phase_error(
             .map(|name| PhaseTimingReport::not_started(*name, ReportReasonCode::PriorFailure)),
     );
     let mut phase_timings = planned.phase_timings().to_vec();
-    phase_timings.extend(query_phase_timings);
+    phase_timings.extend(query_phase_timings.iter().cloned());
     let cleanup = match planned.output_plan().load_mode() {
         LoadMode::AppendExisting => MssqlTargetCleanupStatus::NotApplicable,
         LoadMode::CreateAndLoad | LoadMode::Replace => MssqlTargetCleanupStatus::NotAttempted,
@@ -448,9 +562,12 @@ fn mssql_query_phase_error(
     )
     .with_phase_timings(phase_timings)
     .with_execution_profile(execution_profile);
-    DeltaFunnelError::MssqlQueryPhase {
-        context: Box::new(context),
-        source: Box::new(source),
+    MssqlOutputQueryError {
+        error: DeltaFunnelError::MssqlQueryPhase {
+            context: Box::new(context),
+            source: Box::new(source),
+        },
+        query_phase_timings,
     }
 }
 

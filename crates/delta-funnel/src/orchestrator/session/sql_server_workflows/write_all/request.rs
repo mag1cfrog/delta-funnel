@@ -129,6 +129,7 @@ impl DeltaFunnelSession {
                                 writer,
                                 Some(Arc::clone(&shared_provider_stats)),
                                 active_reporter,
+                                options.execution_profile_mode(),
                             )
                             .await?;
                         (workflow, cache_report::from_plan(cache_plan))
@@ -153,6 +154,7 @@ impl DeltaFunnelSession {
                             writer,
                             Some(Arc::clone(&shared_provider_stats)),
                             active_reporter,
+                            options.execution_profile_mode(),
                         )
                         .await?;
                     (workflow, cache_report::disabled())
@@ -382,11 +384,12 @@ mod tests {
         WORKFLOW_EXECUTION_PHASE,
     };
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlBatchShapingReport,
-        MssqlOutputBatchStream, MssqlSchemaPlanOptions, MssqlTargetCleanupStatus,
-        MssqlTargetConfig, MssqlTargetTable, MssqlTargetTableState, MssqlWorkflowOutputWriter,
-        MssqlWriteBackend, MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport,
-        PhaseStatus, PhaseTimingReport, ReportReasonCode, ResolvedMssqlTarget, RowCount,
+        DeltaFunnelError, DeltaSourceConfig, ExecutionProfileMode, LoadMode,
+        MssqlBatchShapingReport, MssqlOutputBatchStream, MssqlSchemaPlanOptions,
+        MssqlTargetCleanupStatus, MssqlTargetConfig, MssqlTargetTable, MssqlTargetTableState,
+        MssqlWorkflowOutputWriter, MssqlWriteBackend, MssqlWriteFailureContext, MssqlWritePhase,
+        MssqlWriteReport, PhaseStatus, PhaseTimingReport, QueryExecutionOutcome,
+        QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget, RowCount,
         WriteAllCacheAliasStatus, WriteAllCacheReport, WriteAllNoCacheReason,
         plan_mssql_target_for_resolved_output,
         progress::{
@@ -1179,6 +1182,18 @@ mod tests {
             };
             assert_eq!(west_report.stats().rows_written(), 2);
             assert_eq!(west_report.stats().batches_written(), calls[0].batches);
+            assert_eq!(west_report.execution_profile(), None);
+            for phase_name in [
+                "query_dataframe_planning",
+                "query_physical_planning",
+                "query_stream_setup",
+            ] {
+                assert_phase_timing(
+                    west_report.phase_timings(),
+                    phase_name,
+                    PhaseStatus::completed(),
+                )?;
+            }
             assert_eq!(report.outputs()[0].output_row_count(), RowCount::exact(2));
             assert_batch_shaping(
                 report.outputs()[0].batch_shaping(),
@@ -1221,6 +1236,111 @@ mod tests {
                 SOURCE_REPORTING_PHASE,
                 PhaseStatus::completed(),
             )?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn uncached_detailed_mode_profiles_each_output_query()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let first = session.table_from_sql("select 1 as id").await?;
+            let second = session.table_from_sql("select 2 as id").await?;
+            let first = execute_output_request(
+                first,
+                "first_output",
+                "first_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let second = execute_output_request(
+                second,
+                "second_output",
+                "second_orders",
+                LoadMode::AppendExisting,
+            )?;
+
+            let report = session
+                .write_all_with_options_and_writer(
+                    &[first, second],
+                    WriteAllOptions::new()
+                        .with_cache_mode(WriteAllCacheMode::Disabled)
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+
+            for status in report.outputs() {
+                let crate::MssqlOutputWriteStatus::Succeeded(output_report) = status else {
+                    return Err(format!("expected succeeded status, got {status:?}").into());
+                };
+                let profile = output_report
+                    .execution_profile()
+                    .ok_or("expected output query profile")?;
+                assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+                assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+                assert!(!profile.partial());
+                assert!(!profile.operators().is_empty());
+                for phase_name in [
+                    "query_dataframe_planning",
+                    "query_physical_planning",
+                    "query_stream_setup",
+                ] {
+                    assert_phase_timing(
+                        output_report.phase_timings(),
+                        phase_name,
+                        PhaseStatus::completed(),
+                    )?;
+                }
+            }
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn uncached_detailed_mode_keeps_completed_query_profile_on_post_eof_failure()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let first = session.table_from_sql("select 1 as id").await?;
+            let second = session.table_from_sql("select 2 as id").await?;
+            let first = execute_output_request(
+                first,
+                "first_output",
+                "first_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let second = execute_output_request(
+                second,
+                "second_output",
+                "second_orders",
+                LoadMode::AppendExisting,
+            )?;
+
+            let report = session
+                .write_all_with_options_and_writer(
+                    &[first, second],
+                    WriteAllOptions::new()
+                        .with_cache_mode(WriteAllCacheMode::Disabled)
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                    FakeWorkflowWriter::failing_on("first_output"),
+                )
+                .await?;
+
+            let [crate::MssqlOutputWriteStatus::Failed(failure), skipped] = report.outputs() else {
+                return Err("expected one failed and one skipped output".into());
+            };
+            let context = failure.context().ok_or("expected failure context")?;
+            let profile = context
+                .report()
+                .execution_profile()
+                .ok_or("expected failed output query profile")?;
+            assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+            assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+            assert!(!profile.partial());
+            assert!(skipped.is_skipped());
+
             Ok(())
         }
 
@@ -2248,7 +2368,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn write_all_with_writer_reports_stream_setup_failure_before_writer()
+        async fn write_all_with_writer_reports_physical_planning_failure_before_writer()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -2312,20 +2432,37 @@ mod tests {
             assert_eq!(report.skipped_count(), 1);
             assert!(report.outputs()[0].is_succeeded());
             assert_eq!(report.outputs()[0].output_name(), "first_output");
-            assert!(report.outputs()[1].is_failed());
-            assert_eq!(report.outputs()[1].output_name(), "failing_output");
-            assert_eq!(
-                report.outputs()[1].output_row_count(),
-                RowCount::unavailable()
-            );
+            let crate::MssqlOutputWriteStatus::Failed(failure) = &report.outputs()[1] else {
+                return Err("expected failed output status".into());
+            };
+            assert_eq!(failure.output_name(), "failing_output");
+            let context = failure.context().ok_or("expected query failure context")?;
+            assert_eq!(context.phase(), MssqlWritePhase::QueryPhysicalPlanning);
+            assert_eq!(context.report().execution_profile(), None);
+            assert_eq!(report.outputs()[1].output_row_count(), RowCount::partial(0));
             assert_batch_shaping(
                 report.outputs()[1].batch_shaping(),
-                PhaseStatus::not_started(ReportReasonCode::NotExecuted),
+                PhaseStatus::failed(),
                 0,
                 0,
                 0,
                 0,
             );
+            assert_phase_timing(
+                report.outputs()[1].phase_timings(),
+                "query_dataframe_planning",
+                PhaseStatus::completed(),
+            )?;
+            assert_phase_timing(
+                report.outputs()[1].phase_timings(),
+                "query_physical_planning",
+                PhaseStatus::failed(),
+            )?;
+            assert_phase_timing(
+                report.outputs()[1].phase_timings(),
+                "query_stream_setup",
+                PhaseStatus::not_started(ReportReasonCode::PriorFailure),
+            )?;
             assert!(report.outputs()[2].is_skipped());
             assert_eq!(report.outputs()[2].output_name(), "third_output");
             assert_eq!(

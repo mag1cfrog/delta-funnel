@@ -1064,7 +1064,7 @@ fn push_html_escaped(output: &mut String, value: &str) {
     }
 }
 
-async fn dataframe_for_lazy_table_from_session_parts(
+pub(super) async fn dataframe_for_lazy_table_from_session_parts(
     context: &SessionContext,
     table: &LazyTable,
     sources: &[RegisteredSessionSource],
