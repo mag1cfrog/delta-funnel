@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     DeltaSourceReport, MssqlOutputWriteStatus, MssqlWorkflowWriteReport, PhaseTimingReport,
-    support::sanitize_text_for_display,
+    QueryExecutionProfile, support::sanitize_text_for_display,
 };
 
 /// Report for one `write_all` call that reached the sequential workflow.
@@ -181,6 +181,7 @@ pub struct WriteAllCacheAliasReport {
     status: WriteAllCacheAliasStatus,
     phase_timings: Vec<PhaseTimingReport>,
     failed_phase: Option<String>,
+    execution_profile: Option<QueryExecutionProfile>,
 }
 
 impl WriteAllCacheAliasReport {
@@ -196,6 +197,7 @@ impl WriteAllCacheAliasReport {
             status: WriteAllCacheAliasStatus::Selected,
             phase_timings: Vec::new(),
             failed_phase: None,
+            execution_profile: None,
         }
     }
 
@@ -219,6 +221,7 @@ impl WriteAllCacheAliasReport {
             status,
             phase_timings,
             failed_phase: failed_phase.map(str::to_owned),
+            execution_profile: None,
         }
     }
 
@@ -260,6 +263,12 @@ impl WriteAllCacheAliasReport {
     pub fn failed_phase(&self) -> Option<&str> {
         self.failed_phase.as_deref()
     }
+
+    /// Returns the terminal cache materialization profile when collection was enabled.
+    #[must_use]
+    pub const fn execution_profile(&self) -> Option<&QueryExecutionProfile> {
+        self.execution_profile.as_ref()
+    }
 }
 
 impl fmt::Debug for WriteAllCacheAliasReport {
@@ -272,6 +281,7 @@ impl fmt::Debug for WriteAllCacheAliasReport {
             .field("status", &self.status)
             .field("phase_timings", &self.phase_timings)
             .field("failed_phase", &self.failed_phase)
+            .field("execution_profile", &self.execution_profile)
             .finish()
     }
 }
