@@ -1299,7 +1299,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn uncached_detailed_mode_keeps_completed_query_profile_on_post_eof_failure()
+        async fn uncached_detailed_mode_nests_failed_profile_and_skipped_null_once()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -1341,6 +1341,25 @@ mod tests {
             assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
             assert!(!profile.partial());
             assert!(skipped.is_skipped());
+
+            let value = report.to_json_value();
+            let failed = &value["workflow"]["outputs"][0];
+            assert!(value.get("execution_profile").is_none());
+            assert!(value["workflow"].get("execution_profile").is_none());
+            assert!(failed.get("execution_profile").is_none());
+            assert!(failed["failure"].get("execution_profile").is_none());
+            assert!(
+                failed["failure"]["context"]
+                    .get("execution_profile")
+                    .is_none()
+            );
+            assert_eq!(
+                failed["failure"]["context"]["report"]["execution_profile"]["outcome"],
+                "success"
+            );
+            let skipped = &value["workflow"]["outputs"][1];
+            assert!(skipped.get("execution_profile").is_none());
+            assert!(skipped["skipped"]["execution_profile"].is_null());
 
             Ok(())
         }
