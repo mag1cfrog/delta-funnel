@@ -94,6 +94,12 @@ impl DeltaFunnelSession {
     ) -> Result<MssqlScopedCacheAliasReplacement<'_>, DeltaFunnelError> {
         let registered = self.registered_derived_for_scoped_cache_alias(table)?;
         let alias_name = registered.name().to_owned();
+        if self.context.state_ref().read().cache_factory().is_some() {
+            return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                message: "`write_all` cache alias materialization requires DataFusion's default cache behavior; custom cache factories are not supported"
+                    .to_owned(),
+            });
+        }
 
         if let Some(reporter) = reporter {
             reporter.emit(&ProgressEvent::phase_changed(
@@ -459,9 +465,21 @@ pub(super) fn cache_error_with_restore_error(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::Ordering};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    use datafusion::arrow::{datatypes::Schema, record_batch::RecordBatch};
+    use datafusion::{
+        arrow::{
+            array::{ArrayRef, StringArray},
+            datatypes::{DataType, Field, Schema, SchemaRef},
+            record_batch::RecordBatch,
+        },
+        execution::session_state::{CacheFactory, SessionState},
+        logical_expr::LogicalPlan,
+        physical_plan::collect_partitioned,
+    };
     use futures_util::stream;
 
     use super::*;
@@ -479,6 +497,60 @@ mod tests {
         table_formats::RealParquetDeltaTable,
     };
     use tracing::Level;
+
+    #[derive(Debug)]
+    struct RecordingCacheFactory {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CacheFactory for RecordingCacheFactory {
+        fn create(
+            &self,
+            plan: LogicalPlan,
+            _session_state: &SessionState,
+        ) -> datafusion::error::Result<LogicalPlan> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(plan)
+        }
+    }
+
+    fn marker_batch(
+        schema: &SchemaRef,
+        markers: Vec<&str>,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        Ok(RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::new(StringArray::from(markers)) as ArrayRef],
+        )?)
+    }
+
+    async fn memtable_partitions(
+        provider: &Arc<dyn TableProvider>,
+    ) -> Result<Vec<Vec<RecordBatch>>, Box<dyn std::error::Error>> {
+        let table = provider
+            .as_any()
+            .downcast_ref::<MemTable>()
+            .ok_or("expected MemTable cache provider")?;
+        let mut partitions = Vec::with_capacity(table.batches.len());
+        for partition in &table.batches {
+            partitions.push(partition.read().await.clone());
+        }
+        Ok(partitions)
+    }
+
+    fn marker_batches_by_partition(
+        partitions: &[Vec<RecordBatch>],
+    ) -> Result<Vec<Vec<Vec<String>>>, Box<dyn std::error::Error>> {
+        partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .iter()
+                    .map(|batch| marker_values_from_batches(std::slice::from_ref(batch)))
+                    .collect()
+            })
+            .collect()
+    }
 
     fn provider_io_events(events: &CapturedEvents) -> Vec<CapturedEvent> {
         events
@@ -578,6 +650,112 @@ mod tests {
         let task_ids = task_ids.lock().map_err(|_| "cache task id lock poisoned")?;
         assert_eq!(task_ids.len(), 2);
         assert_ne!(task_ids[0], task_ids[1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_cache_matches_datafusion_default_with_and_without_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "marker",
+            DataType::Utf8,
+            false,
+        )]));
+        let source_partitions = vec![
+            vec![
+                marker_batch(&schema, vec!["partition-0-batch-0"])?,
+                marker_batch(
+                    &schema,
+                    vec!["partition-0-batch-1-a", "partition-0-batch-1-b"],
+                )?,
+            ],
+            vec![
+                marker_batch(&schema, vec!["partition-1-batch-0"])?,
+                marker_batch(&schema, vec!["partition-1-batch-1"])?,
+            ],
+        ];
+        session.context().register_table(
+            "cache_source",
+            Arc::new(MemTable::try_new(Arc::clone(&schema), source_partitions)?),
+        )?;
+
+        let default_cached = session
+            .context()
+            .table("cache_source")
+            .await?
+            .cache()
+            .await?;
+        let default_task_ctx = Arc::new(default_cached.task_ctx());
+        let default_plan = default_cached.create_physical_plan().await?;
+        let default_schema = default_plan.schema();
+        let default_partitions = collect_partitioned(default_plan, default_task_ctx).await?;
+
+        let without_progress = session
+            .materialize_cache(
+                session.context().table("cache_source").await?,
+                "cache_source",
+                None,
+            )
+            .await?;
+        let reporter = ProgressReporter::default();
+        let with_progress = session
+            .materialize_cache(
+                session.context().table("cache_source").await?,
+                "cache_source",
+                Some(&reporter),
+            )
+            .await?;
+
+        assert_eq!(without_progress.schema(), default_schema);
+        assert_eq!(with_progress.schema(), default_schema);
+        let expected = marker_batches_by_partition(&default_partitions)?;
+        assert_eq!(
+            marker_batches_by_partition(&memtable_partitions(&without_progress).await?)?,
+            expected
+        );
+        assert_eq!(
+            marker_batches_by_partition(&memtable_partitions(&with_progress).await?)?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn custom_cache_factory_fails_before_materialization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        session
+            .context()
+            .state_ref()
+            .write()
+            .set_cache_factory(Arc::new(RecordingCacheFactory {
+                calls: Arc::clone(&factory_calls),
+            }));
+
+        let error = session
+            .replace_registered_derived_alias_with_cache(&big, None)
+            .await
+            .err()
+            .ok_or("expected custom cache factory compatibility error")?;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message == "`write_all` cache alias materialization requires DataFusion's default cache behavior; custom cache factories are not supported"
+        ));
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+        assert!(session.context().table("big").await.is_ok());
         Ok(())
     }
 
