@@ -1851,6 +1851,7 @@ mod tests {
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
             let (reporter, _events) = recording_progress();
+            let capture = TracingCapture::start();
 
             let report = session
                 .write_all_with_progress_and_writer(
@@ -1912,6 +1913,9 @@ mod tests {
             assert!(aliases[0].phase_timings().iter().all(|timing| {
                 timing.status() == PhaseStatus::completed() && timing.elapsed_micros().is_some()
             }));
+            assert_eq!(aliases[0].execution_profile(), None);
+            assert!(report.to_json_value()["cache"]["aliases"][0]["execution_profile"].is_null());
+            assert!(execution_profile_events(&capture).is_empty());
 
             let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
