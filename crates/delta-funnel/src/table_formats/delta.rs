@@ -1206,6 +1206,31 @@ mod tests {
         Ok(paths)
     }
 
+    #[test]
+    fn v2_checkpoint_parquet_sidecars_expand_active_files() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("v2-checkpoint-parquet-with-sidecars");
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "v2_checkpoint".to_owned(),
+            table_uri: table_path.to_string_lossy().into_owned(),
+            version: None,
+            storage_options: Default::default(),
+        })?;
+
+        let preflight = super::preflight_delta_protocol(&source)?;
+        let scan = build_projected_delta_scan(&source, None)?;
+        let file_paths = kernel_scan_file_paths(&scan, source.table_uri())?;
+
+        assert_eq!(source.version(), 6);
+        assert_eq!(preflight.protocol().reader_features, vec!["v2Checkpoint"]);
+        assert_eq!(file_paths.len(), 101);
+
+        Ok(())
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct KernelScanFileBoundary {
         path: String,
