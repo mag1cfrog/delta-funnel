@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     DeltaSourceReport, MssqlOutputWriteStatus, MssqlWorkflowWriteReport, PhaseTimingReport,
-    QueryExecutionProfile, support::sanitize_text_for_display,
+    QueryExecutionProfile, QueryExecutionScope, support::sanitize_text_for_display,
 };
 
 /// Report for one `write_all` call that reached the sequential workflow.
@@ -268,6 +268,18 @@ impl WriteAllCacheAliasReport {
     #[must_use]
     pub const fn execution_profile(&self) -> Option<&QueryExecutionProfile> {
         self.execution_profile.as_ref()
+    }
+
+    pub(crate) fn with_execution_profile(
+        mut self,
+        execution_profile: Option<QueryExecutionProfile>,
+    ) -> Self {
+        debug_assert!(execution_profile.as_ref().is_none_or(|profile| {
+            profile.scope() == QueryExecutionScope::WriteAllCacheAlias
+                && profile.delta_funnel_row_limit().is_none()
+        }));
+        self.execution_profile = execution_profile;
+        self
     }
 }
 

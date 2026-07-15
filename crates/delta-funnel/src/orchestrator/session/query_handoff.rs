@@ -167,26 +167,33 @@ impl Drop for QueryExecutionTerminalStream {
 }
 
 /// Coordinates one terminal outcome across all partitions of one execution.
-struct PartitionScanCoordinator {
-    state: Mutex<PartitionScanState>,
+struct PartitionExecutionCoordinator {
+    state: Mutex<PartitionExecutionState>,
 }
 
-struct PartitionScanState {
+struct PartitionExecutionState {
     // Finalization waits until every returned partition stream is terminal.
     remaining_streams: usize,
     // Each terminal result can only strengthen success -> cancelled -> error.
     outcome: DeltaProviderScanOutcome,
     // The last terminal stream takes these handles and releases them after use.
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+    // The same terminal stream consumes the optional execution profile.
+    profile_consumer: Option<QueryExecutionProfileConsumer>,
 }
 
-impl PartitionScanCoordinator {
-    fn new(read_stats_handles: Vec<DeltaProviderReadStatsHandle>, stream_count: usize) -> Self {
+impl PartitionExecutionCoordinator {
+    fn new(
+        read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+        profile_consumer: Option<QueryExecutionProfileConsumer>,
+        stream_count: usize,
+    ) -> Self {
         Self {
-            state: Mutex::new(PartitionScanState {
+            state: Mutex::new(PartitionExecutionState {
                 remaining_streams: stream_count,
                 outcome: DeltaProviderScanOutcome::Success,
                 read_stats_handles,
+                profile_consumer,
             }),
         }
     }
@@ -196,17 +203,21 @@ impl PartitionScanCoordinator {
             Ok(mut state) => state.record_stream_terminal(outcome),
             Err(poisoned) => poisoned.into_inner().record_stream_terminal(outcome),
         };
-        if let Some((read_stats_handles, outcome)) = finalization {
-            finalize_tracked_query_execution(&read_stats_handles, None, None, outcome);
+        if let Some((read_stats_handles, profile_consumer, outcome)) = finalization {
+            finalize_tracked_query_execution(&read_stats_handles, None, profile_consumer, outcome);
         }
     }
 }
 
-impl PartitionScanState {
+impl PartitionExecutionState {
     fn record_stream_terminal(
         &mut self,
         outcome: DeltaProviderScanOutcome,
-    ) -> Option<(Vec<DeltaProviderReadStatsHandle>, DeltaProviderScanOutcome)> {
+    ) -> Option<(
+        Vec<DeltaProviderReadStatsHandle>,
+        Option<QueryExecutionProfileConsumer>,
+        DeltaProviderScanOutcome,
+    )> {
         if self.remaining_streams == 0 {
             return None;
         }
@@ -217,7 +228,11 @@ impl PartitionScanState {
             return None;
         }
 
-        Some((std::mem::take(&mut self.read_stats_handles), self.outcome))
+        Some((
+            std::mem::take(&mut self.read_stats_handles),
+            self.profile_consumer.take(),
+            self.outcome,
+        ))
     }
 }
 
@@ -237,12 +252,12 @@ const fn strongest_provider_scan_outcome(
 }
 
 /// Reports one partition's terminal state to its shared execution coordinator.
-struct PartitionScanStream {
+struct PartitionExecutionStream {
     inner: MssqlOutputBatchStream,
-    coordinator: Option<Arc<PartitionScanCoordinator>>,
+    coordinator: Option<Arc<PartitionExecutionCoordinator>>,
 }
 
-impl PartitionScanStream {
+impl PartitionExecutionStream {
     fn record_terminal_once(&mut self, outcome: DeltaProviderScanOutcome) {
         if let Some(coordinator) = self.coordinator.take() {
             coordinator.record_stream_terminal(outcome);
@@ -250,7 +265,7 @@ impl PartitionScanStream {
     }
 }
 
-impl Stream for PartitionScanStream {
+impl Stream for PartitionExecutionStream {
     type Item = Result<RecordBatch, DeltaFunnelError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -268,38 +283,40 @@ impl Stream for PartitionScanStream {
     }
 }
 
-impl Drop for PartitionScanStream {
+impl Drop for PartitionExecutionStream {
     fn drop(&mut self) {
         self.record_terminal_once(DeltaProviderScanOutcome::Cancelled);
     }
 }
 
 /// Adds one shared terminal outcome tracker to a partitioned execution.
-pub(super) fn track_partitioned_scan_completion(
+pub(super) fn track_partitioned_query_execution_completion(
     streams: Vec<MssqlOutputBatchStream>,
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
+    profile_consumer: Option<QueryExecutionProfileConsumer>,
 ) -> Vec<MssqlOutputBatchStream> {
-    if read_stats_handles.is_empty() {
+    if read_stats_handles.is_empty() && profile_consumer.is_none() {
         return streams;
     }
     if streams.is_empty() {
         finalize_tracked_query_execution(
             &read_stats_handles,
             None,
-            None,
+            profile_consumer,
             DeltaProviderScanOutcome::Success,
         );
         return streams;
     }
 
-    let coordinator = Arc::new(PartitionScanCoordinator::new(
+    let coordinator = Arc::new(PartitionExecutionCoordinator::new(
         read_stats_handles,
+        profile_consumer,
         streams.len(),
     ));
     streams
         .into_iter()
         .map(|inner| {
-            Box::pin(PartitionScanStream {
+            Box::pin(PartitionExecutionStream {
                 inner,
                 coordinator: Some(Arc::clone(&coordinator)),
             }) as MssqlOutputBatchStream
@@ -638,7 +655,7 @@ fn register_preview_execution_profile(
     }
 }
 
-fn clone_terminal_execution_profile(
+pub(super) fn clone_terminal_execution_profile(
     result: Option<QueryExecutionProfileResult>,
 ) -> Option<QueryExecutionProfile> {
     result
@@ -1416,17 +1433,17 @@ mod tests {
     }
 
     fn partition_stream(
-        coordinator: &Arc<super::PartitionScanCoordinator>,
+        coordinator: &Arc<super::PartitionExecutionCoordinator>,
         batches: Vec<Result<RecordBatch, DeltaFunnelError>>,
     ) -> crate::MssqlOutputBatchStream {
-        Box::pin(super::PartitionScanStream {
+        Box::pin(super::PartitionExecutionStream {
             inner: Box::pin(futures_util::stream::iter(batches)),
             coordinator: Some(Arc::clone(coordinator)),
         })
     }
 
     fn partitioned_coordinator_state(
-        coordinator: &super::PartitionScanCoordinator,
+        coordinator: &super::PartitionExecutionCoordinator,
     ) -> (usize, crate::observability::DeltaProviderScanOutcome) {
         match coordinator.state.lock() {
             Ok(state) => (state.remaining_streams, state.outcome),
@@ -1441,7 +1458,11 @@ mod tests {
     async fn partitioned_terminal_stream_finishes_once_after_repeated_eof_and_drop() {
         use crate::observability::DeltaProviderScanOutcome;
 
-        let coordinator = Arc::new(super::PartitionScanCoordinator::new(Vec::new(), 2));
+        let coordinator = Arc::new(super::PartitionExecutionCoordinator::new(
+            Vec::new(),
+            None,
+            2,
+        ));
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
         let mut first = partition_stream(&coordinator, vec![Ok(batch)]);
         let mut second = partition_stream(&coordinator, Vec::new());
@@ -1472,7 +1493,7 @@ mod tests {
             unexecuted_delta_read_stats_handles("partition-error-summary", "orders").await?;
         let snapshots = super::snapshot_delta_provider_read_stats(&handles);
         let expected = snapshots.first().ok_or("expected provider snapshot")?;
-        let coordinator = Arc::new(super::PartitionScanCoordinator::new(handles, 2));
+        let coordinator = Arc::new(super::PartitionExecutionCoordinator::new(handles, None, 2));
         let mut errored = partition_stream(
             &coordinator,
             vec![Err(DeltaFunnelError::Config {
@@ -1512,7 +1533,7 @@ mod tests {
             unexecuted_delta_read_stats_handles("partition-cancelled-summary", "orders").await?;
         let snapshots = super::snapshot_delta_provider_read_stats(&handles);
         let expected = snapshots.first().ok_or("expected provider snapshot")?;
-        let coordinator = Arc::new(super::PartitionScanCoordinator::new(handles, 2));
+        let coordinator = Arc::new(super::PartitionExecutionCoordinator::new(handles, None, 2));
         let mut completed = partition_stream(&coordinator, Vec::new());
         let unconsumed = partition_stream(&coordinator, Vec::new());
         let capture = TracingCapture::start();
@@ -1890,7 +1911,8 @@ mod tests {
         assert_eq!(handles.len(), 1);
 
         let capture = TracingCapture::start();
-        let streams = super::track_partitioned_scan_completion(Vec::new(), handles);
+        let streams =
+            super::track_partitioned_query_execution_completion(Vec::new(), handles, None);
         let summaries = provider_io_events(capture.captured());
 
         assert!(streams.is_empty());
