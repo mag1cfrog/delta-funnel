@@ -347,6 +347,93 @@ before later SQL Server work finishes. Neither surface includes plan display
 text, raw SQL, row values, paths, URLs, credentials, storage options, headers,
 or byte ranges.
 
+## Inspect Returned Write-All Cache Diagnostics
+
+Auto-cached `write_all` calls record cache lifecycle timings whether detailed
+operator profiling is enabled or disabled. On success, read the executed alias
+reports under `report["cache"]["aliases"]`. Each attempted alias has one of
+these statuses:
+
+- `materialized_and_restored` means cache setup, installation, and required
+  restoration completed. Outputs may still contain failures.
+- `failed` means one cache lifecycle phase failed. `failed_phase` identifies
+  the primary failed cache phase for that alias.
+
+The `selected` status is plan-shaped metadata, such as a dry-run cache plan.
+It was not attempted and therefore omits `phase_timings` and `failed_phase`.
+
+Every attempted alias has these eight timings in order:
+
+| Phase | Boundary |
+| --- | --- |
+| `cache_alias_dataframe_resolution` | Resolve the selected registered alias with `SessionContext::table`. |
+| `cache_alias_physical_planning` | Create one DataFusion physical plan for the alias. |
+| `cache_alias_stream_setup` | Create every partition stream and install progress and terminal observation. It does not poll the streams. |
+| `cache_alias_execute_collect` | Poll and collect the partition streams concurrently, restore partition order, and complete deterministic task cancellation cleanup after an error. |
+| `cache_alias_memtable_build` | Build the `MemTable` and convert it to the cached table provider. |
+| `cache_alias_materialization_total` | Measure resolution through successful `MemTable` construction. This contains the first five phases. |
+| `cache_alias_install` | Replace the registered alias with the cached provider, including immediate restoration if cached registration fails after deregistration. |
+| `cache_alias_restore` | Remove the cached provider and restore the original provider after output execution or failure cleanup. |
+
+The materialization total overlaps its five leaf phases. It excludes cache
+installation, output execution, and cache restoration. Output execution occurs
+between `cache_alias_install` and `cache_alias_restore` but is not itself a
+cache phase. Do not add the phase durations and interpret the result as wall
+time.
+
+On a materialization failure, both the causal leaf and
+`cache_alias_materialization_total` are `failed`. Later unstarted phases are
+`not_started` with reason `prior_failure`. Install and restore are marked
+`completed` or `failed` only when attempted. No elapsed time is invented for
+an unstarted phase.
+
+Progress and no-progress calls use the same explicit default cache path. It
+preserves the physical plan schema, partition count, partition order, and
+batches produced by DataFusion's default memory cache. A configured custom
+DataFusion cache factory is not silently bypassed. The call fails with a
+redacted planning error before materialization because an arbitrary custom
+factory cannot provide the physical-plan ownership required by these
+diagnostics.
+
+### Read A Cache Failure
+
+Python exposes a cache orchestration failure as `DeltaFunnelError` with
+`phase="write_all_cache"`, `kind="write_all_cache_failed"`, and this context:
+
+```python
+failure = error.context
+attempted_aliases = failure["aliases"]
+primary_table_id = failure["primary_failed_alias_table_id"]
+completed_workflow = failure["workflow"]
+```
+
+`aliases` contains each attempted alias exactly once in cache-selection order.
+Aliases are installed in that order and restored in reverse installation
+order. If a later alias fails, earlier installed aliases retain their final
+restore timings. If restoration also fails after another primary error, the
+alias records its restore failure without replacing the original error. The
+array is empty only when failure happens before the first selected alias
+attempt starts.
+
+`primary_failed_alias_table_id` identifies the alias whose cache phase caused
+the primary failure. It is `None` when the primary failure happened outside an
+alias phase, such as output workflow setup or execution. `workflow` is present
+only when output execution completed and later cache restoration failed, so
+completed output reports are not lost.
+
+Rust callers match `DeltaFunnelError::WriteAllCache { failure, source }` and
+read `WriteAllCacheFailure::aliases()`,
+`primary_failed_alias_table_id()`, and `workflow()`. `source` retains the
+original primary error and its source chain.
+
+These lifecycle timings describe cache orchestration boundaries. A detailed
+operator profile, when available, describes work inside one DataFusion
+physical plan and is separately opt-in. Operator work can overlap across the
+phase boundaries above, so operator durations and lifecycle durations are not
+additive. See the
+[execution profile model](../reference/api.md#execution-profile-model) for the
+operator-level contract.
+
 ## What Not To Share
 
 Do not include these values in public issues, chat, logs, or pasted reports:

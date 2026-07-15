@@ -100,8 +100,11 @@ profile schema, see [API references](../reference/api.md#multi-output-sql-server
 
 A report can contain failed or skipped outputs when top-level orchestration
 completes. A top-level planning, cache, orchestration, or cache-restoration
-error raises an exception instead. Cache restoration happens before the result
-is delivered, so a restoration error supersedes any completed report.
+error raises an exception instead. A cache failure retains every attempted
+alias report. If output execution completed before cache restoration failed,
+the failure also retains that completed workflow report. See
+[returned write-all cache diagnostics](tracing-and-diagnostics.md#inspect-returned-write-all-cache-diagnostics)
+for phase boundaries and Python and Rust failure access.
 
 For consolidated progress across planning, shared cache work, and every output,
 see [Progress displays](../progress.md).
