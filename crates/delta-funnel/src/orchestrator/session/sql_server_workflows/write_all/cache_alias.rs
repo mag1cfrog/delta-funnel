@@ -674,22 +674,40 @@ async fn join_cache_partition_tasks(
                     Err(error) => {
                         // A cancelled task has no partition result to retain.
                         emit_cache_progress(&mut sampler);
-                        return Err(mssql_scoped_cache_alias_error(
+                        let primary_error = mssql_scoped_cache_alias_error(
                             "materialize",
                             alias_name,
                             error,
-                        ));
+                        );
+                        abort_and_drain_cache_partition_tasks(&mut tasks).await;
+                        return Err(primary_error);
                     }
                 };
                 emit_cache_progress(&mut sampler);
-                // The partition wrapper already recorded an upstream error.
-                // Returning here drops the JoinSet and cancels its siblings.
-                let batches = batches?;
+                let batches = match batches {
+                    Ok(batches) => batches,
+                    Err(primary_error) => {
+                        abort_and_drain_cache_partition_tasks(&mut tasks).await;
+                        return Err(primary_error);
+                    }
+                };
                 partitions.push((partition_index, batches));
             }
         }
     }
     Ok(partitions)
+}
+
+/// Cancels sibling collectors and waits until every owned stream is dropped.
+async fn abort_and_drain_cache_partition_tasks(tasks: &mut JoinSet<CachePartitionTaskOutput>) {
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result
+            && error.is_panic()
+        {
+            resume_unwind(error.into_panic());
+        }
+    }
 }
 
 fn emit_cache_progress(sampler: &mut Option<DeltaFileProgressSampler>) {
@@ -769,22 +787,32 @@ pub(super) fn write_all_cache_failure(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        any::Any,
+        collections::HashMap,
+        sync::{
+            Arc, Mutex, MutexGuard,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::Poll,
+        time::Duration,
     };
 
+    use async_trait::async_trait;
     use datafusion::{
         arrow::{
             array::{ArrayRef, StringArray},
             datatypes::{DataType, Field, Schema, SchemaRef},
             record_batch::RecordBatch,
         },
+        catalog::SchemaProvider,
+        common::{DataFusionError, Result as DataFusionResult},
         execution::session_state::{CacheFactory, SessionState},
         logical_expr::LogicalPlan,
         physical_plan::collect_partitioned,
     };
     use futures_util::stream;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -798,6 +826,7 @@ mod tests {
                 scan_counting_marker_region_provider,
             },
         },
+        query_engine::datafusion::test_support::SingleSchemaCatalogProvider,
         table_formats::RealParquetDeltaTable,
     };
     use tracing::Level;
@@ -805,6 +834,76 @@ mod tests {
     #[derive(Debug)]
     struct RecordingCacheFactory {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailOnceSchema {
+        tables: Mutex<HashMap<String, Arc<dyn TableProvider>>>,
+        fail_next_registration: AtomicBool,
+    }
+
+    impl FailOnceSchema {
+        fn fail_next_registration(&self) {
+            self.fail_next_registration.store(true, Ordering::SeqCst);
+        }
+
+        fn tables(&self) -> MutexGuard<'_, HashMap<String, Arc<dyn TableProvider>>> {
+            self.tables
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    #[async_trait]
+    impl SchemaProvider for FailOnceSchema {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn table_names(&self) -> Vec<String> {
+            self.tables().keys().cloned().collect()
+        }
+
+        async fn table(
+            &self,
+            name: &str,
+        ) -> DataFusionResult<Option<Arc<dyn TableProvider>>, DataFusionError> {
+            Ok(self.tables().get(name).cloned())
+        }
+
+        fn register_table(
+            &self,
+            name: String,
+            table: Arc<dyn TableProvider>,
+        ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+            if self.fail_next_registration.swap(false, Ordering::SeqCst) {
+                return Err(DataFusionError::Execution(
+                    "injected schema registration failure".to_owned(),
+                ));
+            }
+            if self.table_exist(name.as_str()) {
+                return Err(DataFusionError::Execution(format!(
+                    "table `{name}` already exists"
+                )));
+            }
+            Ok(self.tables().insert(name, table))
+        }
+
+        fn deregister_table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+            Ok(self.tables().remove(name))
+        }
+
+        fn table_exist(&self, name: &str) -> bool {
+            self.tables().contains_key(name)
+        }
     }
 
     impl CacheFactory for RecordingCacheFactory {
@@ -826,6 +925,62 @@ mod tests {
             Arc::clone(schema),
             vec![Arc::new(StringArray::from(markers)) as ArrayRef],
         )?)
+    }
+
+    fn session_with_fail_once_schema()
+    -> Result<(DeltaFunnelSession, Arc<FailOnceSchema>), Box<dyn std::error::Error>> {
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let schema = Arc::new(FailOnceSchema::default());
+        let schema_provider: Arc<dyn SchemaProvider> = schema.clone();
+        session.context().register_catalog(
+            "datafusion",
+            Arc::new(SingleSchemaCatalogProvider::new(schema_provider)),
+        );
+        Ok((session, schema))
+    }
+
+    async fn register_cache_alias(
+        session: &mut DeltaFunnelSession,
+    ) -> Result<LazyTable, Box<dyn std::error::Error>> {
+        let (source_provider, _) = scan_counting_marker_region_provider("shared")?;
+        session
+            .context()
+            .register_table("big_source", source_provider)?;
+        let pending_big = session
+            .table_from_sql("select marker, region from big_source")
+            .await?;
+        Ok(session.register_alias("big", &pending_big)?)
+    }
+
+    fn assert_cache_phase_statuses(
+        report: &WriteAllCacheAliasReport,
+        expected_statuses: [PhaseStatus; 8],
+    ) {
+        assert_eq!(
+            report
+                .phase_timings()
+                .iter()
+                .map(PhaseTimingReport::phase_name)
+                .collect::<Vec<_>>(),
+            [
+                CACHE_ALIAS_DATAFRAME_RESOLUTION_PHASE,
+                CACHE_ALIAS_PHYSICAL_PLANNING_PHASE,
+                CACHE_ALIAS_STREAM_SETUP_PHASE,
+                CACHE_ALIAS_EXECUTE_COLLECT_PHASE,
+                CACHE_ALIAS_MEMTABLE_BUILD_PHASE,
+                CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE,
+                CACHE_ALIAS_INSTALL_PHASE,
+                CACHE_ALIAS_RESTORE_PHASE,
+            ]
+        );
+        assert_eq!(
+            report
+                .phase_timings()
+                .iter()
+                .map(PhaseTimingReport::status)
+                .collect::<Vec<_>>(),
+            expected_statuses
+        );
     }
 
     async fn memtable_partitions(
@@ -958,6 +1113,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_partition_error_drains_live_sibling_before_returning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sibling_started = Arc::new(Notify::new());
+        let sibling_dropped = Arc::new(AtomicBool::new(false));
+
+        let wait_for_sibling = Arc::clone(&sibling_started);
+        let failing_stream = stream::once(async move {
+            wait_for_sibling.notified().await;
+            Err(DeltaFunnelError::Config {
+                message: "injected cache partition failure".to_owned(),
+            })
+        });
+
+        let announce_sibling = Arc::clone(&sibling_started);
+        let drop_flag = DropFlag(Arc::clone(&sibling_dropped));
+        let mut announced = false;
+        let live_stream = stream::poll_fn(move |_| {
+            let _ = &drop_flag;
+            if !announced {
+                announced = true;
+                announce_sibling.notify_one();
+            }
+            Poll::<Option<Result<RecordBatch, DeltaFunnelError>>>::Pending
+        });
+
+        let streams: Vec<MssqlOutputBatchStream> =
+            vec![Box::pin(failing_stream), Box::pin(live_stream)];
+        let error = collect_cache_partitions(streams, None, "big")
+            .await
+            .err()
+            .ok_or("expected cache partition failure")?;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::Config { message }
+                if message == "injected cache partition failure"
+        ));
+        assert!(sibling_dropped.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_partition_join_failure_drains_live_sibling_before_returning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sibling_started = Arc::new(Notify::new());
+        let sibling_dropped = Arc::new(AtomicBool::new(false));
+        let mut tasks: JoinSet<CachePartitionTaskOutput> = JoinSet::new();
+
+        let announce_sibling = Arc::clone(&sibling_started);
+        let drop_flag = DropFlag(Arc::clone(&sibling_dropped));
+        tasks.spawn(async move {
+            let _drop_flag = drop_flag;
+            announce_sibling.notify_one();
+            std::future::pending::<CachePartitionTaskOutput>().await
+        });
+        sibling_started.notified().await;
+
+        let cancelled = tasks.spawn(std::future::pending::<CachePartitionTaskOutput>());
+        cancelled.abort();
+        let (_progress_changed, progress_changes) = watch::channel(());
+        let error = join_cache_partition_tasks(tasks, progress_changes, None, "big")
+            .await
+            .err()
+            .ok_or("expected cache partition join failure")?;
+
+        assert!(matches!(
+            error,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message.contains("scoped MSSQL cache alias materialize failed")
+        ));
+        assert!(sibling_dropped.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    fn panic_cache_partition_task() -> CachePartitionTaskOutput {
+        resume_unwind(Box::new("injected cache partition panic"))
+    }
+
+    #[tokio::test]
+    async fn cache_partition_task_panic_resumes_unwind() -> Result<(), Box<dyn std::error::Error>> {
+        let mut tasks: JoinSet<CachePartitionTaskOutput> = JoinSet::new();
+        tasks.spawn(async { panic_cache_partition_task() });
+        let (_progress_changed, progress_changes) = watch::channel(());
+
+        let result = tokio::spawn(async move {
+            join_cache_partition_tasks(tasks, progress_changes, None, "big").await
+        })
+        .await;
+
+        let error = result.err().ok_or("expected cache partition panic")?;
+        assert!(error.is_panic());
+        Ok(())
+    }
+
+    #[test]
+    fn every_materialization_failure_has_exact_leaf_and_aggregate_statuses() {
+        let expected_phase_names = [
+            CACHE_ALIAS_DATAFRAME_RESOLUTION_PHASE,
+            CACHE_ALIAS_PHYSICAL_PLANNING_PHASE,
+            CACHE_ALIAS_STREAM_SETUP_PHASE,
+            CACHE_ALIAS_EXECUTE_COLLECT_PHASE,
+            CACHE_ALIAS_MEMTABLE_BUILD_PHASE,
+            CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE,
+            CACHE_ALIAS_INSTALL_PHASE,
+            CACHE_ALIAS_RESTORE_PHASE,
+        ];
+
+        for (failed_phase_index, failed_phase) in CACHE_ALIAS_MATERIALIZATION_PHASES
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let completed_timings = CACHE_ALIAS_MATERIALIZATION_PHASES
+                .iter()
+                .take(failed_phase_index)
+                .map(|phase_name| PhaseTimingReport::completed(*phase_name, Duration::ZERO))
+                .collect();
+            let failure = cache_alias_materialization_failure(
+                DeltaFunnelError::Config {
+                    message: "injected cache materialization failure".to_owned(),
+                },
+                completed_timings,
+                PhaseTimer::start(failed_phase),
+                failed_phase_index,
+                PhaseTimer::start(CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE),
+            );
+
+            assert_eq!(
+                failure
+                    .phase_timings
+                    .iter()
+                    .map(PhaseTimingReport::phase_name)
+                    .collect::<Vec<_>>(),
+                expected_phase_names
+            );
+            assert_eq!(failure.failed_phase, failed_phase);
+            for (phase_index, timing) in failure.phase_timings[..5].iter().enumerate() {
+                let expected_status = match phase_index.cmp(&failed_phase_index) {
+                    std::cmp::Ordering::Less => PhaseStatus::completed(),
+                    std::cmp::Ordering::Equal => PhaseStatus::failed(),
+                    std::cmp::Ordering::Greater => {
+                        PhaseStatus::not_started(ReportReasonCode::PriorFailure)
+                    }
+                };
+                assert_eq!(timing.status(), expected_status);
+            }
+            assert_eq!(failure.phase_timings[5].status(), PhaseStatus::failed());
+            assert!(failure.phase_timings[6..].iter().all(|timing| {
+                timing.status() == PhaseStatus::not_started(ReportReasonCode::PriorFailure)
+            }));
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_cache_matches_datafusion_default_with_and_without_progress()
     -> Result<(), Box<dyn std::error::Error>> {
         let session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -1056,6 +1365,149 @@ mod tests {
         assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
         assert!(session.context().table("big").await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn install_failure_reports_failed_install_and_completed_immediate_restore()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut session, schema) = session_with_fail_once_schema()?;
+        let big = register_cache_alias(&mut session).await?;
+        schema.fail_next_registration();
+
+        let failure = session
+            .replace_registered_derived_alias_with_cache_attempt(&big, vec![0, 1], None)
+            .await
+            .err()
+            .ok_or("expected cache install failure")?;
+        let CacheAliasReplacementFailure { source, report } = failure;
+        let report = report.ok_or("expected attempted cache alias report")?;
+
+        assert!(matches!(
+            source,
+            DeltaFunnelError::MssqlWorkflowPlanning { message }
+                if message.contains("failed to register cached provider")
+                    && message.contains("injected schema registration failure")
+        ));
+        assert_eq!(report.table_id(), big.id());
+        assert_eq!(report.output_indexes(), &[0, 1]);
+        assert_eq!(report.status(), WriteAllCacheAliasStatus::Failed);
+        assert_eq!(report.failed_phase(), Some(CACHE_ALIAS_INSTALL_PHASE));
+        assert_cache_phase_statuses(
+            &report,
+            [
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::failed(),
+                PhaseStatus::completed(),
+            ],
+        );
+        assert!(session.context().table("big").await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_failure_reports_restore_and_retains_completed_workflow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut session, schema) = session_with_fail_once_schema()?;
+        let big = register_cache_alias(&mut session).await?;
+        let replacement = session
+            .replace_registered_derived_alias_with_cache(&big, None)
+            .await?;
+        schema.fail_next_registration();
+
+        let (reports, restore_result) =
+            restore_mssql_cache_aliases_with_reports(vec![replacement], None);
+        let (table_id, restore_error) = restore_result
+            .err()
+            .ok_or("expected cache restore failure")?;
+        assert_eq!(table_id, big.id());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status(), WriteAllCacheAliasStatus::Failed);
+        assert_eq!(reports[0].failed_phase(), Some(CACHE_ALIAS_RESTORE_PHASE));
+        assert_cache_phase_statuses(
+            &reports[0],
+            [
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::failed(),
+            ],
+        );
+
+        let workflow = crate::write_mssql_outputs_with_writer(
+            Vec::<crate::MssqlOutputWriteJob>::new(),
+            crate::MssqlWorkflowWriteOptions::default(),
+            crate::MssqlStreamBenchmarkOutputWriter,
+        )
+        .await?;
+        let error = write_all_cache_failure(
+            restore_error,
+            reports,
+            Some(table_id),
+            Some(workflow.clone()),
+        );
+        let DeltaFunnelError::WriteAllCache { failure, .. } = error else {
+            return Err("expected structured write_all cache failure".into());
+        };
+        assert_eq!(failure.primary_failed_alias_table_id(), Some(big.id()));
+        assert_eq!(failure.workflow(), Some(&workflow));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn primary_failure_survives_secondary_restore_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut session, schema) = session_with_fail_once_schema()?;
+        let big = register_cache_alias(&mut session).await?;
+        let replacement = session
+            .replace_registered_derived_alias_with_cache(&big, None)
+            .await?;
+        schema.fail_next_registration();
+        let primary_error = DeltaFunnelError::Config {
+            message: "injected primary workflow failure".to_owned(),
+        };
+
+        let error =
+            restore_cache_aliases_after_failure(primary_error, vec![replacement], None, None);
+        let DeltaFunnelError::WriteAllCache { failure, source } = error else {
+            return Err("expected structured write_all cache failure".into());
+        };
+
+        assert!(matches!(
+            *source,
+            DeltaFunnelError::Config { message }
+                if message == "injected primary workflow failure"
+        ));
+        assert_eq!(failure.primary_failed_alias_table_id(), None);
+        assert_eq!(failure.workflow(), None);
+        assert_eq!(failure.aliases().len(), 1);
+        assert_eq!(failure.aliases()[0].table_id(), big.id());
+        assert_eq!(
+            failure.aliases()[0].failed_phase(),
+            Some(CACHE_ALIAS_RESTORE_PHASE)
+        );
+        assert_cache_phase_statuses(
+            &failure.aliases()[0],
+            [
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::failed(),
+            ],
+        );
         Ok(())
     }
 
