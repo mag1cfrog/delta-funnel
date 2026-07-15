@@ -312,10 +312,10 @@ pub enum WriteAllCacheAliasStatus {
     /// selected aliases because the scoped catalog replacement has already
     /// been cleaned up before the report is returned.
     Selected,
-    /// The alias was materialized, used for the workflow, and restored.
+    /// The alias was materialized, installed, and restored.
     ///
-    /// The workflow may still contain per-output failures. This status only
-    /// states that cache setup and restoration completed for the alias.
+    /// The output workflow may fail or may not start. This status only states
+    /// that cache setup and restoration completed for the alias.
     MaterializedAndRestored,
     /// Cache materialization, installation, or restoration failed.
     Failed,
