@@ -736,8 +736,7 @@ fn create_renderer(
     let elapsed_kwargs = PyDict::new(py);
     elapsed_kwargs.set_item("style", "dim")?;
     elapsed_kwargs.set_item("markup", false)?;
-    let elapsed_column =
-        text_column_type.call(("{task.elapsed:>5.1f}s",), Some(&elapsed_kwargs))?;
+    let elapsed_column = text_column_type.call(("{task.elapsed:.3f}s",), Some(&elapsed_kwargs))?;
 
     let bar_kwargs = PyDict::new(py);
     bar_kwargs.set_item("bar_width", 24)?;
