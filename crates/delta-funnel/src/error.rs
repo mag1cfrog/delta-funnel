@@ -530,6 +530,20 @@ pub enum DeltaFunnelError {
         message: String,
     },
 
+    /// SQL Server output query preparation failed during a known phase.
+    #[snafu(display(
+        "MSSQL write error for output `{}` during {}: {}",
+        sanitize_text_for_display(context.output_name()),
+        context.phase(),
+        sanitize_reason_for_display(&source.to_string())
+    ))]
+    MssqlQueryPhase {
+        /// Structured, redacted failure context.
+        context: Box<crate::MssqlWriteFailureContext>,
+        /// Original query preparation failure with its source chain preserved.
+        source: Box<DeltaFunnelError>,
+    },
+
     /// SQL Server output batch schema validation failed.
     #[snafu(display(
         "MSSQL write error for output `{}` during {}: {}",

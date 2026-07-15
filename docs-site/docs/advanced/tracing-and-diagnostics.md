@@ -281,6 +281,72 @@ the operator list and can be observed before later preview formatting finishes.
 Both surfaces derive execution facts from the same immutable profile; preview
 orchestration does not recollect metrics or emit a second profile event.
 
+## Inspect Returned SQL Server Output Diagnostics
+
+After output planning succeeds, one-output SQL Server execute reports include
+three query preparation timings in addition to the existing output planning,
+stream polling, SQL Server lifecycle, validation, and cleanup timings. Detailed
+operator profiling is separately opt-in. See
+[API references](../reference/api.md#one-output-sql-server-profiling) for
+Python and Rust enablement.
+
+The query phases are:
+
+| Phase | Boundary |
+| --- | --- |
+| `query_dataframe_planning` | Resolve the session-owned lazy table into the DataFusion `DataFrame` to execute. |
+| `query_physical_planning` | Run `DataFrame::create_physical_plan` for that output query. |
+| `query_stream_setup` | Create the physical-plan partition streams, construct the effective merged stream, and install progress, terminal-state, and optional profile observers. It does not poll the stream. |
+
+If one of these phases fails, that phase is `failed`. Each later query phase is
+`not_started` with reason `prior_failure`; no elapsed time is invented for it.
+A failure before query phase timing begins follows the existing output-planning
+error contract. A failure before a physical plan exists cannot return an
+execution profile. See [Dry runs and reports](../dry-runs-reports.md#read-report-values)
+for the shared phase status and reason vocabulary.
+
+`poll_batch_stream` is the accumulated time spent awaiting each next batch and
+the final end-of-stream result. DataFusion executes lazily while the stream is
+polled, so this timing includes upstream computation and delivery latency. It
+does not include batch schema validation, `write_batch`, or `finalize`, and it
+is not a separate total query duration. Operator and partition work can
+overlap, so do not add this timing to DataFusion operator durations and treat
+the result as wall time.
+
+The execution profile describes the query stream lifecycle, not the final SQL
+Server result:
+
+| Query stream transition | Profile outcome | Possible final write result |
+| --- | --- | --- |
+| Reaches normal end-of-stream | `success` | Success, or a later `finalize`, target validation, swap, or cleanup failure. |
+| Returns an upstream DataFusion error | `error` | Failure in `poll_batch_stream`. |
+| Is dropped before end-of-stream without an upstream error | `cancelled` | An earlier connection, lifecycle, writer, schema, or write failure. An abandoned call returns no report. |
+
+This means a failed SQL Server call can legitimately retain a non-partial
+`success` profile when query execution had already reached end-of-stream. It
+can also retain a partial `cancelled` profile when SQL Server work stopped
+consumption early. These outcomes follow the same
+[terminal stream lifecycle](#inspect-terminal-parquet-io) used by provider
+snapshots.
+
+On success, Python reads `report["execution_profile"]`, while Rust calls
+`MssqlWriteReport::execution_profile()`. For a profiled Python write failure,
+the same field is nested under `error.context["report"]["execution_profile"]`
+when structured SQL Server failure context is available. Rust reads it from
+`MssqlWriteFailureContext::report().execution_profile()` on
+`MssqlQueryPhase`, `MssqlWritePhase`, or `MssqlBatchSchemaValidation` errors.
+A failure before the profile consumer can be installed has no profile.
+
+The returned value uses the shared
+[execution profile model](../reference/api.md#execution-profile-model),
+including its Delta provider snapshots and redaction rules. The same immutable
+terminal profile supplies the bounded
+[`query_execution_profile_terminal`](#inspect-terminal-execution-profiles)
+event; the event is not a copy of the returned operator list and can arrive
+before later SQL Server work finishes. Neither surface includes plan display
+text, raw SQL, row values, paths, URLs, credentials, storage options, headers,
+or byte ranges.
+
 ## What Not To Share
 
 Do not include these values in public issues, chat, logs, or pasted reports:

@@ -22,7 +22,7 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStream, MssqlOutputBatchStreamFactory,
     PhaseTimingReport, PreviewFailureContext, QueryExecutionProfile, QueryExecutionScope,
-    ReportReasonCode, datafusion_query_output_stream,
+    ReportReasonCode,
     observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
@@ -474,40 +474,93 @@ async fn batch_stream_for_lazy_table_from_session_parts(
         .await
         .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
 
-    batch_stream_for_physical_plan(context, physical_plan, provider_stats_snapshots, progress)
+    batch_stream_for_physical_plan(
+        context,
+        physical_plan,
+        provider_stats_snapshots,
+        progress,
+        None,
+    )
+    .map(|setup| setup.stream)
+    .map_err(|failure| *failure.source)
 }
 
-fn batch_stream_for_physical_plan(
+/// A tracked query stream plus the optional terminal profile result handle.
+///
+/// The result becomes available only after the stream reaches EOF, errors, or
+/// is dropped.
+pub(super) struct QueryStreamSetup {
+    pub(super) stream: MssqlOutputBatchStream,
+    pub(super) profile_result: Option<QueryExecutionProfileResult>,
+}
+
+/// A stream setup failure plus any profile finalized at that boundary.
+pub(super) struct QueryStreamSetupFailure {
+    pub(super) source: Box<DeltaFunnelError>,
+    pub(super) execution_profile: Option<QueryExecutionProfile>,
+}
+
+/// Creates the merged stream and installs its shared terminal observers.
+pub(super) fn batch_stream_for_physical_plan(
     context: &SessionContext,
     physical_plan: Arc<dyn ExecutionPlan>,
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<(ProgressReporter, String)>,
-) -> Result<MssqlOutputBatchStream, DeltaFunnelError> {
+    profile_scope: Option<QueryExecutionScope>,
+) -> Result<QueryStreamSetup, QueryStreamSetupFailure> {
     // These handles must exist before merged stream setup can fail.
     let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-    let stream = match datafusion_query_output_stream(physical_plan, context.task_ctx()) {
-        Ok(stream) => stream,
+    let DFQueryExecution {
+        stream,
+        effective_profile_root,
+    } = match datafusion_query_output_stream_with_effective_root(
+        Arc::clone(&physical_plan),
+        context.task_ctx(),
+    ) {
+        Ok(execution) => execution,
         Err(error) => {
+            let (profile_consumer, profile_result) = match profile_scope {
+                Some(scope) => {
+                    let (consumer, result) =
+                        QueryExecutionProfileConsumer::register(physical_plan, scope, None);
+                    (Some(consumer), Some(result))
+                }
+                None => (None, None),
+            };
             finalize_tracked_query_execution(
                 &read_stats_handles,
                 provider_stats_snapshots.as_ref(),
-                None,
+                profile_consumer,
                 DeltaProviderScanOutcome::Error,
             );
-            return Err(datafusion_handoff_setup_error("query_output_stream", error));
+            return Err(QueryStreamSetupFailure {
+                source: Box::new(datafusion_handoff_setup_error("query_output_stream", error)),
+                execution_profile: clone_terminal_execution_profile(profile_result),
+            });
         }
+    };
+    let (profile_consumer, profile_result) = match profile_scope {
+        Some(scope) => {
+            let (consumer, result) =
+                QueryExecutionProfileConsumer::register(effective_profile_root, scope, None);
+            (Some(consumer), Some(result))
+        }
+        None => (None, None),
     };
     let stream = Box::pin(stream.map(|batch| {
         batch.map_err(|error| datafusion_handoff_setup_error("query_output_stream", error))
     }));
 
-    Ok(wrap_stream_with_query_execution_tracking(
-        stream,
-        read_stats_handles,
-        provider_stats_snapshots,
-        progress,
-        None,
-    ))
+    Ok(QueryStreamSetup {
+        stream: wrap_stream_with_query_execution_tracking(
+            stream,
+            read_stats_handles,
+            provider_stats_snapshots,
+            progress,
+            profile_consumer,
+        ),
+        profile_result,
+    })
 }
 
 struct PreviewTimingTracker {
@@ -598,6 +651,7 @@ impl DeltaFunnelSession {
     ///
     /// `progress` contains the reporter and output name used for emitted
     /// events. `None` returns the normal stream without progress sampling.
+    #[cfg(test)]
     pub(crate) async fn batch_stream_for_lazy_table(
         &self,
         table: &LazyTable,
@@ -1789,11 +1843,19 @@ mod tests {
             failing_plan,
             Some(Arc::clone(&shared_provider_stats)),
             None,
+            Some(QueryExecutionScope::MssqlOutput),
         );
         let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
         let summaries = provider_io_events(capture.captured());
+        let profile_events = execution_profile_events(capture.captured());
 
-        assert!(result.is_err());
+        let failure = result.err().ok_or("expected stream setup failure")?;
+        let profile = failure
+            .execution_profile
+            .ok_or("expected setup failure profile")?;
+        assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Error);
+        assert!(profile.partial());
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].source_name, "orders");
         assert_eq!(snapshots[0].files_started, 0);
@@ -1802,6 +1864,11 @@ mod tests {
         assert_eq!(snapshots[0].parquet_data_file_opened_bytes, Some(0));
         assert_eq!(summaries.len(), 1);
         assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "error");
+        assert_eq!(profile_events.len(), 1);
+        assert_eq!(
+            profile_events[0].fields.get("outcome").map(String::as_str),
+            Some("error")
+        );
         Ok(())
     }
 
@@ -1873,8 +1940,15 @@ mod tests {
         );
 
         let capture = TracingCapture::start();
-        let stream =
-            super::batch_stream_for_physical_plan(&session.context, combined_plan, None, None)?;
+        let stream = super::batch_stream_for_physical_plan(
+            &session.context,
+            combined_plan,
+            None,
+            None,
+            None,
+        )
+        .map_err(|failure| *failure.source)?
+        .stream;
         let rows = collect_stream_row_count(stream).await?;
         let summaries = provider_io_events(capture.captured());
 

@@ -12,9 +12,9 @@ use super::session::OrchestratorMssqlOutputWriter;
 #[cfg(test)]
 use crate::MssqlWorkflowOutputWriter;
 use crate::{
-    DeltaFunnelError, DeltaFunnelSession, DeltaSourceConfig, LazyTable, MssqlDryRunOutputReport,
-    MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan, PreviewOptions, TablePreview,
-    WriteAllOptions, WriteAllReport, progress::ProgressReporter,
+    DeltaFunnelError, DeltaFunnelSession, DeltaSourceConfig, ExecutionProfileMode, LazyTable,
+    MssqlDryRunOutputReport, MssqlDryRunWorkflowReport, MssqlWriteReport, OutputWritePlan,
+    PreviewOptions, TablePreview, WriteAllOptions, WriteAllReport, progress::ProgressReporter,
 };
 
 /// Blocking runtime boundary for high-level Delta Funnel session actions.
@@ -218,8 +218,24 @@ impl DeltaFunnelRuntime {
         session: &DeltaFunnelSession,
         request: &OutputWritePlan,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        self.write_to_mssql_with_profile_mode(session, request, ExecutionProfileMode::Disabled)
+    }
+
+    /// Blocks on one selected output write with optional detailed query profiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as
+    /// [`DeltaFunnelSession::write_to_mssql_with_profile_mode`].
+    pub fn write_to_mssql_with_profile_mode(
+        &self,
+        session: &DeltaFunnelSession,
+        request: &OutputWritePlan,
+        profile_mode: ExecutionProfileMode,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         reject_nested_runtime()?;
-        self.runtime.block_on(session.write_to_mssql(request))
+        self.runtime
+            .block_on(session.write_to_mssql_with_profile_mode(request, profile_mode))
     }
 
     /// Blocks on one selected output write with a workspace host progress reporter.
@@ -233,6 +249,24 @@ impl DeltaFunnelRuntime {
         reject_nested_runtime()?;
         self.runtime
             .block_on(session.write_to_mssql_with_reporter(request, reporter))
+    }
+
+    /// Blocks on one profiled output write with a workspace host progress reporter.
+    #[doc(hidden)]
+    pub fn write_to_mssql_with_profile_mode_and_progress(
+        &self,
+        session: &DeltaFunnelSession,
+        request: &OutputWritePlan,
+        profile_mode: ExecutionProfileMode,
+        reporter: ProgressReporter,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.write_to_mssql_with_profile_mode_and_reporter(
+                request,
+                profile_mode,
+                reporter,
+            ))
     }
 
     #[cfg(test)]
@@ -340,8 +374,8 @@ mod tests {
         DeltaSourceConfig, DryRunScanSummaryMode, LoadMode, MssqlConnectionConfig,
         MssqlConnectionSource, MssqlOutputBatchStream, MssqlOutputTarget, MssqlTargetCleanupStatus,
         MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteBackend,
-        ResolvedMssqlTarget, RunMode, SessionOptions, ValidationOptions,
-        table_formats::RealParquetDeltaTable,
+        MssqlWriteFailureContext, MssqlWritePhase, ResolvedMssqlTarget, RunMode, SessionOptions,
+        ValidationOptions, table_formats::RealParquetDeltaTable,
     };
 
     fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
@@ -426,7 +460,6 @@ mod tests {
     impl OrchestratorMssqlOutputWriter for FakeRuntimeWriter {
         async fn write_output(
             &mut self,
-            output_schema: SchemaRef,
             output_plan: MssqlTargetOutputPlan,
             resolved_target: ResolvedMssqlTarget,
             mut batches: MssqlOutputBatchStream,
@@ -438,12 +471,25 @@ mod tests {
             let mut batch_count = 0_u64;
 
             while let Some(batch) = batches.next().await {
-                let batch = batch?;
-                rows = rows.saturating_add(u64::try_from(batch.num_rows()).map_err(|_| {
-                    DeltaFunnelError::Config {
-                        message: "fake runtime writer row count overflowed u64".to_owned(),
+                let cleanup = match output_plan.load_mode() {
+                    LoadMode::AppendExisting => MssqlTargetCleanupStatus::NotApplicable,
+                    LoadMode::CreateAndLoad | LoadMode::Replace => {
+                        MssqlTargetCleanupStatus::NotAttempted
                     }
-                })?);
+                };
+                let batch = batch.map_err(|error| DeltaFunnelError::MssqlWritePhase {
+                    context: Box::new(MssqlWriteFailureContext::from_output_plan(
+                        &output_plan,
+                        MssqlWritePhase::PollBatchStream,
+                        rows,
+                        batch_count,
+                        0,
+                        rows != 0,
+                        cleanup,
+                    )),
+                    message: error.to_string(),
+                })?;
+                rows = rows.saturating_add(crate::usize_to_u64_saturating(batch.num_rows()));
                 batch_count = batch_count.saturating_add(1);
             }
 
@@ -453,7 +499,7 @@ mod tests {
                 connection_source: resolved_target.connection_source(),
                 rows,
                 batches: batch_count,
-                schema_fields: output_schema.fields().len(),
+                schema_fields: output_plan.schema_mappings().len(),
             });
 
             Ok(MssqlWriteReport::from_output_plan(
@@ -487,7 +533,6 @@ mod tests {
 
             OrchestratorMssqlOutputWriter::write_output(
                 self,
-                output_schema,
                 output_plan,
                 resolved_target,
                 batches,

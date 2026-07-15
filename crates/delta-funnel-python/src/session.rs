@@ -259,14 +259,20 @@ impl PySession {
         &self,
         py: Python<'_>,
         request: &delta_funnel::OutputWritePlan,
+        profile_mode: delta_funnel::ExecutionProfileMode,
         progress: Option<&PythonProgress>,
     ) -> PyResult<Py<PyAny>> {
         let report = py.detach(|| match progress {
-            Some(progress) => {
+            Some(progress) => self.runtime.write_to_mssql_with_profile_mode_and_progress(
+                &self.inner,
+                request,
+                profile_mode,
+                progress.reporter(),
+            ),
+            None => {
                 self.runtime
-                    .write_to_mssql_with_progress(&self.inner, request, progress.reporter())
+                    .write_to_mssql_with_profile_mode(&self.inner, request, profile_mode)
             }
-            None => self.runtime.write_to_mssql(&self.inner, request),
         });
         let report = report.map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
@@ -1269,6 +1275,7 @@ mod tests {
                 .getattr("__doc__")?
                 .extract::<String>()?;
             assert!(write_to_mssql_doc.contains("dry_run=True"));
+            assert!(write_to_mssql_doc.contains("profile=True"));
             assert!(write_to_mssql_doc.contains("plain Python"));
 
             let output_doc = module

@@ -145,11 +145,14 @@ fn config_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr
 #[cfg(test)]
 mod tests {
     use super::PyMssqlOutputSpec;
-    use crate::{deltafunnel, test_support::python_state};
+    use crate::{
+        deltafunnel, exception::DeltaFunnelError, progress::adapter_creation_count,
+        test_support::python_state,
+    };
     use delta_funnel::{LoadMode, MssqlTableName, connect_mssql_client_from_ado_string};
     use pyo3::exceptions::{PyAssertionError, PyKeyError};
     use pyo3::prelude::*;
-    use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule};
+    use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyModule};
     use std::{
         env,
         error::Error,
@@ -177,6 +180,17 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    #[test]
+    fn pyi_stub_exposes_table_write_profile_option() {
+        let stub = include_str!("../deltafunnel.pyi");
+        let signature = stub
+            .split_once("def write_to_mssql(")
+            .and_then(|(_, tail)| tail.split_once(") -> Report:"))
+            .map_or("", |(signature, _)| signature);
+
+        assert!(signature.contains("profile: bool | None = False"));
     }
 
     #[test]
@@ -321,6 +335,7 @@ mod tests {
             assert!(!report_repr.contains("password=secret-token"));
 
             let report = report.cast::<PyDict>()?;
+            assert!(!report.contains("execution_profile")?);
             let dry_run = required_item(report, "dry_run")?;
             let dry_run = dry_run.cast::<PyDict>()?;
             let target_table = required_item(report, "target_table")?;
@@ -351,6 +366,87 @@ mod tests {
             assert!(!required_item(dry_run, "table_lifecycle_started")?.extract::<bool>()?);
             assert!(!required_item(dry_run, "bulk_writer_started")?.extract::<bool>()?);
 
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn table_write_profile_validation_precedes_progress_and_dry_run() -> PyResult<()> {
+        let _state = python_state();
+        Python::attach(|py| {
+            let table = sql_table(py)?;
+            let initial_adapter_count = adapter_creation_count();
+            let invalid_profiles = PyList::empty(py);
+            invalid_profiles.append(0)?;
+            invalid_profiles.append(1)?;
+            invalid_profiles.append("detailed")?;
+            invalid_profiles.append(PyList::new(py, [true])?)?;
+            let truthy_dict = PyDict::new(py);
+            truthy_dict.set_item("enabled", true)?;
+            invalid_profiles.append(truthy_dict)?;
+
+            for profile in invalid_profiles.iter() {
+                let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
+                kwargs.set_item("progress", true)?;
+                kwargs.set_item("profile", profile)?;
+                let error = table
+                    .call_method("write_to_mssql", (), Some(&kwargs))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<DeltaFunnelError>(py));
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "config"
+                );
+                assert_eq!(
+                    error.value(py).getattr("kind")?.extract::<String>()?,
+                    "invalid_option_value"
+                );
+            }
+
+            let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
+            kwargs.set_item("dry_run", true)?;
+            kwargs.set_item("progress", true)?;
+            kwargs.set_item("profile", true)?;
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<DeltaFunnelError>(py));
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+
+            for profile in [
+                py.None(),
+                false.into_pyobject(py)?.to_owned().unbind().into_any(),
+            ] {
+                let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
+                kwargs.set_item(
+                    "connection_string",
+                    "server=tcp:sql.example.com;password=secret-token",
+                )?;
+                kwargs.set_item("dry_run", true)?;
+                kwargs.set_item("progress", false)?;
+                kwargs.set_item("profile", profile)?;
+                let report = table
+                    .call_method("write_to_mssql", (), Some(&kwargs))?
+                    .cast_into::<PyDict>()?;
+                assert!(!report.contains("execution_profile")?);
+            }
+            assert_eq!(adapter_creation_count(), initial_adapter_count);
+
+            let signature = py
+                .import("inspect")?
+                .call_method1("signature", (table.getattr("write_to_mssql")?,))?
+                .to_string();
+            assert_eq!(
+                signature,
+                "(*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=False)"
+            );
             Ok(())
         })
     }
@@ -439,6 +535,7 @@ union all select cast(103 as bigint) as order_id",),
                 table.table().as_str(),
                 "create_and_load",
             )?;
+            kwargs.set_item("profile", true)?;
 
             let report = source.call_method("write_to_mssql", (), Some(&kwargs))?;
             let report_repr = report.repr()?.extract::<String>()?;
@@ -461,6 +558,21 @@ union all select cast(103 as bigint) as order_id",),
                 "not_attempted"
             );
             assert!(!required_item(report, "partial_write_possible")?.extract::<bool>()?);
+            let profile = required_item(report, "execution_profile")?.cast_into::<PyDict>()?;
+            assert_eq!(
+                required_item(&profile, "scope")?.extract::<String>()?,
+                "mssql_output"
+            );
+            assert_eq!(
+                required_item(&profile, "outcome")?.extract::<String>()?,
+                "success"
+            );
+            assert!(required_item(&profile, "delta_funnel_row_limit")?.is_none());
+            assert!(
+                !required_item(&profile, "operators")?
+                    .cast::<PyList>()?
+                    .is_empty()
+            );
 
             let output_row_count = required_item(report, "output_row_count")?;
             let output_row_count = output_row_count.cast::<PyDict>()?;
@@ -549,6 +661,7 @@ union all select cast(202 as bigint) as order_id",),
             let report_repr = report.repr()?.extract::<String>()?;
             assert!(!report_repr.contains(config.connection_string.as_str()));
             let report = report.cast::<PyDict>()?;
+            assert!(required_item(report, "execution_profile")?.is_none());
             assert_eq!(
                 required_item(report, "output_name")?.extract::<String>()?,
                 "orders_override"

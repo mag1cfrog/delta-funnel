@@ -41,6 +41,12 @@ name=None, progress=None)` registers a named Delta source immediately when
 `name` is present. Without `name`, it returns a lazy `PendingDeltaSource` and
 does not load or register the source.
 
+For Delta sources, `Session.delta_lake(..., storage_options=...)` accepts a
+mapping of string keys and values and forwards them to the underlying
+object-store builder used by Delta Funnel. For private S3 tables, see the
+[Private S3 sources](../advanced/private-s3.md) guide for the exact
+documented AWS keys, examples, and troubleshooting guidance.
+
 `PendingDeltaSource.alias(name, *, progress=None)` performs the deferred
 registration. Progress is selected by the call that performs registration. A
 value passed while creating an unnamed pending source is not reused by
@@ -91,11 +97,46 @@ See [Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#inspect-ret
 for phase boundaries and interpretation. See the execution profile model below
 for the profile schema.
 
-For Delta sources, `Session.delta_lake(..., storage_options=...)` accepts a
-mapping of string keys and values and forwards them to the underlying
-object-store builder used by Delta Funnel. For private S3 tables, see the
-[Private S3 sources](../advanced/private-s3.md) guide for the exact
-documented AWS keys, examples, and troubleshooting guidance.
+## One-Output SQL Server Profiling
+
+Python callers can attach a detailed query profile to an execute report:
+
+```python
+report = table.write_to_mssql(
+    schema="dbo",
+    table="daily_orders",
+    load_mode="create_and_load",
+    profile=True,
+)
+profile = report["execution_profile"]
+```
+
+Omitting `profile`, or passing `None` or `False`, leaves detailed profiling
+disabled and sets the execute report's `execution_profile` field to `None`.
+Only the actual Boolean `True` enables it. `profile=True` is rejected with
+`dry_run=True`; dry-run report JSON keeps its existing schema and has no
+`execution_profile` field.
+
+Rust callers select the same mode on the option-bearing session or runtime
+method:
+
+```rust
+use delta_funnel::ExecutionProfileMode;
+
+let report = runtime.write_to_mssql_with_profile_mode(
+    &session,
+    &request,
+    ExecutionProfileMode::Detailed,
+)?;
+
+if let Some(profile) = report.execution_profile() {
+    println!("profiled {} operators", profile.operators().len());
+}
+```
+
+The existing `write_to_mssql` methods remain default-disabled. For query phase
+boundaries, outcome interpretation, and failure-context access, see
+[returned SQL Server output diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-sql-server-output-diagnostics).
 
 ## Execution Profile Model
 

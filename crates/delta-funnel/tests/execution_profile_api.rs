@@ -8,10 +8,11 @@ use datafusion::{
     physical_plan::{ExecutionPlan, SendableRecordBatchStream},
 };
 use delta_funnel::{
-    DeltaProviderReadStatsSnapshot, ExecutionProfileMode, QueryExecutionMetric,
+    DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession, DeltaProviderReadStatsSnapshot,
+    ExecutionProfileMode, MssqlWriteReport, OutputWritePlan, QueryExecutionMetric,
     QueryExecutionMetricCategory, QueryExecutionMetricValue, QueryExecutionOperatorProfile,
     QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope,
-    datafusion_query_output_stream,
+    datafusion_query_output_stream, progress::ProgressReporter,
 };
 use serde_json::Value;
 
@@ -20,11 +21,41 @@ type QueryOutputStreamFn = fn(
     Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream, DataFusionError>;
 
+type RuntimeMssqlProfileFn = fn(
+    &DeltaFunnelRuntime,
+    &DeltaFunnelSession,
+    &OutputWritePlan,
+    ExecutionProfileMode,
+) -> Result<MssqlWriteReport, DeltaFunnelError>;
+
+type RuntimeMssqlProfileProgressFn = fn(
+    &DeltaFunnelRuntime,
+    &DeltaFunnelSession,
+    &OutputWritePlan,
+    ExecutionProfileMode,
+    ProgressReporter,
+) -> Result<MssqlWriteReport, DeltaFunnelError>;
+
+#[allow(dead_code)]
+async fn session_mssql_profile_route_compiles(
+    session: &DeltaFunnelSession,
+    request: &OutputWritePlan,
+) -> Result<MssqlWriteReport, DeltaFunnelError> {
+    session
+        .write_to_mssql_with_profile_mode(request, ExecutionProfileMode::Detailed)
+        .await
+}
+
 #[test]
 fn execution_profile_types_and_accessors_are_exported_from_the_crate_root() {
     let _: QueryOutputStreamFn = datafusion_query_output_stream;
+    let _: RuntimeMssqlProfileFn = DeltaFunnelRuntime::write_to_mssql_with_profile_mode;
+    let _: RuntimeMssqlProfileProgressFn =
+        DeltaFunnelRuntime::write_to_mssql_with_profile_mode_and_progress;
 
     let _: ExecutionProfileMode = ExecutionProfileMode::default();
+    let _: for<'a> fn(&'a MssqlWriteReport) -> Option<&'a QueryExecutionProfile> =
+        MssqlWriteReport::execution_profile;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionScope = QueryExecutionProfile::scope;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionOutcome = QueryExecutionProfile::outcome;
     let _: fn(&QueryExecutionProfile) -> bool = QueryExecutionProfile::partial;

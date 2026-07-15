@@ -99,6 +99,49 @@ where
 {
     let request =
         plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
+    write_output_connection_request_for_workflow(
+        request,
+        batches,
+        write_backend,
+        validation_options,
+        reporter,
+    )
+    .await
+}
+
+/// Writes an output that was already fully planned by orchestration.
+pub(crate) async fn write_planned_output_batches_to_mssql_for_workflow<S>(
+    output_plan: MssqlTargetOutputPlan,
+    resolved_target: ResolvedMssqlTarget,
+    batches: S,
+    write_backend: MssqlWriteBackend,
+    validation_options: ValidationOptions,
+    reporter: Option<&ProgressReporter>,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
+    let request = MssqlOutputConnectionRequest::from_planned_output(output_plan, resolved_target);
+    write_output_connection_request_for_workflow(
+        request,
+        batches,
+        write_backend,
+        validation_options,
+        reporter,
+    )
+    .await
+}
+
+async fn write_output_connection_request_for_workflow<S>(
+    request: MssqlOutputConnectionRequest,
+    batches: S,
+    write_backend: MssqlWriteBackend,
+    validation_options: ValidationOptions,
+    reporter: Option<&ProgressReporter>,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
     emit_progress_phase(
         reporter,
         ProgressPhase::Connecting,
