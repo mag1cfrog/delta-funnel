@@ -33,13 +33,44 @@ class Console:
         self.is_jupyter = jupyter
 
 
+class Column:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+class SpinnerColumn(Column):
+    pass
+
+
+class BarColumn(Column):
+    pass
+
+
+class TaskProgressColumn(Column):
+    pass
+
+
+class TextColumn(Column):
+    pass
+
+
+def column_types(columns):
+    return [
+        column if isinstance(column, str) else type(column).__name__
+        for column in columns
+    ]
+
+
 class Progress:
     def __init__(self, *columns, **kwargs):
+        self.columns = columns
         console = kwargs.get("console")
         record(
             {
                 "call": "progress",
                 "columns": len(columns),
+                "column_types": column_types(columns),
                 "console_stderr": None if console is None else console.stderr,
                 "auto_refresh": kwargs.get("auto_refresh"),
                 "transient": kwargs.get("transient"),
@@ -65,7 +96,14 @@ class Progress:
         maybe_fail("start")
 
     def update(self, task_id, **kwargs):
-        record({"call": "update", "task_id": task_id, **kwargs})
+        record(
+            {
+                "call": "update",
+                "task_id": task_id,
+                "column_types": column_types(self.columns),
+                **kwargs,
+            }
+        )
         description = kwargs.get("description", "")
         terminal = any(
             description.startswith(label)
@@ -84,10 +122,10 @@ console_module = types.ModuleType("rich.console")
 console_module.Console = Console
 progress_module = types.ModuleType("rich.progress")
 progress_module.Progress = Progress
-progress_module.TimeElapsedColumn = object
-progress_module.BarColumn = object
-progress_module.TaskProgressColumn = object
-progress_module.TextColumn = lambda *args, **kwargs: object()
+progress_module.SpinnerColumn = SpinnerColumn
+progress_module.BarColumn = BarColumn
+progress_module.TaskProgressColumn = TaskProgressColumn
+progress_module.TextColumn = TextColumn
 rich.console = console_module
 rich.progress = progress_module
 sys.modules["rich"] = rich

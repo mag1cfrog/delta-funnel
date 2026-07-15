@@ -102,15 +102,15 @@ report = session.write_all(outputs, progress=True)
 
 ## Read the display
 
-An action starts with its current phase and an indeterminate bar. For example,
-it may show metadata loading, query planning, cache materialization, connecting,
-writing, validation, or cleanup. An indeterminate bar means Delta Funnel does
-not have a truthful total for the active work.
+An action starts with a spinner beside its current phase. For example, it may
+show metadata loading, query planning, cache materialization, connecting,
+writing, validation, or cleanup. The spinner means Delta Funnel does not have a
+truthful total for the active work.
 
 ### Delta file progress
 
-After planning, an eligible Delta scan can switch the same display to a file
-percentage:
+After planning, an eligible Delta scan can switch the same display to a compact
+file progress bar and percentage:
 
 ```text
 80%  Delta files 8/10 | pruned 3 at runtime, ~90 in planning
@@ -126,8 +126,8 @@ after the scan reaches 100%.
 query executed. `~90 in planning` is an approximate number excluded earlier by
 Delta metadata selection. Planning-pruned files are outside the selected total.
 
-The display stays indeterminate when the active plan has no reliable Delta
-file total. This includes non-Delta plans and plans with zero selected files.
+The display keeps the spinner when the active plan has no reliable Delta file
+total. This includes non-Delta plans and plans with zero selected files.
 A bounded preview may finish successfully before every selected file is
 handled, because its limit can stop the query early. A failure also keeps the
 last real position instead of filling the bar.
@@ -146,7 +146,7 @@ without file, row, or batch counters.
 One `write_all` call owns one consolidated display. It labels active outputs as
 `Output 1/2`, `Output 2/2`, and so on. Cache work and each output have separate
 physical-plan scopes, so the file total and write counters reset when the
-active scope changes. A new scope may return to an indeterminate bar.
+active scope changes. A new scope may return to the spinner.
 
 Progress reads statistics from work that the workflow already performs. It
 does not execute the query twice, run a count query, repeat shared cache work,

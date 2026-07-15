@@ -163,6 +163,9 @@ struct ProgressSettings {
 struct RichRenderer {
     progress: Py<PyAny>,
     task_id: Py<PyAny>,
+    indeterminate_columns: Py<PyAny>,
+    terminal_columns: Py<PyAny>,
+    determinate_columns: Py<PyAny>,
 }
 
 /// Current display state and the first Python interruption waiting to be raised.
@@ -520,7 +523,15 @@ fn flush_previous_metrics(
         ) => {
             let description = previous_visible.description(ProgressEventKind::Progress);
             let updates_enabled = python_value_or_save_interruption(
-                try_python(|py| update_renderer(py, &renderer, &description, previous_visible)),
+                try_python(|py| {
+                    update_renderer(
+                        py,
+                        &renderer,
+                        ProgressEventKind::Progress,
+                        &description,
+                        previous_visible,
+                    )
+                }),
                 pending_interruption,
             )
             .is_some();
@@ -610,7 +621,9 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
             let updates_enabled = if updates_enabled {
                 let description = visible.description(event.kind());
                 python_value_or_save_interruption(
-                    try_python(|py| update_renderer(py, &renderer, &description, &visible)),
+                    try_python(|py| {
+                        update_renderer(py, &renderer, event.kind(), &description, &visible)
+                    }),
                     &mut pending_interruption,
                 )
                 .is_some()
@@ -632,7 +645,9 @@ fn render_event(state: &Mutex<ProgressState>, event: &ProgressEvent, now: Instan
         {
             let description = visible.description(event.kind());
             let updated = python_value_or_save_interruption(
-                try_python(|py| update_renderer(py, &renderer, &description, &visible)),
+                try_python(|py| {
+                    update_renderer(py, &renderer, event.kind(), &description, &visible)
+                }),
                 &mut pending_interruption,
             )
             .is_some();
@@ -699,34 +714,79 @@ fn create_renderer(
         return Ok(None);
     }
 
-    // Use the same columns in terminals and notebooks: elapsed time, current
-    // phase, progress bar, and numeric progress when a total becomes available.
+    // Keep unknown work visually distinct from measurable file progress. Rich
+    // renders the same task with a spinner until a truthful total is available,
+    // then swaps to a compact determinate bar without restarting the display.
     let progress_module = py.import("rich.progress")?;
     let progress_type = progress_module.getattr("Progress")?;
-    let elapsed_column = progress_module.getattr("TimeElapsedColumn")?.call0()?;
-    let bar_column = progress_module.getattr("BarColumn")?.call0()?;
-    let task_progress_column = progress_module.getattr("TaskProgressColumn")?.call0()?;
+    let text_column_type = progress_module.getattr("TextColumn")?;
+
+    let spinner_kwargs = PyDict::new(py);
+    spinner_kwargs.set_item("spinner_name", "arc")?;
+    spinner_kwargs.set_item("style", "bright_blue")?;
+    let spinner_column = progress_module
+        .getattr("SpinnerColumn")?
+        .call((), Some(&spinner_kwargs))?;
+
+    let description_kwargs = PyDict::new(py);
+    description_kwargs.set_item("markup", false)?;
+    let description_column =
+        text_column_type.call(("{task.description}",), Some(&description_kwargs))?;
+
+    let elapsed_kwargs = PyDict::new(py);
+    elapsed_kwargs.set_item("style", "dim")?;
+    elapsed_kwargs.set_item("markup", false)?;
+    let elapsed_column =
+        text_column_type.call(("{task.elapsed:>5.1f}s",), Some(&elapsed_kwargs))?;
+
+    let bar_kwargs = PyDict::new(py);
+    bar_kwargs.set_item("bar_width", 24)?;
+    bar_kwargs.set_item("style", "grey35")?;
+    bar_kwargs.set_item("complete_style", "bright_blue")?;
+    bar_kwargs.set_item("finished_style", "bright_green")?;
+    let bar_column = progress_module
+        .getattr("BarColumn")?
+        .call((), Some(&bar_kwargs))?;
+
+    let task_progress_kwargs = PyDict::new(py);
+    task_progress_kwargs.set_item("text_format", "{task.percentage:>3.0f}%")?;
+    task_progress_kwargs.set_item("style", "bright_blue")?;
+    task_progress_kwargs.set_item("markup", false)?;
+    let task_progress_column = progress_module
+        .getattr("TaskProgressColumn")?
+        .call((), Some(&task_progress_kwargs))?;
+
+    let file_count_kwargs = PyDict::new(py);
+    file_count_kwargs.set_item("style", "dim")?;
+    file_count_kwargs.set_item("markup", false)?;
     let file_count_column = progress_module
         .getattr("TextColumn")?
-        .call1(("{task.fields[file_progress]}",))?;
+        .call(("{task.fields[file_progress]}",), Some(&file_count_kwargs))?;
 
-    // Refresh only when Rust admits an event through the metric throttle.
+    let indeterminate_columns = (
+        spinner_column,
+        description_column.clone(),
+        elapsed_column.clone(),
+    )
+        .into_pyobject(py)?;
+    let terminal_columns =
+        (description_column.clone(), elapsed_column.clone()).into_pyobject(py)?;
+    let determinate_columns = (
+        description_column,
+        bar_column,
+        task_progress_column,
+        file_count_column,
+        elapsed_column,
+    )
+        .into_pyobject(py)?;
+
     let progress_kwargs = PyDict::new(py);
     progress_kwargs.set_item("console", console)?;
-    progress_kwargs.set_item("auto_refresh", false)?;
+    progress_kwargs.set_item("auto_refresh", true)?;
     progress_kwargs.set_item("transient", false)?;
     progress_kwargs.set_item("redirect_stdout", false)?;
     progress_kwargs.set_item("redirect_stderr", false)?;
-    let progress = progress_type.call(
-        (
-            elapsed_column,
-            "{task.description}",
-            bar_column,
-            task_progress_column,
-            file_count_column,
-        ),
-        Some(&progress_kwargs),
-    )?;
+    let progress = progress_type.call(&indeterminate_columns, Some(&progress_kwargs))?;
 
     // Start without a total. The first eligible file snapshot updates this
     // same task so its display and elapsed time continue without restarting.
@@ -741,6 +801,9 @@ fn create_renderer(
     Ok(Some(RichRenderer {
         progress: progress.unbind(),
         task_id: task_id.unbind(),
+        indeterminate_columns: indeterminate_columns.into_any().unbind(),
+        terminal_columns: terminal_columns.into_any().unbind(),
+        determinate_columns: determinate_columns.into_any().unbind(),
     }))
 }
 
@@ -754,9 +817,22 @@ fn start_renderer(py: Python<'_>, renderer: &RichRenderer) -> PyResult<()> {
 fn update_renderer(
     py: Python<'_>,
     renderer: &RichRenderer,
+    kind: ProgressEventKind,
     description: &str,
     visible: &VisibleProgress,
 ) -> PyResult<()> {
+    let columns = if visible.files_total.is_some() {
+        &renderer.determinate_columns
+    } else if ends_action(kind) {
+        &renderer.terminal_columns
+    } else {
+        &renderer.indeterminate_columns
+    };
+    renderer
+        .progress
+        .bind(py)
+        .setattr("columns", columns.bind(py))?;
+
     let kwargs = PyDict::new(py);
     kwargs.set_item("description", description)?;
     match (visible.files_handled, visible.files_total) {
@@ -1236,10 +1312,7 @@ pub(crate) mod tests {
             let (_guard, records) = ModuleGuard::install(py, true, false)?;
             let progress = py.import("rich.progress")?.getattr("Progress")?.call0()?;
             let task_id = progress.call_method1("add_task", ("Starting",))?;
-            let renderer = RichRenderer {
-                progress: progress.unbind(),
-                task_id: task_id.unbind(),
-            };
+            let renderer = renderer_with_test_columns(py, progress, task_id)?;
             let mut visible = VisibleProgress::new();
             visible.phase = Some(ProgressPhase::Writing);
             visible.output_name = Some("orders".to_owned());
@@ -1248,6 +1321,7 @@ pub(crate) mod tests {
             update_renderer(
                 py,
                 &renderer,
+                ProgressEventKind::Progress,
                 &visible.description(ProgressEventKind::Progress),
                 &visible,
             )?;
@@ -1256,6 +1330,13 @@ pub(crate) mod tests {
             assert_eq!(update.get_item("task_id")?.unwrap().extract::<u8>()?, 7);
             assert_eq!(update.get_item("completed")?.unwrap().extract::<u64>()?, 3);
             assert_eq!(update.get_item("total")?.unwrap().extract::<u64>()?, 10);
+            assert_eq!(
+                update
+                    .get_item("column_types")?
+                    .unwrap()
+                    .extract::<Vec<String>>()?,
+                ["determinate"]
+            );
             assert_eq!(
                 update
                     .get_item("file_progress")?
@@ -1275,6 +1356,7 @@ pub(crate) mod tests {
             update_renderer(
                 py,
                 &renderer,
+                ProgressEventKind::Failed,
                 &visible.description(ProgressEventKind::Failed),
                 &visible,
             )?;
@@ -1303,10 +1385,7 @@ pub(crate) mod tests {
             let progress = py.import("rich.progress")?.getattr("Progress")?.call0()?;
             let task_id = progress.call_method1("add_task", ("Starting",))?;
             let render = RenderState::Active {
-                renderer: RichRenderer {
-                    progress: progress.unbind(),
-                    task_id: task_id.unbind(),
-                },
+                renderer: renderer_with_test_columns(py, progress, task_id)?,
                 updates_enabled: true,
             };
             let mut visible = VisibleProgress::new();
@@ -1465,6 +1544,20 @@ pub(crate) mod tests {
             .iter()
             .map(|record| record.get_item(key)?.extract::<String>())
             .collect()
+    }
+
+    fn renderer_with_test_columns(
+        py: Python<'_>,
+        progress: Bound<'_, PyAny>,
+        task_id: Bound<'_, PyAny>,
+    ) -> PyResult<RichRenderer> {
+        Ok(RichRenderer {
+            progress: progress.unbind(),
+            task_id: task_id.unbind(),
+            indeterminate_columns: ("indeterminate",).into_pyobject(py)?.into_any().unbind(),
+            terminal_columns: ("terminal",).into_pyobject(py)?.into_any().unbind(),
+            determinate_columns: ("determinate",).into_pyobject(py)?.into_any().unbind(),
+        })
     }
 
     fn assert_modules_match(
@@ -2113,9 +2206,16 @@ def fail_print(*args, **kwargs):
             let console = records.get_item(0)?.cast_into::<PyDict>()?;
             assert!(console.get_item("stderr")?.unwrap().extract::<bool>()?);
             let progress = records.get_item(1)?.cast_into::<PyDict>()?;
-            assert_eq!(progress.get_item("columns")?.unwrap().extract::<u8>()?, 5);
+            assert_eq!(progress.get_item("columns")?.unwrap().extract::<u8>()?, 3);
+            assert_eq!(
+                progress
+                    .get_item("column_types")?
+                    .unwrap()
+                    .extract::<Vec<String>>()?,
+                ["SpinnerColumn", "TextColumn", "TextColumn"]
+            );
             assert!(
-                !progress
+                progress
                     .get_item("auto_refresh")?
                     .unwrap()
                     .extract::<bool>()?
@@ -2154,10 +2254,24 @@ def fail_print(*args, **kwargs):
             );
             assert_eq!(
                 records
+                    .get_item(4)?
+                    .get_item("column_types")?
+                    .extract::<Vec<String>>()?,
+                ["SpinnerColumn", "TextColumn", "TextColumn"]
+            );
+            assert_eq!(
+                records
                     .get_item(5)?
                     .get_item("description")?
                     .extract::<String>()?,
                 "Completed: orders"
+            );
+            assert_eq!(
+                records
+                    .get_item(5)?
+                    .get_item("column_types")?
+                    .extract::<Vec<String>>()?,
+                ["TextColumn", "TextColumn"]
             );
             assert!(
                 records
