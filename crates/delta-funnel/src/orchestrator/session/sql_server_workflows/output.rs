@@ -142,6 +142,19 @@ impl DeltaFunnelSession {
         .await
     }
 
+    pub(crate) async fn write_to_mssql_with_reporter(
+        &self,
+        request: &OutputWritePlan,
+        reporter: ProgressReporter,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        self.write_to_mssql_with_profile_mode_and_reporter(
+            request,
+            ExecutionProfileMode::Disabled,
+            reporter,
+        )
+        .await
+    }
+
     pub(crate) async fn write_to_mssql_with_profile_mode_and_reporter(
         &self,
         request: &OutputWritePlan,
@@ -506,6 +519,11 @@ fn ensure_validation_phase_timing(report: MssqlWriteReport) -> MssqlWriteReport 
 
 #[async_trait]
 pub(crate) trait OrchestratorMssqlOutputWriter: Send {
+    /// Writes one planned output.
+    ///
+    /// After stream setup, implementations must return failures through a
+    /// phase-aware SQL write error variant so timings and profiles can be
+    /// attached to its [`MssqlWriteFailureContext`].
     async fn write_output(
         &mut self,
         output_plan: MssqlTargetOutputPlan,
@@ -557,7 +575,7 @@ fn ensure_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunnelError> {
 mod tests {
     use std::{
         error::Error,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, atomic::Ordering},
         time::Duration,
     };
 
@@ -579,8 +597,10 @@ mod tests {
     use super::super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, OutputWritePlan, RunMode, SessionOptions,
         test_support::{
-            DeltaLogTable, UNSUPPORTED_SCHEMA_FIELDS_JSON, execute_output_request, output_request,
-            override_connection, secret_connection,
+            DeltaLogTable, UNSUPPORTED_SCHEMA_FIELDS_JSON, execute_output_request,
+            failing_scan_marker_region_provider, output_request, override_connection,
+            plan_lifetime_tracking_marker_region_provider, secret_connection,
+            stream_setup_failing_marker_region_provider,
         },
     };
     use super::{
@@ -639,21 +659,68 @@ mod tests {
         validation_options: ValidationOptions,
     }
 
+    fn cleanup_before_stream_write(
+        output_plan: &MssqlTargetOutputPlan,
+    ) -> MssqlTargetCleanupStatus {
+        match output_plan.load_mode() {
+            LoadMode::AppendExisting => MssqlTargetCleanupStatus::NotApplicable,
+            LoadMode::CreateAndLoad | LoadMode::Replace => MssqlTargetCleanupStatus::NotAttempted,
+        }
+    }
+
+    fn injected_write_error(
+        output_plan: &MssqlTargetOutputPlan,
+        phase: MssqlWritePhase,
+        rows: u64,
+        batches: u64,
+        partial_write_possible: bool,
+        cleanup: MssqlTargetCleanupStatus,
+        message: impl Into<String>,
+    ) -> DeltaFunnelError {
+        DeltaFunnelError::MssqlWritePhase {
+            context: Box::new(MssqlWriteFailureContext::from_output_plan(
+                output_plan,
+                phase,
+                rows,
+                batches,
+                0,
+                partial_write_possible,
+                cleanup,
+            )),
+            message: message.into(),
+        }
+    }
+
+    async fn drain_batches(
+        output_plan: &MssqlTargetOutputPlan,
+        batches: &mut MssqlOutputBatchStream,
+    ) -> Result<(u64, u64), DeltaFunnelError> {
+        let mut rows = 0_u64;
+        let mut batch_count = 0_u64;
+        while let Some(batch) = batches.next().await {
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    return Err(injected_write_error(
+                        output_plan,
+                        MssqlWritePhase::PollBatchStream,
+                        rows,
+                        batch_count,
+                        rows != 0,
+                        cleanup_before_stream_write(output_plan),
+                        error.to_string(),
+                    ));
+                }
+            };
+            rows = rows.saturating_add(crate::usize_to_u64_saturating(batch.num_rows()));
+            batch_count = batch_count.saturating_add(1);
+        }
+        Ok((rows, batch_count))
+    }
+
     #[derive(Default)]
     struct FakeOrchestratorWriter {
         calls: Vec<FakeOrchestratorWriteCall>,
-        failure: Option<DeltaFunnelError>,
-    }
-
-    impl FakeOrchestratorWriter {
-        fn failing_with(message: &str) -> Self {
-            Self {
-                failure: Some(DeltaFunnelError::Config {
-                    message: message.to_owned(),
-                }),
-                ..Self::default()
-            }
-        }
     }
 
     #[async_trait]
@@ -667,22 +734,7 @@ mod tests {
             validation_options: ValidationOptions,
             _reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-            let mut rows = 0_u64;
-            let mut batch_count = 0_u64;
-
-            while let Some(batch) = batches.next().await {
-                let batch = batch?;
-                rows = rows.saturating_add(u64::try_from(batch.num_rows()).map_err(|_| {
-                    DeltaFunnelError::Config {
-                        message: "fake writer row count overflowed u64".to_owned(),
-                    }
-                })?);
-                batch_count = batch_count.saturating_add(1);
-            }
-
-            if let Some(error) = self.failure.take() {
-                return Err(error);
-            }
+            let (rows, batch_count) = drain_batches(&output_plan, &mut batches).await?;
 
             self.calls.push(FakeOrchestratorWriteCall {
                 output_name: resolved_target.output_name().to_owned(),
@@ -705,7 +757,7 @@ mod tests {
         }
     }
 
-    struct EarlyFailureWriter;
+    struct EarlyFailureWriter(MssqlWritePhase);
 
     #[async_trait]
     impl OrchestratorMssqlOutputWriter for EarlyFailureWriter {
@@ -719,22 +771,69 @@ mod tests {
             _reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             drop(batches);
-            Err(DeltaFunnelError::MssqlWritePhase {
-                context: Box::new(MssqlWriteFailureContext::from_output_plan(
-                    &output_plan,
-                    MssqlWritePhase::InitializeWriter,
-                    0,
-                    0,
-                    0,
-                    false,
-                    MssqlTargetCleanupStatus::NotApplicable,
-                )),
-                message: "injected writer initialization failure".to_owned(),
-            })
+            Err(injected_write_error(
+                &output_plan,
+                self.0,
+                0,
+                0,
+                false,
+                cleanup_before_stream_write(&output_plan),
+                "injected pre-stream writer failure",
+            ))
         }
     }
 
-    struct PostEofFailureWriter;
+    struct PreEofFailureWriter(MssqlWritePhase);
+
+    #[async_trait]
+    impl OrchestratorMssqlOutputWriter for PreEofFailureWriter {
+        async fn write_output(
+            &mut self,
+            output_plan: MssqlTargetOutputPlan,
+            _resolved_target: ResolvedMssqlTarget,
+            mut batches: MssqlOutputBatchStream,
+            _write_backend: MssqlWriteBackend,
+            _validation_options: ValidationOptions,
+            _reporter: Option<&ProgressReporter>,
+        ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+            let (rows, batch_count) = match batches.next().await {
+                Some(Ok(batch)) => (crate::usize_to_u64_saturating(batch.num_rows()), 1),
+                Some(Err(error)) => {
+                    return Err(injected_write_error(
+                        &output_plan,
+                        MssqlWritePhase::PollBatchStream,
+                        0,
+                        0,
+                        false,
+                        cleanup_before_stream_write(&output_plan),
+                        error.to_string(),
+                    ));
+                }
+                None => (0, 0),
+            };
+            drop(batches);
+            Err(injected_write_error(
+                &output_plan,
+                self.0,
+                rows,
+                batch_count,
+                self.0 == MssqlWritePhase::WriteBatch,
+                cleanup_before_stream_write(&output_plan),
+                "injected pre-EOF writer failure",
+            ))
+        }
+    }
+
+    struct PostEofFailureWriter {
+        phase: MssqlWritePhase,
+        message: &'static str,
+    }
+
+    impl PostEofFailureWriter {
+        const fn new(phase: MssqlWritePhase, message: &'static str) -> Self {
+            Self { phase, message }
+        }
+    }
 
     #[async_trait]
     impl OrchestratorMssqlOutputWriter for PostEofFailureWriter {
@@ -747,26 +846,21 @@ mod tests {
             _validation_options: ValidationOptions,
             _reporter: Option<&ProgressReporter>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-            let mut rows = 0_u64;
-            let mut batch_count = 0_u64;
-            while let Some(batch) = batches.next().await {
-                let batch = batch?;
-                rows = rows.saturating_add(crate::usize_to_u64_saturating(batch.num_rows()));
-                batch_count = batch_count.saturating_add(1);
-            }
-
-            Err(DeltaFunnelError::MssqlWritePhase {
-                context: Box::new(MssqlWriteFailureContext::from_output_plan(
-                    &output_plan,
-                    MssqlWritePhase::Finalize,
-                    rows,
-                    batch_count,
-                    0,
-                    false,
-                    MssqlTargetCleanupStatus::NotApplicable,
-                )),
-                message: "injected finalization failure".to_owned(),
-            })
+            let (rows, batch_count) = drain_batches(&output_plan, &mut batches).await?;
+            let cleanup = if self.phase == MssqlWritePhase::Cleanup {
+                MssqlTargetCleanupStatus::Failed
+            } else {
+                cleanup_before_stream_write(&output_plan)
+            };
+            Err(injected_write_error(
+                &output_plan,
+                self.phase,
+                rows,
+                batch_count,
+                false,
+                cleanup,
+                self.message,
+            ))
         }
     }
 
@@ -1133,11 +1227,7 @@ mod tests {
         let (reporter, events) = recording_reporter();
 
         let error = session
-            .write_to_mssql_with_profile_mode_and_reporter(
-                &request,
-                ExecutionProfileMode::Disabled,
-                reporter,
-            )
+            .write_to_mssql_with_reporter(&request, reporter)
             .await;
 
         assert!(matches!(
@@ -1300,6 +1390,15 @@ mod tests {
         assert!(!profile.partial());
         assert_eq!(profile.delta_funnel_row_limit(), None);
         assert!(!profile.operators().is_empty());
+        let value = report.to_json_value();
+        assert_eq!(value["execution_profile"]["scope"], "mssql_output");
+        assert_eq!(value["execution_profile"]["outcome"], "success");
+        assert_eq!(
+            value
+                .as_object()
+                .map(|object| object.contains_key("execution_profile")),
+            Some(true)
+        );
         let events = execution_profile_events(&capture);
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -1385,36 +1484,44 @@ mod tests {
             "orders_sink",
             LoadMode::CreateAndLoad,
         )?;
-        let capture = TracingCapture::start();
+        for phase in [
+            MssqlWritePhase::Connect,
+            MssqlWritePhase::PrepareTargetLifecycle,
+            MssqlWritePhase::InitializeWriter,
+        ] {
+            let capture = TracingCapture::start();
+            let error = session
+                .write_to_mssql_with_writer_and_profile_mode(
+                    &request,
+                    &mut EarlyFailureWriter(phase),
+                    ExecutionProfileMode::Detailed,
+                )
+                .await
+                .err()
+                .ok_or("expected writer failure")?;
 
-        let error = session
-            .write_to_mssql_with_writer_and_profile_mode(
-                &request,
-                &mut EarlyFailureWriter,
-                ExecutionProfileMode::Detailed,
-            )
-            .await
-            .err()
-            .ok_or("expected writer failure")?;
-
-        let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
-            return Err("expected MSSQL write phase failure".into());
-        };
-        assert_eq!(context.phase(), MssqlWritePhase::InitializeWriter);
-        assert!(!context.partial_write_possible());
-        let profile = context
-            .report()
-            .execution_profile()
-            .ok_or("expected failure profile")?;
-        assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
-        assert_eq!(profile.outcome(), QueryExecutionOutcome::Cancelled);
-        assert!(profile.partial());
-        let events = execution_profile_events(&capture);
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].fields.get("outcome").map(String::as_str),
-            Some("cancelled")
-        );
+            let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+                return Err("expected MSSQL write phase failure".into());
+            };
+            assert_eq!(context.phase(), phase);
+            assert!(!context.partial_write_possible());
+            let profile = context
+                .report()
+                .execution_profile()
+                .ok_or("expected failure profile")?;
+            assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+            assert_eq!(profile.outcome(), QueryExecutionOutcome::Cancelled);
+            assert!(profile.partial());
+            let value = context.to_json_value();
+            assert!(value.get("execution_profile").is_none());
+            assert_eq!(value["report"]["execution_profile"]["outcome"], "cancelled");
+            let events = execution_profile_events(&capture);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].fields.get("outcome").map(String::as_str),
+                Some("cancelled")
+            );
+        }
         Ok(())
     }
 
@@ -1433,34 +1540,307 @@ mod tests {
             "orders_sink",
             LoadMode::CreateAndLoad,
         )?;
+        for phase in [
+            MssqlWritePhase::Finalize,
+            MssqlWritePhase::Validation,
+            MssqlWritePhase::SwapTarget,
+            MssqlWritePhase::Cleanup,
+        ] {
+            let capture = TracingCapture::start();
+            let error = session
+                .write_to_mssql_with_writer_and_profile_mode(
+                    &request,
+                    &mut PostEofFailureWriter::new(phase, "injected post-EOF writer failure"),
+                    ExecutionProfileMode::Detailed,
+                )
+                .await
+                .err()
+                .ok_or("expected post-EOF writer failure")?;
+
+            let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+                return Err("expected MSSQL write phase failure".into());
+            };
+            assert_eq!(context.phase(), phase);
+            let profile = context
+                .report()
+                .execution_profile()
+                .ok_or("expected failure profile")?;
+            assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+            assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+            assert!(!profile.partial());
+            let events = execution_profile_events(&capture);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].fields.get("outcome").map(String::as_str),
+                Some("success")
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_write_reports_real_dataframe_planning_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let request = execute_output_request(
+            source,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let removed = session.context().deregister_table("orders")?;
+        assert!(removed.is_some());
+        let mut writer = FakeOrchestratorWriter::default();
         let capture = TracingCapture::start();
 
         let error = session
             .write_to_mssql_with_writer_and_profile_mode(
                 &request,
-                &mut PostEofFailureWriter,
+                &mut writer,
                 ExecutionProfileMode::Detailed,
             )
             .await
             .err()
-            .ok_or("expected finalization failure")?;
+            .ok_or("expected DataFrame planning failure")?;
+
+        let DeltaFunnelError::MssqlQueryPhase { context, .. } = error else {
+            return Err("expected MSSQL query phase failure".into());
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::QueryDataFramePlanning);
+        assert_eq!(context.report().execution_profile(), None);
+        assert!(execution_profile_events(&capture).is_empty());
+        assert!(writer.calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_write_reports_real_physical_planning_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (provider, scans) = failing_scan_marker_region_provider();
+        session
+            .context()
+            .register_table("broken_source", provider)?;
+        let derived = session
+            .table_from_sql("select marker from broken_source")
+            .await?;
+        let request = execute_output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let mut writer = FakeOrchestratorWriter::default();
+        let capture = TracingCapture::start();
+
+        let error = session
+            .write_to_mssql_with_writer_and_profile_mode(
+                &request,
+                &mut writer,
+                ExecutionProfileMode::Detailed,
+            )
+            .await
+            .err()
+            .ok_or("expected physical planning failure")?;
+
+        let DeltaFunnelError::MssqlQueryPhase { context, .. } = error else {
+            return Err("expected MSSQL query phase failure".into());
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::QueryPhysicalPlanning);
+        assert_eq!(context.report().execution_profile(), None);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        assert!(execution_profile_events(&capture).is_empty());
+        assert!(writer.calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_write_reports_real_stream_setup_failure_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        session.context().register_table(
+            "setup_failure_source",
+            stream_setup_failing_marker_region_provider()?,
+        )?;
+        let derived = session
+            .table_from_sql("select marker from setup_failure_source")
+            .await?;
+        let request = execute_output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let mut writer = FakeOrchestratorWriter::default();
+        let capture = TracingCapture::start();
+
+        let error = session
+            .write_to_mssql_with_writer_and_profile_mode(
+                &request,
+                &mut writer,
+                ExecutionProfileMode::Detailed,
+            )
+            .await
+            .err()
+            .ok_or("expected stream setup failure")?;
+
+        let DeltaFunnelError::MssqlQueryPhase { context, .. } = error else {
+            return Err("expected MSSQL query phase failure".into());
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::QueryStreamSetup);
+        let profile = context
+            .report()
+            .execution_profile()
+            .ok_or("expected stream setup failure profile")?;
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Error);
+        assert!(profile.partial());
+        assert_eq!(execution_profile_events(&capture).len(), 1);
+        assert!(writer.calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_write_reports_upstream_execution_error_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let derived = session
+            .table_from_sql("select cast(1 as bigint) / cast(0 as bigint) as value")
+            .await?;
+        let request = execute_output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let mut writer = FakeOrchestratorWriter::default();
+        let capture = TracingCapture::start();
+
+        let error = session
+            .write_to_mssql_with_writer_and_profile_mode(
+                &request,
+                &mut writer,
+                ExecutionProfileMode::Detailed,
+            )
+            .await
+            .err()
+            .ok_or("expected upstream execution failure")?;
 
         let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
             return Err("expected MSSQL write phase failure".into());
         };
-        assert_eq!(context.phase(), MssqlWritePhase::Finalize);
+        assert_eq!(context.phase(), MssqlWritePhase::PollBatchStream);
         let profile = context
             .report()
             .execution_profile()
-            .ok_or("expected failure profile")?;
-        assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
-        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
-        assert!(!profile.partial());
-        let events = execution_profile_events(&capture);
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].fields.get("outcome").map(String::as_str),
-            Some("success")
+            .ok_or("expected execution failure profile")?;
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Error);
+        assert!(profile.partial());
+        assert_eq!(execution_profile_events(&capture).len(), 1);
+        tokio::task::yield_now().await;
+        assert_eq!(execution_profile_events(&capture).len(), 1);
+        assert!(writer.calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_write_reports_pre_eof_validation_and_write_cancellation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let derived = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let request = execute_output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+
+        for phase in [
+            MssqlWritePhase::ValidateBatchSchema,
+            MssqlWritePhase::WriteBatch,
+        ] {
+            let capture = TracingCapture::start();
+            let error = session
+                .write_to_mssql_with_writer_and_profile_mode(
+                    &request,
+                    &mut PreEofFailureWriter(phase),
+                    ExecutionProfileMode::Detailed,
+                )
+                .await
+                .err()
+                .ok_or("expected pre-EOF writer failure")?;
+
+            let DeltaFunnelError::MssqlWritePhase { context, .. } = error else {
+                return Err("expected MSSQL write phase failure".into());
+            };
+            assert_eq!(context.phase(), phase);
+            assert_eq!(
+                context.partial_write_possible(),
+                phase == MssqlWritePhase::WriteBatch
+            );
+            let profile = context
+                .report()
+                .execution_profile()
+                .ok_or("expected cancellation profile")?;
+            assert_eq!(profile.outcome(), QueryExecutionOutcome::Cancelled);
+            assert!(profile.partial());
+            assert_eq!(execution_profile_events(&capture).len(), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_write_releases_execution_plan_after_report_capture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+        )?;
+        let (provider, last_plan_marker) =
+            plan_lifetime_tracking_marker_region_provider("observed")?;
+        session
+            .context()
+            .register_table("profile_source", provider)?;
+        let derived = session
+            .table_from_sql("select marker from profile_source")
+            .await?;
+        let request = execute_output_request(
+            derived,
+            "orders_output",
+            "orders_sink",
+            LoadMode::AppendExisting,
+        )?;
+        let mut writer = FakeOrchestratorWriter::default();
+
+        let report = session
+            .write_to_mssql_with_writer_and_profile_mode(
+                &request,
+                &mut writer,
+                ExecutionProfileMode::Detailed,
+            )
+            .await?;
+
+        assert!(report.execution_profile().is_some());
+        let marker = match last_plan_marker.lock() {
+            Ok(marker) => marker,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(
+            marker
+                .as_ref()
+                .is_some_and(|marker| marker.upgrade().is_none())
         );
         Ok(())
     }
@@ -1673,7 +2053,7 @@ mod tests {
             "orders_sink",
             LoadMode::CreateAndLoad,
         )?;
-        let mut writer = FakeOrchestratorWriter::failing_with("raw-error-secret");
+        let mut writer = PostEofFailureWriter::new(MssqlWritePhase::Finalize, "raw-error-secret");
         let events = Arc::new(Mutex::new(Vec::new()));
         let callback_events = Arc::clone(&events);
         let reporter = ProgressReporter::new(move |event| {
@@ -1690,7 +2070,8 @@ mod tests {
 
         assert!(matches!(
             error,
-            Err(DeltaFunnelError::Config { message }) if message == "raw-error-secret"
+            Err(DeltaFunnelError::MssqlWritePhase { message, .. })
+                if message == "raw-error-secret"
         ));
         let events = match events.lock() {
             Ok(events) => events,
@@ -1781,7 +2162,8 @@ mod tests {
         )?;
         // This writer drains the batch stream to EOF before returning its
         // injected failure, matching a later SQL finalization failure.
-        let mut writer = FakeOrchestratorWriter::failing_with("post-stream failure");
+        let mut writer =
+            PostEofFailureWriter::new(MssqlWritePhase::Finalize, "post-stream failure");
         let capture = TracingCapture::start();
 
         let result = session
@@ -1799,7 +2181,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(DeltaFunnelError::Config { message }) if message == "post-stream failure"
+            Err(DeltaFunnelError::MssqlWritePhase { message, .. })
+                if message == "post-stream failure"
         ));
         assert_eq!(summaries.len(), 1);
         assert_eq!(

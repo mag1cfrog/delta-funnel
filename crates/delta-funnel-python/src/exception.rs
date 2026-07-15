@@ -173,12 +173,8 @@ fn delta_funnel_error_parts(
         delta_funnel::DeltaFunnelError::MssqlWrite { .. } => {
             Ok(("mssql_write", "mssql_write", None))
         }
-        delta_funnel::DeltaFunnelError::MssqlWritePhase { context, .. } => Ok((
-            mssql_write_phase(context.phase()),
-            "mssql_write_phase",
-            Some(json_value_to_py(py, &context.to_json_value())?),
-        )),
-        delta_funnel::DeltaFunnelError::MssqlQueryPhase { context, .. } => Ok((
+        delta_funnel::DeltaFunnelError::MssqlWritePhase { context, .. }
+        | delta_funnel::DeltaFunnelError::MssqlQueryPhase { context, .. } => Ok((
             mssql_write_phase(context.phase()),
             "mssql_write_phase",
             Some(json_value_to_py(py, &context.to_json_value())?),

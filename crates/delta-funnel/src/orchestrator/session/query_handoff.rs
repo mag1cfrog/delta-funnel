@@ -485,16 +485,22 @@ async fn batch_stream_for_lazy_table_from_session_parts(
     .map_err(|failure| *failure.source)
 }
 
+/// A tracked query stream plus the optional terminal profile result handle.
+///
+/// The result becomes available only after the stream reaches EOF, errors, or
+/// is dropped.
 pub(super) struct QueryStreamSetup {
     pub(super) stream: MssqlOutputBatchStream,
     pub(super) profile_result: Option<QueryExecutionProfileResult>,
 }
 
+/// A stream setup failure plus any profile finalized at that boundary.
 pub(super) struct QueryStreamSetupFailure {
     pub(super) source: Box<DeltaFunnelError>,
     pub(super) execution_profile: Option<QueryExecutionProfile>,
 }
 
+/// Creates the merged stream and installs its shared terminal observers.
 pub(super) fn batch_stream_for_physical_plan(
     context: &SessionContext,
     physical_plan: Arc<dyn ExecutionPlan>,

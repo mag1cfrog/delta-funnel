@@ -246,12 +246,9 @@ impl DeltaFunnelRuntime {
         request: &OutputWritePlan,
         reporter: ProgressReporter,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.write_to_mssql_with_profile_mode_and_progress(
-            session,
-            request,
-            ExecutionProfileMode::Disabled,
-            reporter,
-        )
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.write_to_mssql_with_reporter(request, reporter))
     }
 
     /// Blocks on one profiled output write with a workspace host progress reporter.
@@ -377,8 +374,8 @@ mod tests {
         DeltaSourceConfig, DryRunScanSummaryMode, LoadMode, MssqlConnectionConfig,
         MssqlConnectionSource, MssqlOutputBatchStream, MssqlOutputTarget, MssqlTargetCleanupStatus,
         MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetTable, MssqlWriteBackend,
-        ResolvedMssqlTarget, RunMode, SessionOptions, ValidationOptions,
-        table_formats::RealParquetDeltaTable,
+        MssqlWriteFailureContext, MssqlWritePhase, ResolvedMssqlTarget, RunMode, SessionOptions,
+        ValidationOptions, table_formats::RealParquetDeltaTable,
     };
 
     fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
@@ -474,12 +471,25 @@ mod tests {
             let mut batch_count = 0_u64;
 
             while let Some(batch) = batches.next().await {
-                let batch = batch?;
-                rows = rows.saturating_add(u64::try_from(batch.num_rows()).map_err(|_| {
-                    DeltaFunnelError::Config {
-                        message: "fake runtime writer row count overflowed u64".to_owned(),
+                let cleanup = match output_plan.load_mode() {
+                    LoadMode::AppendExisting => MssqlTargetCleanupStatus::NotApplicable,
+                    LoadMode::CreateAndLoad | LoadMode::Replace => {
+                        MssqlTargetCleanupStatus::NotAttempted
                     }
-                })?);
+                };
+                let batch = batch.map_err(|error| DeltaFunnelError::MssqlWritePhase {
+                    context: Box::new(MssqlWriteFailureContext::from_output_plan(
+                        &output_plan,
+                        MssqlWritePhase::PollBatchStream,
+                        rows,
+                        batch_count,
+                        0,
+                        rows != 0,
+                        cleanup,
+                    )),
+                    message: error.to_string(),
+                })?;
+                rows = rows.saturating_add(crate::usize_to_u64_saturating(batch.num_rows()));
                 batch_count = batch_count.saturating_add(1);
             }
 
