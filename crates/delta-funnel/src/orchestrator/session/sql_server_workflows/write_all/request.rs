@@ -142,6 +142,7 @@ impl DeltaFunnelSession {
                                 writer,
                                 Some(Arc::clone(&shared_provider_stats)),
                                 active_reporter,
+                                options.execution_profile_mode(),
                             )
                             .await?;
                         (workflow, cache_report::from_executed_plan(cache_plan))
@@ -1734,6 +1735,12 @@ mod tests {
                 assert_eq!(names_source_scans.load(Ordering::SeqCst), 1);
                 assert!(report.all_succeeded());
             }
+            for status in report.outputs() {
+                let crate::MssqlOutputWriteStatus::Succeeded(output_report) = status else {
+                    return Err(format!("expected succeeded status, got {status:?}").into());
+                };
+                assert_eq!(output_report.execution_profile(), None);
+            }
             let WriteAllCacheReport::CacheAliases {
                 aliases,
                 skipped_candidates,
@@ -1776,7 +1783,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn write_all_auto_keeps_unrelated_output_on_normal_stream_path()
+        async fn write_all_auto_profiles_direct_replanned_and_unrelated_output_queries()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
@@ -1818,7 +1825,12 @@ mod tests {
             let calls = writer.calls();
 
             let report = session
-                .write_all_with_writer(&[big_output, unrelated_output, west_output], writer)
+                .write_all_with_options_and_writer(
+                    &[big_output, unrelated_output, west_output],
+                    WriteAllOptions::new()
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                    writer,
+                )
                 .await?;
             {
                 let calls = calls
@@ -1835,6 +1847,29 @@ mod tests {
                 assert_eq!(shared_scans.load(Ordering::SeqCst), 1);
                 assert_eq!(unrelated_scans.load(Ordering::SeqCst), 1);
                 assert!(report.all_succeeded());
+            }
+            for status in report.outputs() {
+                let crate::MssqlOutputWriteStatus::Succeeded(output_report) = status else {
+                    return Err(format!("expected succeeded status, got {status:?}").into());
+                };
+                let profile = output_report
+                    .execution_profile()
+                    .ok_or("expected cached output query profile")?;
+                assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
+                assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+                assert!(!profile.partial());
+                assert!(!profile.operators().is_empty());
+                for phase_name in [
+                    "query_dataframe_planning",
+                    "query_physical_planning",
+                    "query_stream_setup",
+                ] {
+                    assert_phase_timing(
+                        output_report.phase_timings(),
+                        phase_name,
+                        PhaseStatus::completed(),
+                    )?;
+                }
             }
             Ok(())
         }

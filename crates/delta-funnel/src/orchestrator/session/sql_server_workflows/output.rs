@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{DataFrame, SessionContext};
 use tracing::Instrument;
 
 use crate::{
@@ -444,6 +444,27 @@ async fn create_mssql_output_query_execution(
     };
     query_phase_timings.push(dataframe_timer.completed());
 
+    create_mssql_output_query_execution_from_dataframe(
+        context,
+        planned,
+        dataframe,
+        query_phase_timings,
+        provider_stats_snapshots,
+        progress,
+        profile_mode,
+    )
+    .await
+}
+
+pub(super) async fn create_mssql_output_query_execution_from_dataframe(
+    context: &SessionContext,
+    planned: &PlannedMssqlOutput,
+    dataframe: DataFrame,
+    mut query_phase_timings: Vec<PhaseTimingReport>,
+    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
+    progress: Option<ProgressReporter>,
+    profile_mode: ExecutionProfileMode,
+) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
     let physical_plan_timer = PhaseTimer::start(QUERY_PHYSICAL_PLANNING_PHASE);
     let physical_plan = match dataframe.create_physical_plan().await {
         Ok(physical_plan) => physical_plan,
@@ -526,7 +547,7 @@ fn mssql_query_phase_error(
     .error
 }
 
-fn mssql_output_query_error(
+pub(super) fn mssql_output_query_error(
     planned: &PlannedMssqlOutput,
     phase: MssqlWritePhase,
     mut query_phase_timings: Vec<PhaseTimingReport>,
