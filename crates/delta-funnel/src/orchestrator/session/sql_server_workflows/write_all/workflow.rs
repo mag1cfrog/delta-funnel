@@ -4,8 +4,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlOutputQueryFuture, MssqlOutputWriteJob,
-    MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, progress::ProgressReporter,
-    usize_to_u64_saturating, write_mssql_outputs_with_writer,
+    MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, WriteAllCacheAliasReport,
+    progress::ProgressReporter, usize_to_u64_saturating, write_mssql_outputs_with_writer,
 };
 
 use super::super::super::{
@@ -14,8 +14,8 @@ use super::super::super::{
 use super::{
     MssqlDerivedCacheAliasPlan,
     cache_alias::{
-        cache_error_with_restore_error, restore_mssql_cache_aliases,
-        restore_mssql_cache_aliases_after_error,
+        restore_cache_aliases_after_failure, restore_mssql_cache_aliases_with_reports,
+        write_all_cache_failure,
     },
 };
 
@@ -152,7 +152,7 @@ impl DeltaFunnelSession {
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
-    ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
+    ) -> Result<(MssqlWorkflowWriteReport, Vec<WriteAllCacheAliasReport>), DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
@@ -168,9 +168,10 @@ impl DeltaFunnelSession {
         ) {
             Ok(jobs) => jobs,
             Err(error) => {
-                return Err(restore_mssql_cache_aliases_after_error(
+                return Err(restore_cache_aliases_after_failure(
                     error,
                     replacements,
+                    None,
                     reporter,
                 ));
             }
@@ -178,15 +179,23 @@ impl DeltaFunnelSession {
         let write_result =
             write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer)
                 .await;
-        let restore_result = restore_mssql_cache_aliases(replacements, reporter);
+        let (alias_reports, restore_result) =
+            restore_mssql_cache_aliases_with_reports(replacements, reporter);
 
         match (write_result, restore_result) {
-            (Ok(report), Ok(())) => Ok(report),
-            (Ok(_report), Err(restore_error)) => Err(restore_error),
-            (Err(write_error), Ok(())) => Err(write_error),
-            (Err(write_error), Err(restore_error)) => {
-                Err(cache_error_with_restore_error(write_error, restore_error))
-            }
+            (Ok(report), Ok(())) => Ok((report, alias_reports)),
+            (Ok(report), Err((table_id, restore_error))) => Err(write_all_cache_failure(
+                restore_error,
+                alias_reports,
+                Some(table_id),
+                Some(report),
+            )),
+            (Err(write_error), _) => Err(write_all_cache_failure(
+                write_error,
+                alias_reports,
+                None,
+                None,
+            )),
         }
     }
 }

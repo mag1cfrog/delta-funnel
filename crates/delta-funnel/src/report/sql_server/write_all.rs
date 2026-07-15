@@ -179,20 +179,46 @@ pub struct WriteAllCacheAliasReport {
     alias: String,
     output_indexes: Vec<usize>,
     status: WriteAllCacheAliasStatus,
+    phase_timings: Vec<PhaseTimingReport>,
+    failed_phase: Option<String>,
 }
 
 impl WriteAllCacheAliasReport {
-    pub(crate) fn new(
+    pub(crate) fn selected(
         table_id: u64,
         alias: impl Into<String>,
         output_indexes: Vec<usize>,
-        status: WriteAllCacheAliasStatus,
     ) -> Self {
         Self {
             table_id,
             alias: alias.into(),
             output_indexes,
+            status: WriteAllCacheAliasStatus::Selected,
+            phase_timings: Vec::new(),
+            failed_phase: None,
+        }
+    }
+
+    pub(crate) fn executed(
+        table_id: u64,
+        alias: impl Into<String>,
+        output_indexes: Vec<usize>,
+        status: WriteAllCacheAliasStatus,
+        phase_timings: Vec<PhaseTimingReport>,
+        failed_phase: Option<&'static str>,
+    ) -> Self {
+        debug_assert_ne!(status, WriteAllCacheAliasStatus::Selected);
+        debug_assert_eq!(
+            status == WriteAllCacheAliasStatus::Failed,
+            failed_phase.is_some()
+        );
+        Self {
+            table_id,
+            alias: alias.into(),
+            output_indexes,
             status,
+            phase_timings,
+            failed_phase: failed_phase.map(str::to_owned),
         }
     }
 
@@ -219,6 +245,21 @@ impl WriteAllCacheAliasReport {
     pub const fn status(&self) -> WriteAllCacheAliasStatus {
         self.status
     }
+
+    /// Returns lifecycle timings for an attempted cache alias.
+    ///
+    /// Plan-shaped [`WriteAllCacheAliasStatus::Selected`] reports return an
+    /// empty slice because no lifecycle phase was attempted.
+    #[must_use]
+    pub fn phase_timings(&self) -> &[PhaseTimingReport] {
+        &self.phase_timings
+    }
+
+    /// Returns the primary failed lifecycle phase for a failed alias.
+    #[must_use]
+    pub fn failed_phase(&self) -> Option<&str> {
+        self.failed_phase.as_deref()
+    }
 }
 
 impl fmt::Debug for WriteAllCacheAliasReport {
@@ -229,6 +270,8 @@ impl fmt::Debug for WriteAllCacheAliasReport {
             .field("alias", &sanitize_text_for_display(&self.alias))
             .field("output_indexes", &self.output_indexes)
             .field("status", &self.status)
+            .field("phase_timings", &self.phase_timings)
+            .field("failed_phase", &self.failed_phase)
             .finish()
     }
 }
@@ -248,6 +291,66 @@ pub enum WriteAllCacheAliasStatus {
     /// The workflow may still contain per-output failures. This status only
     /// states that cache setup and restoration completed for the alias.
     MaterializedAndRestored,
+    /// Cache materialization, installation, or restoration failed.
+    Failed,
+}
+
+/// Structured details retained when a cache-enabled `write_all` call fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAllCacheFailure {
+    aliases: Vec<WriteAllCacheAliasReport>,
+    primary_failed_alias_table_id: Option<u64>,
+    workflow: Option<MssqlWorkflowWriteReport>,
+}
+
+impl WriteAllCacheFailure {
+    pub(crate) fn new(
+        aliases: Vec<WriteAllCacheAliasReport>,
+        primary_failed_alias_table_id: Option<u64>,
+        workflow: Option<MssqlWorkflowWriteReport>,
+    ) -> Self {
+        Self {
+            aliases,
+            primary_failed_alias_table_id,
+            workflow,
+        }
+    }
+
+    /// Returns every attempted cache alias in deterministic selection order.
+    #[must_use]
+    pub fn aliases(&self) -> &[WriteAllCacheAliasReport] {
+        &self.aliases
+    }
+
+    /// Returns the table id whose cache phase caused the primary failure.
+    #[must_use]
+    pub const fn primary_failed_alias_table_id(&self) -> Option<u64> {
+        self.primary_failed_alias_table_id
+    }
+
+    /// Returns the completed output workflow when restoration later failed.
+    #[must_use]
+    pub const fn workflow(&self) -> Option<&MssqlWorkflowWriteReport> {
+        self.workflow.as_ref()
+    }
+}
+
+impl WriteAllCacheAliasStatus {
+    /// Returns the stable lower-snake-case report value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::MaterializedAndRestored => "materialized_and_restored",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl fmt::Display for WriteAllCacheAliasStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Registered derived alias skipped during conservative cache selection.

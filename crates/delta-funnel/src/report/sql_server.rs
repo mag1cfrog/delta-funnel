@@ -13,5 +13,6 @@ pub use write::{
 };
 pub use write_all::{
     WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
-    WriteAllCacheCandidateSkipReason, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
+    WriteAllCacheCandidateSkipReason, WriteAllCacheFailure, WriteAllCacheReport,
+    WriteAllNoCacheReason, WriteAllReport,
 };

@@ -69,6 +69,11 @@ fn delta_funnel_error_parts(
             "preview_failed",
             Some(json_value_to_py(py, &context.to_json_value())?),
         )),
+        delta_funnel::DeltaFunnelError::WriteAllCache { failure, .. } => Ok((
+            "write_all_cache",
+            "write_all_cache_failed",
+            Some(json_value_to_py(py, &failure.to_json_value())?),
+        )),
         delta_funnel::DeltaFunnelError::Config { .. } => Ok(("config", "config", None)),
         delta_funnel::DeltaFunnelError::InvalidSourceName { .. } => {
             Ok(("source_config", "invalid_source_name", None))
@@ -215,9 +220,9 @@ mod tests {
     use crate::json::json_value_to_py;
     use arrow_schema::{DataType, Field, Schema};
     use pyo3::IntoPyObjectExt;
-    use pyo3::exceptions::PyKeyError;
+    use pyo3::exceptions::{PyKeyError, PyRuntimeError};
     use pyo3::prelude::*;
-    use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule};
+    use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyModule};
 
     #[test]
     fn module_exports_delta_funnel_error() -> PyResult<()> {
@@ -603,6 +608,103 @@ mod tests {
                 context.get_item("phase")?.extract::<String>()?,
                 "query_stream_setup"
             );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_cache_failure_maps_exact_python_phase_kind_and_context() -> PyResult<()> {
+        Python::attach(|py| {
+            let runtime =
+                delta_funnel::DeltaFunnelRuntime::new().map_err(|error| py_error(py, error))?;
+            let connection = delta_funnel::MssqlConnectionConfig::new(
+                "server=tcp:localhost,1433;database=test;User ID=cache-user;Password=super-secret-cache-password;TrustServerCertificate=yes",
+            )
+            .map_err(|error| py_error(py, error))?;
+            let mut session = delta_funnel::DeltaFunnelSession::new(
+                delta_funnel::SessionOptions::new().with_default_mssql_connection(connection),
+            )
+            .map_err(|error| py_error(py, error))?;
+            let pending_big = runtime
+                .table_from_sql(&mut session, "select 1 as id")
+                .map_err(|error| py_error(py, error))?;
+            let big = session
+                .register_alias("big", &pending_big)
+                .map_err(|error| py_error(py, error))?;
+            let first = runtime
+                .table_from_sql(&mut session, "select id from big")
+                .map_err(|error| py_error(py, error))?;
+            let second = runtime
+                .table_from_sql(&mut session, "select id from big")
+                .map_err(|error| py_error(py, error))?;
+            let output = |table, output_name: &str, target_name: &str| {
+                let target = delta_funnel::MssqlTargetConfig::new(
+                    delta_funnel::MssqlTargetTable::new("dbo", target_name)
+                        .map_err(|error| py_error(py, error))?,
+                )
+                .with_load_mode(delta_funnel::LoadMode::AppendExisting);
+                Ok::<_, PyErr>(delta_funnel::OutputWritePlan::new(
+                    table,
+                    delta_funnel::MssqlOutputTarget::new(
+                        output_name,
+                        target,
+                        delta_funnel::RunMode::Execute,
+                    ),
+                ))
+            };
+            let outputs = [
+                output(first, "first", "first_target")?,
+                output(second, "second", "second_target")?,
+            ];
+
+            session
+                .context()
+                .deregister_table("big")
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            let rust_error = runtime
+                .write_all(&session, &outputs)
+                .err()
+                .ok_or_else(|| PyRuntimeError::new_err("expected write_all cache failure"))?;
+            let error = delta_funnel_error_to_py(py, rust_error)?;
+
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "write_all_cache"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "write_all_cache_failed"
+            );
+            let message = error.value(py).getattr("message")?.extract::<String>()?;
+            assert!(!message.contains("cache-user"));
+            assert!(!message.contains("super-secret-cache-password"));
+            let context = error.value(py).getattr("context")?;
+            let context = context.cast::<PyDict>()?;
+            let aliases = required_item(context, "aliases")?;
+            let aliases = aliases.cast::<PyList>()?;
+            assert_eq!(aliases.len(), 1);
+            let alias = aliases.get_item(0)?;
+            let alias = alias.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(alias, "status")?.extract::<String>()?,
+                "failed"
+            );
+            assert_eq!(
+                required_item(alias, "failed_phase")?.extract::<String>()?,
+                "cache_alias_dataframe_resolution"
+            );
+            assert_eq!(
+                required_item(alias, "phase_timings")?
+                    .cast::<PyList>()?
+                    .len(),
+                8
+            );
+            assert_eq!(
+                required_item(context, "primary_failed_alias_table_id")?.extract::<u64>()?,
+                big.id()
+            );
+            assert!(required_item(context, "workflow")?.is_none());
 
             Ok(())
         })

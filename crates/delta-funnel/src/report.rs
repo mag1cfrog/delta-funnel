@@ -29,7 +29,7 @@ pub use sql_server::{
     MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
     MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport, WriteAllCacheAliasReport,
     WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
-    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
+    WriteAllCacheFailure, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
 };
 
 /// Saturates a platform-sized count into the public `u64` report shape.
