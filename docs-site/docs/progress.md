@@ -105,7 +105,8 @@ report = session.write_all(outputs, progress=True)
 An action starts with a spinner beside its current phase. For example, it may
 show metadata loading, query planning, cache materialization, connecting,
 writing, validation, or cleanup. The spinner means Delta Funnel does not have a
-truthful total for the active work.
+truthful total for the active work. A dim timer continues across phase changes
+and reports the finished action duration to millisecond precision.
 
 ### Delta file progress
 
