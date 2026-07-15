@@ -55,6 +55,47 @@ report = session.write_all(
 )
 ```
 
+## Profile every attempted output
+
+Enable detailed DataFusion profiling for each output query:
+
+```python
+report = session.write_all(outputs, options={"profile": True})
+```
+
+Profiling works with both cache modes. For example, disable shared caching and
+enable profiling in the same call:
+
+```python
+report = session.write_all(
+    outputs,
+    options={"cache_mode": "disabled", "profile": True},
+)
+```
+
+Profiles stay with the output result that produced them:
+
+```python
+for output in report["workflow"]["outputs"]:
+    if output["kind"] == "succeeded":
+        profile = output["report"]["execution_profile"]
+    elif output["kind"] == "failed":
+        context = output["failure"]["context"]
+        profile = None if context is None else context["report"]["execution_profile"]
+    else:
+        profile = output["skipped"]["execution_profile"]  # Always None.
+```
+
+An attempted output can still have `None` when it failed before a profile
+observer could be installed. An output skipped after an earlier failure was
+not attempted and always has `execution_profile=None`. The top-level report and
+output status wrappers do not duplicate these fields.
+
+Omitting `profile`, or passing `None` or `False`, disables profiling. Only the
+actual Boolean `True` enables it. The `options` argument remains unavailable
+for dry runs. For exact Python and Rust contracts, profile outcomes, and the
+profile schema, see [API references](../reference/api.md#multi-output-sql-server-profiling).
+
 ## Interpret failures
 
 A report can contain failed or skipped outputs when top-level orchestration

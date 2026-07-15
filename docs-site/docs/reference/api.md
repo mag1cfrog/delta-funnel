@@ -138,6 +138,68 @@ The existing `write_to_mssql` methods remain default-disabled. For query phase
 boundaries, outcome interpretation, and failure-context access, see
 [returned SQL Server output diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-sql-server-output-diagnostics).
 
+## Multi-Output SQL Server Profiling
+
+`Session.write_all(...)` accepts this typed options dictionary on execute
+calls:
+
+```python
+WriteAllCacheMode: TypeAlias = Literal["auto", "disabled"]
+
+class WriteAllExecutionOptions(TypedDict, total=False):
+    cache_mode: WriteAllCacheMode
+    profile: bool | None
+```
+
+Enable one independent detailed profile for every attempted output:
+
+```python
+report = session.write_all(outputs, options={"profile": True})
+```
+
+Omission, `None`, and `False` leave detailed profiling disabled. Only the
+actual Boolean `True` enables it; integers, strings, and other truthy values
+are rejected. Any `options` dictionary, including an empty one, is rejected
+when `dry_run=True`.
+
+Returned profiles are nested under the output report that owns them:
+
+| Output status | Python profile location | Rust profile location |
+| --- | --- | --- |
+| `succeeded` | `output["report"]["execution_profile"]` | `MssqlOutputWriteStatus::Succeeded(report)` and `report.execution_profile()` |
+| `failed` | `output["failure"]["context"]["report"]["execution_profile"]`, when context exists | `MssqlOutputWriteStatus::Failed(failure)`, then `failure.context()` and `context.report().execution_profile()` |
+| `skipped` | `output["skipped"]["execution_profile"]`, always `None` | No profile because the output was not attempted |
+
+An attempted output that fails before its physical plan or profile observer
+exists has no profile. Each attempt uses a fresh physical plan, so repeated
+writes of the same lazy table still produce separate profiles. The
+`WriteAllReport`, its `workflow` object, and each output status wrapper do not
+duplicate `execution_profile`.
+
+The profile outcome describes the output query stream, not the final SQL
+Server result. Normal end-of-stream is `success`, an upstream DataFusion error
+is `error`, and dropping the stream before end-of-stream is `cancelled`. A
+later SQL Server failure can therefore retain a `success` profile. See
+[returned SQL Server output diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-sql-server-output-diagnostics)
+for the shared stream-outcome semantics.
+
+Rust callers select the same mode with `WriteAllOptions`:
+
+```rust
+use delta_funnel::{ExecutionProfileMode, WriteAllOptions};
+
+let options = WriteAllOptions::new()
+    .with_execution_profile_mode(ExecutionProfileMode::Detailed);
+let report = runtime.write_all_with_options(&session, &outputs, options)?;
+```
+
+The default `write_all` methods and `WriteAllOptions::default()` keep profiling
+disabled. Profiling composes with either `WriteAllCacheMode`; cache selection
+does not change per-output profile ownership. Each available profile also
+supplies one bounded `query_execution_profile_terminal` event. See
+[terminal execution profiles](../advanced/tracing-and-diagnostics.md#inspect-terminal-execution-profiles)
+for its tracing contract.
+
 ## Execution Profile Model
 
 The Rust crate exports one immutable execution-profile model for bounded
