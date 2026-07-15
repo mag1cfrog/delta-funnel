@@ -12,7 +12,15 @@ use super::kernel::{
 
 // Reader features are Delta correctness requirements. Add features only after
 // the provider path proves the relevant semantics before rows reach DataFusion.
-const SUPPORTED_READER_FEATURES: &[&str] = &["timestampNtz", "deletionVectors", "columnMapping"];
+const SUPPORTED_READER_FEATURES: &[&str] = &[
+    "timestampNtz",
+    "deletionVectors",
+    "columnMapping",
+    "v2Checkpoint",
+    "vacuumProtocolCheck",
+    "typeWidening",
+    "typeWidening-preview",
+];
 
 /// Successful protocol preflight for one source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,6 +471,18 @@ mod tests {
         };
 
         assert!(super::ensure_protocol_supported(&report).is_ok());
+    }
+
+    #[test]
+    fn protocol_policy_allows_new_kernel_reader_features() {
+        for feature in [
+            "v2Checkpoint",
+            "vacuumProtocolCheck",
+            "typeWidening",
+            "typeWidening-preview",
+        ] {
+            assert!(super::unsupported_reader_feature(&[feature.to_owned()]).is_none());
+        }
     }
 
     #[test]
