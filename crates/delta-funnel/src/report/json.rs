@@ -611,6 +611,9 @@ impl WriteAllCacheAliasReport {
                 "status": self.status().as_str(),
                 "phase_timings": phase_timings_value(self.phase_timings()),
                 "failed_phase": self.failed_phase(),
+                "execution_profile": self
+                    .execution_profile()
+                    .map(QueryExecutionProfile::to_json_value),
             }),
         }
     }
@@ -1400,6 +1403,7 @@ mod tests {
         assert_eq!(value["kind"], "cache_aliases");
         assert_eq!(value["aliases"][0]["alias"], "shared_orders");
         assert_eq!(value["aliases"][0]["status"], "materialized_and_restored");
+        assert!(value["aliases"][0]["execution_profile"].is_null());
         assert_eq!(
             value["aliases"][0]["phase_timings"][0]["phase_name"],
             "cache_alias_restore"
@@ -1426,8 +1430,10 @@ mod tests {
         assert_eq!(selected.status().to_string(), "selected");
         assert!(selected.phase_timings().is_empty());
         assert_eq!(selected.failed_phase(), None);
+        assert_eq!(selected.execution_profile(), None);
         assert!(selected_value.get("phase_timings").is_none());
         assert!(selected_value.get("failed_phase").is_none());
+        assert!(selected_value.get("execution_profile").is_none());
 
         let failed = WriteAllCacheAliasReport::executed(
             9,
@@ -1444,6 +1450,7 @@ mod tests {
         assert_eq!(failed.status().to_string(), "failed");
         assert_eq!(failed_value["status"], "failed");
         assert_eq!(failed_value["failed_phase"], "cache_alias_install");
+        assert!(failed_value["execution_profile"].is_null());
         assert_eq!(failed_value["phase_timings"][0]["status"]["kind"], "failed");
     }
 

@@ -11,12 +11,14 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
-    DeltaFunnelError, MssqlOutputBatchStream, MssqlWorkflowWriteReport, PhaseTimingReport,
-    ReportReasonCode, WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheFailure,
+    DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStream, MssqlWorkflowWriteReport,
+    PhaseTimingReport, QueryExecutionProfile, QueryExecutionScope, ReportReasonCode,
+    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheFailure,
     observability::DeltaProviderScanOutcome,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
         DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
+        execution_profile::QueryExecutionProfileConsumer,
     },
     report::PhaseTimer,
     support::sanitize_text_for_display,
@@ -26,8 +28,8 @@ use super::super::super::{
     DeltaFunnelSession, LazyTable,
     errors::{mssql_scoped_cache_alias_error, unknown_cached_alias_error},
     query_handoff::{
-        DeltaFileProgressSampler, finalize_tracked_query_execution,
-        track_partitioned_scan_completion,
+        DeltaFileProgressSampler, clone_terminal_execution_profile,
+        finalize_tracked_query_execution, track_partitioned_query_execution_completion,
     },
 };
 use super::MssqlDerivedCacheAliasPlan;
@@ -51,12 +53,14 @@ const CACHE_ALIAS_MATERIALIZATION_PHASES: [&str; 5] = [
 struct MaterializedCache {
     provider: Arc<dyn TableProvider>,
     phase_timings: Vec<PhaseTimingReport>,
+    execution_profile: Option<QueryExecutionProfile>,
 }
 
 struct CacheAliasPhaseFailure {
     source: DeltaFunnelError,
     phase_timings: Vec<PhaseTimingReport>,
     failed_phase: &'static str,
+    execution_profile: Option<QueryExecutionProfile>,
 }
 
 impl CacheAliasPhaseFailure {
@@ -73,14 +77,17 @@ impl CacheAliasPhaseFailure {
     ) -> CacheAliasReplacementFailure {
         CacheAliasReplacementFailure {
             source: self.source,
-            report: Some(WriteAllCacheAliasReport::executed(
-                table_id,
-                alias,
-                output_indexes,
-                WriteAllCacheAliasStatus::Failed,
-                self.phase_timings,
-                Some(self.failed_phase),
-            )),
+            report: Some(
+                WriteAllCacheAliasReport::executed(
+                    table_id,
+                    alias,
+                    output_indexes,
+                    WriteAllCacheAliasStatus::Failed,
+                    self.phase_timings,
+                    Some(self.failed_phase),
+                )
+                .with_execution_profile(self.execution_profile),
+            ),
         }
     }
 }
@@ -115,6 +122,7 @@ pub(crate) struct MssqlScopedCacheAliasReplacement<'a> {
     output_indexes: Vec<usize>,
     original_provider: Arc<dyn TableProvider>,
     phase_timings: Vec<PhaseTimingReport>,
+    execution_profile: Option<QueryExecutionProfile>,
 }
 
 impl<'a> MssqlScopedCacheAliasReplacement<'a> {
@@ -125,6 +133,7 @@ impl<'a> MssqlScopedCacheAliasReplacement<'a> {
         output_indexes: Vec<usize>,
         original_provider: Arc<dyn TableProvider>,
         phase_timings: Vec<PhaseTimingReport>,
+        execution_profile: Option<QueryExecutionProfile>,
     ) -> Self {
         Self {
             context,
@@ -133,6 +142,7 @@ impl<'a> MssqlScopedCacheAliasReplacement<'a> {
             output_indexes,
             original_provider,
             phase_timings,
+            execution_profile,
         }
     }
 
@@ -156,6 +166,7 @@ impl<'a> MssqlScopedCacheAliasReplacement<'a> {
             output_indexes,
             original_provider,
             mut phase_timings,
+            execution_profile,
         } = self;
         let restore_timer = PhaseTimer::start(CACHE_ALIAS_RESTORE_PHASE);
         let restore_result = context
@@ -192,7 +203,8 @@ impl<'a> MssqlScopedCacheAliasReplacement<'a> {
             status,
             phase_timings,
             failed_phase,
-        );
+        )
+        .with_execution_profile(execution_profile);
         (report, restore_result)
     }
 }
@@ -213,9 +225,14 @@ impl DeltaFunnelSession {
         table: &LazyTable,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlScopedCacheAliasReplacement<'_>, DeltaFunnelError> {
-        self.replace_registered_derived_alias_with_cache_attempt(table, Vec::new(), reporter)
-            .await
-            .map_err(|failure| failure.source)
+        self.replace_registered_derived_alias_with_cache_attempt(
+            table,
+            Vec::new(),
+            reporter,
+            ExecutionProfileMode::Disabled,
+        )
+        .await
+        .map_err(|failure| failure.source)
     }
 
     async fn replace_registered_derived_alias_with_cache_attempt(
@@ -223,6 +240,7 @@ impl DeltaFunnelSession {
         table: &LazyTable,
         output_indexes: Vec<usize>,
         reporter: Option<&ProgressReporter>,
+        profile_mode: ExecutionProfileMode,
     ) -> Result<MssqlScopedCacheAliasReplacement<'_>, CacheAliasReplacementFailure> {
         let registered = self
             .registered_derived_for_scoped_cache_alias(table)
@@ -246,8 +264,9 @@ impl DeltaFunnelSession {
         let MaterializedCache {
             provider,
             mut phase_timings,
+            execution_profile,
         } = self
-            .materialize_cache(alias_name.as_str(), reporter)
+            .materialize_cache(alias_name.as_str(), reporter, profile_mode)
             .await
             .map_err(|failure| {
                 failure.into_alias_failure(table.id(), alias_name.clone(), output_indexes.clone())
@@ -272,6 +291,7 @@ impl DeltaFunnelSession {
                         source: *failure.source,
                         phase_timings,
                         failed_phase: CACHE_ALIAS_INSTALL_PHASE,
+                        execution_profile,
                     }
                     .into_alias_failure(table.id(), alias_name, output_indexes));
                 }
@@ -284,6 +304,7 @@ impl DeltaFunnelSession {
             output_indexes,
             original_provider,
             phase_timings,
+            execution_profile,
         ))
     }
 
@@ -291,6 +312,7 @@ impl DeltaFunnelSession {
         &self,
         cache_aliases: &[MssqlDerivedCacheAliasPlan],
         reporter: Option<&ProgressReporter>,
+        profile_mode: ExecutionProfileMode,
     ) -> Result<Vec<MssqlScopedCacheAliasReplacement<'_>>, DeltaFunnelError> {
         let mut replacements = Vec::new();
 
@@ -311,6 +333,7 @@ impl DeltaFunnelSession {
                     &table,
                     cache_alias.output_indexes().to_vec(),
                     reporter,
+                    profile_mode,
                 )
                 .await
             {
@@ -338,6 +361,7 @@ impl DeltaFunnelSession {
         &self,
         alias_name: &str,
         reporter: Option<&ProgressReporter>,
+        profile_mode: ExecutionProfileMode,
     ) -> Result<MaterializedCache, CacheAliasPhaseFailure> {
         let materialization_timer = PhaseTimer::start(CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE);
         let mut phase_timings = Vec::with_capacity(8);
@@ -351,6 +375,7 @@ impl DeltaFunnelSession {
                     phase_timings,
                     resolution_timer,
                     materialization_timer,
+                    None,
                 ));
             }
         };
@@ -366,6 +391,7 @@ impl DeltaFunnelSession {
                     phase_timings,
                     planning_timer,
                     materialization_timer,
+                    None,
                 ));
             }
         };
@@ -373,6 +399,17 @@ impl DeltaFunnelSession {
 
         let schema = physical_plan.schema();
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        let (profile_consumer, profile_result) = match profile_mode {
+            ExecutionProfileMode::Disabled => (None, None),
+            ExecutionProfileMode::Detailed => {
+                let (consumer, result) = QueryExecutionProfileConsumer::register(
+                    Arc::clone(&physical_plan),
+                    QueryExecutionScope::WriteAllCacheAlias,
+                    None,
+                );
+                (Some(consumer), Some(result))
+            }
+        };
         let stream_setup_timer = PhaseTimer::start(CACHE_ALIAS_STREAM_SETUP_PHASE);
         let sampler = reporter.map(|reporter| {
             DeltaFileProgressSampler::new(
@@ -387,6 +424,7 @@ impl DeltaFunnelSession {
             task_ctx,
             read_stats_handles,
             alias_name,
+            profile_consumer,
         ) {
             Ok(streams) => streams,
             Err(error) => {
@@ -395,6 +433,7 @@ impl DeltaFunnelSession {
                     phase_timings,
                     stream_setup_timer,
                     materialization_timer,
+                    clone_terminal_execution_profile(profile_result),
                 ));
             }
         };
@@ -409,10 +448,12 @@ impl DeltaFunnelSession {
                     phase_timings,
                     collect_timer,
                     materialization_timer,
+                    clone_terminal_execution_profile(profile_result),
                 ));
             }
         };
         phase_timings.push(collect_timer.completed());
+        let execution_profile = clone_terminal_execution_profile(profile_result);
 
         let memtable_timer = PhaseTimer::start(CACHE_ALIAS_MEMTABLE_BUILD_PHASE);
         let cached_provider = match MemTable::try_new(schema, partitions) {
@@ -423,6 +464,7 @@ impl DeltaFunnelSession {
                     phase_timings,
                     memtable_timer,
                     materialization_timer,
+                    execution_profile,
                 ));
             }
         };
@@ -433,6 +475,7 @@ impl DeltaFunnelSession {
         Ok(MaterializedCache {
             provider,
             phase_timings,
+            execution_profile,
         })
     }
 
@@ -515,6 +558,7 @@ fn cache_alias_materialization_failure(
     mut phase_timings: Vec<PhaseTimingReport>,
     failed_timer: PhaseTimer,
     materialization_timer: PhaseTimer,
+    execution_profile: Option<QueryExecutionProfile>,
 ) -> CacheAliasPhaseFailure {
     let failed_phase_index = phase_timings.len();
     let failed_phase = CACHE_ALIAS_MATERIALIZATION_PHASES[failed_phase_index];
@@ -539,6 +583,7 @@ fn cache_alias_materialization_failure(
         source,
         phase_timings,
         failed_phase,
+        execution_profile,
     }
 }
 
@@ -551,6 +596,7 @@ fn start_cache_partition_streams(
     task_ctx: Arc<TaskContext>,
     read_stats_handles: Vec<DeltaProviderReadStatsHandle>,
     alias_name: &str,
+    profile_consumer: Option<QueryExecutionProfileConsumer>,
 ) -> Result<Vec<MssqlOutputBatchStream>, DeltaFunnelError> {
     let streams = match execute_stream_partitioned(physical_plan, task_ctx) {
         Ok(streams) => streams,
@@ -558,7 +604,7 @@ fn start_cache_partition_streams(
             finalize_tracked_query_execution(
                 &read_stats_handles,
                 None,
-                None,
+                profile_consumer,
                 DeltaProviderScanOutcome::Error,
             );
             return Err(mssql_scoped_cache_alias_error(
@@ -580,9 +626,10 @@ fn start_cache_partition_streams(
             stream
         })
         .collect();
-    Ok(track_partitioned_scan_completion(
+    Ok(track_partitioned_query_execution_completion(
         streams,
         read_stats_handles,
+        profile_consumer,
     ))
 }
 
@@ -804,7 +851,10 @@ mod tests {
         common::{DataFusionError, Result as DataFusionResult},
         execution::session_state::{CacheFactory, SessionState},
         logical_expr::LogicalPlan,
-        physical_plan::collect_partitioned,
+        physical_plan::{
+            DisplayAs, DisplayFormatType, PlanProperties, SendableRecordBatchStream,
+            collect_partitioned, test::exec::MockExec,
+        },
     };
     use futures_util::stream;
     use tokio::sync::Notify;
@@ -813,12 +863,13 @@ mod tests {
 
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, ExecutionProfileMode, LoadMode,
-        MssqlStreamBenchmarkOutputWriter, PhaseStatus,
+        MssqlStreamBenchmarkOutputWriter, PhaseStatus, QueryExecutionOutcome, QueryExecutionScope,
         observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         orchestrator::session::{
             DeltaFunnelSession, SessionOptions,
             test_support::{
                 StreamSetupFailingPlan, execute_output_request, marker_values_from_batches,
+                plan_lifetime_tracking_marker_region_provider,
                 scan_counting_marker_region_provider, secret_connection,
             },
         },
@@ -830,6 +881,94 @@ mod tests {
     #[derive(Debug)]
     struct RecordingCacheFactory {
         calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct MismatchedBatchProvider {
+        declared_schema: SchemaRef,
+        batch: RecordBatch,
+    }
+
+    #[derive(Debug)]
+    struct MismatchedBatchExec(MockExec);
+
+    impl DisplayAs for MismatchedBatchExec {
+        fn fmt_as(
+            &self,
+            display_type: DisplayFormatType,
+            formatter: &mut fmt::Formatter,
+        ) -> fmt::Result {
+            self.0.fmt_as(display_type, formatter)
+        }
+    }
+
+    impl ExecutionPlan for MismatchedBatchExec {
+        fn name(&self) -> &str {
+            "MismatchedBatchExec"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.0.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            Vec::new()
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if !children.is_empty() {
+                return Err(DataFusionError::Plan(
+                    "MismatchedBatchExec requires no children".to_owned(),
+                ));
+            }
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            self.0.execute(partition, context)
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for MismatchedBatchProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.declared_schema)
+        }
+
+        fn table_type(&self) -> datafusion::logical_expr::TableType {
+            datafusion::logical_expr::TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[datafusion::logical_expr::Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(MismatchedBatchExec(
+                MockExec::new(
+                    vec![Ok(self.batch.clone())],
+                    Arc::clone(&self.declared_schema),
+                )
+                .with_use_task(false),
+            )))
+        }
     }
 
     struct DropFlag(Arc<AtomicBool>);
@@ -1020,8 +1159,19 @@ mod tests {
             .collect()
     }
 
+    fn execution_profile_events(events: &CapturedEvents) -> Vec<CapturedEvent> {
+        events
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("telemetry_event").map(String::as_str)
+                    == Some("query_execution_profile_terminal")
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    async fn cache_stream_setup_error_emits_one_error_summary()
+    async fn cache_stream_setup_error_emits_terminal_summaries()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("cache-stream-setup-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -1036,9 +1186,20 @@ mod tests {
             Arc::new(StreamSetupFailingPlan::new(physical_plan));
         let handles = collect_delta_provider_read_stats_handles(failing_plan.as_ref());
         assert_eq!(handles.len(), 1);
+        let (consumer, profile_result) = QueryExecutionProfileConsumer::register(
+            Arc::clone(&failing_plan),
+            QueryExecutionScope::WriteAllCacheAlias,
+            None,
+        );
 
         let capture = TracingCapture::start();
-        let result = start_cache_partition_streams(failing_plan, task_ctx, handles, "orders_cache");
+        let result = start_cache_partition_streams(
+            failing_plan,
+            task_ctx,
+            handles,
+            "orders_cache",
+            Some(consumer),
+        );
         let summaries = provider_io_events(capture.captured());
 
         assert!(result.is_err());
@@ -1071,6 +1232,136 @@ mod tests {
                 Some("0")
             );
         }
+        let profile = profile_result
+            .profile()
+            .ok_or("expected cache stream setup profile")?;
+        assert_eq!(profile.scope(), QueryExecutionScope::WriteAllCacheAlias);
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Error);
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_partition_error_attaches_profile_before_report_serialization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::empty());
+        let physical_plan: Arc<dyn ExecutionPlan> = Arc::new(
+            MockExec::new(
+                vec![Err(DataFusionError::Execution(
+                    "injected live cache partition failure".to_owned(),
+                ))],
+                schema,
+            )
+            .with_use_task(false),
+        );
+        let (consumer, profile_result) = QueryExecutionProfileConsumer::register(
+            Arc::clone(&physical_plan),
+            QueryExecutionScope::WriteAllCacheAlias,
+            None,
+        );
+        let capture = TracingCapture::start();
+        let streams = start_cache_partition_streams(
+            physical_plan,
+            Arc::new(TaskContext::default()),
+            Vec::new(),
+            "failing_cache",
+            Some(consumer),
+        )?;
+        assert_eq!(profile_result.profile(), None);
+
+        let source = collect_cache_partitions(streams, None, "failing_cache")
+            .await
+            .err()
+            .ok_or("expected live cache partition failure")?;
+        let execution_profile = clone_terminal_execution_profile(Some(profile_result))
+            .ok_or("expected terminal cache execution profile")?;
+        assert_eq!(execution_profile.outcome(), QueryExecutionOutcome::Error);
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+
+        let failure = cache_alias_materialization_failure(
+            source,
+            vec![
+                PhaseTimingReport::completed(
+                    CACHE_ALIAS_DATAFRAME_RESOLUTION_PHASE,
+                    Duration::ZERO,
+                ),
+                PhaseTimingReport::completed(CACHE_ALIAS_PHYSICAL_PLANNING_PHASE, Duration::ZERO),
+                PhaseTimingReport::completed(CACHE_ALIAS_STREAM_SETUP_PHASE, Duration::ZERO),
+            ],
+            PhaseTimer::start(CACHE_ALIAS_EXECUTE_COLLECT_PHASE),
+            PhaseTimer::start(CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE),
+            Some(execution_profile),
+        )
+        .into_alias_failure(7, "failing_cache".to_owned(), vec![0]);
+        let report = failure.report.ok_or("expected failed cache alias report")?;
+        assert_eq!(
+            report
+                .execution_profile()
+                .map(QueryExecutionProfile::outcome),
+            Some(QueryExecutionOutcome::Error)
+        );
+        let value = report.to_json_value();
+        assert_eq!(value["execution_profile"]["scope"], "write_all_cache_alias");
+        assert_eq!(value["execution_profile"]["outcome"], "error");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memtable_failure_retains_successful_execution_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let declared_schema = Arc::new(Schema::new(vec![Field::new(
+            "declared",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "actual",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = marker_batch(&batch_schema, vec!["value"])?;
+        let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.context().register_table(
+            "mismatched_cache",
+            Arc::new(MismatchedBatchProvider {
+                declared_schema,
+                batch,
+            }),
+        )?;
+        let capture = TracingCapture::start();
+
+        let failure = session
+            .materialize_cache("mismatched_cache", None, ExecutionProfileMode::Detailed)
+            .await
+            .err()
+            .ok_or("expected MemTable schema failure")?
+            .into_alias_failure(7, "mismatched_cache".to_owned(), vec![0]);
+        let report = failure.report.ok_or("expected failed cache alias report")?;
+
+        assert_eq!(report.status(), WriteAllCacheAliasStatus::Failed);
+        assert_eq!(
+            report.failed_phase(),
+            Some(CACHE_ALIAS_MEMTABLE_BUILD_PHASE)
+        );
+        let profile = report
+            .execution_profile()
+            .ok_or("expected completed cache execution profile")?;
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+        assert!(!profile.partial());
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+        assert_cache_phase_statuses(
+            &report,
+            [
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::completed(),
+                PhaseStatus::failed(),
+                PhaseStatus::failed(),
+                PhaseStatus::not_started(ReportReasonCode::PriorFailure),
+                PhaseStatus::not_started(ReportReasonCode::PriorFailure),
+            ],
+        );
         Ok(())
     }
 
@@ -1235,6 +1526,7 @@ mod tests {
                 completed_timings,
                 PhaseTimer::start(failed_phase),
                 PhaseTimer::start(CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE),
+                None,
             );
 
             assert_eq!(
@@ -1301,15 +1593,25 @@ mod tests {
         let default_schema = default_plan.schema();
         let default_partitions = collect_partitioned(default_plan, default_task_ctx).await?;
 
+        let without_progress_capture = TracingCapture::start();
         let without_progress = session
-            .materialize_cache("cache_source", None)
+            .materialize_cache("cache_source", None, ExecutionProfileMode::Detailed)
             .await
             .map_err(CacheAliasPhaseFailure::into_source)?;
+        let without_progress_events = execution_profile_events(without_progress_capture.captured());
+        drop(without_progress_capture);
+
         let reporter = ProgressReporter::default();
+        let with_progress_capture = TracingCapture::start();
         let with_progress = session
-            .materialize_cache("cache_source", Some(&reporter))
+            .materialize_cache(
+                "cache_source",
+                Some(&reporter),
+                ExecutionProfileMode::Detailed,
+            )
             .await
             .map_err(CacheAliasPhaseFailure::into_source)?;
+        let with_progress_events = execution_profile_events(with_progress_capture.captured());
 
         let expected_phase_names = [
             CACHE_ALIAS_DATAFRAME_RESOLUTION_PHASE,
@@ -1332,6 +1634,48 @@ mod tests {
                 timing.status() == PhaseStatus::completed() && timing.elapsed_micros().is_some()
             }));
         }
+        let without_progress_profile = without_progress
+            .execution_profile
+            .as_ref()
+            .ok_or("expected cache execution profile without progress")?;
+        let with_progress_profile = with_progress
+            .execution_profile
+            .as_ref()
+            .ok_or("expected cache execution profile with progress")?;
+        for profile in [without_progress_profile, with_progress_profile] {
+            assert_eq!(profile.scope(), QueryExecutionScope::WriteAllCacheAlias);
+            assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+            assert_eq!(profile.delta_funnel_row_limit(), None);
+            assert!(!profile.operators().is_empty());
+        }
+        let operator_shape = |profile: &QueryExecutionProfile| {
+            profile
+                .operators()
+                .iter()
+                .map(|operator| {
+                    (
+                        operator.operator_name().to_owned(),
+                        operator.parent_node_id(),
+                        operator.output_partition_count(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            operator_shape(without_progress_profile),
+            operator_shape(with_progress_profile)
+        );
+        for events in [&without_progress_events, &with_progress_events] {
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].fields.get("scope").map(String::as_str),
+                Some("write_all_cache_alias")
+            );
+            assert_eq!(
+                events[0].fields.get("outcome").map(String::as_str),
+                Some("success")
+            );
+        }
 
         assert_eq!(without_progress.provider.schema(), default_schema);
         assert_eq!(with_progress.provider.schema(), default_schema);
@@ -1344,6 +1688,44 @@ mod tests {
             marker_batches_by_partition(&memtable_partitions(&with_progress.provider).await?)?,
             expected
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_materialization_releases_plan_in_both_profile_modes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for mode in [
+            ExecutionProfileMode::Disabled,
+            ExecutionProfileMode::Detailed,
+        ] {
+            let session = DeltaFunnelSession::new(SessionOptions::default())?;
+            let (provider, last_plan_marker) =
+                plan_lifetime_tracking_marker_region_provider("observed")?;
+            session.context().register_table("cache_source", provider)?;
+
+            let materialized = session
+                .materialize_cache("cache_source", None, mode)
+                .await
+                .map_err(CacheAliasPhaseFailure::into_source)?;
+
+            let plan_released = match last_plan_marker.lock() {
+                Ok(last_plan_marker) => last_plan_marker
+                    .as_ref()
+                    .is_some_and(|marker| marker.upgrade().is_none()),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .as_ref()
+                    .is_some_and(|marker| marker.upgrade().is_none()),
+            };
+            assert!(
+                plan_released,
+                "{mode:?} cache materialization retained its plan"
+            );
+            assert_eq!(
+                materialized.execution_profile.is_some(),
+                mode == ExecutionProfileMode::Detailed
+            );
+        }
         Ok(())
     }
 
@@ -1391,9 +1773,15 @@ mod tests {
         let (mut session, schema) = session_with_fail_once_schema()?;
         let big = register_cache_alias(&mut session).await?;
         schema.fail_next_registration();
+        let capture = TracingCapture::start();
 
         let failure = session
-            .replace_registered_derived_alias_with_cache_attempt(&big, vec![0, 1], None)
+            .replace_registered_derived_alias_with_cache_attempt(
+                &big,
+                vec![0, 1],
+                None,
+                ExecutionProfileMode::Detailed,
+            )
             .await
             .err()
             .ok_or("expected cache install failure")?;
@@ -1410,6 +1798,12 @@ mod tests {
         assert_eq!(report.output_indexes(), &[0, 1]);
         assert_eq!(report.status(), WriteAllCacheAliasStatus::Failed);
         assert_eq!(report.failed_phase(), Some(CACHE_ALIAS_INSTALL_PHASE));
+        let profile = report
+            .execution_profile()
+            .ok_or("expected completed cache materialization profile")?;
+        assert_eq!(profile.scope(), QueryExecutionScope::WriteAllCacheAlias);
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
         assert_cache_phase_statuses(
             &report,
             [
@@ -1535,6 +1929,7 @@ mod tests {
                 restore_schema.fail_next_registration();
             }
         });
+        let capture = TracingCapture::start();
 
         let error = session
             .write_all_cached_with_writer(
@@ -1543,7 +1938,7 @@ mod tests {
                 MssqlStreamBenchmarkOutputWriter,
                 None,
                 Some(&reporter),
-                ExecutionProfileMode::Disabled,
+                ExecutionProfileMode::Detailed,
             )
             .await
             .err()
@@ -1562,6 +1957,14 @@ mod tests {
         let workflow = failure.workflow().ok_or("expected completed workflow")?;
         assert_eq!(workflow.len(), 1);
         assert!(workflow.all_succeeded());
+        let [crate::MssqlOutputWriteStatus::Succeeded(output)] = workflow.outputs() else {
+            return Err("expected successful profiled output".into());
+        };
+        let output_profile = output
+            .execution_profile()
+            .ok_or("expected output execution profile")?;
+        assert_eq!(output_profile.scope(), QueryExecutionScope::MssqlOutput);
+        assert_eq!(output_profile.outcome(), QueryExecutionOutcome::Success);
         assert_eq!(failure.aliases().len(), 1);
         assert_eq!(
             failure.aliases()[0].status(),
@@ -1571,6 +1974,22 @@ mod tests {
             failure.aliases()[0].failed_phase(),
             Some(CACHE_ALIAS_RESTORE_PHASE)
         );
+        let cache_profile = failure.aliases()[0]
+            .execution_profile()
+            .ok_or("expected cache alias execution profile")?;
+        assert_eq!(
+            cache_profile.scope(),
+            QueryExecutionScope::WriteAllCacheAlias
+        );
+        assert_eq!(cache_profile.outcome(), QueryExecutionOutcome::Success);
+        let events = execution_profile_events(capture.captured());
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| {
+            event.fields.get("scope").map(String::as_str) == Some("mssql_output")
+        }));
+        assert!(events.iter().any(|event| {
+            event.fields.get("scope").map(String::as_str) == Some("write_all_cache_alias")
+        }));
         assert_cache_phase_statuses(
             &failure.aliases()[0],
             [
@@ -1650,8 +2069,14 @@ mod tests {
         assert_eq!(source_scans.load(Ordering::SeqCst), 0);
 
         let replacement = session
-            .replace_registered_derived_alias_with_cache(&big, None)
-            .await?;
+            .replace_registered_derived_alias_with_cache_attempt(
+                &big,
+                Vec::new(),
+                None,
+                ExecutionProfileMode::Detailed,
+            )
+            .await
+            .map_err(|failure| failure.source)?;
 
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
@@ -1667,7 +2092,14 @@ mod tests {
         );
         assert_eq!(source_scans.load(Ordering::SeqCst), 1);
 
-        replacement.restore()?;
+        let (report, restore_result) = replacement.restore_with_report();
+        restore_result?;
+        let profile = report
+            .execution_profile()
+            .ok_or("expected cache alias execution profile")?;
+        assert_eq!(profile.scope(), QueryExecutionScope::WriteAllCacheAlias);
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+        assert_eq!(profile.delta_funnel_row_limit(), None);
 
         let direct_restored_big = session
             .context()

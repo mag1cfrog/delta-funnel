@@ -52,14 +52,14 @@ impl WriteAllOptions {
         self.cache_mode
     }
 
-    /// Sets detailed execution profiling for each attempted output.
+    /// Sets detailed execution profiling for each attempted output and cache materialization.
     #[must_use]
     pub const fn with_execution_profile_mode(mut self, mode: ExecutionProfileMode) -> Self {
         self.execution_profile_mode = mode;
         self
     }
 
-    /// Returns the per-output execution profile mode.
+    /// Returns the query execution profile mode.
     #[must_use]
     pub const fn execution_profile_mode(&self) -> ExecutionProfileMode {
         self.execution_profile_mode

@@ -71,7 +71,7 @@ impl ExecutionPlan for StreamSetupFailingPlan {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        self.error.properties()
+        self.child.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

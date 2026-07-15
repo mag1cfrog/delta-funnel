@@ -427,10 +427,28 @@ read `WriteAllCacheFailure::aliases()`,
 original primary error and its source chain.
 
 These lifecycle timings describe cache orchestration boundaries. A detailed
-operator profile, when available, describes work inside one DataFusion
-physical plan and is separately opt-in. Operator work can overlap across the
-phase boundaries above, so operator durations and lifecycle durations are not
-additive. See the
+operator profile is separately opt-in and describes work inside one cache
+physical plan. On a normal Python result, read it from
+`report["cache"]["aliases"][i]["execution_profile"]`. On a cache failure, read
+the same alias-owned field from `error.context["aliases"][i]`. Rust callers use
+`WriteAllCacheAliasReport::execution_profile()` on aliases from either
+`WriteAllCacheReport::CacheAliases` or `WriteAllCacheFailure::aliases()`.
+
+Disabled profiling and pre-plan failures store `None`. Dry-run `selected`
+aliases omit the field. An available cache profile has
+`scope="write_all_cache_alias"` and describes only alias materialization, not
+later reads from the cached table or output queries. Its terminal outcome is
+unchanged by later `MemTable`, install, output, or restore failures. Output
+profiles remain separate with `scope="mssql_output"`.
+
+Every available cache profile supplies exactly one
+[`query_execution_profile_terminal`](#inspect-terminal-execution-profiles)
+event from the same immutable terminal result. The event is a live bounded
+summary, not another report-owned profile. Operator work can overlap across the
+cache phase boundaries above, so operator durations and lifecycle durations are
+not additive. See
+[multi-output SQL Server profiling](../reference/api.md#multi-output-sql-server-profiling)
+for normal and failure navigation and the
 [execution profile model](../reference/api.md#execution-profile-model) for the
 operator-level contract.
 
