@@ -649,6 +649,13 @@ mod tests {
             .collect()
     }
 
+    fn execution_profile_event_count(events: &[CapturedEvent], scope: &str) -> usize {
+        events
+            .iter()
+            .filter(|event| event.fields.get("scope").map(String::as_str) == Some(scope))
+            .count()
+    }
+
     const fn detailed_uncached_write_all_options() -> WriteAllOptions {
         WriteAllOptions::new()
             .with_cache_mode(WriteAllCacheMode::Disabled)
@@ -1207,20 +1214,39 @@ mod tests {
             )?;
             let (reporter, events) = recording_progress();
             let action_task_id = tokio::task::try_id();
+            let capture = TracingCapture::start();
 
             let report = session
                 .write_all_with_progress_and_writer(
                     &[big_output, selected_output],
-                    WriteAllOptions::default(),
+                    WriteAllOptions::new()
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
                     reporter,
                     FakeWorkflowWriter::default(),
                 )
                 .await?;
             assert!(report.all_succeeded());
-            assert!(matches!(
-                report.cache(),
-                WriteAllCacheReport::CacheAliases { .. }
-            ));
+            let WriteAllCacheReport::CacheAliases { aliases, .. } = report.cache() else {
+                return Err("expected cache alias report".into());
+            };
+            let [alias] = aliases.as_slice() else {
+                return Err("expected one cache alias report".into());
+            };
+            let profile = alias
+                .execution_profile()
+                .ok_or("expected cache alias execution profile")?;
+            let provider_snapshot = profile
+                .operators()
+                .iter()
+                .find_map(|operator| operator.delta_provider_read_stats())
+                .ok_or("expected cache profile Delta provider snapshot")?;
+            assert_eq!(provider_snapshot.source_name, "orders");
+            assert!(provider_snapshot.files_started > 0);
+            let profile_events = execution_profile_events(&capture);
+            assert_eq!(
+                execution_profile_event_count(&profile_events, "write_all_cache_alias"),
+                1
+            );
 
             let events = events.lock().map_err(|_| "progress event lock poisoned")?;
             let cache_events = events
@@ -2001,9 +2027,15 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
+            let capture = TracingCapture::start();
 
             let report = session
-                .write_all_with_writer(&[west_output, east_output], writer)
+                .write_all_with_options_and_writer(
+                    &[west_output, east_output],
+                    WriteAllOptions::new()
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                    writer,
+                )
                 .await?;
             {
                 let calls = calls
@@ -2023,7 +2055,12 @@ mod tests {
                 let crate::MssqlOutputWriteStatus::Succeeded(output_report) = status else {
                     return Err(format!("expected succeeded status, got {status:?}").into());
                 };
-                assert_eq!(output_report.execution_profile(), None);
+                assert_eq!(
+                    output_report
+                        .execution_profile()
+                        .map(|profile| profile.scope()),
+                    Some(QueryExecutionScope::MssqlOutput)
+                );
             }
             let WriteAllCacheReport::CacheAliases {
                 aliases,
@@ -2050,6 +2087,30 @@ mod tests {
                 aliases[1].status(),
                 WriteAllCacheAliasStatus::MaterializedAndRestored
             );
+            for alias in aliases {
+                let profile = alias
+                    .execution_profile()
+                    .ok_or("expected cache alias execution profile")?;
+                assert_eq!(profile.scope(), QueryExecutionScope::WriteAllCacheAlias);
+                assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+            }
+            let profile_events = execution_profile_events(&capture);
+            assert_eq!(
+                execution_profile_event_count(&profile_events, "write_all_cache_alias"),
+                2
+            );
+            assert_eq!(
+                execution_profile_event_count(&profile_events, "mssql_output"),
+                2
+            );
+            let value = report.to_json_value();
+            assert!(value.get("execution_profile").is_none());
+            assert!(value["workflow"].get("execution_profile").is_none());
+            assert!(value["cache"]["aliases"].as_array().is_some_and(|aliases| {
+                aliases
+                    .iter()
+                    .all(|alias| alias["execution_profile"]["scope"] == "write_all_cache_alias")
+            }));
 
             let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_names_factory = session.lazy_table_batch_stream_factory(names, None, None);
@@ -2335,9 +2396,15 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
+            let capture = TracingCapture::start();
 
             let error = session
-                .write_all_with_writer(&[west_output, east_output], writer)
+                .write_all_with_options_and_writer(
+                    &[west_output, east_output],
+                    WriteAllOptions::new()
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                    writer,
+                )
                 .await
                 .err()
                 .ok_or("expected cache materialization failure")?;
@@ -2369,6 +2436,9 @@ mod tests {
             assert!(alias.phase_timings()[6..].iter().all(|timing| {
                 timing.status() == PhaseStatus::not_started(ReportReasonCode::PriorFailure)
             }));
+            assert_eq!(alias.execution_profile(), None);
+            assert!(execution_profile_events(&capture).is_empty());
+            assert!(alias.to_json_value()["execution_profile"].is_null());
             assert!(matches!(
                 *source,
                 DeltaFunnelError::MssqlWorkflowPlanning { message }
@@ -2455,9 +2525,15 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
+            let capture = TracingCapture::start();
 
             let error = session
-                .write_all_with_writer(&[west_output, east_output], writer)
+                .write_all_with_options_and_writer(
+                    &[west_output, east_output],
+                    WriteAllOptions::new()
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                    writer,
+                )
                 .await
                 .err()
                 .ok_or("expected later cache materialization failure")?;
@@ -2483,6 +2559,12 @@ mod tests {
             );
             assert_eq!(
                 failure.aliases()[0]
+                    .execution_profile()
+                    .map(|profile| profile.outcome()),
+                Some(QueryExecutionOutcome::Success)
+            );
+            assert_eq!(
+                failure.aliases()[0]
                     .phase_timings()
                     .last()
                     .map(PhaseTimingReport::status),
@@ -2497,6 +2579,19 @@ mod tests {
                 failure.aliases()[1].failed_phase(),
                 Some("cache_alias_physical_planning")
             );
+            assert_eq!(failure.aliases()[1].execution_profile(), None);
+            let profile_events = execution_profile_events(&capture);
+            assert_eq!(profile_events.len(), 1);
+            assert_eq!(
+                profile_events[0].fields.get("scope").map(String::as_str),
+                Some("write_all_cache_alias")
+            );
+            let value = failure.to_json_value();
+            assert_eq!(
+                value["aliases"][0]["execution_profile"]["outcome"],
+                "success"
+            );
+            assert!(value["aliases"][1]["execution_profile"].is_null());
             assert!(matches!(
                 *source,
                 DeltaFunnelError::MssqlWorkflowPlanning { message }

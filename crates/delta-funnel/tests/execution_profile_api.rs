@@ -11,7 +11,7 @@ use delta_funnel::{
     DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession, DeltaProviderReadStatsSnapshot,
     ExecutionProfileMode, MssqlWriteReport, OutputWritePlan, QueryExecutionMetric,
     QueryExecutionMetricCategory, QueryExecutionMetricValue, QueryExecutionOperatorProfile,
-    QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope,
+    QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope, WriteAllCacheAliasReport,
     datafusion_query_output_stream, progress::ProgressReporter,
 };
 use serde_json::Value;
@@ -56,6 +56,8 @@ fn execution_profile_types_and_accessors_are_exported_from_the_crate_root() {
     let _: ExecutionProfileMode = ExecutionProfileMode::default();
     let _: for<'a> fn(&'a MssqlWriteReport) -> Option<&'a QueryExecutionProfile> =
         MssqlWriteReport::execution_profile;
+    let _: for<'a> fn(&'a WriteAllCacheAliasReport) -> Option<&'a QueryExecutionProfile> =
+        WriteAllCacheAliasReport::execution_profile;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionScope = QueryExecutionProfile::scope;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionOutcome = QueryExecutionProfile::outcome;
     let _: fn(&QueryExecutionProfile) -> bool = QueryExecutionProfile::partial;
@@ -97,4 +99,8 @@ fn execution_profile_types_and_accessors_are_exported_from_the_crate_root() {
         QueryExecutionMetricValue::value_kind;
 
     assert_eq!(QueryExecutionScope::Preview.as_str(), "preview");
+    assert_eq!(
+        QueryExecutionScope::WriteAllCacheAlias.as_str(),
+        "write_all_cache_alias"
+    );
 }

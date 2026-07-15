@@ -120,7 +120,7 @@ impl PySession {
     ///
     /// Pass `dry_run=True` to plan without writing. Execute calls accept
     /// `cache_mode` and `profile` options. Pass `profile=True` to attach a
-    /// detailed execution profile to each attempted output.
+    /// detailed execution profile to each attempted output and cache materialization.
     /// Returns a plain Python `dict` report. One consolidated progress display
     /// follows output planning, shared cache work, and sequential writes. Pass
     /// `progress=False` to disable it for this call.
