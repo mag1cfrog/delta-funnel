@@ -27,6 +27,7 @@ pub(crate) use execution::{
     MssqlOutputQueryFuture, MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter,
     MssqlWorkflowSinkWriter, write_mssql_outputs_with_writer,
     write_planned_output_batches_to_mssql_for_workflow,
+    write_planned_output_batches_to_mssql_for_workflow_with_timeline,
 };
 pub use planning::{
     MssqlBinaryPolicy, MssqlDate64Policy, MssqlDdlPlan, MssqlDecimal256Policy, MssqlDecimalPolicy,

@@ -14,7 +14,7 @@ use crate::{
     observability,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     report::{
-        PhaseTimer,
+        OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer,
         sql_server::{MssqlBatchShapingReport, MssqlWriteReportMetrics},
     },
 };
@@ -32,7 +32,7 @@ use super::{
     lifecycle::{
         cleanup_mssql_prepared_target, prepare_mssql_target_lifecycle, swap_mssql_replace_target,
     },
-    write::write_mssql_batches_with_writer,
+    write::write_mssql_batches_with_writer_and_timeline,
 };
 
 const PREPARE_TARGET_LIFECYCLE_PHASE: &str = "prepare_target_lifecycle";
@@ -105,6 +105,7 @@ where
         write_backend,
         validation_options,
         reporter,
+        None,
     )
     .await
 }
@@ -128,6 +129,32 @@ where
         write_backend,
         validation_options,
         reporter,
+        None,
+    )
+    .await
+}
+
+/// Writes an already planned output while recording its detailed wall-clock timeline.
+pub(crate) async fn write_planned_output_batches_to_mssql_for_workflow_with_timeline<S>(
+    output_plan: MssqlTargetOutputPlan,
+    resolved_target: ResolvedMssqlTarget,
+    batches: S,
+    write_backend: MssqlWriteBackend,
+    validation_options: ValidationOptions,
+    reporter: Option<&ProgressReporter>,
+    timeline: Option<&OperationTimelineRecorder>,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
+    let request = MssqlOutputConnectionRequest::from_planned_output(output_plan, resolved_target);
+    write_output_connection_request_for_workflow(
+        request,
+        batches,
+        write_backend,
+        validation_options,
+        reporter,
+        timeline,
     )
     .await
 }
@@ -138,6 +165,7 @@ async fn write_output_connection_request_for_workflow<S>(
     write_backend: MssqlWriteBackend,
     validation_options: ValidationOptions,
     reporter: Option<&ProgressReporter>,
+    timeline: Option<&OperationTimelineRecorder>,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
@@ -154,6 +182,7 @@ where
         write_backend,
         validation_options,
         reporter,
+        timeline,
     )
     .await
 }
@@ -216,28 +245,56 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         batches: S,
         options: MssqlWriteBackend,
         reporter: Option<&ProgressReporter>,
+        timeline: Option<&OperationTimelineRecorder>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>
     where
         Self: 'static,
         S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
     {
         let initialize_timer = PhaseTimer::start(INITIALIZE_WRITER_PHASE);
+        let initialize_span = start_sink_span(
+            timeline,
+            "Initialize bulk writer",
+            "delta_funnel.write.sql_server",
+            "Initialize writer",
+        );
         let writer = match self
             .initialize_writer(output_plan, prepared_target, options)
             .await
         {
             Ok(writer) => writer,
             Err(error) => {
+                fail_sink_span(initialize_span);
                 return Err(error_with_phase_timings(
                     error,
                     vec![initialize_timer.failed()],
                 ));
             }
         };
+        complete_sink_span(initialize_span);
         let initialize_timing = initialize_timer.completed();
 
-        match write_mssql_batches_with_writer(output_plan, batches, writer, options, reporter).await
-        {
+        let write_span = start_sink_span(
+            timeline,
+            "Stream and write batches",
+            "delta_funnel.write.streaming",
+            "Stream and write batches",
+        );
+        let write_result = write_mssql_batches_with_writer_and_timeline(
+            output_plan,
+            batches,
+            writer,
+            options,
+            reporter,
+            timeline,
+        )
+        .await;
+        if write_result.is_ok() {
+            complete_sink_span(write_span);
+        } else {
+            fail_sink_span(write_span);
+        }
+        match write_result {
             Ok(report) => Ok(report.with_phase_timings(vec![initialize_timing])),
             Err(error) => Err(error_with_phase_timings(error, vec![initialize_timing])),
         }
@@ -326,7 +383,8 @@ pub(crate) async fn write_mssql_output_connection_request_with_validation_option
 where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
-    run_mssql_output_connection_request(request, batches, options, validation_options, None).await
+    run_mssql_output_connection_request(request, batches, options, validation_options, None, None)
+        .await
 }
 
 async fn run_mssql_output_connection_request<S>(
@@ -335,15 +393,31 @@ async fn run_mssql_output_connection_request<S>(
     options: MssqlWriteBackend,
     validation_options: ValidationOptions,
     reporter: Option<&ProgressReporter>,
+    timeline: Option<&OperationTimelineRecorder>,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
     let output_plan = request.output_plan().clone();
-    let connection = connect_mssql_output_client(request).await?;
+    let connect_span = start_sink_span(
+        timeline,
+        "Connect to SQL Server",
+        "delta_funnel.write.sql_server",
+        "SQL Server connection",
+    );
+    let connection = match connect_mssql_output_client(request).await {
+        Ok(connection) => {
+            complete_sink_span(connect_span);
+            connection
+        }
+        Err(error) => {
+            fail_sink_span(connect_span);
+            return Err(error);
+        }
+    };
     let phase_timings = connection.phase_timings().to_vec();
 
-    run_mssql_output_batches_on_connection(
+    run_mssql_output_batches_on_connection_with_timeline(
         output_plan,
         connection,
         batches,
@@ -351,6 +425,7 @@ where
         validation_options,
         phase_timings,
         reporter,
+        timeline,
     )
     .await
 }
@@ -390,7 +465,7 @@ where
     C: MssqlOneOutputSinkConnection + 'static,
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
-    run_mssql_output_batches_on_connection(
+    write_mssql_output_batches_on_connection_with_phase_timings_and_timeline(
         output_plan,
         connection,
         batches,
@@ -402,7 +477,64 @@ where
     .await
 }
 
+async fn write_mssql_output_batches_on_connection_with_phase_timings_and_timeline<C, S>(
+    output_plan: MssqlTargetOutputPlan,
+    connection: C,
+    batches: S,
+    options: MssqlWriteBackend,
+    validation_options: ValidationOptions,
+    phase_timings: Vec<PhaseTimingReport>,
+    timeline: Option<&OperationTimelineRecorder>,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    C: MssqlOneOutputSinkConnection + 'static,
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
+    run_mssql_output_batches_on_connection_with_timeline(
+        output_plan,
+        connection,
+        batches,
+        options,
+        validation_options,
+        phase_timings,
+        None,
+        timeline,
+    )
+    .await
+}
+
+#[allow(dead_code)]
 async fn run_mssql_output_batches_on_connection<C, S>(
+    output_plan: MssqlTargetOutputPlan,
+    connection: C,
+    batches: S,
+    options: MssqlWriteBackend,
+    validation_options: ValidationOptions,
+    phase_timings: Vec<PhaseTimingReport>,
+    reporter: Option<&ProgressReporter>,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    C: MssqlOneOutputSinkConnection + 'static,
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
+    run_mssql_output_batches_on_connection_with_timeline(
+        output_plan,
+        connection,
+        batches,
+        options,
+        validation_options,
+        phase_timings,
+        reporter,
+        None,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the sink boundary carries existing write inputs plus optional timeline state"
+)]
+async fn run_mssql_output_batches_on_connection_with_timeline<C, S>(
     output_plan: MssqlTargetOutputPlan,
     mut connection: C,
     batches: S,
@@ -410,6 +542,7 @@ async fn run_mssql_output_batches_on_connection<C, S>(
     validation_options: ValidationOptions,
     mut phase_timings: Vec<PhaseTimingReport>,
     reporter: Option<&ProgressReporter>,
+    timeline: Option<&OperationTimelineRecorder>,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     C: MssqlOneOutputSinkConnection + 'static,
@@ -421,15 +554,36 @@ where
         output_plan.output_name(),
     );
     let prepare_timer = PhaseTimer::start(PREPARE_TARGET_LIFECYCLE_PHASE);
+    let prepare_span = start_sink_span(
+        timeline,
+        "Prepare target lifecycle",
+        "delta_funnel.write.sql_server",
+        "Prepare target",
+    );
     let prepared_target = match connection.prepare_target_lifecycle(&output_plan).await {
-        Ok(prepared_target) => prepared_target,
+        Ok(prepared_target) => {
+            complete_sink_span(prepare_span);
+            prepared_target
+        }
         Err(error) => {
             phase_timings.push(prepare_timer.failed());
+            fail_sink_span(prepare_span);
             return Err(error_with_phase_timings(error, phase_timings));
         }
     };
     phase_timings.push(prepare_timer.completed());
 
+    let pre_write_validation_span = (output_plan.load_mode() == LoadMode::AppendExisting
+        && validation_options.target_validation_mode() != TargetValidationMode::Disabled)
+        .then(|| {
+            start_sink_span(
+                timeline,
+                "Read pre-write target row count",
+                "delta_funnel.write.validation",
+                "Pre-write validation",
+            )
+        })
+        .flatten();
     let target_row_count_before_write = match target_row_count_before_append_write(
         &mut connection,
         &output_plan,
@@ -438,14 +592,19 @@ where
     )
     .await
     {
-        Ok(target_row_count_before_write) => target_row_count_before_write,
+        Ok(target_row_count_before_write) => {
+            complete_sink_span(pre_write_validation_span);
+            target_row_count_before_write
+        }
         Err(error) => {
+            fail_sink_span(pre_write_validation_span);
             return Err(cleanup_after_prepared_target_failure(
                 &mut connection,
                 &output_plan,
                 &prepared_target,
                 error_with_phase_timings(error, phase_timings),
                 reporter,
+                timeline,
             )
             .await);
         }
@@ -453,7 +612,14 @@ where
 
     emit_progress_phase(reporter, ProgressPhase::Writing, output_plan.output_name());
     match connection
-        .write_prepared_batches(&output_plan, &prepared_target, batches, options, reporter)
+        .write_prepared_batches(
+            &output_plan,
+            &prepared_target,
+            batches,
+            options,
+            reporter,
+            timeline,
+        )
         .await
     {
         Ok(report) => {
@@ -468,7 +634,19 @@ where
                     output_plan.output_name(),
                 );
             }
-            match validate_written_target(
+            let validation_span = (validation_options.target_validation_mode()
+                != TargetValidationMode::Disabled
+                || output_plan.load_mode() == LoadMode::Replace)
+                .then(|| {
+                    start_sink_span(
+                        timeline,
+                        "Validate written target",
+                        "delta_funnel.write.validation",
+                        "Post-write validation",
+                    )
+                })
+                .flatten();
+            let validation_result = validate_written_target(
                 &mut connection,
                 &output_plan,
                 &prepared_target,
@@ -476,8 +654,13 @@ where
                 validation_options,
                 target_row_count_before_write,
             )
-            .await
-            {
+            .await;
+            if validation_result.is_ok() {
+                complete_sink_span(validation_span);
+            } else {
+                fail_sink_span(validation_span);
+            }
+            match validation_result {
                 Ok(report) => {
                     if output_plan.load_mode() == LoadMode::Replace {
                         emit_progress_phase(
@@ -486,14 +669,29 @@ where
                             output_plan.output_name(),
                         );
                     }
-                    match swap_replace_target_after_validation(
+                    let swap_span = (output_plan.load_mode() == LoadMode::Replace)
+                        .then(|| {
+                            start_sink_span(
+                                timeline,
+                                "Swap replace target",
+                                "delta_funnel.write.sql_server",
+                                "Swap target",
+                            )
+                        })
+                        .flatten();
+                    let swap_result = swap_replace_target_after_validation(
                         &mut connection,
                         &output_plan,
                         &prepared_target,
                         report,
                     )
-                    .await
-                    {
+                    .await;
+                    if swap_result.is_ok() {
+                        complete_sink_span(swap_span);
+                    } else {
+                        fail_sink_span(swap_span);
+                    }
+                    match swap_result {
                         Ok(report) => Ok(report),
                         Err(error) => Err(cleanup_after_prepared_target_failure(
                             &mut connection,
@@ -501,6 +699,7 @@ where
                             &prepared_target,
                             error,
                             reporter,
+                            timeline,
                         )
                         .await),
                     }
@@ -511,6 +710,7 @@ where
                     &prepared_target,
                     error,
                     reporter,
+                    timeline,
                 )
                 .await),
             }
@@ -521,6 +721,7 @@ where
             &prepared_target,
             error_with_phase_timings(error, phase_timings),
             reporter,
+            timeline,
         )
         .await),
     }
@@ -1018,6 +1219,7 @@ async fn cleanup_after_prepared_target_failure<C>(
     prepared_target: &MssqlPreparedTarget,
     original_error: DeltaFunnelError,
     reporter: Option<&ProgressReporter>,
+    timeline: Option<&OperationTimelineRecorder>,
 ) -> DeltaFunnelError
 where
     C: MssqlOneOutputSinkConnection,
@@ -1030,18 +1232,51 @@ where
         );
     }
     let cleanup_timer = PhaseTimer::start(CLEANUP_PHASE);
+    let cleanup_span = start_sink_span(
+        timeline,
+        "Clean up prepared target",
+        "delta_funnel.write.sql_server",
+        "Cleanup",
+    );
     match connection
         .cleanup_prepared_target(output_plan, Some(prepared_target))
         .await
     {
-        Ok(cleanup) => error_with_appended_phase_timings(
-            error_with_cleanup(output_plan, original_error, cleanup),
-            vec![cleanup_timer.completed()],
-        ),
-        Err(cleanup_error) => error_with_appended_phase_timings(
-            error_with_cleanup_failure(output_plan, original_error, cleanup_error),
-            vec![cleanup_timer.failed()],
-        ),
+        Ok(cleanup) => {
+            complete_sink_span(cleanup_span);
+            error_with_appended_phase_timings(
+                error_with_cleanup(output_plan, original_error, cleanup),
+                vec![cleanup_timer.completed()],
+            )
+        }
+        Err(cleanup_error) => {
+            fail_sink_span(cleanup_span);
+            error_with_appended_phase_timings(
+                error_with_cleanup_failure(output_plan, original_error, cleanup_error),
+                vec![cleanup_timer.failed()],
+            )
+        }
+    }
+}
+
+fn start_sink_span(
+    timeline: Option<&OperationTimelineRecorder>,
+    name: &str,
+    category: &str,
+    track_name: &str,
+) -> Option<OperationTimelineSpanRecorder> {
+    timeline.map(|timeline| timeline.start_span(name, category, track_name))
+}
+
+fn complete_sink_span(span: Option<OperationTimelineSpanRecorder>) {
+    if let Some(span) = span {
+        span.completed();
+    }
+}
+
+fn fail_sink_span(span: Option<OperationTimelineSpanRecorder>) {
+    if let Some(span) = span {
+        span.failed();
     }
 }
 
@@ -1643,8 +1878,9 @@ mod tests {
         let validation_options =
             ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Disabled);
         let (reporter, phases) = recording_reporter();
+        let timeline = OperationTimelineRecorder::start();
 
-        let report = run_mssql_output_batches_on_connection(
+        let report = run_mssql_output_batches_on_connection_with_timeline(
             output_plan,
             connection,
             batches,
@@ -1652,8 +1888,10 @@ mod tests {
             validation_options,
             Vec::new(),
             Some(&reporter),
+            Some(&timeline),
         )
         .await?;
+        let timeline = timeline.finish("write", crate::TimelineSpanStatus::Completed);
 
         assert_eq!(
             logged_events(&log)?,
@@ -1662,6 +1900,26 @@ mod tests {
         assert_eq!(report.output_name(), "orders_output");
         assert_eq!(report.stats().rows_written(), 3);
         assert_eq!(report.stats().batches_written(), 2);
+        assert!(
+            timeline
+                .spans()
+                .iter()
+                .any(|span| span.name() == "Prepare target lifecycle")
+        );
+        assert!(
+            timeline
+                .spans()
+                .iter()
+                .any(|span| span.name() == "Stream and write batches")
+        );
+        assert_eq!(
+            timeline
+                .spans()
+                .iter()
+                .filter(|span| span.name() == "Write batch to SQL Server")
+                .count(),
+            2
+        );
         assert_phase_timing(
             report.phase_timings(),
             PREPARE_TARGET_LIFECYCLE_PHASE,

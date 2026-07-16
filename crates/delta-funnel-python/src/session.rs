@@ -1,5 +1,7 @@
 //! Python session wrapper.
 
+use std::path::Path;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 
@@ -264,6 +266,7 @@ impl PySession {
         request: &delta_funnel::OutputWritePlan,
         profile_mode: delta_funnel::ExecutionProfileMode,
         progress: Option<&PythonProgress>,
+        trace_path: Option<&Path>,
     ) -> PyResult<Py<PyAny>> {
         let report = py.detach(|| match progress {
             Some(progress) => self.runtime.write_to_mssql_with_profile_mode_and_progress(
@@ -282,6 +285,16 @@ impl PySession {
             progress.finish(py, report.as_ref().err(), None)?;
         }
         let report = report?;
+        if let Some(trace_path) = trace_path {
+            let trace = report.to_trace_event_json_value().ok_or_else(|| {
+                config_py_error(
+                    py,
+                    "execution_profile_unavailable",
+                    "write trace export requires detailed profiling".to_owned(),
+                )
+            })?;
+            crate::table::write_trace_json(trace_path, &trace)?;
+        }
         json_value_to_py(py, &report.to_json_value())
     }
 

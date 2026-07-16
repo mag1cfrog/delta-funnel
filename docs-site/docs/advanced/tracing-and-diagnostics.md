@@ -269,10 +269,11 @@ event arguments and is not positioned as a fabricated wall-clock span. The
 top-level `delta_funnel_timeline` field preserves the relative timeline data,
 while `delta_funnel_profile` preserves the complete redacted operator profile.
 
-Each event uses its own synthetic track because phases and operator partitions
-can overlap without forming a call stack. Do not add overlapping event
-durations together. Operator timestamps are clamped to the preview interval,
-and operators without a usable timestamp pair remain in
+Distinct phases and operator partitions use separate synthetic tracks because
+they can overlap without forming a call stack. Repeated events with the same
+track label reuse one track. Do not add overlapping event durations together.
+Operator timestamps are clamped to the preview interval, and operators without
+a usable timestamp pair remain in
 `delta_funnel_profile` without appearing as lifecycle events.
 
 Custom metrics added to an owned DataFusion operator automatically remain in
@@ -393,6 +394,46 @@ when structured SQL Server failure context is available. Rust reads it from
 `MssqlWriteFailureContext::report().execution_profile()` on
 `MssqlQueryPhase`, `MssqlWritePhase`, or `MssqlBatchSchemaValidation` errors.
 A failure before the profile consumer can be installed has no profile.
+
+### Export A One-Output Write Trace
+
+Pass `trace_path` with detailed profiling to write the successful operation
+directly as Chrome Trace Event JSON:
+
+```python
+report = table.write_to_mssql(
+    schema="dbo",
+    table="daily_orders",
+    load_mode="create_and_load",
+    profile=True,
+    trace_path="daily-orders-write.json",
+)
+```
+
+Open it with `vizviewer daily-orders-write.json`, Perfetto, or another Chrome
+Trace Event viewer. The root event starts at zero and covers the complete
+one-output wall clock from output schema and target planning through query
+planning, SQL Server connection and target preparation, stream consumption,
+writer finalization, validation, swap, and any required cleanup.
+
+Repeated `Poll query batch`, `Validate batch schema`, and `Write batch to SQL
+Server` events preserve their real positions on that clock and reuse readable
+tracks. Batch details include the one-based batch index and, after polling, the
+row count. DataFusion operator lifecycles appear on separate tracks with
+`time_semantics="lifecycle"`; they can overlap stream polling and SQL Server
+writes and must not be added together as sequential wall time.
+
+The returned report also contains the relative model under
+`report["operation_timeline"]`. Detailed SQL Server failure contexts retain the
+partial failed timeline under
+`error.context["report"]["operation_timeline"]`, although `trace_path` is only
+written after a successful call. Rust callers can inspect
+`MssqlWriteReport::operation_timeline()` and export the same document with
+`MssqlWriteReport::to_trace_event_json_value()`.
+
+Trace serialization happens after the SQL Server write succeeds. If the call
+raises `OSError` for `trace_path`, treat the database write as completed and do
+not blindly retry an append or create-and-load operation.
 
 The returned value uses the shared
 [execution profile model](../reference/api.md#execution-profile-model),

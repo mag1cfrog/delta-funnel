@@ -1,6 +1,9 @@
 //! Python lazy table wrapper.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
@@ -80,9 +83,7 @@ impl PyPreview {
                 "trace export requires a preview created with `profile=True`".to_owned(),
             )
         })?;
-        let bytes = serde_json::to_vec(trace)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        fs::write(path, bytes).map_err(PyOSError::new_err)
+        write_trace_json(&path, trace)
     }
 
     fn __str__(&self) -> &str {
@@ -155,7 +156,9 @@ impl PyTable {
     ///
     /// Pass `dry_run=True` to plan without writing. Returns a plain Python
     /// `dict` report. Pass `profile=True` on execute calls to attach a detailed
-    /// query execution profile. Profiling is not available for dry runs.
+    /// query execution profile and full operation timeline. Pass `trace_path`
+    /// with `profile=True` to export Chrome Trace Event JSON after success.
+    /// Profiling and trace export are not available for dry runs.
     ///
     /// By default, shows an indeterminate phase display in interactive
     /// terminals and Jupyter, and stays quiet elsewhere. Pass `progress=True`
@@ -169,7 +172,7 @@ impl PyTable {
     /// cleanup before raising the interruption. When possible, the exception
     /// includes `deltafunnel_operation_status` and, for a failed action,
     /// `deltafunnel_operation_error`.
-    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=false))]
+    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=false, trace_path=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(
         &self,
@@ -182,12 +185,27 @@ impl PyTable {
         connection_string: Option<String>,
         progress: Option<bool>,
         #[pyo3(from_py_with = parse_profile_arg)] profile: bool,
+        trace_path: Option<PathBuf>,
     ) -> PyResult<Py<PyAny>> {
         if dry_run == Some(true) && profile {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
                 "`profile=True` is only supported for execute `write_to_mssql` calls".to_owned(),
+            ));
+        }
+        if dry_run == Some(true) && trace_path.is_some() {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                "`trace_path` is only supported for execute `write_to_mssql` calls".to_owned(),
+            ));
+        }
+        if trace_path.is_some() && !profile {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                "`trace_path` requires `profile=True`".to_owned(),
             ));
         }
         let spec = PyMssqlOutputSpec::new(
@@ -219,6 +237,7 @@ impl PyTable {
             &spec.write_plan(delta_funnel::RunMode::Execute),
             profile_mode,
             progress.as_ref(),
+            trace_path.as_deref(),
         )
     }
 
@@ -290,6 +309,12 @@ impl PyTable {
             self.inner.name()
         )
     }
+}
+
+pub(crate) fn write_trace_json(path: &Path, trace: &serde_json::Value) -> PyResult<()> {
+    let bytes =
+        serde_json::to_vec(trace).map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    fs::write(path, bytes).map_err(PyOSError::new_err)
 }
 
 fn parse_profile_arg(profile: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -364,6 +389,47 @@ mod tests {
         let stub = include_str!("../deltafunnel.pyi");
 
         assert!(stub.contains("def export_trace(self, path: str | PathLike[str]) -> None: ..."));
+        assert!(stub.contains("trace_path: str | PathLike[str] | None = None"));
+    }
+
+    #[test]
+    fn write_trace_path_is_keyword_only_and_requires_detailed_profile() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+            let signature = py
+                .import("inspect")?
+                .call_method1("signature", (table.getattr("write_to_mssql")?,))?
+                .to_string();
+            assert!(signature.ends_with("profile=False, trace_path=None)"));
+
+            let trace_path = temp_trace_path("write-without-profile")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("schema", "dbo")?;
+            kwargs.set_item("table", "orders")?;
+            kwargs.set_item("load_mode", "append_existing")?;
+            kwargs.set_item("trace_path", trace_path.to_string_lossy().as_ref())?;
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .unwrap_err();
+
+            assert!(error.is_instance_of::<DeltaFunnelError>(py));
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+            assert!(
+                error
+                    .value(py)
+                    .getattr("message")?
+                    .extract::<String>()?
+                    .contains("requires `profile=True`")
+            );
+            assert!(!trace_path.exists());
+            Ok(())
+        })
     }
 
     #[test]

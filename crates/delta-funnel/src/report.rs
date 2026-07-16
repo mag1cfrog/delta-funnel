@@ -35,6 +35,7 @@ pub use sql_server::{
 pub use timeline::{
     OperationTimeline, TimelineSpan, TimelineSpanStatus, TimelineSpanTimeSemantics,
 };
+pub(crate) use timeline::{OperationTimelineRecorder, OperationTimelineSpanRecorder};
 
 /// Saturates a platform-sized count into the public `u64` report shape.
 #[must_use]

@@ -1,6 +1,10 @@
 //! Shared wall-clock timeline values for profiled operations.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::Value;
 
@@ -218,6 +222,175 @@ impl OperationTimeline {
     #[must_use]
     pub fn spans(&self) -> &[TimelineSpan] {
         &self.spans
+    }
+}
+
+#[derive(Debug)]
+struct OperationTimelineRecorderState {
+    next_span_id: u64,
+    spans: Vec<TimelineSpan>,
+}
+
+/// Shared monotonic recorder used while a profiled operation crosses async layers.
+#[derive(Debug, Clone)]
+pub(crate) struct OperationTimelineRecorder {
+    started_at: Instant,
+    wall_clock_origin_nanos: i128,
+    state: Arc<Mutex<OperationTimelineRecorderState>>,
+}
+
+impl OperationTimelineRecorder {
+    pub(crate) fn start() -> Self {
+        let started_at = Instant::now();
+        let wall_clock_origin_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX)
+            });
+        Self {
+            started_at,
+            wall_clock_origin_nanos,
+            state: Arc::new(Mutex::new(OperationTimelineRecorderState {
+                next_span_id: 1,
+                spans: Vec::new(),
+            })),
+        }
+    }
+
+    pub(crate) fn start_span(
+        &self,
+        name: impl Into<String>,
+        category: impl Into<String>,
+        track_name: impl Into<String>,
+    ) -> OperationTimelineSpanRecorder {
+        let id = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let id = state.next_span_id;
+            state.next_span_id = state.next_span_id.saturating_add(1);
+            id
+        };
+        let start_offset = self.started_at.elapsed();
+        OperationTimelineSpanRecorder {
+            recorder: self.clone(),
+            span: Some(PendingTimelineSpan {
+                id,
+                name: name.into(),
+                category: category.into(),
+                track_name: track_name.into(),
+                started_at: Instant::now(),
+                start_offset,
+                attributes: BTreeMap::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    pub(crate) const fn wall_clock_origin_nanos(&self) -> i128 {
+        self.wall_clock_origin_nanos
+    }
+
+    pub(crate) fn next_span_id(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .next_span_id
+    }
+
+    pub(crate) fn extend_spans(&self, spans: impl IntoIterator<Item = TimelineSpan>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        for span in spans {
+            state.next_span_id = state.next_span_id.max(span.id().saturating_add(1));
+            state.spans.push(span);
+        }
+    }
+
+    pub(crate) fn finish(
+        &self,
+        name: impl Into<String>,
+        status: TimelineSpanStatus,
+    ) -> OperationTimeline {
+        let total_duration = self.elapsed();
+        let mut spans = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .spans
+            .clone();
+        spans.sort_by_key(|span| (span.start_offset_micros(), span.id()));
+        OperationTimeline::new(name, status, total_duration, spans)
+    }
+
+    fn record(&self, pending: PendingTimelineSpan, status: TimelineSpanStatus) {
+        let span = TimelineSpan::new(
+            pending.id,
+            None,
+            pending.name,
+            pending.category,
+            pending.start_offset,
+            pending.started_at.elapsed(),
+            status,
+            TimelineSpanTimeSemantics::WallClock,
+        )
+        .with_track_name(pending.track_name);
+        let span = pending
+            .attributes
+            .into_iter()
+            .fold(span, |span, (name, value)| span.with_attribute(name, value));
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .spans
+            .push(span);
+    }
+}
+
+#[derive(Debug)]
+struct PendingTimelineSpan {
+    id: u64,
+    name: String,
+    category: String,
+    track_name: String,
+    started_at: Instant,
+    start_offset: Duration,
+    attributes: BTreeMap<String, Value>,
+}
+
+/// An in-progress span that records cancellation if its owner exits early.
+#[derive(Debug)]
+pub(crate) struct OperationTimelineSpanRecorder {
+    recorder: OperationTimelineRecorder,
+    span: Option<PendingTimelineSpan>,
+}
+
+impl OperationTimelineSpanRecorder {
+    pub(crate) fn with_attribute(mut self, name: impl Into<String>, value: Value) -> Self {
+        if let Some(span) = &mut self.span {
+            span.attributes.insert(name.into(), value);
+        }
+        self
+    }
+
+    pub(crate) fn completed(mut self) {
+        self.finish(TimelineSpanStatus::Completed);
+    }
+
+    pub(crate) fn failed(mut self) {
+        self.finish(TimelineSpanStatus::Failed);
+    }
+
+    fn finish(&mut self, status: TimelineSpanStatus) {
+        if let Some(span) = self.span.take() {
+            self.recorder.record(span, status);
+        }
+    }
+}
+
+impl Drop for OperationTimelineSpanRecorder {
+    fn drop(&mut self) {
+        self.finish(TimelineSpanStatus::Cancelled);
     }
 }
 

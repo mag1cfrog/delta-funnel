@@ -134,9 +134,20 @@ impl OperationTimeline {
             }),
         ];
 
-        for (index, span) in self.spans().iter().enumerate() {
-            let lane = super::usize_to_u64_saturating(index.saturating_add(1));
-            events.push(trace_lane_metadata(lane, span.track_name()));
+        let mut lanes = BTreeMap::new();
+        for span in self.spans() {
+            let next_lane = super::usize_to_u64_saturating(lanes.len().saturating_add(1));
+            let lane_key = (span.category().to_owned(), span.track_name().to_owned());
+            let (lane, new_lane) = match lanes.entry(lane_key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(next_lane);
+                    (next_lane, true)
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => (*entry.get(), false),
+            };
+            if new_lane {
+                events.push(trace_lane_metadata(lane, span.track_name()));
+            }
             events.push(json!({
                 "name": span.name(),
                 "cat": span.category(),
@@ -718,10 +729,25 @@ impl MssqlWriteReport {
             "execution_profile": self
                 .execution_profile()
                 .map(QueryExecutionProfile::to_json_value),
+            "operation_timeline": self
+                .operation_timeline()
+                .map(OperationTimeline::to_json_value),
             "write_stats": self.stats().to_json_value(),
             "partial_write_possible": self.partial_write_possible(),
             "cleanup": cleanup_status(self.cleanup()),
         })
+    }
+
+    /// Returns a Chrome Trace Event JSON document for this profiled write.
+    #[must_use]
+    pub fn to_trace_event_json_value(&self) -> Option<Value> {
+        let profile = self.execution_profile()?;
+        let mut trace = self.operation_timeline()?.to_trace_event_json_value();
+        let Value::Object(document) = &mut trace else {
+            return None;
+        };
+        document.insert("delta_funnel_profile".to_owned(), profile.to_json_value());
+        Some(trace)
     }
 }
 
@@ -1502,6 +1528,53 @@ mod tests {
         assert_eq!(events[4]["args"]["time_semantics"], "wall_clock");
         assert_eq!(events[4]["args"]["attributes"]["rows"], 10_000);
         assert_eq!(trace["delta_funnel_timeline"], timeline.to_json_value());
+    }
+
+    #[test]
+    fn operation_timeline_trace_reuses_lanes_for_repeated_batch_steps() {
+        let spans = [10_u64, 30]
+            .into_iter()
+            .enumerate()
+            .map(|(index, start)| {
+                TimelineSpan::new(
+                    crate::usize_to_u64_saturating(index.saturating_add(1)),
+                    None,
+                    "Write batch",
+                    "delta_funnel.write.batch",
+                    Duration::from_micros(start),
+                    Duration::from_micros(5),
+                    crate::TimelineSpanStatus::Completed,
+                    crate::TimelineSpanTimeSemantics::WallClock,
+                )
+                .with_track_name("SQL Server batch writes")
+            })
+            .collect();
+        let timeline = OperationTimeline::new(
+            "write",
+            crate::TimelineSpanStatus::Completed,
+            Duration::from_micros(50),
+            spans,
+        );
+
+        let trace = timeline.to_trace_event_json_value();
+        let events = trace["traceEvents"]
+            .as_array()
+            .expect("trace events should be an array");
+        let lane_metadata = events
+            .iter()
+            .filter(|event| {
+                event["name"] == "thread_name" && event["args"]["name"] == "SQL Server batch writes"
+            })
+            .count();
+        let write_lanes = events
+            .iter()
+            .filter(|event| event["name"] == "Write batch")
+            .filter_map(|event| event["tid"].as_u64())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lane_metadata, 1);
+        assert_eq!(write_lanes.len(), 2);
+        assert_eq!(write_lanes[0], write_lanes[1]);
     }
 
     #[test]

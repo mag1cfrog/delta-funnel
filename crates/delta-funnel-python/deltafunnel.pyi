@@ -121,6 +121,7 @@ class Table:
         connection_string: str | None = None,
         progress: bool | None = None,
         profile: bool | None = False,
+        trace_path: str | PathLike[str] | None = None,
     ) -> Report: ...
 
 

@@ -125,15 +125,32 @@ report = table.write_to_mssql(
     table="daily_orders",
     load_mode="create_and_load",
     profile=True,
+    trace_path="daily-orders-write.json",
 )
 profile = report["execution_profile"]
+timeline = report["operation_timeline"]
 ```
 
 Omitting `profile`, or passing `None` or `False`, leaves detailed profiling
-disabled and sets the execute report's `execution_profile` field to `None`.
+disabled and sets the execute report's `execution_profile` and
+`operation_timeline` fields to `None`.
 Only the actual Boolean `True` enables it. `profile=True` is rejected with
 `dry_run=True`; dry-run report JSON keeps its existing schema and has no
 `execution_profile` field.
+
+`trace_path` accepts a string or `os.PathLike[str]` and requires
+`profile=True` on an execute call. After a successful write, it creates or
+replaces a Chrome Trace Event JSON file without creating missing parent
+directories. The root event covers the complete one-output wall clock, while
+positioned child events cover planning, SQL Server lifecycle work, query stream
+polls, per-batch validation and writes, finalization, target validation, swap,
+cleanup, and available DataFusion operator lifecycles. File-system failures
+raise `OSError`. A failed write retains its partial timeline in structured
+failure context but does not write `trace_path`.
+
+The file is serialized after SQL Server reports success. An `OSError` from
+`trace_path` therefore does not roll back the database write and must not be
+treated as evidence that an append is safe to retry.
 
 Rust callers select the same mode on the option-bearing session or runtime
 method:
@@ -149,6 +166,9 @@ let report = runtime.write_to_mssql_with_profile_mode(
 
 if let Some(profile) = report.execution_profile() {
     println!("profiled {} operators", profile.operators().len());
+}
+if let Some(trace) = report.to_trace_event_json_value() {
+    std::fs::write("daily-orders-write.json", serde_json::to_vec(&trace)?)?;
 }
 ```
 
