@@ -108,6 +108,8 @@ impl OperationTimeline {
     /// Returns a Chrome Trace Event JSON document for this wall-clock timeline.
     #[must_use]
     pub fn to_trace_event_json_value(&self) -> Value {
+        // VizTracer and Perfetto reserve thread zero for their main-thread track.
+        const ROOT_LANE: u64 = 1;
         let mut events = vec![
             json!({
                 "name": "process_name",
@@ -116,13 +118,13 @@ impl OperationTimeline {
                 "pid": 1,
                 "args": {"name": format!("Delta Funnel {}", self.name())},
             }),
-            trace_lane_metadata(0, self.name()),
+            trace_lane_metadata(ROOT_LANE, self.name()),
             json!({
                 "name": self.name(),
                 "cat": "delta_funnel.operation",
                 "ph": "X",
                 "pid": 1,
-                "tid": 0,
+                "tid": ROOT_LANE,
                 "ts": 0,
                 "dur": self.total_duration_micros(),
                 "args": {
@@ -136,7 +138,9 @@ impl OperationTimeline {
 
         let mut lanes = BTreeMap::new();
         for span in self.spans() {
-            let next_lane = super::usize_to_u64_saturating(lanes.len().saturating_add(1));
+            let next_lane = ROOT_LANE.saturating_add(super::usize_to_u64_saturating(
+                lanes.len().saturating_add(1),
+            ));
             let lane_key = (span.category().to_owned(), span.track_name().to_owned());
             let (lane, new_lane) = match lanes.entry(lane_key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -1539,10 +1543,18 @@ mod tests {
             .expect("trace events should be an array");
 
         assert_eq!(events.len(), 5);
+        assert!(
+            events
+                .iter()
+                .filter_map(|event| event["tid"].as_u64())
+                .all(|lane| lane > 0)
+        );
+        assert_eq!(events[2]["tid"], 1);
         assert_eq!(events[2]["name"], "preview");
         assert_eq!(events[2]["ts"], 0);
         assert_eq!(events[2]["dur"], 8_000_000);
         assert_eq!(events[4]["name"], "preview_execute_collect");
+        assert_eq!(events[4]["tid"], 2);
         assert_eq!(events[4]["ts"], 1_700_000);
         assert_eq!(events[4]["dur"], 6_200_000);
         assert_eq!(events[4]["args"]["time_semantics"], "wall_clock");
