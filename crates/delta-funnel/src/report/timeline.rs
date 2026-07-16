@@ -292,24 +292,18 @@ impl OperationTimelineRecorder {
         self.wall_clock_origin_nanos
     }
 
-    pub(crate) fn next_span_id(&self) -> u64 {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .next_span_id
-    }
-
-    pub(crate) fn extend_spans(&self, spans: impl IntoIterator<Item = TimelineSpan>) {
+    fn append_spans_with_fresh_ids(&self, spans: impl IntoIterator<Item = TimelineSpan>) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        for span in spans {
-            state.next_span_id = state.next_span_id.max(span.id().saturating_add(1));
+        for mut span in spans {
+            span.id = state.next_span_id;
+            state.next_span_id = state.next_span_id.saturating_add(1);
             state.spans.push(span);
         }
     }
 
     pub(crate) fn append_operator_lifecycles(&self, profile: &QueryExecutionProfile) {
-        self.extend_spans(profile.operator_lifecycle_timeline_spans(
-            self.next_span_id(),
+        self.append_spans_with_fresh_ids(profile.operator_lifecycle_timeline_spans(
+            0,
             self.wall_clock_origin_nanos(),
             duration_to_micros_saturating(self.elapsed()),
         ));
@@ -324,7 +318,7 @@ impl OperationTimelineRecorder {
     ) {
         let spans = profile
             .operator_lifecycle_timeline_spans(
-                self.next_span_id(),
+                0,
                 self.wall_clock_origin_nanos(),
                 duration_to_micros_saturating(self.elapsed()),
             )
@@ -334,7 +328,7 @@ impl OperationTimelineRecorder {
                 span.with_track_name(track_name)
                     .with_attribute(owner_attribute, Value::String(owner_name.to_owned()))
             });
-        self.extend_spans(spans);
+        self.append_spans_with_fresh_ids(spans);
     }
 
     pub(crate) fn finish(
@@ -426,9 +420,18 @@ impl Drop for OperationTimelineSpanRecorder {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        collections::BTreeSet,
+        sync::{Arc, Barrier},
+        time::Duration,
+    };
 
     use serde_json::json;
+
+    use crate::{
+        QueryExecutionMetric, QueryExecutionMetricCategory, QueryExecutionMetricValue,
+        QueryExecutionOperatorProfile, QueryExecutionOutcome,
+    };
 
     use super::*;
 
@@ -472,5 +475,63 @@ mod tests {
             timeline.spans()[1].time_semantics(),
             TimelineSpanTimeSemantics::Lifecycle
         );
+    }
+
+    #[test]
+    fn concurrent_operator_appends_assign_unique_span_ids() {
+        const THREAD_COUNT: usize = 8;
+        const PARTITION_COUNT: u64 = 256;
+
+        let mut metrics = Vec::new();
+        for partition in 0..PARTITION_COUNT {
+            for (name, timestamp) in [("start_timestamp", 0), ("end_timestamp", 1)] {
+                metrics.push(QueryExecutionMetric::new(
+                    name,
+                    QueryExecutionMetricCategory::Summary,
+                    Some(partition),
+                    None,
+                    QueryExecutionMetricValue::TimestampNanoseconds(Some(timestamp)),
+                ));
+            }
+        }
+        let profile = Arc::new(QueryExecutionProfile::mssql_output(
+            QueryExecutionOutcome::Success,
+            vec![QueryExecutionOperatorProfile::new(
+                1,
+                None,
+                "TestExec",
+                PARTITION_COUNT,
+                true,
+                Vec::new(),
+                metrics,
+                None,
+            )],
+        ));
+        let recorder = Arc::new(OperationTimelineRecorder::start());
+        let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREAD_COUNT {
+                let profile = Arc::clone(&profile);
+                let recorder = Arc::clone(&recorder);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    recorder.append_operator_lifecycles(&profile);
+                });
+            }
+        });
+
+        let timeline = recorder.finish("concurrent", TimelineSpanStatus::Completed);
+        let ids = timeline
+            .spans()
+            .iter()
+            .map(TimelineSpan::id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            timeline.spans().len(),
+            THREAD_COUNT * usize::try_from(PARTITION_COUNT).expect("partition count fits usize")
+        );
+        assert_eq!(ids.len(), timeline.spans().len());
     }
 }
