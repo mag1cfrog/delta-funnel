@@ -107,9 +107,11 @@ timings with detailed profiling disabled.
 When preview execution fails, Rust returns
 `DeltaFunnelError::PreviewFailed { context, source }`. The redacted context
 identifies the failed phase and retains the ordered phase timings plus any
-terminal execution profile that was available. Python exposes the same data on
-`DeltaFunnelError` with `phase="preview"`, `kind="preview_failed"`, and the
-JSON-compatible `context` dictionary.
+terminal execution profile and partial operation timeline that were available.
+Python exposes the same data on `DeltaFunnelError` with `phase="preview"`,
+`kind="preview_failed"`, and the JSON-compatible `context` dictionary. The
+timeline is available at `error.context["operation_timeline"]`; Rust reads it
+with `PreviewFailureContext::operation_timeline()`.
 
 See [Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-preview-diagnostics)
 for phase boundaries and interpretation. See the execution profile model below

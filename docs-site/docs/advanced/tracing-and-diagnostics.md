@@ -323,8 +323,11 @@ profile. A failure before a physical plan exists has no profile.
 Rust exposes failure diagnostics through `PreviewFailureContext`. Python maps
 them to a `DeltaFunnelError` whose `phase` is `preview`, whose `kind` is
 `preview_failed`, and whose `context` contains `failed_phase`, `phase_timings`,
-and `execution_profile`. These fields follow the same redaction rules as a
-successful profile.
+`execution_profile`, and `operation_timeline`. The partial timeline uses the
+same preview origin, has root status `failed`, and contains spans recorded
+through the failed phase. Rust reads it with
+`PreviewFailureContext::operation_timeline()`. These fields follow the same
+redaction rules as a successful profile.
 
 The returned diagnostics and terminal tracing event serve different uses:
 
