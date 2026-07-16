@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.3.2...delta-funnel-v0.3.3) - 2026-07-16
+
+### Added
+
+- export detailed preview execution profiles for interactive analysis in VizTracer and Perfetto ([#506](https://github.com/mag1cfrog/delta-funnel/pull/506))
+
 ## [0.3.2](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.3.1...delta-funnel-v0.3.2) - 2026-07-16
 
 ### Fixed
