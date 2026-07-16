@@ -336,13 +336,9 @@ impl OperationTimelineRecorder {
         name: impl Into<String>,
         status: TimelineSpanStatus,
     ) -> OperationTimeline {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let total_duration = self.elapsed();
-        let mut spans = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .spans
-            .clone();
+        let mut spans = state.spans.clone();
         spans.sort_by_key(|span| (span.start_offset_micros(), span.id()));
         OperationTimeline::new(name, status, total_duration, spans)
     }
@@ -540,5 +536,46 @@ mod tests {
             THREAD_COUNT * usize::try_from(PARTITION_COUNT).expect("partition count fits usize")
         );
         assert_eq!(ids.len(), timeline.spans().len());
+    }
+
+    #[test]
+    fn finish_keeps_every_snapshotted_span_inside_the_root_duration() {
+        let recorder = OperationTimelineRecorder::start();
+        let mut state = recorder
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (ready, finishing) = std::sync::mpsc::channel();
+        let finishing_recorder = recorder.clone();
+        let handle = std::thread::spawn(move || {
+            ready
+                .send(())
+                .expect("finish thread should signal readiness");
+            finishing_recorder.finish("concurrent", TimelineSpanStatus::Completed)
+        });
+        finishing
+            .recv()
+            .expect("finish thread should reach the snapshot");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let span_id = state.next_span_id;
+        state.spans.push(TimelineSpan::new(
+            span_id,
+            None,
+            "concurrent span",
+            "test",
+            recorder.elapsed(),
+            Duration::ZERO,
+            TimelineSpanStatus::Completed,
+            TimelineSpanTimeSemantics::WallClock,
+        ));
+        drop(state);
+
+        let timeline = handle.join().expect("finish thread should not panic");
+        assert!(timeline.spans().iter().all(|span| {
+            span.start_offset_micros()
+                .saturating_add(span.duration_micros())
+                <= timeline.total_duration_micros()
+        }));
     }
 }
