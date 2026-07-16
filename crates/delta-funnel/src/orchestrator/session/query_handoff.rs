@@ -2364,6 +2364,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_preview_projects_where_only_columns_from_multi_partition_delta_scan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_mixed_timestamp_physical_types(
+            "preview-output-projection",
+        )?;
+
+        for reader_backend in [
+            DeltaProviderReaderBackend::OfficialKernel,
+            DeltaProviderReaderBackend::NativeAsync,
+        ] {
+            let provider_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+                reader_backend,
+                2,
+                1,
+            )?;
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new()
+                    .with_query_options(QueryOptions {
+                        target_partitions: Some(2),
+                        output_batch_size: Some(8),
+                    })
+                    .with_provider_scan_options(provider_options),
+            )?;
+            let _source = session.delta_lake(DeltaSourceConfig::new(
+                "metrics",
+                table.path().to_string_lossy().to_string(),
+            ))?;
+            let filtered = session
+                .table_from_sql(
+                    "select event_date, amount from metrics \
+                     where id > 0 and customer_name < 'z'",
+                )
+                .await?;
+
+            let preview = session
+                .preview_table_with_options(
+                    &filtered,
+                    PreviewOptions::new(3)
+                        .with_execution_profile_mode(ExecutionProfileMode::Detailed),
+                )
+                .await?;
+
+            assert!(preview.text().contains("| event_date | amount |"));
+            assert!(!preview.text().contains("customer_name"));
+            assert!(!preview.text().contains("| id"));
+            assert_eq!(
+                preview
+                    .text()
+                    .lines()
+                    .filter(|line| line.starts_with("| 2024-"))
+                    .count(),
+                3
+            );
+            assert!(
+                preview
+                    .html()
+                    .contains("Showing <b>3</b> rows, <b>2</b> columns.")
+            );
+
+            let profile = preview
+                .execution_profile()
+                .ok_or("expected detailed Delta preview profile")?;
+            assert_eq!(profile.delta_funnel_row_limit(), Some(3));
+            let snapshot = profile
+                .operators()
+                .iter()
+                .find_map(crate::QueryExecutionOperatorProfile::delta_provider_read_stats)
+                .ok_or("expected terminal provider snapshot")?;
+            assert_eq!(snapshot.reader_backend, reader_backend);
+            assert_eq!(snapshot.scan_partitions_planned, 2);
+            assert_eq!(snapshot.files_planned, 2);
+            assert_eq!(snapshot.datafusion_output_batch_size, Some(8));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn detailed_delta_preview_attaches_the_terminal_provider_snapshot()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_two_files("detailed-preview-profile")?;
