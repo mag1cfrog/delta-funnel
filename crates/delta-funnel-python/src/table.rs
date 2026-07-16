@@ -1,5 +1,8 @@
 //! Python lazy table wrapper.
 
+use std::{fs, path::PathBuf};
+
+use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool};
 
@@ -15,6 +18,7 @@ pub(crate) struct PyPreview {
     html: String,
     phase_timings: Py<PyAny>,
     execution_profile: Py<PyAny>,
+    execution_profile_report: Option<delta_funnel::QueryExecutionProfile>,
 }
 
 impl PyPreview {
@@ -26,8 +30,9 @@ impl PyPreview {
                 .map(delta_funnel::PhaseTimingReport::to_json_value)
                 .collect(),
         );
-        let execution_profile = preview
-            .execution_profile()
+        let execution_profile_report = preview.execution_profile().cloned();
+        let execution_profile = execution_profile_report
+            .as_ref()
             .map(delta_funnel::QueryExecutionProfile::to_json_value)
             .unwrap_or(serde_json::Value::Null);
 
@@ -36,6 +41,7 @@ impl PyPreview {
             html: preview.html().to_owned(),
             phase_timings: json_value_to_py(py, &phase_timings)?,
             execution_profile: json_value_to_py(py, &execution_profile)?,
+            execution_profile_report,
         })
     }
 }
@@ -60,6 +66,23 @@ impl PyPreview {
     #[getter]
     fn execution_profile(&self, py: Python<'_>) -> Py<PyAny> {
         self.execution_profile.clone_ref(py)
+    }
+
+    /// Writes the detailed execution profile as Chrome Trace Event JSON.
+    ///
+    /// The resulting file can be opened by VizTracer's `vizviewer`, Perfetto,
+    /// and other viewers that accept Chrome Trace Event JSON.
+    fn export_trace(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        let profile = self.execution_profile_report.as_ref().ok_or_else(|| {
+            config_py_error(
+                py,
+                "execution_profile_unavailable",
+                "trace export requires a preview created with `profile=True`".to_owned(),
+            )
+        })?;
+        let bytes = serde_json::to_vec(&profile.to_trace_event_json_value())
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        fs::write(path, bytes).map_err(PyOSError::new_err)
     }
 
     fn __str__(&self) -> &str {
@@ -290,13 +313,20 @@ pub(crate) fn add_table(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use crate::{
         deltafunnel, exception::DeltaFunnelError, progress::adapter_creation_count,
         test_support::python_state,
     };
-    use pyo3::exceptions::{PyAttributeError, PyKeyError, PyTypeError};
+    use pyo3::exceptions::{PyAttributeError, PyKeyError, PyRuntimeError, PyTypeError};
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
+    use serde_json::Value;
 
     const PREVIEW_PHASES: [&str; 7] = [
         "preview_dataframe_planning",
@@ -327,6 +357,13 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    #[test]
+    fn pyi_stub_exposes_preview_trace_export() {
+        let stub = include_str!("../deltafunnel.pyi");
+
+        assert!(stub.contains("def export_trace(self, path: str | PathLike[str]) -> None: ..."));
     }
 
     #[test]
@@ -390,6 +427,16 @@ mod tests {
                 );
             }
             assert!(preview.getattr("execution_profile")?.is_none());
+            let trace_path = temp_trace_path("disabled")?;
+            let error = preview
+                .call_method1("export_trace", (trace_path.to_string_lossy().as_ref(),))
+                .unwrap_err();
+            assert!(error.is_instance_of::<DeltaFunnelError>(py));
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "execution_profile_unavailable"
+            );
+            assert!(!trace_path.exists());
             for field in ["phase_timings", "execution_profile"] {
                 assert!(
                     preview
@@ -437,6 +484,25 @@ mod tests {
                 !required_item(&profile, "operators")?
                     .cast::<PyList>()?
                     .is_empty()
+            );
+
+            let path = temp_trace_path("detailed")?;
+            let path_object = py
+                .import("pathlib")?
+                .getattr("Path")?
+                .call1((path.to_string_lossy().as_ref(),))?;
+            preview.call_method1("export_trace", (path_object,))?;
+            let trace: Value = serde_json::from_slice(
+                &fs::read(&path).map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+            )
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            let _ = fs::remove_file(path);
+
+            assert_eq!(trace["delta_funnel_profile"]["scope"], "preview");
+            assert!(
+                trace["traceEvents"]
+                    .as_array()
+                    .is_some_and(|events| events.iter().any(|event| event["ph"] == "X"))
             );
             Ok(())
         })
@@ -617,5 +683,16 @@ mod tests {
     fn required_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
         dict.get_item(key)?
             .ok_or_else(|| PyKeyError::new_err(key.to_owned()))
+    }
+
+    fn temp_trace_path(name: &str) -> PyResult<PathBuf> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
+            .as_nanos();
+        Ok(std::env::temp_dir().join(format!(
+            "delta-funnel-preview-trace-{name}-{}-{nanos}.json",
+            std::process::id()
+        )))
     }
 }

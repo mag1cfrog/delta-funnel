@@ -5,6 +5,8 @@
 //! here gives both APIs one report shape and makes the fields that are safe to
 //! expose explicit instead of relying on generic serialization.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use crate::{
@@ -101,6 +103,153 @@ impl QueryExecutionProfile {
                 .collect::<Vec<_>>(),
         })
     }
+
+    /// Returns a Chrome Trace Event JSON document for this execution profile.
+    ///
+    /// Each physical operator partition with terminal start and end timestamps
+    /// becomes one complete event on its own synthetic track. Timestamps and
+    /// durations use the trace format's standard microsecond unit and are
+    /// relative to the first included operator start.
+    #[must_use]
+    pub fn to_trace_event_json_value(&self) -> Value {
+        let spans = trace_spans(self);
+        let origin_nanos = spans
+            .iter()
+            .map(|span| span.start_nanos)
+            .min()
+            .unwrap_or_default();
+        let mut events = vec![json!({
+            "name": "process_name",
+            "cat": "__metadata",
+            "ph": "M",
+            "pid": 1,
+            "args": {
+                "name": format!("Delta Funnel {}", self.scope().as_str()),
+            },
+        })];
+
+        for (lane, span) in spans.into_iter().enumerate() {
+            let lane = super::usize_to_u64_saturating(lane.saturating_add(1));
+            events.push(json!({
+                "name": "thread_name",
+                "cat": "__metadata",
+                "ph": "M",
+                "pid": 1,
+                "tid": lane,
+                "args": {
+                    "name": trace_lane_name(&span),
+                },
+            }));
+            events.push(json!({
+                "name": span.operator.operator_name(),
+                "cat": "datafusion.operator",
+                "ph": "X",
+                "pid": 1,
+                "tid": lane,
+                "ts": nanos_to_micros(span.start_nanos - origin_nanos),
+                "dur": nanos_to_micros(span.end_nanos - span.start_nanos),
+                "args": {
+                    "node_id": span.operator.node_id(),
+                    "parent_node_id": span.operator.parent_node_id(),
+                    "partition": span.partition,
+                    "output_partition_count": span.operator.output_partition_count(),
+                    "metrics": span
+                        .metrics
+                        .iter()
+                        .map(|metric| metric.to_json_value())
+                        .collect::<Vec<_>>(),
+                },
+            }));
+        }
+
+        json!({
+            "traceEvents": events,
+            "delta_funnel_profile": self.to_json_value(),
+        })
+    }
+}
+
+struct TraceSpan<'a> {
+    operator: &'a QueryExecutionOperatorProfile,
+    partition: Option<u64>,
+    start_nanos: i64,
+    end_nanos: i64,
+    metrics: Vec<&'a QueryExecutionMetric>,
+}
+
+#[derive(Default)]
+struct TraceSpanMetrics<'a> {
+    start_nanos: Option<i64>,
+    end_nanos: Option<i64>,
+    metrics: Vec<&'a QueryExecutionMetric>,
+}
+
+fn trace_spans(profile: &QueryExecutionProfile) -> Vec<TraceSpan<'_>> {
+    let mut spans = Vec::new();
+
+    for operator in profile.operators() {
+        let mut partition_metrics = BTreeMap::new();
+        for metric in operator.metrics() {
+            let entry = partition_metrics
+                .entry(metric.partition())
+                .or_insert_with(TraceSpanMetrics::default);
+            match (metric.name(), metric.value()) {
+                (
+                    "start_timestamp",
+                    QueryExecutionMetricValue::TimestampNanoseconds(Some(value)),
+                ) => {
+                    entry.start_nanos = Some(
+                        entry
+                            .start_nanos
+                            .map_or(*value, |current| current.min(*value)),
+                    );
+                }
+                ("end_timestamp", QueryExecutionMetricValue::TimestampNanoseconds(Some(value))) => {
+                    entry.end_nanos = Some(
+                        entry
+                            .end_nanos
+                            .map_or(*value, |current| current.max(*value)),
+                    );
+                }
+                _ => entry.metrics.push(metric),
+            }
+        }
+
+        spans.extend(
+            partition_metrics
+                .into_iter()
+                .filter_map(|(partition, metrics)| {
+                    let start_nanos = metrics.start_nanos?;
+                    let end_nanos = metrics.end_nanos?;
+                    (end_nanos >= start_nanos).then_some(TraceSpan {
+                        operator,
+                        partition,
+                        start_nanos,
+                        end_nanos,
+                        metrics: metrics.metrics,
+                    })
+                }),
+        );
+    }
+
+    spans
+}
+
+fn trace_lane_name(span: &TraceSpan<'_>) -> String {
+    let partition = span
+        .partition
+        .map_or_else(|| "global".to_owned(), |value| value.to_string());
+    let mut name = format!(
+        "{} [node {}, partition {partition}",
+        span.operator.operator_name(),
+        span.operator.node_id()
+    );
+    name.push(']');
+    name
+}
+
+fn nanos_to_micros(nanos: i64) -> f64 {
+    nanos as f64 / 1_000.0
 }
 
 impl crate::PreviewFailureContext {
@@ -1114,6 +1263,80 @@ mod tests {
             })
         );
         serde_json::from_str::<Value>(&serde_json::to_string(&value)?).map(|_| ())
+    }
+
+    #[test]
+    fn execution_profile_trace_json_exposes_partition_spans_and_embeds_profile() {
+        let metric = |name, partition, value| {
+            QueryExecutionMetric::new(
+                name,
+                crate::QueryExecutionMetricCategory::Summary,
+                Some(partition),
+                None,
+                value,
+            )
+        };
+        let operator = QueryExecutionOperatorProfile::new(
+            4,
+            Some(3),
+            "FilterExec",
+            2,
+            true,
+            Vec::new(),
+            vec![
+                metric(
+                    "start_timestamp",
+                    0,
+                    QueryExecutionMetricValue::TimestampNanoseconds(Some(1_000_000)),
+                ),
+                metric(
+                    "end_timestamp",
+                    0,
+                    QueryExecutionMetricValue::TimestampNanoseconds(Some(1_750_500)),
+                ),
+                metric("output_rows", 0, QueryExecutionMetricValue::Count(42)),
+                metric(
+                    "start_timestamp",
+                    1,
+                    QueryExecutionMetricValue::TimestampNanoseconds(Some(900_000)),
+                ),
+                metric(
+                    "end_timestamp",
+                    1,
+                    QueryExecutionMetricValue::TimestampNanoseconds(Some(2_000_000)),
+                ),
+                metric("output_rows", 1, QueryExecutionMetricValue::Count(7)),
+            ],
+            None,
+        );
+        let profile = QueryExecutionProfile::preview(
+            crate::QueryExecutionOutcome::Success,
+            20,
+            vec![operator],
+        );
+
+        let trace = profile.to_trace_event_json_value();
+        let events = trace["traceEvents"]
+            .as_array()
+            .expect("trace events should be an array");
+
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0]["ph"], "M");
+        assert_eq!(
+            events[1]["args"]["name"],
+            "FilterExec [node 4, partition 0]"
+        );
+        assert_eq!(events[2]["ph"], "X");
+        assert_eq!(events[2]["ts"], 100.0);
+        assert_eq!(events[2]["dur"], 750.5);
+        assert_eq!(events[2]["args"]["metrics"][0]["name"], "output_rows");
+        assert_eq!(
+            events[3]["args"]["name"],
+            "FilterExec [node 4, partition 1]"
+        );
+        assert_eq!(events[4]["ts"], 0.0);
+        assert_eq!(events[4]["dur"], 1100.0);
+        assert_eq!(trace["delta_funnel_profile"], profile.to_json_value());
     }
 
     #[tokio::test]
