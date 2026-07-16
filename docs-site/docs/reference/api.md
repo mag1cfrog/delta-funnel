@@ -65,16 +65,21 @@ collection, read rows, and do not contact or write to SQL Server. `Preview.text`
 is the plain text table and `Preview.html` backs notebook `_repr_html_()`
 display.
 
-`Preview.export_trace(path)` writes the detailed execution profile as Chrome
-Trace Event JSON. `path` accepts a string or `os.PathLike[str]`. The method
-creates or replaces the file, but does not create missing parent directories.
-It raises `DeltaFunnelError` with
+`Preview.export_trace(path)` writes the full preview wall-clock timeline as
+Chrome Trace Event JSON. The root event covers the complete preview, and child
+events position planning, stream setup, execution, formatting, and available
+DataFusion operator lifecycles on that same clock. `path` accepts a string or
+`os.PathLike[str]`. The method creates or replaces the file, but does not create
+missing parent directories. It raises `DeltaFunnelError` with
 `kind="execution_profile_unavailable"` when the preview was not created with
 `profile=True`; file-system failures raise `OSError`.
 
 The trace document is accepted by VizTracer's `vizviewer`, Perfetto, and other
-Chrome Trace Event viewers. Rust callers can produce the same JSON-compatible
-document with `QueryExecutionProfile::to_trace_event_json_value()`. See
+Chrome Trace Event viewers. Rust callers can produce the same complete preview
+document with `TablePreview::to_trace_event_json_value()` and inspect the
+underlying relative spans with `TablePreview::operation_timeline()`. The
+lower-level `QueryExecutionProfile::to_trace_event_json_value()` remains
+available for execution-only operator traces. See
 [Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#export-a-preview-trace)
 for export steps and event interpretation.
 
@@ -102,9 +107,11 @@ timings with detailed profiling disabled.
 When preview execution fails, Rust returns
 `DeltaFunnelError::PreviewFailed { context, source }`. The redacted context
 identifies the failed phase and retains the ordered phase timings plus any
-terminal execution profile that was available. Python exposes the same data on
-`DeltaFunnelError` with `phase="preview"`, `kind="preview_failed"`, and the
-JSON-compatible `context` dictionary.
+terminal execution profile and partial operation timeline that were available.
+Python exposes the same data on `DeltaFunnelError` with `phase="preview"`,
+`kind="preview_failed"`, and the JSON-compatible `context` dictionary. The
+timeline is available at `error.context["operation_timeline"]`; Rust reads it
+with `PreviewFailureContext::operation_timeline()`.
 
 See [Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-preview-diagnostics)
 for phase boundaries and interpretation. See the execution profile model below
@@ -120,15 +127,35 @@ report = table.write_to_mssql(
     table="daily_orders",
     load_mode="create_and_load",
     profile=True,
+    trace_path="daily-orders-write.json",
 )
 profile = report["execution_profile"]
+timeline = report["operation_timeline"]
 ```
 
 Omitting `profile`, or passing `None` or `False`, leaves detailed profiling
-disabled and sets the execute report's `execution_profile` field to `None`.
+disabled and sets the execute report's `execution_profile` and
+`operation_timeline` fields to `None`.
 Only the actual Boolean `True` enables it. `profile=True` is rejected with
 `dry_run=True`; dry-run report JSON keeps its existing schema and has no
 `execution_profile` field.
+
+`trace_path` accepts a string or `os.PathLike[str]` and requires
+`profile=True` on an execute call. DeltaFunnel opens the destination before SQL
+Server work starts, without creating missing parent directories. An open
+failure raises `OSError` before the database operation. After a successful
+write, the destination receives Chrome Trace Event JSON. The root event covers
+the complete one-output wall clock, while positioned child events cover
+planning, SQL Server lifecycle work, query stream polls, per-batch validation
+and writes, finalization, target validation, swap, cleanup, and available
+DataFusion operator lifecycles. A failed write leaves an existing destination
+unchanged and removes a newly reserved file.
+
+Final serialization and file writes still happen after SQL Server reports
+success. A resulting Python error carries
+`deltafunnel_operation_status="completed"` and the sanitized successful report
+in `deltafunnel_operation_report`. It does not roll back the database write and
+must not be treated as evidence that an append is safe to retry.
 
 Rust callers select the same mode on the option-bearing session or runtime
 method:
@@ -144,6 +171,9 @@ let report = runtime.write_to_mssql_with_profile_mode(
 
 if let Some(profile) = report.execution_profile() {
     println!("profiled {} operators", profile.operators().len());
+}
+if let Some(trace) = report.to_trace_event_json_value() {
+    std::fs::write("daily-orders-write.json", serde_json::to_vec(&trace)?)?;
 }
 ```
 
@@ -168,13 +198,41 @@ Enable one independent detailed profile for every attempted output and every
 executed auto-cache alias:
 
 ```python
-report = session.write_all(outputs, options={"profile": True})
+report = session.write_all(
+    outputs,
+    options={"profile": True},
+    trace_path="write-all-trace.json",
+)
 ```
 
 Omission, `None`, and `False` leave detailed profiling disabled. Only the
 actual Boolean `True` enables it; integers, strings, and other truthy values
 are rejected. Any `options` dictionary, including an empty one, is rejected
 when `dry_run=True`.
+
+`trace_path` accepts a string or `os.PathLike[str]`, requires
+`options={"profile": True}`, and is rejected for dry runs. DeltaFunnel opens
+the destination before SQL Server work starts. A returned `write_all` report
+writes one Chrome Trace Event JSON document even when the report contains
+failed or skipped outputs. The root event is the full `write_all` duration, and
+its positioned spans include top-level phases, attempted outputs, SQL Server
+work, and output-query operator lifecycles. The same relative model is
+available at `report["operation_timeline"]`.
+
+A top-level planning, cache, or orchestration exception leaves an existing
+destination unchanged and removes a newly reserved file. A final export error
+after the workflow report carries `deltafunnel_operation_status` as `completed`
+or `completed_with_failures` and attaches the sanitized report as
+`deltafunnel_operation_report`. It must not trigger a blind retry. Rust callers
+use `WriteAllReport::operation_timeline()` and
+`WriteAllReport::to_trace_event_json_value()`.
+
+Auto-cache traces position alias resolution, planning, stream setup,
+execution and collection, `MemTable` construction, installation, and
+restoration on labeled cache lanes. A detailed cache orchestration exception
+retains the partial failed timeline at
+`error.context["operation_timeline"]`; Rust reads it with
+`WriteAllCacheFailure::operation_timeline()`.
 
 Returned profiles are nested under the output report that owns them:
 

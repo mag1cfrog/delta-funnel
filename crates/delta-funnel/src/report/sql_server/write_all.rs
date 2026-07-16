@@ -5,6 +5,8 @@ use crate::{
     QueryExecutionProfile, QueryExecutionScope, support::sanitize_text_for_display,
 };
 
+use super::super::OperationTimeline;
+
 /// Report for one `write_all` call that reached the sequential workflow.
 ///
 /// Planning and cache setup failures are returned as errors before this report
@@ -17,6 +19,7 @@ pub struct WriteAllReport {
     cache: WriteAllCacheReport,
     sources: Vec<DeltaSourceReport>,
     phase_timings: Vec<PhaseTimingReport>,
+    operation_timeline: Option<OperationTimeline>,
 }
 
 impl WriteAllReport {
@@ -30,11 +33,20 @@ impl WriteAllReport {
             cache,
             sources,
             phase_timings: Vec::new(),
+            operation_timeline: None,
         }
     }
 
     pub(crate) fn with_phase_timings(mut self, phase_timings: Vec<PhaseTimingReport>) -> Self {
         self.phase_timings = phase_timings;
+        self
+    }
+
+    pub(crate) fn with_operation_timeline(
+        mut self,
+        operation_timeline: Option<OperationTimeline>,
+    ) -> Self {
+        self.operation_timeline = operation_timeline;
         self
     }
 
@@ -60,6 +72,12 @@ impl WriteAllReport {
     #[must_use]
     pub fn phase_timings(&self) -> &[PhaseTimingReport] {
         &self.phase_timings
+    }
+
+    /// Returns the full write-all wall-clock timeline when detailed profiling was enabled.
+    #[must_use]
+    pub const fn operation_timeline(&self) -> Option<&OperationTimeline> {
+        self.operation_timeline.as_ref()
     }
 
     /// Returns the number of selected outputs represented by this report.
@@ -327,6 +345,7 @@ pub struct WriteAllCacheFailure {
     aliases: Vec<WriteAllCacheAliasReport>,
     primary_failed_alias_table_id: Option<u64>,
     workflow: Option<MssqlWorkflowWriteReport>,
+    operation_timeline: Option<OperationTimeline>,
 }
 
 impl WriteAllCacheFailure {
@@ -339,7 +358,16 @@ impl WriteAllCacheFailure {
             aliases,
             primary_failed_alias_table_id,
             workflow,
+            operation_timeline: None,
         }
+    }
+
+    pub(crate) fn with_operation_timeline(
+        mut self,
+        operation_timeline: Option<OperationTimeline>,
+    ) -> Self {
+        self.operation_timeline = operation_timeline;
+        self
     }
 
     /// Returns every attempted cache alias in deterministic selection order.
@@ -358,6 +386,12 @@ impl WriteAllCacheFailure {
     #[must_use]
     pub const fn workflow(&self) -> Option<&MssqlWorkflowWriteReport> {
         self.workflow.as_ref()
+    }
+
+    /// Returns the partial write-all wall-clock timeline captured before cache failure.
+    #[must_use]
+    pub const fn operation_timeline(&self) -> Option<&OperationTimeline> {
+        self.operation_timeline.as_ref()
     }
 }
 

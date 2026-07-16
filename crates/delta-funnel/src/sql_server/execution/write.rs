@@ -20,10 +20,13 @@ use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationStatus,
     observability,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
-    report::sql_server::{
-        MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
-        MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
-        write::MssqlWriteDiagnostic,
+    report::{
+        OperationTimelineRecorder, OperationTimelineSpanRecorder,
+        sql_server::{
+            MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
+            MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
+            write::MssqlWriteDiagnostic,
+        },
     },
 };
 
@@ -585,9 +588,32 @@ impl MssqlWriteLoopPhaseTimings {
 pub(crate) async fn write_mssql_batches_with_writer<W, S>(
     output_plan: &MssqlTargetOutputPlan,
     batches: S,
+    writer: W,
+    _options: MssqlWriteBackend,
+    reporter: Option<&ProgressReporter>,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    W: MssqlBulkLoadWriter,
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>>,
+{
+    write_mssql_batches_with_writer_and_timeline(
+        output_plan,
+        batches,
+        writer,
+        _options,
+        reporter,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn write_mssql_batches_with_writer_and_timeline<W, S>(
+    output_plan: &MssqlTargetOutputPlan,
+    batches: S,
     mut writer: W,
     _options: MssqlWriteBackend,
     reporter: Option<&ProgressReporter>,
+    timeline: Option<&OperationTimelineRecorder>,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     W: MssqlBulkLoadWriter,
@@ -611,11 +637,28 @@ where
 
     loop {
         let poll_started_at = Instant::now();
+        let poll_span = start_batch_span(
+            timeline,
+            "Poll query batch",
+            "delta_funnel.write.stream",
+            "Query stream polling",
+            input_batches.saturating_add(1),
+            None,
+        );
         let Some(batch) = batches.next().await else {
             phase_timings.add_poll_batch_stream(poll_started_at.elapsed());
+            complete_batch_span(
+                poll_span.map(|span| span.with_attribute("end_of_stream", true.into())),
+            );
             break;
         };
         phase_timings.add_poll_batch_stream(poll_started_at.elapsed());
+
+        if batch.is_ok() {
+            complete_batch_span(poll_span);
+        } else {
+            fail_batch_span(poll_span);
+        }
 
         let batch = batch.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
@@ -648,11 +691,24 @@ where
         input_batches = input_batches.saturating_add(1);
 
         let validation_started_at = Instant::now();
+        let validation_span = start_batch_span(
+            timeline,
+            "Validate batch schema",
+            "delta_funnel.write.batch",
+            "Batch schema validation",
+            input_batches,
+            Some(row_count),
+        );
         let validation_result = arrow_tiberius::validate_record_batch_schema_against_mappings(
             &batch,
             output_plan.schema_mappings(),
         );
         phase_timings.add_validate_batch_schema(validation_started_at.elapsed());
+        if validation_result.is_ok() {
+            complete_batch_span(validation_span);
+        } else {
+            fail_batch_span(validation_span);
+        }
         validation_result.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
             let batch_shaping = trace_datafusion_batch_stream_finished(
@@ -679,8 +735,21 @@ where
         })?;
 
         let write_batch_started_at = Instant::now();
+        let write_batch_span = start_batch_span(
+            timeline,
+            "Write batch to SQL Server",
+            "delta_funnel.write.batch",
+            "SQL Server batch writes",
+            input_batches,
+            Some(row_count),
+        );
         let write_batch_result = MssqlBulkLoadWriter::write_batch(&mut writer, &batch).await;
         phase_timings.add_write_batch(write_batch_started_at.elapsed());
+        if write_batch_result.is_ok() {
+            complete_batch_span(write_batch_span);
+        } else {
+            fail_batch_span(write_batch_span);
+        }
         write_batch_result.map_err(|source| {
             let elapsed_ms = elapsed_ms_since(started_at);
             let batch_shaping = trace_datafusion_batch_stream_finished(
@@ -722,8 +791,20 @@ where
     }
 
     let finalize_started_at = Instant::now();
+    let finalize_span = timeline.map(|timeline| {
+        timeline.start_span(
+            "Finalize SQL Server writer",
+            "delta_funnel.write.sql_server",
+            "Finalize writer",
+        )
+    });
     let finish_result = MssqlBulkLoadWriter::finish(writer).await;
     let finalize_elapsed = finalize_started_at.elapsed();
+    if finish_result.is_ok() {
+        complete_batch_span(finalize_span);
+    } else {
+        fail_batch_span(finalize_span);
+    }
     finish_result.map_err(|source| {
         let elapsed_ms = elapsed_ms_since(started_at);
         let batch_shaping = trace_datafusion_batch_stream_finished(
@@ -769,6 +850,37 @@ where
         )
         .with_phase_timings(phase_timings.completed(finalize_elapsed)),
     ))
+}
+
+fn start_batch_span(
+    timeline: Option<&OperationTimelineRecorder>,
+    name: &str,
+    category: &str,
+    track_name: &str,
+    batch_index: u64,
+    row_count: Option<u64>,
+) -> Option<OperationTimelineSpanRecorder> {
+    timeline.map(|timeline| {
+        let span = timeline
+            .start_span(name, category, track_name)
+            .with_attribute("batch_index", batch_index.into());
+        match row_count {
+            Some(row_count) => span.with_attribute("row_count", row_count.into()),
+            None => span,
+        }
+    })
+}
+
+fn complete_batch_span(span: Option<OperationTimelineSpanRecorder>) {
+    if let Some(span) = span {
+        span.completed();
+    }
+}
+
+fn fail_batch_span(span: Option<OperationTimelineSpanRecorder>) {
+    if let Some(span) = span {
+        span.failed();
+    }
 }
 
 /// Drains a selected output stream through the write-loop reporting path without
@@ -1782,6 +1894,58 @@ mod tests {
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_write_loop_positions_each_batch_step_on_one_clock()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_for_orders_schema()?;
+        let writer = FakeBulkLoadWriter::default().delay_writes_by(Duration::from_millis(2));
+        let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
+        let second = orders_batch(vec![3], vec![None])?;
+        let batches = stream::iter(vec![Ok(first), Ok(second)]);
+        let timeline = OperationTimelineRecorder::start();
+
+        write_mssql_batches_with_writer_and_timeline(
+            &output_plan,
+            batches,
+            writer,
+            default_mssql_write_backend(),
+            None,
+            Some(&timeline),
+        )
+        .await?;
+
+        let timeline = timeline.finish("write", crate::TimelineSpanStatus::Completed);
+        assert_eq!(timeline.spans().len(), 8);
+        assert_eq!(
+            timeline
+                .spans()
+                .iter()
+                .filter(|span| span.name() == "Poll query batch")
+                .count(),
+            3
+        );
+        assert_eq!(
+            timeline
+                .spans()
+                .iter()
+                .filter(|span| span.name() == "Write batch to SQL Server")
+                .count(),
+            2
+        );
+        assert!(timeline.spans().iter().any(|span| {
+            span.name() == "Write batch to SQL Server"
+                && span.attributes()["batch_index"] == 1
+                && span.attributes()["row_count"] == 2
+                && span.duration_micros() > 0
+        }));
+        assert!(timeline.spans().iter().all(|span| {
+            span.start_offset_micros()
+                .saturating_add(span.duration_micros())
+                <= timeline.total_duration_micros()
+        }));
         Ok(())
     }
 

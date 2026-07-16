@@ -248,25 +248,33 @@ The same file can be imported into Perfetto or another viewer that accepts
 Chrome Trace Event JSON. No VizTracer instrumentation is required because
 DeltaFunnel writes the trace document directly.
 
-The timeline contains one complete `X` event for each physical operator
-partition with usable `start_timestamp` and `end_timestamp` metrics. The event
-name is the short DataFusion operator name. Its synthetic track identifies the
-operator node and partition, while its arguments include the parent node,
-output partition count, and remaining raw per-partition metrics. Timestamps and
-durations use microseconds relative to the earliest included operator start.
+The first complete `X` event is `Preview total`. It starts at zero and spans the
+entire preview wall clock, including DataFrame planning, physical planning,
+stream setup, execution and collection, and text and HTML formatting. Each
+phase is positioned beneath that same origin, so an eight-second preview is
+shown on an eight-second timeline rather than an execution-only subset.
 
-Use event duration to find long-lived operator partitions, then inspect the
-event arguments for metrics such as `output_rows` and `elapsed_compute` when
-DataFusion exposes them. The top-level `delta_funnel_profile` field preserves
-the complete redacted profile, including aggregated metrics, for analysis
-outside the timeline.
+Physical operator partitions with usable `start_timestamp` and `end_timestamp`
+metrics are mapped onto the same preview origin. Their category is
+`datafusion.operator.lifecycle`, and their `time_semantics` argument is
+`lifecycle`. This distinction is important: the event measures how long the
+operator stream existed, including waiting for upstream or downstream work. It
+does not claim that the operator was actively computing for the entire bar.
 
-Treat the visualization as an operator timeline, not a call-stack flame graph.
-Each event uses its own synthetic track because operator partitions can overlap
-without forming nested calls. Event duration is wall-clock lifetime, not CPU
-time, and operator durations must not be added together. Operators without a
-usable timestamp pair remain in `delta_funnel_profile` but do not appear as
-timeline events.
+Use the phase events first to identify whether planning, execution, or
+formatting dominates the preview. Then inspect operator lifecycle events and
+their arguments for metrics such as `output_rows` and `elapsed_compute` when
+DataFusion exposes them. `elapsed_compute` remains an aggregate metric in the
+event arguments and is not positioned as a fabricated wall-clock span. The
+top-level `delta_funnel_timeline` field preserves the relative timeline data,
+while `delta_funnel_profile` preserves the complete redacted operator profile.
+
+Distinct phases and operator partitions use separate synthetic tracks because
+they can overlap without forming a call stack. Repeated events with the same
+track label reuse one track. Do not add overlapping event durations together.
+Operator timestamps are clamped to the preview interval, and operators without
+a usable timestamp pair remain in
+`delta_funnel_profile` without appearing as lifecycle events.
 
 Custom metrics added to an owned DataFusion operator automatically remain in
 the event arguments and embedded profile. The exporter currently creates spans
@@ -278,10 +286,11 @@ Omitting `profile`, or passing `None` or `False`, still returns all phase
 timings but leaves `execution_profile` as `None`. `Table.show()` always uses
 this disabled mode because it does not return the preview diagnostics.
 
-Rust callers use `PreviewOptions` with
-`ExecutionProfileMode::Detailed`, then read `TablePreview::phase_timings()` and
-`TablePreview::execution_profile()`. See [API references](../reference/api.md)
-for the option-bearing call.
+Rust callers use `PreviewOptions` with `ExecutionProfileMode::Detailed`, then
+call `TablePreview::to_trace_event_json_value()` or inspect
+`TablePreview::operation_timeline()`, `phase_timings()`, and
+`execution_profile()`. See [API references](../reference/api.md) for the
+option-bearing call.
 
 The phases are:
 
@@ -314,8 +323,11 @@ profile. A failure before a physical plan exists has no profile.
 Rust exposes failure diagnostics through `PreviewFailureContext`. Python maps
 them to a `DeltaFunnelError` whose `phase` is `preview`, whose `kind` is
 `preview_failed`, and whose `context` contains `failed_phase`, `phase_timings`,
-and `execution_profile`. These fields follow the same redaction rules as a
-successful profile.
+`execution_profile`, and `operation_timeline`. The partial timeline uses the
+same preview origin, has root status `failed`, and contains spans recorded
+through the failed phase. Rust reads it with
+`PreviewFailureContext::operation_timeline()`. These fields follow the same
+redaction rules as a successful profile.
 
 The returned diagnostics and terminal tracing event serve different uses:
 
@@ -386,6 +398,49 @@ when structured SQL Server failure context is available. Rust reads it from
 `MssqlQueryPhase`, `MssqlWritePhase`, or `MssqlBatchSchemaValidation` errors.
 A failure before the profile consumer can be installed has no profile.
 
+### Export A One-Output Write Trace
+
+Pass `trace_path` with detailed profiling to write the successful operation
+directly as Chrome Trace Event JSON:
+
+```python
+report = table.write_to_mssql(
+    schema="dbo",
+    table="daily_orders",
+    load_mode="create_and_load",
+    profile=True,
+    trace_path="daily-orders-write.json",
+)
+```
+
+Open it with `vizviewer daily-orders-write.json`, Perfetto, or another Chrome
+Trace Event viewer. The root event starts at zero and covers the complete
+one-output wall clock from output schema and target planning through query
+planning, SQL Server connection and target preparation, stream consumption,
+writer finalization, validation, swap, and any required cleanup.
+
+Repeated `Poll query batch`, `Validate batch schema`, and `Write batch to SQL
+Server` events preserve their real positions on that clock and reuse readable
+tracks. Batch details include the one-based batch index and, after polling, the
+row count. DataFusion operator lifecycles appear on separate tracks with
+`time_semantics="lifecycle"`; they can overlap stream polling and SQL Server
+writes and must not be added together as sequential wall time.
+
+The returned report also contains the relative model under
+`report["operation_timeline"]`. Detailed SQL Server failure contexts retain the
+partial failed timeline under
+`error.context["report"]["operation_timeline"]`, although `trace_path` is only
+written after a successful call. Rust callers can inspect
+`MssqlWriteReport::operation_timeline()` and export the same document with
+`MssqlWriteReport::to_trace_event_json_value()`.
+
+DeltaFunnel opens the trace destination before SQL Server work starts. An open
+failure therefore prevents the database operation. If final serialization or
+writing still fails after SQL Server succeeds, the Python error carries
+`deltafunnel_operation_status="completed"` and the sanitized report in
+`deltafunnel_operation_report`. Do not blindly retry an append or
+create-and-load operation.
+
 The returned value uses the shared
 [execution profile model](../reference/api.md#execution-profile-model),
 including its Delta provider snapshots and redaction rules. The same immutable
@@ -395,6 +450,47 @@ event; the event is not a copy of the returned operator list and can arrive
 before later SQL Server work finishes. Neither surface includes plan display
 text, raw SQL, row values, paths, URLs, credentials, storage options, headers,
 or byte ranges.
+
+### Export A Write-All Trace
+
+Use one root wall clock to understand phase order, overlap, and sequential
+output attempts across a multi-output write:
+
+```python
+report = session.write_all(
+    outputs,
+    options={"profile": True},
+    trace_path="write-all-trace.json",
+)
+```
+
+Open the file with `vizviewer write-all-trace.json`, Perfetto, or another
+Chrome Trace Event viewer. The root event starts at zero and covers output and
+cache planning, workflow execution, and source reporting. Each attempted
+output has its own positioned span. Query planning, SQL Server sink phases,
+batch work, and DataFusion operator lifecycles use that same origin, so the
+trace tells the complete wall-clock story without adding independent elapsed
+durations together.
+
+For auto-cached calls, each alias gets a labeled cache lane containing
+DataFrame resolution, physical planning, stream setup, execution and
+collection, `MemTable` construction, installation, and restoration. Cache
+operator lifecycles share the root origin and overlap the execution and
+collection window that drove them, beginning as early as stream setup.
+
+The returned report contains the relative model under
+`report["operation_timeline"]`. Its root status is `failed` when the workflow
+report contains failed or skipped outputs, and the trace file is still written
+because the report itself was returned. Top-level exceptions that prevent a
+report do not write `trace_path`.
+
+Rust callers inspect `WriteAllReport::operation_timeline()` or export the same
+document with `WriteAllReport::to_trace_event_json_value()`. As with a
+one-output trace, the destination is opened before SQL Server work, while final
+serialization occurs afterward. A late Python error carries the
+`completed` or `completed_with_failures` operation status and the sanitized
+report. It does not roll back completed writes and must not lead to a blind
+retry.
 
 ## Inspect Returned Write-All Cache Diagnostics
 
@@ -430,6 +526,11 @@ between `cache_alias_install` and `cache_alias_restore` but is not itself a
 cache phase. Do not add the phase durations and interpret the result as wall
 time.
 
+Detailed write-all traces position the seven non-overlapping cache actions on
+the root wall clock. The aggregate `cache_alias_materialization_total` remains
+in the report but is not duplicated as another trace span over its five child
+actions.
+
 On a materialization failure, both the causal leaf and
 `cache_alias_materialization_total` are `failed`. Later unstarted phases are
 `not_started` with reason `prior_failure`. Install and restore are marked
@@ -454,6 +555,7 @@ failure = error.context
 attempted_aliases = failure["aliases"]
 primary_table_id = failure["primary_failed_alias_table_id"]
 completed_workflow = failure["workflow"]
+partial_timeline = failure["operation_timeline"]
 ```
 
 `aliases` contains each attempted alias exactly once in cache-selection order.
@@ -472,8 +574,10 @@ completed output reports are not lost.
 
 Rust callers match `DeltaFunnelError::WriteAllCache { failure, source }` and
 read `WriteAllCacheFailure::aliases()`,
-`primary_failed_alias_table_id()`, and `workflow()`. `source` retains the
-original primary error and its source chain.
+`primary_failed_alias_table_id()`, `workflow()`, and `operation_timeline()`.
+The partial timeline is present when detailed profiling was enabled and uses a
+failed root status. `source` retains the original primary error and its source
+chain.
 
 These lifecycle timings describe cache orchestration boundaries. A detailed
 operator profile is separately opt-in and describes work inside one cache

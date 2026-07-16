@@ -17,7 +17,7 @@ use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationOptions,
     ValidationStatus, observability, plan_mssql_target_for_resolved_output,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
-    report::PhaseTimer,
+    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer},
     support::sanitize_text_for_display,
 };
 
@@ -26,6 +26,7 @@ use super::{
     MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteBackend,
     MssqlWriteFailureContext, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_backend,
     drain_mssql_batches_for_stream_benchmark, write_output_batches_to_mssql_for_workflow,
+    write_output_batches_to_mssql_for_workflow_with_timeline,
 };
 
 const OUTPUT_STREAM_SETUP_PHASE: &str = "output_stream_setup";
@@ -85,6 +86,7 @@ pub struct MssqlOutputWriteJob {
     validation_options: ValidationOptions,
     phase_timings: Vec<PhaseTimingReport>,
     progress_reporter: Option<ProgressReporter>,
+    operation_timeline: Option<OperationTimelineRecorder>,
 }
 
 impl MssqlOutputWriteJob {
@@ -145,6 +147,7 @@ impl MssqlOutputWriteJob {
             validation_options,
             phase_timings: Vec::new(),
             progress_reporter: None,
+            operation_timeline: None,
         }
     }
 
@@ -162,6 +165,16 @@ impl MssqlOutputWriteJob {
         progress_reporter: Option<ProgressReporter>,
     ) -> Self {
         self.progress_reporter = progress_reporter;
+        self
+    }
+
+    /// Adds the shared write-all timeline used only if this output is attempted.
+    #[must_use]
+    pub(crate) fn with_operation_timeline(
+        mut self,
+        operation_timeline: Option<OperationTimelineRecorder>,
+    ) -> Self {
+        self.operation_timeline = operation_timeline;
         self
     }
 
@@ -725,6 +738,33 @@ pub(crate) trait MssqlWorkflowOutputWriter: Send {
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the workflow writer receives one planned write plus profiling state"
+    )]
+    async fn write_output_with_timeline(
+        &mut self,
+        output_schema: SchemaRef,
+        resolved_target: ResolvedMssqlTarget,
+        schema_options: MssqlSchemaPlanOptions,
+        batches: MssqlOutputBatchStream,
+        write_backend: MssqlWriteBackend,
+        validation_options: ValidationOptions,
+        reporter: Option<&ProgressReporter>,
+        _timeline: Option<&OperationTimelineRecorder>,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        self.write_output(
+            output_schema,
+            resolved_target,
+            schema_options,
+            batches,
+            write_backend,
+            validation_options,
+            reporter,
+        )
+        .await
+    }
 }
 
 pub(crate) struct MssqlWorkflowSinkWriter;
@@ -749,6 +789,30 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowSinkWriter {
             write_backend,
             validation_options,
             reporter,
+        )
+        .await
+    }
+
+    async fn write_output_with_timeline(
+        &mut self,
+        output_schema: SchemaRef,
+        resolved_target: ResolvedMssqlTarget,
+        schema_options: MssqlSchemaPlanOptions,
+        batches: MssqlOutputBatchStream,
+        write_backend: MssqlWriteBackend,
+        validation_options: ValidationOptions,
+        reporter: Option<&ProgressReporter>,
+        timeline: Option<&OperationTimelineRecorder>,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        write_output_batches_to_mssql_for_workflow_with_timeline(
+            output_schema.as_ref(),
+            resolved_target,
+            schema_options,
+            batches,
+            write_backend,
+            validation_options,
+            reporter,
+            timeline,
         )
         .await
     }
@@ -895,7 +959,17 @@ where
         validation_options,
         phase_timings: mut planned_phase_timings,
         progress_reporter,
+        operation_timeline,
     } = job;
+    let output_timeline_span = operation_timeline.as_ref().map(|timeline| {
+        timeline
+            .start_span(
+                format!("Write output: {}", target.output_name()),
+                "delta_funnel.write_all.output",
+                format!("Output: {}", target.output_name()),
+            )
+            .with_attribute("output_name", target.output_name().to_owned().into())
+    });
     if let Some(reporter) = progress_reporter.as_ref() {
         reporter.emit(&ProgressEvent::phase_changed(
             ProgressPhase::SettingUpStream,
@@ -906,6 +980,12 @@ where
     let (query_execution, stream_setup_timing) = match create_query_execution().await {
         Ok(query_execution) => (query_execution, stream_setup_timer.completed()),
         Err(failure) => {
+            append_error_profile_to_timeline(
+                operation_timeline.as_ref(),
+                &failure.error,
+                target.output_name(),
+            );
+            fail_timeline_span(output_timeline_span);
             planned_phase_timings.extend(failure.query_phase_timings);
             let failure = MssqlWriteFailureReport::from_error(
                 target,
@@ -927,7 +1007,7 @@ where
 
     let write_timer = PhaseTimer::start(SQL_WRITE_PHASE);
     let write_result = writer
-        .write_output(
+        .write_output_with_timeline(
             output_schema,
             resolved_target,
             schema_options,
@@ -935,6 +1015,7 @@ where
             write_backend,
             validation_options,
             progress_reporter.as_ref(),
+            operation_timeline.as_ref(),
         )
         .await;
     // The writer has now drained, failed, or dropped the stream, so the
@@ -943,6 +1024,30 @@ where
         Some(attach_profile) => attach_profile(write_result),
         None => write_result,
     };
+    match &write_result {
+        Ok(report) => {
+            if let (Some(timeline), Some(profile)) =
+                (operation_timeline.as_ref(), report.execution_profile())
+            {
+                let output_name = target.output_name();
+                timeline.append_operator_lifecycles_with_owner(
+                    profile,
+                    "output_name",
+                    output_name,
+                    &format!("Output: {output_name}"),
+                );
+            }
+            complete_timeline_span(output_timeline_span);
+        }
+        Err(error) => {
+            append_error_profile_to_timeline(
+                operation_timeline.as_ref(),
+                error,
+                target.output_name(),
+            );
+            fail_timeline_span(output_timeline_span);
+        }
+    }
     match write_result {
         Ok(report) => {
             let report = report.with_phase_timings(output_write_phase_timings(
@@ -964,6 +1069,36 @@ where
             );
             MssqlOutputWriteStatus::Failed(failure)
         }
+    }
+}
+
+fn append_error_profile_to_timeline(
+    timeline: Option<&OperationTimelineRecorder>,
+    error: &DeltaFunnelError,
+    output_name: &str,
+) {
+    if let (Some(timeline), Some(profile)) = (
+        timeline,
+        failure_context(error).and_then(|context| context.report().execution_profile()),
+    ) {
+        timeline.append_operator_lifecycles_with_owner(
+            profile,
+            "output_name",
+            output_name,
+            &format!("Output: {output_name}"),
+        );
+    }
+}
+
+fn complete_timeline_span(span: Option<OperationTimelineSpanRecorder>) {
+    if let Some(span) = span {
+        span.completed();
+    }
+}
+
+fn fail_timeline_span(span: Option<OperationTimelineSpanRecorder>) {
+    if let Some(span) = span {
+        span.failed();
     }
 }
 

@@ -8,9 +8,9 @@ use crate::{
     MssqlOutputQueryFuture, MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteBackend,
     MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport, PhaseTimingReport,
     QueryExecutionProfile, QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget,
-    ValidationOptions, observability, plan_mssql_target_for_resolved_output,
+    TimelineSpanStatus, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
-    report::PhaseTimer,
+    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer},
     sql_server::write_planned_output_batches_to_mssql_for_workflow,
 };
 
@@ -58,21 +58,55 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<PlannedMssqlOutput, DeltaFunnelError> {
+        self.plan_mssql_output_with_timeline(request, None)
+    }
+
+    pub(super) fn plan_mssql_output_with_timeline(
+        &self,
+        request: &OutputWritePlan,
+        timeline: Option<&OperationTimelineRecorder>,
+    ) -> Result<PlannedMssqlOutput, DeltaFunnelError> {
         let mut phase_timings = self.phase_timings_for_lazy_table(request.table())?;
 
         let schema_timer = PhaseTimer::start(OUTPUT_SCHEMA_PLANNING_PHASE);
+        let schema_span = start_write_span(
+            timeline,
+            "Plan output schema",
+            "delta_funnel.write.planning",
+            "Output schema planning",
+        )
+        .map(|span| {
+            span.with_attribute(
+                "output_name",
+                request.target().output_name().to_owned().into(),
+            )
+        });
         let schema = match self.schema_for_lazy_table(request.table()) {
             Ok(schema) => {
                 phase_timings.push(schema_timer.completed());
+                complete_write_span(schema_span);
                 schema
             }
             Err(error) => {
                 phase_timings.push(schema_timer.failed());
+                fail_write_span(schema_span);
                 return Err(error);
             }
         };
 
         let target_timer = PhaseTimer::start(SQL_TARGET_PLANNING_PHASE);
+        let target_span = start_write_span(
+            timeline,
+            "Plan SQL Server target",
+            "delta_funnel.write.planning",
+            "SQL Server target planning",
+        )
+        .map(|span| {
+            span.with_attribute(
+                "output_name",
+                request.target().output_name().to_owned().into(),
+            )
+        });
         let resolved_target =
             match request
                 .target()
@@ -84,6 +118,7 @@ impl DeltaFunnelSession {
                 Ok(resolved_target) => resolved_target,
                 Err(error) => {
                     phase_timings.push(target_timer.failed());
+                    fail_write_span(target_span);
                     return Err(error);
                 }
             };
@@ -94,10 +129,12 @@ impl DeltaFunnelSession {
         ) {
             Ok(output_plan) => {
                 phase_timings.push(target_timer.completed());
+                complete_write_span(target_span);
                 output_plan
             }
             Err(error) => {
                 phase_timings.push(target_timer.failed());
+                fail_write_span(target_span);
                 return Err(error);
             }
         };
@@ -306,12 +343,13 @@ impl DeltaFunnelSession {
         result
     }
 
-    pub(super) fn mssql_output_query_factory(
+    pub(super) fn mssql_output_query_factory_with_timeline(
         &self,
         planned: PlannedMssqlOutput,
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         progress: Option<ProgressReporter>,
         profile_mode: ExecutionProfileMode,
+        timeline: Option<OperationTimelineRecorder>,
     ) -> Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send> {
         let context = self.context.clone();
         let sources = self.sources.clone();
@@ -320,7 +358,7 @@ impl DeltaFunnelSession {
 
         Box::new(move || {
             Box::pin(async move {
-                create_mssql_output_query_execution(
+                create_mssql_output_query_execution_with_timeline(
                     &context,
                     &sources,
                     &derived_tables,
@@ -329,6 +367,7 @@ impl DeltaFunnelSession {
                     provider_stats_snapshots,
                     progress,
                     profile_mode,
+                    timeline.as_ref(),
                 )
                 .await
             })
@@ -345,6 +384,10 @@ impl DeltaFunnelSession {
     where
         W: OrchestratorMssqlOutputWriter,
     {
+        let timeline = match profile_mode {
+            ExecutionProfileMode::Disabled => None,
+            ExecutionProfileMode::Detailed => Some(OperationTimelineRecorder::start()),
+        };
         let output_name = Some(request.target().output_name());
         if let Some(reporter) = reporter {
             reporter.emit(&ProgressEvent::phase_changed(
@@ -352,7 +395,7 @@ impl DeltaFunnelSession {
                 output_name,
             ));
         }
-        let planned = self.plan_mssql_output(request)?;
+        let planned = self.plan_mssql_output_with_timeline(request, timeline.as_ref())?;
         if let Some(reporter) = reporter {
             reporter.emit(&ProgressEvent::phase_changed(
                 ProgressPhase::SettingUpStream,
@@ -363,7 +406,7 @@ impl DeltaFunnelSession {
             stream: batches,
             query_phase_timings,
             attach_profile_to_result,
-        } = create_mssql_output_query_execution(
+        } = create_mssql_output_query_execution_with_timeline(
             &self.context,
             &self.sources,
             &self.derived_tables,
@@ -372,27 +415,35 @@ impl DeltaFunnelSession {
             None,
             reporter.cloned(),
             profile_mode,
+            timeline.as_ref(),
         )
         .await
-        .map_err(|failure| failure.error)?;
+        .map_err(|failure| {
+            finish_mssql_write_error_timeline(
+                failure.error,
+                timeline.as_ref(),
+                request.target().output_name(),
+            )
+        })?;
 
         let mut phase_timings = planned.phase_timings().to_vec();
         phase_timings.extend(query_phase_timings);
         let result = writer
-            .write_output(
+            .write_output_with_timeline(
                 planned.output_plan().clone(),
                 planned.resolved_target().clone(),
                 batches,
                 self.options.mssql_write_backend(),
                 self.options.validation_options(),
                 reporter,
+                timeline.as_ref(),
             )
             .await;
         let result = match attach_profile_to_result {
             Some(attach_profile) => attach_profile(result),
             None => result,
         };
-        match result {
+        let result = match result {
             Ok(report) => {
                 Ok(ensure_validation_phase_timing(report).with_phase_timings(phase_timings))
             }
@@ -400,7 +451,8 @@ impl DeltaFunnelSession {
                 let error = prepend_mssql_write_phase_timings(error, phase_timings);
                 Err(error)
             }
-        }
+        };
+        finish_mssql_write_timeline(result, timeline.as_ref(), request.target().output_name())
     }
 }
 
@@ -408,7 +460,7 @@ impl DeltaFunnelSession {
     clippy::too_many_arguments,
     reason = "query creation needs the session registries plus per-output reporting state"
 )]
-async fn create_mssql_output_query_execution(
+pub(super) async fn create_mssql_output_query_execution_with_timeline(
     context: &SessionContext,
     sources: &[RegisteredSessionSource],
     derived_tables: &[RegisteredDerivedTable],
@@ -417,10 +469,23 @@ async fn create_mssql_output_query_execution(
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<ProgressReporter>,
     profile_mode: ExecutionProfileMode,
+    timeline: Option<&OperationTimelineRecorder>,
 ) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
     let mut query_phase_timings = Vec::with_capacity(QUERY_PHASE_NAMES.len());
 
     let dataframe_timer = PhaseTimer::start(QUERY_DATAFRAME_PLANNING_PHASE);
+    let dataframe_span = start_write_span(
+        timeline,
+        "Build query DataFrame",
+        "delta_funnel.write.query",
+        "Query DataFrame planning",
+    )
+    .map(|span| {
+        span.with_attribute(
+            "output_name",
+            planned.resolved_target().output_name().to_owned().into(),
+        )
+    });
     let dataframe = match dataframe_for_lazy_table_from_session_parts(
         context,
         planned.table(),
@@ -432,6 +497,7 @@ async fn create_mssql_output_query_execution(
     {
         Ok(dataframe) => dataframe,
         Err(source) => {
+            fail_write_span(dataframe_span);
             return Err(mssql_output_query_error(
                 planned,
                 MssqlWritePhase::QueryDataFramePlanning,
@@ -442,9 +508,10 @@ async fn create_mssql_output_query_execution(
             ));
         }
     };
+    complete_write_span(dataframe_span);
     query_phase_timings.push(dataframe_timer.completed());
 
-    create_mssql_output_query_execution_from_dataframe(
+    create_mssql_output_query_execution_from_dataframe_with_timeline(
         context,
         planned,
         dataframe,
@@ -452,11 +519,16 @@ async fn create_mssql_output_query_execution(
         provider_stats_snapshots,
         progress,
         profile_mode,
+        timeline,
     )
     .await
 }
 
-pub(super) async fn create_mssql_output_query_execution_from_dataframe(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "query creation carries timing, progress, and profiling state"
+)]
+pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_timeline(
     context: &SessionContext,
     planned: &PlannedMssqlOutput,
     dataframe: DataFrame,
@@ -464,11 +536,25 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe(
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<ProgressReporter>,
     profile_mode: ExecutionProfileMode,
+    timeline: Option<&OperationTimelineRecorder>,
 ) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
     let physical_plan_timer = PhaseTimer::start(QUERY_PHYSICAL_PLANNING_PHASE);
+    let physical_plan_span = start_write_span(
+        timeline,
+        "Build physical plan",
+        "delta_funnel.write.query",
+        "Query physical planning",
+    )
+    .map(|span| {
+        span.with_attribute(
+            "output_name",
+            planned.resolved_target().output_name().to_owned().into(),
+        )
+    });
     let physical_plan = match dataframe.create_physical_plan().await {
         Ok(physical_plan) => physical_plan,
         Err(error) => {
+            fail_write_span(physical_plan_span);
             return Err(mssql_output_query_error(
                 planned,
                 MssqlWritePhase::QueryPhysicalPlanning,
@@ -479,9 +565,22 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe(
             ));
         }
     };
+    complete_write_span(physical_plan_span);
     query_phase_timings.push(physical_plan_timer.completed());
 
     let stream_setup_timer = PhaseTimer::start(QUERY_STREAM_SETUP_PHASE);
+    let stream_setup_span = start_write_span(
+        timeline,
+        "Set up query stream",
+        "delta_funnel.write.query",
+        "Query stream setup",
+    )
+    .map(|span| {
+        span.with_attribute(
+            "output_name",
+            planned.resolved_target().output_name().to_owned().into(),
+        )
+    });
     let profile_scope = match profile_mode {
         ExecutionProfileMode::Disabled => None,
         ExecutionProfileMode::Detailed => Some(QueryExecutionScope::MssqlOutput),
@@ -498,6 +597,7 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe(
     ) {
         Ok(execution) => execution,
         Err(failure) => {
+            fail_write_span(stream_setup_span);
             return Err(mssql_output_query_error(
                 planned,
                 MssqlWritePhase::QueryStreamSetup,
@@ -508,6 +608,7 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe(
             ));
         }
     };
+    complete_write_span(stream_setup_span);
     query_phase_timings.push(stream_setup_timer.completed());
 
     let attach_profile_to_result = profile_result.map(|profile_result| {
@@ -619,6 +720,118 @@ fn with_mssql_write_execution_profile(
     }
 }
 
+fn finish_mssql_write_timeline(
+    result: Result<MssqlWriteReport, DeltaFunnelError>,
+    timeline: Option<&OperationTimelineRecorder>,
+    output_name: &str,
+) -> Result<MssqlWriteReport, DeltaFunnelError> {
+    let Some(timeline) = timeline else {
+        return result;
+    };
+    if let Some(profile) = mssql_write_execution_profile(&result) {
+        timeline.append_operator_lifecycles(profile);
+    }
+    let status = if result.is_ok() {
+        TimelineSpanStatus::Completed
+    } else {
+        TimelineSpanStatus::Failed
+    };
+    let operation_timeline = timeline.finish(format!("SQL Server write: {output_name}"), status);
+    match result {
+        Ok(report) => Ok(report.with_operation_timeline(Some(operation_timeline))),
+        Err(error) => Err(with_mssql_write_operation_timeline(
+            error,
+            operation_timeline,
+        )),
+    }
+}
+
+fn finish_mssql_write_error_timeline(
+    error: DeltaFunnelError,
+    timeline: Option<&OperationTimelineRecorder>,
+    output_name: &str,
+) -> DeltaFunnelError {
+    let Some(timeline) = timeline else {
+        return error;
+    };
+    if let Some(profile) = mssql_write_error_execution_profile(&error) {
+        timeline.append_operator_lifecycles(profile);
+    }
+    let operation_timeline = timeline.finish(
+        format!("SQL Server write: {output_name}"),
+        TimelineSpanStatus::Failed,
+    );
+    with_mssql_write_operation_timeline(error, operation_timeline)
+}
+
+fn mssql_write_execution_profile(
+    result: &Result<MssqlWriteReport, DeltaFunnelError>,
+) -> Option<&QueryExecutionProfile> {
+    match result {
+        Ok(report) => report.execution_profile(),
+        Err(error) => mssql_write_error_execution_profile(error),
+    }
+}
+
+fn mssql_write_error_execution_profile(error: &DeltaFunnelError) -> Option<&QueryExecutionProfile> {
+    match error {
+        DeltaFunnelError::MssqlWritePhase { context, .. }
+        | DeltaFunnelError::MssqlQueryPhase { context, .. }
+        | DeltaFunnelError::MssqlBatchSchemaValidation { context, .. } => {
+            context.report().execution_profile()
+        }
+        _ => None,
+    }
+}
+
+fn with_mssql_write_operation_timeline(
+    error: DeltaFunnelError,
+    operation_timeline: crate::OperationTimeline,
+) -> DeltaFunnelError {
+    match error {
+        DeltaFunnelError::MssqlWritePhase { context, message } => {
+            DeltaFunnelError::MssqlWritePhase {
+                context: Box::new((*context).with_operation_timeline(Some(operation_timeline))),
+                message,
+            }
+        }
+        DeltaFunnelError::MssqlQueryPhase { context, source } => {
+            DeltaFunnelError::MssqlQueryPhase {
+                context: Box::new((*context).with_operation_timeline(Some(operation_timeline))),
+                source,
+            }
+        }
+        DeltaFunnelError::MssqlBatchSchemaValidation { context, source } => {
+            DeltaFunnelError::MssqlBatchSchemaValidation {
+                context: Box::new((*context).with_operation_timeline(Some(operation_timeline))),
+                source,
+            }
+        }
+        other => other,
+    }
+}
+
+fn start_write_span(
+    timeline: Option<&OperationTimelineRecorder>,
+    name: &str,
+    category: &str,
+    track_name: &str,
+) -> Option<OperationTimelineSpanRecorder> {
+    timeline.map(|timeline| timeline.start_span(name, category, track_name))
+}
+
+fn complete_write_span(span: Option<OperationTimelineSpanRecorder>) {
+    if let Some(span) = span {
+        span.completed();
+    }
+}
+
+fn fail_write_span(span: Option<OperationTimelineSpanRecorder>) {
+    if let Some(span) = span {
+        span.failed();
+    }
+}
+
 fn prepend_mssql_write_phase_timings(
     error: DeltaFunnelError,
     phase_timings: Vec<PhaseTimingReport>,
@@ -671,6 +884,28 @@ pub(crate) trait OrchestratorMssqlOutputWriter: Send {
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_output_with_timeline(
+        &mut self,
+        output_plan: MssqlTargetOutputPlan,
+        resolved_target: ResolvedMssqlTarget,
+        batches: MssqlOutputBatchStream,
+        write_backend: MssqlWriteBackend,
+        validation_options: ValidationOptions,
+        reporter: Option<&ProgressReporter>,
+        _timeline: Option<&OperationTimelineRecorder>,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        self.write_output(
+            output_plan,
+            resolved_target,
+            batches,
+            write_backend,
+            validation_options,
+            reporter,
+        )
+        .await
+    }
 }
 
 struct MssqlOneOutputSinkWriter;
@@ -693,6 +928,28 @@ impl OrchestratorMssqlOutputWriter for MssqlOneOutputSinkWriter {
             write_backend,
             validation_options,
             reporter,
+        )
+        .await
+    }
+
+    async fn write_output_with_timeline(
+        &mut self,
+        output_plan: MssqlTargetOutputPlan,
+        resolved_target: ResolvedMssqlTarget,
+        batches: MssqlOutputBatchStream,
+        write_backend: MssqlWriteBackend,
+        validation_options: ValidationOptions,
+        reporter: Option<&ProgressReporter>,
+        timeline: Option<&OperationTimelineRecorder>,
+    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
+        crate::sql_server::write_planned_output_batches_to_mssql_for_workflow_with_timeline(
+            output_plan,
+            resolved_target,
+            batches,
+            write_backend,
+            validation_options,
+            reporter,
+            timeline,
         )
         .await
     }
@@ -1528,9 +1785,33 @@ mod tests {
         assert!(!profile.partial());
         assert_eq!(profile.delta_funnel_row_limit(), None);
         assert!(!profile.operators().is_empty());
+        let timeline = report.operation_timeline().ok_or("expected timeline")?;
+        assert_eq!(timeline.status(), crate::TimelineSpanStatus::Completed);
+        assert!(timeline.total_duration_micros() > 0);
+        assert!(timeline.spans().iter().any(|span| {
+            span.name() == "Build query DataFrame" && span.category() == "delta_funnel.write.query"
+        }));
+        assert!(
+            timeline
+                .spans()
+                .iter()
+                .any(|span| span.category() == "datafusion.operator.lifecycle")
+        );
+        assert!(timeline.spans().iter().all(|span| {
+            span.start_offset_micros()
+                .saturating_add(span.duration_micros())
+                <= timeline.total_duration_micros()
+        }));
         let value = report.to_json_value();
         assert_eq!(value["execution_profile"]["scope"], "mssql_output");
         assert_eq!(value["execution_profile"]["outcome"], "success");
+        assert_eq!(value["operation_timeline"]["status"], "completed");
+        let trace = report.to_trace_event_json_value().ok_or("expected trace")?;
+        assert_eq!(
+            trace["delta_funnel_timeline"]["total_duration_micros"],
+            timeline.total_duration_micros()
+        );
+        assert_eq!(trace["delta_funnel_profile"]["scope"], "mssql_output");
         assert_eq!(
             value
                 .as_object()
@@ -1650,9 +1931,14 @@ mod tests {
             assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
             assert_eq!(profile.outcome(), QueryExecutionOutcome::Cancelled);
             assert!(profile.partial());
+            let timeline = context
+                .operation_timeline()
+                .ok_or("expected failure timeline")?;
+            assert_eq!(timeline.status(), crate::TimelineSpanStatus::Failed);
             let value = context.to_json_value();
             assert!(value.get("execution_profile").is_none());
             assert_eq!(value["report"]["execution_profile"]["outcome"], "cancelled");
+            assert_eq!(value["report"]["operation_timeline"]["status"], "failed");
             let events = execution_profile_events(&capture);
             assert_eq!(events.len(), 1);
             assert_eq!(

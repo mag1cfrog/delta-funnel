@@ -2,8 +2,8 @@ use std::fmt;
 
 use crate::{
     MssqlConnectionSource, MssqlConnectionSummary, MssqlTargetOutputPlan, MssqlTargetTable,
-    MssqlWritePhase, PhaseStatus, PhaseTimingReport, QueryExecutionProfile, QueryExecutionScope,
-    ReportReasonCode, RowCount, ValidationStatus, sql_server::LoadMode,
+    MssqlWritePhase, OperationTimeline, PhaseStatus, PhaseTimingReport, QueryExecutionProfile,
+    QueryExecutionScope, ReportReasonCode, RowCount, ValidationStatus, sql_server::LoadMode,
     support::sanitize_text_for_display,
 };
 
@@ -369,6 +369,7 @@ pub struct MssqlWriteReport {
     batch_shaping: MssqlBatchShapingReport,
     phase_timings: Vec<PhaseTimingReport>,
     execution_profile: Option<QueryExecutionProfile>,
+    operation_timeline: Option<OperationTimeline>,
     stats: MssqlWriteStats,
     partial_write_possible: bool,
     cleanup: MssqlTargetCleanupStatus,
@@ -429,6 +430,7 @@ impl MssqlWriteReport {
             batch_shaping: metrics.batch_shaping,
             phase_timings: metrics.phase_timings,
             execution_profile: None,
+            operation_timeline: None,
             stats: MssqlWriteStats::new(
                 output_name,
                 metrics.rows_written,
@@ -458,6 +460,14 @@ impl MssqlWriteReport {
                 .is_none_or(|profile| profile.scope() == QueryExecutionScope::MssqlOutput)
         );
         self.execution_profile = execution_profile;
+        self
+    }
+
+    pub(crate) fn with_operation_timeline(
+        mut self,
+        operation_timeline: Option<OperationTimeline>,
+    ) -> Self {
+        self.operation_timeline = operation_timeline;
         self
     }
 
@@ -591,6 +601,12 @@ impl MssqlWriteReport {
     #[must_use]
     pub const fn execution_profile(&self) -> Option<&QueryExecutionProfile> {
         self.execution_profile.as_ref()
+    }
+
+    /// Returns the full wall-clock timeline when detailed profiling was enabled.
+    #[must_use]
+    pub const fn operation_timeline(&self) -> Option<&OperationTimeline> {
+        self.operation_timeline.as_ref()
     }
 
     /// Returns whether the target may contain a partial write after failure.
@@ -839,6 +855,20 @@ impl MssqlWriteFailureContext {
     ) -> Self {
         self.report = self.report.with_execution_profile(execution_profile);
         self
+    }
+
+    pub(crate) fn with_operation_timeline(
+        mut self,
+        operation_timeline: Option<OperationTimeline>,
+    ) -> Self {
+        self.report = self.report.with_operation_timeline(operation_timeline);
+        self
+    }
+
+    /// Returns the partial wall-clock timeline captured through the failure.
+    #[must_use]
+    pub const fn operation_timeline(&self) -> Option<&OperationTimeline> {
+        self.report.operation_timeline()
     }
 
     pub(crate) fn with_appended_phase_timings(

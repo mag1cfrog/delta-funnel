@@ -63,6 +63,28 @@ Enable detailed DataFusion profiling for each output query:
 report = session.write_all(outputs, options={"profile": True})
 ```
 
+Export the complete workflow on one wall clock when phase and output ordering
+matters:
+
+```python
+report = session.write_all(
+    outputs,
+    options={"profile": True},
+    trace_path="write-all-trace.json",
+)
+```
+
+Open the file with `vizviewer write-all-trace.json`, Perfetto, or another
+Chrome Trace Event viewer. The root event is the total `write_all` duration.
+Top-level planning, workflow execution, source reporting, sequential output
+attempts, SQL Server work, and output-query operator lifecycles are positioned
+relative to that same origin. The returned dictionary also exposes the model
+under `report["operation_timeline"]`.
+
+With automatic caching, the trace also positions each alias's resolution,
+planning, execution, `MemTable` construction, installation, restoration, and
+DataFusion operator lifecycles on labeled cache lanes.
+
 Profiling works with both cache modes. For example, disable shared caching and
 enable profiling in the same call:
 
@@ -93,8 +115,9 @@ output status wrappers do not duplicate these fields.
 
 Omitting `profile`, or passing `None` or `False`, disables profiling. Only the
 actual Boolean `True` enables it. The `options` argument remains unavailable
-for dry runs. For exact Python and Rust contracts, profile outcomes, and the
-profile schema, see [API references](../reference/api.md#multi-output-sql-server-profiling).
+for dry runs, and `trace_path` is execute-only. For exact Python and Rust
+contracts, profile outcomes, and the profile schema, see
+[API references](../reference/api.md#multi-output-sql-server-profiling).
 
 ## Interpret failures
 

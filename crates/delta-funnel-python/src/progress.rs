@@ -19,7 +19,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use serde_json::Value;
 
-use crate::json::json_value_to_py;
+use crate::exception::attach_operation_result;
 
 #[cfg(test)]
 thread_local! {
@@ -110,23 +110,11 @@ impl PythonProgress {
         let status = action_status(state.final_event, operation_error.is_some());
         match state.pending_interruption {
             Some(error) => {
-                // Metadata is best effort. A custom exception may reject
-                // attributes, but it must still be raised unchanged.
-                let _ = error
-                    .value(py)
-                    .setattr("deltafunnel_operation_status", status);
-                if let Some(operation_error) = operation_error {
-                    let _ = error
-                        .value(py)
-                        .setattr("deltafunnel_operation_error", operation_error.value(py));
-                } else if state.final_event == Some(ProgressEventKind::CompletedWithFailures)
-                    && let Some(operation_report) = operation_report
-                    && let Ok(operation_report) = json_value_to_py(py, operation_report)
-                {
-                    let _ = error
-                        .value(py)
-                        .setattr("deltafunnel_operation_report", operation_report.bind(py));
-                }
+                let operation_report = (state.final_event
+                    == Some(ProgressEventKind::CompletedWithFailures))
+                .then_some(operation_report)
+                .flatten();
+                attach_operation_result(py, &error, status, operation_error, operation_report);
                 write_interruption_notice(py, status);
                 Err(error)
             }

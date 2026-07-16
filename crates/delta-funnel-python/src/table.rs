@@ -1,6 +1,10 @@
 //! Python lazy table wrapper.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
@@ -14,11 +18,9 @@ use crate::session::{PySession, config_py_error};
 /// Rendered preview of a Delta Funnel table.
 #[pyclass(name = "Preview", module = "deltafunnel")]
 pub(crate) struct PyPreview {
-    text: String,
-    html: String,
+    inner: delta_funnel::TablePreview,
     phase_timings: Py<PyAny>,
     execution_profile: Py<PyAny>,
-    execution_profile_report: Option<delta_funnel::QueryExecutionProfile>,
 }
 
 impl PyPreview {
@@ -30,18 +32,15 @@ impl PyPreview {
                 .map(delta_funnel::PhaseTimingReport::to_json_value)
                 .collect(),
         );
-        let execution_profile_report = preview.execution_profile().cloned();
-        let execution_profile = execution_profile_report
-            .as_ref()
+        let execution_profile = preview
+            .execution_profile()
             .map(delta_funnel::QueryExecutionProfile::to_json_value)
             .unwrap_or(serde_json::Value::Null);
 
         Ok(Self {
-            text: preview.text().to_owned(),
-            html: preview.html().to_owned(),
+            inner: preview,
             phase_timings: json_value_to_py(py, &phase_timings)?,
             execution_profile: json_value_to_py(py, &execution_profile)?,
-            execution_profile_report,
         })
     }
 }
@@ -50,12 +49,12 @@ impl PyPreview {
 impl PyPreview {
     #[getter]
     fn text(&self) -> &str {
-        &self.text
+        self.inner.text()
     }
 
     #[getter]
     fn html(&self) -> &str {
-        &self.html
+        self.inner.html()
     }
 
     #[getter]
@@ -68,33 +67,31 @@ impl PyPreview {
         self.execution_profile.clone_ref(py)
     }
 
-    /// Writes the detailed execution profile as Chrome Trace Event JSON.
+    /// Writes the full preview wall-clock timeline as Chrome Trace Event JSON.
     ///
     /// The resulting file can be opened by VizTracer's `vizviewer`, Perfetto,
     /// and other viewers that accept Chrome Trace Event JSON.
     fn export_trace(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
-        let profile = self.execution_profile_report.as_ref().ok_or_else(|| {
+        let trace = self.inner.to_trace_event_json_value().ok_or_else(|| {
             config_py_error(
                 py,
                 "execution_profile_unavailable",
                 "trace export requires a preview created with `profile=True`".to_owned(),
             )
         })?;
-        let bytes = serde_json::to_vec(&profile.to_trace_event_json_value())
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        fs::write(path, bytes).map_err(PyOSError::new_err)
+        write_trace_json(&path, &trace)
     }
 
     fn __str__(&self) -> &str {
-        &self.text
+        self.inner.text()
     }
 
     fn __repr__(&self) -> &str {
-        &self.text
+        self.inner.text()
     }
 
     fn _repr_html_(&self) -> &str {
-        &self.html
+        self.inner.html()
     }
 }
 
@@ -155,7 +152,9 @@ impl PyTable {
     ///
     /// Pass `dry_run=True` to plan without writing. Returns a plain Python
     /// `dict` report. Pass `profile=True` on execute calls to attach a detailed
-    /// query execution profile. Profiling is not available for dry runs.
+    /// query execution profile and full operation timeline. Pass `trace_path`
+    /// with `profile=True` to export Chrome Trace Event JSON after success.
+    /// Profiling and trace export are not available for dry runs.
     ///
     /// By default, shows an indeterminate phase display in interactive
     /// terminals and Jupyter, and stays quiet elsewhere. Pass `progress=True`
@@ -169,7 +168,7 @@ impl PyTable {
     /// cleanup before raising the interruption. When possible, the exception
     /// includes `deltafunnel_operation_status` and, for a failed action,
     /// `deltafunnel_operation_error`.
-    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=false))]
+    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=false, trace_path=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(
         &self,
@@ -182,12 +181,27 @@ impl PyTable {
         connection_string: Option<String>,
         progress: Option<bool>,
         #[pyo3(from_py_with = parse_profile_arg)] profile: bool,
+        trace_path: Option<PathBuf>,
     ) -> PyResult<Py<PyAny>> {
         if dry_run == Some(true) && profile {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
                 "`profile=True` is only supported for execute `write_to_mssql` calls".to_owned(),
+            ));
+        }
+        if dry_run == Some(true) && trace_path.is_some() {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                "`trace_path` is only supported for execute `write_to_mssql` calls".to_owned(),
+            ));
+        }
+        if trace_path.is_some() && !profile {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                "`trace_path` requires `profile=True`".to_owned(),
             ));
         }
         let spec = PyMssqlOutputSpec::new(
@@ -219,6 +233,7 @@ impl PyTable {
             &spec.write_plan(delta_funnel::RunMode::Execute),
             profile_mode,
             progress.as_ref(),
+            trace_path.as_deref(),
         )
     }
 
@@ -292,6 +307,62 @@ impl PyTable {
     }
 }
 
+pub(crate) fn write_trace_json(path: &Path, trace: &serde_json::Value) -> PyResult<()> {
+    let bytes =
+        serde_json::to_vec(trace).map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    fs::write(path, bytes).map_err(PyOSError::new_err)
+}
+
+/// A trace file opened before a mutating operation starts.
+pub(crate) struct TraceDestination {
+    path: PathBuf,
+    file: fs::File,
+    remove_on_drop: bool,
+}
+
+impl TraceDestination {
+    pub(crate) fn open(path: &Path) -> PyResult<Self> {
+        let (file, remove_on_drop) = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(PyOSError::new_err)?,
+                false,
+            ),
+            Err(error) => return Err(PyOSError::new_err(error)),
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+            remove_on_drop,
+        })
+    }
+
+    pub(crate) fn write(mut self, trace: &serde_json::Value) -> PyResult<()> {
+        let bytes = serde_json::to_vec(trace)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        self.file.set_len(0).map_err(PyOSError::new_err)?;
+        self.file.write_all(&bytes).map_err(PyOSError::new_err)?;
+        self.file.flush().map_err(PyOSError::new_err)?;
+        self.remove_on_drop = false;
+        Ok(())
+    }
+}
+
+impl Drop for TraceDestination {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn parse_profile_arg(profile: &Bound<'_, PyAny>) -> PyResult<bool> {
     if profile.is_none() {
         return Ok(false);
@@ -319,6 +390,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use super::TraceDestination;
     use crate::{
         deltafunnel, exception::DeltaFunnelError, progress::adapter_creation_count,
         test_support::python_state,
@@ -337,6 +409,28 @@ mod tests {
         "preview_format_html",
         "preview_total",
     ];
+
+    #[test]
+    fn unused_trace_destination_preserves_the_preoperation_file_state() -> PyResult<()> {
+        let new_path = temp_trace_path("preflight-new")?;
+        let destination = TraceDestination::open(&new_path)?;
+        assert!(new_path.exists());
+        drop(destination);
+        assert!(!new_path.exists());
+
+        let existing_path = temp_trace_path("preflight-existing")?;
+        fs::write(&existing_path, b"existing trace")
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let destination = TraceDestination::open(&existing_path)?;
+        drop(destination);
+        assert_eq!(
+            fs::read(&existing_path).map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+            b"existing trace"
+        );
+        fs::remove_file(existing_path)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Ok(())
+    }
 
     #[test]
     fn module_exports_table_type() -> PyResult<()> {
@@ -364,6 +458,47 @@ mod tests {
         let stub = include_str!("../deltafunnel.pyi");
 
         assert!(stub.contains("def export_trace(self, path: str | PathLike[str]) -> None: ..."));
+        assert!(stub.contains("trace_path: str | PathLike[str] | None = None"));
+    }
+
+    #[test]
+    fn write_trace_path_is_keyword_only_and_requires_detailed_profile() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+            let signature = py
+                .import("inspect")?
+                .call_method1("signature", (table.getattr("write_to_mssql")?,))?
+                .to_string();
+            assert!(signature.ends_with("profile=False, trace_path=None)"));
+
+            let trace_path = temp_trace_path("write-without-profile")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("schema", "dbo")?;
+            kwargs.set_item("table", "orders")?;
+            kwargs.set_item("load_mode", "append_existing")?;
+            kwargs.set_item("trace_path", trace_path.to_string_lossy().as_ref())?;
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .unwrap_err();
+
+            assert!(error.is_instance_of::<DeltaFunnelError>(py));
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+            assert!(
+                error
+                    .value(py)
+                    .getattr("message")?
+                    .extract::<String>()?
+                    .contains("requires `profile=True`")
+            );
+            assert!(!trace_path.exists());
+            Ok(())
+        })
     }
 
     #[test]
@@ -499,10 +634,37 @@ mod tests {
             let _ = fs::remove_file(path);
 
             assert_eq!(trace["delta_funnel_profile"]["scope"], "preview");
+            assert_eq!(trace["delta_funnel_timeline"]["name"], "Preview total");
+            let total_duration = trace["delta_funnel_timeline"]["total_duration_micros"]
+                .as_u64()
+                .ok_or_else(|| PyRuntimeError::new_err("missing preview total duration"))?;
+            let events = trace["traceEvents"]
+                .as_array()
+                .ok_or_else(|| PyRuntimeError::new_err("missing trace events"))?;
+            assert!(events.iter().any(|event| {
+                event["name"] == "Preview total"
+                    && event["ts"] == 0
+                    && event["dur"] == total_duration
+            }));
+            assert!(events.iter().any(|event| {
+                event["name"] == "Physical planning"
+                    && event["args"]["time_semantics"] == "wall_clock"
+            }));
             assert!(
-                trace["traceEvents"]
-                    .as_array()
-                    .is_some_and(|events| events.iter().any(|event| event["ph"] == "X"))
+                events
+                    .iter()
+                    .filter(|event| event["cat"] == "datafusion.operator.lifecycle")
+                    .all(|event| event["args"]["time_semantics"] == "lifecycle")
+            );
+            assert!(
+                events
+                    .iter()
+                    .filter(|event| event["ph"] == "X")
+                    .all(|event| {
+                        event["ts"].as_u64().zip(event["dur"].as_u64()).is_some_and(
+                            |(start, duration)| start.saturating_add(duration) <= total_duration,
+                        )
+                    })
             );
             Ok(())
         })
@@ -557,6 +719,11 @@ mod tests {
                 "error"
             );
             assert!(required_item(&profile, "partial")?.extract::<bool>()?);
+            let timeline = required_item(&context, "operation_timeline")?.cast_into::<PyDict>()?;
+            assert_eq!(
+                required_item(&timeline, "status")?.extract::<String>()?,
+                "failed"
+            );
             Ok(())
         })
     }

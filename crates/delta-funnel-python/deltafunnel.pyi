@@ -67,6 +67,7 @@ class Session:
         options: WriteAllExecutionOptions | None = None,
         dry_run: bool | None = None,
         progress: bool | None = None,
+        trace_path: str | PathLike[str] | None = None,
     ) -> Report: ...
 
 
@@ -121,6 +122,7 @@ class Table:
         connection_string: str | None = None,
         progress: bool | None = None,
         profile: bool | None = False,
+        trace_path: str | PathLike[str] | None = None,
     ) -> Report: ...
 
 

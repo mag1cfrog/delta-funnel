@@ -5,7 +5,7 @@
 //! here gives both APIs one report shape and makes the fields that are safe to
 //! expose explicit instead of relying on generic serialization.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde_json::{Value, json};
 
@@ -16,11 +16,12 @@ use crate::{
     MssqlOutputFieldReport, MssqlOutputWriteStatus, MssqlTargetCleanupStatus, MssqlTargetTable,
     MssqlWorkflowWriteReport, MssqlWriteFailureContext, MssqlWriteFailureReport, MssqlWritePhase,
     MssqlWriteReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport, MssqlWriteStats,
-    OutputStatus, PhaseStatus, PhaseTimingReport, QueryExecutionMetric, QueryExecutionMetricValue,
-    QueryExecutionOperatorProfile, QueryExecutionProfile, ReportReasonCode, RowCount, RunMode,
-    ValidationStatus, WorkflowStatus, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
-    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheFailure,
-    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
+    OperationTimeline, OutputStatus, PhaseStatus, PhaseTimingReport, QueryExecutionMetric,
+    QueryExecutionMetricValue, QueryExecutionOperatorProfile, QueryExecutionProfile,
+    ReportReasonCode, RowCount, RunMode, TablePreview, TimelineSpan, TimelineSpanStatus,
+    TimelineSpanTimeSemantics, ValidationStatus, WorkflowStatus, WriteAllCacheAliasReport,
+    WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
+    WriteAllCacheFailure, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
 };
 
 impl RowCount {
@@ -87,6 +88,124 @@ impl PhaseTimingReport {
     }
 }
 
+impl OperationTimeline {
+    /// Returns this wall-clock timeline as a stable JSON-compatible value.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "schema_version": Self::SCHEMA_VERSION,
+            "name": self.name(),
+            "status": self.status().as_str(),
+            "total_duration_micros": self.total_duration_micros(),
+            "spans": self
+                .spans()
+                .iter()
+                .map(TimelineSpan::to_json_value)
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Returns a Chrome Trace Event JSON document for this wall-clock timeline.
+    #[must_use]
+    pub fn to_trace_event_json_value(&self) -> Value {
+        // VizTracer and Perfetto reserve thread zero for their main-thread track.
+        const ROOT_LANE: u64 = 1;
+        let mut events = vec![
+            json!({
+                "name": "process_name",
+                "cat": "__metadata",
+                "ph": "M",
+                "pid": 1,
+                "args": {"name": format!("Delta Funnel {}", self.name())},
+            }),
+            trace_lane_metadata(ROOT_LANE, self.name()),
+            json!({
+                "name": self.name(),
+                "cat": "delta_funnel.operation",
+                "ph": "X",
+                "pid": 1,
+                "tid": ROOT_LANE,
+                "ts": 0,
+                "dur": self.total_duration_micros(),
+                "args": {
+                    "id": 0,
+                    "parent_id": Value::Null,
+                    "status": self.status().as_str(),
+                    "time_semantics": "wall_clock",
+                },
+            }),
+        ];
+
+        let mut lanes = BTreeMap::new();
+        for span in self.spans() {
+            let next_lane = ROOT_LANE.saturating_add(super::usize_to_u64_saturating(
+                lanes.len().saturating_add(1),
+            ));
+            let lane_key = (span.category().to_owned(), span.track_name().to_owned());
+            let (lane, new_lane) = match lanes.entry(lane_key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(next_lane);
+                    (next_lane, true)
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => (*entry.get(), false),
+            };
+            if new_lane {
+                events.push(trace_lane_metadata(lane, span.track_name()));
+            }
+            events.push(json!({
+                "name": span.name(),
+                "cat": span.category(),
+                "ph": "X",
+                "pid": 1,
+                "tid": lane,
+                "ts": span.start_offset_micros(),
+                "dur": span.duration_micros(),
+                "args": {
+                    "id": span.id(),
+                    "parent_id": span.parent_id().unwrap_or(0),
+                    "status": span.status().as_str(),
+                    "time_semantics": span.time_semantics().as_str(),
+                    "attributes": span.attributes(),
+                },
+            }));
+        }
+
+        json!({
+            "traceEvents": events,
+            "displayTimeUnit": "ms",
+            "delta_funnel_timeline": self.to_json_value(),
+        })
+    }
+}
+
+impl TimelineSpan {
+    fn to_json_value(&self) -> Value {
+        json!({
+            "id": self.id(),
+            "parent_id": self.parent_id(),
+            "name": self.name(),
+            "track_name": self.track_name(),
+            "category": self.category(),
+            "start_offset_micros": self.start_offset_micros(),
+            "duration_micros": self.duration_micros(),
+            "status": self.status().as_str(),
+            "time_semantics": self.time_semantics().as_str(),
+            "attributes": self.attributes(),
+        })
+    }
+}
+
+fn trace_lane_metadata(lane: u64, name: &str) -> Value {
+    json!({
+        "name": "thread_name",
+        "cat": "__metadata",
+        "ph": "M",
+        "pid": 1,
+        "tid": lane,
+        "args": {"name": name},
+    })
+}
+
 impl QueryExecutionProfile {
     /// Returns this execution profile as a stable JSON-compatible value.
     #[must_use]
@@ -102,6 +221,68 @@ impl QueryExecutionProfile {
                 .map(QueryExecutionOperatorProfile::to_json_value)
                 .collect::<Vec<_>>(),
         })
+    }
+
+    pub(crate) fn operator_lifecycle_timeline_spans(
+        &self,
+        first_span_id: u64,
+        wall_clock_origin_nanos: i128,
+        total_duration_micros: u64,
+    ) -> Vec<TimelineSpan> {
+        let status = match self.outcome() {
+            crate::QueryExecutionOutcome::Success => TimelineSpanStatus::Completed,
+            crate::QueryExecutionOutcome::Error => TimelineSpanStatus::Failed,
+            crate::QueryExecutionOutcome::Cancelled => TimelineSpanStatus::Cancelled,
+        };
+
+        trace_spans(self)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, span)| {
+                let start_micros = timestamp_offset_micros(
+                    span.start_nanos,
+                    wall_clock_origin_nanos,
+                    total_duration_micros,
+                );
+                let end_micros = timestamp_offset_micros(
+                    span.end_nanos,
+                    wall_clock_origin_nanos,
+                    total_duration_micros,
+                );
+                let duration_micros = end_micros.checked_sub(start_micros)?;
+                let id = first_span_id.saturating_add(super::usize_to_u64_saturating(index));
+
+                Some(
+                    TimelineSpan::new(
+                        id,
+                        None,
+                        span.operator.operator_name(),
+                        "datafusion.operator.lifecycle",
+                        Duration::from_micros(start_micros),
+                        Duration::from_micros(duration_micros),
+                        status,
+                        TimelineSpanTimeSemantics::Lifecycle,
+                    )
+                    .with_track_name(trace_lane_name(&span))
+                    .with_attribute("node_id", json!(span.operator.node_id()))
+                    .with_attribute("parent_node_id", json!(span.operator.parent_node_id()))
+                    .with_attribute("partition", json!(span.partition))
+                    .with_attribute(
+                        "output_partition_count",
+                        json!(span.operator.output_partition_count()),
+                    )
+                    .with_attribute(
+                        "metrics",
+                        Value::Array(
+                            span.metrics
+                                .iter()
+                                .map(|metric| metric.to_json_value())
+                                .collect(),
+                        ),
+                    ),
+                )
+            })
+            .collect()
     }
 
     /// Returns a Chrome Trace Event JSON document for this execution profile.
@@ -252,6 +433,22 @@ fn nanos_to_micros(nanos: u64) -> f64 {
     nanos as f64 / 1_000.0
 }
 
+fn timestamp_offset_micros(
+    timestamp_nanos: i64,
+    wall_clock_origin_nanos: i128,
+    total_duration_micros: u64,
+) -> u64 {
+    let offset_nanos = i128::from(timestamp_nanos).saturating_sub(wall_clock_origin_nanos);
+    if offset_nanos <= 0 {
+        return 0;
+    }
+    let offset_micros = offset_nanos / 1_000;
+    match u64::try_from(offset_micros) {
+        Ok(value) => value.min(total_duration_micros),
+        Err(_) => total_duration_micros,
+    }
+}
+
 impl crate::PreviewFailureContext {
     /// Returns this preview failure context as a stable JSON-compatible value.
     #[must_use]
@@ -266,7 +463,27 @@ impl crate::PreviewFailureContext {
             "execution_profile": self
                 .execution_profile()
                 .map(QueryExecutionProfile::to_json_value),
+            "operation_timeline": self
+                .operation_timeline()
+                .map(OperationTimeline::to_json_value),
         })
+    }
+}
+
+impl TablePreview {
+    /// Returns a Chrome Trace Event JSON document for this profiled preview.
+    ///
+    /// Returns `None` for a legacy preview or when detailed execution
+    /// profiling was disabled.
+    #[must_use]
+    pub fn to_trace_event_json_value(&self) -> Option<Value> {
+        let profile = self.execution_profile()?;
+        let mut trace = self.operation_timeline()?.to_trace_event_json_value();
+        let Value::Object(document) = &mut trace else {
+            return None;
+        };
+        document.insert("delta_funnel_profile".to_owned(), profile.to_json_value());
+        Some(trace)
     }
 }
 
@@ -516,10 +733,25 @@ impl MssqlWriteReport {
             "execution_profile": self
                 .execution_profile()
                 .map(QueryExecutionProfile::to_json_value),
+            "operation_timeline": self
+                .operation_timeline()
+                .map(OperationTimeline::to_json_value),
             "write_stats": self.stats().to_json_value(),
             "partial_write_possible": self.partial_write_possible(),
             "cleanup": cleanup_status(self.cleanup()),
         })
+    }
+
+    /// Returns a Chrome Trace Event JSON document for this profiled write.
+    #[must_use]
+    pub fn to_trace_event_json_value(&self) -> Option<Value> {
+        let profile = self.execution_profile()?;
+        let mut trace = self.operation_timeline()?.to_trace_event_json_value();
+        let Value::Object(document) = &mut trace else {
+            return None;
+        };
+        document.insert("delta_funnel_profile".to_owned(), profile.to_json_value());
+        Some(trace)
     }
 }
 
@@ -690,12 +922,29 @@ impl WriteAllReport {
                 .map(DeltaSourceReport::to_json_value)
                 .collect::<Vec<_>>(),
             "phase_timings": phase_timings_value(self.phase_timings()),
+            "operation_timeline": self
+                .operation_timeline()
+                .map(OperationTimeline::to_json_value),
             "output_count": self.len(),
             "all_succeeded": self.all_succeeded(),
             "succeeded_count": self.succeeded_count(),
             "failed_count": self.failed_count(),
             "skipped_count": self.skipped_count(),
         })
+    }
+
+    /// Returns a Chrome Trace Event JSON document for this profiled write-all call.
+    #[must_use]
+    pub fn to_trace_event_json_value(&self) -> Option<Value> {
+        let mut trace = self.operation_timeline()?.to_trace_event_json_value();
+        let Value::Object(document) = &mut trace else {
+            return None;
+        };
+        document.insert(
+            "delta_funnel_write_all_report".to_owned(),
+            self.to_json_value(),
+        );
+        Some(trace)
     }
 }
 
@@ -780,6 +1029,9 @@ impl WriteAllCacheFailure {
                 .collect::<Vec<_>>(),
             "primary_failed_alias_table_id": self.primary_failed_alias_table_id(),
             "workflow": self.workflow().map(MssqlWorkflowWriteReport::to_json_value),
+            "operation_timeline": self
+                .operation_timeline()
+                .map(OperationTimeline::to_json_value),
         })
     }
 }
@@ -1266,6 +1518,98 @@ mod tests {
     }
 
     #[test]
+    fn operation_timeline_trace_uses_the_total_wall_clock_as_its_origin() {
+        let execution = TimelineSpan::new(
+            1,
+            None,
+            "preview_execute_collect",
+            "delta_funnel.phase",
+            Duration::from_micros(1_700_000),
+            Duration::from_micros(6_200_000),
+            crate::TimelineSpanStatus::Completed,
+            crate::TimelineSpanTimeSemantics::WallClock,
+        )
+        .with_attribute("rows", json!(10_000));
+        let timeline = OperationTimeline::new(
+            "preview",
+            crate::TimelineSpanStatus::Completed,
+            Duration::from_micros(8_000_000),
+            vec![execution],
+        );
+
+        let trace = timeline.to_trace_event_json_value();
+        let events = trace["traceEvents"]
+            .as_array()
+            .expect("trace events should be an array");
+
+        assert_eq!(events.len(), 5);
+        assert!(
+            events
+                .iter()
+                .filter_map(|event| event["tid"].as_u64())
+                .all(|lane| lane > 0)
+        );
+        assert_eq!(events[2]["tid"], 1);
+        assert_eq!(events[2]["name"], "preview");
+        assert_eq!(events[2]["ts"], 0);
+        assert_eq!(events[2]["dur"], 8_000_000);
+        assert_eq!(events[4]["name"], "preview_execute_collect");
+        assert_eq!(events[4]["tid"], 2);
+        assert_eq!(events[4]["ts"], 1_700_000);
+        assert_eq!(events[4]["dur"], 6_200_000);
+        assert_eq!(events[4]["args"]["time_semantics"], "wall_clock");
+        assert_eq!(events[4]["args"]["attributes"]["rows"], 10_000);
+        assert_eq!(trace["delta_funnel_timeline"], timeline.to_json_value());
+    }
+
+    #[test]
+    fn operation_timeline_trace_reuses_lanes_for_repeated_batch_steps() {
+        let spans = [10_u64, 30]
+            .into_iter()
+            .enumerate()
+            .map(|(index, start)| {
+                TimelineSpan::new(
+                    crate::usize_to_u64_saturating(index.saturating_add(1)),
+                    None,
+                    "Write batch",
+                    "delta_funnel.write.batch",
+                    Duration::from_micros(start),
+                    Duration::from_micros(5),
+                    crate::TimelineSpanStatus::Completed,
+                    crate::TimelineSpanTimeSemantics::WallClock,
+                )
+                .with_track_name("SQL Server batch writes")
+            })
+            .collect();
+        let timeline = OperationTimeline::new(
+            "write",
+            crate::TimelineSpanStatus::Completed,
+            Duration::from_micros(50),
+            spans,
+        );
+
+        let trace = timeline.to_trace_event_json_value();
+        let events = trace["traceEvents"]
+            .as_array()
+            .expect("trace events should be an array");
+        let lane_metadata = events
+            .iter()
+            .filter(|event| {
+                event["name"] == "thread_name" && event["args"]["name"] == "SQL Server batch writes"
+            })
+            .count();
+        let write_lanes = events
+            .iter()
+            .filter(|event| event["name"] == "Write batch")
+            .filter_map(|event| event["tid"].as_u64())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lane_metadata, 1);
+        assert_eq!(write_lanes.len(), 2);
+        assert_eq!(write_lanes[0], write_lanes[1]);
+    }
+
+    #[test]
     fn execution_profile_trace_json_exposes_partition_spans_and_embeds_profile() {
         let metric = |name, partition, value| {
             QueryExecutionMetric::new(
@@ -1395,6 +1739,64 @@ mod tests {
         assert_eq!(event_for_partition(0)["ts"], 0.0);
         assert_eq!(event_for_partition(1)["dur"], nanos_to_micros(u64::MAX));
         assert_eq!(event_for_partition(2)["ts"], nanos_to_micros(u64::MAX));
+    }
+
+    #[test]
+    fn operator_lifecycles_align_to_and_are_clamped_by_the_operation_wall_clock() {
+        let metric = |name, value| {
+            QueryExecutionMetric::new(
+                name,
+                crate::QueryExecutionMetricCategory::Summary,
+                Some(3),
+                None,
+                value,
+            )
+        };
+        let operator = QueryExecutionOperatorProfile::new(
+            4,
+            Some(2),
+            "FilterExec",
+            4,
+            true,
+            Vec::new(),
+            vec![
+                metric(
+                    "start_timestamp",
+                    QueryExecutionMetricValue::TimestampNanoseconds(Some(1_100_000)),
+                ),
+                metric(
+                    "end_timestamp",
+                    QueryExecutionMetricValue::TimestampNanoseconds(Some(2_000_000)),
+                ),
+                metric(
+                    "elapsed_compute",
+                    QueryExecutionMetricValue::Nanoseconds(42_000),
+                ),
+            ],
+            None,
+        );
+        let profile =
+            QueryExecutionProfile::preview(crate::QueryExecutionOutcome::Error, 20, vec![operator]);
+
+        let spans = profile.operator_lifecycle_timeline_spans(7, 1_000_000, 800);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].id(), 7);
+        assert_eq!(spans[0].name(), "FilterExec");
+        assert_eq!(spans[0].track_name(), "FilterExec [node 4, partition 3]");
+        assert_eq!(spans[0].start_offset_micros(), 100);
+        assert_eq!(spans[0].duration_micros(), 700);
+        assert_eq!(spans[0].status(), crate::TimelineSpanStatus::Failed);
+        assert_eq!(
+            spans[0].time_semantics(),
+            crate::TimelineSpanTimeSemantics::Lifecycle
+        );
+        assert_eq!(spans[0].attributes()["node_id"], 4);
+        assert_eq!(spans[0].attributes()["parent_node_id"], 2);
+        assert_eq!(
+            spans[0].attributes()["metrics"][0]["name"],
+            "elapsed_compute"
+        );
     }
 
     #[tokio::test]
@@ -1745,6 +2147,7 @@ mod tests {
                 "aliases": [],
                 "primary_failed_alias_table_id": null,
                 "workflow": null,
+                "operation_timeline": null,
             })
         );
     }

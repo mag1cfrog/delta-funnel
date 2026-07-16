@@ -191,6 +191,7 @@ mod tests {
             .map_or("", |(signature, _)| signature);
 
         assert!(signature.contains("profile: bool | None = False"));
+        assert!(signature.contains("trace_path: str | PathLike[str] | None = None"));
     }
 
     #[test]
@@ -445,7 +446,7 @@ mod tests {
                 .to_string();
             assert_eq!(
                 signature,
-                "(*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=False)"
+                "(*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=False, trace_path=None)"
             );
             Ok(())
         })

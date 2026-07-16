@@ -16,6 +16,7 @@ pub mod delta;
 mod execution_profile;
 mod json;
 pub mod sql_server;
+mod timeline;
 
 pub use delta::{
     DeltaProtocolReport, DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus,
@@ -31,6 +32,10 @@ pub use sql_server::{
     WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
     WriteAllCacheFailure, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
 };
+pub use timeline::{
+    OperationTimeline, TimelineSpan, TimelineSpanStatus, TimelineSpanTimeSemantics,
+};
+pub(crate) use timeline::{OperationTimelineRecorder, OperationTimelineSpanRecorder};
 
 /// Saturates a platform-sized count into the public `u64` report shape.
 #[must_use]

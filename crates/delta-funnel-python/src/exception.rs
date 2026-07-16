@@ -22,6 +22,32 @@ pub(crate) fn add_exception(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )
 }
 
+/// Attaches the terminal Rust result to a Python error raised after the action.
+pub(crate) fn attach_operation_result(
+    py: Python<'_>,
+    error: &PyErr,
+    status: &str,
+    operation_error: Option<&PyErr>,
+    operation_report: Option<&serde_json::Value>,
+) {
+    // Metadata is best effort. A custom exception may reject attributes, but
+    // it must still be raised unchanged.
+    let _ = error
+        .value(py)
+        .setattr("deltafunnel_operation_status", status);
+    if let Some(operation_error) = operation_error {
+        let _ = error
+            .value(py)
+            .setattr("deltafunnel_operation_error", operation_error.value(py));
+    } else if let Some(operation_report) = operation_report
+        && let Ok(operation_report) = json_value_to_py(py, operation_report)
+    {
+        let _ = error
+            .value(py)
+            .setattr("deltafunnel_operation_report", operation_report.bind(py));
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn delta_funnel_py_error(
     py: Python<'_>,
@@ -215,12 +241,14 @@ fn mssql_write_phase(phase: delta_funnel::MssqlWritePhase) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeltaFunnelError, delta_funnel_error_to_py, delta_funnel_py_error};
+    use super::{
+        DeltaFunnelError, attach_operation_result, delta_funnel_error_to_py, delta_funnel_py_error,
+    };
     use crate::deltafunnel;
     use crate::json::json_value_to_py;
     use arrow_schema::{DataType, Field, Schema};
     use pyo3::IntoPyObjectExt;
-    use pyo3::exceptions::{PyKeyError, PyRuntimeError};
+    use pyo3::exceptions::{PyKeyError, PyOSError, PyRuntimeError};
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyModule};
 
@@ -236,6 +264,36 @@ mod tests {
                 "DeltaFunnelError"
             );
 
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn completed_operation_report_is_attached_to_a_late_python_error() -> PyResult<()> {
+        Python::attach(|py| {
+            let error = PyOSError::new_err("trace export failed");
+            let report = serde_json::json!({"output_name": "orders"});
+
+            attach_operation_result(py, &error, "completed", None, Some(&report));
+
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("deltafunnel_operation_status")?
+                    .extract::<String>()?,
+                "completed"
+            );
+            let attached = error
+                .value(py)
+                .getattr("deltafunnel_operation_report")?
+                .cast_into::<PyDict>()?;
+            assert_eq!(
+                attached
+                    .get_item("output_name")?
+                    .ok_or_else(|| PyKeyError::new_err("output_name"))?
+                    .extract::<String>()?,
+                "orders"
+            );
             Ok(())
         })
     }
