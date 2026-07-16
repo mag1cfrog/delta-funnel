@@ -980,7 +980,11 @@ where
     let (query_execution, stream_setup_timing) = match create_query_execution().await {
         Ok(query_execution) => (query_execution, stream_setup_timer.completed()),
         Err(failure) => {
-            append_error_profile_to_timeline(operation_timeline.as_ref(), &failure.error);
+            append_error_profile_to_timeline(
+                operation_timeline.as_ref(),
+                &failure.error,
+                target.output_name(),
+            );
             fail_timeline_span(output_timeline_span);
             planned_phase_timings.extend(failure.query_phase_timings);
             let failure = MssqlWriteFailureReport::from_error(
@@ -1025,12 +1029,22 @@ where
             if let (Some(timeline), Some(profile)) =
                 (operation_timeline.as_ref(), report.execution_profile())
             {
-                timeline.append_operator_lifecycles(profile);
+                let output_name = target.output_name();
+                timeline.append_operator_lifecycles_with_owner(
+                    profile,
+                    "output_name",
+                    output_name,
+                    &format!("Output: {output_name}"),
+                );
             }
             complete_timeline_span(output_timeline_span);
         }
         Err(error) => {
-            append_error_profile_to_timeline(operation_timeline.as_ref(), error);
+            append_error_profile_to_timeline(
+                operation_timeline.as_ref(),
+                error,
+                target.output_name(),
+            );
             fail_timeline_span(output_timeline_span);
         }
     }
@@ -1061,12 +1075,18 @@ where
 fn append_error_profile_to_timeline(
     timeline: Option<&OperationTimelineRecorder>,
     error: &DeltaFunnelError,
+    output_name: &str,
 ) {
     if let (Some(timeline), Some(profile)) = (
         timeline,
         failure_context(error).and_then(|context| context.report().execution_profile()),
     ) {
-        timeline.append_operator_lifecycles(profile);
+        timeline.append_operator_lifecycles_with_owner(
+            profile,
+            "output_name",
+            output_name,
+            &format!("Output: {output_name}"),
+        );
     }
 }
 

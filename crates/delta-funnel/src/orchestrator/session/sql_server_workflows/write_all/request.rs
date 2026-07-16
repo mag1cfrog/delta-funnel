@@ -1730,12 +1730,24 @@ mod tests {
                     .saturating_add(first_span.duration_micros())
                     <= second_span.start_offset_micros()
             );
-            assert!(
-                timeline
-                    .spans()
-                    .iter()
-                    .any(|span| span.category() == "datafusion.operator.lifecycle")
-            );
+            let operator_spans = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == "datafusion.operator.lifecycle")
+                .collect::<Vec<_>>();
+            assert!(!operator_spans.is_empty());
+            for output_name in ["first_output", "second_output"] {
+                assert!(operator_spans.iter().any(|span| {
+                    span.attributes()["output_name"].as_str() == Some(output_name)
+                }));
+            }
+            assert!(operator_spans.iter().all(|span| {
+                let output_name = span.attributes()["output_name"]
+                    .as_str()
+                    .expect("operator span output name");
+                span.track_name()
+                    .starts_with(&format!("Output: {output_name} / "))
+            }));
             assert!(timeline.spans().iter().all(|span| {
                 span.start_offset_micros()
                     .saturating_add(span.duration_micros())

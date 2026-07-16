@@ -315,6 +315,28 @@ impl OperationTimelineRecorder {
         ));
     }
 
+    pub(crate) fn append_operator_lifecycles_with_owner(
+        &self,
+        profile: &QueryExecutionProfile,
+        owner_attribute: &str,
+        owner_name: &str,
+        owner_track_name: &str,
+    ) {
+        let spans = profile
+            .operator_lifecycle_timeline_spans(
+                self.next_span_id(),
+                self.wall_clock_origin_nanos(),
+                duration_to_micros_saturating(self.elapsed()),
+            )
+            .into_iter()
+            .map(|span| {
+                let track_name = format!("{owner_track_name} / {}", span.track_name());
+                span.with_track_name(track_name)
+                    .with_attribute(owner_attribute, Value::String(owner_name.to_owned()))
+            });
+        self.extend_spans(spans);
+    }
+
     pub(crate) fn finish(
         &self,
         name: impl Into<String>,

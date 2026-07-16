@@ -478,7 +478,11 @@ impl DeltaFunnelSession {
             Err(error) => {
                 fail_cache_alias_span(stream_setup_span);
                 let execution_profile = clone_terminal_execution_profile(profile_result);
-                append_cache_operator_lifecycles(operation_timeline, execution_profile.as_ref());
+                append_cache_operator_lifecycles(
+                    operation_timeline,
+                    execution_profile.as_ref(),
+                    alias_name,
+                );
                 return Err(cache_alias_materialization_failure(
                     error,
                     phase_timings,
@@ -499,7 +503,11 @@ impl DeltaFunnelSession {
             Err(error) => {
                 fail_cache_alias_span(collect_span);
                 let execution_profile = clone_terminal_execution_profile(profile_result);
-                append_cache_operator_lifecycles(operation_timeline, execution_profile.as_ref());
+                append_cache_operator_lifecycles(
+                    operation_timeline,
+                    execution_profile.as_ref(),
+                    alias_name,
+                );
                 return Err(cache_alias_materialization_failure(
                     error,
                     phase_timings,
@@ -512,7 +520,11 @@ impl DeltaFunnelSession {
         complete_cache_alias_span(collect_span);
         phase_timings.push(collect_timer.completed());
         let execution_profile = clone_terminal_execution_profile(profile_result);
-        append_cache_operator_lifecycles(operation_timeline, execution_profile.as_ref());
+        append_cache_operator_lifecycles(
+            operation_timeline,
+            execution_profile.as_ref(),
+            alias_name,
+        );
 
         let memtable_timer = PhaseTimer::start(CACHE_ALIAS_MEMTABLE_BUILD_PHASE);
         let memtable_span =
@@ -665,9 +677,15 @@ fn start_cache_alias_cleanup_span(
 fn append_cache_operator_lifecycles(
     operation_timeline: Option<&OperationTimelineRecorder>,
     execution_profile: Option<&QueryExecutionProfile>,
+    alias_name: &str,
 ) {
     if let (Some(timeline), Some(profile)) = (operation_timeline, execution_profile) {
-        timeline.append_operator_lifecycles(profile);
+        timeline.append_operator_lifecycles_with_owner(
+            profile,
+            "cache_alias",
+            alias_name,
+            &format!("Cache alias: {alias_name}"),
+        );
     }
 }
 
@@ -1710,12 +1728,16 @@ mod tests {
             "cache materialization",
             crate::TimelineSpanStatus::Completed,
         );
-        assert!(
-            timeline
-                .spans()
-                .iter()
-                .any(|span| span.category() == "datafusion.operator.lifecycle")
-        );
+        let operator_spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == "datafusion.operator.lifecycle")
+            .collect::<Vec<_>>();
+        assert!(!operator_spans.is_empty());
+        assert!(operator_spans.iter().all(|span| {
+            span.attributes()["cache_alias"] == "cache_alias"
+                && span.track_name().starts_with("Cache alias: cache_alias / ")
+        }));
         assert!(timeline.spans().iter().any(|span| {
             span.name() == "Execute and collect cache"
                 && span.track_name() == "Cache alias: cache_alias"
