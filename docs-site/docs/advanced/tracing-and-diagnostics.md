@@ -266,9 +266,9 @@ synchronous `poll_next` interval. These events use the
 `datafusion.operator.activity` category and `wall_clock` time semantics. They
 share tracks by query execution and executor worker, so each worker shows one
 sequential or properly nested top-down call stack. A synchronous host thread
-that polls the merged result uses a separate coordinator track. VizViewer's
-funnel can filter one displayed lane by a name such as
-`DataFusion query 1 / worker 2`.
+that polls the merged result uses a separate coordinator track. In VizViewer,
+use the funnel's `Filter by Thread` selector to choose one exact track such as
+`DataFusion query 1 / worker 2`; the name field uses substring matching.
 The `activity` and `result` arguments distinguish stream creation, batches,
 pending polls, end-of-stream, and errors. `query_execution_id`,
 `worker_lane_id`, `worker_kind`, and `execution_stream_id` identify the
@@ -448,6 +448,10 @@ tracks. Batch details include the one-based batch index and, after polling, the
 row count. DataFusion operator lifecycles appear on separate tracks with
 `time_semantics="lifecycle"`; they can overlap stream polling and SQL Server
 writes and must not be added together as sequential wall time.
+The same query and worker tracks used by detailed previews contain the output
+query's wall-clock `execute` and `poll_next` activity. Select one exact worker
+with VizViewer's `Filter by Thread` control for a sequential or properly nested
+top-down flame view.
 
 The returned report also contains the relative model under
 `report["operation_timeline"]`. Detailed SQL Server failure contexts retain the
@@ -494,12 +498,17 @@ output has its own positioned span. Query planning, SQL Server sink phases,
 batch work, and DataFusion operator lifecycles use that same origin, so the
 trace tells the complete wall-clock story without adding independent elapsed
 durations together.
+Each output query also records wall-clock operator activity on its query and
+worker tracks. Filter one exact worker track to inspect a conventional
+top-down flame view while retaining the full write-all clock as context.
 
 For auto-cached calls, each alias gets a labeled cache lane containing
 DataFrame resolution, physical planning, stream setup, execution and
 collection, `MemTable` construction, installation, and restoration. Cache
 operator lifecycles share the root origin and overlap the execution and
 collection window that drove them, beginning as early as stream setup.
+Cache materialization queries use the same query and worker activity tracks as
+output queries.
 
 The returned report contains the relative model under
 `report["operation_timeline"]`. Its root status is `failed` when the workflow

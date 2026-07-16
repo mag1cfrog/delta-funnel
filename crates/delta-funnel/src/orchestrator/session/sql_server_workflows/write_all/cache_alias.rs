@@ -18,7 +18,7 @@ use crate::{
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
         DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
-        execution_profile::QueryExecutionProfileConsumer,
+        execution_profile::QueryExecutionProfileConsumer, instrument_query_execution_plan,
     },
     report::{OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer},
     support::sanitize_text_for_display,
@@ -445,6 +445,27 @@ impl DeltaFunnelSession {
 
         let schema = physical_plan.schema();
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+        let stream_setup_timer = PhaseTimer::start(CACHE_ALIAS_STREAM_SETUP_PHASE);
+        let stream_setup_span =
+            start_cache_alias_span(operation_timeline, alias_name, "Set up cache streams");
+        let physical_plan = match (profile_mode, operation_timeline) {
+            (ExecutionProfileMode::Detailed, Some(timeline)) => {
+                match instrument_query_execution_plan(physical_plan, timeline.clone()) {
+                    Ok(physical_plan) => physical_plan,
+                    Err(error) => {
+                        fail_cache_alias_span(stream_setup_span);
+                        return Err(cache_alias_materialization_failure(
+                            mssql_scoped_cache_alias_error("materialize", alias_name, error),
+                            phase_timings,
+                            stream_setup_timer,
+                            materialization_timer,
+                            None,
+                        ));
+                    }
+                }
+            }
+            _ => physical_plan,
+        };
         let (profile_consumer, profile_result) = match profile_mode {
             ExecutionProfileMode::Disabled => (None, None),
             ExecutionProfileMode::Detailed => {
@@ -456,9 +477,6 @@ impl DeltaFunnelSession {
                 (Some(consumer), Some(result))
             }
         };
-        let stream_setup_timer = PhaseTimer::start(CACHE_ALIAS_STREAM_SETUP_PHASE);
-        let stream_setup_span =
-            start_cache_alias_span(operation_timeline, alias_name, "Set up cache streams");
         let sampler = reporter.map(|reporter| {
             DeltaFileProgressSampler::new(
                 read_stats_handles.clone(),
@@ -1737,6 +1755,18 @@ mod tests {
         assert!(operator_spans.iter().all(|span| {
             span.attributes()["cache_alias"] == "cache_alias"
                 && span.track_name().starts_with("Cache alias: cache_alias / ")
+        }));
+        let activity_spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == "datafusion.operator.activity")
+            .collect::<Vec<_>>();
+        assert!(!activity_spans.is_empty());
+        assert!(activity_spans.iter().all(|span| {
+            span.attributes()["query_execution_id"].is_u64()
+                && span.attributes()["worker_lane_id"].is_u64()
+                && span.attributes()["worker_kind"].is_string()
+                && span.track_name().starts_with("DataFusion query ")
         }));
         assert!(timeline.spans().iter().any(|span| {
             span.name() == "Execute and collect cache"

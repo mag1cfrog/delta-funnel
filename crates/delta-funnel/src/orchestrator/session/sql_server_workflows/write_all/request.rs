@@ -1748,6 +1748,24 @@ mod tests {
                 span.track_name()
                     .starts_with(&format!("Output: {output_name} / "))
             }));
+            let activity_spans = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == "datafusion.operator.activity")
+                .collect::<Vec<_>>();
+            assert!(!activity_spans.is_empty());
+            let mut query_execution_ids = activity_spans
+                .iter()
+                .filter_map(|span| span.attributes()["query_execution_id"].as_u64())
+                .collect::<Vec<_>>();
+            query_execution_ids.sort_unstable();
+            query_execution_ids.dedup();
+            assert_eq!(query_execution_ids.len(), 2);
+            assert!(activity_spans.iter().all(|span| {
+                span.attributes()["worker_lane_id"].is_u64()
+                    && span.attributes()["worker_kind"].is_string()
+                    && span.track_name().starts_with("DataFusion query ")
+            }));
             assert!(timeline.spans().iter().all(|span| {
                 span.start_offset_micros()
                     .saturating_add(span.duration_micros())

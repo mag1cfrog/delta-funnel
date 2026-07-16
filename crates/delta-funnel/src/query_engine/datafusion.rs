@@ -11,14 +11,14 @@ use datafusion::physical_plan::{
 
 use crate::{DeltaFunnelError, report::OperationTimelineRecorder};
 
-use self::operator_activity::instrument_query_execution_plan;
-
 mod catalog;
 mod execution;
 pub(crate) mod execution_profile;
 mod operator_activity;
 mod planning;
 mod session;
+
+pub(crate) use operator_activity::instrument_query_execution_plan;
 
 pub use catalog::registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources,

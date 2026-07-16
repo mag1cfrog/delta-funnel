@@ -321,7 +321,7 @@ impl Drop for OperatorActivitySpanRecorder {
 }
 
 /// Adds transparent execute and poll instrumentation to one finalized plan.
-pub(super) fn instrument_query_execution_plan(
+pub(crate) fn instrument_query_execution_plan(
     root: Arc<dyn ExecutionPlan>,
     timeline: OperationTimelineRecorder,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {

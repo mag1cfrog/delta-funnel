@@ -79,11 +79,14 @@ Chrome Trace Event viewer. The root event is the total `write_all` duration.
 Top-level planning, workflow execution, source reporting, sequential output
 attempts, SQL Server work, and output-query operator lifecycles are positioned
 relative to that same origin. The returned dictionary also exposes the model
-under `report["operation_timeline"]`.
+under `report["operation_timeline"]`. Detailed output queries also record
+wall-clock operator activity grouped into query and executor-worker tracks.
 
 With automatic caching, the trace also positions each alias's resolution,
 planning, execution, `MemTable` construction, installation, restoration, and
 DataFusion operator lifecycles on labeled cache lanes.
+Cache materialization queries also use query and executor-worker activity
+tracks, so selecting one exact worker produces a top-down flame view.
 
 Profiling works with both cache modes. For example, disable shared caching and
 enable profiling in the same call:

@@ -594,6 +594,7 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_time
         provider_stats_snapshots,
         progress.map(|reporter| (reporter, planned.resolved_target().output_name().to_owned())),
         profile_scope,
+        timeline,
     ) {
         Ok(execution) => execution,
         Err(failure) => {
@@ -1797,6 +1798,18 @@ mod tests {
                 .iter()
                 .any(|span| span.category() == "datafusion.operator.lifecycle")
         );
+        let activity_spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == "datafusion.operator.activity")
+            .collect::<Vec<_>>();
+        assert!(!activity_spans.is_empty());
+        assert!(activity_spans.iter().all(|span| {
+            span.attributes()["query_execution_id"].is_u64()
+                && span.attributes()["worker_lane_id"].is_u64()
+                && span.attributes()["worker_kind"].is_string()
+                && span.track_name().starts_with("DataFusion query ")
+        }));
         assert!(timeline.spans().iter().all(|span| {
             span.start_offset_micros()
                 .saturating_add(span.duration_micros())

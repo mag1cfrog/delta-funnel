@@ -502,6 +502,7 @@ async fn batch_stream_for_lazy_table_from_session_parts(
         provider_stats_snapshots,
         progress,
         None,
+        None,
     )
     .map(|setup| setup.stream)
     .map_err(|failure| *failure.source)
@@ -529,16 +530,24 @@ pub(super) fn batch_stream_for_physical_plan(
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<(ProgressReporter, String)>,
     profile_scope: Option<QueryExecutionScope>,
+    timeline: Option<&OperationTimelineRecorder>,
 ) -> Result<QueryStreamSetup, QueryStreamSetupFailure> {
     // These handles must exist before merged stream setup can fail.
     let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
     let DFQueryExecution {
         stream,
         effective_profile_root,
-    } = match datafusion_query_output_stream_with_effective_root(
-        Arc::clone(&physical_plan),
-        context.task_ctx(),
-    ) {
+    } = match match (profile_scope, timeline) {
+        (Some(_), Some(timeline)) => profiled_datafusion_query_output_stream_with_effective_root(
+            Arc::clone(&physical_plan),
+            context.task_ctx(),
+            timeline.clone(),
+        ),
+        _ => datafusion_query_output_stream_with_effective_root(
+            Arc::clone(&physical_plan),
+            context.task_ctx(),
+        ),
+    } {
         Ok(execution) => execution,
         Err(error) => {
             let (profile_consumer, profile_result) = match profile_scope {
@@ -2016,6 +2025,7 @@ mod tests {
             Some(Arc::clone(&shared_provider_stats)),
             None,
             Some(QueryExecutionScope::MssqlOutput),
+            None,
         );
         let snapshots = super::provider_stats_snapshots(&shared_provider_stats);
         let summaries = provider_io_events(capture.captured());
@@ -2116,6 +2126,7 @@ mod tests {
         let stream = super::batch_stream_for_physical_plan(
             &session.context,
             combined_plan,
+            None,
             None,
             None,
             None,
