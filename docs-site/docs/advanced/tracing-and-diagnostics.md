@@ -225,6 +225,55 @@ for timing in preview.phase_timings:
 profile = preview.execution_profile
 ```
 
+### Export A Preview Trace
+
+Export a trace when the operator dictionary is too difficult to compare
+directly or when execution overlap matters:
+
+```python
+from pathlib import Path
+
+preview = table.preview(limit=100_000, profile=True)
+trace_path = Path("preview-trace.json")
+preview.export_trace(trace_path)
+```
+
+Open the result with VizTracer's viewer:
+
+```bash
+vizviewer preview-trace.json
+```
+
+The same file can be imported into Perfetto or another viewer that accepts
+Chrome Trace Event JSON. No VizTracer instrumentation is required because
+DeltaFunnel writes the trace document directly.
+
+The timeline contains one complete `X` event for each physical operator
+partition with usable `start_timestamp` and `end_timestamp` metrics. The event
+name is the short DataFusion operator name. Its synthetic track identifies the
+operator node and partition, while its arguments include the parent node,
+output partition count, and remaining raw per-partition metrics. Timestamps and
+durations use microseconds relative to the earliest included operator start.
+
+Use event duration to find long-lived operator partitions, then inspect the
+event arguments for metrics such as `output_rows` and `elapsed_compute` when
+DataFusion exposes them. The top-level `delta_funnel_profile` field preserves
+the complete redacted profile, including aggregated metrics, for analysis
+outside the timeline.
+
+Treat the visualization as an operator timeline, not a call-stack flame graph.
+Each event uses its own synthetic track because operator partitions can overlap
+without forming nested calls. Event duration is wall-clock lifetime, not CPU
+time, and operator durations must not be added together. Operators without a
+usable timestamp pair remain in `delta_funnel_profile` but do not appear as
+timeline events.
+
+Custom metrics added to an owned DataFusion operator automatically remain in
+the event arguments and embedded profile. The exporter currently creates spans
+only from each operator partition's standard start and end timestamps; it does
+not turn custom timers into nested sub-operator spans or collect function-level
+CPU stacks.
+
 Omitting `profile`, or passing `None` or `False`, still returns all phase
 timings but leaves `execution_profile` as `None`. `Table.show()` always uses
 this disabled mode because it does not return the preview diagnostics.
