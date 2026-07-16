@@ -1025,6 +1025,9 @@ impl WriteAllCacheFailure {
                 .collect::<Vec<_>>(),
             "primary_failed_alias_table_id": self.primary_failed_alias_table_id(),
             "workflow": self.workflow().map(MssqlWorkflowWriteReport::to_json_value),
+            "operation_timeline": self
+                .operation_timeline()
+                .map(OperationTimeline::to_json_value),
         })
     }
 }
@@ -2132,6 +2135,7 @@ mod tests {
                 "aliases": [],
                 "primary_failed_alias_table_id": null,
                 "workflow": null,
+                "operation_timeline": null,
             })
         );
     }

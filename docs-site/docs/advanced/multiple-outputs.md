@@ -81,6 +81,10 @@ attempts, SQL Server work, and output-query operator lifecycles are positioned
 relative to that same origin. The returned dictionary also exposes the model
 under `report["operation_timeline"]`.
 
+With automatic caching, the trace also positions each alias's resolution,
+planning, execution, `MemTable` construction, installation, restoration, and
+DataFusion operator lifecycles on labeled cache lanes.
+
 Profiling works with both cache modes. For example, disable shared caching and
 enable profiling in the same call:
 

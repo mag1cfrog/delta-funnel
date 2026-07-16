@@ -466,6 +466,12 @@ batch work, and DataFusion operator lifecycles use that same origin, so the
 trace tells the complete wall-clock story without adding independent elapsed
 durations together.
 
+For auto-cached calls, each alias gets a labeled cache lane containing
+DataFrame resolution, physical planning, stream setup, execution and
+collection, `MemTable` construction, installation, and restoration. Cache
+operator lifecycles share the root origin and overlap the execution and
+collection window that drove them, beginning as early as stream setup.
+
 The returned report contains the relative model under
 `report["operation_timeline"]`. Its root status is `failed` when the workflow
 report contains failed or skipped outputs, and the trace file is still written
@@ -511,6 +517,11 @@ between `cache_alias_install` and `cache_alias_restore` but is not itself a
 cache phase. Do not add the phase durations and interpret the result as wall
 time.
 
+Detailed write-all traces position the seven non-overlapping cache actions on
+the root wall clock. The aggregate `cache_alias_materialization_total` remains
+in the report but is not duplicated as another trace span over its five child
+actions.
+
 On a materialization failure, both the causal leaf and
 `cache_alias_materialization_total` are `failed`. Later unstarted phases are
 `not_started` with reason `prior_failure`. Install and restore are marked
@@ -535,6 +546,7 @@ failure = error.context
 attempted_aliases = failure["aliases"]
 primary_table_id = failure["primary_failed_alias_table_id"]
 completed_workflow = failure["workflow"]
+partial_timeline = failure["operation_timeline"]
 ```
 
 `aliases` contains each attempted alias exactly once in cache-selection order.
@@ -553,8 +565,10 @@ completed output reports are not lost.
 
 Rust callers match `DeltaFunnelError::WriteAllCache { failure, source }` and
 read `WriteAllCacheFailure::aliases()`,
-`primary_failed_alias_table_id()`, and `workflow()`. `source` retains the
-original primary error and its source chain.
+`primary_failed_alias_table_id()`, `workflow()`, and `operation_timeline()`.
+The partial timeline is present when detailed profiling was enabled and uses a
+failed root status. `source` retains the original primary error and its source
+chain.
 
 These lifecycle timings describe cache orchestration boundaries. A detailed
 operator profile is separately opt-in and describes work inside one cache

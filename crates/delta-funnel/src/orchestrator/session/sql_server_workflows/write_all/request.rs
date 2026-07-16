@@ -253,6 +253,10 @@ impl DeltaFunnelSession {
                 let timeline = timeline.finish("SQL Server write_all", status);
                 Ok(report.with_operation_timeline(Some(timeline)))
             }
+            (Err(error), Some(timeline)) => {
+                let timeline = timeline.finish("SQL Server write_all", TimelineSpanStatus::Failed);
+                Err(with_write_all_cache_operation_timeline(error, timeline))
+            }
             (result, _) => result,
         };
 
@@ -426,6 +430,19 @@ fn complete_write_all_span(span: Option<OperationTimelineSpanRecorder>) {
 fn fail_write_all_span(span: Option<OperationTimelineSpanRecorder>) {
     if let Some(span) = span {
         span.failed();
+    }
+}
+
+fn with_write_all_cache_operation_timeline(
+    error: DeltaFunnelError,
+    operation_timeline: crate::OperationTimeline,
+) -> DeltaFunnelError {
+    match error {
+        DeltaFunnelError::WriteAllCache { failure, source } => DeltaFunnelError::WriteAllCache {
+            failure: Box::new((*failure).with_operation_timeline(Some(operation_timeline))),
+            source,
+        },
+        other => other,
     }
 }
 
@@ -1337,6 +1354,58 @@ mod tests {
             assert_eq!(
                 execution_profile_event_count(&profile_events, "write_all_cache_alias"),
                 1
+            );
+            let timeline = report
+                .operation_timeline()
+                .ok_or("expected write-all operation timeline")?;
+            for expected_name in [
+                "Resolve cache DataFrame",
+                "Build cache physical plan",
+                "Set up cache streams",
+                "Execute and collect cache",
+                "Build cache MemTable",
+                "Install cache alias",
+                "Restore cache alias",
+            ] {
+                assert!(
+                    timeline
+                        .spans()
+                        .iter()
+                        .any(|span| span.name() == expected_name),
+                    "missing cache timeline span {expected_name}"
+                );
+            }
+            let install = timeline
+                .spans()
+                .iter()
+                .find(|span| span.name() == "Install cache alias")
+                .ok_or("missing cache install span")?;
+            let first_output = timeline
+                .spans()
+                .iter()
+                .find(|span| span.name() == "Write output: big_output")
+                .ok_or("missing first output span")?;
+            assert!(
+                install
+                    .start_offset_micros()
+                    .saturating_add(install.duration_micros())
+                    <= first_output.start_offset_micros()
+            );
+            let second_output = timeline
+                .spans()
+                .iter()
+                .find(|span| span.name() == "Write output: selected_output")
+                .ok_or("missing second output span")?;
+            let restore = timeline
+                .spans()
+                .iter()
+                .find(|span| span.name() == "Restore cache alias")
+                .ok_or("missing cache restore span")?;
+            assert!(
+                second_output
+                    .start_offset_micros()
+                    .saturating_add(second_output.duration_micros())
+                    <= restore.start_offset_micros()
             );
 
             let events = events.lock().map_err(|_| "progress event lock poisoned")?;
@@ -2604,6 +2673,26 @@ mod tests {
             let DeltaFunnelError::WriteAllCache { failure, source } = error else {
                 return Err("expected structured write_all cache failure".into());
             };
+            let timeline = failure
+                .operation_timeline()
+                .ok_or("expected partial cache failure timeline")?;
+            assert_eq!(timeline.status().as_str(), "failed");
+            assert!(timeline.spans().iter().any(|span| {
+                span.name() == "Resolve cache DataFrame" && span.status().as_str() == "completed"
+            }));
+            assert!(timeline.spans().iter().any(|span| {
+                span.name() == "Build cache physical plan" && span.status().as_str() == "failed"
+            }));
+            assert!(
+                timeline
+                    .spans()
+                    .iter()
+                    .all(|span| !span.name().starts_with("Write output:"))
+            );
+            assert_eq!(
+                failure.to_json_value()["operation_timeline"]["status"],
+                "failed"
+            );
             assert_eq!(failure.primary_failed_alias_table_id(), Some(big.id()));
             assert_eq!(failure.workflow(), None);
             assert_eq!(failure.aliases().len(), 1);

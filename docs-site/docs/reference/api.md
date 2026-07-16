@@ -219,6 +219,13 @@ so an `OSError` can occur after SQL Server effects and must not trigger a blind
 retry. Rust callers use `WriteAllReport::operation_timeline()` and
 `WriteAllReport::to_trace_event_json_value()`.
 
+Auto-cache traces position alias resolution, planning, stream setup,
+execution and collection, `MemTable` construction, installation, and
+restoration on labeled cache lanes. A detailed cache orchestration exception
+retains the partial failed timeline at
+`error.context["operation_timeline"]`; Rust reads it with
+`WriteAllCacheFailure::operation_timeline()`.
+
 Returned profiles are nested under the output report that owns them:
 
 | Output status | Python profile location | Rust profile location |
