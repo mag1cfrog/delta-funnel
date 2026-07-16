@@ -15,7 +15,10 @@ use crate::{
     QueryExecutionProfile, QueryExecutionScope, usize_to_u64_saturating,
 };
 
-use super::{DeltaProviderReadStatsHandle, execution::DeltaScanPlanningExec};
+use super::{
+    DeltaProviderReadStatsHandle, execution::DeltaScanPlanningExec,
+    operator_activity::unprofiled_execution_plan,
+};
 
 pub(crate) type DeltaProviderReadStatsSnapshotSet =
     Vec<(DeltaProviderReadStatsHandle, DeltaProviderReadStatsSnapshot)>;
@@ -176,6 +179,7 @@ fn provider_snapshot(
     supplied_snapshots: Option<&HashMap<usize, &DeltaProviderReadStatsSnapshot>>,
     fallback_snapshots: &mut HashMap<usize, DeltaProviderReadStatsSnapshot>,
 ) -> Option<DeltaProviderReadStatsSnapshot> {
+    let plan = unprofiled_execution_plan(plan);
     let scan = plan.as_any().downcast_ref::<DeltaScanPlanningExec>()?;
     let handle = scan.read_stats_handle();
     let identity = handle_identity(&handle);

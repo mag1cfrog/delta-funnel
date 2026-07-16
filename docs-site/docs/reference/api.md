@@ -68,9 +68,12 @@ display.
 `Preview.export_trace(path)` writes the full preview wall-clock timeline as
 Chrome Trace Event JSON. The root event covers the complete preview, and child
 events position planning, stream setup, execution, formatting, and available
-DataFusion operator lifecycles on that same clock. `path` accepts a string or
-`os.PathLike[str]`. The method creates or replaces the file, but does not create
-missing parent directories. It raises `DeltaFunnelError` with
+DataFusion operator lifecycles on that same clock. Detailed previews also
+include wall-clock `execute` and `poll_next` activity grouped by partition and
+worker thread, allowing VizViewer track-name filters such as `partition 0`.
+`path` accepts a string or `os.PathLike[str]`. The method creates or replaces
+the file, but does not create missing parent directories. It raises
+`DeltaFunnelError` with
 `kind="execution_profile_unavailable"` when the preview was not created with
 `profile=True`; file-system failures raise `OSError`.
 

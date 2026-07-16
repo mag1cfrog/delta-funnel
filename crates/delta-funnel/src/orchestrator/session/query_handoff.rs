@@ -35,6 +35,7 @@ use crate::{
             QueryExecutionProfileConsumer, QueryExecutionProfileResult,
             delta_provider_read_stats_snapshot_set,
         },
+        profiled_datafusion_query_output_stream_with_effective_root,
         snapshot_delta_provider_read_stats,
     },
     report::{OperationTimelineRecorder, OperationTimelineSpanRecorder},
@@ -862,10 +863,19 @@ impl DeltaFunnelSession {
         let DFQueryExecution {
             stream,
             effective_profile_root,
-        } = match datafusion_query_output_stream_with_effective_root(
-            Arc::clone(&physical_plan),
-            task_context,
-        ) {
+        } = match match options.execution_profile_mode() {
+            ExecutionProfileMode::Disabled => datafusion_query_output_stream_with_effective_root(
+                Arc::clone(&physical_plan),
+                task_context,
+            ),
+            ExecutionProfileMode::Detailed => {
+                profiled_datafusion_query_output_stream_with_effective_root(
+                    Arc::clone(&physical_plan),
+                    task_context,
+                    timings.timeline.clone(),
+                )
+            }
+        } {
             Ok(execution) => execution,
             Err(error) => {
                 let (profile_consumer, profile_result) =
@@ -2413,6 +2423,8 @@ mod tests {
             .table_from_sql("select 1 as id union all select 2 as id")
             .await?;
         let capture = TracingCapture::start();
+        let mut saw_operator_execute = false;
+        let mut saw_operator_poll = false;
 
         for limit in [0, 1] {
             let preview = session
@@ -2460,6 +2472,17 @@ mod tests {
                     .filter(|span| span.category() == "datafusion.operator.lifecycle")
                     .all(|span| { span.time_semantics() == TimelineSpanTimeSemantics::Lifecycle })
             );
+            for span in timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == "datafusion.operator.activity")
+            {
+                assert_eq!(span.time_semantics(), TimelineSpanTimeSemantics::WallClock);
+                saw_operator_execute |= span.attributes()["activity"] == "execute";
+                saw_operator_poll |= span.attributes()["activity"] == "poll_next";
+                assert!(span.attributes()["node_id"].is_u64());
+                assert!(span.attributes()["partition"].is_u64());
+            }
             let trace = preview
                 .to_trace_event_json_value()
                 .ok_or("expected detailed preview trace")?;
@@ -2468,8 +2491,27 @@ mod tests {
                 timeline.total_duration_micros()
             );
             assert_eq!(trace["delta_funnel_profile"]["scope"], "preview");
+            let activity_span_count = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == "datafusion.operator.activity")
+                .count();
+            let activity_events = trace["traceEvents"]
+                .as_array()
+                .ok_or("expected trace events")?
+                .iter()
+                .filter(|event| event["cat"] == "datafusion.operator.activity")
+                .collect::<Vec<_>>();
+            assert_eq!(activity_events.len(), activity_span_count);
+            assert!(activity_events.iter().all(|event| {
+                event["ph"] == "X"
+                    && event["args"]["time_semantics"] == "wall_clock"
+                    && event["args"]["attributes"]["activity"].is_string()
+            }));
         }
 
+        assert!(saw_operator_execute);
+        assert!(saw_operator_poll);
         assert_eq!(execution_profile_events(capture.captured()).len(), 2);
         Ok(())
     }

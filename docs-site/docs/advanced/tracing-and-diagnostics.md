@@ -261,26 +261,43 @@ metrics are mapped onto the same preview origin. Their category is
 operator stream existed, including waiting for upstream or downstream work. It
 does not claim that the operator was actively computing for the entire bar.
 
+Detailed preview profiling also records each operator's `execute` call and each
+synchronous `poll_next` interval. These events use the
+`datafusion.operator.activity` category and `wall_clock` time semantics. They
+share tracks by partition and worker thread, so nested operator polls form a
+call stack while gaps show time when that worker was not inside an instrumented
+operator call for that partition. VizViewer's funnel can therefore filter the
+activity lanes exactly by a name such as `partition 0`.
+The `activity` and `result` arguments distinguish stream creation, batches,
+pending polls, end-of-stream, and errors. The `node_id`, `parent_node_id`, and
+`partition` arguments link each event to the execution profile.
+
 Use the phase events first to identify whether planning, execution, or
-formatting dominates the preview. Then inspect operator lifecycle events and
-their arguments for metrics such as `output_rows` and `elapsed_compute` when
-DataFusion exposes them. `elapsed_compute` remains an aggregate metric in the
-event arguments and is not positioned as a fabricated wall-clock span. The
+formatting dominates the preview. During execution, use operator activity
+events to locate active work and use lifecycle events to understand concurrency
+and waiting. Lifecycle arguments retain metrics such as `output_rows` and
+`elapsed_compute` when DataFusion exposes them. `elapsed_compute` remains an
+aggregate metric and is not positioned as a fabricated wall-clock span. The
 top-level `delta_funnel_timeline` field preserves the relative timeline data,
 while `delta_funnel_profile` preserves the complete redacted operator profile.
 
-Distinct phases and operator partitions use separate synthetic tracks because
-they can overlap without forming a call stack. Repeated events with the same
-track label reuse one track. Do not add overlapping event durations together.
-Operator timestamps are clamped to the preview interval, and operators without
-a usable timestamp pair remain in
+Distinct phases and operator lifecycle partitions use separate synthetic tracks
+because they can overlap without forming a call stack. Operator activity events
+instead reuse the partition and worker-thread pair on which each call was
+measured. A partition can appear on multiple worker lanes when async execution
+moves between threads. Partition numbers are operator-local, so repartition and
+coalesce boundaries can change what a given number represents. Do not add
+overlapping event durations together. Operator timestamps are clamped to the
+preview interval, and operators without a usable timestamp pair remain in
 `delta_funnel_profile` without appearing as lifecycle events.
 
 Custom metrics added to an owned DataFusion operator automatically remain in
-the event arguments and embedded profile. The exporter currently creates spans
-only from each operator partition's standard start and end timestamps; it does
-not turn custom timers into nested sub-operator spans or collect function-level
-CPU stacks.
+the lifecycle event arguments and embedded profile. Activity instrumentation is
+one level below the lifecycle: it measures `execute` and `poll_next` calls but
+does not invent positions for aggregate custom timers or collect function-level
+CPU stacks inside those calls. Activity recording is capped at 100,000 spans.
+If execution exceeds that bound, the trace contains one
+`Operator activity trace truncated` marker and continues the query normally.
 
 Omitting `profile`, or passing `None` or `False`, still returns all phase
 timings but leaves `execution_profile` as `None`. `Table.show()` always uses

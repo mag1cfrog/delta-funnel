@@ -9,11 +9,14 @@ use datafusion::physical_plan::{
     coalesce_partitions::CoalescePartitionsExec,
 };
 
-use crate::DeltaFunnelError;
+use crate::{DeltaFunnelError, report::OperationTimelineRecorder};
+
+use self::operator_activity::instrument_query_execution_plan;
 
 mod catalog;
 mod execution;
 pub(crate) mod execution_profile;
+mod operator_activity;
 mod planning;
 mod session;
 
@@ -119,31 +122,52 @@ pub(crate) fn datafusion_query_output_stream_with_effective_root(
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
 ) -> Result<DFQueryExecution, DataFusionError> {
+    datafusion_query_output_stream_with_effective_root_impl(plan, task_context, None)
+}
+
+pub(crate) fn profiled_datafusion_query_output_stream_with_effective_root(
+    plan: Arc<dyn ExecutionPlan>,
+    task_context: Arc<TaskContext>,
+    timeline: OperationTimelineRecorder,
+) -> Result<DFQueryExecution, DataFusionError> {
+    datafusion_query_output_stream_with_effective_root_impl(plan, task_context, Some(timeline))
+}
+
+fn datafusion_query_output_stream_with_effective_root_impl(
+    plan: Arc<dyn ExecutionPlan>,
+    task_context: Arc<TaskContext>,
+    timeline: Option<OperationTimelineRecorder>,
+) -> Result<DFQueryExecution, DataFusionError> {
     // Keep these branches in sync with DataFusion 53.1's `execute_stream`.
-    match plan.properties().output_partitioning().partition_count() {
-        // DataFusion returns an empty stream without executing a partition, but
-        // profiling still needs the real planned root.
-        0 => Ok(DFQueryExecution {
-            stream: Box::pin(EmptyRecordBatchStream::new(plan.schema())),
-            effective_profile_root: plan,
-        }),
-        // The only output partition has the zero-based index 0.
-        1 => Ok(DFQueryExecution {
-            stream: plan.execute(0, task_context)?,
-            effective_profile_root: plan,
-        }),
-        2.. => {
-            // The wrapper exposes one output partition at index 0 and consumes
-            // every output partition from the original plan.
-            let effective_profile_root: Arc<dyn ExecutionPlan> =
-                Arc::new(CoalescePartitionsExec::new(plan));
-            let stream = effective_profile_root.execute(0, task_context)?;
-            Ok(DFQueryExecution {
-                stream,
-                effective_profile_root,
-            })
-        }
-    }
+    let (effective_profile_root, execute) =
+        match plan.properties().output_partitioning().partition_count() {
+            // DataFusion returns an empty stream without executing a partition, but
+            // profiling still needs the real planned root.
+            0 => (plan, false),
+            // The only output partition has the zero-based index 0.
+            1 => (plan, true),
+            2.. => {
+                // The wrapper exposes one output partition at index 0 and consumes
+                // every output partition from the original plan.
+                (
+                    Arc::new(CoalescePartitionsExec::new(plan)) as Arc<dyn ExecutionPlan>,
+                    true,
+                )
+            }
+        };
+    let effective_profile_root = match timeline {
+        Some(timeline) => instrument_query_execution_plan(effective_profile_root, timeline)?,
+        None => effective_profile_root,
+    };
+    let stream = if execute {
+        effective_profile_root.execute(0, task_context)?
+    } else {
+        Box::pin(EmptyRecordBatchStream::new(effective_profile_root.schema()))
+    };
+    Ok(DFQueryExecution {
+        stream,
+        effective_profile_root,
+    })
 }
 
 #[cfg(test)]

@@ -269,7 +269,8 @@ impl OperationTimelineRecorder {
             state.next_span_id = state.next_span_id.saturating_add(1);
             id
         };
-        let start_offset = self.started_at.elapsed();
+        let started_at = Instant::now();
+        let start_offset = started_at.saturating_duration_since(self.started_at);
         OperationTimelineSpanRecorder {
             recorder: self.clone(),
             span: Some(PendingTimelineSpan {
@@ -277,7 +278,7 @@ impl OperationTimelineRecorder {
                 name: name.into(),
                 category: category.into(),
                 track_name: track_name.into(),
-                started_at: Instant::now(),
+                started_at,
                 start_offset,
                 attributes: BTreeMap::new(),
             }),
