@@ -18,7 +18,7 @@ pub(crate) struct PyPreview {
     html: String,
     phase_timings: Py<PyAny>,
     execution_profile: Py<PyAny>,
-    execution_profile_report: Option<delta_funnel::QueryExecutionProfile>,
+    trace_report: Option<serde_json::Value>,
 }
 
 impl PyPreview {
@@ -30,18 +30,18 @@ impl PyPreview {
                 .map(delta_funnel::PhaseTimingReport::to_json_value)
                 .collect(),
         );
-        let execution_profile_report = preview.execution_profile().cloned();
-        let execution_profile = execution_profile_report
-            .as_ref()
+        let execution_profile = preview
+            .execution_profile()
             .map(delta_funnel::QueryExecutionProfile::to_json_value)
             .unwrap_or(serde_json::Value::Null);
+        let trace_report = preview.to_trace_event_json_value();
 
         Ok(Self {
             text: preview.text().to_owned(),
             html: preview.html().to_owned(),
             phase_timings: json_value_to_py(py, &phase_timings)?,
             execution_profile: json_value_to_py(py, &execution_profile)?,
-            execution_profile_report,
+            trace_report,
         })
     }
 }
@@ -68,19 +68,19 @@ impl PyPreview {
         self.execution_profile.clone_ref(py)
     }
 
-    /// Writes the detailed execution profile as Chrome Trace Event JSON.
+    /// Writes the full preview wall-clock timeline as Chrome Trace Event JSON.
     ///
     /// The resulting file can be opened by VizTracer's `vizviewer`, Perfetto,
     /// and other viewers that accept Chrome Trace Event JSON.
     fn export_trace(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
-        let profile = self.execution_profile_report.as_ref().ok_or_else(|| {
+        let trace = self.trace_report.as_ref().ok_or_else(|| {
             config_py_error(
                 py,
                 "execution_profile_unavailable",
                 "trace export requires a preview created with `profile=True`".to_owned(),
             )
         })?;
-        let bytes = serde_json::to_vec(&profile.to_trace_event_json_value())
+        let bytes = serde_json::to_vec(trace)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         fs::write(path, bytes).map_err(PyOSError::new_err)
     }
@@ -499,10 +499,37 @@ mod tests {
             let _ = fs::remove_file(path);
 
             assert_eq!(trace["delta_funnel_profile"]["scope"], "preview");
+            assert_eq!(trace["delta_funnel_timeline"]["name"], "Preview total");
+            let total_duration = trace["delta_funnel_timeline"]["total_duration_micros"]
+                .as_u64()
+                .ok_or_else(|| PyRuntimeError::new_err("missing preview total duration"))?;
+            let events = trace["traceEvents"]
+                .as_array()
+                .ok_or_else(|| PyRuntimeError::new_err("missing trace events"))?;
+            assert!(events.iter().any(|event| {
+                event["name"] == "Preview total"
+                    && event["ts"] == 0
+                    && event["dur"] == total_duration
+            }));
+            assert!(events.iter().any(|event| {
+                event["name"] == "Physical planning"
+                    && event["args"]["time_semantics"] == "wall_clock"
+            }));
             assert!(
-                trace["traceEvents"]
-                    .as_array()
-                    .is_some_and(|events| events.iter().any(|event| event["ph"] == "X"))
+                events
+                    .iter()
+                    .filter(|event| event["cat"] == "datafusion.operator.lifecycle")
+                    .all(|event| event["args"]["time_semantics"] == "lifecycle")
+            );
+            assert!(
+                events
+                    .iter()
+                    .filter(|event| event["ph"] == "X")
+                    .all(|event| {
+                        event["ts"].as_u64().zip(event["dur"].as_u64()).is_some_and(
+                            |(start, duration)| start.saturating_add(duration) <= total_duration,
+                        )
+                    })
             );
             Ok(())
         })
@@ -557,6 +584,11 @@ mod tests {
                 "error"
             );
             assert!(required_item(&profile, "partial")?.extract::<bool>()?);
+            let timeline = required_item(&context, "operation_timeline")?.cast_into::<PyDict>()?;
+            assert_eq!(
+                required_item(&timeline, "status")?.extract::<String>()?,
+                "failed"
+            );
             Ok(())
         })
     }

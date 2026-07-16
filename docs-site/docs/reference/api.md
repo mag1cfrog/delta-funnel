@@ -65,16 +65,21 @@ collection, read rows, and do not contact or write to SQL Server. `Preview.text`
 is the plain text table and `Preview.html` backs notebook `_repr_html_()`
 display.
 
-`Preview.export_trace(path)` writes the detailed execution profile as Chrome
-Trace Event JSON. `path` accepts a string or `os.PathLike[str]`. The method
-creates or replaces the file, but does not create missing parent directories.
-It raises `DeltaFunnelError` with
+`Preview.export_trace(path)` writes the full preview wall-clock timeline as
+Chrome Trace Event JSON. The root event covers the complete preview, and child
+events position planning, stream setup, execution, formatting, and available
+DataFusion operator lifecycles on that same clock. `path` accepts a string or
+`os.PathLike[str]`. The method creates or replaces the file, but does not create
+missing parent directories. It raises `DeltaFunnelError` with
 `kind="execution_profile_unavailable"` when the preview was not created with
 `profile=True`; file-system failures raise `OSError`.
 
 The trace document is accepted by VizTracer's `vizviewer`, Perfetto, and other
-Chrome Trace Event viewers. Rust callers can produce the same JSON-compatible
-document with `QueryExecutionProfile::to_trace_event_json_value()`. See
+Chrome Trace Event viewers. Rust callers can produce the same complete preview
+document with `TablePreview::to_trace_event_json_value()` and inspect the
+underlying relative spans with `TablePreview::operation_timeline()`. The
+lower-level `QueryExecutionProfile::to_trace_event_json_value()` remains
+available for execution-only operator traces. See
 [Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#export-a-preview-trace)
 for export steps and event interpretation.
 

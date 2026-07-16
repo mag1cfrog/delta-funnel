@@ -248,25 +248,32 @@ The same file can be imported into Perfetto or another viewer that accepts
 Chrome Trace Event JSON. No VizTracer instrumentation is required because
 DeltaFunnel writes the trace document directly.
 
-The timeline contains one complete `X` event for each physical operator
-partition with usable `start_timestamp` and `end_timestamp` metrics. The event
-name is the short DataFusion operator name. Its synthetic track identifies the
-operator node and partition, while its arguments include the parent node,
-output partition count, and remaining raw per-partition metrics. Timestamps and
-durations use microseconds relative to the earliest included operator start.
+The first complete `X` event is `Preview total`. It starts at zero and spans the
+entire preview wall clock, including DataFrame planning, physical planning,
+stream setup, execution and collection, and text and HTML formatting. Each
+phase is positioned beneath that same origin, so an eight-second preview is
+shown on an eight-second timeline rather than an execution-only subset.
 
-Use event duration to find long-lived operator partitions, then inspect the
-event arguments for metrics such as `output_rows` and `elapsed_compute` when
-DataFusion exposes them. The top-level `delta_funnel_profile` field preserves
-the complete redacted profile, including aggregated metrics, for analysis
-outside the timeline.
+Physical operator partitions with usable `start_timestamp` and `end_timestamp`
+metrics are mapped onto the same preview origin. Their category is
+`datafusion.operator.lifecycle`, and their `time_semantics` argument is
+`lifecycle`. This distinction is important: the event measures how long the
+operator stream existed, including waiting for upstream or downstream work. It
+does not claim that the operator was actively computing for the entire bar.
 
-Treat the visualization as an operator timeline, not a call-stack flame graph.
-Each event uses its own synthetic track because operator partitions can overlap
-without forming nested calls. Event duration is wall-clock lifetime, not CPU
-time, and operator durations must not be added together. Operators without a
-usable timestamp pair remain in `delta_funnel_profile` but do not appear as
-timeline events.
+Use the phase events first to identify whether planning, execution, or
+formatting dominates the preview. Then inspect operator lifecycle events and
+their arguments for metrics such as `output_rows` and `elapsed_compute` when
+DataFusion exposes them. `elapsed_compute` remains an aggregate metric in the
+event arguments and is not positioned as a fabricated wall-clock span. The
+top-level `delta_funnel_timeline` field preserves the relative timeline data,
+while `delta_funnel_profile` preserves the complete redacted operator profile.
+
+Each event uses its own synthetic track because phases and operator partitions
+can overlap without forming a call stack. Do not add overlapping event
+durations together. Operator timestamps are clamped to the preview interval,
+and operators without a usable timestamp pair remain in
+`delta_funnel_profile` without appearing as lifecycle events.
 
 Custom metrics added to an owned DataFusion operator automatically remain in
 the event arguments and embedded profile. The exporter currently creates spans
@@ -278,10 +285,11 @@ Omitting `profile`, or passing `None` or `False`, still returns all phase
 timings but leaves `execution_profile` as `None`. `Table.show()` always uses
 this disabled mode because it does not return the preview diagnostics.
 
-Rust callers use `PreviewOptions` with
-`ExecutionProfileMode::Detailed`, then read `TablePreview::phase_timings()` and
-`TablePreview::execution_profile()`. See [API references](../reference/api.md)
-for the option-bearing call.
+Rust callers use `PreviewOptions` with `ExecutionProfileMode::Detailed`, then
+call `TablePreview::to_trace_event_json_value()` or inspect
+`TablePreview::operation_timeline()`, `phase_timings()`, and
+`execution_profile()`. See [API references](../reference/api.md) for the
+option-bearing call.
 
 The phases are:
 

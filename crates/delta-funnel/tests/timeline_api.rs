@@ -19,6 +19,7 @@ fn operation_timeline_types_and_accessors_are_exported_from_the_crate_root() {
     let _: fn(&TimelineSpan) -> u64 = TimelineSpan::id;
     let _: fn(&TimelineSpan) -> Option<u64> = TimelineSpan::parent_id;
     let _: fn(&TimelineSpan) -> &str = TimelineSpan::name;
+    let _: fn(&TimelineSpan) -> &str = TimelineSpan::track_name;
     let _: fn(&TimelineSpan) -> &str = TimelineSpan::category;
     let _: fn(&TimelineSpan) -> u64 = TimelineSpan::start_offset_micros;
     let _: fn(&TimelineSpan) -> u64 = TimelineSpan::duration_micros;

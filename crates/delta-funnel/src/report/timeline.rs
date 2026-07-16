@@ -55,6 +55,7 @@ pub struct TimelineSpan {
     id: u64,
     parent_id: Option<u64>,
     name: String,
+    track_name: Option<String>,
     category: String,
     start_offset_micros: u64,
     duration_micros: u64,
@@ -81,6 +82,7 @@ impl TimelineSpan {
             id,
             parent_id,
             name: name.into(),
+            track_name: None,
             category: category.into(),
             start_offset_micros: duration_to_micros_saturating(start_offset),
             duration_micros: duration_to_micros_saturating(duration),
@@ -94,6 +96,13 @@ impl TimelineSpan {
     #[must_use]
     pub fn with_attribute(mut self, name: impl Into<String>, value: Value) -> Self {
         self.attributes.insert(name.into(), value);
+        self
+    }
+
+    /// Sets a trace track label that is more specific than the event name.
+    #[must_use]
+    pub fn with_track_name(mut self, track_name: impl Into<String>) -> Self {
+        self.track_name = Some(track_name.into());
         self
     }
 
@@ -113,6 +122,12 @@ impl TimelineSpan {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the trace track label, falling back to the event name.
+    #[must_use]
+    pub fn track_name(&self) -> &str {
+        self.track_name.as_deref().unwrap_or(&self.name)
     }
 
     /// Returns the stable trace category for this span.

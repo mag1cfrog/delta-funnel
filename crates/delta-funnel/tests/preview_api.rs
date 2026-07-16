@@ -1,9 +1,9 @@
 //! Compile-time coverage for the public bounded-preview value model.
 
 use delta_funnel::{
-    DeltaFunnelRuntime, DeltaFunnelSession, ExecutionProfileMode, PhaseTimingReport,
-    PreviewFailureContext, PreviewOptions, QueryExecutionProfile, SessionOptions, TablePreview,
-    progress::ProgressReporter,
+    DeltaFunnelRuntime, DeltaFunnelSession, ExecutionProfileMode, OperationTimeline,
+    PhaseTimingReport, PreviewFailureContext, PreviewOptions, QueryExecutionProfile,
+    SessionOptions, TablePreview, progress::ProgressReporter,
 };
 
 #[test]
@@ -16,11 +16,16 @@ fn preview_options_and_result_accessors_are_exported_from_the_crate_root() {
     let _: for<'a> fn(&'a TablePreview) -> &'a [PhaseTimingReport] = TablePreview::phase_timings;
     let _: for<'a> fn(&'a TablePreview) -> Option<&'a QueryExecutionProfile> =
         TablePreview::execution_profile;
+    let _: for<'a> fn(&'a TablePreview) -> Option<&'a OperationTimeline> =
+        TablePreview::operation_timeline;
+    let _: fn(&TablePreview) -> Option<serde_json::Value> = TablePreview::to_trace_event_json_value;
     let _: for<'a> fn(&'a PreviewFailureContext) -> &'a str = PreviewFailureContext::failed_phase;
     let _: for<'a> fn(&'a PreviewFailureContext) -> &'a [PhaseTimingReport] =
         PreviewFailureContext::phase_timings;
     let _: for<'a> fn(&'a PreviewFailureContext) -> Option<&'a QueryExecutionProfile> =
         PreviewFailureContext::execution_profile;
+    let _: for<'a> fn(&'a PreviewFailureContext) -> Option<&'a OperationTimeline> =
+        PreviewFailureContext::operation_timeline;
     let _: fn(&PreviewFailureContext) -> serde_json::Value = PreviewFailureContext::to_json_value;
 
     assert_eq!(options.limit(), 20);
@@ -38,6 +43,8 @@ async fn option_bearing_session_route_is_public() -> Result<(), Box<dyn std::err
         .preview_table_with_options(&async_table, PreviewOptions::new(1))
         .await?;
     assert_eq!(async_preview.execution_profile(), None);
+    assert!(async_preview.operation_timeline().is_some());
+    assert!(async_preview.to_trace_event_json_value().is_none());
     Ok(())
 }
 
@@ -50,6 +57,8 @@ fn option_bearing_runtime_routes_are_public() -> Result<(), Box<dyn std::error::
         PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed);
     let preview = runtime.preview_table_with_options(&session, &table, options)?;
     assert!(preview.execution_profile().is_some());
+    assert!(preview.operation_timeline().is_some());
+    assert!(preview.to_trace_event_json_value().is_some());
 
     let preview = runtime.preview_table_with_options_and_progress(
         &session,
