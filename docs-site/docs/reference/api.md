@@ -70,8 +70,9 @@ Chrome Trace Event JSON. The root event covers the complete preview, and child
 events position planning, stream setup, execution, formatting, and available
 DataFusion operator lifecycles on that same clock. Detailed previews also
 include wall-clock `execute` and `poll_next` activity grouped by query execution
-and logical task. This preserves nested operator calls when a task moves between
-worker threads and allows VizViewer to filter an individual displayed task lane.
+and executor worker. Each worker lane remains sequential or properly nested
+while Tokio task IDs remain event metadata. VizViewer can filter an individual
+displayed worker lane.
 `path` accepts a string or `os.PathLike[str]`. The method creates or replaces
 the file, but does not create missing parent directories. It raises
 `DeltaFunnelError` with

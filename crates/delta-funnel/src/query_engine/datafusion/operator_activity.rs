@@ -35,32 +35,51 @@ const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
 const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 static NEXT_QUERY_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ActivityTask {
-    Tokio(tokio::task::Id),
-    External(ThreadId),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityWorkerKind {
+    Coordinator,
+    Runtime,
+    External,
+}
+
+impl ActivityWorkerKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Coordinator => "coordinator",
+            Self::Runtime => "runtime",
+            Self::External => "external",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivityWorkerLane {
+    id: u64,
+    kind: ActivityWorkerKind,
 }
 
 #[derive(Debug)]
 struct OperatorActivityIdentityState {
     next_stream_id: u64,
-    next_task_lane_id: u64,
-    task_lanes: HashMap<ActivityTask, u64>,
+    next_worker_lane_id: u64,
+    coordinator_thread: Option<ThreadId>,
+    worker_lanes: HashMap<ThreadId, ActivityWorkerLane>,
 }
 
 impl Default for OperatorActivityIdentityState {
     fn default() -> Self {
         Self {
             next_stream_id: 1,
-            next_task_lane_id: 1,
-            task_lanes: HashMap::new(),
+            next_worker_lane_id: 1,
+            coordinator_thread: None,
+            worker_lanes: HashMap::new(),
         }
     }
 }
 
 #[derive(Debug)]
 struct ActivityExecutionContext {
-    task_lane_id: u64,
+    worker_lane: ActivityWorkerLane,
     task_kind: &'static str,
     runtime_task_id: Option<String>,
     worker_thread_id: String,
@@ -70,7 +89,7 @@ struct ActivityExecutionContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ActiveOperatorActivitySpan {
     query_execution_id: u64,
-    task_lane_id: u64,
+    worker_lane_id: u64,
     span_id: u64,
 }
 
@@ -129,20 +148,33 @@ impl OperatorActivityRecorder {
         let parent_id = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
             active.borrow().last().and_then(|parent| {
                 (parent.query_execution_id == self.query_execution_id
-                    && parent.task_lane_id == context.task_lane_id)
+                    && parent.worker_lane_id == context.worker_lane.id)
                     .then_some(parent.span_id)
             })
         });
-        let track_name = format!(
-            "DataFusion query {} / task {}",
-            self.query_execution_id, context.task_lane_id
-        );
+        let track_name = match context.worker_lane.kind {
+            ActivityWorkerKind::Coordinator => {
+                format!("DataFusion query {} / coordinator", self.query_execution_id)
+            }
+            ActivityWorkerKind::Runtime => format!(
+                "DataFusion query {} / worker {}",
+                self.query_execution_id, context.worker_lane.id
+            ),
+            ActivityWorkerKind::External => format!(
+                "DataFusion query {} / external worker {}",
+                self.query_execution_id, context.worker_lane.id
+            ),
+        };
         let timeline_span = self
             .timeline
             .start_span(operator_name, OPERATOR_ACTIVITY_CATEGORY, track_name)
             .with_parent_id(parent_id)
             .with_attribute("query_execution_id", Value::from(self.query_execution_id))
-            .with_attribute("task_lane_id", Value::from(context.task_lane_id))
+            .with_attribute("worker_lane_id", Value::from(context.worker_lane.id))
+            .with_attribute(
+                "worker_kind",
+                Value::String(context.worker_lane.kind.as_str().to_owned()),
+            )
             .with_attribute("task_kind", Value::String(context.task_kind.to_owned()))
             .with_attribute(
                 "runtime_task_id",
@@ -168,7 +200,7 @@ impl OperatorActivityRecorder {
             .with_attribute("activity", Value::String(activity.to_owned()));
         let active = ActiveOperatorActivitySpan {
             query_execution_id: self.query_execution_id,
-            task_lane_id: context.task_lane_id,
+            worker_lane_id: context.worker_lane.id,
             span_id: timeline_span.id()?,
         };
         ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active));
@@ -190,30 +222,50 @@ impl OperatorActivityRecorder {
 
     fn execution_context(&self) -> ActivityExecutionContext {
         let thread = std::thread::current();
-        let (task, task_kind, runtime_task_id) = match tokio::task::try_id() {
-            Some(id) => (ActivityTask::Tokio(id), "tokio", Some(id.to_string())),
-            None => (ActivityTask::External(thread.id()), "external", None),
+        let runtime_task_id = tokio::task::try_id().map(|id| id.to_string());
+        let task_kind = if runtime_task_id.is_some() {
+            "tokio"
+        } else {
+            "external"
         };
-        let task_lane_id = {
+        let thread_id = thread.id();
+        let worker_lane = {
             let mut identities = self
                 .identities
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            match identities.task_lanes.get(&task) {
-                Some(task_lane_id) => *task_lane_id,
+            match identities.worker_lanes.get(&thread_id) {
+                Some(worker_lane) => *worker_lane,
                 None => {
-                    let task_lane_id = identities.next_task_lane_id;
-                    identities.next_task_lane_id = identities.next_task_lane_id.saturating_add(1);
-                    identities.task_lanes.insert(task, task_lane_id);
-                    task_lane_id
+                    let worker_lane =
+                        if runtime_task_id.is_none() && identities.coordinator_thread.is_none() {
+                            identities.coordinator_thread = Some(thread_id);
+                            ActivityWorkerLane {
+                                id: 0,
+                                kind: ActivityWorkerKind::Coordinator,
+                            }
+                        } else {
+                            let id = identities.next_worker_lane_id;
+                            identities.next_worker_lane_id = id.saturating_add(1);
+                            ActivityWorkerLane {
+                                id,
+                                kind: if runtime_task_id.is_some() {
+                                    ActivityWorkerKind::Runtime
+                                } else {
+                                    ActivityWorkerKind::External
+                                },
+                            }
+                        };
+                    identities.worker_lanes.insert(thread_id, worker_lane);
+                    worker_lane
                 }
             }
         };
         ActivityExecutionContext {
-            task_lane_id,
+            worker_lane,
             task_kind,
             runtime_task_id,
-            worker_thread_id: format!("{:?}", thread.id()),
+            worker_thread_id: format!("{thread_id:?}"),
             worker_thread_name: thread.name().map(str::to_owned),
         }
     }
@@ -471,7 +523,7 @@ impl RecordBatchStream for ProfiledRecordBatchStream {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, sync::Arc};
+    use std::{collections::BTreeSet, error::Error, sync::Arc};
 
     use datafusion::{physical_plan::collect, prelude::SessionContext};
 
@@ -503,6 +555,15 @@ mod tests {
         );
 
         let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        let activity_span = timeline
+            .spans()
+            .iter()
+            .find(|span| span.name() == "FilterExec")
+            .expect("first activity should be recorded");
+        assert!(activity_span.track_name().ends_with(" / coordinator"));
+        assert_eq!(activity_span.attributes()["worker_lane_id"], 0);
+        assert_eq!(activity_span.attributes()["worker_kind"], "coordinator");
+        assert_eq!(activity_span.attributes()["runtime_task_id"], Value::Null);
         assert_eq!(
             timeline
                 .spans()
@@ -511,6 +572,64 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_tracks_are_bounded_by_executor_threads_not_task_count()
+    -> Result<(), Box<dyn Error>> {
+        const TASK_COUNT: usize = 32;
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(timeline.clone());
+        let barrier = Arc::new(tokio::sync::Barrier::new(TASK_COUNT));
+        let mut tasks = Vec::with_capacity(TASK_COUNT);
+
+        for _ in 0..TASK_COUNT {
+            let activity = activity.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                activity
+                    .start_span("WorkerExec", 0, None, 0, 1, "poll_next")
+                    .expect("worker activity should fit")
+                    .completed();
+            }));
+        }
+        for task in tasks {
+            task.await?;
+        }
+
+        let timeline = timeline.finish("workers", TimelineSpanStatus::Completed);
+        let spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == OPERATOR_ACTIVITY_CATEGORY)
+            .collect::<Vec<_>>();
+        let runtime_task_ids = spans
+            .iter()
+            .filter_map(|span| span.attributes()["runtime_task_id"].as_str())
+            .collect::<BTreeSet<_>>();
+        let worker_lane_ids = spans
+            .iter()
+            .filter_map(|span| span.attributes()["worker_lane_id"].as_u64())
+            .collect::<BTreeSet<_>>();
+        let worker_thread_ids = spans
+            .iter()
+            .filter_map(|span| span.attributes()["worker_thread_id"].as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(spans.len(), TASK_COUNT);
+        assert_eq!(runtime_task_ids.len(), TASK_COUNT);
+        assert!(!worker_lane_ids.is_empty());
+        assert!(worker_lane_ids.len() <= 2);
+        assert_eq!(worker_thread_ids.len(), worker_lane_ids.len());
+        assert!(runtime_task_ids.len() > worker_lane_ids.len());
+        assert!(spans.iter().all(|span| {
+            span.attributes()["worker_kind"] == "runtime"
+                && span.track_name().starts_with("DataFusion query ")
+                && span.track_name().contains(" / worker ")
+        }));
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -544,16 +663,28 @@ mod tests {
         assert!(!spans.is_empty());
         assert!(spans.iter().all(|span| {
             let query_execution_id = span.attributes()["query_execution_id"].as_u64();
-            let task_lane_id = span.attributes()["task_lane_id"].as_u64();
+            let worker_lane_id = span.attributes()["worker_lane_id"].as_u64();
+            let expected_track_name = match (
+                query_execution_id,
+                worker_lane_id,
+                span.attributes()["worker_kind"].as_str(),
+            ) {
+                (Some(query), Some(_), Some("coordinator")) => {
+                    Some(format!("DataFusion query {query} / coordinator"))
+                }
+                (Some(query), Some(worker), Some("runtime")) => {
+                    Some(format!("DataFusion query {query} / worker {worker}"))
+                }
+                (Some(query), Some(worker), Some("external")) => Some(format!(
+                    "DataFusion query {query} / external worker {worker}"
+                )),
+                _ => None,
+            };
             span.time_semantics() == TimelineSpanTimeSemantics::WallClock
                 && query_execution_id.is_some()
-                && task_lane_id.is_some()
-                && span.track_name()
-                    == format!(
-                        "DataFusion query {} / task {}",
-                        query_execution_id.unwrap_or_default(),
-                        task_lane_id.unwrap_or_default()
-                    )
+                && worker_lane_id.is_some()
+                && expected_track_name.as_deref() == Some(span.track_name())
+                && span.attributes()["task_kind"].is_string()
                 && span.attributes()["execution_stream_id"].is_u64()
                 && span.attributes()["operator_partition"].is_u64()
                 && span.attributes()["worker_thread_id"].is_string()
@@ -603,8 +734,8 @@ mod tests {
                 span.attributes()["query_execution_id"]
             );
             assert_eq!(
-                parent.attributes()["task_lane_id"],
-                span.attributes()["task_lane_id"]
+                parent.attributes()["worker_lane_id"],
+                span.attributes()["worker_lane_id"]
             );
             assert!(parent.start_offset_micros() <= span.start_offset_micros());
             assert!(
@@ -630,7 +761,7 @@ mod tests {
                         && !(right_start < left_start
                             && left_start < right_end
                             && right_end < left_end),
-                    "activity spans on one task lane must not cross"
+                    "activity spans on one worker lane must not cross"
                 );
             }
         }

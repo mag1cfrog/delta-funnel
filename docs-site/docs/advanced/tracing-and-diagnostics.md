@@ -264,16 +264,19 @@ does not claim that the operator was actively computing for the entire bar.
 Detailed preview profiling also records each operator's `execute` call and each
 synchronous `poll_next` interval. These events use the
 `datafusion.operator.activity` category and `wall_clock` time semantics. They
-share tracks by query execution and logical Tokio task, so nested operator
-polls form a top-down call stack even when Tokio moves that task between worker
-threads. VizViewer's funnel can filter one displayed lane by a name such as
-`DataFusion query 1 / task 2`.
+share tracks by query execution and executor worker, so each worker shows one
+sequential or properly nested top-down call stack. A synchronous host thread
+that polls the merged result uses a separate coordinator track. VizViewer's
+funnel can filter one displayed lane by a name such as
+`DataFusion query 1 / worker 2`.
 The `activity` and `result` arguments distinguish stream creation, batches,
-pending polls, end-of-stream, and errors. `query_execution_id`, `task_lane_id`,
-and `execution_stream_id` identify the execution context. `node_id`,
-`parent_node_id`, and `operator_partition` link the event to its physical-plan
-operator. `worker_thread_id` and `worker_thread_name` report where the call was
-observed without defining its lane identity.
+pending polls, end-of-stream, and errors. `query_execution_id`,
+`worker_lane_id`, `worker_kind`, and `execution_stream_id` identify the
+execution context. `runtime_task_id` remains metadata because many short-lived
+Tokio tasks can share one executor worker. `node_id`, `parent_node_id`, and
+`operator_partition` link the event to its physical-plan operator.
+`worker_thread_id` and `worker_thread_name` expose the underlying thread behind
+the normalized worker lane.
 
 Use the phase events first to identify whether planning, execution, or
 formatting dominates the preview. During execution, use operator activity
@@ -286,10 +289,10 @@ while `delta_funnel_profile` preserves the complete redacted operator profile.
 
 Distinct phases and operator lifecycle partitions use separate synthetic tracks
 because they can overlap without forming a call stack. Operator activity events
-instead reuse the logical task that synchronously executed each call. Activity
-spans on one task lane are sequential or properly nested; independently spawned
-work appears on another task lane. Partition numbers remain operator-local, so
-repartition and coalesce boundaries can change what a given number represents.
+instead reuse the executor worker that synchronously ran each call. Activity
+spans on one worker lane are sequential or properly nested, even when that
+worker runs many different Tokio tasks. Partition numbers remain operator-local,
+so repartition and coalesce boundaries can change what a given number represents.
 Do not add overlapping event durations together. Operator timestamps are
 clamped to the preview interval, and operators without a usable timestamp pair
 remain in `delta_funnel_profile` without appearing as lifecycle events.

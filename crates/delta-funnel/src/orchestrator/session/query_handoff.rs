@@ -2481,7 +2481,8 @@ mod tests {
                 saw_operator_execute |= span.attributes()["activity"] == "execute";
                 saw_operator_poll |= span.attributes()["activity"] == "poll_next";
                 assert!(span.attributes()["query_execution_id"].is_u64());
-                assert!(span.attributes()["task_lane_id"].is_u64());
+                assert!(span.attributes()["worker_lane_id"].is_u64());
+                assert!(span.attributes()["worker_kind"].is_string());
                 assert!(span.attributes()["execution_stream_id"].is_u64());
                 assert!(span.attributes()["node_id"].is_u64());
                 assert!(span.attributes()["operator_partition"].is_u64());
