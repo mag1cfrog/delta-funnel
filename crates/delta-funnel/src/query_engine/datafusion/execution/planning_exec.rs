@@ -14,7 +14,9 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, Sched
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
-use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
+use datafusion::physical_plan::stream::{
+    RecordBatchReceiverStreamBuilder, RecordBatchStreamAdapter,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, Partitioning,
     PlanProperties, SendableRecordBatchStream,
@@ -530,6 +532,42 @@ fn dynamic_partition_keep_reason_is_unsupported_expression(
     )
 }
 
+fn project_scan_output_stream(
+    stream: SendableRecordBatchStream,
+    schema: SchemaRef,
+) -> SendableRecordBatchStream {
+    let projected_schema = Arc::clone(&schema);
+    let stream = stream.map(move |batch| {
+        batch.and_then(|batch| project_batch_to_output_schema(batch, &projected_schema))
+    });
+
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+}
+
+fn project_batch_to_output_schema(
+    batch: RecordBatch,
+    schema: &SchemaRef,
+) -> DataFusionResult<RecordBatch> {
+    let batch_schema = batch.schema();
+    if batch_schema.fields().len() == schema.fields().len()
+        && batch_schema
+            .fields()
+            .iter()
+            .zip(schema.fields())
+            .all(|(actual, expected)| actual.name() == expected.name())
+    {
+        return Ok(batch);
+    }
+
+    let projection = schema
+        .fields()
+        .iter()
+        .map(|field| batch_schema.index_of(field.name()))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    batch.project(&projection).map_err(DataFusionError::from)
+}
+
 fn partition_read_schema(
     read_schema: KernelScanReadSchema,
     file_tasks: &[DeltaScanFileTask],
@@ -574,7 +612,8 @@ fn sequential_scan_partition_stream(
     output_buffer_capacity: usize,
     admission: DeltaDynamicPartitionFileAdmission,
 ) -> SendableRecordBatchStream {
-    let mut builder = RecordBatchReceiverStreamBuilder::new(schema, output_buffer_capacity);
+    let mut builder =
+        RecordBatchReceiverStreamBuilder::new(Arc::clone(&schema), output_buffer_capacity);
     let output = builder.tx();
     let read_stats = Arc::clone(&admission.read_stats);
 
@@ -619,7 +658,7 @@ fn sequential_scan_partition_stream(
         Ok(())
     });
 
-    builder.build()
+    project_scan_output_stream(builder.build(), schema)
 }
 
 fn native_async_scan_partition_stream(
@@ -631,7 +670,8 @@ fn native_async_scan_partition_stream(
     prefetch_file_count: usize,
     admission: DeltaDynamicPartitionFileAdmission,
 ) -> SendableRecordBatchStream {
-    let mut builder = RecordBatchReceiverStreamBuilder::new(schema, output_buffer_capacity);
+    let mut builder =
+        RecordBatchReceiverStreamBuilder::new(Arc::clone(&schema), output_buffer_capacity);
     let output = builder.tx();
     let read_stats = Arc::clone(&admission.read_stats);
 
@@ -704,7 +744,7 @@ fn native_async_scan_partition_stream(
         Ok(())
     });
 
-    builder.build()
+    project_scan_output_stream(builder.build(), schema)
 }
 
 type NativeAsyncPartitionScheduler = DeltaProviderAsyncPartitionReadScheduler<
@@ -3294,7 +3334,7 @@ mod tests {
         )?;
 
         let dataframe = ctx
-            .sql("select customer_name from orders where id > 1 order by id")
+            .sql("select customer_name from orders where id > 1")
             .await?;
         let physical_plan = dataframe.create_physical_plan().await?;
         let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
