@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.3.0...delta-funnel-v0.3.1) - 2026-07-15
+
+### Added
+
+- support reading Delta tables with v2 checkpoints, type widening, and vacuum protocol checks ([#500](https://github.com/mag1cfrog/delta-funnel/pull/500))
+- improve Python progress displays with animated spinners for work without known totals and compact bars for measurable progress ([#502](https://github.com/mag1cfrog/delta-funnel/pull/502))
+
+### Fixed
+
+- show millisecond-precision progress timing ([#503](https://github.com/mag1cfrog/delta-funnel/pull/503))
+
 ## [0.3.0](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.2.1...delta-funnel-v0.3.0) - 2026-07-15
 
 ### Added
