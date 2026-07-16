@@ -1,3 +1,4 @@
+from os import PathLike
 from typing import Literal, Mapping, Sequence, TypeAlias, TypedDict, overload
 
 __version__: str
@@ -78,6 +79,8 @@ class Preview:
     html: str
     phase_timings: list[dict[str, object]]
     execution_profile: dict[str, object] | None
+
+    def export_trace(self, path: str | PathLike[str]) -> None: ...
 
     def __str__(self) -> str: ...
 

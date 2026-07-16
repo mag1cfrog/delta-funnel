@@ -66,6 +66,7 @@ fn execution_profile_types_and_accessors_are_exported_from_the_crate_root() {
     let _: for<'a> fn(&'a QueryExecutionProfile) -> &'a [QueryExecutionOperatorProfile] =
         QueryExecutionProfile::operators;
     let _: fn(&QueryExecutionProfile) -> Value = QueryExecutionProfile::to_json_value;
+    let _: fn(&QueryExecutionProfile) -> Value = QueryExecutionProfile::to_trace_event_json_value;
 
     let _: fn(&QueryExecutionOperatorProfile) -> u64 = QueryExecutionOperatorProfile::node_id;
     let _: fn(&QueryExecutionOperatorProfile) -> Option<u64> =
