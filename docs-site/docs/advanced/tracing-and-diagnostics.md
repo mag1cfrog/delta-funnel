@@ -264,13 +264,16 @@ does not claim that the operator was actively computing for the entire bar.
 Detailed preview profiling also records each operator's `execute` call and each
 synchronous `poll_next` interval. These events use the
 `datafusion.operator.activity` category and `wall_clock` time semantics. They
-share tracks by partition and worker thread, so nested operator polls form a
-call stack while gaps show time when that worker was not inside an instrumented
-operator call for that partition. VizViewer's funnel can therefore filter the
-activity lanes exactly by a name such as `partition 0`.
+share tracks by query execution and logical Tokio task, so nested operator
+polls form a top-down call stack even when Tokio moves that task between worker
+threads. VizViewer's funnel can filter one displayed lane by a name such as
+`DataFusion query 1 / task 2`.
 The `activity` and `result` arguments distinguish stream creation, batches,
-pending polls, end-of-stream, and errors. The `node_id`, `parent_node_id`, and
-`partition` arguments link each event to the execution profile.
+pending polls, end-of-stream, and errors. `query_execution_id`, `task_lane_id`,
+and `execution_stream_id` identify the execution context. `node_id`,
+`parent_node_id`, and `operator_partition` link the event to its physical-plan
+operator. `worker_thread_id` and `worker_thread_name` report where the call was
+observed without defining its lane identity.
 
 Use the phase events first to identify whether planning, execution, or
 formatting dominates the preview. During execution, use operator activity
@@ -283,13 +286,13 @@ while `delta_funnel_profile` preserves the complete redacted operator profile.
 
 Distinct phases and operator lifecycle partitions use separate synthetic tracks
 because they can overlap without forming a call stack. Operator activity events
-instead reuse the partition and worker-thread pair on which each call was
-measured. A partition can appear on multiple worker lanes when async execution
-moves between threads. Partition numbers are operator-local, so repartition and
-coalesce boundaries can change what a given number represents. Do not add
-overlapping event durations together. Operator timestamps are clamped to the
-preview interval, and operators without a usable timestamp pair remain in
-`delta_funnel_profile` without appearing as lifecycle events.
+instead reuse the logical task that synchronously executed each call. Activity
+spans on one task lane are sequential or properly nested; independently spawned
+work appears on another task lane. Partition numbers remain operator-local, so
+repartition and coalesce boundaries can change what a given number represents.
+Do not add overlapping event durations together. Operator timestamps are
+clamped to the preview interval, and operators without a usable timestamp pair
+remain in `delta_funnel_profile` without appearing as lifecycle events.
 
 Custom metrics added to an owned DataFusion operator automatically remain in
 the lifecycle event arguments and embedded profile. Activity instrumentation is

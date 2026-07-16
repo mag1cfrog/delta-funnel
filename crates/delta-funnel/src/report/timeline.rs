@@ -275,10 +275,10 @@ impl OperationTimelineRecorder {
             recorder: self.clone(),
             span: Some(PendingTimelineSpan {
                 id,
+                parent_id: None,
                 name: name.into(),
                 category: category.into(),
                 track_name: track_name.into(),
-                started_at,
                 start_offset,
                 attributes: BTreeMap::new(),
             }),
@@ -345,10 +345,14 @@ impl OperationTimelineRecorder {
     }
 
     fn record(&self, pending: PendingTimelineSpan, status: TimelineSpanStatus) -> Duration {
-        let duration = pending.started_at.elapsed();
+        let finished_at = Instant::now();
+        let end_offset = finished_at.saturating_duration_since(self.started_at);
+        let start_offset_micros = duration_to_micros_saturating(pending.start_offset);
+        let end_offset_micros = duration_to_micros_saturating(end_offset);
+        let duration = Duration::from_micros(end_offset_micros.saturating_sub(start_offset_micros));
         let span = TimelineSpan::new(
             pending.id,
-            None,
+            pending.parent_id,
             pending.name,
             pending.category,
             pending.start_offset,
@@ -373,10 +377,10 @@ impl OperationTimelineRecorder {
 #[derive(Debug)]
 struct PendingTimelineSpan {
     id: u64,
+    parent_id: Option<u64>,
     name: String,
     category: String,
     track_name: String,
-    started_at: Instant,
     start_offset: Duration,
     attributes: BTreeMap<String, Value>,
 }
@@ -389,6 +393,17 @@ pub(crate) struct OperationTimelineSpanRecorder {
 }
 
 impl OperationTimelineSpanRecorder {
+    pub(crate) fn id(&self) -> Option<u64> {
+        self.span.as_ref().map(|span| span.id)
+    }
+
+    pub(crate) fn with_parent_id(mut self, parent_id: Option<u64>) -> Self {
+        if let Some(span) = &mut self.span {
+            span.parent_id = parent_id;
+        }
+        self
+    }
+
     pub(crate) fn with_attribute(mut self, name: impl Into<String>, value: Value) -> Self {
         if let Some(span) = &mut self.span {
             span.attributes.insert(name.into(), value);
@@ -478,6 +493,39 @@ mod tests {
         assert_eq!(
             timeline.spans()[1].time_semantics(),
             TimelineSpanTimeSemantics::Lifecycle
+        );
+    }
+
+    #[test]
+    fn recorder_preserves_parent_identity_and_positioned_nesting() {
+        let recorder = OperationTimelineRecorder::start();
+        let parent = recorder.start_span("parent", "test", "task 1");
+        let parent_id = parent.id().expect("active parent should expose its ID");
+        let child = recorder
+            .start_span("child", "test", "task 1")
+            .with_parent_id(Some(parent_id));
+        child.completed();
+        parent.completed();
+
+        let timeline = recorder.finish("nested", TimelineSpanStatus::Completed);
+        let parent = timeline
+            .spans()
+            .iter()
+            .find(|span| span.id() == parent_id)
+            .expect("parent span should be recorded");
+        let child = timeline
+            .spans()
+            .iter()
+            .find(|span| span.parent_id() == Some(parent_id))
+            .expect("child span should preserve its parent");
+        assert!(parent.start_offset_micros() <= child.start_offset_micros());
+        assert!(
+            parent
+                .start_offset_micros()
+                .saturating_add(parent.duration_micros())
+                >= child
+                    .start_offset_micros()
+                    .saturating_add(child.duration_micros())
         );
     }
 

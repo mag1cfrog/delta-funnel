@@ -2,14 +2,16 @@
 
 use std::{
     any::Any,
+    cell::RefCell,
     collections::HashMap,
     fmt,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
+    thread::ThreadId,
 };
 
 use datafusion::{
@@ -31,10 +33,57 @@ use crate::{
 
 const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
 const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
+static NEXT_QUERY_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ActivityTask {
+    Tokio(tokio::task::Id),
+    External(ThreadId),
+}
+
+#[derive(Debug)]
+struct OperatorActivityIdentityState {
+    next_stream_id: u64,
+    next_task_lane_id: u64,
+    task_lanes: HashMap<ActivityTask, u64>,
+}
+
+impl Default for OperatorActivityIdentityState {
+    fn default() -> Self {
+        Self {
+            next_stream_id: 1,
+            next_task_lane_id: 1,
+            task_lanes: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActivityExecutionContext {
+    task_lane_id: u64,
+    task_kind: &'static str,
+    runtime_task_id: Option<String>,
+    worker_thread_id: String,
+    worker_thread_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveOperatorActivitySpan {
+    query_execution_id: u64,
+    task_lane_id: u64,
+    span_id: u64,
+}
+
+thread_local! {
+    static ACTIVE_OPERATOR_ACTIVITY_SPANS: RefCell<Vec<ActiveOperatorActivitySpan>> =
+        const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Debug, Clone)]
 struct OperatorActivityRecorder {
     timeline: OperationTimelineRecorder,
+    query_execution_id: u64,
+    identities: Arc<Mutex<OperatorActivityIdentityState>>,
     maximum_spans: u64,
     remaining_spans: Arc<AtomicU64>,
     truncation_reported: Arc<AtomicBool>,
@@ -48,6 +97,8 @@ impl OperatorActivityRecorder {
     fn with_max_spans(timeline: OperationTimelineRecorder, maximum_spans: u64) -> Self {
         Self {
             timeline,
+            query_execution_id: NEXT_QUERY_EXECUTION_ID.fetch_add(1, Ordering::Relaxed),
+            identities: Arc::new(Mutex::new(OperatorActivityIdentityState::default())),
             maximum_spans,
             remaining_spans: Arc::new(AtomicU64::new(maximum_spans)),
             truncation_reported: Arc::new(AtomicBool::new(false)),
@@ -60,8 +111,9 @@ impl OperatorActivityRecorder {
         node_id: u64,
         parent_node_id: Option<u64>,
         partition: usize,
+        stream_id: u64,
         activity: &'static str,
-    ) -> Option<OperationTimelineSpanRecorder> {
+    ) -> Option<OperatorActivitySpanRecorder> {
         if self
             .remaining_spans
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
@@ -73,21 +125,97 @@ impl OperatorActivityRecorder {
             return None;
         }
 
-        Some(
-            self.timeline
-                .start_span(
-                    operator_name,
-                    OPERATOR_ACTIVITY_CATEGORY,
-                    activity_track_name(partition),
-                )
-                .with_attribute("node_id", Value::from(node_id))
-                .with_attribute(
-                    "parent_node_id",
-                    parent_node_id.map_or(Value::Null, Value::from),
-                )
-                .with_attribute("partition", Value::from(usize_to_u64_saturating(partition)))
-                .with_attribute("activity", Value::String(activity.to_owned())),
-        )
+        let context = self.execution_context();
+        let parent_id = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
+            active.borrow().last().and_then(|parent| {
+                (parent.query_execution_id == self.query_execution_id
+                    && parent.task_lane_id == context.task_lane_id)
+                    .then_some(parent.span_id)
+            })
+        });
+        let track_name = format!(
+            "DataFusion query {} / task {}",
+            self.query_execution_id, context.task_lane_id
+        );
+        let timeline_span = self
+            .timeline
+            .start_span(operator_name, OPERATOR_ACTIVITY_CATEGORY, track_name)
+            .with_parent_id(parent_id)
+            .with_attribute("query_execution_id", Value::from(self.query_execution_id))
+            .with_attribute("task_lane_id", Value::from(context.task_lane_id))
+            .with_attribute("task_kind", Value::String(context.task_kind.to_owned()))
+            .with_attribute(
+                "runtime_task_id",
+                context.runtime_task_id.map_or(Value::Null, Value::String),
+            )
+            .with_attribute("execution_stream_id", Value::from(stream_id))
+            .with_attribute("node_id", Value::from(node_id))
+            .with_attribute(
+                "parent_node_id",
+                parent_node_id.map_or(Value::Null, Value::from),
+            )
+            .with_attribute(
+                "operator_partition",
+                Value::from(usize_to_u64_saturating(partition)),
+            )
+            .with_attribute("worker_thread_id", Value::String(context.worker_thread_id))
+            .with_attribute(
+                "worker_thread_name",
+                context
+                    .worker_thread_name
+                    .map_or(Value::Null, Value::String),
+            )
+            .with_attribute("activity", Value::String(activity.to_owned()));
+        let active = ActiveOperatorActivitySpan {
+            query_execution_id: self.query_execution_id,
+            task_lane_id: context.task_lane_id,
+            span_id: timeline_span.id()?,
+        };
+        ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active));
+        Some(OperatorActivitySpanRecorder {
+            timeline_span: Some(timeline_span),
+            active,
+        })
+    }
+
+    fn next_stream_id(&self) -> u64 {
+        let mut identities = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let stream_id = identities.next_stream_id;
+        identities.next_stream_id = identities.next_stream_id.saturating_add(1);
+        stream_id
+    }
+
+    fn execution_context(&self) -> ActivityExecutionContext {
+        let thread = std::thread::current();
+        let (task, task_kind, runtime_task_id) = match tokio::task::try_id() {
+            Some(id) => (ActivityTask::Tokio(id), "tokio", Some(id.to_string())),
+            None => (ActivityTask::External(thread.id()), "external", None),
+        };
+        let task_lane_id = {
+            let mut identities = self
+                .identities
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match identities.task_lanes.get(&task) {
+                Some(task_lane_id) => *task_lane_id,
+                None => {
+                    let task_lane_id = identities.next_task_lane_id;
+                    identities.next_task_lane_id = identities.next_task_lane_id.saturating_add(1);
+                    identities.task_lanes.insert(task, task_lane_id);
+                    task_lane_id
+                }
+            }
+        };
+        ActivityExecutionContext {
+            task_lane_id,
+            task_kind,
+            runtime_task_id,
+            worker_thread_id: format!("{:?}", thread.id()),
+            worker_thread_name: thread.name().map(str::to_owned),
+        }
     }
 
     fn report_truncation(&self) {
@@ -98,19 +226,46 @@ impl OperatorActivityRecorder {
                     OPERATOR_ACTIVITY_CATEGORY,
                     "DataFusion operator activity",
                 )
+                .with_attribute("query_execution_id", Value::from(self.query_execution_id))
                 .with_attribute("maximum_spans", Value::from(self.maximum_spans))
                 .completed();
         }
     }
 }
 
-fn activity_track_name(partition: usize) -> String {
-    let thread = std::thread::current();
-    let thread_id = format!("{:?}", thread.id());
-    let worker = thread
-        .name()
-        .map_or_else(|| thread_id.clone(), |name| format!("{name} ({thread_id})"));
-    format!("DataFusion partition {partition} / worker {worker}")
+struct OperatorActivitySpanRecorder {
+    timeline_span: Option<OperationTimelineSpanRecorder>,
+    active: ActiveOperatorActivitySpan,
+}
+
+impl OperatorActivitySpanRecorder {
+    fn with_attribute(mut self, name: impl Into<String>, value: Value) -> Self {
+        if let Some(span) = self.timeline_span.take() {
+            self.timeline_span = Some(span.with_attribute(name, value));
+        }
+        self
+    }
+
+    fn completed(mut self) {
+        if let Some(span) = self.timeline_span.take() {
+            span.completed();
+        }
+    }
+
+    fn failed(mut self) {
+        if let Some(span) = self.timeline_span.take() {
+            span.failed();
+        }
+    }
+}
+
+impl Drop for OperatorActivitySpanRecorder {
+    fn drop(&mut self) {
+        let _ = ACTIVE_OPERATOR_ACTIVITY_SPANS.try_with(|spans| {
+            let popped = spans.borrow_mut().pop();
+            debug_assert_eq!(popped, Some(self.active));
+        });
+    }
 }
 
 /// Adds transparent execute and poll instrumentation to one finalized plan.
@@ -226,11 +381,13 @@ impl ExecutionPlan for ProfiledOperatorExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let stream_id = self.activity.next_stream_id();
         let span = self.activity.start_span(
             self.name(),
             self.node_id,
             self.parent_node_id,
             partition,
+            stream_id,
             "execute",
         );
         let result = self.inner.execute(partition, context);
@@ -253,6 +410,7 @@ impl ExecutionPlan for ProfiledOperatorExec {
                 node_id: self.node_id,
                 parent_node_id: self.parent_node_id,
                 partition,
+                stream_id,
                 activity: self.activity.clone(),
             }) as SendableRecordBatchStream
         })
@@ -270,6 +428,7 @@ struct ProfiledRecordBatchStream {
     node_id: u64,
     parent_node_id: Option<u64>,
     partition: usize,
+    stream_id: u64,
     activity: OperatorActivityRecorder,
 }
 
@@ -282,6 +441,7 @@ impl Stream for ProfiledRecordBatchStream {
             self.node_id,
             self.parent_node_id,
             self.partition,
+            self.stream_id,
             "poll_next",
         );
         let poll = self.inner.as_mut().poll_next(context);
@@ -328,17 +488,17 @@ mod tests {
         let activity = OperatorActivityRecorder::with_max_spans(timeline.clone(), 1);
 
         activity
-            .start_span("FilterExec", 0, None, 0, "poll_next")
+            .start_span("FilterExec", 0, None, 0, 1, "poll_next")
             .expect("first activity should fit")
             .completed();
         assert!(
             activity
-                .start_span("FilterExec", 0, None, 0, "poll_next")
+                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
                 .is_none()
         );
         assert!(
             activity
-                .start_span("FilterExec", 0, None, 0, "poll_next")
+                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
                 .is_none()
         );
 
@@ -383,13 +543,20 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!spans.is_empty());
         assert!(spans.iter().all(|span| {
-            let Some(partition) = span.attributes()["partition"].as_u64() else {
-                return false;
-            };
+            let query_execution_id = span.attributes()["query_execution_id"].as_u64();
+            let task_lane_id = span.attributes()["task_lane_id"].as_u64();
             span.time_semantics() == TimelineSpanTimeSemantics::WallClock
-                && span
-                    .track_name()
-                    .starts_with(&format!("DataFusion partition {partition} / worker "))
+                && query_execution_id.is_some()
+                && task_lane_id.is_some()
+                && span.track_name()
+                    == format!(
+                        "DataFusion query {} / task {}",
+                        query_execution_id.unwrap_or_default(),
+                        task_lane_id.unwrap_or_default()
+                    )
+                && span.attributes()["execution_stream_id"].is_u64()
+                && span.attributes()["operator_partition"].is_u64()
+                && span.attributes()["worker_thread_id"].is_string()
                 && matches!(
                     span.attributes()["activity"].as_str(),
                     Some("execute" | "poll_next")
@@ -409,21 +576,64 @@ mod tests {
                 span.attributes()["parent_node_id"].as_u64(),
                 operator.parent_node_id()
             );
+            if span.attributes()["activity"] == "poll_next" {
+                assert!(spans.iter().any(|candidate| {
+                    candidate.attributes()["activity"] == "execute"
+                        && candidate.attributes()["execution_stream_id"]
+                            == span.attributes()["execution_stream_id"]
+                        && candidate.attributes()["node_id"] == span.attributes()["node_id"]
+                        && candidate.attributes()["operator_partition"]
+                            == span.attributes()["operator_partition"]
+                }));
+            }
         }
-        assert!(spans.iter().any(|outer| {
-            let outer_end = outer
-                .start_offset_micros()
-                .saturating_add(outer.duration_micros());
-            spans.iter().any(|inner| {
-                let inner_end = inner
+        let nested = spans
+            .iter()
+            .filter_map(|span| span.parent_id().map(|parent_id| (span, parent_id)))
+            .collect::<Vec<_>>();
+        assert!(!nested.is_empty());
+        for (span, parent_id) in nested {
+            let parent = spans
+                .iter()
+                .find(|candidate| candidate.id() == parent_id)
+                .ok_or("expected activity parent span")?;
+            assert_eq!(parent.track_name(), span.track_name());
+            assert_eq!(
+                parent.attributes()["query_execution_id"],
+                span.attributes()["query_execution_id"]
+            );
+            assert_eq!(
+                parent.attributes()["task_lane_id"],
+                span.attributes()["task_lane_id"]
+            );
+            assert!(parent.start_offset_micros() <= span.start_offset_micros());
+            assert!(
+                parent
                     .start_offset_micros()
-                    .saturating_add(inner.duration_micros());
-                outer.id() != inner.id()
-                    && outer.track_name() == inner.track_name()
-                    && outer.start_offset_micros() <= inner.start_offset_micros()
-                    && outer_end >= inner_end
-            })
-        }));
+                    .saturating_add(parent.duration_micros())
+                    >= span
+                        .start_offset_micros()
+                        .saturating_add(span.duration_micros())
+            );
+        }
+        for (index, left) in spans.iter().enumerate() {
+            for right in spans.iter().skip(index + 1) {
+                if left.track_name() != right.track_name() {
+                    continue;
+                }
+                let left_start = left.start_offset_micros();
+                let left_end = left_start.saturating_add(left.duration_micros());
+                let right_start = right.start_offset_micros();
+                let right_end = right_start.saturating_add(right.duration_micros());
+                assert!(
+                    !(left_start < right_start && right_start < left_end && left_end < right_end)
+                        && !(right_start < left_start
+                            && left_start < right_end
+                            && right_end < left_end),
+                    "activity spans on one task lane must not cross"
+                );
+            }
+        }
 
         Ok(())
     }
