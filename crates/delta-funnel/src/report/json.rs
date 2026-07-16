@@ -146,8 +146,8 @@ impl QueryExecutionProfile {
                 "ph": "X",
                 "pid": 1,
                 "tid": lane,
-                "ts": nanos_to_micros(span.start_nanos - origin_nanos),
-                "dur": nanos_to_micros(span.end_nanos - span.start_nanos),
+                "ts": nanos_to_micros(span.start_nanos.abs_diff(origin_nanos)),
+                "dur": nanos_to_micros(span.end_nanos.abs_diff(span.start_nanos)),
                 "args": {
                     "node_id": span.operator.node_id(),
                     "parent_node_id": span.operator.parent_node_id(),
@@ -248,7 +248,7 @@ fn trace_lane_name(span: &TraceSpan<'_>) -> String {
     name
 }
 
-fn nanos_to_micros(nanos: i64) -> f64 {
+fn nanos_to_micros(nanos: u64) -> f64 {
     nanos as f64 / 1_000.0
 }
 
@@ -1337,6 +1337,64 @@ mod tests {
         assert_eq!(events[4]["ts"], 0.0);
         assert_eq!(events[4]["dur"], 1100.0);
         assert_eq!(trace["delta_funnel_profile"], profile.to_json_value());
+    }
+
+    #[test]
+    fn execution_profile_trace_json_handles_timestamp_boundaries_and_invalid_spans() {
+        let metric = |name, partition, value| {
+            QueryExecutionMetric::new(
+                name,
+                crate::QueryExecutionMetricCategory::Summary,
+                Some(partition),
+                None,
+                QueryExecutionMetricValue::TimestampNanoseconds(Some(value)),
+            )
+        };
+        let operator = QueryExecutionOperatorProfile::new(
+            0,
+            None,
+            "BoundaryExec",
+            5,
+            true,
+            Vec::new(),
+            vec![
+                metric("start_timestamp", 0, i64::MIN),
+                metric("end_timestamp", 0, i64::MIN),
+                metric("start_timestamp", 1, i64::MIN),
+                metric("end_timestamp", 1, i64::MAX),
+                metric("start_timestamp", 2, i64::MAX),
+                metric("end_timestamp", 2, i64::MAX),
+                metric("start_timestamp", 3, 0),
+                metric("start_timestamp", 4, 1),
+                metric("end_timestamp", 4, 0),
+            ],
+            None,
+        );
+        let profile = QueryExecutionProfile::preview(
+            crate::QueryExecutionOutcome::Success,
+            20,
+            vec![operator],
+        );
+
+        let trace = profile.to_trace_event_json_value();
+        let complete_events = trace["traceEvents"]
+            .as_array()
+            .expect("trace events should be an array")
+            .iter()
+            .filter(|event| event["ph"] == "X")
+            .collect::<Vec<_>>();
+        let event_for_partition = |partition| {
+            complete_events
+                .iter()
+                .find(|event| event["args"]["partition"] == partition)
+                .copied()
+                .expect("partition should have a complete event")
+        };
+
+        assert_eq!(complete_events.len(), 3);
+        assert_eq!(event_for_partition(0)["ts"], 0.0);
+        assert_eq!(event_for_partition(1)["dur"], nanos_to_micros(u64::MAX));
+        assert_eq!(event_for_partition(2)["ts"], nanos_to_micros(u64::MAX));
     }
 
     #[tokio::test]
