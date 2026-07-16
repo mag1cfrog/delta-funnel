@@ -97,15 +97,72 @@ pub(crate) async fn write_output_batches_to_mssql_for_workflow<S>(
 where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
-    let request =
-        plan_mssql_output_connection_request(output_schema, resolved_target, schema_options)?;
+    write_output_batches_to_mssql_for_workflow_with_timeline(
+        output_schema,
+        resolved_target,
+        schema_options,
+        batches,
+        write_backend,
+        validation_options,
+        reporter,
+        None,
+    )
+    .await
+}
+
+/// Internal sink that positions SQL Server work on a shared operation timeline.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the workflow sink receives one planned write plus profiling state"
+)]
+pub(crate) async fn write_output_batches_to_mssql_for_workflow_with_timeline<S>(
+    output_schema: impl AsRef<arrow_schema::Schema>,
+    resolved_target: ResolvedMssqlTarget,
+    schema_options: MssqlSchemaPlanOptions,
+    batches: S,
+    write_backend: MssqlWriteBackend,
+    validation_options: ValidationOptions,
+    reporter: Option<&ProgressReporter>,
+    timeline: Option<&OperationTimelineRecorder>,
+) -> Result<MssqlWriteReport, DeltaFunnelError>
+where
+    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
+{
+    let output_name = resolved_target.output_name().to_owned();
+    let planning_span = timeline.map(|timeline| {
+        timeline
+            .start_span(
+                "Plan SQL Server connection request",
+                "delta_funnel.write.planning",
+                "SQL Server connection planning",
+            )
+            .with_attribute("output_name", output_name.into())
+    });
+    let request = match plan_mssql_output_connection_request(
+        output_schema,
+        resolved_target,
+        schema_options,
+    ) {
+        Ok(request) => {
+            if let Some(span) = planning_span {
+                span.completed();
+            }
+            request
+        }
+        Err(error) => {
+            if let Some(span) = planning_span {
+                span.failed();
+            }
+            return Err(error);
+        }
+    };
     write_output_connection_request_for_workflow(
         request,
         batches,
         write_backend,
         validation_options,
         reporter,
-        None,
+        timeline,
     )
     .await
 }

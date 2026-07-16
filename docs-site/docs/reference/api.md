@@ -193,13 +193,31 @@ Enable one independent detailed profile for every attempted output and every
 executed auto-cache alias:
 
 ```python
-report = session.write_all(outputs, options={"profile": True})
+report = session.write_all(
+    outputs,
+    options={"profile": True},
+    trace_path="write-all-trace.json",
+)
 ```
 
 Omission, `None`, and `False` leave detailed profiling disabled. Only the
 actual Boolean `True` enables it; integers, strings, and other truthy values
 are rejected. Any `options` dictionary, including an empty one, is rejected
 when `dry_run=True`.
+
+`trace_path` accepts a string or `os.PathLike[str]`, requires
+`options={"profile": True}`, and is rejected for dry runs. A returned
+`write_all` report writes one Chrome Trace Event JSON document even when the
+report contains failed or skipped outputs. The root event is the full
+`write_all` duration, and its positioned spans include top-level phases,
+attempted outputs, SQL Server work, and output-query operator lifecycles. The
+same relative model is available at `report["operation_timeline"]`.
+
+A top-level planning, cache, or orchestration exception does not write the
+file. Trace serialization happens after the workflow has produced its report,
+so an `OSError` can occur after SQL Server effects and must not trigger a blind
+retry. Rust callers use `WriteAllReport::operation_timeline()` and
+`WriteAllReport::to_trace_event_json_value()`.
 
 Returned profiles are nested under the output report that owns them:
 

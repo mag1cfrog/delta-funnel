@@ -15,7 +15,9 @@ pub(crate) use lifecycle::{MssqlConnectedLifecycleClient, table_name_from_target
 pub use lifecycle::{MssqlPreparedTarget, MssqlPreparedTargetAction, MssqlPreparedTargetReport};
 pub use sink::write_output_batches_to_mssql;
 pub(crate) use sink::{
-    write_output_batches_to_mssql_for_workflow, write_planned_output_batches_to_mssql_for_workflow,
+    write_output_batches_to_mssql_for_workflow,
+    write_output_batches_to_mssql_for_workflow_with_timeline,
+    write_planned_output_batches_to_mssql_for_workflow,
     write_planned_output_batches_to_mssql_for_workflow_with_timeline,
 };
 pub use workflow::{

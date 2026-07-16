@@ -6,7 +6,9 @@ use datafusion::{arrow::datatypes::SchemaRef, prelude::SessionContext};
 use crate::MssqlOutputBatchStreamFactory;
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlOutputQueryError, MssqlOutputQueryExecution,
-    MssqlOutputQueryFuture, MssqlWritePhase, progress::ProgressReporter, report::PhaseTimer,
+    MssqlOutputQueryFuture, MssqlWritePhase,
+    progress::ProgressReporter,
+    report::{OperationTimelineRecorder, PhaseTimer},
 };
 
 use super::super::super::{
@@ -16,8 +18,8 @@ use super::super::super::{
     registry::{DerivedTableDependency, read_only_sql_options},
 };
 use super::super::output::{
-    QUERY_DATAFRAME_PLANNING_PHASE, create_mssql_output_query_execution_from_dataframe,
-    mssql_output_query_error,
+    QUERY_DATAFRAME_PLANNING_PHASE,
+    create_mssql_output_query_execution_from_dataframe_with_timeline, mssql_output_query_error,
 };
 use super::MssqlDerivedCacheAliasPlan;
 
@@ -35,6 +37,10 @@ fn failing_cached_output_query_factory(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "cached query setup carries retained SQL, reporting, and profiling state"
+)]
 async fn create_cached_output_query_execution_from_retained_sql(
     context: SessionContext,
     planned: PlannedMssqlOutput,
@@ -43,15 +49,28 @@ async fn create_cached_output_query_execution_from_retained_sql(
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     reporter: Option<ProgressReporter>,
     profile_mode: ExecutionProfileMode,
+    timeline: Option<OperationTimelineRecorder>,
 ) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
     let output_name = planned.resolved_target().output_name();
     let dataframe_timer = PhaseTimer::start(QUERY_DATAFRAME_PLANNING_PHASE);
+    let dataframe_span = timeline.as_ref().map(|timeline| {
+        timeline
+            .start_span(
+                "Build query DataFrame",
+                "delta_funnel.write.query",
+                "Query DataFrame planning",
+            )
+            .with_attribute("output_name", output_name.to_owned().into())
+    });
     let dataframe = match context
         .sql_with_options(sql_text.as_str(), read_only_sql_options())
         .await
     {
         Ok(dataframe) => dataframe,
         Err(error) => {
+            if let Some(span) = dataframe_span {
+                span.failed();
+            }
             return Err(mssql_output_query_error(
                 &planned,
                 MssqlWritePhase::QueryDataFramePlanning,
@@ -67,6 +86,9 @@ async fn create_cached_output_query_execution_from_retained_sql(
         dataframe.schema().as_arrow(),
         &expected_schema,
     ) {
+        if let Some(span) = dataframe_span {
+            span.failed();
+        }
         return Err(mssql_output_query_error(
             &planned,
             MssqlWritePhase::QueryDataFramePlanning,
@@ -76,9 +98,12 @@ async fn create_cached_output_query_execution_from_retained_sql(
             None,
         ));
     }
+    if let Some(span) = dataframe_span {
+        span.completed();
+    }
     let query_phase_timings = vec![dataframe_timer.completed()];
 
-    create_mssql_output_query_execution_from_dataframe(
+    create_mssql_output_query_execution_from_dataframe_with_timeline(
         &context,
         &planned,
         dataframe,
@@ -86,6 +111,7 @@ async fn create_cached_output_query_execution_from_retained_sql(
         provider_stats_snapshots,
         reporter,
         profile_mode,
+        timeline.as_ref(),
     )
     .await
 }
@@ -143,6 +169,7 @@ impl DeltaFunnelSession {
     /// can replace the registered providers referenced by that SQL.
     /// Optional provider stats, progress, and profiling are attached without
     /// changing how the cache route is selected.
+    #[cfg(test)]
     pub(crate) fn cached_output_query_factory(
         &self,
         planned: &PlannedMssqlOutput,
@@ -151,13 +178,33 @@ impl DeltaFunnelSession {
         reporter: Option<ProgressReporter>,
         profile_mode: ExecutionProfileMode,
     ) -> Result<Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send>, DeltaFunnelError> {
+        self.cached_output_query_factory_with_timeline(
+            planned,
+            active_aliases,
+            provider_stats_snapshots,
+            reporter,
+            profile_mode,
+            None,
+        )
+    }
+
+    pub(super) fn cached_output_query_factory_with_timeline(
+        &self,
+        planned: &PlannedMssqlOutput,
+        active_aliases: &[MssqlDerivedCacheAliasPlan],
+        provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
+        reporter: Option<ProgressReporter>,
+        profile_mode: ExecutionProfileMode,
+        timeline: Option<OperationTimelineRecorder>,
+    ) -> Result<Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send>, DeltaFunnelError> {
         let request = planned.request();
         if !self.output_requires_cache_replan(request, active_aliases)? {
-            return Ok(self.mssql_output_query_factory(
+            return Ok(self.mssql_output_query_factory_with_timeline(
                 planned.clone(),
                 provider_stats_snapshots,
                 reporter,
                 profile_mode,
+                timeline,
             ));
         }
 
@@ -186,6 +233,7 @@ impl DeltaFunnelSession {
                     provider_stats_snapshots,
                     reporter,
                     profile_mode,
+                    timeline,
                 )
                 .await
             })

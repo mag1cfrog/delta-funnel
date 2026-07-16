@@ -445,6 +445,38 @@ before later SQL Server work finishes. Neither surface includes plan display
 text, raw SQL, row values, paths, URLs, credentials, storage options, headers,
 or byte ranges.
 
+### Export A Write-All Trace
+
+Use one root wall clock to understand phase order, overlap, and sequential
+output attempts across a multi-output write:
+
+```python
+report = session.write_all(
+    outputs,
+    options={"profile": True},
+    trace_path="write-all-trace.json",
+)
+```
+
+Open the file with `vizviewer write-all-trace.json`, Perfetto, or another
+Chrome Trace Event viewer. The root event starts at zero and covers output and
+cache planning, workflow execution, and source reporting. Each attempted
+output has its own positioned span. Query planning, SQL Server sink phases,
+batch work, and DataFusion operator lifecycles use that same origin, so the
+trace tells the complete wall-clock story without adding independent elapsed
+durations together.
+
+The returned report contains the relative model under
+`report["operation_timeline"]`. Its root status is `failed` when the workflow
+report contains failed or skipped outputs, and the trace file is still written
+because the report itself was returned. Top-level exceptions that prevent a
+report do not write `trace_path`.
+
+Rust callers inspect `WriteAllReport::operation_timeline()` or export the same
+document with `WriteAllReport::to_trace_event_json_value()`. As with a
+one-output trace, serialization occurs after SQL Server work. An `OSError`
+does not roll back completed writes and must not lead to a blind retry.
+
 ## Inspect Returned Write-All Cache Diagnostics
 
 Auto-cached `write_all` calls record cache lifecycle timings whether detailed

@@ -61,7 +61,7 @@ impl DeltaFunnelSession {
         self.plan_mssql_output_with_timeline(request, None)
     }
 
-    fn plan_mssql_output_with_timeline(
+    pub(super) fn plan_mssql_output_with_timeline(
         &self,
         request: &OutputWritePlan,
         timeline: Option<&OperationTimelineRecorder>,
@@ -74,7 +74,13 @@ impl DeltaFunnelSession {
             "Plan output schema",
             "delta_funnel.write.planning",
             "Output schema planning",
-        );
+        )
+        .map(|span| {
+            span.with_attribute(
+                "output_name",
+                request.target().output_name().to_owned().into(),
+            )
+        });
         let schema = match self.schema_for_lazy_table(request.table()) {
             Ok(schema) => {
                 phase_timings.push(schema_timer.completed());
@@ -94,7 +100,13 @@ impl DeltaFunnelSession {
             "Plan SQL Server target",
             "delta_funnel.write.planning",
             "SQL Server target planning",
-        );
+        )
+        .map(|span| {
+            span.with_attribute(
+                "output_name",
+                request.target().output_name().to_owned().into(),
+            )
+        });
         let resolved_target =
             match request
                 .target()
@@ -331,12 +343,13 @@ impl DeltaFunnelSession {
         result
     }
 
-    pub(super) fn mssql_output_query_factory(
+    pub(super) fn mssql_output_query_factory_with_timeline(
         &self,
         planned: PlannedMssqlOutput,
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         progress: Option<ProgressReporter>,
         profile_mode: ExecutionProfileMode,
+        timeline: Option<OperationTimelineRecorder>,
     ) -> Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send> {
         let context = self.context.clone();
         let sources = self.sources.clone();
@@ -345,7 +358,7 @@ impl DeltaFunnelSession {
 
         Box::new(move || {
             Box::pin(async move {
-                create_mssql_output_query_execution(
+                create_mssql_output_query_execution_with_timeline(
                     &context,
                     &sources,
                     &derived_tables,
@@ -354,6 +367,7 @@ impl DeltaFunnelSession {
                     provider_stats_snapshots,
                     progress,
                     profile_mode,
+                    timeline.as_ref(),
                 )
                 .await
             })
@@ -446,35 +460,7 @@ impl DeltaFunnelSession {
     clippy::too_many_arguments,
     reason = "query creation needs the session registries plus per-output reporting state"
 )]
-async fn create_mssql_output_query_execution(
-    context: &SessionContext,
-    sources: &[RegisteredSessionSource],
-    derived_tables: &[RegisteredDerivedTable],
-    pending_derived_tables: &[PendingDerivedTable],
-    planned: &PlannedMssqlOutput,
-    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
-    progress: Option<ProgressReporter>,
-    profile_mode: ExecutionProfileMode,
-) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
-    create_mssql_output_query_execution_with_timeline(
-        context,
-        sources,
-        derived_tables,
-        pending_derived_tables,
-        planned,
-        provider_stats_snapshots,
-        progress,
-        profile_mode,
-        None,
-    )
-    .await
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "query creation needs the session registries plus per-output reporting state"
-)]
-async fn create_mssql_output_query_execution_with_timeline(
+pub(super) async fn create_mssql_output_query_execution_with_timeline(
     context: &SessionContext,
     sources: &[RegisteredSessionSource],
     derived_tables: &[RegisteredDerivedTable],
@@ -493,7 +479,13 @@ async fn create_mssql_output_query_execution_with_timeline(
         "Build query DataFrame",
         "delta_funnel.write.query",
         "Query DataFrame planning",
-    );
+    )
+    .map(|span| {
+        span.with_attribute(
+            "output_name",
+            planned.resolved_target().output_name().to_owned().into(),
+        )
+    });
     let dataframe = match dataframe_for_lazy_table_from_session_parts(
         context,
         planned.table(),
@@ -532,33 +524,11 @@ async fn create_mssql_output_query_execution_with_timeline(
     .await
 }
 
-pub(super) async fn create_mssql_output_query_execution_from_dataframe(
-    context: &SessionContext,
-    planned: &PlannedMssqlOutput,
-    dataframe: DataFrame,
-    query_phase_timings: Vec<PhaseTimingReport>,
-    provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
-    progress: Option<ProgressReporter>,
-    profile_mode: ExecutionProfileMode,
-) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
-    create_mssql_output_query_execution_from_dataframe_with_timeline(
-        context,
-        planned,
-        dataframe,
-        query_phase_timings,
-        provider_stats_snapshots,
-        progress,
-        profile_mode,
-        None,
-    )
-    .await
-}
-
 #[allow(
     clippy::too_many_arguments,
     reason = "query creation carries timing, progress, and profiling state"
 )]
-async fn create_mssql_output_query_execution_from_dataframe_with_timeline(
+pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_timeline(
     context: &SessionContext,
     planned: &PlannedMssqlOutput,
     dataframe: DataFrame,
@@ -574,7 +544,13 @@ async fn create_mssql_output_query_execution_from_dataframe_with_timeline(
         "Build physical plan",
         "delta_funnel.write.query",
         "Query physical planning",
-    );
+    )
+    .map(|span| {
+        span.with_attribute(
+            "output_name",
+            planned.resolved_target().output_name().to_owned().into(),
+        )
+    });
     let physical_plan = match dataframe.create_physical_plan().await {
         Ok(physical_plan) => physical_plan,
         Err(error) => {
@@ -598,7 +574,13 @@ async fn create_mssql_output_query_execution_from_dataframe_with_timeline(
         "Set up query stream",
         "delta_funnel.write.query",
         "Query stream setup",
-    );
+    )
+    .map(|span| {
+        span.with_attribute(
+            "output_name",
+            planned.resolved_target().output_name().to_owned().into(),
+        )
+    });
     let profile_scope = match profile_mode {
         ExecutionProfileMode::Disabled => None,
         ExecutionProfileMode::Detailed => Some(QueryExecutionScope::MssqlOutput),
@@ -746,13 +728,8 @@ fn finish_mssql_write_timeline(
     let Some(timeline) = timeline else {
         return result;
     };
-    let total_duration_micros = crate::report::duration_to_micros_saturating(timeline.elapsed());
     if let Some(profile) = mssql_write_execution_profile(&result) {
-        timeline.extend_spans(profile.operator_lifecycle_timeline_spans(
-            timeline.next_span_id(),
-            timeline.wall_clock_origin_nanos(),
-            total_duration_micros,
-        ));
+        timeline.append_operator_lifecycles(profile);
     }
     let status = if result.is_ok() {
         TimelineSpanStatus::Completed
@@ -777,13 +754,8 @@ fn finish_mssql_write_error_timeline(
     let Some(timeline) = timeline else {
         return error;
     };
-    let total_duration_micros = crate::report::duration_to_micros_saturating(timeline.elapsed());
     if let Some(profile) = mssql_write_error_execution_profile(&error) {
-        timeline.extend_spans(profile.operator_lifecycle_timeline_spans(
-            timeline.next_span_id(),
-            timeline.wall_clock_origin_nanos(),
-            total_duration_micros,
-        ));
+        timeline.append_operator_lifecycles(profile);
     }
     let operation_timeline = timeline.finish(
         format!("SQL Server write: {output_name}"),

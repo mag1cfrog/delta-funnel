@@ -918,12 +918,29 @@ impl WriteAllReport {
                 .map(DeltaSourceReport::to_json_value)
                 .collect::<Vec<_>>(),
             "phase_timings": phase_timings_value(self.phase_timings()),
+            "operation_timeline": self
+                .operation_timeline()
+                .map(OperationTimeline::to_json_value),
             "output_count": self.len(),
             "all_succeeded": self.all_succeeded(),
             "succeeded_count": self.succeeded_count(),
             "failed_count": self.failed_count(),
             "skipped_count": self.skipped_count(),
         })
+    }
+
+    /// Returns a Chrome Trace Event JSON document for this profiled write-all call.
+    #[must_use]
+    pub fn to_trace_event_json_value(&self) -> Option<Value> {
+        let mut trace = self.operation_timeline()?.to_trace_event_json_value();
+        let Value::Object(document) = &mut trace else {
+            return None;
+        };
+        document.insert(
+            "delta_funnel_write_all_report".to_owned(),
+            self.to_json_value(),
+        );
+        Some(trace)
     }
 }
 

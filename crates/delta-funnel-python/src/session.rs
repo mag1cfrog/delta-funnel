@@ -1,6 +1,6 @@
 //! Python session wrapper.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
@@ -123,12 +123,14 @@ impl PySession {
     /// Pass `dry_run=True` to plan without writing. Execute calls accept
     /// `cache_mode` and `profile` options. Pass `profile=True` to attach a
     /// detailed execution profile to each attempted output and executed cache
-    /// alias. Cache profiles are under `report["cache"]["aliases"]`, or under
+    /// alias. Pass `trace_path` with detailed profiling to export one Chrome
+    /// Trace Event JSON file for the complete write-all wall clock. Cache
+    /// profiles are under `report["cache"]["aliases"]`, or under
     /// `error.context["aliases"]` for cache orchestration failures.
     /// Returns a plain Python `dict` report. One consolidated progress display
     /// follows output planning, shared cache work, and sequential writes. Pass
     /// `progress=False` to disable it for this call.
-    #[pyo3(signature = (outputs, *, options=None, dry_run=None, progress=None))]
+    #[pyo3(signature = (outputs, *, options=None, dry_run=None, progress=None, trace_path=None))]
     fn write_all(
         slf: Py<Self>,
         py: Python<'_>,
@@ -136,6 +138,7 @@ impl PySession {
         options: Option<&Bound<'_, PyDict>>,
         dry_run: Option<bool>,
         progress: Option<bool>,
+        trace_path: Option<PathBuf>,
     ) -> PyResult<Py<PyAny>> {
         for output in &outputs {
             if !output.belongs_to_session(py, &slf) {
@@ -158,6 +161,13 @@ impl PySession {
             .collect::<Vec<_>>();
 
         if dry_run == Some(true) {
+            if trace_path.is_some() {
+                return Err(config_py_error(
+                    py,
+                    "invalid_option_value",
+                    "`trace_path` is only supported for execute `write_all` calls".to_owned(),
+                ));
+            }
             if options.is_some() {
                 return Err(config_py_error(
                     py,
@@ -175,14 +185,32 @@ impl PySession {
         }
 
         let options = parse_write_all_options(py, options)?;
+        if trace_path.is_some()
+            && options.execution_profile_mode() != delta_funnel::ExecutionProfileMode::Detailed
+        {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                "`trace_path` requires `options={'profile': True}`".to_owned(),
+            ));
+        }
         if requests.is_empty() {
-            return slf
-                .borrow(py)
-                .execute_write_all(py, &requests, options, None);
+            return slf.borrow(py).execute_write_all(
+                py,
+                &requests,
+                options,
+                None,
+                trace_path.as_deref(),
+            );
         }
         let progress = PythonProgress::new(progress);
-        slf.borrow(py)
-            .execute_write_all(py, &requests, options, progress.as_ref())
+        slf.borrow(py).execute_write_all(
+            py,
+            &requests,
+            options,
+            progress.as_ref(),
+            trace_path.as_deref(),
+        )
     }
 }
 
@@ -359,6 +387,7 @@ impl PySession {
         requests: &[delta_funnel::OutputWritePlan],
         options: delta_funnel::WriteAllOptions,
         progress: Option<&PythonProgress>,
+        trace_path: Option<&Path>,
     ) -> PyResult<Py<PyAny>> {
         let report = py.detach(|| match progress {
             Some(progress) => self.runtime.write_all_with_progress(
@@ -381,6 +410,16 @@ impl PySession {
             progress.finish(py, report.as_ref().err(), operation_report.as_ref())?;
         }
         let report = report?;
+        if let Some(trace_path) = trace_path {
+            let trace = report.to_trace_event_json_value().ok_or_else(|| {
+                config_py_error(
+                    py,
+                    "execution_profile_unavailable",
+                    "write-all trace export requires detailed profiling".to_owned(),
+                )
+            })?;
+            crate::table::write_trace_json(trace_path, &trace)?;
+        }
         json_value_to_py(py, &report.to_json_value())
     }
 }
@@ -1237,7 +1276,49 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once(") -> Report:"))
             .map_or("", |(signature, _)| signature);
         assert!(signature.contains("options: WriteAllExecutionOptions | None = None"));
+        assert!(signature.contains("trace_path: str | PathLike[str] | None = None"));
         assert!(!signature.contains("options: Options"));
+    }
+
+    #[test]
+    fn write_all_trace_path_requires_detailed_execute_and_exports_json() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let outputs = PyList::empty(py);
+            let trace_path = env_unique_path("write-all-trace")?.with_extension("json");
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("trace_path", trace_path.to_string_lossy().as_ref())?;
+            let error = session
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .unwrap_err();
+            assert_config_error(py, &error, "invalid_option_value")?;
+            assert!(!trace_path.exists());
+
+            let options = PyDict::new(py);
+            options.set_item("profile", true)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("options", options)?;
+            kwargs.set_item("trace_path", trace_path.to_string_lossy().as_ref())?;
+            session.call_method("write_all", (&outputs,), Some(&kwargs))?;
+
+            let trace: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&trace_path).map_err(io_py_error)?)
+                    .map_err(|error| PyAssertionError::new_err(error.to_string()))?;
+            assert!(trace.get("traceEvents").is_some());
+            assert!(trace.get("delta_funnel_write_all_report").is_some());
+            fs::remove_file(trace_path).map_err(io_py_error)?;
+
+            let signature = module
+                .getattr("Session")?
+                .getattr("write_all")?
+                .getattr("__text_signature__")?
+                .extract::<String>()?;
+            assert!(signature.ends_with("progress=None, trace_path=None)"));
+            Ok(())
+        })
     }
 
     #[test]

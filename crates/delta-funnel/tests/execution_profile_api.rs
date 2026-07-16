@@ -12,7 +12,7 @@ use delta_funnel::{
     ExecutionProfileMode, MssqlWriteFailureContext, MssqlWriteReport, OperationTimeline,
     OutputWritePlan, QueryExecutionMetric, QueryExecutionMetricCategory, QueryExecutionMetricValue,
     QueryExecutionOperatorProfile, QueryExecutionOutcome, QueryExecutionProfile,
-    QueryExecutionScope, WriteAllCacheAliasReport, datafusion_query_output_stream,
+    QueryExecutionScope, WriteAllCacheAliasReport, WriteAllReport, datafusion_query_output_stream,
     progress::ProgressReporter,
 };
 use serde_json::Value;
@@ -64,6 +64,9 @@ fn execution_profile_types_and_accessors_are_exported_from_the_crate_root() {
         MssqlWriteFailureContext::operation_timeline;
     let _: for<'a> fn(&'a WriteAllCacheAliasReport) -> Option<&'a QueryExecutionProfile> =
         WriteAllCacheAliasReport::execution_profile;
+    let _: for<'a> fn(&'a WriteAllReport) -> Option<&'a OperationTimeline> =
+        WriteAllReport::operation_timeline;
+    let _: fn(&WriteAllReport) -> Option<Value> = WriteAllReport::to_trace_event_json_value;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionScope = QueryExecutionProfile::scope;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionOutcome = QueryExecutionProfile::outcome;
     let _: fn(&QueryExecutionProfile) -> bool = QueryExecutionProfile::partial;

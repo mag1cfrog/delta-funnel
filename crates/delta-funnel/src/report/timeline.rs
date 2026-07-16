@@ -8,7 +8,7 @@ use std::{
 
 use serde_json::Value;
 
-use super::duration_to_micros_saturating;
+use super::{QueryExecutionProfile, duration_to_micros_saturating};
 
 /// Status recorded for an operation or one measured timeline span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +305,14 @@ impl OperationTimelineRecorder {
             state.next_span_id = state.next_span_id.max(span.id().saturating_add(1));
             state.spans.push(span);
         }
+    }
+
+    pub(crate) fn append_operator_lifecycles(&self, profile: &QueryExecutionProfile) {
+        self.extend_spans(profile.operator_lifecycle_timeline_spans(
+            self.next_span_id(),
+            self.wall_clock_origin_nanos(),
+            duration_to_micros_saturating(self.elapsed()),
+        ));
     }
 
     pub(crate) fn finish(

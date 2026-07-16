@@ -1,10 +1,14 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
-    DeltaFunnelError, MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter,
-    MssqlWorkflowSinkWriter, PhaseTimingReport, ReportReasonCode, observability,
+    DeltaFunnelError, ExecutionProfileMode, MssqlStreamBenchmarkOutputWriter,
+    MssqlWorkflowOutputWriter, MssqlWorkflowSinkWriter, PhaseTimingReport, ReportReasonCode,
+    observability,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
-    report::{PhaseTimer, sql_server::WriteAllReport},
+    report::{
+        OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer, TimelineSpanStatus,
+        sql_server::WriteAllReport,
+    },
     support::sanitize_text_for_display,
     usize_to_u64_saturating,
 };
@@ -28,13 +32,14 @@ impl DeltaFunnelSession {
         requests: &[OutputWritePlan],
     ) -> Result<Vec<PlannedMssqlOutput>, DeltaFunnelError> {
         validate_write_all_requests(requests)?;
-        self.plan_write_outputs(requests, None)
+        self.plan_write_outputs(requests, None, None)
     }
 
     fn plan_write_outputs(
         &self,
         requests: &[OutputWritePlan],
         reporter: Option<&ProgressReporter>,
+        timeline: Option<&OperationTimelineRecorder>,
     ) -> Result<Vec<PlannedMssqlOutput>, DeltaFunnelError> {
         let output_count = usize_to_u64_saturating(requests.len());
 
@@ -51,7 +56,7 @@ impl DeltaFunnelSession {
                         Some(request.target().output_name()),
                     ));
                 }
-                self.plan_mssql_output(request)
+                self.plan_mssql_output_with_timeline(request, timeline)
             })
             .collect()
     }
@@ -87,6 +92,10 @@ impl DeltaFunnelSession {
     {
         validate_write_all_requests(requests)?;
         let active_reporter = if requests.is_empty() { None } else { reporter };
+        let timeline = match options.execution_profile_mode() {
+            ExecutionProfileMode::Disabled => None,
+            ExecutionProfileMode::Detailed => Some(OperationTimelineRecorder::start()),
+        };
 
         if let Some(reporter) = active_reporter {
             reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
@@ -95,7 +104,22 @@ impl DeltaFunnelSession {
         let result = async {
             // Resolve every output before cache planning or execution starts.
             let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
-            let planned_outputs = self.plan_write_outputs(requests, active_reporter)?;
+            let planning_span = start_write_all_phase_span(
+                timeline.as_ref(),
+                "Plan outputs",
+                "delta_funnel.write_all.planning",
+            );
+            let planned_outputs =
+                match self.plan_write_outputs(requests, active_reporter, timeline.as_ref()) {
+                    Ok(outputs) => {
+                        complete_write_all_span(planning_span);
+                        outputs
+                    }
+                    Err(error) => {
+                        fail_write_all_span(planning_span);
+                        return Err(error);
+                    }
+                };
             let mut phase_timings = vec![planning_timer.completed()];
 
             // Cache planning selects the execution route. Disabled mode records
@@ -103,7 +127,13 @@ impl DeltaFunnelSession {
             let automatic_cache_plan = match options.cache_mode() {
                 WriteAllCacheMode::Auto => {
                     let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
+                    let cache_span = start_write_all_phase_span(
+                        timeline.as_ref(),
+                        "Plan caches",
+                        "delta_funnel.write_all.planning",
+                    );
                     let cache_plan = self.plan_mssql_output_cache(requests);
+                    complete_write_all_span(cache_span);
                     phase_timings.push(cache_timer.completed());
                     Some(cache_plan)
                 }
@@ -120,48 +150,62 @@ impl DeltaFunnelSession {
             // statistics snapshot collection used by the final source report.
             let shared_provider_stats = shared_provider_stats_snapshots();
             let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
-            let (workflow, cache) = match automatic_cache_plan.as_ref() {
+            let workflow_span = start_write_all_phase_span(
+                timeline.as_ref(),
+                "Execute output workflow",
+                "delta_funnel.write_all.execution",
+            );
+            let workflow_result = match automatic_cache_plan.as_ref() {
                 Some(cache_plan) => match cache_plan.decision() {
-                    MssqlOutputCacheDecision::NoCache { .. } => {
-                        let workflow = self
-                            .write_all_uncached_with_writer(
-                                &planned_outputs,
-                                writer,
-                                Some(Arc::clone(&shared_provider_stats)),
-                                active_reporter,
-                                options.execution_profile_mode(),
-                            )
-                            .await?;
-                        (workflow, cache_report::from_plan(cache_plan))
-                    }
-                    MssqlOutputCacheDecision::CacheAliases(cache_aliases) => {
-                        let (workflow, alias_reports) = self
-                            .write_all_cached_with_writer(
-                                &planned_outputs,
-                                cache_aliases,
-                                writer,
-                                Some(Arc::clone(&shared_provider_stats)),
-                                active_reporter,
-                                options.execution_profile_mode(),
-                            )
-                            .await?;
-                        (
-                            workflow,
-                            cache_report::from_executed_plan(cache_plan, alias_reports),
-                        )
-                    }
-                },
-                None => {
-                    let workflow = self
-                        .write_all_uncached_with_writer(
+                    MssqlOutputCacheDecision::NoCache { .. } => self
+                        .write_all_uncached_with_writer_and_timeline(
                             &planned_outputs,
                             writer,
                             Some(Arc::clone(&shared_provider_stats)),
                             active_reporter,
                             options.execution_profile_mode(),
+                            timeline.clone(),
                         )
-                        .await?;
-                    (workflow, cache_report::disabled())
+                        .await
+                        .map(|workflow| (workflow, cache_report::from_plan(cache_plan))),
+                    MssqlOutputCacheDecision::CacheAliases(cache_aliases) => self
+                        .write_all_cached_with_writer_and_timeline(
+                            &planned_outputs,
+                            cache_aliases,
+                            writer,
+                            Some(Arc::clone(&shared_provider_stats)),
+                            active_reporter,
+                            options.execution_profile_mode(),
+                            timeline.clone(),
+                        )
+                        .await
+                        .map(|(workflow, alias_reports)| {
+                            (
+                                workflow,
+                                cache_report::from_executed_plan(cache_plan, alias_reports),
+                            )
+                        }),
+                },
+                None => self
+                    .write_all_uncached_with_writer_and_timeline(
+                        &planned_outputs,
+                        writer,
+                        Some(Arc::clone(&shared_provider_stats)),
+                        active_reporter,
+                        options.execution_profile_mode(),
+                        timeline.clone(),
+                    )
+                    .await
+                    .map(|workflow| (workflow, cache_report::disabled())),
+            };
+            let (workflow, cache) = match workflow_result {
+                Ok(result) => {
+                    complete_write_all_span(workflow_span);
+                    result
+                }
+                Err(error) => {
+                    fail_write_all_span(workflow_span);
+                    return Err(error);
                 }
             };
             phase_timings.push(workflow_timer.completed());
@@ -175,15 +219,42 @@ impl DeltaFunnelSession {
                 ));
             }
             let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
-            let sources = self.source_reports_for_planned_outputs_with_provider_stats(
+            let source_span = start_write_all_phase_span(
+                timeline.as_ref(),
+                "Report sources",
+                "delta_funnel.write_all.reporting",
+            );
+            let sources = match self.source_reports_for_planned_outputs_with_provider_stats(
                 &planned_outputs,
                 provider_stats_snapshots(&shared_provider_stats),
-            )?;
+            ) {
+                Ok(sources) => {
+                    complete_write_all_span(source_span);
+                    sources
+                }
+                Err(error) => {
+                    fail_write_all_span(source_span);
+                    return Err(error);
+                }
+            };
             phase_timings.push(source_timer.completed());
 
             Ok(WriteAllReport::new(workflow, cache, sources).with_phase_timings(phase_timings))
         }
         .await;
+
+        let result = match (result, timeline.as_ref()) {
+            (Ok(report), Some(timeline)) => {
+                let status = if report.all_succeeded() {
+                    TimelineSpanStatus::Completed
+                } else {
+                    TimelineSpanStatus::Failed
+                };
+                let timeline = timeline.finish("SQL Server write_all", status);
+                Ok(report.with_operation_timeline(Some(timeline)))
+            }
+            (result, _) => result,
+        };
 
         if let Some(reporter) = active_reporter {
             reporter.emit(&match &result {
@@ -335,6 +406,26 @@ fn ensure_write_all_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunne
                 "write_all requires RunMode::Execute; use dry_run_all_to_mssql for dry-run planning"
                     .to_owned(),
         }),
+    }
+}
+
+fn start_write_all_phase_span(
+    timeline: Option<&OperationTimelineRecorder>,
+    name: &str,
+    category: &str,
+) -> Option<OperationTimelineSpanRecorder> {
+    timeline.map(|timeline| timeline.start_span(name, category, "Write-all phases"))
+}
+
+fn complete_write_all_span(span: Option<OperationTimelineSpanRecorder>) {
+    if let Some(span) = span {
+        span.completed();
+    }
+}
+
+fn fail_write_all_span(span: Option<OperationTimelineSpanRecorder>) {
+    if let Some(span) = span {
+        span.failed();
     }
 }
 
@@ -1478,12 +1569,8 @@ mod tests {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
             )?;
-            let (provider, scans) = scan_counting_marker_region_provider("shared")?;
-            session
-                .context()
-                .register_table("shared_source", provider)?;
             let shared = session
-                .table_from_sql("select marker from shared_source")
+                .table_from_sql("select 1 as id union all select 2 as id")
                 .await?;
             let first = execute_output_request(
                 shared.clone(),
@@ -1538,7 +1625,58 @@ mod tests {
                     )?;
                 }
             }
-            assert_eq!(scans.load(Ordering::SeqCst), 2);
+            let timeline = report
+                .operation_timeline()
+                .ok_or("expected write-all operation timeline")?;
+            assert_eq!(timeline.name(), "SQL Server write_all");
+            assert_eq!(timeline.status().as_str(), "completed");
+            for expected_name in [
+                "Plan outputs",
+                "Execute output workflow",
+                "Write output: first_output",
+                "Write output: second_output",
+                "Report sources",
+            ] {
+                assert!(
+                    timeline
+                        .spans()
+                        .iter()
+                        .any(|span| span.name() == expected_name),
+                    "missing timeline span {expected_name}"
+                );
+            }
+            let first_span = timeline
+                .spans()
+                .iter()
+                .find(|span| span.name() == "Write output: first_output")
+                .ok_or("missing first output span")?;
+            let second_span = timeline
+                .spans()
+                .iter()
+                .find(|span| span.name() == "Write output: second_output")
+                .ok_or("missing second output span")?;
+            assert!(
+                first_span
+                    .start_offset_micros()
+                    .saturating_add(first_span.duration_micros())
+                    <= second_span.start_offset_micros()
+            );
+            assert!(
+                timeline
+                    .spans()
+                    .iter()
+                    .any(|span| span.category() == "datafusion.operator.lifecycle")
+            );
+            assert!(timeline.spans().iter().all(|span| {
+                span.start_offset_micros()
+                    .saturating_add(span.duration_micros())
+                    <= timeline.total_duration_micros()
+            }));
+            let trace = report
+                .to_trace_event_json_value()
+                .ok_or("expected write-all trace export")?;
+            assert!(trace.get("traceEvents").is_some());
+            assert!(trace.get("delta_funnel_write_all_report").is_some());
             let events = execution_profile_events(&capture);
             assert_eq!(events.len(), 2);
             assert!(events.iter().all(|event| {
@@ -1612,6 +1750,24 @@ mod tests {
             assert!(skipped.is_skipped());
             assert_eq!(execution_profile_events(&capture).len(), 2);
 
+            let timeline = report
+                .operation_timeline()
+                .ok_or("expected failed write-all timeline")?;
+            assert_eq!(timeline.status().as_str(), "failed");
+            let failed_output_span = timeline
+                .spans()
+                .iter()
+                .find(|span| span.name() == "Write output: second_output")
+                .ok_or("missing failed output span")?;
+            assert_eq!(failed_output_span.status().as_str(), "failed");
+            assert!(
+                timeline
+                    .spans()
+                    .iter()
+                    .all(|span| span.name() != "Write output: third_output")
+            );
+            assert!(report.to_trace_event_json_value().is_some());
+
             let value = report.to_json_value();
             let failed = &value["workflow"]["outputs"][1];
             assert!(value.get("execution_profile").is_none());
@@ -1664,6 +1820,8 @@ mod tests {
                 )
                 .await?;
 
+            assert!(report.operation_timeline().is_none());
+            assert!(report.to_trace_event_json_value().is_none());
             assert_eq!(report.outputs().len(), 1);
             assert_eq!(report.outputs()[0].output_name(), "orders_output");
             assert_eq!(report.sources().len(), 1);

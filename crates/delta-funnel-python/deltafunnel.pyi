@@ -67,6 +67,7 @@ class Session:
         options: WriteAllExecutionOptions | None = None,
         dry_run: bool | None = None,
         progress: bool | None = None,
+        trace_path: str | PathLike[str] | None = None,
     ) -> Report: ...
 
 
