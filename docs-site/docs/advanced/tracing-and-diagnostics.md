@@ -431,9 +431,12 @@ written after a successful call. Rust callers can inspect
 `MssqlWriteReport::operation_timeline()` and export the same document with
 `MssqlWriteReport::to_trace_event_json_value()`.
 
-Trace serialization happens after the SQL Server write succeeds. If the call
-raises `OSError` for `trace_path`, treat the database write as completed and do
-not blindly retry an append or create-and-load operation.
+DeltaFunnel opens the trace destination before SQL Server work starts. An open
+failure therefore prevents the database operation. If final serialization or
+writing still fails after SQL Server succeeds, the Python error carries
+`deltafunnel_operation_status="completed"` and the sanitized report in
+`deltafunnel_operation_report`. Do not blindly retry an append or
+create-and-load operation.
 
 The returned value uses the shared
 [execution profile model](../reference/api.md#execution-profile-model),
@@ -480,8 +483,11 @@ report do not write `trace_path`.
 
 Rust callers inspect `WriteAllReport::operation_timeline()` or export the same
 document with `WriteAllReport::to_trace_event_json_value()`. As with a
-one-output trace, serialization occurs after SQL Server work. An `OSError`
-does not roll back completed writes and must not lead to a blind retry.
+one-output trace, the destination is opened before SQL Server work, while final
+serialization occurs afterward. A late Python error carries the
+`completed` or `completed_with_failures` operation status and the sanitized
+report. It does not roll back completed writes and must not lead to a blind
+retry.
 
 ## Inspect Returned Write-All Cache Diagnostics
 

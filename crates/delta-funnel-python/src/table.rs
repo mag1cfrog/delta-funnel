@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -317,6 +318,56 @@ pub(crate) fn write_trace_json(path: &Path, trace: &serde_json::Value) -> PyResu
     fs::write(path, bytes).map_err(PyOSError::new_err)
 }
 
+/// A trace file opened before a mutating operation starts.
+pub(crate) struct TraceDestination {
+    path: PathBuf,
+    file: fs::File,
+    remove_on_drop: bool,
+}
+
+impl TraceDestination {
+    pub(crate) fn open(path: &Path) -> PyResult<Self> {
+        let (file, remove_on_drop) = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(PyOSError::new_err)?,
+                false,
+            ),
+            Err(error) => return Err(PyOSError::new_err(error)),
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+            remove_on_drop,
+        })
+    }
+
+    pub(crate) fn write(mut self, trace: &serde_json::Value) -> PyResult<()> {
+        let bytes = serde_json::to_vec(trace)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        self.file.set_len(0).map_err(PyOSError::new_err)?;
+        self.file.write_all(&bytes).map_err(PyOSError::new_err)?;
+        self.file.flush().map_err(PyOSError::new_err)?;
+        self.remove_on_drop = false;
+        Ok(())
+    }
+}
+
+impl Drop for TraceDestination {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn parse_profile_arg(profile: &Bound<'_, PyAny>) -> PyResult<bool> {
     if profile.is_none() {
         return Ok(false);
@@ -344,6 +395,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use super::TraceDestination;
     use crate::{
         deltafunnel, exception::DeltaFunnelError, progress::adapter_creation_count,
         test_support::python_state,
@@ -362,6 +414,28 @@ mod tests {
         "preview_format_html",
         "preview_total",
     ];
+
+    #[test]
+    fn unused_trace_destination_preserves_the_preoperation_file_state() -> PyResult<()> {
+        let new_path = temp_trace_path("preflight-new")?;
+        let destination = TraceDestination::open(&new_path)?;
+        assert!(new_path.exists());
+        drop(destination);
+        assert!(!new_path.exists());
+
+        let existing_path = temp_trace_path("preflight-existing")?;
+        fs::write(&existing_path, b"existing trace")
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let destination = TraceDestination::open(&existing_path)?;
+        drop(destination);
+        assert_eq!(
+            fs::read(&existing_path).map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+            b"existing trace"
+        );
+        fs::remove_file(existing_path)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Ok(())
+    }
 
     #[test]
     fn module_exports_table_type() -> PyResult<()> {

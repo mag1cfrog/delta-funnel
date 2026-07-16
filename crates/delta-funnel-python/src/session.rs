@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 
-use crate::exception::{delta_funnel_error_to_py, delta_funnel_py_error};
+use crate::exception::{attach_operation_result, delta_funnel_error_to_py, delta_funnel_py_error};
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
 use crate::progress::PythonProgress;
-use crate::table::PyTable;
+use crate::table::{PyTable, TraceDestination};
 
 /// Delta Funnel workflow session.
 ///
@@ -296,6 +296,7 @@ impl PySession {
         progress: Option<&PythonProgress>,
         trace_path: Option<&Path>,
     ) -> PyResult<Py<PyAny>> {
+        let trace_destination = trace_path.map(TraceDestination::open).transpose()?;
         let report = py.detach(|| match progress {
             Some(progress) => self.runtime.write_to_mssql_with_profile_mode_and_progress(
                 &self.inner,
@@ -313,17 +314,18 @@ impl PySession {
             progress.finish(py, report.as_ref().err(), None)?;
         }
         let report = report?;
-        if let Some(trace_path) = trace_path {
-            let trace = report.to_trace_event_json_value().ok_or_else(|| {
-                config_py_error(
-                    py,
-                    "execution_profile_unavailable",
-                    "write trace export requires detailed profiling".to_owned(),
-                )
-            })?;
-            crate::table::write_trace_json(trace_path, &trace)?;
+        let report_value = report.to_json_value();
+        if let Some(trace_destination) = trace_destination {
+            write_completed_trace(
+                py,
+                trace_destination,
+                report.to_trace_event_json_value(),
+                "write trace export requires detailed profiling",
+                "completed",
+                &report_value,
+            )?;
         }
-        json_value_to_py(py, &report.to_json_value())
+        json_value_to_py(py, &report_value)
     }
 
     #[allow(
@@ -389,6 +391,7 @@ impl PySession {
         progress: Option<&PythonProgress>,
         trace_path: Option<&Path>,
     ) -> PyResult<Py<PyAny>> {
+        let trace_destination = trace_path.map(TraceDestination::open).transpose()?;
         let report = py.detach(|| match progress {
             Some(progress) => self.runtime.write_all_with_progress(
                 &self.inner,
@@ -410,18 +413,46 @@ impl PySession {
             progress.finish(py, report.as_ref().err(), operation_report.as_ref())?;
         }
         let report = report?;
-        if let Some(trace_path) = trace_path {
-            let trace = report.to_trace_event_json_value().ok_or_else(|| {
-                config_py_error(
-                    py,
-                    "execution_profile_unavailable",
-                    "write-all trace export requires detailed profiling".to_owned(),
-                )
-            })?;
-            crate::table::write_trace_json(trace_path, &trace)?;
+        let status = if report.all_succeeded() {
+            "completed"
+        } else {
+            "completed_with_failures"
+        };
+        let report_value = report.to_json_value();
+        if let Some(trace_destination) = trace_destination {
+            write_completed_trace(
+                py,
+                trace_destination,
+                report.to_trace_event_json_value(),
+                "write-all trace export requires detailed profiling",
+                status,
+                &report_value,
+            )?;
         }
-        json_value_to_py(py, &report.to_json_value())
+        json_value_to_py(py, &report_value)
     }
+}
+
+fn write_completed_trace(
+    py: Python<'_>,
+    destination: TraceDestination,
+    trace: Option<serde_json::Value>,
+    unavailable_message: &'static str,
+    status: &str,
+    report: &serde_json::Value,
+) -> PyResult<()> {
+    trace
+        .ok_or_else(|| {
+            config_py_error(
+                py,
+                "execution_profile_unavailable",
+                unavailable_message.to_owned(),
+            )
+        })
+        .and_then(|trace| destination.write(&trace))
+        .inspect_err(|error| {
+            attach_operation_result(py, error, status, None, Some(report));
+        })
 }
 
 /// Unregistered Delta source returned by `Session.delta_lake(...)` without `name`.
@@ -1175,7 +1206,7 @@ mod tests {
         MssqlTableName, MssqlTimestampPolicy, MssqlTimezonePolicy, MssqlUInt64Policy, QueryOptions,
         TargetValidationMode, connect_mssql_client_from_ado_string,
     };
-    use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError};
+    use pyo3::exceptions::{PyAssertionError, PyKeyError, PyOSError, PyTypeError};
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
     use std::{
@@ -2507,6 +2538,28 @@ mod tests {
                 .call_method("write_all", (&outputs,), Some(&kwargs))
                 .unwrap_err();
             assert_missing_connection_error(py, &error)?;
+
+            let options = PyDict::new(py);
+            options.set_item("profile", true)?;
+            let trace_path = env_unique_path("failed-write-all-trace")?.with_extension("json");
+            kwargs.set_item("options", options)?;
+            kwargs.set_item("trace_path", trace_path.to_string_lossy().as_ref())?;
+            let error = session
+                .bind(py)
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .unwrap_err();
+            assert_missing_connection_error(py, &error)?;
+            assert!(!trace_path.exists());
+
+            let missing_parent = env_unique_path("missing-trace-parent")?;
+            let invalid_trace_path = missing_parent.join("trace.json");
+            kwargs.set_item("trace_path", invalid_trace_path.to_string_lossy().as_ref())?;
+            let error = session
+                .bind(py)
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyOSError>(py));
+            assert!(!missing_parent.exists());
 
             Ok(())
         })

@@ -139,18 +139,21 @@ Only the actual Boolean `True` enables it. `profile=True` is rejected with
 `execution_profile` field.
 
 `trace_path` accepts a string or `os.PathLike[str]` and requires
-`profile=True` on an execute call. After a successful write, it creates or
-replaces a Chrome Trace Event JSON file without creating missing parent
-directories. The root event covers the complete one-output wall clock, while
-positioned child events cover planning, SQL Server lifecycle work, query stream
-polls, per-batch validation and writes, finalization, target validation, swap,
-cleanup, and available DataFusion operator lifecycles. File-system failures
-raise `OSError`. A failed write retains its partial timeline in structured
-failure context but does not write `trace_path`.
+`profile=True` on an execute call. DeltaFunnel opens the destination before SQL
+Server work starts, without creating missing parent directories. An open
+failure raises `OSError` before the database operation. After a successful
+write, the destination receives Chrome Trace Event JSON. The root event covers
+the complete one-output wall clock, while positioned child events cover
+planning, SQL Server lifecycle work, query stream polls, per-batch validation
+and writes, finalization, target validation, swap, cleanup, and available
+DataFusion operator lifecycles. A failed write leaves an existing destination
+unchanged and removes a newly reserved file.
 
-The file is serialized after SQL Server reports success. An `OSError` from
-`trace_path` therefore does not roll back the database write and must not be
-treated as evidence that an append is safe to retry.
+Final serialization and file writes still happen after SQL Server reports
+success. A resulting Python error carries
+`deltafunnel_operation_status="completed"` and the sanitized successful report
+in `deltafunnel_operation_report`. It does not roll back the database write and
+must not be treated as evidence that an append is safe to retry.
 
 Rust callers select the same mode on the option-bearing session or runtime
 method:
@@ -206,17 +209,20 @@ are rejected. Any `options` dictionary, including an empty one, is rejected
 when `dry_run=True`.
 
 `trace_path` accepts a string or `os.PathLike[str]`, requires
-`options={"profile": True}`, and is rejected for dry runs. A returned
-`write_all` report writes one Chrome Trace Event JSON document even when the
-report contains failed or skipped outputs. The root event is the full
-`write_all` duration, and its positioned spans include top-level phases,
-attempted outputs, SQL Server work, and output-query operator lifecycles. The
-same relative model is available at `report["operation_timeline"]`.
+`options={"profile": True}`, and is rejected for dry runs. DeltaFunnel opens
+the destination before SQL Server work starts. A returned `write_all` report
+writes one Chrome Trace Event JSON document even when the report contains
+failed or skipped outputs. The root event is the full `write_all` duration, and
+its positioned spans include top-level phases, attempted outputs, SQL Server
+work, and output-query operator lifecycles. The same relative model is
+available at `report["operation_timeline"]`.
 
-A top-level planning, cache, or orchestration exception does not write the
-file. Trace serialization happens after the workflow has produced its report,
-so an `OSError` can occur after SQL Server effects and must not trigger a blind
-retry. Rust callers use `WriteAllReport::operation_timeline()` and
+A top-level planning, cache, or orchestration exception leaves an existing
+destination unchanged and removes a newly reserved file. A final export error
+after the workflow report carries `deltafunnel_operation_status` as `completed`
+or `completed_with_failures` and attaches the sanitized report as
+`deltafunnel_operation_report`. It must not trigger a blind retry. Rust callers
+use `WriteAllReport::operation_timeline()` and
 `WriteAllReport::to_trace_event_json_value()`.
 
 Auto-cache traces position alias resolution, planning, stream setup,
