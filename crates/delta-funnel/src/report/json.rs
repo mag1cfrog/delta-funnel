@@ -16,11 +16,12 @@ use crate::{
     MssqlOutputFieldReport, MssqlOutputWriteStatus, MssqlTargetCleanupStatus, MssqlTargetTable,
     MssqlWorkflowWriteReport, MssqlWriteFailureContext, MssqlWriteFailureReport, MssqlWritePhase,
     MssqlWriteReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport, MssqlWriteStats,
-    OutputStatus, PhaseStatus, PhaseTimingReport, QueryExecutionMetric, QueryExecutionMetricValue,
-    QueryExecutionOperatorProfile, QueryExecutionProfile, ReportReasonCode, RowCount, RunMode,
-    ValidationStatus, WorkflowStatus, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
-    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheFailure,
-    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
+    OperationTimeline, OutputStatus, PhaseStatus, PhaseTimingReport, QueryExecutionMetric,
+    QueryExecutionMetricValue, QueryExecutionOperatorProfile, QueryExecutionProfile,
+    ReportReasonCode, RowCount, RunMode, TimelineSpan, ValidationStatus, WorkflowStatus,
+    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
+    WriteAllCacheCandidateSkipReason, WriteAllCacheFailure, WriteAllCacheReport,
+    WriteAllNoCacheReason, WriteAllReport,
 };
 
 impl RowCount {
@@ -85,6 +86,108 @@ impl PhaseTimingReport {
             "elapsed_micros": self.elapsed_micros(),
         })
     }
+}
+
+impl OperationTimeline {
+    /// Returns this wall-clock timeline as a stable JSON-compatible value.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "schema_version": Self::SCHEMA_VERSION,
+            "name": self.name(),
+            "status": self.status().as_str(),
+            "total_duration_micros": self.total_duration_micros(),
+            "spans": self
+                .spans()
+                .iter()
+                .map(TimelineSpan::to_json_value)
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Returns a Chrome Trace Event JSON document for this wall-clock timeline.
+    #[must_use]
+    pub fn to_trace_event_json_value(&self) -> Value {
+        let mut events = vec![
+            json!({
+                "name": "process_name",
+                "cat": "__metadata",
+                "ph": "M",
+                "pid": 1,
+                "args": {"name": format!("Delta Funnel {}", self.name())},
+            }),
+            trace_lane_metadata(0, self.name()),
+            json!({
+                "name": self.name(),
+                "cat": "delta_funnel.operation",
+                "ph": "X",
+                "pid": 1,
+                "tid": 0,
+                "ts": 0,
+                "dur": self.total_duration_micros(),
+                "args": {
+                    "id": 0,
+                    "parent_id": Value::Null,
+                    "status": self.status().as_str(),
+                    "time_semantics": "wall_clock",
+                },
+            }),
+        ];
+
+        for (index, span) in self.spans().iter().enumerate() {
+            let lane = super::usize_to_u64_saturating(index.saturating_add(1));
+            events.push(trace_lane_metadata(lane, span.name()));
+            events.push(json!({
+                "name": span.name(),
+                "cat": span.category(),
+                "ph": "X",
+                "pid": 1,
+                "tid": lane,
+                "ts": span.start_offset_micros(),
+                "dur": span.duration_micros(),
+                "args": {
+                    "id": span.id(),
+                    "parent_id": span.parent_id().unwrap_or(0),
+                    "status": span.status().as_str(),
+                    "time_semantics": span.time_semantics().as_str(),
+                    "attributes": span.attributes(),
+                },
+            }));
+        }
+
+        json!({
+            "traceEvents": events,
+            "displayTimeUnit": "ms",
+            "delta_funnel_timeline": self.to_json_value(),
+        })
+    }
+}
+
+impl TimelineSpan {
+    fn to_json_value(&self) -> Value {
+        json!({
+            "id": self.id(),
+            "parent_id": self.parent_id(),
+            "name": self.name(),
+            "category": self.category(),
+            "start_offset_micros": self.start_offset_micros(),
+            "duration_micros": self.duration_micros(),
+            "status": self.status().as_str(),
+            "time_semantics": self.time_semantics().as_str(),
+            "attributes": self.attributes(),
+        })
+    }
+}
+
+fn trace_lane_metadata(lane: u64, name: &str) -> Value {
+    json!({
+        "name": "thread_name",
+        "cat": "__metadata",
+        "ph": "M",
+        "pid": 1,
+        "tid": lane,
+        "args": {"name": name},
+    })
 }
 
 impl QueryExecutionProfile {
@@ -1263,6 +1366,43 @@ mod tests {
             })
         );
         serde_json::from_str::<Value>(&serde_json::to_string(&value)?).map(|_| ())
+    }
+
+    #[test]
+    fn operation_timeline_trace_uses_the_total_wall_clock_as_its_origin() {
+        let execution = TimelineSpan::new(
+            1,
+            None,
+            "preview_execute_collect",
+            "delta_funnel.phase",
+            Duration::from_micros(1_700_000),
+            Duration::from_micros(6_200_000),
+            crate::TimelineSpanStatus::Completed,
+            crate::TimelineSpanTimeSemantics::WallClock,
+        )
+        .with_attribute("rows", json!(10_000));
+        let timeline = OperationTimeline::new(
+            "preview",
+            crate::TimelineSpanStatus::Completed,
+            Duration::from_micros(8_000_000),
+            vec![execution],
+        );
+
+        let trace = timeline.to_trace_event_json_value();
+        let events = trace["traceEvents"]
+            .as_array()
+            .expect("trace events should be an array");
+
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[2]["name"], "preview");
+        assert_eq!(events[2]["ts"], 0);
+        assert_eq!(events[2]["dur"], 8_000_000);
+        assert_eq!(events[4]["name"], "preview_execute_collect");
+        assert_eq!(events[4]["ts"], 1_700_000);
+        assert_eq!(events[4]["dur"], 6_200_000);
+        assert_eq!(events[4]["args"]["time_semantics"], "wall_clock");
+        assert_eq!(events[4]["args"]["attributes"]["rows"], 10_000);
+        assert_eq!(trace["delta_funnel_timeline"], timeline.to_json_value());
     }
 
     #[test]

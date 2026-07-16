@@ -16,6 +16,7 @@ pub mod delta;
 mod execution_profile;
 mod json;
 pub mod sql_server;
+mod timeline;
 
 pub use delta::{
     DeltaProtocolReport, DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus,
@@ -30,6 +31,9 @@ pub use sql_server::{
     MssqlDryRunSqlIdentityState, MssqlDryRunWorkflowReport, WriteAllCacheAliasReport,
     WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason,
     WriteAllCacheFailure, WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
+};
+pub use timeline::{
+    OperationTimeline, TimelineSpan, TimelineSpanStatus, TimelineSpanTimeSemantics,
 };
 
 /// Saturates a platform-sized count into the public `u64` report shape.
