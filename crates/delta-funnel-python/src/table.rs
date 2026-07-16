@@ -18,11 +18,9 @@ use crate::session::{PySession, config_py_error};
 /// Rendered preview of a Delta Funnel table.
 #[pyclass(name = "Preview", module = "deltafunnel")]
 pub(crate) struct PyPreview {
-    text: String,
-    html: String,
+    inner: delta_funnel::TablePreview,
     phase_timings: Py<PyAny>,
     execution_profile: Py<PyAny>,
-    trace_report: Option<serde_json::Value>,
 }
 
 impl PyPreview {
@@ -38,14 +36,11 @@ impl PyPreview {
             .execution_profile()
             .map(delta_funnel::QueryExecutionProfile::to_json_value)
             .unwrap_or(serde_json::Value::Null);
-        let trace_report = preview.to_trace_event_json_value();
 
         Ok(Self {
-            text: preview.text().to_owned(),
-            html: preview.html().to_owned(),
+            inner: preview,
             phase_timings: json_value_to_py(py, &phase_timings)?,
             execution_profile: json_value_to_py(py, &execution_profile)?,
-            trace_report,
         })
     }
 }
@@ -54,12 +49,12 @@ impl PyPreview {
 impl PyPreview {
     #[getter]
     fn text(&self) -> &str {
-        &self.text
+        self.inner.text()
     }
 
     #[getter]
     fn html(&self) -> &str {
-        &self.html
+        self.inner.html()
     }
 
     #[getter]
@@ -77,26 +72,26 @@ impl PyPreview {
     /// The resulting file can be opened by VizTracer's `vizviewer`, Perfetto,
     /// and other viewers that accept Chrome Trace Event JSON.
     fn export_trace(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
-        let trace = self.trace_report.as_ref().ok_or_else(|| {
+        let trace = self.inner.to_trace_event_json_value().ok_or_else(|| {
             config_py_error(
                 py,
                 "execution_profile_unavailable",
                 "trace export requires a preview created with `profile=True`".to_owned(),
             )
         })?;
-        write_trace_json(&path, trace)
+        write_trace_json(&path, &trace)
     }
 
     fn __str__(&self) -> &str {
-        &self.text
+        self.inner.text()
     }
 
     fn __repr__(&self) -> &str {
-        &self.text
+        self.inner.text()
     }
 
     fn _repr_html_(&self) -> &str {
-        &self.html
+        self.inner.html()
     }
 }
 

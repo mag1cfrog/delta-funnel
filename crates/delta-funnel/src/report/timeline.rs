@@ -347,14 +347,15 @@ impl OperationTimelineRecorder {
         OperationTimeline::new(name, status, total_duration, spans)
     }
 
-    fn record(&self, pending: PendingTimelineSpan, status: TimelineSpanStatus) {
+    fn record(&self, pending: PendingTimelineSpan, status: TimelineSpanStatus) -> Duration {
+        let duration = pending.started_at.elapsed();
         let span = TimelineSpan::new(
             pending.id,
             None,
             pending.name,
             pending.category,
             pending.start_offset,
-            pending.started_at.elapsed(),
+            duration,
             status,
             TimelineSpanTimeSemantics::WallClock,
         )
@@ -368,6 +369,7 @@ impl OperationTimelineRecorder {
             .unwrap_or_else(|error| error.into_inner())
             .spans
             .push(span);
+        duration
     }
 }
 
@@ -398,23 +400,28 @@ impl OperationTimelineSpanRecorder {
     }
 
     pub(crate) fn completed(mut self) {
-        self.finish(TimelineSpanStatus::Completed);
+        let _ = self.finish(TimelineSpanStatus::Completed);
     }
 
     pub(crate) fn failed(mut self) {
-        self.finish(TimelineSpanStatus::Failed);
+        let _ = self.finish(TimelineSpanStatus::Failed);
     }
 
-    fn finish(&mut self, status: TimelineSpanStatus) {
+    pub(crate) fn finish_with_duration(mut self, status: TimelineSpanStatus) -> Duration {
+        self.finish(status).unwrap_or_default()
+    }
+
+    fn finish(&mut self, status: TimelineSpanStatus) -> Option<Duration> {
         if let Some(span) = self.span.take() {
-            self.recorder.record(span, status);
+            return Some(self.recorder.record(span, status));
         }
+        None
     }
 }
 
 impl Drop for OperationTimelineSpanRecorder {
     fn drop(&mut self) {
-        self.finish(TimelineSpanStatus::Cancelled);
+        let _ = self.finish(TimelineSpanStatus::Cancelled);
     }
 }
 

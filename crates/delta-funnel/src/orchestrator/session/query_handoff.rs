@@ -2,7 +2,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use datafusion::{
@@ -25,8 +25,7 @@ use crate::MssqlOutputBatchStreamFactory;
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStream, OperationTimeline,
     PhaseTimingReport, PreviewFailureContext, QueryExecutionProfile, QueryExecutionScope,
-    ReportReasonCode, TimelineSpan, TimelineSpanStatus, TimelineSpanTimeSemantics,
-    duration_to_micros_saturating,
+    ReportReasonCode, TimelineSpanStatus,
     observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
@@ -38,6 +37,7 @@ use crate::{
         },
         snapshot_delta_provider_read_stats,
     },
+    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder},
     usize_to_u64_saturating,
 };
 
@@ -585,31 +585,34 @@ pub(super) fn batch_stream_for_physical_plan(
 }
 
 struct PreviewTimingTracker {
-    started_at: Instant,
-    wall_clock_origin_nanos: i128,
     phase_timings: Vec<PhaseTimingReport>,
-    timeline_spans: Vec<TimelineSpan>,
+    timeline: OperationTimelineRecorder,
 }
 
 struct PreviewPhaseTimer {
     phase_name: &'static str,
-    started_offset: Duration,
+    timeline_span: OperationTimelineSpanRecorder,
 }
 
 impl PreviewTimingTracker {
     fn start() -> Self {
         Self {
-            started_at: Instant::now(),
-            wall_clock_origin_nanos: system_time_nanos(SystemTime::now()),
             phase_timings: Vec::with_capacity(PREVIEW_PHASE_NAMES.len()),
-            timeline_spans: Vec::with_capacity(PREVIEW_PHASE_NAMES.len() - 1),
+            timeline: OperationTimelineRecorder::start(),
         }
     }
 
     fn start_phase(&self, phase_name: &'static str) -> PreviewPhaseTimer {
+        let display_name = preview_phase_display_name(phase_name);
         PreviewPhaseTimer {
             phase_name,
-            started_offset: self.started_at.elapsed(),
+            timeline_span: self
+                .timeline
+                .start_span(display_name, "delta_funnel.preview.phase", display_name)
+                .with_attribute(
+                    "phase_name",
+                    serde_json::Value::String(phase_name.to_owned()),
+                ),
         }
     }
 
@@ -623,51 +626,31 @@ impl PreviewTimingTracker {
         timer: PreviewPhaseTimer,
         status: TimelineSpanStatus,
     ) -> PhaseTimingReport {
-        let ended_offset = self.started_at.elapsed();
-        let duration = ended_offset.saturating_sub(timer.started_offset);
-        let timing = match status {
+        let duration = timer.timeline_span.finish_with_duration(status);
+        match status {
             TimelineSpanStatus::Completed => {
                 PhaseTimingReport::completed(timer.phase_name, duration)
             }
-            TimelineSpanStatus::Failed => PhaseTimingReport::failed(timer.phase_name, duration),
-            TimelineSpanStatus::Cancelled => PhaseTimingReport::failed(timer.phase_name, duration),
-        };
-        let id = usize_to_u64_saturating(self.timeline_spans.len().saturating_add(1));
-        self.timeline_spans.push(
-            TimelineSpan::new(
-                id,
-                None,
-                preview_phase_display_name(timer.phase_name),
-                "delta_funnel.preview.phase",
-                timer.started_offset,
-                duration,
-                status,
-                TimelineSpanTimeSemantics::WallClock,
-            )
-            .with_attribute(
-                "phase_name",
-                serde_json::Value::String(timer.phase_name.to_owned()),
-            ),
-        );
-        timing
+            TimelineSpanStatus::Failed | TimelineSpanStatus::Cancelled => {
+                PhaseTimingReport::failed(timer.phase_name, duration)
+            }
+        }
     }
 
     fn completed(
         mut self,
         execution_profile: Option<&QueryExecutionProfile>,
     ) -> (Vec<PhaseTimingReport>, OperationTimeline) {
-        let total_duration = self.started_at.elapsed();
+        if let Some(execution_profile) = execution_profile {
+            self.timeline.append_operator_lifecycles(execution_profile);
+        }
+        let timeline = self
+            .timeline
+            .finish("Preview total", TimelineSpanStatus::Completed);
         self.phase_timings.push(PhaseTimingReport::completed(
             PREVIEW_TOTAL_PHASE,
-            total_duration,
+            Duration::from_micros(timeline.total_duration_micros()),
         ));
-        self.append_operator_lifecycles(execution_profile, total_duration);
-        let timeline = OperationTimeline::new(
-            "Preview total",
-            TimelineSpanStatus::Completed,
-            total_duration,
-            self.timeline_spans,
-        );
         (self.phase_timings, timeline)
     }
 
@@ -689,18 +672,16 @@ impl PreviewTimingTracker {
             .extend(remaining_non_total_phases.iter().map(|phase_name| {
                 PhaseTimingReport::not_started(*phase_name, ReportReasonCode::PriorFailure)
             }));
-        let total_duration = self.started_at.elapsed();
+        if let Some(execution_profile) = execution_profile.as_ref() {
+            self.timeline.append_operator_lifecycles(execution_profile);
+        }
+        let timeline = self
+            .timeline
+            .finish("Preview total", TimelineSpanStatus::Failed);
         self.phase_timings.push(PhaseTimingReport::failed(
             PREVIEW_TOTAL_PHASE,
-            total_duration,
+            Duration::from_micros(timeline.total_duration_micros()),
         ));
-        self.append_operator_lifecycles(execution_profile.as_ref(), total_duration);
-        let timeline = OperationTimeline::new(
-            "Preview total",
-            TimelineSpanStatus::Failed,
-            total_duration,
-            self.timeline_spans,
-        );
 
         DeltaFunnelError::PreviewFailed {
             context: Box::new(
@@ -709,23 +690,6 @@ impl PreviewTimingTracker {
             ),
             source: Box::new(source),
         }
-    }
-
-    fn append_operator_lifecycles(
-        &mut self,
-        execution_profile: Option<&QueryExecutionProfile>,
-        total_duration: Duration,
-    ) {
-        let Some(execution_profile) = execution_profile else {
-            return;
-        };
-        let first_span_id = usize_to_u64_saturating(self.timeline_spans.len().saturating_add(1));
-        self.timeline_spans
-            .extend(execution_profile.operator_lifecycle_timeline_spans(
-                first_span_id,
-                self.wall_clock_origin_nanos,
-                duration_to_micros_saturating(total_duration),
-            ));
     }
 }
 
@@ -738,21 +702,6 @@ fn preview_phase_display_name(phase_name: &str) -> &str {
         PREVIEW_FORMAT_TEXT_PHASE => "Format text",
         PREVIEW_FORMAT_HTML_PHASE => "Format HTML",
         _ => phase_name,
-    }
-}
-
-fn system_time_nanos(time: SystemTime) -> i128 {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => u128_to_i128_saturating(duration.as_nanos()),
-        Err(error) => -u128_to_i128_saturating(error.duration().as_nanos()),
-    }
-}
-
-fn u128_to_i128_saturating(value: u128) -> i128 {
-    if value > i128::MAX as u128 {
-        i128::MAX
-    } else {
-        value as i128
     }
 }
 
@@ -2495,14 +2444,15 @@ mod tests {
                 .operation_timeline()
                 .ok_or("expected detailed preview timeline")?;
             assert_eq!(timeline.status(), TimelineSpanStatus::Completed);
-            assert_eq!(
-                timeline
-                    .spans()
-                    .iter()
-                    .filter(|span| span.category() == "delta_funnel.preview.phase")
-                    .count(),
-                PREVIEW_PHASES.len() - 1
-            );
+            let phase_spans = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == "delta_funnel.preview.phase")
+                .collect::<Vec<_>>();
+            assert_eq!(phase_spans.len(), PREVIEW_PHASES.len() - 1);
+            for (timing, span) in preview.phase_timings().iter().zip(phase_spans) {
+                assert_eq!(timing.elapsed_micros(), Some(span.duration_micros()));
+            }
             assert!(
                 timeline
                     .spans()
