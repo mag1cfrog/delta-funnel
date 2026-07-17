@@ -2818,6 +2818,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detailed_official_kernel_preview_records_nested_scan_activity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("official-kernel-scan-activity")?;
+        let provider_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::OfficialKernel,
+            1,
+            1,
+        )?;
+        let mut session = DeltaFunnelSession::new(
+            SessionOptions::new()
+                .with_query_options(QueryOptions {
+                    target_partitions: Some(1),
+                    output_batch_size: Some(1),
+                })
+                .with_provider_scan_options(provider_options),
+        )?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+
+        let preview = session
+            .preview_table_with_options(
+                &source,
+                PreviewOptions::new(2).with_execution_profile_mode(ExecutionProfileMode::Detailed),
+            )
+            .await?;
+        let timeline = preview
+            .operation_timeline()
+            .ok_or("expected detailed official-kernel timeline")?;
+        let activity_spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == "datafusion.operator.activity")
+            .collect::<Vec<_>>();
+        let producer = activity_spans
+            .iter()
+            .find(|span| {
+                span.name() == "Delta scan producer"
+                    && span.attributes()["activity"] == "delta_scan_producer_run"
+            })
+            .ok_or("expected official-kernel Delta scan producer")?;
+        for (name, activity) in [
+            ("Delta scan file read", "delta_scan_file_read"),
+            ("Delta scan output send", "delta_scan_output_send"),
+        ] {
+            let spans = activity_spans
+                .iter()
+                .filter(|span| span.name() == name && span.attributes()["activity"] == activity)
+                .collect::<Vec<_>>();
+            assert!(!spans.is_empty());
+            for span in spans {
+                assert_eq!(span.parent_id(), Some(producer.id()));
+                assert_eq!(span.track_name(), producer.track_name());
+                assert!(producer.start_offset_micros() <= span.start_offset_micros());
+                assert!(
+                    producer
+                        .start_offset_micros()
+                        .saturating_add(producer.duration_micros())
+                        >= span
+                            .start_offset_micros()
+                            .saturating_add(span.duration_micros())
+                );
+            }
+        }
+        assert!(
+            timeline
+                .spans()
+                .iter()
+                .all(|span| span.category() != "datafusion.operator.wait")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn detailed_preview_progress_preserves_profile_and_timing_shape()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_two_files("detailed-progress-parity")?;

@@ -30,6 +30,7 @@ use crate::table_formats::{DeltaKernelPredicate, KernelScanReadSchema};
 
 use super::super::operator_activity::{
     current_operator_activity_context, profile_operator_activity_future,
+    profile_operator_activity_sync, profile_operator_activity_sync_result,
 };
 use super::super::planning::dynamic_filters::{
     DeltaDynamicFilterOutcome, DeltaDynamicFilterPlan, DeltaRetainedDynamicFilter,
@@ -621,8 +622,10 @@ fn sequential_scan_partition_stream(
         RecordBatchReceiverStreamBuilder::new(Arc::clone(&schema), output_buffer_capacity);
     let output = builder.tx();
     let read_stats = Arc::clone(&admission.read_stats);
+    let activity = current_operator_activity_context();
 
-    builder.spawn_blocking(move || {
+    let producer_activity = activity.clone();
+    let producer = move || {
         read_stats.record_scan_partition_started();
         for task in file_tasks {
             if output.is_closed() {
@@ -633,11 +636,19 @@ fn sequential_scan_partition_stream(
             }
 
             read_stats.record_file_started();
-            let _permit = partition_limiter.acquire_file_permit();
-            let file_result = match file_reader.read_file(DeltaFileReadRequest {
-                task: &task,
-                read_schema: &read_schema,
-            }) {
+            let (file_result, _permit) = match profile_operator_activity_sync_result(
+                producer_activity.as_ref(),
+                "Delta scan file read",
+                "delta_scan_file_read",
+                || {
+                    let permit = partition_limiter.acquire_file_permit();
+                    let file_result = file_reader.read_file(DeltaFileReadRequest {
+                        task: &task,
+                        read_schema: &read_schema,
+                    })?;
+                    Ok((file_result, permit))
+                },
+            ) {
                 Ok(file_result) => file_result,
                 Err(error) => {
                     record_deletion_vector_read_error(read_stats.as_ref(), &error);
@@ -651,7 +662,14 @@ fn sequential_scan_partition_stream(
 
             for batch in file_result {
                 let rows = batch.num_rows();
-                if output.blocking_send(Ok(batch)).is_err() {
+                if profile_operator_activity_sync(
+                    producer_activity.as_ref(),
+                    "Delta scan output send",
+                    "delta_scan_output_send",
+                    || output.blocking_send(Ok(batch)),
+                )
+                .is_err()
+                {
                     return Ok(());
                 }
                 read_stats.record_batch_produced(rows);
@@ -661,6 +679,14 @@ fn sequential_scan_partition_stream(
 
         read_stats.record_scan_partition_completed();
         Ok(())
+    };
+    builder.spawn_blocking(move || {
+        profile_operator_activity_sync_result(
+            activity.as_ref(),
+            "Delta scan producer",
+            "delta_scan_producer_run",
+            producer,
+        )
     });
 
     project_scan_output_stream(builder.build(), schema)

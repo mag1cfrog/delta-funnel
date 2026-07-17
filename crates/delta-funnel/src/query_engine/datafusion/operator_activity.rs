@@ -123,6 +123,58 @@ pub(super) struct OperatorActivityContext {
 }
 
 impl OperatorActivityContext {
+    fn profile_sync<T>(
+        &self,
+        name: &'static str,
+        activity: &'static str,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        self.profile_sync_classified(name, activity, operation, |_| ("completed", false))
+    }
+
+    fn profile_sync_result<T, E>(
+        &self,
+        name: &'static str,
+        activity: &'static str,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.profile_sync_classified(name, activity, operation, |result| {
+            if result.is_ok() {
+                ("ok", false)
+            } else {
+                ("error", true)
+            }
+        })
+    }
+
+    fn profile_sync_classified<T>(
+        &self,
+        name: &'static str,
+        activity: &'static str,
+        operation: impl FnOnce() -> T,
+        classify: impl FnOnce(&T) -> (&'static str, bool),
+    ) -> T {
+        let span = self.activity.start_span(
+            name,
+            self.node_id,
+            self.parent_node_id,
+            self.partition,
+            self.stream_id,
+            activity,
+        );
+        let result = operation();
+        if let Some(span) = span {
+            let (result_name, failed) = classify(&result);
+            let span = span.with_attribute("result", Value::String(result_name.to_owned()));
+            if failed {
+                span.failed();
+            } else {
+                span.completed();
+            }
+        }
+        result
+    }
+
     /// Records each poll as a closed worker span so no span crosses an await or
     /// follows a future when the runtime moves its next poll to another worker.
     pub(super) async fn profile_future<F>(
@@ -201,6 +253,30 @@ impl OperatorActivityContext {
             poll
         })
         .await
+    }
+}
+
+pub(super) fn profile_operator_activity_sync<T>(
+    activity: Option<&OperatorActivityContext>,
+    name: &'static str,
+    activity_name: &'static str,
+    operation: impl FnOnce() -> T,
+) -> T {
+    match activity {
+        Some(activity) => activity.profile_sync(name, activity_name, operation),
+        None => operation(),
+    }
+}
+
+pub(super) fn profile_operator_activity_sync_result<T, E>(
+    activity: Option<&OperatorActivityContext>,
+    name: &'static str,
+    activity_name: &'static str,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    match activity {
+        Some(activity) => activity.profile_sync_result(name, activity_name, operation),
+        None => operation(),
     }
 }
 
