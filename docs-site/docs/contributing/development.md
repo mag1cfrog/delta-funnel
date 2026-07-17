@@ -55,9 +55,9 @@ existing server, and individual suite options.
 ## Profile Python-driven Rust execution with Samply
 
 Use Samply when you need sampled call stacks below Delta Funnel's semantic
-operation timeline. Samply can show Python, PyO3, Delta Funnel, DataFusion,
-Delta Kernel, Arrow, Parquet, and Tokio frames in one profile. Use the
-[tracing and diagnostics](../advanced/tracing-and-diagnostics.md) workflow
+operation timeline. Samply can show CPython native, PyO3, Delta Funnel,
+DataFusion, Delta Kernel, Arrow, Parquet, and Tokio frames in one profile. Use
+the [tracing and diagnostics](../advanced/tracing-and-diagnostics.md) workflow
 instead when you need exact phase boundaries, logical worker identities,
 operation metrics, or wall-clock ordering.
 
@@ -146,10 +146,10 @@ samply record \
   path/to/workload.py
 ```
 
-Samply starts the Python process, records its Python and native threads, then
-opens Firefox Profiler. Prefer one representative invocation that runs for a
-few seconds. Repeating a short script creates extra processes and runtime
-threads that make the profile harder to read.
+Samply starts the Python process, samples its native operating-system threads,
+then opens Firefox Profiler. Prefer one representative invocation that runs
+for a few seconds. Repeating a short script creates extra processes and
+runtime threads that make the profile harder to read.
 
 Use the repository progress smoke test to check the build and recording
 plumbing with deterministic local data:
@@ -214,12 +214,13 @@ questions and can be used together.
 
 ### Verified Linux result
 
-This workflow was checked on Fedora Linux 43 x86-64 with Linux 6.19, Samply
-0.13.1, Python 3.12 and 3.14, and Rust 1.97. The profile resolved CPython and
-PyO3 symbols, plus function names, source lines, and inline frames for Delta
-Funnel, DataFusion, Delta Kernel, Arrow, Parquet, and Tokio code. The Python to
-Rust transition and Rust worker stacks unwound without enabling frame pointers.
-One libc entry remained generic, but the native call chains were intact.
+The symbolized extension was built and imported with Python 3.12 and 3.14 on
+Fedora Linux 43 x86-64 with Linux 6.19 and Rust 1.97. The inspected recording
+used Python 3.12 and Samply 0.13.1. It resolved CPython and PyO3 native symbols,
+plus function names, source lines, and inline frames for Delta Funnel,
+DataFusion, Delta Kernel, Arrow, Parquet, and Tokio code. The CPython to Rust
+transition and Rust worker stacks unwound without enabling frame pointers. One
+libc entry remained generic, but the native call chains were intact.
 
 The short Python validation confirms the mixed-language call stacks, but its
 process startup cost is not a representative overhead measurement. The

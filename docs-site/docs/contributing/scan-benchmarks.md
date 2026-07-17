@@ -170,36 +170,54 @@ cargo build --locked --profile profiling \
   --bin delta_scan_partition_bench
 ```
 
-Run the disabled workflow under Samply:
+On Linux with GNU `time`, run the complete comparison in one Bash or Zsh
+session. Keep the common arguments in one array so every case stays identical:
 
 ```bash
-samply record \
+benchmark_args=(
+  --mode provider-exec
+  --seed 0
+  --provider-exec-storage-profile local
+  --provider-exec-workload provider_wide_event_export_13m
+  --provider-exec-query write_all_exports
+  --provider-exec-phase-aligned-workflow
+  --provider-exec-backend native_async
+  --provider-exec-scheduling-profile prefetch_2_parallel_buffer_1
+  --provider-exec-repetitions 3
+)
+
+/usr/bin/time -f 'disabled_before_command_wall_seconds=%e' \
+  target/profiling/delta_scan_partition_bench \
+  "${benchmark_args[@]}" \
+  --output target/operation-profile-disabled-before.csv
+
+/usr/bin/time -f 'detailed_command_wall_seconds=%e' \
+  target/profiling/delta_scan_partition_bench \
+  "${benchmark_args[@]}" \
+  --provider-exec-detailed-profile \
+  --output target/operation-profile-detailed.csv
+
+/usr/bin/time -f 'samply_command_wall_seconds=%e' \
+  samply record \
+  --rate 1000 \
   --save-only \
   --output target/samply-operation-profile.json.gz \
   target/profiling/delta_scan_partition_bench \
-  --mode provider-exec \
-  --seed 0 \
-  --provider-exec-storage-profile local \
-  --provider-exec-workload provider_wide_event_export_13m \
-  --provider-exec-query write_all_exports \
-  --provider-exec-phase-aligned-workflow \
-  --provider-exec-backend native_async \
-  --provider-exec-scheduling-profile prefetch_2_parallel_buffer_1 \
-  --provider-exec-repetitions 3 \
+  "${benchmark_args[@]}" \
   --output target/operation-profile-samply.csv
-```
 
-Run the same direct binary without the `samply record` prefix before the
-comparison and again after the sampled run, using a different CSV output path
-for each control. Run it once more with `--provider-exec-detailed-profile` for
-the detailed case. Keep every other argument identical. Bracketing the matrix
-with two controls makes host drift visible instead of attributing it to the
-profiler.
+/usr/bin/time -f 'disabled_after_command_wall_seconds=%e' \
+  target/profiling/delta_scan_partition_bench \
+  "${benchmark_args[@]}" \
+  --output target/operation-profile-disabled-after.csv
+```
 
 Compare Samply's `total_micros` with both disabled controls. The benchmark's
 internal timer includes sampling overhead during the workflow, while excluding
-Samply startup and profile finalization. Also compare the whole-process wall
-time when startup and finalization matter to the use case.
+Samply startup and profile finalization. Each `/usr/bin/time` result captures
+the corresponding command wall time, including startup and finalization.
+Bracketing the matrix with two controls makes host drift visible instead of
+attributing it to the profiler.
 
 #### Samply comparison from 2026-07-17
 
