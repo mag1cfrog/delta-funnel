@@ -18,6 +18,9 @@ mod json;
 pub mod sql_server;
 mod timeline;
 
+#[cfg(test)]
+pub(crate) mod trace_contract;
+
 pub use delta::{
     DeltaProtocolReport, DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus,
 };
