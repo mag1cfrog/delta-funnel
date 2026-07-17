@@ -283,9 +283,9 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 77] = [
     "min_total_micros",
     "max_total_micros",
     "execution_profile_mode",
-    "operation_timeline_span_count",
-    "trace_event_count",
-    "trace_json_bytes",
+    "operation_timeline_span_count_max",
+    "trace_event_count_max",
+    "trace_json_bytes_max",
     "trace_export_micros_p50",
     "trace_export_micros_p95",
     "trace_export_micros_p99",
@@ -1025,9 +1025,9 @@ struct ProviderExecSummary {
     batch_latency_micros: PercentileSummary,
     process_peak_rss_bytes: Option<u64>,
     process_peak_rss_delta_bytes: Option<u64>,
-    operation_timeline_span_count: usize,
-    trace_event_count: usize,
-    trace_json_bytes: usize,
+    operation_timeline_span_count_max: usize,
+    trace_event_count_max: usize,
+    trace_json_bytes_max: usize,
     trace_export_micros: PercentileSummary,
     min_total_micros: u64,
     max_total_micros: u64,
@@ -2821,17 +2821,17 @@ fn provider_exec_summary(measurements: &[ProviderExecRunMeasurement]) -> Provide
             .iter()
             .filter_map(|measurement| measurement.process_peak_rss_delta_bytes)
             .max(),
-        operation_timeline_span_count: measurements
+        operation_timeline_span_count_max: measurements
             .iter()
             .map(|measurement| measurement.operation_timeline_span_count)
             .max()
             .unwrap_or(0),
-        trace_event_count: measurements
+        trace_event_count_max: measurements
             .iter()
             .map(|measurement| measurement.trace_event_count)
             .max()
             .unwrap_or(0),
-        trace_json_bytes: measurements
+        trace_json_bytes_max: measurements
             .iter()
             .map(|measurement| measurement.trace_json_bytes)
             .max()
@@ -3227,9 +3227,9 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         summary.min_total_micros.to_string(),
         summary.max_total_micros.to_string(),
         execution_profile_mode_name(input.execution_profile_mode).to_owned(),
-        summary.operation_timeline_span_count.to_string(),
-        summary.trace_event_count.to_string(),
-        summary.trace_json_bytes.to_string(),
+        summary.operation_timeline_span_count_max.to_string(),
+        summary.trace_event_count_max.to_string(),
+        summary.trace_json_bytes_max.to_string(),
         summary.trace_export_micros.p50.to_string(),
         summary.trace_export_micros.p95.to_string(),
         summary.trace_export_micros.p99.to_string(),
@@ -8186,9 +8186,9 @@ mod tests {
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"source_rows_per_second_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"batch_latency_micros_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"execution_profile_mode"));
-        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"operation_timeline_span_count"));
-        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"trace_event_count"));
-        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"trace_json_bytes"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"operation_timeline_span_count_max"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"trace_event_count_max"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"trace_json_bytes_max"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"trace_export_micros_p99"));
     }
 
@@ -8751,9 +8751,9 @@ mod tests {
             },
             process_peak_rss_bytes: Some(4096),
             process_peak_rss_delta_bytes: Some(1024),
-            operation_timeline_span_count: 100,
-            trace_event_count: 110,
-            trace_json_bytes: 32_768,
+            operation_timeline_span_count_max: 100,
+            trace_event_count_max: 110,
+            trace_json_bytes_max: 32_768,
             trace_export_micros: PercentileSummary {
                 p50: 60,
                 p95: 61,

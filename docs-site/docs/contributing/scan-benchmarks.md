@@ -133,7 +133,10 @@ these references:
 `total_micros` includes the measured workflow but excludes Chrome trace
 serialization. `trace_export_micros` records trace construction and compact
 JSON serialization separately. Peak RSS is sampled after serialization, so it
-includes retained profiling data and trace export memory.
+includes retained profiling data and trace export memory. The
+`operation_timeline_span_count_max`, `trace_event_count_max`, and
+`trace_json_bytes_max` columns report the largest value observed across the
+repetitions.
 
 ### Reference result from 2026-07-16
 
@@ -147,9 +150,9 @@ parallelism slots, and Rust 1.97.0. Each row summarizes three repetitions.
 | Workflow time p95 | 25.704 s | 32.935 s | +28.1% |
 | Source rows per second p50 | 538,507 | 444,216 | -17.5% |
 | Peak RSS increase | 14,683.5 MiB | 16,512.2 MiB | +12.5% |
-| Operation timeline spans | 0 | 192,739 | n/a |
-| Chrome trace events | 0 | 193,222 | n/a |
-| Compact trace JSON size | 0 | 344.8 MiB | n/a |
+| Operation timeline spans, maximum | 0 | 192,739 | n/a |
+| Chrome trace events, maximum | 0 | 193,222 | n/a |
+| Compact trace JSON size, maximum | 0 | 344.8 MiB | n/a |
 | Trace export time p50 | 0 | 5.478 s | n/a |
 
 Three repetitions are enough for a reproducible development baseline, but not

@@ -449,7 +449,21 @@ fn validate_attributes(event: &TraceEvent, lane_name: &str) -> Result<(), String
         ));
     }
 
-    if event.category == OPERATOR_ACTIVITY_CATEGORY && event.name != TRUNCATION_MARKER {
+    if event.category == OPERATOR_ACTIVITY_CATEGORY && event.name == TRUNCATION_MARKER {
+        let query_id = required_u64(attributes, "query_execution_id", event)?;
+        required_str(attributes, "query_scope", event)?;
+        required_u64(attributes, "maximum_spans", event)?;
+        let expected_lane = format!("DataFusion query [{query_id}] / trace status");
+        if lane_name != expected_lane {
+            return Err(format!(
+                "truncation marker lane metadata is inconsistent: expected {expected_lane:?}, got {lane_name:?}: {}",
+                event.summary()
+            ));
+        }
+        return Ok(());
+    }
+
+    if event.category == OPERATOR_ACTIVITY_CATEGORY {
         let query_id = required_u64(attributes, "query_execution_id", event)?;
         required_str(attributes, "query_scope", event)?;
         let worker_id = required_u64(attributes, "worker_lane_id", event)?;
@@ -497,10 +511,6 @@ fn validate_attributes(event: &TraceEvent, lane_name: &str) -> Result<(), String
         required_u64(attributes, "query_execution_id", event)?;
         required_str(attributes, "query_scope", event)?;
         required_str(attributes, "activity", event)?;
-    } else if event.name == TRUNCATION_MARKER {
-        required_u64(attributes, "query_execution_id", event)?;
-        required_str(attributes, "query_scope", event)?;
-        required_u64(attributes, "maximum_spans", event)?;
     }
 
     Ok(())
@@ -663,7 +673,9 @@ fn validate_typed_and_chrome_agree(
 fn validate_truncation(events: &[TraceEvent], expect_truncation: bool) -> Result<(), String> {
     let markers = events
         .iter()
-        .filter(|event| event.name == TRUNCATION_MARKER)
+        .filter(|event| {
+            event.category == OPERATOR_ACTIVITY_CATEGORY && event.name == TRUNCATION_MARKER
+        })
         .collect::<Vec<_>>();
     let expected = usize::from(expect_truncation);
     if markers.len() != expected {
@@ -675,6 +687,16 @@ fn validate_truncation(events: &[TraceEvent], expect_truncation: bool) -> Result
                 .map(|event| event.summary())
                 .collect::<Vec<_>>()
                 .join("; ")
+        ));
+    }
+    if let Some(marker) = markers.iter().find(|event| {
+        event.parent_id != Some(0)
+            || event.status != TimelineSpanStatus::Completed.as_str()
+            || event.time_semantics != TimelineSpanTimeSemantics::WallClock.as_str()
+    }) {
+        return Err(format!(
+            "operator truncation marker must be a completed root child with wall_clock semantics: {}",
+            marker.summary()
         ));
     }
     Ok(())
@@ -713,6 +735,23 @@ mod tests {
         .with_attribute("worker_thread_id", json!("ThreadId(2)"))
         .with_attribute("worker_thread_name", json!("tokio-runtime-worker"))
         .with_attribute("activity", json!("poll_next"))
+    }
+
+    fn truncation_marker(status: TimelineSpanStatus) -> TimelineSpan {
+        TimelineSpan::new(
+            5,
+            None,
+            TRUNCATION_MARKER,
+            OPERATOR_ACTIVITY_CATEGORY,
+            Duration::from_micros(90),
+            Duration::ZERO,
+            status,
+            TimelineSpanTimeSemantics::WallClock,
+        )
+        .with_track_name("DataFusion query [1] / trace status")
+        .with_attribute("query_execution_id", json!(1))
+        .with_attribute("query_scope", json!("preview"))
+        .with_attribute("maximum_spans", json!(100))
     }
 
     fn valid_timeline() -> OperationTimeline {
@@ -1158,22 +1197,8 @@ mod tests {
             "{absent}"
         );
 
-        let marker = TimelineSpan::new(
-            5,
-            None,
-            TRUNCATION_MARKER,
-            OPERATOR_ACTIVITY_CATEGORY,
-            Duration::from_micros(90),
-            Duration::ZERO,
-            TimelineSpanStatus::Completed,
-            TimelineSpanTimeSemantics::WallClock,
-        )
-        .with_track_name("DataFusion query [1] / trace status")
-        .with_attribute("query_execution_id", json!(1))
-        .with_attribute("query_scope", json!("preview"))
-        .with_attribute("maximum_spans", json!(100));
         let mut spans = valid_timeline().spans().to_vec();
-        spans.push(marker);
+        spans.push(truncation_marker(TimelineSpanStatus::Completed));
         let timeline = OperationTimeline::new(
             "preview",
             TimelineSpanStatus::Completed,
@@ -1185,6 +1210,66 @@ mod tests {
         assert!(
             unexpected.contains("expected 0 operator truncation marker"),
             "{unexpected}"
+        );
+
+        let mut spans = valid_timeline().spans().to_vec();
+        spans.push(
+            TimelineSpan::new(
+                5,
+                None,
+                TRUNCATION_MARKER,
+                OPERATOR_LIFECYCLE_CATEGORY,
+                Duration::from_micros(90),
+                Duration::ZERO,
+                TimelineSpanStatus::Completed,
+                TimelineSpanTimeSemantics::Lifecycle,
+            )
+            .with_track_name("Coincidental lifecycle name")
+            .with_attribute("node_id", json!(1))
+            .with_attribute("parent_node_id", Value::Null)
+            .with_attribute("partition", json!(0))
+            .with_attribute("output_partition_count", json!(1))
+            .with_attribute("metrics", json!([])),
+        );
+        let collision = OperationTimeline::new(
+            "preview",
+            TimelineSpanStatus::Completed,
+            Duration::from_micros(100),
+            spans,
+        );
+        validate_operation_trace(&collision)
+            .expect("an unrelated category may use the same display name");
+        let absent = validate_truncated_operation_trace(&collision)
+            .expect_err("a lifecycle name collision is not a truncation marker");
+        assert!(
+            absent.contains("expected 1 operator truncation marker"),
+            "{absent}"
+        );
+
+        let wrong_lane = OperationTimeline::new(
+            "preview",
+            TimelineSpanStatus::Completed,
+            Duration::from_micros(100),
+            vec![truncation_marker(TimelineSpanStatus::Completed).with_track_name("wrong lane")],
+        );
+        let wrong_lane = validate_truncated_operation_trace(&wrong_lane)
+            .expect_err("marker lane identity should be exact");
+        assert!(
+            wrong_lane.contains("truncation marker lane"),
+            "{wrong_lane}"
+        );
+
+        let failed = OperationTimeline::new(
+            "preview",
+            TimelineSpanStatus::Completed,
+            Duration::from_micros(100),
+            vec![truncation_marker(TimelineSpanStatus::Failed)],
+        );
+        let failed =
+            validate_truncated_operation_trace(&failed).expect_err("marker must be completed");
+        assert!(
+            failed.contains("must be a completed root child"),
+            "{failed}"
         );
     }
 }
