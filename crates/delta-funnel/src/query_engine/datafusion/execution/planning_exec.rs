@@ -759,9 +759,11 @@ fn native_async_scan_partition_stream(
         Ok(())
     };
     match activity {
-        Some(activity) => builder.spawn(activity.profile_future(
+        Some(activity) => builder.spawn(activity.profile_future_with_async_wait(
             "Delta scan producer",
             "delta_scan_producer_poll",
+            "Delta scan producer wait",
+            "delta_scan_producer_wait",
             producer,
         )),
         None => builder.spawn(producer),

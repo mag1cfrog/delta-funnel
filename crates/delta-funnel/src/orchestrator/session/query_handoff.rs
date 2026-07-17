@@ -2761,6 +2761,55 @@ mod tests {
                         .saturating_add(span.duration_micros())
             );
         }
+        let wait_spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == "datafusion.operator.wait")
+            .collect::<Vec<_>>();
+        assert!(!wait_spans.is_empty());
+        for wait in &wait_spans {
+            assert_eq!(wait.name(), "Delta scan producer wait");
+            assert_eq!(wait.parent_id(), None);
+            assert_eq!(wait.status(), TimelineSpanStatus::Completed);
+            assert!(wait.track_name().contains(" / async waits [node "));
+            assert_eq!(wait.attributes()["wait_kind"], "async_suspension");
+            assert!(activity_spans.iter().any(|span| {
+                span.name() == "Delta scan producer"
+                    && span.attributes()["query_execution_id"]
+                        == wait.attributes()["query_execution_id"]
+                    && span.attributes()["execution_stream_id"]
+                        == wait.attributes()["execution_stream_id"]
+                    && span.attributes()["node_id"] == wait.attributes()["node_id"]
+                    && span.attributes()["operator_partition"]
+                        == wait.attributes()["operator_partition"]
+            }));
+        }
+        for (index, left) in wait_spans.iter().enumerate() {
+            for right in wait_spans.iter().skip(index + 1) {
+                if left.track_name() == right.track_name() {
+                    let left_end = left
+                        .start_offset_micros()
+                        .saturating_add(left.duration_micros());
+                    let right_end = right
+                        .start_offset_micros()
+                        .saturating_add(right.duration_micros());
+                    assert!(
+                        left_end <= right.start_offset_micros()
+                            || right_end <= left.start_offset_micros()
+                    );
+                }
+            }
+        }
+        let trace = preview
+            .to_trace_event_json_value()
+            .ok_or("expected detailed Delta preview trace")?;
+        let wait_event_count = trace["traceEvents"]
+            .as_array()
+            .ok_or("expected trace events")?
+            .iter()
+            .filter(|event| event["cat"] == "datafusion.operator.wait")
+            .count();
+        assert_eq!(wait_event_count, wait_spans.len());
         let provider_events = provider_io_events(capture.captured());
         assert_eq!(provider_events.len(), 1);
         assert_provider_io_event_matches_snapshot(&provider_events[0], snapshot, "success");

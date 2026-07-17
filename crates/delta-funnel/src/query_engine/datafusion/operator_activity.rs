@@ -33,6 +33,7 @@ use crate::{
 };
 
 const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
+const OPERATOR_WAIT_CATEGORY: &str = "datafusion.operator.wait";
 const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,8 +134,42 @@ impl OperatorActivityContext {
     where
         F: Future,
     {
+        self.profile_future_impl(name, activity, None, future).await
+    }
+
+    /// Also records the wall-clock suspension between consecutive polls on a
+    /// logical stream lane that is independent of runtime worker placement.
+    pub(super) async fn profile_future_with_async_wait<F>(
+        self,
+        name: &'static str,
+        activity: &'static str,
+        wait_name: &'static str,
+        wait_activity: &'static str,
+        future: F,
+    ) -> F::Output
+    where
+        F: Future,
+    {
+        self.profile_future_impl(name, activity, Some((wait_name, wait_activity)), future)
+            .await
+    }
+
+    async fn profile_future_impl<F>(
+        self,
+        name: &'static str,
+        activity: &'static str,
+        wait: Option<(&'static str, &'static str)>,
+        future: F,
+    ) -> F::Output
+    where
+        F: Future,
+    {
         let mut future = std::pin::pin!(future);
+        let mut wait_span: Option<OperationTimelineSpanRecorder> = None;
         poll_fn(|context| {
+            if let Some(span) = wait_span.take() {
+                span.completed();
+            }
             let span = self.activity.start_span(
                 name,
                 self.node_id,
@@ -150,6 +185,18 @@ impl OperatorActivityContext {
                     Value::String(if poll.is_ready() { "ready" } else { "pending" }.to_owned()),
                 )
                 .completed();
+            }
+            if poll.is_pending()
+                && let Some((wait_name, wait_activity)) = wait
+            {
+                wait_span = self.activity.start_wait_span(
+                    wait_name,
+                    self.node_id,
+                    self.parent_node_id,
+                    self.partition,
+                    self.stream_id,
+                    wait_activity,
+                );
             }
             poll
         })
@@ -229,14 +276,7 @@ impl OperatorActivityRecorder {
         stream_id: u64,
         activity: &'static str,
     ) -> Option<OperatorActivitySpanRecorder> {
-        if self
-            .remaining_spans
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_err()
-        {
-            self.report_truncation();
+        if !self.reserve_span() {
             return None;
         }
 
@@ -304,6 +344,62 @@ impl OperatorActivityRecorder {
             timeline_span: Some(timeline_span),
             active,
         })
+    }
+
+    fn start_wait_span(
+        &self,
+        name: &'static str,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        partition: usize,
+        stream_id: u64,
+        activity: &'static str,
+    ) -> Option<OperationTimelineSpanRecorder> {
+        if !self.reserve_span() {
+            return None;
+        }
+
+        Some(
+            self.timeline
+                .start_span(
+                    name,
+                    OPERATOR_WAIT_CATEGORY,
+                    format!(
+                        "DataFusion query {} / async waits [node {node_id}, partition {partition}, stream {stream_id}]",
+                        self.query_execution_id
+                    ),
+                )
+                .with_attribute("query_execution_id", Value::from(self.query_execution_id))
+                .with_attribute("execution_stream_id", Value::from(stream_id))
+                .with_attribute("node_id", Value::from(node_id))
+                .with_attribute(
+                    "parent_node_id",
+                    parent_node_id.map_or(Value::Null, Value::from),
+                )
+                .with_attribute(
+                    "operator_partition",
+                    Value::from(usize_to_u64_saturating(partition)),
+                )
+                .with_attribute("activity", Value::String(activity.to_owned()))
+                .with_attribute(
+                    "wait_kind",
+                    Value::String("async_suspension".to_owned()),
+                ),
+        )
+    }
+
+    fn reserve_span(&self) -> bool {
+        if self
+            .remaining_spans
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return true;
+        }
+        self.report_truncation();
+        false
     }
 
     fn next_stream_id(&self) -> u64 {
@@ -713,6 +809,53 @@ mod tests {
             truncation_markers[0].track_name(),
             "DataFusion query 1 / trace status"
         );
+    }
+
+    #[tokio::test]
+    async fn async_suspension_uses_a_logical_stream_lane() {
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(timeline.clone());
+        let stream_id = activity.next_stream_id();
+        let context = OperatorActivityContext {
+            activity,
+            node_id: 4,
+            parent_node_id: Some(2),
+            partition: 3,
+            stream_id,
+        };
+
+        context
+            .profile_future_with_async_wait(
+                "Delta scan producer",
+                "delta_scan_producer_poll",
+                "Delta scan producer wait",
+                "delta_scan_producer_wait",
+                tokio::task::yield_now(),
+            )
+            .await;
+
+        let timeline = timeline.finish("wait", TimelineSpanStatus::Completed);
+        let wait_spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == OPERATOR_WAIT_CATEGORY)
+            .collect::<Vec<_>>();
+        assert_eq!(wait_spans.len(), 1);
+        let wait = wait_spans[0];
+        assert_eq!(wait.name(), "Delta scan producer wait");
+        assert_eq!(
+            wait.track_name(),
+            "DataFusion query 1 / async waits [node 4, partition 3, stream 1]"
+        );
+        assert_eq!(wait.parent_id(), None);
+        assert_eq!(wait.status(), TimelineSpanStatus::Completed);
+        assert_eq!(wait.attributes()["query_execution_id"], 1);
+        assert_eq!(wait.attributes()["execution_stream_id"], 1);
+        assert_eq!(wait.attributes()["node_id"], 4);
+        assert_eq!(wait.attributes()["parent_node_id"], 2);
+        assert_eq!(wait.attributes()["operator_partition"], 3);
+        assert_eq!(wait.attributes()["activity"], "delta_scan_producer_wait");
+        assert_eq!(wait.attributes()["wait_kind"], "async_suspension");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
