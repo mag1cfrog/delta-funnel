@@ -87,6 +87,28 @@ fn validate_typed_timeline(timeline: &OperationTimeline) -> Result<(), String> {
         }
     }
 
+    let mut acyclic = BTreeSet::new();
+    for span in timeline.spans() {
+        let mut path = BTreeSet::new();
+        let mut current_id = Some(span.id());
+        while let Some(id) = current_id {
+            if acyclic.contains(&id) {
+                break;
+            }
+            if !path.insert(id) {
+                return Err(format!(
+                    "typed parent cycle reaches span {id}: {}",
+                    typed_span_summary(span)
+                ));
+            }
+            current_id = spans
+                .get(&id)
+                .ok_or_else(|| format!("typed parent path does not resolve span {id}"))?
+                .parent_id();
+        }
+        acyclic.extend(path);
+    }
+
     Ok(())
 }
 
@@ -512,9 +534,10 @@ fn required_nullable_u64(
     event: &TraceEvent,
 ) -> Result<(), String> {
     match attributes.get(name) {
-        Some(Value::Null | Value::Number(_)) => Ok(()),
+        Some(Value::Null) => Ok(()),
+        Some(value) if value.as_u64().is_some() => Ok(()),
         _ => Err(format!(
-            "attribute {name:?} must be numeric or null: {}",
+            "attribute {name:?} must be an unsigned integer or null: {}",
             event.summary()
         )),
     }
@@ -918,6 +941,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_typed_parent_cycle() {
+        let timeline = OperationTimeline::new(
+            "cycle",
+            TimelineSpanStatus::Completed,
+            Duration::from_micros(10),
+            vec![worker_span(1, Some(1), 1, 2)],
+        );
+
+        let error = validate_operation_trace(&timeline).expect_err("parent cycle should fail");
+        assert!(error.contains("typed parent cycle"), "{error}");
+    }
+
+    #[test]
     fn rejects_unresolved_or_noncontaining_chrome_parents() {
         let missing = trace_error(
             |trace| duration_event_mut(trace, 3)["args"]["parent_id"] = json!(99),
@@ -1023,6 +1059,20 @@ mod tests {
             "generic phases deliberately have no worker attributes"
         );
         validate_operation_trace(&timeline).expect("generic phase should remain valid");
+    }
+
+    #[test]
+    fn rejects_negative_nullable_unsigned_worker_attribute() {
+        let timeline = OperationTimeline::new(
+            "negative attribute",
+            TimelineSpanStatus::Completed,
+            Duration::from_micros(10),
+            vec![worker_span(1, None, 1, 2).with_attribute("parent_node_id", json!(-1))],
+        );
+
+        let error =
+            validate_operation_trace(&timeline).expect_err("negative parent_node_id should fail");
+        assert!(error.contains("parent_node_id"), "{error}");
     }
 
     #[test]
