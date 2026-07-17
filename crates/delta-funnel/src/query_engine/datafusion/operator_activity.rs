@@ -60,6 +60,24 @@ struct ActivityWorkerLane {
     kind: ActivityWorkerKind,
 }
 
+impl ActivityWorkerLane {
+    fn track_name(self, query_execution_id: u64) -> String {
+        match self.kind {
+            ActivityWorkerKind::Coordinator => {
+                format!("DataFusion query [{query_execution_id}] / coordinator")
+            }
+            ActivityWorkerKind::Runtime => format!(
+                "DataFusion query [{query_execution_id}] / worker [{}]",
+                self.id
+            ),
+            ActivityWorkerKind::External => format!(
+                "DataFusion query [{query_execution_id}] / external worker [{}]",
+                self.id
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct OperatorActivityIdentityState {
     next_stream_id: u64,
@@ -164,19 +182,7 @@ impl OperatorActivityRecorder {
                     .then_some(parent.span_id)
             })
         });
-        let track_name = match context.worker_lane.kind {
-            ActivityWorkerKind::Coordinator => {
-                format!("DataFusion query {} / coordinator", self.query_execution_id)
-            }
-            ActivityWorkerKind::Runtime => format!(
-                "DataFusion query {} / worker {}",
-                self.query_execution_id, context.worker_lane.id
-            ),
-            ActivityWorkerKind::External => format!(
-                "DataFusion query {} / external worker {}",
-                self.query_execution_id, context.worker_lane.id
-            ),
-        };
+        let track_name = context.worker_lane.track_name(self.query_execution_id);
         let timeline_span = self
             .with_query_identity(self.timeline.start_span(
                 operator_name,
@@ -290,7 +296,7 @@ impl OperatorActivityRecorder {
                 "Operator activity trace truncated",
                 OPERATOR_ACTIVITY_CATEGORY,
                 format!(
-                    "DataFusion query {} / trace status",
+                    "DataFusion query [{}] / trace status",
                     self.query_execution_id
                 ),
             ))
@@ -622,8 +628,31 @@ mod tests {
         assert_eq!(truncation_markers.len(), 1);
         assert_eq!(
             truncation_markers[0].track_name(),
-            "DataFusion query 1 / trace status"
+            "DataFusion query [1] / trace status"
         );
+    }
+
+    #[test]
+    fn track_names_delimit_query_and_worker_ids() {
+        let worker_1 = ActivityWorkerLane {
+            id: 1,
+            kind: ActivityWorkerKind::Runtime,
+        }
+        .track_name(1);
+        let worker_10 = ActivityWorkerLane {
+            id: 10,
+            kind: ActivityWorkerKind::Runtime,
+        }
+        .track_name(1);
+        let query_10 = ActivityWorkerLane {
+            id: 1,
+            kind: ActivityWorkerKind::Runtime,
+        }
+        .track_name(10);
+
+        assert_eq!(worker_1, "DataFusion query [1] / worker [1]");
+        assert!(!worker_10.contains("worker [1]"));
+        assert!(!query_10.contains("query [1]"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -722,13 +751,13 @@ mod tests {
                 span.attributes()["worker_kind"].as_str(),
             ) {
                 (Some(query), Some(_), Some("coordinator")) => {
-                    Some(format!("DataFusion query {query} / coordinator"))
+                    Some(format!("DataFusion query [{query}] / coordinator"))
                 }
                 (Some(query), Some(worker), Some("runtime")) => {
-                    Some(format!("DataFusion query {query} / worker {worker}"))
+                    Some(format!("DataFusion query [{query}] / worker [{worker}]"))
                 }
                 (Some(query), Some(worker), Some("external")) => Some(format!(
-                    "DataFusion query {query} / external worker {worker}"
+                    "DataFusion query [{query}] / external worker [{worker}]"
                 )),
                 _ => None,
             };

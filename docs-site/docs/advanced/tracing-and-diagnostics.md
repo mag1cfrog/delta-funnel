@@ -276,7 +276,8 @@ share tracks by query execution and executor worker, so each worker shows one
 sequential or properly nested top-down call stack. A synchronous host thread
 that polls the merged result uses a separate coordinator track. In VizViewer,
 use the funnel's `Filter by Thread` selector to choose one exact track such as
-`DataFusion query 1 / worker 2`; the name field uses substring matching.
+`DataFusion query [1] / worker [2]`. The bracketed IDs also make the substring-
+matching name field unambiguous: `worker [1]` does not match `worker [10]`.
 The `activity` and `result` arguments distinguish stream creation, batches,
 pending polls, end-of-stream, and errors. `query_execution_id`,
 `worker_lane_id`, `worker_kind`, and `execution_stream_id` identify the

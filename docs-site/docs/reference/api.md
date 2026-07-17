@@ -72,7 +72,9 @@ DataFusion operator lifecycles on that same clock. Detailed previews also
 include wall-clock `execute` and `poll_next` activity grouped by query execution
 and executor worker. Each worker lane remains sequential or properly nested
 while Tokio task IDs remain event metadata. VizViewer's `Filter by Thread`
-selector can choose one exact displayed worker lane.
+selector can choose one exact displayed worker lane. Bracketed query and worker
+IDs, such as `DataFusion query [1] / worker [2]`, also make substring name
+filtering unambiguous.
 `path` accepts a string or `os.PathLike[str]`. The method creates or replaces
 the file, but does not create missing parent directories. It raises
 `DeltaFunnelError` with
