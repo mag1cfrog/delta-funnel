@@ -549,11 +549,14 @@ pub(super) fn batch_stream_for_physical_plan(
         ),
     } {
         Ok(execution) => execution,
-        Err(error) => {
+        Err(failure) => {
             let (profile_consumer, profile_result) = match profile_scope {
                 Some(scope) => {
-                    let (consumer, result) =
-                        QueryExecutionProfileConsumer::register(physical_plan, scope, None);
+                    let (consumer, result) = QueryExecutionProfileConsumer::register(
+                        failure.effective_profile_root,
+                        scope,
+                        None,
+                    );
                     (Some(consumer), Some(result))
                 }
                 None => (None, None),
@@ -565,7 +568,10 @@ pub(super) fn batch_stream_for_physical_plan(
                 DeltaProviderScanOutcome::Error,
             );
             return Err(QueryStreamSetupFailure {
-                source: Box::new(datafusion_handoff_setup_error("query_output_stream", error)),
+                source: Box::new(datafusion_handoff_setup_error(
+                    "query_output_stream",
+                    failure.source,
+                )),
                 execution_profile: clone_terminal_execution_profile(profile_result),
             });
         }
@@ -886,9 +892,9 @@ impl DeltaFunnelSession {
             }
         } {
             Ok(execution) => execution,
-            Err(error) => {
+            Err(failure) => {
                 let (profile_consumer, profile_result) =
-                    register_preview_execution_profile(physical_plan, options);
+                    register_preview_execution_profile(failure.effective_profile_root, options);
                 finalize_tracked_query_execution(
                     &read_stats_handles,
                     None,
@@ -896,7 +902,7 @@ impl DeltaFunnelSession {
                     DeltaProviderScanOutcome::Error,
                 );
                 let execution_profile = clone_terminal_execution_profile(profile_result);
-                let source = datafusion_handoff_setup_error("preview_collect", error);
+                let source = datafusion_handoff_setup_error("preview_collect", failure.source);
                 return Err(timings.failed(stream_setup_timer, execution_profile, source));
             }
         };
@@ -1888,6 +1894,41 @@ mod tests {
             profile_events[0].fields.get("outcome").map(String::as_str),
             Some("error")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn profiled_setup_failure_retains_the_instrumented_effective_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("profiled-stream-setup-error-root")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let source = session.delta_lake(DeltaSourceConfig::new(
+            "orders",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let dataframe = session.dataframe_for_lazy_table(&source).await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let failing_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamSetupFailingPlan::new(physical_plan));
+        let timeline = crate::report::OperationTimelineRecorder::start();
+
+        let failure = match super::profiled_datafusion_query_output_stream_with_effective_root(
+            Arc::clone(&failing_plan),
+            session.context.task_ctx(),
+            timeline.clone(),
+        ) {
+            Ok(_) => return Err("expected profiled stream setup error".into()),
+            Err(failure) => failure,
+        };
+
+        assert!(!Arc::ptr_eq(&failure.effective_profile_root, &failing_plan));
+        assert_eq!(failure.effective_profile_root.name(), failing_plan.name());
+        let timeline = timeline.finish("profiled setup", TimelineSpanStatus::Failed);
+        assert!(timeline.spans().iter().any(|span| {
+            span.category() == "datafusion.operator.activity"
+                && span.name() == failing_plan.name()
+                && span.status() == TimelineSpanStatus::Failed
+        }));
         Ok(())
     }
 

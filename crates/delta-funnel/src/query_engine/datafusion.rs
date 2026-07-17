@@ -1,6 +1,6 @@
 //! DataFusion integration.
 
-use std::sync::Arc;
+use std::{error::Error, fmt, sync::Arc};
 
 use datafusion::common::DataFusionError;
 use datafusion::execution::TaskContext;
@@ -108,7 +108,8 @@ pub fn datafusion_query_output_stream(
     let DFQueryExecution {
         stream,
         effective_profile_root,
-    } = datafusion_query_output_stream_with_effective_root(plan, task_context)?;
+    } = datafusion_query_output_stream_with_effective_root(plan, task_context)
+        .map_err(|failure| failure.source)?;
     drop(effective_profile_root);
     Ok(stream)
 }
@@ -118,10 +119,28 @@ pub(crate) struct DFQueryExecution {
     pub(crate) effective_profile_root: Arc<dyn ExecutionPlan>,
 }
 
+#[derive(Debug)]
+pub(crate) struct DFQueryExecutionSetupError {
+    pub(crate) source: DataFusionError,
+    pub(crate) effective_profile_root: Arc<dyn ExecutionPlan>,
+}
+
+impl fmt::Display for DFQueryExecutionSetupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for DFQueryExecutionSetupError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 pub(crate) fn datafusion_query_output_stream_with_effective_root(
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
-) -> Result<DFQueryExecution, DataFusionError> {
+) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
     datafusion_query_output_stream_with_effective_root_impl(plan, task_context, None)
 }
 
@@ -129,7 +148,7 @@ pub(crate) fn profiled_datafusion_query_output_stream_with_effective_root(
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
     timeline: OperationTimelineRecorder,
-) -> Result<DFQueryExecution, DataFusionError> {
+) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
     datafusion_query_output_stream_with_effective_root_impl(plan, task_context, Some(timeline))
 }
 
@@ -137,7 +156,7 @@ fn datafusion_query_output_stream_with_effective_root_impl(
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
     timeline: Option<OperationTimelineRecorder>,
-) -> Result<DFQueryExecution, DataFusionError> {
+) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
     // Keep these branches in sync with DataFusion 53.1's `execute_stream`.
     let (effective_profile_root, execute) =
         match plan.properties().output_partitioning().partition_count() {
@@ -156,11 +175,23 @@ fn datafusion_query_output_stream_with_effective_root_impl(
             }
         };
     let effective_profile_root = match timeline {
-        Some(timeline) => instrument_query_execution_plan(effective_profile_root, timeline)?,
+        Some(timeline) => {
+            instrument_query_execution_plan(Arc::clone(&effective_profile_root), timeline).map_err(
+                |source| DFQueryExecutionSetupError {
+                    source,
+                    effective_profile_root,
+                },
+            )?
+        }
         None => effective_profile_root,
     };
     let stream = if execute {
-        effective_profile_root.execute(0, task_context)?
+        effective_profile_root
+            .execute(0, task_context)
+            .map_err(|source| DFQueryExecutionSetupError {
+                source,
+                effective_profile_root: Arc::clone(&effective_profile_root),
+            })?
     } else {
         Box::pin(EmptyRecordBatchStream::new(effective_profile_root.schema()))
     };
@@ -730,9 +761,10 @@ mod tests {
         Ok(batches)
     }
 
-    fn setup_error_message<T>(
-        result: Result<T, DataFusionError>,
-    ) -> Result<String, Box<dyn Error>> {
+    fn setup_error_message<T, E>(result: Result<T, E>) -> Result<String, Box<dyn Error>>
+    where
+        E: Error,
+    {
         match result {
             Ok(_) => Err("expected stream setup error".into()),
             Err(error) => Ok(error.to_string()),
