@@ -221,11 +221,9 @@ Funnel, DataFusion, Delta Kernel, Arrow, Parquet, and Tokio code. The Python to
 Rust transition and Rust worker stacks unwound without enabling frame pointers.
 One libc entry remained generic, but the native call chains were intact.
 
-A directional three-run check used one Python aggregate preview over a local
-100,000-file Delta table. The median process wall time was 2.31 seconds without
-Samply and 2.82 seconds with Samply at its default 1000 Hz rate, about 22%
-overhead for this short workload. The inspected profile lost 50 of 25,053
-events, about 0.2%. These numbers validate the development workflow; they are
-not a performance threshold. Use the repeatable
-[Delta scan benchmark](scan-benchmarks.md) when comparing implementation
-changes.
+The short Python validation confirms the mixed-language call stacks, but its
+process startup cost is not a representative overhead measurement. The
+repeatable 13,394,789-row
+[Delta scan benchmark](scan-benchmarks.md#compare-samply-with-detailed-profiling)
+compares Samply with both disabled controls and detailed operation profiling
+on the same optimized binary.
