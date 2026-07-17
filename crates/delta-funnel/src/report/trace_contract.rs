@@ -8,6 +8,7 @@ use super::{OperationTimeline, TimelineSpan, TimelineSpanStatus, TimelineSpanTim
 
 const OPERATION_CATEGORY: &str = "delta_funnel.operation";
 const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
+const OPERATOR_LIFECYCLE_CATEGORY: &str = "datafusion.operator.lifecycle";
 const PLANNING_ACTIVITY_CATEGORY: &str = "datafusion.planning.activity";
 const TRUNCATION_MARKER: &str = "Operator activity trace truncated";
 
@@ -405,14 +406,12 @@ fn validate_attributes(event: &TraceEvent, lane_name: &str) -> Result<(), String
             )
         })?;
 
-    const WORKER_ONLY: [&str; 10] = [
+    const WORKER_ONLY: [&str; 8] = [
         "worker_lane_id",
         "worker_kind",
         "task_kind",
         "runtime_task_id",
         "execution_stream_id",
-        "node_id",
-        "parent_node_id",
         "operator_partition",
         "worker_thread_id",
         "worker_thread_name",
@@ -466,6 +465,12 @@ fn validate_attributes(event: &TraceEvent, lane_name: &str) -> Result<(), String
                 event.summary()
             ));
         }
+    } else if event.category == OPERATOR_LIFECYCLE_CATEGORY {
+        required_u64(attributes, "node_id", event)?;
+        required_nullable_u64(attributes, "parent_node_id", event)?;
+        required_u64(attributes, "partition", event)?;
+        required_u64(attributes, "output_partition_count", event)?;
+        required_array(attributes, "metrics", event)?;
     } else if event.category == PLANNING_ACTIVITY_CATEGORY {
         required_u64(attributes, "query_execution_id", event)?;
         required_str(attributes, "query_scope", event)?;
@@ -527,6 +532,18 @@ fn required_nullable_str(
             event.summary()
         )),
     }
+}
+
+fn required_array(
+    attributes: &serde_json::Map<String, Value>,
+    name: &str,
+    event: &TraceEvent,
+) -> Result<(), String> {
+    attributes
+        .get(name)
+        .and_then(Value::as_array)
+        .map(|_| ())
+        .ok_or_else(|| format!("attribute {name:?} must be an array: {}", event.summary()))
 }
 
 fn validate_worker_nesting(events: &[TraceEvent]) -> Result<(), String> {
@@ -1019,6 +1036,41 @@ mod tests {
             false,
         );
         assert!(error.contains("only applies"), "{error}");
+    }
+
+    #[test]
+    fn rejects_missing_operator_lifecycle_attributes() {
+        let span = TimelineSpan::new(
+            1,
+            None,
+            "FilterExec",
+            OPERATOR_LIFECYCLE_CATEGORY,
+            Duration::from_micros(1),
+            Duration::from_micros(5),
+            TimelineSpanStatus::Completed,
+            TimelineSpanTimeSemantics::Lifecycle,
+        )
+        .with_attribute("node_id", json!(1))
+        .with_attribute("parent_node_id", Value::Null)
+        .with_attribute("partition", json!(0))
+        .with_attribute("output_partition_count", json!(1))
+        .with_attribute("metrics", json!([]));
+        let timeline = OperationTimeline::new(
+            "lifecycle",
+            TimelineSpanStatus::Completed,
+            Duration::from_micros(10),
+            vec![span],
+        );
+        validate_operation_trace(&timeline).expect("complete lifecycle attributes should pass");
+
+        let mut trace = timeline.to_trace_event_json_value();
+        duration_event_mut(&mut trace, 1)["args"]["attributes"]
+            .as_object_mut()
+            .expect("attributes")
+            .remove("metrics");
+        let error = validate_trace_document(&timeline, &trace, false)
+            .expect_err("missing lifecycle metrics should fail");
+        assert!(error.contains("metrics"), "{error}");
     }
 
     #[test]

@@ -1803,6 +1803,7 @@ mod tests {
         assert_eq!(profile.delta_funnel_row_limit(), None);
         assert!(!profile.operators().is_empty());
         let timeline = report.operation_timeline().ok_or("expected timeline")?;
+        crate::report::trace_contract::validate_operation_trace(timeline)?;
         assert_eq!(timeline.status(), crate::TimelineSpanStatus::Completed);
         assert!(timeline.total_duration_micros() > 0);
         assert!(timeline.spans().iter().any(|span| {
@@ -1963,6 +1964,7 @@ mod tests {
             let timeline = context
                 .operation_timeline()
                 .ok_or("expected failure timeline")?;
+            crate::report::trace_contract::validate_operation_trace(timeline)?;
             assert_eq!(timeline.status(), crate::TimelineSpanStatus::Failed);
             let value = context.to_json_value();
             assert!(value.get("execution_profile").is_none());

@@ -576,6 +576,8 @@ mod tests {
         parent.completed();
 
         let timeline = recorder.finish("nested", TimelineSpanStatus::Completed);
+        crate::report::trace_contract::validate_operation_trace(&timeline)
+            .expect("nested recorder timeline should satisfy the trace contract");
         let parent = timeline
             .spans()
             .iter()
@@ -643,6 +645,8 @@ mod tests {
         });
 
         let timeline = recorder.finish("concurrent", TimelineSpanStatus::Completed);
+        crate::report::trace_contract::validate_operation_trace(&timeline)
+            .expect("concurrent recorder timeline should satisfy the trace contract");
         let ids = timeline
             .spans()
             .iter()
@@ -686,6 +690,46 @@ mod tests {
             repeated, timeline,
             "late completion must not mutate the snapshot"
         );
+    }
+
+    #[test]
+    fn concurrent_finish_snapshots_active_span_once() {
+        let recorder = Arc::new(OperationTimelineRecorder::start());
+        let (started, wait_for_start) = std::sync::mpsc::sync_channel(0);
+        let (allow_completion, wait_for_completion) = std::sync::mpsc::sync_channel(0);
+        let worker_recorder = Arc::clone(&recorder);
+        let worker = std::thread::spawn(move || {
+            let span = worker_recorder.start_span("worker", "test", "worker track");
+            let id = span.id().expect("worker span should have an ID");
+            started.send(id).expect("start signal should be received");
+            wait_for_completion
+                .recv()
+                .expect("completion signal should be sent");
+            span.completed();
+        });
+        let span_id = wait_for_start.recv().expect("worker should start its span");
+
+        let timeline = recorder.finish("operation", TimelineSpanStatus::Completed);
+        allow_completion
+            .send(())
+            .expect("worker should receive completion signal");
+        worker.join().expect("worker should not panic");
+
+        assert_eq!(
+            timeline
+                .spans()
+                .iter()
+                .filter(|span| span.id() == span_id)
+                .map(TimelineSpan::status)
+                .collect::<Vec<_>>(),
+            [TimelineSpanStatus::Cancelled]
+        );
+        assert_eq!(
+            recorder.finish("operation", TimelineSpanStatus::Completed),
+            timeline
+        );
+        crate::report::trace_contract::validate_operation_trace(&timeline)
+            .expect("concurrent snapshot should satisfy the trace contract");
     }
 
     #[test]
