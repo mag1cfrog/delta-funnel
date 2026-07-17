@@ -28,9 +28,12 @@ use futures_util::{Stream, future::poll_fn};
 use serde_json::Value;
 
 use crate::{
+    QueryExecutionScope,
     report::{OperationTimelineRecorder, OperationTimelineSpanRecorder},
     usize_to_u64_saturating,
 };
+
+use super::QueryTraceIdentity;
 
 const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
 const OPERATOR_WAIT_CATEGORY: &str = "datafusion.operator.wait";
@@ -107,6 +110,8 @@ thread_local! {
 struct OperatorActivityRecorder {
     timeline: OperationTimelineRecorder,
     query_execution_id: u64,
+    query_scope: QueryExecutionScope,
+    query_owner: Option<Arc<str>>,
     identities: Arc<Mutex<OperatorActivityIdentityState>>,
     maximum_spans: u64,
     remaining_spans: Arc<AtomicU64>,
@@ -138,13 +143,7 @@ impl OperatorActivityContext {
         activity: &'static str,
         operation: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
-        self.profile_sync_classified(name, activity, operation, |result| {
-            if result.is_ok() {
-                ("ok", false)
-            } else {
-                ("error", true)
-            }
-        })
+        self.profile_sync_classified(name, activity, operation, classify_result)
     }
 
     fn profile_sync_classified<T>(
@@ -177,44 +176,44 @@ impl OperatorActivityContext {
 
     /// Records each poll as a closed worker span so no span crosses an await or
     /// follows a future when the runtime moves its next poll to another worker.
-    pub(super) async fn profile_future<F>(
+    pub(super) async fn profile_future_result<F, T, E>(
         self,
         name: &'static str,
         activity: &'static str,
         future: F,
-    ) -> F::Output
+    ) -> Result<T, E>
     where
-        F: Future,
+        F: Future<Output = Result<T, E>>,
     {
         self.profile_future_impl(name, activity, None, future).await
     }
 
     /// Also records the wall-clock suspension between consecutive polls on a
     /// logical stream lane that is independent of runtime worker placement.
-    pub(super) async fn profile_future_with_async_wait<F>(
+    pub(super) async fn profile_future_result_with_async_wait<F, T, E>(
         self,
         name: &'static str,
         activity: &'static str,
         wait_name: &'static str,
         wait_activity: &'static str,
         future: F,
-    ) -> F::Output
+    ) -> Result<T, E>
     where
-        F: Future,
+        F: Future<Output = Result<T, E>>,
     {
         self.profile_future_impl(name, activity, Some((wait_name, wait_activity)), future)
             .await
     }
 
-    async fn profile_future_impl<F>(
+    async fn profile_future_impl<F, T, E>(
         self,
         name: &'static str,
         activity: &'static str,
         wait: Option<(&'static str, &'static str)>,
         future: F,
-    ) -> F::Output
+    ) -> Result<T, E>
     where
-        F: Future,
+        F: Future<Output = Result<T, E>>,
     {
         let mut future = std::pin::pin!(future);
         let mut wait_span: Option<OperationTimelineSpanRecorder> = None;
@@ -232,11 +231,16 @@ impl OperatorActivityContext {
             );
             let poll = future.as_mut().poll(context);
             if let Some(span) = span {
-                span.with_attribute(
-                    "result",
-                    Value::String(if poll.is_ready() { "ready" } else { "pending" }.to_owned()),
-                )
-                .completed();
+                let (result, failed) = match &poll {
+                    Poll::Pending => ("pending", false),
+                    Poll::Ready(output) => classify_result(output),
+                };
+                let span = span.with_attribute("result", Value::String(result.to_owned()));
+                if failed {
+                    span.failed();
+                } else {
+                    span.completed();
+                }
             }
             if poll.is_pending()
                 && let Some((wait_name, wait_activity)) = wait
@@ -253,6 +257,14 @@ impl OperatorActivityContext {
             poll
         })
         .await
+    }
+}
+
+fn classify_result<T, E>(result: &Result<T, E>) -> (&'static str, bool) {
+    if result.is_ok() {
+        ("ok", false)
+    } else {
+        ("error", true)
     }
 }
 
@@ -280,20 +292,20 @@ pub(super) fn profile_operator_activity_sync_result<T, E>(
     }
 }
 
-pub(super) async fn profile_operator_activity_future<F>(
+pub(super) async fn profile_operator_activity_future<F, T, E>(
     activity: Option<&OperatorActivityContext>,
     name: &'static str,
     activity_name: &'static str,
     future: F,
-) -> F::Output
+) -> Result<T, E>
 where
-    F: Future,
+    F: Future<Output = Result<T, E>>,
 {
     match activity {
         Some(activity) => {
             activity
                 .clone()
-                .profile_future(name, activity_name, future)
+                .profile_future_result(name, activity_name, future)
                 .await
         }
         None => future.await,
@@ -327,15 +339,22 @@ pub(super) fn current_operator_activity_context() -> Option<OperatorActivityCont
 }
 
 impl OperatorActivityRecorder {
-    fn new(timeline: OperationTimelineRecorder) -> Self {
-        Self::with_max_spans(timeline, MAX_OPERATOR_ACTIVITY_SPANS)
+    fn new(identity: QueryTraceIdentity) -> Self {
+        Self::with_max_spans(identity, MAX_OPERATOR_ACTIVITY_SPANS)
     }
 
-    fn with_max_spans(timeline: OperationTimelineRecorder, maximum_spans: u64) -> Self {
-        let query_execution_id = timeline.next_query_execution_id();
+    fn with_max_spans(identity: QueryTraceIdentity, maximum_spans: u64) -> Self {
+        let QueryTraceIdentity {
+            timeline,
+            query_execution_id,
+            query_scope,
+            query_owner,
+        } = identity;
         Self {
             timeline,
             query_execution_id,
+            query_scope,
+            query_owner,
             identities: Arc::new(Mutex::new(OperatorActivityIdentityState::default())),
             maximum_spans,
             remaining_spans: Arc::new(AtomicU64::new(maximum_spans)),
@@ -378,10 +397,12 @@ impl OperatorActivityRecorder {
             ),
         };
         let timeline_span = self
-            .timeline
-            .start_span(operator_name, OPERATOR_ACTIVITY_CATEGORY, track_name)
+            .with_query_identity(self.timeline.start_span(
+                operator_name,
+                OPERATOR_ACTIVITY_CATEGORY,
+                track_name,
+            ))
             .with_parent_id(parent_id)
-            .with_attribute("query_execution_id", Value::from(self.query_execution_id))
             .with_attribute("worker_lane_id", Value::from(context.worker_lane.id))
             .with_attribute(
                 "worker_kind",
@@ -436,16 +457,14 @@ impl OperatorActivityRecorder {
         }
 
         Some(
-            self.timeline
-                .start_span(
+            self.with_query_identity(self.timeline.start_span(
                     name,
                     OPERATOR_WAIT_CATEGORY,
                     format!(
                         "DataFusion query {} / async waits [node {node_id}, partition {partition}, stream {stream_id}]",
                         self.query_execution_id
                     ),
-                )
-                .with_attribute("query_execution_id", Value::from(self.query_execution_id))
+                ))
                 .with_attribute("execution_stream_id", Value::from(stream_id))
                 .with_attribute("node_id", Value::from(node_id))
                 .with_attribute(
@@ -563,19 +582,33 @@ impl OperatorActivityRecorder {
 
     fn report_truncation(&self) {
         if !self.truncation_reported.swap(true, Ordering::Relaxed) {
-            self.timeline
-                .start_span(
-                    "Operator activity trace truncated",
-                    OPERATOR_ACTIVITY_CATEGORY,
-                    format!(
-                        "DataFusion query {} / trace status",
-                        self.query_execution_id
-                    ),
-                )
-                .with_attribute("query_execution_id", Value::from(self.query_execution_id))
-                .with_attribute("maximum_spans", Value::from(self.maximum_spans))
-                .completed();
+            self.with_query_identity(self.timeline.start_span(
+                "Operator activity trace truncated",
+                OPERATOR_ACTIVITY_CATEGORY,
+                format!(
+                    "DataFusion query {} / trace status",
+                    self.query_execution_id
+                ),
+            ))
+            .with_attribute("maximum_spans", Value::from(self.maximum_spans))
+            .completed();
         }
+    }
+
+    fn with_query_identity(
+        &self,
+        mut span: OperationTimelineSpanRecorder,
+    ) -> OperationTimelineSpanRecorder {
+        span = span
+            .with_attribute("query_execution_id", Value::from(self.query_execution_id))
+            .with_attribute(
+                "query_scope",
+                Value::String(self.query_scope.as_str().to_owned()),
+            );
+        if let Some(query_owner) = &self.query_owner {
+            span = span.with_attribute("query_owner", Value::String(query_owner.to_string()));
+        }
+        span
     }
 }
 
@@ -617,9 +650,9 @@ impl Drop for OperatorActivitySpanRecorder {
 /// Adds transparent execute and poll instrumentation to one finalized plan.
 pub(crate) fn instrument_query_execution_plan(
     root: Arc<dyn ExecutionPlan>,
-    timeline: OperationTimelineRecorder,
+    identity: QueryTraceIdentity,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-    let activity = OperatorActivityRecorder::new(timeline);
+    let activity = OperatorActivityRecorder::new(identity);
     let mut next_node_id = 0;
     let mut instrumented = HashMap::new();
     instrument_query_execution_node(root, None, &mut next_node_id, &mut instrumented, &activity)
@@ -832,13 +865,18 @@ mod tests {
 
     use super::*;
 
+    fn test_trace_identity(timeline: OperationTimelineRecorder) -> QueryTraceIdentity {
+        QueryTraceIdentity::new(timeline, QueryExecutionScope::Preview, None)
+    }
+
     #[test]
     fn query_execution_ids_are_local_to_each_operation_timeline() {
         let first_timeline = OperationTimelineRecorder::start();
-        let first_query = OperatorActivityRecorder::new(first_timeline.clone());
-        let second_query = OperatorActivityRecorder::new(first_timeline);
+        let first_query =
+            OperatorActivityRecorder::new(test_trace_identity(first_timeline.clone()));
+        let second_query = OperatorActivityRecorder::new(test_trace_identity(first_timeline));
         let separate_timeline = OperationTimelineRecorder::start();
-        let separate_query = OperatorActivityRecorder::new(separate_timeline);
+        let separate_query = OperatorActivityRecorder::new(test_trace_identity(separate_timeline));
 
         assert_eq!(first_query.query_execution_id, 1);
         assert_eq!(second_query.query_execution_id, 2);
@@ -848,7 +886,8 @@ mod tests {
     #[test]
     fn activity_limit_records_one_visible_truncation_marker() {
         let timeline = OperationTimelineRecorder::start();
-        let activity = OperatorActivityRecorder::with_max_spans(timeline.clone(), 1);
+        let activity =
+            OperatorActivityRecorder::with_max_spans(test_trace_identity(timeline.clone()), 1);
 
         activity
             .start_span("FilterExec", 0, None, 0, 1, "poll_next")
@@ -890,7 +929,7 @@ mod tests {
     #[tokio::test]
     async fn async_suspension_uses_a_logical_stream_lane() {
         let timeline = OperationTimelineRecorder::start();
-        let activity = OperatorActivityRecorder::new(timeline.clone());
+        let activity = OperatorActivityRecorder::new(test_trace_identity(timeline.clone()));
         let stream_id = activity.next_stream_id();
         let context = OperatorActivityContext {
             activity,
@@ -901,14 +940,18 @@ mod tests {
         };
 
         context
-            .profile_future_with_async_wait(
+            .profile_future_result_with_async_wait(
                 "Delta scan producer",
                 "delta_scan_producer_poll",
                 "Delta scan producer wait",
                 "delta_scan_producer_wait",
-                tokio::task::yield_now(),
+                async {
+                    tokio::task::yield_now().await;
+                    Ok::<_, ()>(())
+                },
             )
-            .await;
+            .await
+            .expect("test future should complete");
 
         let timeline = timeline.finish("wait", TimelineSpanStatus::Completed);
         let wait_spans = timeline
@@ -934,12 +977,55 @@ mod tests {
         assert_eq!(wait.attributes()["wait_kind"], "async_suspension");
     }
 
+    #[tokio::test]
+    async fn result_futures_mark_terminal_errors_as_failed() {
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity(timeline.clone()));
+        let context = OperatorActivityContext {
+            activity,
+            node_id: 4,
+            parent_node_id: Some(2),
+            partition: 3,
+            stream_id: 1,
+        };
+
+        let child_result = profile_operator_activity_future(
+            Some(&context),
+            "Delta scan batch read",
+            "delta_scan_batch_read_poll",
+            async { Err::<(), _>("batch error") },
+        )
+        .await;
+        let producer_result = context
+            .profile_future_result_with_async_wait(
+                "Delta scan producer",
+                "delta_scan_producer_poll",
+                "Delta scan producer wait",
+                "delta_scan_producer_wait",
+                async { Err::<(), _>("producer error") },
+            )
+            .await;
+
+        assert_eq!(child_result, Err("batch error"));
+        assert_eq!(producer_result, Err("producer error"));
+        let timeline = timeline.finish("errors", TimelineSpanStatus::Failed);
+        for name in ["Delta scan batch read", "Delta scan producer"] {
+            let span = timeline
+                .spans()
+                .iter()
+                .find(|span| span.name() == name)
+                .expect("failed future should record its activity");
+            assert_eq!(span.status(), TimelineSpanStatus::Failed);
+            assert_eq!(span.attributes()["result"], "error");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_tracks_are_bounded_by_executor_threads_not_task_count()
     -> Result<(), Box<dyn Error>> {
         const TASK_COUNT: usize = 32;
         let timeline = OperationTimelineRecorder::start();
-        let activity = OperatorActivityRecorder::new(timeline.clone());
+        let activity = OperatorActivityRecorder::new(test_trace_identity(timeline.clone()));
         let barrier = Arc::new(tokio::sync::Barrier::new(TASK_COUNT));
         let mut tasks = Vec::with_capacity(TASK_COUNT);
 
@@ -1002,7 +1088,7 @@ mod tests {
         let task_context = Arc::new(dataframe.task_ctx());
         let plan = dataframe.create_physical_plan().await?;
         let timeline = OperationTimelineRecorder::start();
-        let plan = instrument_query_execution_plan(plan, timeline.clone())?;
+        let plan = instrument_query_execution_plan(plan, test_trace_identity(timeline.clone()))?;
 
         let batches = collect(Arc::clone(&plan), task_context).await?;
 

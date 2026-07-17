@@ -10,7 +10,7 @@ use crate::{
     QueryExecutionProfile, QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget,
     TimelineSpanStatus, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
-    query_engine::datafusion::with_query_planning_activity,
+    query_engine::datafusion::{QueryTraceIdentity, with_query_planning_activity},
     report::{OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer},
     sql_server::write_planned_output_batches_to_mssql_for_workflow,
 };
@@ -539,6 +539,14 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_time
     profile_mode: ExecutionProfileMode,
     timeline: Option<&OperationTimelineRecorder>,
 ) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
+    let trace_identity = match (profile_mode, timeline) {
+        (ExecutionProfileMode::Detailed, Some(timeline)) => Some(QueryTraceIdentity::new(
+            timeline.clone(),
+            QueryExecutionScope::MssqlOutput,
+            Some(planned.resolved_target().output_name()),
+        )),
+        _ => None,
+    };
     let physical_plan_timer = PhaseTimer::start(QUERY_PHYSICAL_PLANNING_PHASE);
     let physical_plan_span = start_write_span(
         timeline,
@@ -552,17 +560,12 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_time
             planned.resolved_target().output_name().to_owned().into(),
         )
     });
-    let physical_plan_result = match (profile_mode, timeline) {
-        (ExecutionProfileMode::Detailed, Some(timeline)) => {
-            with_query_planning_activity(
-                timeline.clone(),
-                QueryExecutionScope::MssqlOutput,
-                Some(planned.resolved_target().output_name()),
-                dataframe.create_physical_plan(),
-            )
-            .await
+    let physical_plan_result = match &trace_identity {
+        Some(trace_identity) => {
+            with_query_planning_activity(trace_identity.clone(), dataframe.create_physical_plan())
+                .await
         }
-        _ => dataframe.create_physical_plan().await,
+        None => dataframe.create_physical_plan().await,
     };
     let physical_plan = match physical_plan_result {
         Ok(physical_plan) => physical_plan,
@@ -607,7 +610,7 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_time
         provider_stats_snapshots,
         progress.map(|reporter| (reporter, planned.resolved_target().output_name().to_owned())),
         profile_scope,
-        timeline,
+        trace_identity,
     ) {
         Ok(execution) => execution,
         Err(failure) => {

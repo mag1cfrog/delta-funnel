@@ -1826,12 +1826,26 @@ mod tests {
                 .iter()
                 .filter(|span| span.category() == "datafusion.planning.activity")
                 .collect::<Vec<_>>();
+            let activity_spans = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == "datafusion.operator.activity")
+                .collect::<Vec<_>>();
             for output_name in ["first_output", "second_output"] {
                 let expected_track =
                     format!("DataFusion query planning / SQL output: {output_name}");
-                assert!(planning_spans.iter().any(|span| {
-                    span.name() == "Delta scan planning"
-                        && span.track_name() == expected_track
+                let planning = planning_spans
+                    .iter()
+                    .find(|span| {
+                        span.name() == "Delta scan planning"
+                            && span.track_name() == expected_track
+                            && span.attributes()["query_scope"] == "mssql_output"
+                            && span.attributes()["query_owner"] == output_name
+                    })
+                    .ok_or("expected output planning span")?;
+                assert!(activity_spans.iter().any(|span| {
+                    span.attributes()["query_execution_id"]
+                        == planning.attributes()["query_execution_id"]
                         && span.attributes()["query_scope"] == "mssql_output"
                         && span.attributes()["query_owner"] == output_name
                 }));

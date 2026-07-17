@@ -7,19 +7,16 @@ use std::{
 
 use serde_json::Value;
 
-use crate::{
-    QueryExecutionScope,
-    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder},
-};
+use crate::{QueryExecutionScope, report::OperationTimelineSpanRecorder};
+
+use super::QueryTraceIdentity;
 
 const PLANNING_ACTIVITY_CATEGORY: &str = "datafusion.planning.activity";
 
 #[derive(Clone)]
 struct PlanningActivityContext {
-    timeline: OperationTimelineRecorder,
+    identity: QueryTraceIdentity,
     track_name: Arc<str>,
-    query_scope: QueryExecutionScope,
-    query_owner: Option<Arc<str>>,
     active_spans: Arc<Mutex<Vec<u64>>>,
 }
 
@@ -28,23 +25,19 @@ tokio::task_local! {
 }
 
 pub(crate) async fn with_query_planning_activity<F>(
-    timeline: OperationTimelineRecorder,
-    query_scope: QueryExecutionScope,
-    query_owner: Option<&str>,
+    identity: QueryTraceIdentity,
     future: F,
 ) -> F::Output
 where
     F: Future,
 {
-    let query_owner = query_owner.map(Arc::<str>::from);
-    let track_name = query_planning_track_name(query_scope, query_owner.as_deref()).into();
+    let track_name =
+        query_planning_track_name(identity.query_scope(), identity.query_owner()).into();
     PLANNING_ACTIVITY
         .scope(
             PlanningActivityContext {
-                timeline,
+                identity,
                 track_name,
-                query_scope,
-                query_owner,
                 active_spans: Arc::new(Mutex::new(Vec::new())),
             },
             future,
@@ -99,15 +92,20 @@ impl PlanningActivityContext {
             .last()
             .copied();
         let mut timeline_span = self
-            .timeline
+            .identity
+            .timeline()
             .start_span(name, PLANNING_ACTIVITY_CATEGORY, self.track_name.as_ref())
             .with_parent_id(parent_id)
             .with_attribute("activity", Value::String(activity.to_owned()))
             .with_attribute(
+                "query_execution_id",
+                Value::from(self.identity.query_execution_id()),
+            )
+            .with_attribute(
                 "query_scope",
-                Value::String(self.query_scope.as_str().to_owned()),
+                Value::String(self.identity.query_scope().as_str().to_owned()),
             );
-        if let Some(query_owner) = &self.query_owner {
+        if let Some(query_owner) = self.identity.query_owner() {
             timeline_span =
                 timeline_span.with_attribute("query_owner", Value::String(query_owner.to_string()));
         }
@@ -165,7 +163,7 @@ impl Drop for PlanningActivitySpanRecorder {
 
 #[cfg(test)]
 mod tests {
-    use crate::TimelineSpanStatus;
+    use crate::{QueryExecutionScope, TimelineSpanStatus, report::OperationTimelineRecorder};
 
     use super::*;
 
@@ -173,16 +171,16 @@ mod tests {
     async fn nested_planning_failures_keep_parentage_and_status() {
         let recorder = OperationTimelineRecorder::start();
 
-        let result: Result<(), &str> = with_query_planning_activity(
+        let identity = QueryTraceIdentity::new(
             recorder.clone(),
             QueryExecutionScope::MssqlOutput,
             Some("orders"),
-            async {
-                profile_query_planning_sync_result("parent", "parent_activity", || {
-                    profile_query_planning_sync_result("child", "child_activity", || Err("boom"))
-                })
-            },
-        )
+        );
+        let result: Result<(), &str> = with_query_planning_activity(identity, async {
+            profile_query_planning_sync_result("parent", "parent_activity", || {
+                profile_query_planning_sync_result("child", "child_activity", || Err("boom"))
+            })
+        })
         .await;
 
         assert_eq!(result, Err("boom"));
@@ -204,6 +202,7 @@ mod tests {
         );
         assert_eq!(child.track_name(), parent.track_name());
         for span in timeline.spans() {
+            assert_eq!(span.attributes()["query_execution_id"], 1);
             assert_eq!(span.attributes()["query_scope"], "mssql_output");
             assert_eq!(span.attributes()["query_owner"], "orders");
         }

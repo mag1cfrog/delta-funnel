@@ -9,7 +9,7 @@ use datafusion::physical_plan::{
     coalesce_partitions::CoalescePartitionsExec,
 };
 
-use crate::{DeltaFunnelError, report::OperationTimelineRecorder};
+use crate::{DeltaFunnelError, QueryExecutionScope, report::OperationTimelineRecorder};
 
 mod catalog;
 mod execution;
@@ -42,6 +42,47 @@ pub use planning::partition_target::{
     derive_delta_scan_partition_target_diagnostic,
 };
 pub use session::{QueryOptions, datafusion_session_config, datafusion_session_context};
+
+/// Shared identity for the planning and execution events of one query.
+#[derive(Debug, Clone)]
+pub(crate) struct QueryTraceIdentity {
+    timeline: OperationTimelineRecorder,
+    query_execution_id: u64,
+    query_scope: QueryExecutionScope,
+    query_owner: Option<Arc<str>>,
+}
+
+impl QueryTraceIdentity {
+    pub(crate) fn new(
+        timeline: OperationTimelineRecorder,
+        query_scope: QueryExecutionScope,
+        query_owner: Option<&str>,
+    ) -> Self {
+        let query_execution_id = timeline.next_query_execution_id();
+        Self {
+            timeline,
+            query_execution_id,
+            query_scope,
+            query_owner: query_owner.map(Arc::<str>::from),
+        }
+    }
+
+    const fn timeline(&self) -> &OperationTimelineRecorder {
+        &self.timeline
+    }
+
+    const fn query_execution_id(&self) -> u64 {
+        self.query_execution_id
+    }
+
+    const fn query_scope(&self) -> QueryExecutionScope {
+        self.query_scope
+    }
+
+    fn query_owner(&self) -> Option<&str> {
+        self.query_owner.as_deref()
+    }
+}
 
 /// Shared live read counters for one physical Delta scan.
 pub(crate) type DeltaProviderReadStatsHandle = Arc<execution::read_stats::DeltaProviderReadStats>;
@@ -151,15 +192,19 @@ pub(crate) fn datafusion_query_output_stream_with_effective_root(
 pub(crate) fn profiled_datafusion_query_output_stream_with_effective_root(
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
-    timeline: OperationTimelineRecorder,
+    trace_identity: QueryTraceIdentity,
 ) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
-    datafusion_query_output_stream_with_effective_root_impl(plan, task_context, Some(timeline))
+    datafusion_query_output_stream_with_effective_root_impl(
+        plan,
+        task_context,
+        Some(trace_identity),
+    )
 }
 
 fn datafusion_query_output_stream_with_effective_root_impl(
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
-    timeline: Option<OperationTimelineRecorder>,
+    trace_identity: Option<QueryTraceIdentity>,
 ) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
     // Keep these branches in sync with DataFusion 53.1's `execute_stream`.
     let (effective_profile_root, execute) =
@@ -178,14 +223,13 @@ fn datafusion_query_output_stream_with_effective_root_impl(
                 )
             }
         };
-    let effective_profile_root = match timeline {
-        Some(timeline) => {
-            instrument_query_execution_plan(Arc::clone(&effective_profile_root), timeline).map_err(
-                |source| DFQueryExecutionSetupError {
+    let effective_profile_root = match trace_identity {
+        Some(trace_identity) => {
+            instrument_query_execution_plan(Arc::clone(&effective_profile_root), trace_identity)
+                .map_err(|source| DFQueryExecutionSetupError {
                     source,
                     effective_profile_root,
-                },
-            )?
+                })?
         }
         None => effective_profile_root,
     };

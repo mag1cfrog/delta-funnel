@@ -17,7 +17,8 @@ use crate::{
     observability::DeltaProviderScanOutcome,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
-        DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
+        DeltaProviderReadStatsHandle, QueryTraceIdentity,
+        collect_delta_provider_read_stats_handles,
         execution_profile::QueryExecutionProfileConsumer, instrument_query_execution_plan,
         with_query_planning_activity,
     },
@@ -424,21 +425,27 @@ impl DeltaFunnelSession {
         complete_cache_alias_span(resolution_span);
         phase_timings.push(resolution_timer.completed());
 
+        let trace_identity = match (profile_mode, operation_timeline) {
+            (ExecutionProfileMode::Detailed, Some(timeline)) => Some(QueryTraceIdentity::new(
+                timeline.clone(),
+                QueryExecutionScope::WriteAllCacheAlias,
+                Some(alias_name),
+            )),
+            _ => None,
+        };
         let task_ctx = Arc::new(dataframe.task_ctx());
         let planning_timer = PhaseTimer::start(CACHE_ALIAS_PHYSICAL_PLANNING_PHASE);
         let planning_span =
             start_cache_alias_span(operation_timeline, alias_name, "Build cache physical plan");
-        let physical_plan_result = match (profile_mode, operation_timeline) {
-            (ExecutionProfileMode::Detailed, Some(timeline)) => {
+        let physical_plan_result = match &trace_identity {
+            Some(trace_identity) => {
                 with_query_planning_activity(
-                    timeline.clone(),
-                    QueryExecutionScope::WriteAllCacheAlias,
-                    Some(alias_name),
+                    trace_identity.clone(),
                     dataframe.create_physical_plan(),
                 )
                 .await
             }
-            _ => dataframe.create_physical_plan().await,
+            None => dataframe.create_physical_plan().await,
         };
         let physical_plan = match physical_plan_result {
             Ok(physical_plan) => physical_plan,
@@ -461,9 +468,9 @@ impl DeltaFunnelSession {
         let stream_setup_timer = PhaseTimer::start(CACHE_ALIAS_STREAM_SETUP_PHASE);
         let stream_setup_span =
             start_cache_alias_span(operation_timeline, alias_name, "Set up cache streams");
-        let physical_plan = match (profile_mode, operation_timeline) {
-            (ExecutionProfileMode::Detailed, Some(timeline)) => {
-                match instrument_query_execution_plan(physical_plan, timeline.clone()) {
+        let physical_plan = match trace_identity {
+            Some(trace_identity) => {
+                match instrument_query_execution_plan(physical_plan, trace_identity) {
                     Ok(physical_plan) => physical_plan,
                     Err(error) => {
                         fail_cache_alias_span(stream_setup_span);
@@ -477,7 +484,7 @@ impl DeltaFunnelSession {
                     }
                 }
             }
-            _ => physical_plan,
+            None => physical_plan,
         };
         let (profile_consumer, profile_result) = match profile_mode {
             ExecutionProfileMode::Disabled => (None, None),
@@ -1825,6 +1832,13 @@ mod tests {
         );
         assert!(planning_spans.iter().all(|span| {
             span.track_name() == "DataFusion query planning / cache alias: cache_alias"
+                && span.attributes()["query_scope"] == "write_all_cache_alias"
+                && span.attributes()["query_owner"] == "cache_alias"
+        }));
+        let planning_query_id = planning_spans[0].attributes()["query_execution_id"].clone();
+        assert!(timeline.spans().iter().any(|span| {
+            span.category() == "datafusion.operator.activity"
+                && span.attributes()["query_execution_id"] == planning_query_id
                 && span.attributes()["query_scope"] == "write_all_cache_alias"
                 && span.attributes()["query_owner"] == "cache_alias"
         }));

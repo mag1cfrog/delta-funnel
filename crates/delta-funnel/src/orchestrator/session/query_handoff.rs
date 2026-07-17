@@ -29,7 +29,8 @@ use crate::{
     observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
-        DFQueryExecution, DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
+        DFQueryExecution, DeltaProviderReadStatsHandle, QueryTraceIdentity,
+        collect_delta_provider_read_stats_handles,
         datafusion_query_output_stream_with_effective_root,
         execution_profile::{
             QueryExecutionProfileConsumer, QueryExecutionProfileResult,
@@ -530,20 +531,20 @@ pub(super) fn batch_stream_for_physical_plan(
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     progress: Option<(ProgressReporter, String)>,
     profile_scope: Option<QueryExecutionScope>,
-    timeline: Option<&OperationTimelineRecorder>,
+    trace_identity: Option<QueryTraceIdentity>,
 ) -> Result<QueryStreamSetup, QueryStreamSetupFailure> {
     // These handles must exist before merged stream setup can fail.
     let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
     let DFQueryExecution {
         stream,
         effective_profile_root,
-    } = match match (profile_scope, timeline) {
-        (Some(_), Some(timeline)) => profiled_datafusion_query_output_stream_with_effective_root(
+    } = match match trace_identity {
+        Some(trace_identity) => profiled_datafusion_query_output_stream_with_effective_root(
             Arc::clone(&physical_plan),
             context.task_ctx(),
-            timeline.clone(),
+            trace_identity,
         ),
-        _ => datafusion_query_output_stream_with_effective_root(
+        None => datafusion_query_output_stream_with_effective_root(
             Arc::clone(&physical_plan),
             context.task_ctx(),
         ),
@@ -862,18 +863,24 @@ impl DeltaFunnelSession {
         let task_context = Arc::new(dataframe.task_ctx());
         timings.record_completed(dataframe_timer);
 
+        let trace_identity = match options.execution_profile_mode() {
+            ExecutionProfileMode::Disabled => None,
+            ExecutionProfileMode::Detailed => Some(QueryTraceIdentity::new(
+                timings.timeline.clone(),
+                QueryExecutionScope::Preview,
+                None,
+            )),
+        };
         let physical_plan_timer = timings.start_phase(PREVIEW_PHYSICAL_PLANNING_PHASE);
-        let physical_plan_result = match options.execution_profile_mode() {
-            ExecutionProfileMode::Disabled => dataframe.create_physical_plan().await,
-            ExecutionProfileMode::Detailed => {
+        let physical_plan_result = match &trace_identity {
+            Some(trace_identity) => {
                 with_query_planning_activity(
-                    timings.timeline.clone(),
-                    QueryExecutionScope::Preview,
-                    None,
+                    trace_identity.clone(),
                     dataframe.create_physical_plan(),
                 )
                 .await
             }
+            None => dataframe.create_physical_plan().await,
         };
         let physical_plan = match physical_plan_result {
             Ok(physical_plan) => physical_plan,
@@ -890,18 +897,16 @@ impl DeltaFunnelSession {
         let DFQueryExecution {
             stream,
             effective_profile_root,
-        } = match match options.execution_profile_mode() {
-            ExecutionProfileMode::Disabled => datafusion_query_output_stream_with_effective_root(
+        } = match match trace_identity {
+            None => datafusion_query_output_stream_with_effective_root(
                 Arc::clone(&physical_plan),
                 task_context,
             ),
-            ExecutionProfileMode::Detailed => {
-                profiled_datafusion_query_output_stream_with_effective_root(
-                    Arc::clone(&physical_plan),
-                    task_context,
-                    timings.timeline.clone(),
-                )
-            }
+            Some(trace_identity) => profiled_datafusion_query_output_stream_with_effective_root(
+                Arc::clone(&physical_plan),
+                task_context,
+                trace_identity,
+            ),
         } {
             Ok(execution) => execution,
             Err(failure) => {
@@ -1249,8 +1254,9 @@ mod tests {
         QueryOptions, ReportReasonCode, TimelineSpanStatus, TimelineSpanTimeSemantics,
         observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
-        query_engine::datafusion::execution_profile::{
-            QueryExecutionProfileConsumer, QueryExecutionProfileResult,
+        query_engine::datafusion::{
+            QueryTraceIdentity,
+            execution_profile::{QueryExecutionProfileConsumer, QueryExecutionProfileResult},
         },
         table_formats::RealParquetDeltaTable,
     };
@@ -1923,11 +1929,13 @@ mod tests {
         let failing_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSetupFailingPlan::new(physical_plan));
         let timeline = crate::report::OperationTimelineRecorder::start();
+        let trace_identity =
+            QueryTraceIdentity::new(timeline.clone(), QueryExecutionScope::Preview, None);
 
         let failure = match super::profiled_datafusion_query_output_stream_with_effective_root(
             Arc::clone(&failing_plan),
             session.context.task_ctx(),
-            timeline.clone(),
+            trace_identity,
         ) {
             Ok(_) => return Err("expected profiled stream setup error".into()),
             Err(failure) => failure,
@@ -2754,6 +2762,7 @@ mod tests {
             assert_eq!(span.track_name(), "DataFusion query planning / preview");
             assert_eq!(span.status(), TimelineSpanStatus::Completed);
             assert_eq!(span.attributes()["result"], "ok");
+            assert_eq!(span.attributes()["query_execution_id"], 1);
             assert_eq!(span.attributes()["query_scope"], "preview");
             assert_eq!(span.attributes().get("query_owner"), None);
             assert!(physical_planning.start_offset_micros() <= span.start_offset_micros());
@@ -2801,6 +2810,11 @@ mod tests {
         ] {
             assert!(activity_spans.iter().any(|span| span.name() == name));
         }
+        assert!(activity_spans.iter().all(|span| {
+            span.attributes()["query_execution_id"] == 1
+                && span.attributes()["query_scope"] == "preview"
+                && span.attributes().get("query_owner").is_none()
+        }));
         for span in activity_spans.iter().filter(|span| {
             span.name().starts_with("Delta scan ") && span.name() != "Delta scan producer"
         }) {
@@ -2848,6 +2862,9 @@ mod tests {
             assert_eq!(wait.status(), TimelineSpanStatus::Completed);
             assert!(wait.track_name().contains(" / async waits [node "));
             assert_eq!(wait.attributes()["wait_kind"], "async_suspension");
+            assert_eq!(wait.attributes()["query_execution_id"], 1);
+            assert_eq!(wait.attributes()["query_scope"], "preview");
+            assert_eq!(wait.attributes().get("query_owner"), None);
             assert!(activity_spans.iter().any(|span| {
                 span.name() == "Delta scan producer"
                     && span.attributes()["query_execution_id"]
