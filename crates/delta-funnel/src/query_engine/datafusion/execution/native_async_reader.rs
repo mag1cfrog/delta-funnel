@@ -39,7 +39,6 @@ use crate::{
     },
 };
 
-use super::super::operator_activity::{OperatorActivityContext, profile_operator_activity_future};
 use super::super::planning::file_task::DeltaScanFileTask;
 use super::async_scheduler::{DeltaProviderAsyncFileReadFuture, DeltaProviderAsyncFileReader};
 use super::file_reader::DeltaFileReadDeletionVectorStats;
@@ -109,7 +108,6 @@ pub(crate) struct DeltaNativeAsyncPartitionFileReader {
     read_schema: KernelScanReadSchema,
     read_stats: Arc<DeltaProviderReadStats>,
     output_batch_size: usize,
-    activity: Option<OperatorActivityContext>,
 }
 
 /// Native async batches for one provider file task.
@@ -128,7 +126,6 @@ pub(crate) struct DeltaNativeAsyncFileReadStream {
     deletion_vector: Option<ProviderDeletionVectorSelection>,
     deletion_vector_stats: DeltaFileReadDeletionVectorStats,
     deletion_vector_stats_reported: DeltaFileReadDeletionVectorStats,
-    activity: Option<OperatorActivityContext>,
     _permit: Option<DeltaProviderAsyncFileReadPermit>,
 }
 
@@ -409,7 +406,6 @@ impl DeltaNativeAsyncFileReader {
             deletion_vector,
             deletion_vector_stats,
             deletion_vector_stats_reported: DeltaFileReadDeletionVectorStats::default(),
-            activity: None,
             _permit: permit,
         })
     }
@@ -449,10 +445,6 @@ impl DeltaNativeAsyncFileReader {
 }
 
 impl DeltaNativeAsyncFileReadStream {
-    pub(super) fn activity_context(&self) -> Option<OperatorActivityContext> {
-        self.activity.clone()
-    }
-
     /// File-local deletion-vector metrics observed during this read.
     #[allow(dead_code)]
     #[must_use]
@@ -488,15 +480,9 @@ impl DeltaNativeAsyncFileReadStream {
     /// Returns the next provider-visible batch for this file.
     #[allow(dead_code)]
     pub(crate) async fn next_batch(&mut self) -> Result<Option<RecordBatch>, DeltaFunnelError> {
-        let activity = self.activity.clone();
-        profile_operator_activity_future(
-            activity.as_ref(),
-            "Delta scan batch read",
-            "delta_scan_batch_read_poll",
-            self.next_batch_with_original_row_indexes(),
-        )
-        .await
-        .map(|batch| batch.map(|(batch, _original_row_indexes)| batch))
+        self.next_batch_with_original_row_indexes()
+            .await
+            .map(|batch| batch.map(|(batch, _original_row_indexes)| batch))
     }
 
     async fn next_batch_with_original_row_indexes(
@@ -1759,7 +1745,6 @@ impl DeltaNativeAsyncPartitionFileReader {
         read_schema: KernelScanReadSchema,
         read_stats: Arc<DeltaProviderReadStats>,
         output_batch_size: usize,
-        activity: Option<OperatorActivityContext>,
     ) -> Self {
         let reader = Arc::new(reader.with_metered_data_file_store(Arc::clone(&read_stats)));
         Self {
@@ -1767,12 +1752,7 @@ impl DeltaNativeAsyncPartitionFileReader {
             read_schema,
             read_stats,
             output_batch_size,
-            activity,
         }
-    }
-
-    pub(super) fn activity_context(&self) -> Option<OperatorActivityContext> {
-        self.activity.clone()
     }
 }
 
@@ -1787,7 +1767,6 @@ impl DeltaProviderAsyncFileReader<DeltaScanFileTask, DeltaNativeAsyncFileReadStr
         let reader = Arc::clone(&self.reader);
         let read_schema = self.read_schema.clone();
         let output_batch_size = self.output_batch_size;
-        let activity = self.activity.clone();
         // The scheduler calls this once after admission and permit acquisition.
         // Keep both start counters outside the polled future so prefetch cannot
         // count the same task again when its setup future is polled repeatedly.
@@ -1797,22 +1776,16 @@ impl DeltaProviderAsyncFileReader<DeltaScanFileTask, DeltaNativeAsyncFileReadStr
         }
 
         Box::pin(async move {
-            let mut stream = profile_operator_activity_future(
-                activity.as_ref(),
-                "Delta scan file setup",
-                "delta_scan_file_setup_poll",
-                reader.open_file_stream_with_permit(
+            reader
+                .open_file_stream_with_permit(
                     DeltaNativeAsyncFileReadRequest {
                         task: &task,
                         read_schema: &read_schema,
                         output_batch_size: Some(output_batch_size),
                     },
                     Some(permit),
-                ),
-            )
-            .await?;
-            stream.activity = activity;
-            Ok(stream)
+                )
+                .await
         })
     }
 }

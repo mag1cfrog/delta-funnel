@@ -284,30 +284,19 @@ execution context. `runtime_task_id` remains metadata because many short-lived
 Tokio tasks can share one executor worker. `node_id`, `parent_node_id`, and
 `operator_partition` link the event to its physical-plan operator.
 `worker_thread_id` and `worker_thread_name` expose the underlying thread behind
-the normalized worker lane. Planning, operator activity, and async-wait events
-for the same query share `query_execution_id`, `query_scope`, and, for SQL
+the normalized worker lane. Planning and operator activity events for the same
+query share `query_execution_id`, `query_scope`, and, for SQL
 outputs and cache materialization, `query_owner`. Use these fields to associate
 worker tracks with `DataFusion query planning / SQL output: <output>` or
 `DataFusion query planning / cache alias: <alias>` tracks in a multi-query
 trace. Query IDs are local to one exported operation.
 
-`DeltaScanPlanningExec` adds one lower level of scan activity. Both reader
-backends record `Delta scan producer` and `Delta scan output send`. The native
-async backend also records `Delta scan file setup` and `Delta scan batch read`
-polls. Its `Delta scan producer wait` events use the
-`datafusion.operator.wait` category and a logical stream track because an async
-future can resume on another executor worker. A wait event measures suspension
-between polls, not active CPU work, and waits for different streams can overlap.
-The official-kernel backend instead records synchronous `Delta scan file read`
-work on the worker that performs it.
-
 Use the phase events first to identify whether planning, execution, or
 formatting dominates the preview. Within physical planning, use planning
 activity to separate metadata expansion and other Delta provider work. During
-execution, use worker activity to locate active work, async-wait events to find
-suspended native scan producers, and lifecycle events to understand overall
-concurrency and waiting. Lifecycle arguments retain metrics such as
-`output_rows` and `elapsed_compute` when DataFusion exposes them.
+execution, use worker activity to locate active work and lifecycle events to
+understand overall concurrency and waiting. Lifecycle arguments retain metrics
+such as `output_rows` and `elapsed_compute` when DataFusion exposes them.
 `elapsed_compute` remains an aggregate metric and is not positioned as a
 fabricated wall-clock span. The top-level `delta_funnel_timeline` field
 preserves the relative timeline data, while `delta_funnel_profile` preserves
@@ -325,14 +314,12 @@ remain in `delta_funnel_profile` without appearing as lifecycle events.
 
 Custom metrics added to an owned DataFusion operator automatically remain in
 the lifecycle event arguments and embedded profile. Activity instrumentation is
-one level below the lifecycle: it measures `execute`, `poll_next`, and the
-specialized Delta scan calls above, but does not invent positions for aggregate
-custom timers or collect function-level CPU stacks inside those calls. A
-Result-returning activity that reaches an error has failed status and
-`result="error"`; a terminal success uses `result="ok"`, and pending async
-polls remain completed measurements with `result="pending"`. Execution
-activity and async-wait recording share a cap of
-100,000 spans. If execution exceeds that bound, the trace contains one
+one level below the lifecycle: it measures `execute` and `poll_next`, but does
+not invent positions for aggregate custom timers or collect function-level CPU
+stacks inside those calls. An `execute` or `poll_next` error has failed status
+and `result="error"`. Successful stream creation uses `result="stream"`; poll
+events use `pending`, `batch`, or `eof`. Execution activity recording has a cap
+of 100,000 spans. If execution exceeds that bound, the trace contains one
 `Operator activity trace truncated` marker and continues the query normally.
 
 Omitting `profile`, or passing `None` or `False`, still returns all phase

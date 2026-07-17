@@ -5,7 +5,6 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fmt,
-    future::Future,
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -24,7 +23,7 @@ use datafusion::{
         SendableRecordBatchStream, metrics::MetricsSet,
     },
 };
-use futures_util::{Stream, future::poll_fn};
+use futures_util::Stream;
 use serde_json::Value;
 
 use crate::{
@@ -36,7 +35,6 @@ use crate::{
 use super::QueryTraceIdentity;
 
 const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
-const OPERATOR_WAIT_CATEGORY: &str = "datafusion.operator.wait";
 const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,10 +98,6 @@ struct ActiveOperatorActivitySpan {
 thread_local! {
     static ACTIVE_OPERATOR_ACTIVITY_SPANS: RefCell<Vec<ActiveOperatorActivitySpan>> =
         const { RefCell::new(Vec::new()) };
-    // ExecutionPlan::execute is synchronous. Specialized operators can clone
-    // this context during execute and carry it into work they spawn afterward.
-    static ACTIVE_OPERATOR_ACTIVITY_CONTEXTS: RefCell<Vec<OperatorActivityContext>> =
-        const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Debug, Clone)]
@@ -116,226 +110,6 @@ struct OperatorActivityRecorder {
     maximum_spans: u64,
     remaining_spans: Arc<AtomicU64>,
     truncation_reported: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct OperatorActivityContext {
-    activity: OperatorActivityRecorder,
-    node_id: u64,
-    parent_node_id: Option<u64>,
-    partition: usize,
-    stream_id: u64,
-}
-
-impl OperatorActivityContext {
-    fn profile_sync<T>(
-        &self,
-        name: &'static str,
-        activity: &'static str,
-        operation: impl FnOnce() -> T,
-    ) -> T {
-        self.profile_sync_classified(name, activity, operation, |_| ("completed", false))
-    }
-
-    fn profile_sync_result<T, E>(
-        &self,
-        name: &'static str,
-        activity: &'static str,
-        operation: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
-        self.profile_sync_classified(name, activity, operation, classify_result)
-    }
-
-    fn profile_sync_classified<T>(
-        &self,
-        name: &'static str,
-        activity: &'static str,
-        operation: impl FnOnce() -> T,
-        classify: impl FnOnce(&T) -> (&'static str, bool),
-    ) -> T {
-        let span = self.activity.start_span(
-            name,
-            self.node_id,
-            self.parent_node_id,
-            self.partition,
-            self.stream_id,
-            activity,
-        );
-        let result = operation();
-        if let Some(span) = span {
-            let (result_name, failed) = classify(&result);
-            let span = span.with_attribute("result", Value::String(result_name.to_owned()));
-            if failed {
-                span.failed();
-            } else {
-                span.completed();
-            }
-        }
-        result
-    }
-
-    /// Records each poll as a closed worker span so no span crosses an await or
-    /// follows a future when the runtime moves its next poll to another worker.
-    pub(super) async fn profile_future_result<F, T, E>(
-        self,
-        name: &'static str,
-        activity: &'static str,
-        future: F,
-    ) -> Result<T, E>
-    where
-        F: Future<Output = Result<T, E>>,
-    {
-        self.profile_future_impl(name, activity, None, future).await
-    }
-
-    /// Also records the wall-clock suspension between consecutive polls on a
-    /// logical stream lane that is independent of runtime worker placement.
-    pub(super) async fn profile_future_result_with_async_wait<F, T, E>(
-        self,
-        name: &'static str,
-        activity: &'static str,
-        wait_name: &'static str,
-        wait_activity: &'static str,
-        future: F,
-    ) -> Result<T, E>
-    where
-        F: Future<Output = Result<T, E>>,
-    {
-        self.profile_future_impl(name, activity, Some((wait_name, wait_activity)), future)
-            .await
-    }
-
-    async fn profile_future_impl<F, T, E>(
-        self,
-        name: &'static str,
-        activity: &'static str,
-        wait: Option<(&'static str, &'static str)>,
-        future: F,
-    ) -> Result<T, E>
-    where
-        F: Future<Output = Result<T, E>>,
-    {
-        let mut future = std::pin::pin!(future);
-        let mut wait_span: Option<OperationTimelineSpanRecorder> = None;
-        poll_fn(|context| {
-            if let Some(span) = wait_span.take() {
-                span.completed();
-            }
-            let span = self.activity.start_span(
-                name,
-                self.node_id,
-                self.parent_node_id,
-                self.partition,
-                self.stream_id,
-                activity,
-            );
-            let poll = future.as_mut().poll(context);
-            if let Some(span) = span {
-                let (result, failed) = match &poll {
-                    Poll::Pending => ("pending", false),
-                    Poll::Ready(output) => classify_result(output),
-                };
-                let span = span.with_attribute("result", Value::String(result.to_owned()));
-                if failed {
-                    span.failed();
-                } else {
-                    span.completed();
-                }
-            }
-            if poll.is_pending()
-                && let Some((wait_name, wait_activity)) = wait
-            {
-                wait_span = self.activity.start_wait_span(
-                    wait_name,
-                    self.node_id,
-                    self.parent_node_id,
-                    self.partition,
-                    self.stream_id,
-                    wait_activity,
-                );
-            }
-            poll
-        })
-        .await
-    }
-}
-
-fn classify_result<T, E>(result: &Result<T, E>) -> (&'static str, bool) {
-    if result.is_ok() {
-        ("ok", false)
-    } else {
-        ("error", true)
-    }
-}
-
-pub(super) fn profile_operator_activity_sync<T>(
-    activity: Option<&OperatorActivityContext>,
-    name: &'static str,
-    activity_name: &'static str,
-    operation: impl FnOnce() -> T,
-) -> T {
-    match activity {
-        Some(activity) => activity.profile_sync(name, activity_name, operation),
-        None => operation(),
-    }
-}
-
-pub(super) fn profile_operator_activity_sync_result<T, E>(
-    activity: Option<&OperatorActivityContext>,
-    name: &'static str,
-    activity_name: &'static str,
-    operation: impl FnOnce() -> Result<T, E>,
-) -> Result<T, E> {
-    match activity {
-        Some(activity) => activity.profile_sync_result(name, activity_name, operation),
-        None => operation(),
-    }
-}
-
-pub(super) async fn profile_operator_activity_future<F, T, E>(
-    activity: Option<&OperatorActivityContext>,
-    name: &'static str,
-    activity_name: &'static str,
-    future: F,
-) -> Result<T, E>
-where
-    F: Future<Output = Result<T, E>>,
-{
-    match activity {
-        Some(activity) => {
-            activity
-                .clone()
-                .profile_future_result(name, activity_name, future)
-                .await
-        }
-        None => future.await,
-    }
-}
-
-struct OperatorActivityContextGuard {
-    query_execution_id: u64,
-    node_id: u64,
-    stream_id: u64,
-}
-
-impl Drop for OperatorActivityContextGuard {
-    fn drop(&mut self) {
-        let _ = ACTIVE_OPERATOR_ACTIVITY_CONTEXTS.try_with(|contexts| {
-            let popped = contexts.borrow_mut().pop();
-            debug_assert!(popped.is_some_and(|context| {
-                context.activity.query_execution_id == self.query_execution_id
-                    && context.node_id == self.node_id
-                    && context.stream_id == self.stream_id
-            }));
-        });
-    }
-}
-
-pub(super) fn current_operator_activity_context() -> Option<OperatorActivityContext> {
-    ACTIVE_OPERATOR_ACTIVITY_CONTEXTS
-        .try_with(|contexts| contexts.borrow().last().cloned())
-        .ok()
-        .flatten()
 }
 
 impl OperatorActivityRecorder {
@@ -371,7 +145,14 @@ impl OperatorActivityRecorder {
         stream_id: u64,
         activity: &'static str,
     ) -> Option<OperatorActivitySpanRecorder> {
-        if !self.reserve_span() {
+        if self
+            .remaining_spans
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_err()
+        {
+            self.report_truncation();
             return None;
         }
 
@@ -443,60 +224,6 @@ impl OperatorActivityRecorder {
         })
     }
 
-    fn start_wait_span(
-        &self,
-        name: &'static str,
-        node_id: u64,
-        parent_node_id: Option<u64>,
-        partition: usize,
-        stream_id: u64,
-        activity: &'static str,
-    ) -> Option<OperationTimelineSpanRecorder> {
-        if !self.reserve_span() {
-            return None;
-        }
-
-        Some(
-            self.with_query_identity(self.timeline.start_span(
-                    name,
-                    OPERATOR_WAIT_CATEGORY,
-                    format!(
-                        "DataFusion query {} / async waits [node {node_id}, partition {partition}, stream {stream_id}]",
-                        self.query_execution_id
-                    ),
-                ))
-                .with_attribute("execution_stream_id", Value::from(stream_id))
-                .with_attribute("node_id", Value::from(node_id))
-                .with_attribute(
-                    "parent_node_id",
-                    parent_node_id.map_or(Value::Null, Value::from),
-                )
-                .with_attribute(
-                    "operator_partition",
-                    Value::from(usize_to_u64_saturating(partition)),
-                )
-                .with_attribute("activity", Value::String(activity.to_owned()))
-                .with_attribute(
-                    "wait_kind",
-                    Value::String("async_suspension".to_owned()),
-                ),
-        )
-    }
-
-    fn reserve_span(&self) -> bool {
-        if self
-            .remaining_spans
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
-            return true;
-        }
-        self.report_truncation();
-        false
-    }
-
     fn next_stream_id(&self) -> u64 {
         let mut identities = self
             .identities
@@ -505,29 +232,6 @@ impl OperatorActivityRecorder {
         let stream_id = identities.next_stream_id;
         identities.next_stream_id = identities.next_stream_id.saturating_add(1);
         stream_id
-    }
-
-    fn enter_context(
-        &self,
-        node_id: u64,
-        parent_node_id: Option<u64>,
-        partition: usize,
-        stream_id: u64,
-    ) -> OperatorActivityContextGuard {
-        ACTIVE_OPERATOR_ACTIVITY_CONTEXTS.with(|contexts| {
-            contexts.borrow_mut().push(OperatorActivityContext {
-                activity: self.clone(),
-                node_id,
-                parent_node_id,
-                partition,
-                stream_id,
-            });
-        });
-        OperatorActivityContextGuard {
-            query_execution_id: self.query_execution_id,
-            node_id,
-            stream_id,
-        }
     }
 
     fn execution_context(&self) -> ActivityExecutionContext {
@@ -769,11 +473,7 @@ impl ExecutionPlan for ProfiledOperatorExec {
             stream_id,
             "execute",
         );
-        let activity_context =
-            self.activity
-                .enter_context(self.node_id, self.parent_node_id, partition, stream_id);
         let result = self.inner.execute(partition, context);
-        drop(activity_context);
         if let Some(span) = span {
             let span = span.with_attribute(
                 "result",
@@ -924,100 +624,6 @@ mod tests {
             truncation_markers[0].track_name(),
             "DataFusion query 1 / trace status"
         );
-    }
-
-    #[tokio::test]
-    async fn async_suspension_uses_a_logical_stream_lane() {
-        let timeline = OperationTimelineRecorder::start();
-        let activity = OperatorActivityRecorder::new(test_trace_identity(timeline.clone()));
-        let stream_id = activity.next_stream_id();
-        let context = OperatorActivityContext {
-            activity,
-            node_id: 4,
-            parent_node_id: Some(2),
-            partition: 3,
-            stream_id,
-        };
-
-        context
-            .profile_future_result_with_async_wait(
-                "Delta scan producer",
-                "delta_scan_producer_poll",
-                "Delta scan producer wait",
-                "delta_scan_producer_wait",
-                async {
-                    tokio::task::yield_now().await;
-                    Ok::<_, ()>(())
-                },
-            )
-            .await
-            .expect("test future should complete");
-
-        let timeline = timeline.finish("wait", TimelineSpanStatus::Completed);
-        let wait_spans = timeline
-            .spans()
-            .iter()
-            .filter(|span| span.category() == OPERATOR_WAIT_CATEGORY)
-            .collect::<Vec<_>>();
-        assert_eq!(wait_spans.len(), 1);
-        let wait = wait_spans[0];
-        assert_eq!(wait.name(), "Delta scan producer wait");
-        assert_eq!(
-            wait.track_name(),
-            "DataFusion query 1 / async waits [node 4, partition 3, stream 1]"
-        );
-        assert_eq!(wait.parent_id(), None);
-        assert_eq!(wait.status(), TimelineSpanStatus::Completed);
-        assert_eq!(wait.attributes()["query_execution_id"], 1);
-        assert_eq!(wait.attributes()["execution_stream_id"], 1);
-        assert_eq!(wait.attributes()["node_id"], 4);
-        assert_eq!(wait.attributes()["parent_node_id"], 2);
-        assert_eq!(wait.attributes()["operator_partition"], 3);
-        assert_eq!(wait.attributes()["activity"], "delta_scan_producer_wait");
-        assert_eq!(wait.attributes()["wait_kind"], "async_suspension");
-    }
-
-    #[tokio::test]
-    async fn result_futures_mark_terminal_errors_as_failed() {
-        let timeline = OperationTimelineRecorder::start();
-        let activity = OperatorActivityRecorder::new(test_trace_identity(timeline.clone()));
-        let context = OperatorActivityContext {
-            activity,
-            node_id: 4,
-            parent_node_id: Some(2),
-            partition: 3,
-            stream_id: 1,
-        };
-
-        let child_result = profile_operator_activity_future(
-            Some(&context),
-            "Delta scan batch read",
-            "delta_scan_batch_read_poll",
-            async { Err::<(), _>("batch error") },
-        )
-        .await;
-        let producer_result = context
-            .profile_future_result_with_async_wait(
-                "Delta scan producer",
-                "delta_scan_producer_poll",
-                "Delta scan producer wait",
-                "delta_scan_producer_wait",
-                async { Err::<(), _>("producer error") },
-            )
-            .await;
-
-        assert_eq!(child_result, Err("batch error"));
-        assert_eq!(producer_result, Err("producer error"));
-        let timeline = timeline.finish("errors", TimelineSpanStatus::Failed);
-        for name in ["Delta scan batch read", "Delta scan producer"] {
-            let span = timeline
-                .spans()
-                .iter()
-                .find(|span| span.name() == name)
-                .expect("failed future should record its activity");
-            assert_eq!(span.status(), TimelineSpanStatus::Failed);
-            assert_eq!(span.attributes()["result"], "error");
-        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

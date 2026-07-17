@@ -80,16 +80,16 @@ Top-level planning, workflow execution, source reporting, sequential output
 attempts, SQL Server work, and output-query operator lifecycles are positioned
 relative to that same origin. The returned dictionary also exposes the model
 under `report["operation_timeline"]`. Detailed output queries also record
-wall-clock operator activity grouped into query and executor-worker tracks,
-nested Delta planning activity, and native async scan waits. Planning and
-execution tracks share an operation-local query ID, scope, and output owner.
+wall-clock operator activity grouped into query and executor-worker tracks and
+nested Delta planning activity. Planning and execution tracks share an
+operation-local query ID, scope, and output owner.
 
 With automatic caching, the trace also positions each alias's resolution,
 planning, execution, `MemTable` construction, installation, restoration, and
 DataFusion operator lifecycles on labeled cache lanes.
 Cache materialization queries also use query and executor-worker activity
 tracks, so selecting one exact worker produces a top-down flame view. Their
-planning, worker, and wait events carry the cache alias as `query_owner`.
+planning and worker events carry the cache alias as `query_owner`.
 
 Profiling works with both cache modes. For example, disable shared caching and
 enable profiling in the same call:

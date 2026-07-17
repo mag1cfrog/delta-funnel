@@ -28,10 +28,6 @@ use crate::DeltaFunnelError;
 use crate::error::DeltaScanFileReadPhase;
 use crate::table_formats::{DeltaKernelPredicate, KernelScanReadSchema};
 
-use super::super::operator_activity::{
-    current_operator_activity_context, profile_operator_activity_future,
-    profile_operator_activity_sync, profile_operator_activity_sync_result,
-};
 use super::super::planning::dynamic_filters::{
     DeltaDynamicFilterOutcome, DeltaDynamicFilterPlan, DeltaRetainedDynamicFilter,
 };
@@ -325,7 +321,6 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                 ))
             }
             DeltaProviderReaderBackend::NativeAsync => {
-                let activity = current_operator_activity_context();
                 let file_reader =
                     DeltaNativeAsyncFileReader::try_new(DeltaNativeAsyncFileReaderConfig {
                         source_name: &self.scan_plan.source_name,
@@ -338,7 +333,6 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                     read_schema,
                     Arc::clone(&self.read_stats),
                     context.session_config().batch_size(),
-                    activity.clone(),
                 ));
                 let partition_limiter = self
                     .async_read_limiter
@@ -622,10 +616,8 @@ fn sequential_scan_partition_stream(
         RecordBatchReceiverStreamBuilder::new(Arc::clone(&schema), output_buffer_capacity);
     let output = builder.tx();
     let read_stats = Arc::clone(&admission.read_stats);
-    let activity = current_operator_activity_context();
 
-    let producer_activity = activity.clone();
-    let producer = move || {
+    builder.spawn_blocking(move || {
         read_stats.record_scan_partition_started();
         for task in file_tasks {
             if output.is_closed() {
@@ -636,19 +628,11 @@ fn sequential_scan_partition_stream(
             }
 
             read_stats.record_file_started();
-            let (file_result, _permit) = match profile_operator_activity_sync_result(
-                producer_activity.as_ref(),
-                "Delta scan file read",
-                "delta_scan_file_read",
-                || {
-                    let permit = partition_limiter.acquire_file_permit();
-                    let file_result = file_reader.read_file(DeltaFileReadRequest {
-                        task: &task,
-                        read_schema: &read_schema,
-                    })?;
-                    Ok((file_result, permit))
-                },
-            ) {
+            let _permit = partition_limiter.acquire_file_permit();
+            let file_result = match file_reader.read_file(DeltaFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+            }) {
                 Ok(file_result) => file_result,
                 Err(error) => {
                     record_deletion_vector_read_error(read_stats.as_ref(), &error);
@@ -662,14 +646,7 @@ fn sequential_scan_partition_stream(
 
             for batch in file_result {
                 let rows = batch.num_rows();
-                if profile_operator_activity_sync(
-                    producer_activity.as_ref(),
-                    "Delta scan output send",
-                    "delta_scan_output_send",
-                    || output.blocking_send(Ok(batch)),
-                )
-                .is_err()
-                {
+                if output.blocking_send(Ok(batch)).is_err() {
                     return Ok(());
                 }
                 read_stats.record_batch_produced(rows);
@@ -679,14 +656,6 @@ fn sequential_scan_partition_stream(
 
         read_stats.record_scan_partition_completed();
         Ok(())
-    };
-    builder.spawn_blocking(move || {
-        profile_operator_activity_sync_result(
-            activity.as_ref(),
-            "Delta scan producer",
-            "delta_scan_producer_run",
-            producer,
-        )
     });
 
     project_scan_output_stream(builder.build(), schema)
@@ -705,10 +674,8 @@ fn native_async_scan_partition_stream(
         RecordBatchReceiverStreamBuilder::new(Arc::clone(&schema), output_buffer_capacity);
     let output = builder.tx();
     let read_stats = Arc::clone(&admission.read_stats);
-    let activity = file_reader.activity_context();
 
-    let producer_activity = activity.clone();
-    let producer = async move {
+    builder.spawn(async move {
         read_stats.record_scan_partition_started();
         let mut scheduler = DeltaProviderAsyncPartitionReadScheduler::new(
             DeltaProviderAsyncPartitionReadSchedulerConfig::new(
@@ -763,15 +730,7 @@ fn native_async_scan_partition_stream(
                     }
                 };
                 let rows = batch.num_rows();
-                if profile_operator_activity_future(
-                    producer_activity.as_ref(),
-                    "Delta scan output send",
-                    "delta_scan_output_send_poll",
-                    output.send(Ok(batch)),
-                )
-                .await
-                .is_err()
-                {
+                if output.send(Ok(batch)).await.is_err() {
                     return Ok(());
                 }
                 read_stats.record_batch_produced(rows);
@@ -783,17 +742,7 @@ fn native_async_scan_partition_stream(
         }
 
         Ok(())
-    };
-    match activity {
-        Some(activity) => builder.spawn(activity.profile_future_result_with_async_wait(
-            "Delta scan producer",
-            "delta_scan_producer_poll",
-            "Delta scan producer wait",
-            "delta_scan_producer_wait",
-            producer,
-        )),
-        None => builder.spawn(producer),
-    }
+    });
 
     project_scan_output_stream(builder.build(), schema)
 }
@@ -899,7 +848,6 @@ async fn drain_native_async_current_file_with_prefetch(
     // `is_closed` is an early cancellation hint. The send result below is the
     // authoritative close check because the receiver can close after this
     // snapshot.
-    let activity = file_stream.activity_context();
     while !output.is_closed() {
         let next_batch = match poll_native_async_current_batch_or_prefetch_setup(
             file_stream,
@@ -923,15 +871,7 @@ async fn drain_native_async_current_file_with_prefetch(
             }
         };
         let rows = batch.num_rows();
-        if profile_operator_activity_future(
-            activity.as_ref(),
-            "Delta scan output send",
-            "delta_scan_output_send_poll",
-            output.send(Ok(batch)),
-        )
-        .await
-        .is_err()
-        {
+        if output.send(Ok(batch)).await.is_err() {
             return Ok(NativeAsyncFileDrainResult::OutputClosed);
         }
         read_stats.record_batch_produced(rows);

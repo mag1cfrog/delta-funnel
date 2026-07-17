@@ -154,9 +154,9 @@ the complete one-output wall clock, while positioned child events cover
 planning, SQL Server lifecycle work, query stream polls, per-batch validation
 and writes, finalization, target validation, swap, cleanup, and available
 DataFusion operator lifecycles. Detailed output queries also record wall-clock
-operator activity grouped by query and executor worker, nested Delta provider
-planning activity, and native async scan waits. Shared query IDs, scopes, and
-owners connect planning and execution tracks. A failed write leaves an existing
+operator activity grouped by query and executor worker and nested Delta provider
+planning activity. Shared query IDs, scopes, and owners connect planning and
+execution tracks. A failed write leaves an existing
 destination unchanged and removes a newly reserved file.
 
 Final serialization and file writes still happen after SQL Server reports
@@ -225,9 +225,9 @@ writes one Chrome Trace Event JSON document even when the report contains
 failed or skipped outputs. The root event is the full `write_all` duration, and
 its positioned spans include top-level phases, attempted outputs, SQL Server
 work, output-query operator lifecycles, and wall-clock operator activity for
-output and cache-materialization queries. Nested Delta planning activity and
-native async scan waits use the same query identity as their worker activity.
-The same relative model is available at `report["operation_timeline"]`.
+output and cache-materialization queries. Nested Delta planning activity uses
+the same query identity as worker activity. The same relative model is available
+at `report["operation_timeline"]`.
 
 A top-level planning, cache, or orchestration exception leaves an existing
 destination unchanged and removes a newly reserved file. A final export error
