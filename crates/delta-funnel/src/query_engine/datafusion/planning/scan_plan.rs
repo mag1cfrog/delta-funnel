@@ -22,6 +22,7 @@ use crate::{
     },
 };
 
+use super::super::profile_query_planning_sync_result;
 use super::file_task::DeltaScanFileTask;
 use super::file_task_partition::{
     DeltaScanFileTaskPartitionOptions, DeltaScanFileTaskPartitionPlan,
@@ -147,14 +148,19 @@ impl ProviderScanPlan {
             files,
             files_filtered_during_planning,
             scan_metadata_exhausted,
-        } = self
-            .kernel_scan
-            .expand_kernel_scan_metadata(&self.table_uri, &self.storage_options)
-            .context(DeltaScanMetadataExpansionSnafu {
-                source_name: self.source_name.clone(),
-                table_uri: self.table_uri.clone(),
-                snapshot_version: self.snapshot_version,
-            })?;
+        } = profile_query_planning_sync_result(
+            "Delta scan metadata expansion",
+            "delta_scan_metadata_expansion",
+            || {
+                self.kernel_scan
+                    .expand_kernel_scan_metadata(&self.table_uri, &self.storage_options)
+                    .context(DeltaScanMetadataExpansionSnafu {
+                        source_name: self.source_name.clone(),
+                        table_uri: self.table_uri.clone(),
+                        snapshot_version: self.snapshot_version,
+                    })
+            },
+        )?;
 
         Ok(ProviderScanMetadataExpansion {
             source_name: self.source_name.clone(),
@@ -183,8 +189,12 @@ impl ProviderScanPlan {
             &self.table_uri,
             self.snapshot_version,
         )?;
-        self.expand_scan_metadata()?
-            .into_file_task_partition_plan(options)
+        let metadata = self.expand_scan_metadata()?;
+        profile_query_planning_sync_result(
+            "Delta file task partitioning",
+            "delta_file_task_partitioning",
+            || metadata.into_file_task_partition_plan(options),
+        )
     }
 }
 

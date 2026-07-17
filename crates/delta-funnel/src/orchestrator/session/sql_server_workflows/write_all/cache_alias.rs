@@ -19,6 +19,7 @@ use crate::{
     query_engine::datafusion::{
         DeltaProviderReadStatsHandle, collect_delta_provider_read_stats_handles,
         execution_profile::QueryExecutionProfileConsumer, instrument_query_execution_plan,
+        with_query_planning_activity,
     },
     report::{OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer},
     support::sanitize_text_for_display,
@@ -427,7 +428,19 @@ impl DeltaFunnelSession {
         let planning_timer = PhaseTimer::start(CACHE_ALIAS_PHYSICAL_PLANNING_PHASE);
         let planning_span =
             start_cache_alias_span(operation_timeline, alias_name, "Build cache physical plan");
-        let physical_plan = match dataframe.create_physical_plan().await {
+        let physical_plan_result = match (profile_mode, operation_timeline) {
+            (ExecutionProfileMode::Detailed, Some(timeline)) => {
+                with_query_planning_activity(
+                    timeline.clone(),
+                    QueryExecutionScope::WriteAllCacheAlias,
+                    Some(alias_name),
+                    dataframe.create_physical_plan(),
+                )
+                .await
+            }
+            _ => dataframe.create_physical_plan().await,
+        };
+        let physical_plan = match physical_plan_result {
             Ok(physical_plan) => physical_plan,
             Err(error) => {
                 fail_cache_alias_span(planning_span);
@@ -1771,6 +1784,49 @@ mod tests {
         assert!(timeline.spans().iter().any(|span| {
             span.name() == "Execute and collect cache"
                 && span.track_name() == "Cache alias: cache_alias"
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detailed_delta_cache_materialization_profiles_planning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_default("cache-planning")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new(
+            "cache_alias",
+            table.path().to_string_lossy().to_string(),
+        ))?;
+        let timeline = OperationTimelineRecorder::start();
+
+        session
+            .materialize_cache_with_timeline(
+                "cache_alias",
+                None,
+                ExecutionProfileMode::Detailed,
+                Some(&timeline),
+            )
+            .await
+            .map_err(CacheAliasPhaseFailure::into_source)?;
+
+        let timeline = timeline.finish(
+            "cache materialization",
+            crate::TimelineSpanStatus::Completed,
+        );
+        let planning_spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == "datafusion.planning.activity")
+            .collect::<Vec<_>>();
+        assert!(
+            planning_spans
+                .iter()
+                .any(|span| span.name() == "Delta scan planning")
+        );
+        assert!(planning_spans.iter().all(|span| {
+            span.track_name() == "DataFusion query planning / cache alias: cache_alias"
+                && span.attributes()["query_scope"] == "write_all_cache_alias"
+                && span.attributes()["query_owner"] == "cache_alias"
         }));
         Ok(())
     }

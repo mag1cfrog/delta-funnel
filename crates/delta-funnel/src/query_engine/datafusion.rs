@@ -16,9 +16,13 @@ mod execution;
 pub(crate) mod execution_profile;
 mod operator_activity;
 mod planning;
+mod planning_activity;
 mod session;
 
 pub(crate) use operator_activity::instrument_query_execution_plan;
+pub(crate) use planning_activity::{
+    profile_query_planning_sync_result, with_query_planning_activity,
+};
 
 pub use catalog::registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources,

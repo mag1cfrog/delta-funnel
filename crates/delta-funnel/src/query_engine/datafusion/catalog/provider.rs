@@ -37,6 +37,7 @@ use super::super::planning::projection::{ProjectionPlan, plan_projection};
 use super::super::planning::scan_plan::{
     ProviderScanPlan, ProviderScanPlanParts, ProviderScanPlanRequest,
 };
+use super::super::profile_query_planning_sync_result;
 use super::registration::reject_mismatched_preflight;
 
 pub(crate) struct DeltaTableProvider {
@@ -153,23 +154,51 @@ impl DeltaTableProvider {
             projected_schema,
             scan_projection,
             projected_column_names,
-        } = self.plan_projection(requested_projection)?;
-        let normalized_pushed_filters = self.normalize_provider_filters(pushed_filters);
-        let pushed_filter_plan = self.plan_normalized_provider_filters(&normalized_pushed_filters);
-        let mut partition_columns = self.partition_columns().into_iter().collect::<Vec<_>>();
-        partition_columns.sort();
-        self.reject_unaccepted_pushed_filters(&pushed_filter_plan)?;
-        self.reject_projected_inexact_pushed_filters_without_residual_columns(
-            &scan_projection,
-            &pushed_filter_plan,
+        } = profile_query_planning_sync_result(
+            "Delta projection planning",
+            "delta_projection_planning",
+            || self.plan_projection(requested_projection),
         )?;
-        let kernel_partition_predicate =
-            self.build_kernel_partition_predicate(&pushed_filter_plan)?;
-        let kernel_projected_column_names =
-            Self::kernel_projected_column_names(projected_column_names, &pushed_filter_plan);
-        let provider_enforced_row_predicate = self.build_provider_enforced_row_predicate(
-            &pushed_filter_plan,
-            kernel_projected_column_names.as_deref(),
+        let (
+            pushed_filter_plan,
+            partition_columns,
+            kernel_partition_predicate,
+            kernel_projected_column_names,
+            provider_enforced_row_predicate,
+        ) = profile_query_planning_sync_result(
+            "Delta filter planning",
+            "delta_filter_planning",
+            || {
+                let normalized_pushed_filters = self.normalize_provider_filters(pushed_filters);
+                let pushed_filter_plan =
+                    self.plan_normalized_provider_filters(&normalized_pushed_filters);
+                let mut partition_columns =
+                    self.partition_columns().into_iter().collect::<Vec<_>>();
+                partition_columns.sort();
+                self.reject_unaccepted_pushed_filters(&pushed_filter_plan)?;
+                self.reject_projected_inexact_pushed_filters_without_residual_columns(
+                    &scan_projection,
+                    &pushed_filter_plan,
+                )?;
+                let kernel_partition_predicate =
+                    self.build_kernel_partition_predicate(&pushed_filter_plan)?;
+                let kernel_projected_column_names = Self::kernel_projected_column_names(
+                    projected_column_names,
+                    &pushed_filter_plan,
+                );
+                let provider_enforced_row_predicate = self.build_provider_enforced_row_predicate(
+                    &pushed_filter_plan,
+                    kernel_projected_column_names.as_deref(),
+                )?;
+
+                Ok::<_, DeltaFunnelError>((
+                    pushed_filter_plan,
+                    partition_columns,
+                    kernel_partition_predicate,
+                    kernel_projected_column_names,
+                    provider_enforced_row_predicate,
+                ))
+            },
         )?;
         let kernel_scan = self.build_kernel_scan(
             kernel_projected_column_names.as_deref(),
@@ -370,26 +399,33 @@ impl DeltaTableProvider {
         kernel_partition_predicate: Option<DeltaKernelPredicate>,
         include_stats_columns: bool,
     ) -> Result<ProjectedDeltaScan, DeltaFunnelError> {
-        let kernel_projected_column_names = projected_column_names.map(|names| names.to_vec());
+        profile_query_planning_sync_result(
+            "Delta Kernel scan construction",
+            "delta_kernel_scan_construction",
+            || {
+                let kernel_projected_column_names =
+                    projected_column_names.map(|names| names.to_vec());
 
-        let result = if include_stats_columns {
-            build_projected_predicated_stats_delta_scan(
-                &self.source,
-                kernel_projected_column_names.as_deref(),
-                kernel_partition_predicate,
-            )
-        } else {
-            build_projected_predicated_delta_scan(
-                &self.source,
-                kernel_projected_column_names.as_deref(),
-                kernel_partition_predicate,
-            )
-        };
+                let result = if include_stats_columns {
+                    build_projected_predicated_stats_delta_scan(
+                        &self.source,
+                        kernel_projected_column_names.as_deref(),
+                        kernel_partition_predicate,
+                    )
+                } else {
+                    build_projected_predicated_delta_scan(
+                        &self.source,
+                        kernel_projected_column_names.as_deref(),
+                        kernel_partition_predicate,
+                    )
+                };
 
-        result.context(DeltaScanConstructionSnafu {
-            source_name: self.source_name().to_owned(),
-            table_uri: self.source.table_uri().to_owned(),
-        })
+                result.context(DeltaScanConstructionSnafu {
+                    source_name: self.source_name().to_owned(),
+                    table_uri: self.source.table_uri().to_owned(),
+                })
+            },
+        )
     }
 
     #[allow(dead_code)]
@@ -502,39 +538,54 @@ impl TableProvider for DeltaTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        // SQL LIMIT is enforced by DataFusion above the provider scan. Treat the
-        // provider limit as advisory until a scan-local limit case is proven
-        // safe across residual filters, joins, deletion vectors, transforms, and
-        // ordering-sensitive plans.
-        let scan_plan = self.plan_scan(ProviderScanPlanRequest {
-            requested_projection: projection.cloned(),
-            pushed_filters: filters.to_vec(),
-        })?;
-        let partition_target_decision = DeltaScanPartitionTargetPolicy::default().derive_target(
-            DeltaScanPartitionTargetContext {
-                source_name: &scan_plan.source_name,
-                table_uri: &scan_plan.table_uri,
-                snapshot_version: scan_plan.snapshot_version,
-            },
-            DeltaScanPartitionTargetConfig::from_scan_targets(
-                state.config().target_partitions(),
-                self.scan_target_partitions,
-            ),
-        )?;
-        let partition_plan = scan_plan
-            .plan_file_task_partitions(partition_target_decision.file_task_partition_options())?;
-        let execution_options = self
-            .execution_options
-            .with_default_scan_wide_capacity_for_target_partitions(
-                partition_target_decision.target_partitions,
+        profile_query_planning_sync_result("Delta scan planning", "delta_scan_planning", || {
+            // SQL LIMIT is enforced by DataFusion above the provider scan. Treat the
+            // provider limit as advisory until a scan-local limit case is proven
+            // safe across residual filters, joins, deletion vectors, transforms, and
+            // ordering-sensitive plans.
+            let scan_plan = self.plan_scan(ProviderScanPlanRequest {
+                requested_projection: projection.cloned(),
+                pushed_filters: filters.to_vec(),
+            })?;
+            let partition_target_decision = profile_query_planning_sync_result(
+                "Delta partition target selection",
+                "delta_partition_target_selection",
+                || {
+                    DeltaScanPartitionTargetPolicy::default().derive_target(
+                        DeltaScanPartitionTargetContext {
+                            source_name: &scan_plan.source_name,
+                            table_uri: &scan_plan.table_uri,
+                            snapshot_version: scan_plan.snapshot_version,
+                        },
+                        DeltaScanPartitionTargetConfig::from_scan_targets(
+                            state.config().target_partitions(),
+                            self.scan_target_partitions,
+                        ),
+                    )
+                },
+            )?;
+            let partition_plan = scan_plan.plan_file_task_partitions(
+                partition_target_decision.file_task_partition_options(),
+            )?;
+            let execution_options = profile_query_planning_sync_result(
+                "Delta scan execution setup",
+                "delta_scan_execution_setup",
+                || {
+                    self.execution_options
+                        .with_default_scan_wide_capacity_for_target_partitions(
+                            partition_target_decision.target_partitions,
+                        )
+                },
             )?;
 
-        Ok(Arc::new(DeltaScanPlanningExec::new(
-            scan_plan,
-            partition_plan,
-            partition_target_decision,
-            execution_options,
-        )))
+            Ok(Arc::new(DeltaScanPlanningExec::new(
+                scan_plan,
+                partition_plan,
+                partition_target_decision,
+                execution_options,
+            ))
+                as Arc<dyn datafusion::physical_plan::ExecutionPlan>)
+        })
     }
 
     fn supports_filters_pushdown(

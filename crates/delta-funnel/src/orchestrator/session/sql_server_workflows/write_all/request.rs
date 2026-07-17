@@ -1787,6 +1787,59 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn uncached_write_all_profiles_delta_planning_per_output()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let table = RealParquetDeltaTable::new_default("write-all-planning")?;
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let shared = session.delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))?;
+            let first = execute_output_request(
+                shared.clone(),
+                "first_output",
+                "first_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let second = execute_output_request(
+                shared,
+                "second_output",
+                "second_orders",
+                LoadMode::AppendExisting,
+            )?;
+
+            let report = session
+                .write_all_with_options_and_writer(
+                    &[first, second],
+                    detailed_uncached_write_all_options(),
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+
+            let timeline = report
+                .operation_timeline()
+                .ok_or("expected write-all operation timeline")?;
+            let planning_spans = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == "datafusion.planning.activity")
+                .collect::<Vec<_>>();
+            for output_name in ["first_output", "second_output"] {
+                let expected_track =
+                    format!("DataFusion query planning / SQL output: {output_name}");
+                assert!(planning_spans.iter().any(|span| {
+                    span.name() == "Delta scan planning"
+                        && span.track_name() == expected_track
+                        && span.attributes()["query_scope"] == "mssql_output"
+                        && span.attributes()["query_owner"] == output_name
+                }));
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn uncached_detailed_mode_nests_failed_profile_and_skipped_null_once()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(

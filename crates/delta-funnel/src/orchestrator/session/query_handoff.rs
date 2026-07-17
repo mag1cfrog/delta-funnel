@@ -36,7 +36,7 @@ use crate::{
             delta_provider_read_stats_snapshot_set,
         },
         profiled_datafusion_query_output_stream_with_effective_root,
-        snapshot_delta_provider_read_stats,
+        snapshot_delta_provider_read_stats, with_query_planning_activity,
     },
     report::{OperationTimelineRecorder, OperationTimelineSpanRecorder},
     usize_to_u64_saturating,
@@ -863,7 +863,19 @@ impl DeltaFunnelSession {
         timings.record_completed(dataframe_timer);
 
         let physical_plan_timer = timings.start_phase(PREVIEW_PHYSICAL_PLANNING_PHASE);
-        let physical_plan = match dataframe.create_physical_plan().await {
+        let physical_plan_result = match options.execution_profile_mode() {
+            ExecutionProfileMode::Disabled => dataframe.create_physical_plan().await,
+            ExecutionProfileMode::Detailed => {
+                with_query_planning_activity(
+                    timings.timeline.clone(),
+                    QueryExecutionScope::Preview,
+                    None,
+                    dataframe.create_physical_plan(),
+                )
+                .await
+            }
+        };
+        let physical_plan = match physical_plan_result {
             Ok(physical_plan) => physical_plan,
             Err(error) => {
                 let source = datafusion_handoff_setup_error("preview_collect", error);
@@ -2713,6 +2725,69 @@ mod tests {
         assert_eq!(snapshot.source_name, "orders");
         assert!(snapshot.files_planned > 0);
         assert!(snapshot.rows_produced > 0);
+        let planning_spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == "datafusion.planning.activity")
+            .collect::<Vec<_>>();
+        for name in [
+            "Delta scan planning",
+            "Delta projection planning",
+            "Delta filter planning",
+            "Delta Kernel scan construction",
+            "Delta partition target selection",
+            "Delta scan metadata expansion",
+            "Delta file task partitioning",
+            "Delta scan execution setup",
+        ] {
+            assert!(planning_spans.iter().any(|span| span.name() == name));
+        }
+        let physical_planning = timeline
+            .spans()
+            .iter()
+            .find(|span| {
+                span.category() == "delta_funnel.preview.phase"
+                    && span.name() == "Physical planning"
+            })
+            .ok_or("expected physical planning phase")?;
+        for span in &planning_spans {
+            assert_eq!(span.track_name(), "DataFusion query planning / preview");
+            assert_eq!(span.status(), TimelineSpanStatus::Completed);
+            assert_eq!(span.attributes()["result"], "ok");
+            assert_eq!(span.attributes()["query_scope"], "preview");
+            assert_eq!(span.attributes().get("query_owner"), None);
+            assert!(physical_planning.start_offset_micros() <= span.start_offset_micros());
+            assert!(
+                physical_planning
+                    .start_offset_micros()
+                    .saturating_add(physical_planning.duration_micros())
+                    >= span
+                        .start_offset_micros()
+                        .saturating_add(span.duration_micros())
+            );
+
+            if span.name() == "Delta scan planning" {
+                assert_eq!(span.parent_id(), None);
+                continue;
+            }
+            let parent_id = span
+                .parent_id()
+                .ok_or("expected planning activity parent")?;
+            let parent = planning_spans
+                .iter()
+                .find(|candidate| candidate.id() == parent_id)
+                .ok_or("expected recorded planning activity parent")?;
+            assert_eq!(parent.track_name(), span.track_name());
+            assert!(parent.start_offset_micros() <= span.start_offset_micros());
+            assert!(
+                parent
+                    .start_offset_micros()
+                    .saturating_add(parent.duration_micros())
+                    >= span
+                        .start_offset_micros()
+                        .saturating_add(span.duration_micros())
+            );
+        }
         let activity_spans = timeline
             .spans()
             .iter()
@@ -2810,6 +2885,13 @@ mod tests {
             .filter(|event| event["cat"] == "datafusion.operator.wait")
             .count();
         assert_eq!(wait_event_count, wait_spans.len());
+        let planning_event_count = trace["traceEvents"]
+            .as_array()
+            .ok_or("expected trace events")?
+            .iter()
+            .filter(|event| event["cat"] == "datafusion.planning.activity")
+            .count();
+        assert_eq!(planning_event_count, planning_spans.len());
         let provider_events = provider_io_events(capture.captured());
         assert_eq!(provider_events.len(), 1);
         assert_provider_io_event_matches_snapshot(&provider_events[0], snapshot, "success");

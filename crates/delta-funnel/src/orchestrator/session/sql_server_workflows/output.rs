@@ -10,6 +10,7 @@ use crate::{
     QueryExecutionProfile, QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget,
     TimelineSpanStatus, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
+    query_engine::datafusion::with_query_planning_activity,
     report::{OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer},
     sql_server::write_planned_output_batches_to_mssql_for_workflow,
 };
@@ -551,7 +552,19 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_time
             planned.resolved_target().output_name().to_owned().into(),
         )
     });
-    let physical_plan = match dataframe.create_physical_plan().await {
+    let physical_plan_result = match (profile_mode, timeline) {
+        (ExecutionProfileMode::Detailed, Some(timeline)) => {
+            with_query_planning_activity(
+                timeline.clone(),
+                QueryExecutionScope::MssqlOutput,
+                Some(planned.resolved_target().output_name()),
+                dataframe.create_physical_plan(),
+            )
+            .await
+        }
+        _ => dataframe.create_physical_plan().await,
+    };
+    let physical_plan = match physical_plan_result {
         Ok(physical_plan) => physical_plan,
         Err(error) => {
             fail_write_span(physical_plan_span);
@@ -2541,7 +2554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_to_mssql_with_writer_executes_real_delta_source_fixture()
+    async fn detailed_write_executes_real_delta_source_fixture_and_profiles_planning()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("orders")?;
         let mut session = DeltaFunnelSession::new(
@@ -2563,7 +2576,11 @@ mod tests {
         let mut writer = FakeOrchestratorWriter::default();
 
         let report = session
-            .write_to_mssql_with_writer(&request, &mut writer)
+            .write_to_mssql_with_writer_and_profile_mode(
+                &request,
+                &mut writer,
+                ExecutionProfileMode::Detailed,
+            )
             .await?;
 
         assert_eq!(writer.calls.len(), 1);
@@ -2574,6 +2591,22 @@ mod tests {
         assert_eq!(call.schema_fields, 2);
         assert_eq!(report.stats().rows_written(), u64::try_from(table.rows())?);
         assert_eq!(report.stats().batches_written(), call.batches);
+        let timeline = report.operation_timeline().ok_or("expected timeline")?;
+        let planning_spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == "datafusion.planning.activity")
+            .collect::<Vec<_>>();
+        assert!(
+            planning_spans
+                .iter()
+                .any(|span| span.name() == "Delta scan planning")
+        );
+        assert!(planning_spans.iter().all(|span| {
+            span.track_name() == "DataFusion query planning / SQL output: orders_output"
+                && span.attributes()["query_scope"] == "mssql_output"
+                && span.attributes()["query_owner"] == "orders_output"
+        }));
         Ok(())
     }
 
