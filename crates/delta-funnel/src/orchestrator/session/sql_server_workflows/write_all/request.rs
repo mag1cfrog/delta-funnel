@@ -1760,7 +1760,7 @@ mod tests {
                 .collect::<Vec<_>>();
             query_execution_ids.sort_unstable();
             query_execution_ids.dedup();
-            assert_eq!(query_execution_ids.len(), 2);
+            assert_eq!(query_execution_ids, [1, 2]);
             assert!(activity_spans.iter().all(|span| {
                 span.attributes()["worker_lane_id"].is_u64()
                     && span.attributes()["worker_kind"].is_string()

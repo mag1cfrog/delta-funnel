@@ -33,7 +33,6 @@ use crate::{
 
 const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
 const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
-static NEXT_QUERY_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivityWorkerKind {
@@ -114,9 +113,10 @@ impl OperatorActivityRecorder {
     }
 
     fn with_max_spans(timeline: OperationTimelineRecorder, maximum_spans: u64) -> Self {
+        let query_execution_id = timeline.next_query_execution_id();
         Self {
             timeline,
-            query_execution_id: NEXT_QUERY_EXECUTION_ID.fetch_add(1, Ordering::Relaxed),
+            query_execution_id,
             identities: Arc::new(Mutex::new(OperatorActivityIdentityState::default())),
             maximum_spans,
             remaining_spans: Arc::new(AtomicU64::new(maximum_spans)),
@@ -533,6 +533,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn query_execution_ids_are_local_to_each_operation_timeline() {
+        let first_timeline = OperationTimelineRecorder::start();
+        let first_query = OperatorActivityRecorder::new(first_timeline.clone());
+        let second_query = OperatorActivityRecorder::new(first_timeline);
+        let separate_timeline = OperationTimelineRecorder::start();
+        let separate_query = OperatorActivityRecorder::new(separate_timeline);
+
+        assert_eq!(first_query.query_execution_id, 1);
+        assert_eq!(second_query.query_execution_id, 2);
+        assert_eq!(separate_query.query_execution_id, 1);
+    }
 
     #[test]
     fn activity_limit_records_one_visible_truncation_marker() {

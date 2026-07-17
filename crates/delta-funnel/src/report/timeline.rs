@@ -228,6 +228,7 @@ impl OperationTimeline {
 #[derive(Debug)]
 struct OperationTimelineRecorderState {
     next_span_id: u64,
+    next_query_execution_id: u64,
     spans: Vec<TimelineSpan>,
 }
 
@@ -252,9 +253,17 @@ impl OperationTimelineRecorder {
             wall_clock_origin_nanos,
             state: Arc::new(Mutex::new(OperationTimelineRecorderState {
                 next_span_id: 1,
+                next_query_execution_id: 1,
                 spans: Vec::new(),
             })),
         }
+    }
+
+    pub(crate) fn next_query_execution_id(&self) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let id = state.next_query_execution_id;
+        state.next_query_execution_id = state.next_query_execution_id.saturating_add(1);
+        id
     }
 
     pub(crate) fn start_span(
