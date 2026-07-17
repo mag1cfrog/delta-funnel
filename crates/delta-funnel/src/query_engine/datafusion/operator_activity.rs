@@ -276,7 +276,10 @@ impl OperatorActivityRecorder {
                 .start_span(
                     "Operator activity trace truncated",
                     OPERATOR_ACTIVITY_CATEGORY,
-                    "DataFusion operator activity",
+                    format!(
+                        "DataFusion query {} / trace status",
+                        self.query_execution_id
+                    ),
                 )
                 .with_attribute("query_execution_id", Value::from(self.query_execution_id))
                 .with_attribute("maximum_spans", Value::from(self.maximum_spans))
@@ -577,13 +580,15 @@ mod tests {
         assert_eq!(activity_span.attributes()["worker_lane_id"], 0);
         assert_eq!(activity_span.attributes()["worker_kind"], "coordinator");
         assert_eq!(activity_span.attributes()["runtime_task_id"], Value::Null);
+        let truncation_markers = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.name() == "Operator activity trace truncated")
+            .collect::<Vec<_>>();
+        assert_eq!(truncation_markers.len(), 1);
         assert_eq!(
-            timeline
-                .spans()
-                .iter()
-                .filter(|span| span.name() == "Operator activity trace truncated")
-                .count(),
-            1
+            truncation_markers[0].track_name(),
+            "DataFusion query 1 / trace status"
         );
     }
 
