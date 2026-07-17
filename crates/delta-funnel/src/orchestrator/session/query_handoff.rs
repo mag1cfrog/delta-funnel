@@ -1344,6 +1344,7 @@ mod tests {
         let timeline = context
             .operation_timeline()
             .ok_or("expected preview failure timeline")?;
+        crate::report::trace_contract::validate_operation_trace(timeline)?;
         assert_eq!(timeline.status(), TimelineSpanStatus::Failed);
         assert_eq!(
             timeline.total_duration_micros(),
@@ -2527,6 +2528,7 @@ mod tests {
             let timeline = preview
                 .operation_timeline()
                 .ok_or("expected detailed preview timeline")?;
+            crate::report::trace_contract::validate_operation_trace(timeline)?;
             assert_eq!(timeline.status(), TimelineSpanStatus::Completed);
             let phase_spans = timeline
                 .spans()

@@ -816,6 +816,11 @@ mod tests {
         assert_eq!(profile.outcome(), outcome);
         assert!(profile.partial());
         assert!(skipped.is_skipped());
+        crate::report::trace_contract::validate_operation_trace(
+            report
+                .operation_timeline()
+                .ok_or("expected failed write-all timeline")?,
+        )?;
         Ok(())
     }
 
@@ -1697,6 +1702,7 @@ mod tests {
             let timeline = report
                 .operation_timeline()
                 .ok_or("expected write-all operation timeline")?;
+            crate::report::trace_contract::validate_operation_trace(timeline)?;
             assert_eq!(timeline.name(), "SQL Server write_all");
             assert_eq!(timeline.status().as_str(), "completed");
             for expected_name in [

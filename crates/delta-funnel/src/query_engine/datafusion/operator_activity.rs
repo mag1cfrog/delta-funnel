@@ -611,6 +611,8 @@ mod tests {
         );
 
         let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        crate::report::trace_contract::validate_truncated_operation_trace(&timeline)
+            .expect("truncated operator timeline should satisfy the trace contract");
         let activity_span = timeline
             .spans()
             .iter()

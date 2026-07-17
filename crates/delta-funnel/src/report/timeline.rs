@@ -229,6 +229,8 @@ impl OperationTimeline {
 struct OperationTimelineRecorderState {
     next_span_id: u64,
     next_query_execution_id: u64,
+    finished_duration: Option<Duration>,
+    pending_spans: BTreeMap<u64, Arc<Mutex<PendingTimelineSpan>>>,
     spans: Vec<TimelineSpan>,
 }
 
@@ -254,6 +256,8 @@ impl OperationTimelineRecorder {
             state: Arc::new(Mutex::new(OperationTimelineRecorderState {
                 next_span_id: 1,
                 next_query_execution_id: 1,
+                finished_duration: None,
+                pending_spans: BTreeMap::new(),
                 spans: Vec::new(),
             })),
         }
@@ -272,25 +276,31 @@ impl OperationTimelineRecorder {
         category: impl Into<String>,
         track_name: impl Into<String>,
     ) -> OperationTimelineSpanRecorder {
-        let id = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            let id = state.next_span_id;
-            state.next_span_id = state.next_span_id.saturating_add(1);
-            id
-        };
-        let started_at = Instant::now();
-        let start_offset = started_at.saturating_duration_since(self.started_at);
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.finished_duration.is_some() {
+            return OperationTimelineSpanRecorder {
+                recorder: self.clone(),
+                span_id: None,
+                span: None,
+            };
+        }
+        let id = state.next_span_id;
+        state.next_span_id = state.next_span_id.saturating_add(1);
+        let start_offset = Instant::now().saturating_duration_since(self.started_at);
+        let span = Arc::new(Mutex::new(PendingTimelineSpan {
+            id,
+            parent_id: None,
+            name: name.into(),
+            category: category.into(),
+            track_name: track_name.into(),
+            start_offset,
+            attributes: BTreeMap::new(),
+        }));
+        state.pending_spans.insert(id, Arc::clone(&span));
         OperationTimelineSpanRecorder {
             recorder: self.clone(),
-            span: Some(PendingTimelineSpan {
-                id,
-                parent_id: None,
-                name: name.into(),
-                category: category.into(),
-                track_name: track_name.into(),
-                start_offset,
-                attributes: BTreeMap::new(),
-            }),
+            span_id: Some(id),
+            span: Some(span),
         }
     }
 
@@ -304,6 +314,9 @@ impl OperationTimelineRecorder {
 
     fn append_spans_with_fresh_ids(&self, spans: impl IntoIterator<Item = TimelineSpan>) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.finished_duration.is_some() {
+            return;
+        }
         for mut span in spans {
             span.id = state.next_span_id;
             state.next_span_id = state.next_span_id.saturating_add(1);
@@ -346,44 +359,86 @@ impl OperationTimelineRecorder {
         name: impl Into<String>,
         status: TimelineSpanStatus,
     ) -> OperationTimeline {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let total_duration = self.elapsed();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let total_duration = match state.finished_duration {
+            Some(duration) => duration,
+            None => {
+                // The state lock makes this cutoff atomic with span starts and
+                // completions. Pending spans belong to the finished snapshot.
+                let duration = self.elapsed();
+                for pending in std::mem::take(&mut state.pending_spans).into_values() {
+                    let pending = pending
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone();
+                    let (span, _) =
+                        finish_pending_span(pending, TimelineSpanStatus::Cancelled, duration);
+                    state.spans.push(span);
+                }
+                state.finished_duration = Some(duration);
+                duration
+            }
+        };
         let mut spans = state.spans.clone();
         spans.sort_by_key(|span| (span.start_offset_micros(), span.id()));
         OperationTimeline::new(name, status, total_duration, spans)
     }
 
-    fn record(&self, pending: PendingTimelineSpan, status: TimelineSpanStatus) -> Duration {
-        let finished_at = Instant::now();
-        let end_offset = finished_at.saturating_duration_since(self.started_at);
-        let start_offset_micros = duration_to_micros_saturating(pending.start_offset);
-        let end_offset_micros = duration_to_micros_saturating(end_offset);
-        let duration = Duration::from_micros(end_offset_micros.saturating_sub(start_offset_micros));
-        let span = TimelineSpan::new(
-            pending.id,
-            pending.parent_id,
-            pending.name,
-            pending.category,
-            pending.start_offset,
-            duration,
-            status,
-            TimelineSpanTimeSemantics::WallClock,
-        )
-        .with_track_name(pending.track_name);
-        let span = pending
-            .attributes
-            .into_iter()
-            .fold(span, |span, (name, value)| span.with_attribute(name, value));
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .spans
-            .push(span);
-        duration
+    fn record(
+        &self,
+        id: u64,
+        pending: Arc<Mutex<PendingTimelineSpan>>,
+        status: TimelineSpanStatus,
+    ) -> Option<Duration> {
+        let end_offset = Instant::now().saturating_duration_since(self.started_at);
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // Removing the registration decides whether completion or the one-time
+        // snapshot won the race. A missing registration means the snapshot won.
+        let registered = state.pending_spans.remove(&id)?;
+        debug_assert!(Arc::ptr_eq(&registered, &pending));
+        drop(registered);
+        let pending = match Arc::try_unwrap(pending) {
+            Ok(pending) => pending
+                .into_inner()
+                .unwrap_or_else(|error| error.into_inner()),
+            Err(pending) => pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+        };
+        let (span, duration) = finish_pending_span(pending, status, end_offset);
+        state.spans.push(span);
+        Some(duration)
     }
 }
 
-#[derive(Debug)]
+fn finish_pending_span(
+    pending: PendingTimelineSpan,
+    status: TimelineSpanStatus,
+    end_offset: Duration,
+) -> (TimelineSpan, Duration) {
+    let start_offset_micros = duration_to_micros_saturating(pending.start_offset);
+    let end_offset_micros = duration_to_micros_saturating(end_offset);
+    let duration = Duration::from_micros(end_offset_micros.saturating_sub(start_offset_micros));
+    let span = TimelineSpan::new(
+        pending.id,
+        pending.parent_id,
+        pending.name,
+        pending.category,
+        pending.start_offset,
+        duration,
+        status,
+        TimelineSpanTimeSemantics::WallClock,
+    )
+    .with_track_name(pending.track_name);
+    let span = pending
+        .attributes
+        .into_iter()
+        .fold(span, |span, (name, value)| span.with_attribute(name, value));
+    (span, duration)
+}
+
+#[derive(Debug, Clone)]
 struct PendingTimelineSpan {
     id: u64,
     parent_id: Option<u64>,
@@ -398,24 +453,30 @@ struct PendingTimelineSpan {
 #[derive(Debug)]
 pub(crate) struct OperationTimelineSpanRecorder {
     recorder: OperationTimelineRecorder,
-    span: Option<PendingTimelineSpan>,
+    span_id: Option<u64>,
+    span: Option<Arc<Mutex<PendingTimelineSpan>>>,
 }
 
 impl OperationTimelineSpanRecorder {
     pub(crate) fn id(&self) -> Option<u64> {
-        self.span.as_ref().map(|span| span.id)
+        self.span_id
     }
 
-    pub(crate) fn with_parent_id(mut self, parent_id: Option<u64>) -> Self {
-        if let Some(span) = &mut self.span {
-            span.parent_id = parent_id;
+    pub(crate) fn with_parent_id(self, parent_id: Option<u64>) -> Self {
+        if let Some(span) = &self.span {
+            span.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .parent_id = parent_id;
         }
         self
     }
 
-    pub(crate) fn with_attribute(mut self, name: impl Into<String>, value: Value) -> Self {
-        if let Some(span) = &mut self.span {
-            span.attributes.insert(name.into(), value);
+    pub(crate) fn with_attribute(self, name: impl Into<String>, value: Value) -> Self {
+        if let Some(span) = &self.span {
+            span.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .attributes
+                .insert(name.into(), value);
         }
         self
     }
@@ -433,10 +494,8 @@ impl OperationTimelineSpanRecorder {
     }
 
     fn finish(&mut self, status: TimelineSpanStatus) -> Option<Duration> {
-        if let Some(span) = self.span.take() {
-            return Some(self.recorder.record(span, status));
-        }
-        None
+        self.recorder
+            .record(self.span_id.take()?, self.span.take()?, status)
     }
 }
 
@@ -517,6 +576,8 @@ mod tests {
         parent.completed();
 
         let timeline = recorder.finish("nested", TimelineSpanStatus::Completed);
+        crate::report::trace_contract::validate_operation_trace(&timeline)
+            .expect("nested recorder timeline should satisfy the trace contract");
         let parent = timeline
             .spans()
             .iter()
@@ -584,6 +645,8 @@ mod tests {
         });
 
         let timeline = recorder.finish("concurrent", TimelineSpanStatus::Completed);
+        crate::report::trace_contract::validate_operation_trace(&timeline)
+            .expect("concurrent recorder timeline should satisfy the trace contract");
         let ids = timeline
             .spans()
             .iter()
@@ -597,43 +660,90 @@ mod tests {
     }
 
     #[test]
-    fn finish_keeps_every_snapshotted_span_inside_the_root_duration() {
+    fn finish_cancels_active_span_at_cutoff_and_late_completion_is_a_noop() {
         let recorder = OperationTimelineRecorder::start();
-        let mut state = recorder
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (ready, finishing) = std::sync::mpsc::channel();
-        let finishing_recorder = recorder.clone();
-        let handle = std::thread::spawn(move || {
-            ready
-                .send(())
-                .expect("finish thread should signal readiness");
-            finishing_recorder.finish("concurrent", TimelineSpanStatus::Completed)
+        let span = recorder
+            .start_span("active", "test", "test track")
+            .with_attribute("detail", json!("preserved"));
+        let span_id = span.id().expect("active span should have an ID");
+
+        let timeline = recorder.finish("operation", TimelineSpanStatus::Completed);
+        let snapshotted = timeline
+            .spans()
+            .iter()
+            .find(|span| span.id() == span_id)
+            .expect("active span should be included in the snapshot");
+        assert_eq!(snapshotted.status(), TimelineSpanStatus::Cancelled);
+        assert_eq!(snapshotted.attributes()["detail"], "preserved");
+        assert_eq!(
+            snapshotted
+                .start_offset_micros()
+                .checked_add(snapshotted.duration_micros()),
+            Some(timeline.total_duration_micros())
+        );
+        crate::report::trace_contract::validate_operation_trace(&timeline)
+            .expect("snapshot should satisfy the structural trace contract");
+
+        span.completed();
+        let repeated = recorder.finish("operation", TimelineSpanStatus::Completed);
+        assert_eq!(
+            repeated, timeline,
+            "late completion must not mutate the snapshot"
+        );
+    }
+
+    #[test]
+    fn concurrent_finish_snapshots_active_span_once() {
+        let recorder = Arc::new(OperationTimelineRecorder::start());
+        let (started, wait_for_start) = std::sync::mpsc::sync_channel(0);
+        let (allow_completion, wait_for_completion) = std::sync::mpsc::sync_channel(0);
+        let worker_recorder = Arc::clone(&recorder);
+        let worker = std::thread::spawn(move || {
+            let span = worker_recorder.start_span("worker", "test", "worker track");
+            let id = span.id().expect("worker span should have an ID");
+            started.send(id).expect("start signal should be received");
+            wait_for_completion
+                .recv()
+                .expect("completion signal should be sent");
+            span.completed();
         });
-        finishing
-            .recv()
-            .expect("finish thread should reach the snapshot");
-        std::thread::sleep(Duration::from_millis(50));
+        let span_id = wait_for_start.recv().expect("worker should start its span");
 
-        let span_id = state.next_span_id;
-        state.spans.push(TimelineSpan::new(
-            span_id,
-            None,
-            "concurrent span",
-            "test",
-            recorder.elapsed(),
-            Duration::ZERO,
-            TimelineSpanStatus::Completed,
-            TimelineSpanTimeSemantics::WallClock,
-        ));
-        drop(state);
+        let timeline = recorder.finish("operation", TimelineSpanStatus::Completed);
+        allow_completion
+            .send(())
+            .expect("worker should receive completion signal");
+        worker.join().expect("worker should not panic");
 
-        let timeline = handle.join().expect("finish thread should not panic");
-        assert!(timeline.spans().iter().all(|span| {
-            span.start_offset_micros()
-                .saturating_add(span.duration_micros())
-                <= timeline.total_duration_micros()
-        }));
+        assert_eq!(
+            timeline
+                .spans()
+                .iter()
+                .filter(|span| span.id() == span_id)
+                .map(TimelineSpan::status)
+                .collect::<Vec<_>>(),
+            [TimelineSpanStatus::Cancelled]
+        );
+        assert_eq!(
+            recorder.finish("operation", TimelineSpanStatus::Completed),
+            timeline
+        );
+        crate::report::trace_contract::validate_operation_trace(&timeline)
+            .expect("concurrent snapshot should satisfy the trace contract");
+    }
+
+    #[test]
+    fn finished_recorder_rejects_new_spans() {
+        let recorder = OperationTimelineRecorder::start();
+        let timeline = recorder.finish("operation", TimelineSpanStatus::Completed);
+
+        let span = recorder.start_span("late", "test", "test track");
+        assert_eq!(span.id(), None);
+        span.completed();
+
+        assert_eq!(
+            recorder.finish("operation", TimelineSpanStatus::Completed),
+            timeline
+        );
     }
 }
