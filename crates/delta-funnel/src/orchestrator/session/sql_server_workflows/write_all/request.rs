@@ -1748,6 +1748,24 @@ mod tests {
                 span.track_name()
                     .starts_with(&format!("Output: {output_name} / "))
             }));
+            let activity_spans = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == "datafusion.operator.activity")
+                .collect::<Vec<_>>();
+            assert!(!activity_spans.is_empty());
+            let mut query_execution_ids = activity_spans
+                .iter()
+                .filter_map(|span| span.attributes()["query_execution_id"].as_u64())
+                .collect::<Vec<_>>();
+            query_execution_ids.sort_unstable();
+            query_execution_ids.dedup();
+            assert_eq!(query_execution_ids, [1, 2]);
+            assert!(activity_spans.iter().all(|span| {
+                span.attributes()["worker_lane_id"].is_u64()
+                    && span.attributes()["worker_kind"].is_string()
+                    && span.track_name().starts_with("DataFusion query ")
+            }));
             assert!(timeline.spans().iter().all(|span| {
                 span.start_offset_micros()
                     .saturating_add(span.duration_micros())
@@ -1765,6 +1783,73 @@ mod tests {
                     && event.fields.get("outcome").map(String::as_str) == Some("success")
             }));
 
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn uncached_write_all_profiles_delta_planning_per_output()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let table = RealParquetDeltaTable::new_default("write-all-planning")?;
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let shared = session.delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))?;
+            let first = execute_output_request(
+                shared.clone(),
+                "first_output",
+                "first_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let second = execute_output_request(
+                shared,
+                "second_output",
+                "second_orders",
+                LoadMode::AppendExisting,
+            )?;
+
+            let report = session
+                .write_all_with_options_and_writer(
+                    &[first, second],
+                    detailed_uncached_write_all_options(),
+                    FakeWorkflowWriter::default(),
+                )
+                .await?;
+
+            let timeline = report
+                .operation_timeline()
+                .ok_or("expected write-all operation timeline")?;
+            let planning_spans = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == "datafusion.planning.activity")
+                .collect::<Vec<_>>();
+            let activity_spans = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == "datafusion.operator.activity")
+                .collect::<Vec<_>>();
+            for output_name in ["first_output", "second_output"] {
+                let expected_track =
+                    format!("DataFusion query planning / SQL output: {output_name}");
+                let planning = planning_spans
+                    .iter()
+                    .find(|span| {
+                        span.name() == "Delta scan planning"
+                            && span.track_name() == expected_track
+                            && span.attributes()["query_scope"] == "mssql_output"
+                            && span.attributes()["query_owner"] == output_name
+                    })
+                    .ok_or("expected output planning span")?;
+                assert!(activity_spans.iter().any(|span| {
+                    span.attributes()["query_execution_id"]
+                        == planning.attributes()["query_execution_id"]
+                        && span.attributes()["query_scope"] == "mssql_output"
+                        && span.attributes()["query_owner"] == output_name
+                }));
+            }
             Ok(())
         }
 

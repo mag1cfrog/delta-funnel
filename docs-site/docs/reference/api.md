@@ -68,9 +68,14 @@ display.
 `Preview.export_trace(path)` writes the full preview wall-clock timeline as
 Chrome Trace Event JSON. The root event covers the complete preview, and child
 events position planning, stream setup, execution, formatting, and available
-DataFusion operator lifecycles on that same clock. `path` accepts a string or
-`os.PathLike[str]`. The method creates or replaces the file, but does not create
-missing parent directories. It raises `DeltaFunnelError` with
+DataFusion operator lifecycles on that same clock. Detailed previews also
+include wall-clock `execute` and `poll_next` activity grouped by query execution
+and executor worker. Each worker lane remains sequential or properly nested
+while Tokio task IDs remain event metadata. VizViewer's `Filter by Thread`
+selector can choose one exact displayed worker lane.
+`path` accepts a string or `os.PathLike[str]`. The method creates or replaces
+the file, but does not create missing parent directories. It raises
+`DeltaFunnelError` with
 `kind="execution_profile_unavailable"` when the preview was not created with
 `profile=True`; file-system failures raise `OSError`.
 
@@ -148,8 +153,11 @@ write, the destination receives Chrome Trace Event JSON. The root event covers
 the complete one-output wall clock, while positioned child events cover
 planning, SQL Server lifecycle work, query stream polls, per-batch validation
 and writes, finalization, target validation, swap, cleanup, and available
-DataFusion operator lifecycles. A failed write leaves an existing destination
-unchanged and removes a newly reserved file.
+DataFusion operator lifecycles. Detailed output queries also record wall-clock
+operator activity grouped by query and executor worker and nested Delta provider
+planning activity. Shared query IDs, scopes, and owners connect planning and
+execution tracks. A failed write leaves an existing
+destination unchanged and removes a newly reserved file.
 
 Final serialization and file writes still happen after SQL Server reports
 success. A resulting Python error carries
@@ -216,8 +224,10 @@ the destination before SQL Server work starts. A returned `write_all` report
 writes one Chrome Trace Event JSON document even when the report contains
 failed or skipped outputs. The root event is the full `write_all` duration, and
 its positioned spans include top-level phases, attempted outputs, SQL Server
-work, and output-query operator lifecycles. The same relative model is
-available at `report["operation_timeline"]`.
+work, output-query operator lifecycles, and wall-clock operator activity for
+output and cache-materialization queries. Nested Delta planning activity uses
+the same query identity as worker activity. The same relative model is available
+at `report["operation_timeline"]`.
 
 A top-level planning, cache, or orchestration exception leaves an existing
 destination unchanged and removes a newly reserved file. A final export error

@@ -254,6 +254,14 @@ stream setup, execution and collection, and text and HTML formatting. Each
 phase is positioned beneath that same origin, so an eight-second preview is
 shown on an eight-second timeline rather than an execution-only subset.
 
+Detailed profiling records nested Delta provider work performed while
+DataFusion builds the physical plan. These events use the
+`datafusion.planning.activity` category and a `DataFusion query planning`
+track. The current activities are Delta scan planning, projection and filter
+planning, Delta Kernel scan construction, partition target selection, scan
+metadata expansion, file-task partitioning, and scan execution setup. Parent
+IDs preserve the call hierarchy beneath `Delta scan planning`.
+
 Physical operator partitions with usable `start_timestamp` and `end_timestamp`
 metrics are mapped onto the same preview origin. Their category is
 `datafusion.operator.lifecycle`, and their `time_semantics` argument is
@@ -261,26 +269,58 @@ metrics are mapped onto the same preview origin. Their category is
 operator stream existed, including waiting for upstream or downstream work. It
 does not claim that the operator was actively computing for the entire bar.
 
-Use the phase events first to identify whether planning, execution, or
-formatting dominates the preview. Then inspect operator lifecycle events and
-their arguments for metrics such as `output_rows` and `elapsed_compute` when
-DataFusion exposes them. `elapsed_compute` remains an aggregate metric in the
-event arguments and is not positioned as a fabricated wall-clock span. The
-top-level `delta_funnel_timeline` field preserves the relative timeline data,
-while `delta_funnel_profile` preserves the complete redacted operator profile.
+Detailed preview profiling also records each operator's `execute` call and each
+synchronous `poll_next` interval. These events use the
+`datafusion.operator.activity` category and `wall_clock` time semantics. They
+share tracks by query execution and executor worker, so each worker shows one
+sequential or properly nested top-down call stack. A synchronous host thread
+that polls the merged result uses a separate coordinator track. In VizViewer,
+use the funnel's `Filter by Thread` selector to choose one exact track such as
+`DataFusion query 1 / worker 2`; the name field uses substring matching.
+The `activity` and `result` arguments distinguish stream creation, batches,
+pending polls, end-of-stream, and errors. `query_execution_id`,
+`worker_lane_id`, `worker_kind`, and `execution_stream_id` identify the
+execution context. `runtime_task_id` remains metadata because many short-lived
+Tokio tasks can share one executor worker. `node_id`, `parent_node_id`, and
+`operator_partition` link the event to its physical-plan operator.
+`worker_thread_id` and `worker_thread_name` expose the underlying thread behind
+the normalized worker lane. Planning and operator activity events for the same
+query share `query_execution_id`, `query_scope`, and, for SQL
+outputs and cache materialization, `query_owner`. Use these fields to associate
+worker tracks with `DataFusion query planning / SQL output: <output>` or
+`DataFusion query planning / cache alias: <alias>` tracks in a multi-query
+trace. Query IDs are local to one exported operation.
 
-Distinct phases and operator partitions use separate synthetic tracks because
-they can overlap without forming a call stack. Repeated events with the same
-track label reuse one track. Do not add overlapping event durations together.
-Operator timestamps are clamped to the preview interval, and operators without
-a usable timestamp pair remain in
-`delta_funnel_profile` without appearing as lifecycle events.
+Use the phase events first to identify whether planning, execution, or
+formatting dominates the preview. Within physical planning, use planning
+activity to separate metadata expansion and other Delta provider work. During
+execution, use worker activity to locate active work and lifecycle events to
+understand overall concurrency and waiting. Lifecycle arguments retain metrics
+such as `output_rows` and `elapsed_compute` when DataFusion exposes them.
+`elapsed_compute` remains an aggregate metric and is not positioned as a
+fabricated wall-clock span. The top-level `delta_funnel_timeline` field
+preserves the relative timeline data, while `delta_funnel_profile` preserves
+the complete redacted operator profile.
+
+Distinct phases and operator lifecycle partitions use separate synthetic tracks
+because they can overlap without forming a call stack. Operator activity events
+instead reuse the executor worker that synchronously ran each call. Activity
+spans on one worker lane are sequential or properly nested, even when that
+worker runs many different Tokio tasks. Partition numbers remain operator-local,
+so repartition and coalesce boundaries can change what a given number represents.
+Do not add overlapping event durations together. Operator timestamps are
+clamped to the preview interval, and operators without a usable timestamp pair
+remain in `delta_funnel_profile` without appearing as lifecycle events.
 
 Custom metrics added to an owned DataFusion operator automatically remain in
-the event arguments and embedded profile. The exporter currently creates spans
-only from each operator partition's standard start and end timestamps; it does
-not turn custom timers into nested sub-operator spans or collect function-level
-CPU stacks.
+the lifecycle event arguments and embedded profile. Activity instrumentation is
+one level below the lifecycle: it measures `execute` and `poll_next`, but does
+not invent positions for aggregate custom timers or collect function-level CPU
+stacks inside those calls. An `execute` or `poll_next` error has failed status
+and `result="error"`. Successful stream creation uses `result="stream"`; poll
+events use `pending`, `batch`, or `eof`. Execution activity recording has a cap
+of 100,000 spans. If execution exceeds that bound, the trace contains one
+`Operator activity trace truncated` marker and continues the query normally.
 
 Omitting `profile`, or passing `None` or `False`, still returns all phase
 timings but leaves `execution_profile` as `None`. `Table.show()` always uses
@@ -425,6 +465,10 @@ tracks. Batch details include the one-based batch index and, after polling, the
 row count. DataFusion operator lifecycles appear on separate tracks with
 `time_semantics="lifecycle"`; they can overlap stream polling and SQL Server
 writes and must not be added together as sequential wall time.
+The same query and worker tracks used by detailed previews contain the output
+query's wall-clock `execute` and `poll_next` activity. Select one exact worker
+with VizViewer's `Filter by Thread` control for a sequential or properly nested
+top-down flame view.
 
 The returned report also contains the relative model under
 `report["operation_timeline"]`. Detailed SQL Server failure contexts retain the
@@ -471,12 +515,20 @@ output has its own positioned span. Query planning, SQL Server sink phases,
 batch work, and DataFusion operator lifecycles use that same origin, so the
 trace tells the complete wall-clock story without adding independent elapsed
 durations together.
+Each output query also records wall-clock operator activity on its query and
+worker tracks. Filter one exact worker track to inspect a conventional
+top-down flame view while retaining the full write-all clock as context.
+Planning and execution events carry the same operation-local query ID, scope,
+and output or cache owner so each worker track can be matched to its planning
+track without relying on timing order.
 
 For auto-cached calls, each alias gets a labeled cache lane containing
 DataFrame resolution, physical planning, stream setup, execution and
 collection, `MemTable` construction, installation, and restoration. Cache
 operator lifecycles share the root origin and overlap the execution and
 collection window that drove them, beginning as early as stream setup.
+Cache materialization queries use the same query and worker activity tracks as
+output queries.
 
 The returned report contains the relative model under
 `report["operation_timeline"]`. Its root status is `failed` when the workflow
