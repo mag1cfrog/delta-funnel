@@ -808,11 +808,12 @@ mod tests {
                 let left_end = left_start.saturating_add(left.duration_micros());
                 let right_start = right.start_offset_micros();
                 let right_end = right_start.saturating_add(right.duration_micros());
+                let left_crosses_right =
+                    left_start < right_start && right_start < left_end && left_end < right_end;
+                let right_crosses_left =
+                    right_start < left_start && left_start < right_end && right_end < left_end;
                 assert!(
-                    !(left_start < right_start && right_start < left_end && left_end < right_end)
-                        && !(right_start < left_start
-                            && left_start < right_end
-                            && right_end < left_end),
+                    !(left_crosses_right || right_crosses_left),
                     "activity spans on one worker lane must not cross"
                 );
             }
