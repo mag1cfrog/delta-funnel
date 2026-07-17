@@ -159,6 +159,101 @@ Three repetitions are enough for a reproducible development baseline, but not
 for a hard performance threshold. Repeat the comparison and investigate host
 noise before attributing a small difference to a code change.
 
+### Compare Samply with detailed profiling
+
+Use the same symbolized optimized binary for the disabled, Samply, and detailed
+cases so that the build profile is not another variable:
+
+```bash
+cargo build --locked --profile profiling \
+  -p delta-funnel \
+  --bin delta_scan_partition_bench
+```
+
+On Linux with GNU `time`, run the complete comparison in one Bash or Zsh
+session. Keep the common arguments in one array so every case stays identical:
+
+```bash
+benchmark_args=(
+  --mode provider-exec
+  --seed 0
+  --provider-exec-storage-profile local
+  --provider-exec-workload provider_wide_event_export_13m
+  --provider-exec-query write_all_exports
+  --provider-exec-phase-aligned-workflow
+  --provider-exec-backend native_async
+  --provider-exec-scheduling-profile prefetch_2_parallel_buffer_1
+  --provider-exec-repetitions 3
+)
+
+/usr/bin/time -f 'disabled_before_command_wall_seconds=%e' \
+  target/profiling/delta_scan_partition_bench \
+  "${benchmark_args[@]}" \
+  --output target/operation-profile-disabled-before.csv
+
+/usr/bin/time -f 'detailed_command_wall_seconds=%e' \
+  target/profiling/delta_scan_partition_bench \
+  "${benchmark_args[@]}" \
+  --provider-exec-detailed-profile \
+  --output target/operation-profile-detailed.csv
+
+/usr/bin/time -f 'samply_command_wall_seconds=%e' \
+  samply record \
+  --rate 1000 \
+  --save-only \
+  --output target/samply-operation-profile.json.gz \
+  target/profiling/delta_scan_partition_bench \
+  "${benchmark_args[@]}" \
+  --output target/operation-profile-samply.csv
+
+/usr/bin/time -f 'disabled_after_command_wall_seconds=%e' \
+  target/profiling/delta_scan_partition_bench \
+  "${benchmark_args[@]}" \
+  --output target/operation-profile-disabled-after.csv
+```
+
+Compare Samply's `total_micros` with both disabled controls. The benchmark's
+internal timer includes sampling overhead during the workflow, while excluding
+Samply startup and profile finalization. Each `/usr/bin/time` result captures
+the corresponding command wall time, including startup and finalization.
+Bracketing the matrix with two controls makes host drift visible instead of
+attributing it to the profiler.
+
+#### Samply comparison from 2026-07-17
+
+This directional comparison was collected at commit `c60857d41673` on Fedora
+Linux 43 x86-64 with an AMD Ryzen 7 8845HS, 8 cores, 16 hardware threads, 16
+available parallelism slots, Samply 0.13.1 at its default 1000 Hz rate, and
+Rust 1.97.0. Every case used the same `profiling` binary and three repetitions.
+The execution order was disabled control, detailed, Samply, then disabled
+control.
+
+| Metric | Disabled before | Detailed | Samply | Disabled after |
+| --- | ---: | ---: | ---: | ---: |
+| Workflow time p50 | 22.362 s | 30.581 s | 22.021 s | 21.377 s |
+| Workflow time p95 | 23.024 s | 31.497 s | 22.209 s | 22.058 s |
+| Source rows per second p50 | 598,994 | 438,016 | 608,259 | 626,612 |
+| Benchmark process peak RSS increase | 14,800.9 MiB | 16,701.2 MiB | 14,744.7 MiB | 14,595.3 MiB |
+| Command wall time, three repetitions | 88.88 s | 127.05 s | 89.18 s | 86.23 s |
+| Operation timeline spans, maximum | 0 | 189,666 | 0 | 0 |
+| Chrome trace events, maximum | 0 | 190,149 | 0 | 0 |
+| Compact Chrome trace size, maximum | 0 | 338.3 MiB | 0 | 0 |
+| Chrome trace export time p50 | 0 | 5.310 s | 0 | 0 |
+| Samply profile size, three repetitions | 0 | 0 | 4.7 MiB | 0 |
+
+Samply's workflow p50 was 1.5% below the first control and 3.0% above the
+second control. Its throughput and the benchmark process's peak RSS also
+remained within the range of the controls. The RSS field does not include the
+separate Samply recorder process. The controls themselves differed by 4.6%, so
+this sample found no measurable Samply slowdown. The profile contained 287,020
+samples; 119 events, about 0.04%, were lost.
+
+Detailed profiling was 36.8% to 43.1% slower than the controls, reduced median
+throughput by 26.9% to 30.1%, and increased peak RSS by 12.8% to 14.4%. It also
+serialized one Chrome trace per repetition after the measured workflow. These
+results show a material difference on this workload, but they remain a
+directional development measurement rather than a hard performance guarantee.
+
 ## Compare results
 
 - Compare rows with the same `benchmark_schema_version` and benchmark mode.

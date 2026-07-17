@@ -17,3 +17,7 @@ missing_docs = "deny"
 expect_used = "deny"
 panic = "deny"
 unwrap_used = "deny"
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
