@@ -2701,6 +2701,9 @@ mod tests {
         let profile = preview
             .execution_profile()
             .ok_or("expected detailed Delta preview profile")?;
+        let timeline = preview
+            .operation_timeline()
+            .ok_or("expected detailed Delta preview timeline")?;
         let snapshot = profile
             .operators()
             .iter()
@@ -2710,6 +2713,54 @@ mod tests {
         assert_eq!(snapshot.source_name, "orders");
         assert!(snapshot.files_planned > 0);
         assert!(snapshot.rows_produced > 0);
+        let activity_spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == "datafusion.operator.activity")
+            .collect::<Vec<_>>();
+        for name in [
+            "Delta scan producer",
+            "Delta scan file setup",
+            "Delta scan batch read",
+            "Delta scan output send",
+        ] {
+            assert!(activity_spans.iter().any(|span| span.name() == name));
+        }
+        for span in activity_spans.iter().filter(|span| {
+            span.name().starts_with("Delta scan ") && span.name() != "Delta scan producer"
+        }) {
+            let parent_id = span
+                .parent_id()
+                .ok_or("expected Delta scan activity parent")?;
+            let parent = activity_spans
+                .iter()
+                .find(|candidate| candidate.id() == parent_id)
+                .ok_or("expected Delta scan producer parent")?;
+            assert_eq!(parent.name(), "Delta scan producer");
+            assert_eq!(parent.track_name(), span.track_name());
+            assert_eq!(
+                parent.attributes()["query_execution_id"],
+                span.attributes()["query_execution_id"]
+            );
+            assert_eq!(
+                parent.attributes()["execution_stream_id"],
+                span.attributes()["execution_stream_id"]
+            );
+            assert_eq!(parent.attributes()["node_id"], span.attributes()["node_id"]);
+            assert_eq!(
+                parent.attributes()["operator_partition"],
+                span.attributes()["operator_partition"]
+            );
+            assert!(parent.start_offset_micros() <= span.start_offset_micros());
+            assert!(
+                parent
+                    .start_offset_micros()
+                    .saturating_add(parent.duration_micros())
+                    >= span
+                        .start_offset_micros()
+                        .saturating_add(span.duration_micros())
+            );
+        }
         let provider_events = provider_io_events(capture.captured());
         assert_eq!(provider_events.len(), 1);
         assert_provider_io_event_matches_snapshot(&provider_events[0], snapshot, "success");

@@ -5,6 +5,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fmt,
+    future::Future,
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -23,7 +24,7 @@ use datafusion::{
         SendableRecordBatchStream, metrics::MetricsSet,
     },
 };
-use futures_util::Stream;
+use futures_util::{Stream, future::poll_fn};
 use serde_json::Value;
 
 use crate::{
@@ -95,6 +96,10 @@ struct ActiveOperatorActivitySpan {
 thread_local! {
     static ACTIVE_OPERATOR_ACTIVITY_SPANS: RefCell<Vec<ActiveOperatorActivitySpan>> =
         const { RefCell::new(Vec::new()) };
+    // ExecutionPlan::execute is synchronous. Specialized operators can clone
+    // this context during execute and carry it into work they spawn afterward.
+    static ACTIVE_OPERATOR_ACTIVITY_CONTEXTS: RefCell<Vec<OperatorActivityContext>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +110,97 @@ struct OperatorActivityRecorder {
     maximum_spans: u64,
     remaining_spans: Arc<AtomicU64>,
     truncation_reported: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct OperatorActivityContext {
+    activity: OperatorActivityRecorder,
+    node_id: u64,
+    parent_node_id: Option<u64>,
+    partition: usize,
+    stream_id: u64,
+}
+
+impl OperatorActivityContext {
+    /// Records each poll as a closed worker span so no span crosses an await or
+    /// follows a future when the runtime moves its next poll to another worker.
+    pub(super) async fn profile_future<F>(
+        self,
+        name: &'static str,
+        activity: &'static str,
+        future: F,
+    ) -> F::Output
+    where
+        F: Future,
+    {
+        let mut future = std::pin::pin!(future);
+        poll_fn(|context| {
+            let span = self.activity.start_span(
+                name,
+                self.node_id,
+                self.parent_node_id,
+                self.partition,
+                self.stream_id,
+                activity,
+            );
+            let poll = future.as_mut().poll(context);
+            if let Some(span) = span {
+                span.with_attribute(
+                    "result",
+                    Value::String(if poll.is_ready() { "ready" } else { "pending" }.to_owned()),
+                )
+                .completed();
+            }
+            poll
+        })
+        .await
+    }
+}
+
+pub(super) async fn profile_operator_activity_future<F>(
+    activity: Option<&OperatorActivityContext>,
+    name: &'static str,
+    activity_name: &'static str,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    match activity {
+        Some(activity) => {
+            activity
+                .clone()
+                .profile_future(name, activity_name, future)
+                .await
+        }
+        None => future.await,
+    }
+}
+
+struct OperatorActivityContextGuard {
+    query_execution_id: u64,
+    node_id: u64,
+    stream_id: u64,
+}
+
+impl Drop for OperatorActivityContextGuard {
+    fn drop(&mut self) {
+        let _ = ACTIVE_OPERATOR_ACTIVITY_CONTEXTS.try_with(|contexts| {
+            let popped = contexts.borrow_mut().pop();
+            debug_assert!(popped.is_some_and(|context| {
+                context.activity.query_execution_id == self.query_execution_id
+                    && context.node_id == self.node_id
+                    && context.stream_id == self.stream_id
+            }));
+        });
+    }
+}
+
+pub(super) fn current_operator_activity_context() -> Option<OperatorActivityContext> {
+    ACTIVE_OPERATOR_ACTIVITY_CONTEXTS
+        .try_with(|contexts| contexts.borrow().last().cloned())
+        .ok()
+        .flatten()
 }
 
 impl OperatorActivityRecorder {
@@ -218,6 +314,29 @@ impl OperatorActivityRecorder {
         let stream_id = identities.next_stream_id;
         identities.next_stream_id = identities.next_stream_id.saturating_add(1);
         stream_id
+    }
+
+    fn enter_context(
+        &self,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        partition: usize,
+        stream_id: u64,
+    ) -> OperatorActivityContextGuard {
+        ACTIVE_OPERATOR_ACTIVITY_CONTEXTS.with(|contexts| {
+            contexts.borrow_mut().push(OperatorActivityContext {
+                activity: self.clone(),
+                node_id,
+                parent_node_id,
+                partition,
+                stream_id,
+            });
+        });
+        OperatorActivityContextGuard {
+            query_execution_id: self.query_execution_id,
+            node_id,
+            stream_id,
+        }
     }
 
     fn execution_context(&self) -> ActivityExecutionContext {
@@ -445,7 +564,11 @@ impl ExecutionPlan for ProfiledOperatorExec {
             stream_id,
             "execute",
         );
+        let activity_context =
+            self.activity
+                .enter_context(self.node_id, self.parent_node_id, partition, stream_id);
         let result = self.inner.execute(partition, context);
+        drop(activity_context);
         if let Some(span) = span {
             let span = span.with_attribute(
                 "result",
