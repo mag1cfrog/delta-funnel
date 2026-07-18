@@ -6,10 +6,7 @@ use std::{
     collections::HashMap,
     fmt,
     pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     thread::ThreadId,
 };
@@ -34,7 +31,6 @@ use crate::{
 use super::QueryTraceIdentity;
 
 const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
-const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivityWorkerKind {
@@ -126,17 +122,10 @@ struct OperatorActivityRecorder {
     query_scope: QueryExecutionScope,
     query_owner: Option<Arc<str>>,
     identities: Arc<Mutex<OperatorActivityIdentityState>>,
-    maximum_spans: u64,
-    remaining_spans: Arc<AtomicU64>,
-    truncation_reported: Arc<AtomicBool>,
 }
 
 impl OperatorActivityRecorder {
     fn new(identity: QueryTraceIdentity) -> Self {
-        Self::with_max_spans(identity, MAX_OPERATOR_ACTIVITY_SPANS)
-    }
-
-    fn with_max_spans(identity: QueryTraceIdentity, maximum_spans: u64) -> Self {
         let QueryTraceIdentity {
             context,
             query_execution_id,
@@ -149,9 +138,6 @@ impl OperatorActivityRecorder {
             query_scope,
             query_owner,
             identities: Arc::new(Mutex::new(OperatorActivityIdentityState::default())),
-            maximum_spans,
-            remaining_spans: Arc::new(AtomicU64::new(maximum_spans)),
-            truncation_reported: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -169,14 +155,10 @@ impl OperatorActivityRecorder {
         if !records_semantic_span && !records_process_span {
             return None;
         }
-        if self
-            .remaining_spans
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_err()
-        {
-            self.report_truncation();
+        if let Err(limit) = self.context.reserve_operator_activity() {
+            if limit.should_report {
+                self.report_truncation(limit.maximum_spans);
+            }
             return None;
         }
 
@@ -386,11 +368,8 @@ impl OperatorActivityRecorder {
         }
     }
 
-    fn report_truncation(&self) {
-        if !self.truncation_reported.swap(true, Ordering::Relaxed) {
-            let Some(timeline) = self.context.timeline() else {
-                return;
-            };
+    fn report_truncation(&self, maximum_spans: u64) {
+        if let Some(timeline) = self.context.timeline() {
             self.with_query_identity(timeline.start_span(
                 "Operator activity trace truncated",
                 OPERATOR_ACTIVITY_CATEGORY,
@@ -399,8 +378,18 @@ impl OperatorActivityRecorder {
                     self.query_execution_id
                 ),
             ))
-            .with_attribute("maximum_spans", Value::from(self.maximum_spans))
+            .with_attribute("maximum_spans", Value::from(maximum_spans))
             .completed();
+        }
+        if let Some(root) = self.context.process_root_span() {
+            tracing::event!(
+                name: "Operator activity trace truncated",
+                target: crate::profiling::PROFILE_TARGET,
+                parent: root.id(),
+                tracing::Level::TRACE,
+                operation_id = self.context.operation_id(),
+                maximum_spans,
+            );
         }
     }
 
@@ -682,6 +671,21 @@ mod tests {
             .expect("query trace identity should be available")
     }
 
+    fn test_trace_identity_with_limit(
+        timeline: Option<OperationTimelineRecorder>,
+        process_spans_enabled: bool,
+        maximum_spans: u64,
+    ) -> QueryTraceIdentity {
+        let context = OperationTraceContext::start_for_test_with_operator_activity_limit(
+            timeline,
+            process_spans_enabled,
+            maximum_spans,
+        )
+        .expect("profiling should create a context");
+        QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
+            .expect("query trace identity should be available")
+    }
+
     #[test]
     fn query_execution_ids_are_local_to_each_operation_context() {
         let first_timeline = OperationTimelineRecorder::start();
@@ -706,8 +710,11 @@ mod tests {
     #[test]
     fn activity_limit_records_one_visible_truncation_marker() {
         let timeline = OperationTimelineRecorder::start();
-        let activity =
-            OperatorActivityRecorder::with_max_spans(test_trace_identity(timeline.clone()), 1);
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            false,
+            1,
+        ));
 
         activity
             .start_span("FilterExec", 0, None, 0, 1, "poll_next")
@@ -745,6 +752,185 @@ mod tests {
         assert_eq!(
             truncation_markers[0].track_name(),
             "DataFusion query [1] / trace status"
+        );
+    }
+
+    #[test]
+    fn operation_activity_limit_is_shared_by_queries() {
+        let timeline = OperationTimelineRecorder::start();
+        let context = OperationTraceContext::start_for_test_with_operator_activity_limit(
+            Some(timeline.clone()),
+            false,
+            1,
+        )
+        .expect("semantic profiling should create a context");
+        let first = OperatorActivityRecorder::new(
+            QueryTraceIdentity::new(context.clone(), QueryExecutionScope::Preview, None)
+                .expect("first query identity should be available"),
+        );
+        let second = OperatorActivityRecorder::new(
+            QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
+                .expect("second query identity should be available"),
+        );
+
+        first
+            .start_span("FirstExec", 0, None, 0, 1, "poll_next")
+            .expect("first query should consume the operation budget")
+            .finish("batch", false);
+        assert!(
+            second
+                .start_span("SecondExec", 0, None, 0, 1, "poll_next")
+                .is_none()
+        );
+        assert!(
+            first
+                .start_span("FirstExec", 0, None, 0, 1, "poll_next")
+                .is_none()
+        );
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        let markers = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.name() == "Operator activity trace truncated")
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].attributes()["query_execution_id"], 2);
+        assert_eq!(markers[0].attributes()["maximum_spans"], 1);
+    }
+
+    #[test]
+    fn concurrent_operations_emit_independent_truncation_markers() {
+        let first_timeline = OperationTimelineRecorder::start();
+        let second_timeline = OperationTimelineRecorder::start();
+        let first = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(first_timeline.clone()),
+            false,
+            1,
+        ));
+        let second = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(second_timeline.clone()),
+            false,
+            1,
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let exceed = |activity: OperatorActivityRecorder, barrier: Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                activity
+                    .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+                    .expect("each operation should have its own first reservation")
+                    .finish("batch", false);
+                assert!(
+                    activity
+                        .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+                        .is_none()
+                );
+            })
+        };
+
+        let first = exceed(first, Arc::clone(&barrier));
+        let second = exceed(second, barrier);
+        first.join().expect("first operation should finish");
+        second.join().expect("second operation should finish");
+
+        for timeline in [first_timeline, second_timeline] {
+            let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+            let markers = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.name() == "Operator activity trace truncated")
+                .collect::<Vec<_>>();
+            assert_eq!(markers.len(), 1);
+            assert_eq!(markers[0].attributes()["maximum_spans"], 1);
+            assert_eq!(
+                timeline
+                    .spans()
+                    .iter()
+                    .filter(|span| span.name() == "FilterExec")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn combined_activity_limit_reserves_once_and_reports_each_output_once() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            true,
+            1,
+        ));
+        let operation_id = activity.context.operation_id();
+
+        activity
+            .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+            .expect("one logical poll should fit both active outputs")
+            .finish("batch", false);
+        assert!(
+            activity
+                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+                .is_none()
+        );
+        assert!(
+            activity
+                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+                .is_none()
+        );
+        drop(activity);
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        let semantic_markers = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.name() == "Operator activity trace truncated")
+            .collect::<Vec<_>>();
+        assert_eq!(semantic_markers.len(), 1);
+        assert_eq!(semantic_markers[0].attributes()["maximum_spans"], 1);
+
+        let process_markers = capture
+            .captured()
+            .events()
+            .into_iter()
+            .filter(|event| event.name == "Operator activity trace truncated")
+            .collect::<Vec<_>>();
+        assert_eq!(process_markers.len(), 1);
+        assert_eq!(process_markers[0].target, crate::profiling::PROFILE_TARGET);
+        assert_eq!(process_markers[0].level, tracing::Level::TRACE);
+        assert_eq!(
+            process_markers[0].fields["operation_id"],
+            operation_id.to_string()
+        );
+        assert_eq!(process_markers[0].fields["maximum_spans"], "1");
+        assert_eq!(process_markers[0].span_names, ["Delta Funnel preview"]);
+    }
+
+    #[test]
+    fn process_only_activity_limit_reports_without_a_semantic_timeline() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(None, true, 1));
+
+        activity
+            .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+            .expect("first process activity should fit")
+            .finish("batch", false);
+        assert!(
+            activity
+                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+                .is_none()
+        );
+        drop(activity);
+
+        assert_eq!(
+            capture
+                .captured()
+                .events()
+                .iter()
+                .filter(|event| event.name == "Operator activity trace truncated")
+                .count(),
+            1
         );
     }
 

@@ -8,6 +8,7 @@ use std::sync::{
 use crate::report::OperationTimelineRecorder;
 
 pub(crate) const PROFILE_TARGET: &str = "delta_funnel::profile";
+const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -25,6 +26,7 @@ pub(crate) struct OperationTraceContext {
     next_query_execution_id: Arc<AtomicU64>,
     timeline: Option<OperationTimelineRecorder>,
     process_trace: Option<Arc<ProcessOperationTrace>>,
+    operator_activity_budget: Arc<OperatorActivityBudget>,
 }
 
 impl OperationTraceContext {
@@ -50,6 +52,9 @@ impl OperationTraceContext {
             timeline,
             process_trace: process_spans_enabled
                 .then(|| Arc::new(ProcessOperationTrace::new(kind, operation_id))),
+            operator_activity_budget: Arc::new(OperatorActivityBudget::new(
+                MAX_OPERATOR_ACTIVITY_SPANS,
+            )),
         })
     }
 
@@ -58,7 +63,23 @@ impl OperationTraceContext {
         timeline: Option<OperationTimelineRecorder>,
         process_spans_enabled: bool,
     ) -> Option<Self> {
-        Self::start_for_modes(OperationTraceKind::Preview, timeline, process_spans_enabled)
+        Self::start_for_test_with_operator_activity_limit(
+            timeline,
+            process_spans_enabled,
+            MAX_OPERATOR_ACTIVITY_SPANS,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_for_test_with_operator_activity_limit(
+        timeline: Option<OperationTimelineRecorder>,
+        process_spans_enabled: bool,
+        maximum_spans: u64,
+    ) -> Option<Self> {
+        let mut context =
+            Self::start_for_modes(OperationTraceKind::Preview, timeline, process_spans_enabled)?;
+        context.operator_activity_budget = Arc::new(OperatorActivityBudget::new(maximum_spans));
+        Some(context)
     }
 
     pub(crate) const fn operation_id(&self) -> u64 {
@@ -86,6 +107,49 @@ impl OperationTraceContext {
     pub(crate) fn next_query_execution_id(&self) -> Option<u64> {
         allocate_id(&self.next_query_execution_id)
     }
+
+    pub(crate) fn reserve_operator_activity(&self) -> Result<(), OperatorActivityLimit> {
+        self.operator_activity_budget.reserve()
+    }
+}
+
+#[derive(Debug)]
+struct OperatorActivityBudget {
+    maximum_spans: u64,
+    remaining_spans: AtomicU64,
+    truncation_reported: AtomicBool,
+}
+
+impl OperatorActivityBudget {
+    const fn new(maximum_spans: u64) -> Self {
+        Self {
+            maximum_spans,
+            remaining_spans: AtomicU64::new(maximum_spans),
+            truncation_reported: AtomicBool::new(false),
+        }
+    }
+
+    fn reserve(&self) -> Result<(), OperatorActivityLimit> {
+        if self
+            .remaining_spans
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Ok(());
+        }
+        Err(OperatorActivityLimit {
+            maximum_spans: self.maximum_spans,
+            should_report: !self.truncation_reported.swap(true, Ordering::Relaxed),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OperatorActivityLimit {
+    pub(crate) maximum_spans: u64,
+    pub(crate) should_report: bool,
 }
 
 #[derive(Debug)]

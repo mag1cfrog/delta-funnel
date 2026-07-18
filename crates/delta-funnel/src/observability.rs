@@ -737,6 +737,7 @@ pub(crate) mod test_capture {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) struct CapturedEvent {
+        pub(crate) name: &'static str,
         pub(crate) target: &'static str,
         pub(crate) level: Level,
         pub(crate) fields: BTreeMap<String, String>,
@@ -879,6 +880,7 @@ pub(crate) mod test_capture {
                 })
                 .unwrap_or_default();
             let captured = CapturedEvent {
+                name: event.metadata().name(),
                 target: event.metadata().target(),
                 level: *event.metadata().level(),
                 fields: visitor.fields,
