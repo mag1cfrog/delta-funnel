@@ -47,10 +47,8 @@ where
         };
         let mut fields = ProfileFields::default();
         values.record(&mut fields);
-        if let Some(active) = span.extensions_mut().get_mut::<ActiveProfileSpan>()
-            && fields.result.is_some()
-        {
-            active.result = fields.result;
+        if let Some(active) = span.extensions_mut().get_mut::<ActiveProfileSpan>() {
+            active.record(fields);
         }
     }
 
@@ -90,11 +88,20 @@ where
 struct ProfileFields {
     operation_id: Option<u64>,
     query_execution_id: Option<u64>,
+    query_scope: Option<String>,
+    query_owner: Option<String>,
     worker_lane_id: Option<u64>,
+    worker_kind: Option<String>,
+    node_id: Option<u64>,
+    parent_node_id: Option<u64>,
+    operator_partition: Option<u64>,
+    execution_stream_id: Option<u64>,
+    activity: Option<String>,
     maximum_spans: Option<u64>,
     operator_name: Option<String>,
     phase: Option<String>,
     result: Option<String>,
+    time_semantics: Option<String>,
 }
 
 impl Visit for ProfileFields {
@@ -103,6 +110,10 @@ impl Visit for ProfileFields {
             "operation_id" => self.operation_id = Some(value),
             "query_execution_id" => self.query_execution_id = Some(value),
             "worker_lane_id" => self.worker_lane_id = Some(value),
+            "node_id" => self.node_id = Some(value),
+            "parent_node_id" => self.parent_node_id = Some(value),
+            "operator_partition" => self.operator_partition = Some(value),
+            "execution_stream_id" => self.execution_stream_id = Some(value),
             "maximum_spans" => self.maximum_spans = Some(value),
             _ => {}
         }
@@ -110,9 +121,14 @@ impl Visit for ProfileFields {
 
     fn record_str(&mut self, field: &Field, value: &str) {
         match field.name() {
+            "query_scope" => self.query_scope = Some(value.to_owned()),
+            "query_owner" => self.query_owner = Some(value.to_owned()),
+            "worker_kind" => self.worker_kind = Some(value.to_owned()),
+            "activity" => self.activity = Some(value.to_owned()),
             "operator_name" => self.operator_name = Some(value.to_owned()),
             "phase" => self.phase = Some(value.to_owned()),
             "result" => self.result = Some(value.to_owned()),
+            "time_semantics" => self.time_semantics = Some(value.to_owned()),
             _ => {}
         }
     }
@@ -123,10 +139,7 @@ impl Visit for ProfileFields {
 #[derive(Debug)]
 struct ActiveProfileSpan {
     event: ProfileEvent,
-    operation_id: u64,
-    query_execution_id: Option<u64>,
-    worker_lane_id: Option<u64>,
-    result: Option<String>,
+    fields: ProfileFields,
 }
 
 impl ActiveProfileSpan {
@@ -178,13 +191,19 @@ impl ActiveProfileSpan {
             }
             _ => return None,
         };
-        Some(Self {
-            event,
-            operation_id,
-            query_execution_id: fields.query_execution_id,
-            worker_lane_id: fields.worker_lane_id,
-            result: fields.result,
-        })
+        Some(Self { event, fields })
+    }
+
+    fn record(&mut self, fields: ProfileFields) {
+        if fields.query_owner.is_some() {
+            self.fields.query_owner = fields.query_owner;
+        }
+        if fields.parent_node_id.is_some() {
+            self.fields.parent_node_id = fields.parent_node_id;
+        }
+        if fields.result.is_some() {
+            self.fields.result = fields.result;
+        }
     }
 
     fn emit_begin(&self) {
@@ -223,7 +242,7 @@ impl ActiveProfileSpan {
                     "DataFusion query",
                     |context: &mut EventContext| {
                         query.set_on(context);
-                        self.add_identity_args(context);
+                        self.add_profile_args(context);
                     }
                 );
                 track_event_begin!(
@@ -231,7 +250,7 @@ impl ActiveProfileSpan {
                     "DataFusion query planning",
                     |context: &mut EventContext| {
                         phases.set_on(context);
-                        self.add_identity_args(context);
+                        self.add_profile_args(context);
                     }
                 );
             }
@@ -241,7 +260,7 @@ impl ActiveProfileSpan {
                     "Planning",
                     |context: &mut EventContext| {
                         phases.set_on(context);
-                        self.add_identity_args(context);
+                        self.add_profile_args(context);
                     }
                 ),
                 OperationPhaseKind::Execution => track_event_begin!(
@@ -249,7 +268,7 @@ impl ActiveProfileSpan {
                     "Execution",
                     |context: &mut EventContext| {
                         phases.set_on(context);
-                        self.add_identity_args(context);
+                        self.add_profile_args(context);
                     }
                 ),
                 OperationPhaseKind::Finalization => track_event_begin!(
@@ -257,7 +276,7 @@ impl ActiveProfileSpan {
                     "Finalization",
                     |context: &mut EventContext| {
                         phases.set_on(context);
-                        self.add_identity_args(context);
+                        self.add_profile_args(context);
                     }
                 ),
             },
@@ -268,7 +287,7 @@ impl ActiveProfileSpan {
                         TrackEventType::SliceBegin(name.as_ptr()),
                         |context: &mut EventContext| {
                             worker.set_on(context);
-                            self.add_identity_args(context);
+                            self.add_profile_args(context);
                         }
                     );
                 } else {
@@ -277,7 +296,7 @@ impl ActiveProfileSpan {
                         "DataFusion operator",
                         |context: &mut EventContext| {
                             worker.set_on(context);
-                            self.add_identity_args(context);
+                            self.add_profile_args(context);
                         }
                     );
                 }
@@ -296,8 +315,8 @@ impl ActiveProfileSpan {
             "delta_funnel.perfetto_spike",
             |context: &mut EventContext| {
                 track.set_on(context);
-                self.add_identity_args(context);
-                if let Some(result) = &self.result {
+                self.add_profile_args(context);
+                if let Some(result) = &self.fields.result {
                     context.add_debug_arg("result", TrackEventDebugArg::String(result));
                 }
                 if flush {
@@ -309,22 +328,54 @@ impl ActiveProfileSpan {
 
     fn set_operation_on(&self, context: &mut EventContext, operation: &SemanticTrack) {
         operation.set_on(context);
-        self.add_identity_args(context);
+        self.add_profile_args(context);
     }
 
-    fn add_identity_args(&self, context: &mut EventContext) {
-        context.add_debug_arg(
-            "operation_id",
-            TrackEventDebugArg::Uint64(self.operation_id),
-        );
-        if let Some(query_execution_id) = self.query_execution_id {
+    fn add_profile_args(&self, context: &mut EventContext) {
+        if let Some(operation_id) = self.fields.operation_id {
+            context.add_debug_arg("operation_id", TrackEventDebugArg::Uint64(operation_id));
+        }
+        if let Some(query_execution_id) = self.fields.query_execution_id {
             context.add_debug_arg(
                 "query_execution_id",
                 TrackEventDebugArg::Uint64(query_execution_id),
             );
         }
-        if let Some(worker_lane_id) = self.worker_lane_id {
+        if let Some(query_scope) = &self.fields.query_scope {
+            context.add_debug_arg("query_scope", TrackEventDebugArg::String(query_scope));
+        }
+        if let Some(query_owner) = &self.fields.query_owner {
+            context.add_debug_arg("query_owner", TrackEventDebugArg::String(query_owner));
+        }
+        if let Some(worker_lane_id) = self.fields.worker_lane_id {
             context.add_debug_arg("worker_lane_id", TrackEventDebugArg::Uint64(worker_lane_id));
+        }
+        if let Some(worker_kind) = &self.fields.worker_kind {
+            context.add_debug_arg("worker_kind", TrackEventDebugArg::String(worker_kind));
+        }
+        if let Some(node_id) = self.fields.node_id {
+            context.add_debug_arg("node_id", TrackEventDebugArg::Uint64(node_id));
+        }
+        if let Some(parent_node_id) = self.fields.parent_node_id {
+            context.add_debug_arg("parent_node_id", TrackEventDebugArg::Uint64(parent_node_id));
+        }
+        if let Some(operator_partition) = self.fields.operator_partition {
+            context.add_debug_arg(
+                "operator_partition",
+                TrackEventDebugArg::Uint64(operator_partition),
+            );
+        }
+        if let Some(execution_stream_id) = self.fields.execution_stream_id {
+            context.add_debug_arg(
+                "execution_stream_id",
+                TrackEventDebugArg::Uint64(execution_stream_id),
+            );
+        }
+        if let Some(activity) = &self.fields.activity {
+            context.add_debug_arg("activity", TrackEventDebugArg::String(activity));
+        }
+        if let Some(time_semantics) = &self.fields.time_semantics {
+            context.add_debug_arg("time_semantics", TrackEventDebugArg::String(time_semantics));
         }
     }
 
@@ -400,8 +451,17 @@ mod tests {
         ProfileFields {
             operation_id: Some(operation_id),
             query_execution_id: Some(query_execution_id),
+            query_scope: Some("preview".to_owned()),
+            query_owner: Some("orders".to_owned()),
             worker_lane_id: Some(worker_lane_id),
+            worker_kind: Some("runtime".to_owned()),
+            node_id: Some(7),
+            parent_node_id: Some(3),
+            operator_partition: Some(2),
+            execution_stream_id: Some(11),
+            activity: Some("poll_next".to_owned()),
             operator_name: Some("FilterExec".to_owned()),
+            time_semantics: Some("active".to_owned()),
             ..ProfileFields::default()
         }
     }
@@ -430,6 +490,35 @@ mod tests {
                 .name
                 .contains("worker [w-00000000000000000001]")
         );
+        assert_eq!(first.fields.query_scope.as_deref(), Some("preview"));
+        assert_eq!(first.fields.query_owner.as_deref(), Some("orders"));
+        assert_eq!(first.fields.worker_kind.as_deref(), Some("runtime"));
+        assert_eq!(first.fields.node_id, Some(7));
+        assert_eq!(first.fields.parent_node_id, Some(3));
+        assert_eq!(first.fields.operator_partition, Some(2));
+        assert_eq!(first.fields.execution_stream_id, Some(11));
+        assert_eq!(first.fields.activity.as_deref(), Some("poll_next"));
+        assert_eq!(first.fields.time_semantics.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn fields_recorded_after_span_creation_are_preserved() {
+        let mut initial = fields(1, 1, 1);
+        initial.query_owner = None;
+        initial.parent_node_id = None;
+        let mut active = ActiveProfileSpan::from_fields("DataFusion operator poll", initial)
+            .expect("complete operator identity should map");
+
+        active.record(ProfileFields {
+            query_owner: Some("orders".to_owned()),
+            parent_node_id: Some(3),
+            result: Some("batch".to_owned()),
+            ..ProfileFields::default()
+        });
+
+        assert_eq!(active.fields.query_owner.as_deref(), Some("orders"));
+        assert_eq!(active.fields.parent_node_id, Some(3));
+        assert_eq!(active.fields.result.as_deref(), Some("batch"));
     }
 
     #[test]
