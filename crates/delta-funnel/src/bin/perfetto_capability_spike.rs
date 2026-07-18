@@ -1,8 +1,8 @@
 //! Opt-in Perfetto system-backend capability harness.
 //!
 //! This binary is intentionally separate from Delta Funnel production paths.
-//! It proves that one logical Perfetto slice can begin and end on different
-//! Tokio worker threads while system tracing samples the Rust call stack.
+//! It proves that deterministic parented semantic tracks remain independent
+//! of Tokio worker threads while system tracing samples the Rust call stack.
 //!
 //! Start `tracebox` first with `tools/perfetto/capability-spike.pbtx` and
 //! `--system-sockets`, then run this binary from the `profiling` build profile.
@@ -15,19 +15,29 @@
 use std::error::Error;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use perfetto_sdk::producer::{Backends, Producer, ProducerInitArgsBuilder};
-use perfetto_sdk::track_event::{EventContext, TrackEvent, TrackEventDebugArg, TrackEventTrack};
+use perfetto_sdk::protos::trace::track_event::track_descriptor::{
+    TrackDescriptorChildTracksOrdering, TrackDescriptorFieldNumber,
+    TrackDescriptorSiblingMergeBehavior,
+};
+use perfetto_sdk::track_event::{
+    EventContext, TrackEvent, TrackEventDebugArg, TrackEventProtoField, TrackEventProtoTrack,
+    TrackEventTrack,
+};
 use perfetto_sdk::{
     track_event_begin, track_event_categories, track_event_category_enabled, track_event_end,
+    track_event_instant,
 };
 
 const CATEGORY: &str = "delta_funnel.perfetto_spike";
 const CAPTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const PHASE_WORK_DURATION: Duration = Duration::from_millis(50);
 const RELEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-const SAMPLED_WORK_DURATION: Duration = Duration::from_millis(750);
+const WORKER_ACTIVITY_DURATION: Duration = Duration::from_millis(200);
 static NEXT_WORKER_ID: AtomicUsize = AtomicUsize::new(1);
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -44,6 +54,149 @@ track_event_categories! {
 
 use delta_funnel_perfetto as perfetto_te_ns;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticTrack {
+    name: String,
+    uuid: u64,
+    parent_uuid: u64,
+    sibling_order_rank: u64,
+}
+
+impl SemanticTrack {
+    fn new(name: String, id: u64, parent_uuid: u64, sibling_order_rank: u64) -> Self {
+        let uuid = TrackEventTrack::named_track_uuid(&name, id, parent_uuid);
+        Self {
+            name,
+            uuid,
+            parent_uuid,
+            sibling_order_rank,
+        }
+    }
+
+    fn set_on(&self, context: &mut EventContext) {
+        let fields = [
+            TrackEventProtoField::VarInt(
+                TrackDescriptorFieldNumber::ParentUuid as u32,
+                self.parent_uuid,
+            ),
+            TrackEventProtoField::Cstr(TrackDescriptorFieldNumber::Name as u32, &self.name),
+            TrackEventProtoField::VarInt(
+                TrackDescriptorFieldNumber::DisallowMergingWithSystemTracks as u32,
+                1,
+            ),
+            TrackEventProtoField::VarInt(
+                TrackDescriptorFieldNumber::ChildOrdering as u32,
+                u64::from(u32::from(TrackDescriptorChildTracksOrdering::Explicit)),
+            ),
+            TrackEventProtoField::VarInt(
+                TrackDescriptorFieldNumber::SiblingOrderRank as u32,
+                self.sibling_order_rank,
+            ),
+            TrackEventProtoField::VarInt(
+                TrackDescriptorFieldNumber::SiblingMergeBehavior as u32,
+                u64::from(u32::from(
+                    TrackDescriptorSiblingMergeBehavior::SiblingMergeBehaviorNone,
+                )),
+            ),
+        ];
+        context.set_proto_track(&TrackEventProtoTrack {
+            uuid: self.uuid,
+            fields: &fields,
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticTracks {
+    diagnostics: SemanticTrack,
+    operation: SemanticTrack,
+    phases: SemanticTrack,
+    query: SemanticTrack,
+    workers: [(u64, SemanticTrack); 2],
+}
+
+impl SemanticTracks {
+    fn new(
+        process_uuid: u64,
+        operation_id: u64,
+        query_execution_id: u64,
+        mut worker_lane_ids: [u64; 2],
+    ) -> Self {
+        debug_assert_ne!(operation_id, 0);
+        debug_assert_ne!(query_execution_id, 0);
+        debug_assert!(worker_lane_ids.iter().all(|id| *id != 0));
+        worker_lane_ids.sort_unstable();
+        debug_assert_ne!(worker_lane_ids[0], worker_lane_ids[1]);
+
+        let diagnostics =
+            SemanticTrack::new("Delta Funnel diagnostics".to_owned(), 0, process_uuid, 10);
+        let operation_token = operation_token(operation_id);
+        let operation = SemanticTrack::new(
+            format!("Operation [{operation_token}]"),
+            operation_id,
+            diagnostics.uuid,
+            10,
+        );
+        let phases = SemanticTrack::new(
+            format!("Operation [{operation_token}] / phases"),
+            0,
+            operation.uuid,
+            10,
+        );
+        let query_token = query_token(query_execution_id);
+        let query = SemanticTrack::new(
+            format!("Operation [{operation_token}] / query [{query_token}]"),
+            query_execution_id,
+            operation.uuid,
+            20,
+        );
+        let worker_track = |worker_lane_id, sibling_order_rank| {
+            SemanticTrack::new(
+                format!(
+                    "Operation [{operation_token}] / query [{query_token}] / worker [{}]",
+                    worker_token(worker_lane_id)
+                ),
+                worker_lane_id,
+                query.uuid,
+                sibling_order_rank,
+            )
+        };
+        let workers = [
+            (worker_lane_ids[0], worker_track(worker_lane_ids[0], 10)),
+            (worker_lane_ids[1], worker_track(worker_lane_ids[1], 20)),
+        ];
+        Self {
+            diagnostics,
+            operation,
+            phases,
+            query,
+            workers,
+        }
+    }
+}
+
+fn operation_token(id: u64) -> String {
+    format!("op-{id:020}")
+}
+
+fn query_token(id: u64) -> String {
+    format!("q-{id:020}")
+}
+
+fn worker_token(id: u64) -> String {
+    format!("w-{id:020}")
+}
+
+#[derive(Debug)]
+struct WorkerMigrationEvidence {
+    begin_thread: ThreadId,
+    begin_worker: String,
+    end_thread: ThreadId,
+    end_worker: String,
+    parallel_thread: ThreadId,
+    parallel_worker: String,
+}
+
 fn main() -> Result<(), DynError> {
     initialize_perfetto()?;
     wait_for_capture()?;
@@ -55,7 +208,7 @@ fn main() -> Result<(), DynError> {
             format!("perfetto-spike-worker-{worker_id}")
         })
         .build()?;
-    runtime.block_on(emit_cross_worker_slice())?;
+    runtime.block_on(emit_semantic_story())?;
 
     Ok(())
 }
@@ -82,30 +235,133 @@ fn wait_for_capture() -> Result<(), DynError> {
     Ok(())
 }
 
-async fn emit_cross_worker_slice() -> Result<(), DynError> {
-    let track = Arc::new(TrackEventTrack::register_named_track(
-        "Delta Funnel capability track",
-        0,
+async fn emit_semantic_story() -> Result<(), DynError> {
+    let operation_id = 1;
+    let query_execution_id = 1;
+    let tracks = SemanticTracks::new(
         TrackEventTrack::process_track_uuid(),
-    )?);
+        operation_id,
+        query_execution_id,
+        [1, 10],
+    );
+
+    track_event_instant!(
+        "delta_funnel.perfetto_spike",
+        "Delta Funnel diagnostic group",
+        |context: &mut EventContext| {
+            tracks.diagnostics.set_on(context);
+        }
+    );
+    track_event_begin!(
+        "delta_funnel.perfetto_spike",
+        "Delta Funnel operation",
+        |context: &mut EventContext| {
+            tracks.operation.set_on(context);
+            context.add_debug_arg("operation_id", TrackEventDebugArg::Uint64(operation_id));
+        }
+    );
+
+    track_event_begin!(
+        "delta_funnel.perfetto_spike",
+        "Planning",
+        |context: &mut EventContext| {
+            tracks.phases.set_on(context);
+        }
+    );
+    sampled_cpu_work(PHASE_WORK_DURATION);
+    track_event_end!(
+        "delta_funnel.perfetto_spike",
+        |context: &mut EventContext| {
+            tracks.phases.set_on(context);
+        }
+    );
+
+    track_event_begin!(
+        "delta_funnel.perfetto_spike",
+        "Execution",
+        |context: &mut EventContext| {
+            tracks.phases.set_on(context);
+        }
+    );
+    track_event_instant!(
+        "delta_funnel.perfetto_spike",
+        "DataFusion query",
+        |context: &mut EventContext| {
+            tracks.query.set_on(context);
+            context.add_debug_arg(
+                "query_execution_id",
+                TrackEventDebugArg::Uint64(query_execution_id),
+            );
+        }
+    );
+    let migration = emit_parallel_workers(&tracks, WORKER_ACTIVITY_DURATION).await?;
+    track_event_end!(
+        "delta_funnel.perfetto_spike",
+        |context: &mut EventContext| {
+            tracks.phases.set_on(context);
+        }
+    );
+
+    track_event_begin!(
+        "delta_funnel.perfetto_spike",
+        "Finalization",
+        |context: &mut EventContext| {
+            tracks.phases.set_on(context);
+        }
+    );
+    sampled_cpu_work(PHASE_WORK_DURATION);
+    track_event_end!(
+        "delta_funnel.perfetto_spike",
+        |context: &mut EventContext| {
+            tracks.phases.set_on(context);
+        }
+    );
+    track_event_end!(
+        "delta_funnel.perfetto_spike",
+        |context: &mut EventContext| {
+            tracks.operation.set_on(context);
+            context.add_debug_arg("result", TrackEventDebugArg::String("completed"));
+            context.set_flush();
+        }
+    );
+
+    println!(
+        "captured logical worker migration: begin={}/{:?}, end={}/{:?}; parallel worker={}/{:?}",
+        migration.begin_worker,
+        migration.begin_thread,
+        migration.end_worker,
+        migration.end_thread,
+        migration.parallel_worker,
+        migration.parallel_thread,
+    );
+    Ok(())
+}
+
+async fn emit_parallel_workers(
+    tracks: &SemanticTracks,
+    work_duration: Duration,
+) -> Result<WorkerMigrationEvidence, DynError> {
+    let (first_lane_id, first_track) = tracks.workers[0].clone();
+    let (parallel_lane_id, parallel_track) = tracks.workers[1].clone();
     let (begun_tx, begun_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = mpsc::channel();
 
-    let begin_track = Arc::clone(&track);
     let begin_task = tokio::spawn(async move {
         let begin_thread = std::thread::current().id();
         let begin_worker = current_thread_name();
         track_event_begin!(
             "delta_funnel.perfetto_spike",
-            "Cross-worker logical operation",
-            |ctx: &mut EventContext| {
-                ctx.set_track(&begin_track);
-                ctx.add_debug_arg(
+            "Logical worker activity",
+            |context: &mut EventContext| {
+                first_track.set_on(context);
+                context.add_debug_arg("worker_lane_id", TrackEventDebugArg::Uint64(first_lane_id));
+                context.add_debug_arg(
                     "begin_tokio_worker",
                     TrackEventDebugArg::String(&begin_worker),
                 );
             }
         );
+        sampled_cpu_work(work_duration / 2);
         begun_tx
             .send((begin_thread, begin_worker))
             .map_err(|_| "begin thread receiver closed")?;
@@ -116,18 +372,58 @@ async fn emit_cross_worker_slice() -> Result<(), DynError> {
     });
 
     let (begin_thread, begin_worker) = begun_rx.await?;
+    let parallel_task = tokio::spawn(async move {
+        let parallel_thread = std::thread::current().id();
+        let parallel_worker = current_thread_name();
+        track_event_begin!(
+            "delta_funnel.perfetto_spike",
+            "Logical worker activity",
+            |context: &mut EventContext| {
+                parallel_track.set_on(context);
+                context.add_debug_arg(
+                    "worker_lane_id",
+                    TrackEventDebugArg::Uint64(parallel_lane_id),
+                );
+                context.add_debug_arg("tokio_worker", TrackEventDebugArg::String(&parallel_worker));
+            }
+        );
+        sampled_cpu_work(work_duration);
+        track_event_end!(
+            "delta_funnel.perfetto_spike",
+            |context: &mut EventContext| {
+                parallel_track.set_on(context);
+            }
+        );
+        Ok::<_, DynError>((parallel_thread, parallel_worker))
+    });
+    let parallel_result = match parallel_task.await {
+        Ok(result) => result,
+        Err(error) => Err(error.into()),
+    };
+    let (parallel_thread, parallel_worker) = match parallel_result {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            let _ = release_tx.send(());
+            let _ = begin_task.await;
+            return Err(error);
+        }
+    };
+
+    let first_end_track = tracks.workers[0].1.clone();
     let end_task = tokio::spawn(async move {
         let end_thread = std::thread::current().id();
         let end_worker = current_thread_name();
         if end_thread == begin_thread {
-            return Err("slice begin and end ran on the same Tokio worker".into());
+            return Err("logical worker begin and end ran on the same Tokio worker".into());
         }
-        sampled_cpu_work(SAMPLED_WORK_DURATION);
-        track_event_end!("delta_funnel.perfetto_spike", |ctx: &mut EventContext| {
-            ctx.set_track(&track);
-            ctx.add_debug_arg("end_tokio_worker", TrackEventDebugArg::String(&end_worker));
-            ctx.set_flush();
-        });
+        sampled_cpu_work(work_duration / 2);
+        track_event_end!(
+            "delta_funnel.perfetto_spike",
+            |context: &mut EventContext| {
+                first_end_track.set_on(context);
+                context.add_debug_arg("end_tokio_worker", TrackEventDebugArg::String(&end_worker));
+            }
+        );
         Ok::<_, DynError>((end_thread, end_worker))
     });
 
@@ -135,10 +431,14 @@ async fn emit_cross_worker_slice() -> Result<(), DynError> {
     let _ = release_tx.send(());
     let (end_thread, end_worker) = end_result??;
     begin_task.await??;
-    println!(
-        "captured logical slice across Tokio workers: begin={begin_worker}/{begin_thread:?}, end={end_worker}/{end_thread:?}"
-    );
-    Ok(())
+    Ok(WorkerMigrationEvidence {
+        begin_thread,
+        begin_worker,
+        end_thread,
+        end_worker,
+        parallel_thread,
+        parallel_worker,
+    })
 }
 
 fn current_thread_name() -> String {
@@ -156,4 +456,65 @@ fn sampled_cpu_work(duration: Duration) {
         value = black_box(value.wrapping_mul(6364136223846793005).wrapping_add(1));
     }
     black_box(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn semantic_tracks_are_deterministic_parented_ordered_and_exactly_filterable() {
+        let tracks = SemanticTracks::new(42, 1, 1, [10, 1]);
+        let duplicate = SemanticTracks::new(42, 1, 1, [1, 10]);
+        assert_eq!(tracks, duplicate);
+
+        let uuids = [
+            tracks.diagnostics.uuid,
+            tracks.operation.uuid,
+            tracks.phases.uuid,
+            tracks.query.uuid,
+            tracks.workers[0].1.uuid,
+            tracks.workers[1].1.uuid,
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(uuids.len(), 6);
+        assert_eq!(tracks.operation.parent_uuid, tracks.diagnostics.uuid);
+        assert_eq!(tracks.phases.parent_uuid, tracks.operation.uuid);
+        assert_eq!(tracks.query.parent_uuid, tracks.operation.uuid);
+        assert!(
+            tracks
+                .workers
+                .iter()
+                .all(|(_, worker)| worker.parent_uuid == tracks.query.uuid)
+        );
+        assert!(tracks.phases.sibling_order_rank < tracks.query.sibling_order_rank);
+        assert!(tracks.workers[0].1.sibling_order_rank < tracks.workers[1].1.sibling_order_rank);
+
+        let worker_1_filter = format!("worker [{}]", worker_token(1));
+        assert!(tracks.workers[0].1.name.contains(&worker_1_filter));
+        assert!(!tracks.workers[1].1.name.contains(&worker_1_filter));
+        let query_1_filter = format!("query [{}]", query_token(1));
+        let query_10 = SemanticTracks::new(42, 1, 10, [1, 10]);
+        assert!(!query_10.query.name.contains(&query_1_filter));
+        let operation_2 = SemanticTracks::new(42, 2, 1, [1, 10]);
+        assert_ne!(tracks.operation.uuid, operation_2.operation.uuid);
+        assert_ne!(tracks.query.uuid, operation_2.query.uuid);
+        assert_ne!(tracks.workers[0].1.uuid, operation_2.workers[0].1.uuid);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn logical_worker_track_survives_tokio_worker_migration() -> Result<(), DynError> {
+        let tracks = SemanticTracks::new(42, 1, 1, [1, 10]);
+        let worker_uuid = tracks.workers[0].1.uuid;
+
+        let evidence = emit_parallel_workers(&tracks, Duration::from_millis(1)).await?;
+
+        assert_ne!(evidence.begin_thread, evidence.end_thread);
+        assert_eq!(evidence.parallel_thread, evidence.end_thread);
+        assert_eq!(tracks.workers[0].1.uuid, worker_uuid);
+        Ok(())
+    }
 }
