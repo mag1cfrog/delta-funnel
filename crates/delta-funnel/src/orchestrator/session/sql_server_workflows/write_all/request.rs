@@ -4,7 +4,10 @@ use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlStreamBenchmarkOutputWriter,
     MssqlWorkflowOutputWriter, MssqlWorkflowSinkWriter, PhaseTimingReport, ReportReasonCode,
     observability,
-    profiling::{OperationTraceContext, OperationTraceKind},
+    profiling::{
+        OperationTraceContext, OperationTraceKind, OperationTracePhase,
+        ProcessOperationPhaseTracker,
+    },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::{
         OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer, TimelineSpanStatus,
@@ -101,6 +104,10 @@ impl DeltaFunnelSession {
         let timeline = trace_context
             .as_ref()
             .and_then(OperationTraceContext::timeline);
+        let mut process_phases = ProcessOperationPhaseTracker::start(
+            trace_context.as_ref(),
+            OperationTracePhase::Planning,
+        );
 
         if let Some(reporter) = active_reporter {
             reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
@@ -153,6 +160,7 @@ impl DeltaFunnelSession {
 
             // Run exactly one route while all outputs share the same source
             // statistics snapshot collection used by the final source report.
+            process_phases.transition(OperationTracePhase::Execution);
             let shared_provider_stats = shared_provider_stats_snapshots();
             let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
             let workflow_span = start_write_all_phase_span(
@@ -214,6 +222,14 @@ impl DeltaFunnelSession {
                 }
             };
             phase_timings.push(workflow_timer.completed());
+            process_phases.transition_with_result(
+                if workflow.all_succeeded() {
+                    "ok"
+                } else {
+                    "error"
+                },
+                OperationTracePhase::Finalization,
+            );
 
             // Source reporting happens once after either execution route and
             // uses the provider statistics collected above.
@@ -264,12 +280,13 @@ impl DeltaFunnelSession {
             }
             (result, _) => result,
         };
+        process_phases.finish(if result.is_ok() { "ok" } else { "error" });
+        let process_result = match &result {
+            Ok(report) if report.all_succeeded() => "ok",
+            Ok(_) | Err(_) => "error",
+        };
 
         if let Some(context) = &trace_context {
-            let process_result = match &result {
-                Ok(report) if report.all_succeeded() => "ok",
-                Ok(_) | Err(_) => "error",
-            };
             context.record_process_result(process_result);
         }
 
@@ -777,6 +794,36 @@ mod tests {
             .count()
     }
 
+    fn process_write_all_story(capture: &TracingCapture) -> (String, Vec<(String, String)>) {
+        let spans = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .filter(|span| span.target == crate::profiling::PROFILE_TARGET)
+            .collect::<Vec<_>>();
+        let root = spans
+            .iter()
+            .find(|span| span.name == "Delta Funnel SQL Server write_all")
+            .expect("expected SQL Server write_all process root");
+        assert!(root.closed);
+        let phases = spans
+            .iter()
+            .filter(|span| span.name == "Delta Funnel operation phase")
+            .collect::<Vec<_>>();
+        assert!(phases.iter().all(|phase| {
+            phase.parent_id == Some(root.id)
+                && phase.fields["operation_id"] == root.fields["operation_id"]
+                && phase.closed
+        }));
+        (
+            root.fields["result"].clone(),
+            phases
+                .into_iter()
+                .map(|span| (span.fields["phase"].clone(), span.fields["result"].clone()))
+                .collect(),
+        )
+    }
+
     const fn detailed_uncached_write_all_options() -> WriteAllOptions {
         WriteAllOptions::new()
             .with_cache_mode(WriteAllCacheMode::Disabled)
@@ -1022,6 +1069,7 @@ mod tests {
                 LoadMode::AppendExisting,
             )?;
             let (reporter, events) = recording_progress();
+            let capture = TracingCapture::start_with_profile_spans_enabled();
 
             let report = session
                 .write_all_with_progress_and_writer(
@@ -1032,6 +1080,17 @@ mod tests {
                 )
                 .await?;
             assert!(report.all_succeeded());
+            assert_eq!(
+                process_write_all_story(&capture),
+                (
+                    "ok".to_owned(),
+                    vec![
+                        ("planning".to_owned(), "ok".to_owned()),
+                        ("execution".to_owned(), "ok".to_owned()),
+                        ("finalization".to_owned(), "ok".to_owned()),
+                    ],
+                )
+            );
 
             let events = events.lock().map_err(|_| "progress event lock poisoned")?;
             assert_eq!(events.len(), 9);
@@ -3417,7 +3476,7 @@ mod tests {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
             )?;
-            let capture = TracingCapture::start();
+            let capture = TracingCapture::start_with_profile_spans_enabled();
 
             let report = run_two_output_failure_case(
                 &mut session,
@@ -3432,6 +3491,17 @@ mod tests {
                 QueryExecutionOutcome::Error,
             )?;
             assert_eq!(execution_profile_events(&capture).len(), 1);
+            assert_eq!(
+                process_write_all_story(&capture),
+                (
+                    "error".to_owned(),
+                    vec![
+                        ("planning".to_owned(), "ok".to_owned()),
+                        ("execution".to_owned(), "error".to_owned()),
+                        ("finalization".to_owned(), "ok".to_owned()),
+                    ],
+                )
+            );
             Ok(())
         }
 

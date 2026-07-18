@@ -28,7 +28,8 @@ use crate::{
     ReportReasonCode, TimelineSpanStatus,
     observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
     profiling::{
-        OperationTraceContext, OperationTraceKind, OperationTracePhase, ProcessOperationPhaseTrace,
+        OperationTraceContext, OperationTraceKind, OperationTracePhase,
+        ProcessOperationPhaseTracker,
     },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
@@ -607,7 +608,7 @@ pub(super) fn batch_stream_for_physical_plan(
 struct PreviewTimingTracker {
     phase_timings: Vec<PhaseTimingReport>,
     timeline: OperationTimelineRecorder,
-    process_phase: Option<ProcessOperationPhaseTrace>,
+    process_phases: ProcessOperationPhaseTracker,
 }
 
 struct PreviewPhaseTimer {
@@ -620,22 +621,7 @@ impl PreviewTimingTracker {
         Self {
             phase_timings: Vec::with_capacity(PREVIEW_PHASE_NAMES.len()),
             timeline: OperationTimelineRecorder::start(),
-            process_phase: None,
-        }
-    }
-
-    fn transition_process_phase(
-        &mut self,
-        context: Option<&OperationTraceContext>,
-        phase: OperationTracePhase,
-    ) {
-        self.finish_process_phase("ok");
-        self.process_phase = context.and_then(|context| context.start_process_phase(phase));
-    }
-
-    fn finish_process_phase(&mut self, result: &'static str) {
-        if let Some(phase) = self.process_phase.take() {
-            phase.finish(result);
+            process_phases: ProcessOperationPhaseTracker::default(),
         }
     }
 
@@ -678,7 +664,7 @@ impl PreviewTimingTracker {
         mut self,
         execution_profile: Option<&QueryExecutionProfile>,
     ) -> (Vec<PhaseTimingReport>, OperationTimeline) {
-        self.finish_process_phase("ok");
+        self.process_phases.finish("ok");
         if let Some(execution_profile) = execution_profile {
             self.timeline.append_operator_lifecycles(execution_profile);
         }
@@ -698,7 +684,7 @@ impl PreviewTimingTracker {
         execution_profile: Option<QueryExecutionProfile>,
         source: DeltaFunnelError,
     ) -> DeltaFunnelError {
-        self.finish_process_phase("error");
+        self.process_phases.finish("error");
         let failed_timing = self.record_timing(timer, TimelineSpanStatus::Failed);
         let failed_phase = failed_timing.phase_name().to_owned();
         self.phase_timings.push(failed_timing);
@@ -872,7 +858,10 @@ impl DeltaFunnelSession {
             (options.execution_profile_mode() == ExecutionProfileMode::Detailed)
                 .then(|| timings.timeline.clone()),
         );
-        timings.transition_process_phase(trace_context.as_ref(), OperationTracePhase::Planning);
+        timings.process_phases = ProcessOperationPhaseTracker::start(
+            trace_context.as_ref(),
+            OperationTracePhase::Planning,
+        );
 
         let result = async {
             emit_preview_phase(reporter, ProgressPhase::PreparingPreview);
@@ -916,7 +905,8 @@ impl DeltaFunnelSession {
             timings.record_completed(physical_plan_timer);
 
             timings
-                .transition_process_phase(trace_context.as_ref(), OperationTracePhase::Execution);
+                .process_phases
+                .transition(OperationTracePhase::Execution);
             let stream_setup_timer = timings.start_phase(PREVIEW_STREAM_SETUP_PHASE);
             let read_stats_handles =
                 collect_delta_provider_read_stats_handles(physical_plan.as_ref());
@@ -987,10 +977,9 @@ impl DeltaFunnelSession {
                 }
             };
             timings.record_completed(execute_collect_timer);
-            timings.transition_process_phase(
-                trace_context.as_ref(),
-                OperationTracePhase::Finalization,
-            );
+            timings
+                .process_phases
+                .transition(OperationTracePhase::Finalization);
             let execution_profile = clone_terminal_execution_profile(profile_result);
 
             emit_preview_phase(reporter, ProgressPhase::FormattingPreview);

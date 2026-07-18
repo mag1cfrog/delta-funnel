@@ -121,7 +121,7 @@ impl OperationTraceContext {
         }
     }
 
-    pub(crate) fn start_process_phase(
+    fn start_process_phase(
         &self,
         phase: OperationTracePhase,
     ) -> Option<ProcessOperationPhaseTrace> {
@@ -137,7 +137,6 @@ impl OperationTraceContext {
         );
         Some(ProcessOperationPhaseTrace {
             span,
-            _context: self.clone(),
             result_recorded: false,
         })
     }
@@ -151,11 +150,51 @@ impl OperationTraceContext {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct ProcessOperationPhaseTracker {
+    // Drop the active child before releasing the operation root.
+    active: Option<ProcessOperationPhaseTrace>,
+    context: Option<OperationTraceContext>,
+}
+
+impl ProcessOperationPhaseTracker {
+    pub(crate) fn start(
+        context: Option<&OperationTraceContext>,
+        phase: OperationTracePhase,
+    ) -> Self {
+        let context = context.cloned();
+        let active = context
+            .as_ref()
+            .and_then(|context| context.start_process_phase(phase));
+        Self { active, context }
+    }
+
+    pub(crate) fn transition(&mut self, phase: OperationTracePhase) {
+        self.transition_with_result("ok", phase);
+    }
+
+    pub(crate) fn transition_with_result(
+        &mut self,
+        result: &'static str,
+        phase: OperationTracePhase,
+    ) {
+        self.finish(result);
+        self.active = self
+            .context
+            .as_ref()
+            .and_then(|context| context.start_process_phase(phase));
+    }
+
+    pub(crate) fn finish(&mut self, result: &'static str) {
+        if let Some(active) = self.active.take() {
+            active.finish(result);
+        }
+    }
+}
+
 #[derive(Debug)]
-pub(crate) struct ProcessOperationPhaseTrace {
+struct ProcessOperationPhaseTrace {
     span: tracing::Span,
-    // Retain the operation root until this child span closes on cancellation.
-    _context: OperationTraceContext,
     result_recorded: bool,
 }
 
@@ -443,9 +482,8 @@ mod tests {
             .id()
             .expect("the root span should be enabled")
             .into_u64();
-        let phase = context
-            .start_process_phase(OperationTracePhase::Execution)
-            .expect("process tracing should create a phase span");
+        let phases =
+            ProcessOperationPhaseTracker::start(Some(&context), OperationTracePhase::Execution);
 
         drop(context);
         let open_root = capture
@@ -456,7 +494,7 @@ mod tests {
             .expect("the operation root should be captured");
         assert!(!open_root.closed);
 
-        drop(phase);
+        drop(phases);
         let spans = capture.captured().spans();
         let root = spans
             .iter()

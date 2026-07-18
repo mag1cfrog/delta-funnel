@@ -9,7 +9,10 @@ use crate::{
     MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport, PhaseTimingReport,
     QueryExecutionProfile, QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget,
     TimelineSpanStatus, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
-    profiling::{OperationTraceContext, OperationTraceKind},
+    profiling::{
+        OperationTraceContext, OperationTraceKind, OperationTracePhase,
+        ProcessOperationPhaseTracker,
+    },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{QueryTraceIdentity, with_query_planning_activity},
     report::{OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer},
@@ -370,6 +373,7 @@ impl DeltaFunnelSession {
                     progress,
                     profile_mode,
                     trace_context.as_ref(),
+                    None,
                 )
                 .await
             })
@@ -393,6 +397,10 @@ impl DeltaFunnelSession {
         let timeline = trace_context
             .as_ref()
             .and_then(OperationTraceContext::timeline);
+        let mut process_phases = ProcessOperationPhaseTracker::start(
+            trace_context.as_ref(),
+            OperationTracePhase::Planning,
+        );
         let result = async {
             let output_name = Some(request.target().output_name());
             if let Some(reporter) = reporter {
@@ -422,6 +430,7 @@ impl DeltaFunnelSession {
                 reporter.cloned(),
                 profile_mode,
                 trace_context.as_ref(),
+                Some(&mut process_phases),
             )
             .await
             .map_err(|failure| {
@@ -445,6 +454,10 @@ impl DeltaFunnelSession {
                     timeline,
                 )
                 .await;
+            process_phases.transition_with_result(
+                if result.is_ok() { "ok" } else { "error" },
+                OperationTracePhase::Finalization,
+            );
             let result = match attach_profile_to_result {
                 Some(attach_profile) => attach_profile(result),
                 None => result,
@@ -458,9 +471,13 @@ impl DeltaFunnelSession {
                     Err(error)
                 }
             };
-            finish_mssql_write_timeline(result, timeline, request.target().output_name())
+            let result =
+                finish_mssql_write_timeline(result, timeline, request.target().output_name());
+            process_phases.finish("ok");
+            result
         }
         .await;
+        process_phases.finish(if result.is_ok() { "ok" } else { "error" });
         if let Some(context) = &trace_context {
             context.record_process_result(if result.is_ok() { "ok" } else { "error" });
         }
@@ -482,6 +499,7 @@ pub(super) async fn create_mssql_output_query_execution_with_trace_context(
     progress: Option<ProgressReporter>,
     profile_mode: ExecutionProfileMode,
     trace_context: Option<&OperationTraceContext>,
+    process_phases: Option<&mut ProcessOperationPhaseTracker>,
 ) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
     let timeline = trace_context.and_then(OperationTraceContext::timeline);
     let mut query_phase_timings = Vec::with_capacity(QUERY_PHASE_NAMES.len());
@@ -533,6 +551,7 @@ pub(super) async fn create_mssql_output_query_execution_with_trace_context(
         progress,
         profile_mode,
         trace_context,
+        process_phases,
     )
     .await
 }
@@ -550,6 +569,7 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_trac
     progress: Option<ProgressReporter>,
     profile_mode: ExecutionProfileMode,
     trace_context: Option<&OperationTraceContext>,
+    process_phases: Option<&mut ProcessOperationPhaseTracker>,
 ) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
     let timeline = trace_context.and_then(OperationTraceContext::timeline);
     let trace_identity = trace_context.cloned().and_then(|context| {
@@ -595,6 +615,9 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_trac
     };
     complete_write_span(physical_plan_span);
     query_phase_timings.push(physical_plan_timer.completed());
+    if let Some(process_phases) = process_phases {
+        process_phases.transition(OperationTracePhase::Execution);
+    }
 
     let stream_setup_timer = PhaseTimer::start(QUERY_STREAM_SETUP_PHASE);
     let stream_setup_span = start_write_span(
@@ -1700,7 +1723,7 @@ mod tests {
         )?;
         let mut writer = FakeOrchestratorWriter::default();
         let (reporter, events) = recording_reporter();
-        let capture = TracingCapture::start();
+        let capture = TracingCapture::start_with_profile_spans_enabled();
 
         let report = session
             .write_to_mssql_with_writer_and_reporter(&request, &mut writer, reporter)
@@ -1728,6 +1751,41 @@ mod tests {
         assert_eq!(report.cleanup(), MssqlTargetCleanupStatus::NotApplicable);
         assert_eq!(report.execution_profile(), None);
         assert!(execution_profile_events(&capture).is_empty());
+        let spans = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .filter(|span| span.target == crate::profiling::PROFILE_TARGET)
+            .collect::<Vec<_>>();
+        let root = spans
+            .iter()
+            .find(|span| span.name == "Delta Funnel SQL Server write")
+            .ok_or("expected SQL Server write process root")?;
+        assert_eq!(root.fields["result"], "ok");
+        assert!(root.closed);
+        let phases = spans
+            .iter()
+            .filter(|span| span.name == "Delta Funnel operation phase")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases
+                .iter()
+                .map(|span| (
+                    span.fields["phase"].as_str(),
+                    span.fields["result"].as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("planning", "ok"),
+                ("execution", "ok"),
+                ("finalization", "ok"),
+            ]
+        );
+        assert!(phases.iter().all(|phase| {
+            phase.parent_id == Some(root.id)
+                && phase.fields["operation_id"] == root.fields["operation_id"]
+                && phase.closed
+        }));
         assert_eq!(
             report
                 .phase_timings()
