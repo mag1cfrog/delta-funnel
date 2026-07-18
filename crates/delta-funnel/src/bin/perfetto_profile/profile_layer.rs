@@ -315,10 +315,7 @@ impl ActiveProfileSpan {
             "delta_funnel.perfetto_spike",
             |context: &mut EventContext| {
                 track.set_on(context);
-                self.add_profile_args(context);
-                if let Some(result) = &self.fields.result {
-                    context.add_debug_arg("result", TrackEventDebugArg::String(result));
-                }
+                self.add_completion_args(context);
                 if flush {
                     context.set_flush();
                 }
@@ -376,6 +373,18 @@ impl ActiveProfileSpan {
         }
         if let Some(time_semantics) = &self.fields.time_semantics {
             context.add_debug_arg("time_semantics", TrackEventDebugArg::String(time_semantics));
+        }
+    }
+
+    fn add_completion_args(&self, context: &mut EventContext) {
+        if let Some(query_owner) = &self.fields.query_owner {
+            context.add_debug_arg("query_owner", TrackEventDebugArg::String(query_owner));
+        }
+        if let Some(parent_node_id) = self.fields.parent_node_id {
+            context.add_debug_arg("parent_node_id", TrackEventDebugArg::Uint64(parent_node_id));
+        }
+        if let Some(result) = &self.fields.result {
+            context.add_debug_arg("result", TrackEventDebugArg::String(result));
         }
     }
 
