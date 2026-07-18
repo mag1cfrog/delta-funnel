@@ -8,7 +8,6 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
-    thread::ThreadId,
 };
 
 use datafusion::{
@@ -77,8 +76,13 @@ impl ActivityWorkerLane {
 struct OperatorActivityIdentityState {
     next_stream_id: u64,
     next_worker_lane_id: u64,
-    coordinator_thread: Option<ThreadId>,
-    worker_lanes: HashMap<ThreadId, ActivityWorkerLane>,
+    worker_lanes: Vec<ActivityWorkerLaneState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActivityWorkerLaneState {
+    lane: ActivityWorkerLane,
+    active: bool,
 }
 
 impl Default for OperatorActivityIdentityState {
@@ -86,8 +90,7 @@ impl Default for OperatorActivityIdentityState {
         Self {
             next_stream_id: 1,
             next_worker_lane_id: 1,
-            coordinator_thread: None,
-            worker_lanes: HashMap::new(),
+            worker_lanes: Vec::new(),
         }
     }
 }
@@ -105,7 +108,8 @@ struct ActivityExecutionContext {
 struct ActiveOperatorActivitySpan {
     operation_id: u64,
     query_execution_id: u64,
-    worker_lane_id: u64,
+    worker_lane: ActivityWorkerLane,
+    owns_worker_lane: bool,
     timeline_span_id: Option<u64>,
     process_span_active: bool,
 }
@@ -162,13 +166,13 @@ impl OperatorActivityRecorder {
             return None;
         }
 
-        let context = self.execution_context();
+        let (context, owns_worker_lane) = self.execution_context(partition);
         let (parent_id, process_parent_active) = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
             let active = active.borrow();
             let matches_parent = |parent: &ActiveOperatorActivitySpan| {
                 parent.operation_id == self.context.operation_id()
                     && parent.query_execution_id == self.query_execution_id
-                    && parent.worker_lane_id == context.worker_lane.id
+                    && parent.worker_lane.id == context.worker_lane.id
             };
             let parent_id = active
                 .iter()
@@ -241,12 +245,16 @@ impl OperatorActivityRecorder {
             })
             .flatten();
         if timeline_span_id.is_none() && process_span.is_none() {
+            if owns_worker_lane {
+                Self::release_worker_lane(&self.identities, context.worker_lane);
+            }
             return None;
         }
         let active = ActiveOperatorActivitySpan {
             operation_id: self.context.operation_id(),
             query_execution_id: self.query_execution_id,
-            worker_lane_id: context.worker_lane.id,
+            worker_lane: context.worker_lane,
+            owns_worker_lane,
             timeline_span_id,
             process_span_active: process_span.is_some(),
         };
@@ -255,6 +263,7 @@ impl OperatorActivityRecorder {
             timeline_span,
             process_span,
             process_result_recorded: false,
+            identities: Arc::clone(&self.identities),
             active,
         })
     }
@@ -318,7 +327,7 @@ impl OperatorActivityRecorder {
         stream_id
     }
 
-    fn execution_context(&self) -> ActivityExecutionContext {
+    fn execution_context(&self, partition: usize) -> (ActivityExecutionContext, bool) {
         let thread = std::thread::current();
         let runtime_task_id = tokio::task::try_id().map(|id| id.to_string());
         let task_kind = if runtime_task_id.is_some() {
@@ -327,44 +336,83 @@ impl OperatorActivityRecorder {
             "external"
         };
         let thread_id = thread.id();
-        let worker_lane = {
-            let mut identities = self
-                .identities
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            match identities.worker_lanes.get(&thread_id) {
-                Some(worker_lane) => *worker_lane,
-                None => {
-                    let worker_lane =
-                        if runtime_task_id.is_none() && identities.coordinator_thread.is_none() {
-                            identities.coordinator_thread = Some(thread_id);
-                            ActivityWorkerLane {
-                                id: 0,
-                                kind: ActivityWorkerKind::Coordinator,
-                            }
-                        } else {
-                            let id = identities.next_worker_lane_id;
-                            identities.next_worker_lane_id = id.saturating_add(1);
-                            ActivityWorkerLane {
-                                id,
-                                kind: if runtime_task_id.is_some() {
-                                    ActivityWorkerKind::Runtime
-                                } else {
-                                    ActivityWorkerKind::External
-                                },
-                            }
-                        };
-                    identities.worker_lanes.insert(thread_id, worker_lane);
-                    worker_lane
-                }
+        let inherited_worker_lane = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
+            active.borrow().iter().rev().find_map(|parent| {
+                (parent.operation_id == self.context.operation_id()
+                    && parent.query_execution_id == self.query_execution_id)
+                    .then_some(parent.worker_lane)
+            })
+        });
+        let (worker_lane, owns_worker_lane) = match inherited_worker_lane {
+            Some(worker_lane) => (worker_lane, false),
+            None if runtime_task_id.is_none() && partition == 0 => (
+                ActivityWorkerLane {
+                    id: 0,
+                    kind: ActivityWorkerKind::Coordinator,
+                },
+                false,
+            ),
+            None => {
+                let kind = if runtime_task_id.is_some() {
+                    ActivityWorkerKind::Runtime
+                } else {
+                    ActivityWorkerKind::External
+                };
+                (self.acquire_worker_lane(kind), true)
             }
         };
-        ActivityExecutionContext {
-            worker_lane,
-            task_kind,
-            runtime_task_id,
-            worker_thread_id: format!("{thread_id:?}"),
-            worker_thread_name: thread.name().map(str::to_owned),
+        (
+            ActivityExecutionContext {
+                worker_lane,
+                task_kind,
+                runtime_task_id,
+                worker_thread_id: format!("{thread_id:?}"),
+                worker_thread_name: thread.name().map(str::to_owned),
+            },
+            owns_worker_lane,
+        )
+    }
+
+    fn acquire_worker_lane(&self, kind: ActivityWorkerKind) -> ActivityWorkerLane {
+        let mut identities = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Logical lanes represent bounded active executor slots. Reusing an
+        // inactive lane keeps identity independent from Tokio tasks and OS
+        // threads while preventing overlapping slices on one lane.
+        if let Some(state) = identities
+            .worker_lanes
+            .iter_mut()
+            .find(|state| state.lane.kind == kind && !state.active)
+        {
+            state.active = true;
+            return state.lane;
+        }
+
+        let lane = ActivityWorkerLane {
+            id: identities.next_worker_lane_id,
+            kind,
+        };
+        identities.next_worker_lane_id = identities.next_worker_lane_id.saturating_add(1);
+        identities
+            .worker_lanes
+            .push(ActivityWorkerLaneState { lane, active: true });
+        lane
+    }
+
+    fn release_worker_lane(
+        identities: &Mutex<OperatorActivityIdentityState>,
+        lane: ActivityWorkerLane,
+    ) {
+        let mut identities = identities.lock().unwrap_or_else(|error| error.into_inner());
+        let state = identities
+            .worker_lanes
+            .iter_mut()
+            .find(|state| state.lane == lane);
+        debug_assert!(state.as_ref().is_some_and(|state| state.active));
+        if let Some(state) = state {
+            state.active = false;
         }
     }
 
@@ -414,6 +462,7 @@ struct OperatorActivitySpanRecorder {
     timeline_span: Option<OperationTimelineSpanRecorder>,
     process_span: Option<tracing::Span>,
     process_result_recorded: bool,
+    identities: Arc<Mutex<OperatorActivityIdentityState>>,
     active: ActiveOperatorActivitySpan,
 }
 
@@ -452,6 +501,14 @@ impl Drop for OperatorActivitySpanRecorder {
             let popped = spans.borrow_mut().pop();
             debug_assert_eq!(popped, Some(self.active));
         });
+        drop(self.timeline_span.take());
+        drop(self.process_span.take());
+        if self.active.owns_worker_lane {
+            OperatorActivityRecorder::release_worker_lane(
+                &self.identities,
+                self.active.worker_lane,
+            );
+        }
     }
 }
 
@@ -651,7 +708,12 @@ impl RecordBatchStream for ProfiledRecordBatchStream {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, error::Error, sync::Arc};
+    use std::{
+        collections::BTreeSet,
+        error::Error,
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
 
     use datafusion::{physical_plan::collect, prelude::SessionContext};
 
@@ -958,7 +1020,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn worker_tracks_are_bounded_by_executor_threads_not_task_count()
+    async fn worker_tracks_are_bounded_by_active_parallelism_not_task_count()
     -> Result<(), Box<dyn Error>> {
         const TASK_COUNT: usize = 32;
         let timeline = OperationTimelineRecorder::start();
@@ -1004,13 +1066,69 @@ mod tests {
         assert_eq!(runtime_task_ids.len(), TASK_COUNT);
         assert!(!worker_lane_ids.is_empty());
         assert!(worker_lane_ids.len() <= 2);
-        assert_eq!(worker_thread_ids.len(), worker_lane_ids.len());
+        assert!(!worker_thread_ids.is_empty());
+        assert!(worker_thread_ids.len() <= 2);
         assert!(runtime_task_ids.len() > worker_lane_ids.len());
         assert!(spans.iter().all(|span| {
             span.attributes()["worker_kind"] == "runtime"
                 && span.track_name().starts_with("DataFusion query ")
                 && span.track_name().contains(" / worker ")
         }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn logical_worker_lane_is_reused_across_os_threads() -> Result<(), Box<dyn Error>> {
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity(timeline.clone()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let first_activity = activity.clone();
+        let first = tokio::spawn(async move {
+            first_activity
+                .start_span("WorkerExec", 0, None, 0, 1, "poll_next")
+                .expect("first worker activity should fit")
+                .finish("batch", false);
+            let thread_id = format!("{:?}", std::thread::current().id());
+            let _ = started_tx.send(thread_id);
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let first_thread_id = started_rx.await?;
+        let second_activity = activity.clone();
+        let second_thread_id = tokio::spawn(async move {
+            second_activity
+                .start_span("WorkerExec", 0, None, 0, 2, "poll_next")
+                .expect("second worker activity should fit")
+                .finish("batch", false);
+            format!("{:?}", std::thread::current().id())
+        })
+        .await?;
+        release_tx.send(())?;
+        first.await?;
+
+        assert_ne!(first_thread_id, second_thread_id);
+        let timeline = timeline.finish("workers", TimelineSpanStatus::Completed);
+        let spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == OPERATOR_ACTIVITY_CATEGORY)
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|span| {
+            span.attributes()["worker_lane_id"] == 1
+                && span.attributes()["worker_kind"] == "runtime"
+        }));
+        assert_eq!(
+            spans
+                .iter()
+                .filter_map(|span| span.attributes()["worker_thread_id"].as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
 
         Ok(())
     }
