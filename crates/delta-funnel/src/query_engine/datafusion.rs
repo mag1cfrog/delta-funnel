@@ -73,6 +73,14 @@ impl QueryTraceIdentity {
         self.context.timeline()
     }
 
+    const fn operation_id(&self) -> u64 {
+        self.context.operation_id()
+    }
+
+    fn process_root_span(&self) -> Option<&tracing::Span> {
+        self.context.process_root_span()
+    }
+
     const fn query_execution_id(&self) -> u64 {
         self.query_execution_id
     }

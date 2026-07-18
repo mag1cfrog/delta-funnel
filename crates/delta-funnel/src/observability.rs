@@ -661,7 +661,7 @@ pub(crate) mod test_capture {
     use tracing::{
         Event, Level, Subscriber,
         field::{Field, Visit},
-        span::{Attributes, Id},
+        span::{Attributes, Id, Record},
     };
     use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*, registry::LookupSpan};
 
@@ -703,6 +703,14 @@ pub(crate) mod test_capture {
 
     impl TracingCapture {
         pub(crate) fn start() -> Self {
+            Self::start_with_profile_spans(false)
+        }
+
+        pub(crate) fn start_with_profile_spans_enabled() -> Self {
+            Self::start_with_profile_spans(true)
+        }
+
+        fn start_with_profile_spans(profile_spans_enabled: bool) -> Self {
             let test_guard = tracing_test_guard();
             // A no-layer global registry keeps callsites enabled when an
             // ordinary parallel test is the first thread to reach them.
@@ -712,7 +720,8 @@ pub(crate) mod test_capture {
             });
             tracing::callsite::rebuild_interest_cache();
             let captured = CapturedEvents::default();
-            let subscriber = Registry::default().with(CaptureLayer::new(captured.clone()));
+            let subscriber = Registry::default()
+                .with(CaptureLayer::new(captured.clone(), profile_spans_enabled));
             let subscriber_guard = tracing::subscriber::set_default(subscriber);
             Self {
                 _subscriber_guard: subscriber_guard,
@@ -736,10 +745,15 @@ pub(crate) mod test_capture {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) struct CapturedSpan {
+        pub(crate) id: u64,
+        pub(crate) parent_id: Option<u64>,
         pub(crate) target: &'static str,
         pub(crate) name: &'static str,
         pub(crate) level: Level,
         pub(crate) fields: BTreeMap<String, String>,
+        pub(crate) enter_count: u64,
+        pub(crate) exit_count: u64,
+        pub(crate) closed: bool,
     }
 
     #[derive(Clone, Default)]
@@ -762,15 +776,29 @@ pub(crate) mod test_capture {
                 Err(_) => Vec::new(),
             }
         }
+
+        fn update_span(&self, id: &Id, update: impl FnOnce(&mut CapturedSpan)) {
+            if let Ok(mut spans) = self.spans.lock()
+                && let Some(span) = spans
+                    .iter_mut()
+                    .find(|span| span.id == id.clone().into_u64())
+            {
+                update(span);
+            }
+        }
     }
 
     struct CaptureLayer {
         events: CapturedEvents,
+        profile_spans_enabled: bool,
     }
 
     impl CaptureLayer {
-        fn new(events: CapturedEvents) -> Self {
-            Self { events }
+        fn new(events: CapturedEvents, profile_spans_enabled: bool) -> Self {
+            Self {
+                events,
+                profile_spans_enabled,
+            }
         }
     }
 
@@ -785,19 +813,57 @@ pub(crate) mod test_capture {
             tracing::subscriber::Interest::sometimes()
         }
 
-        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+            metadata.target() != crate::profiling::PROFILE_TARGET || self.profile_spans_enabled
+        }
+
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
             let mut visitor = FieldVisitor::default();
             attrs.record(&mut visitor);
             let captured = CapturedSpan {
+                id: id.clone().into_u64(),
+                parent_id: ctx
+                    .span(id)
+                    .and_then(|span| span.parent())
+                    .map(|parent| parent.id().clone().into_u64()),
                 target: attrs.metadata().target(),
                 name: attrs.metadata().name(),
                 level: *attrs.metadata().level(),
                 fields: visitor.fields,
+                enter_count: 0,
+                exit_count: 0,
+                closed: false,
             };
 
             if let Ok(mut spans) = self.events.spans.lock() {
                 spans.push(captured);
             }
+        }
+
+        fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+            self.events.update_span(id, |span| {
+                let mut visitor = FieldVisitor {
+                    fields: std::mem::take(&mut span.fields),
+                };
+                values.record(&mut visitor);
+                span.fields = visitor.fields;
+            });
+        }
+
+        fn on_enter(&self, id: &Id, _ctx: Context<'_, S>) {
+            self.events.update_span(id, |span| {
+                span.enter_count = span.enter_count.saturating_add(1);
+            });
+        }
+
+        fn on_exit(&self, id: &Id, _ctx: Context<'_, S>) {
+            self.events.update_span(id, |span| {
+                span.exit_count = span.exit_count.saturating_add(1);
+            });
+        }
+
+        fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
+            self.events.update_span(&id, |span| span.closed = true);
         }
 
         fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {

@@ -9,7 +9,7 @@ use crate::{
     MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport, PhaseTimingReport,
     QueryExecutionProfile, QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget,
     TimelineSpanStatus, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
-    profiling::OperationTraceContext,
+    profiling::{OperationTraceContext, OperationTraceKind},
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{QueryTraceIdentity, with_query_planning_activity},
     report::{OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer},
@@ -387,76 +387,84 @@ impl DeltaFunnelSession {
         W: OrchestratorMssqlOutputWriter,
     {
         let trace_context = OperationTraceContext::start(
+            OperationTraceKind::MssqlWrite,
             (profile_mode == ExecutionProfileMode::Detailed).then(OperationTimelineRecorder::start),
         );
         let timeline = trace_context
             .as_ref()
             .and_then(OperationTraceContext::timeline);
-        let output_name = Some(request.target().output_name());
-        if let Some(reporter) = reporter {
-            reporter.emit(&ProgressEvent::phase_changed(
-                ProgressPhase::PlanningOutput,
-                output_name,
-            ));
-        }
-        let planned = self.plan_mssql_output_with_timeline(request, timeline)?;
-        if let Some(reporter) = reporter {
-            reporter.emit(&ProgressEvent::phase_changed(
-                ProgressPhase::SettingUpStream,
-                output_name,
-            ));
-        }
-        let MssqlOutputQueryExecution {
-            stream: batches,
-            query_phase_timings,
-            attach_profile_to_result,
-        } = create_mssql_output_query_execution_with_trace_context(
-            &self.context,
-            &self.sources,
-            &self.derived_tables,
-            &self.pending_derived_tables,
-            &planned,
-            None,
-            reporter.cloned(),
-            profile_mode,
-            trace_context.as_ref(),
-        )
-        .await
-        .map_err(|failure| {
-            finish_mssql_write_error_timeline(
-                failure.error,
-                timeline,
-                request.target().output_name(),
+        let result = async {
+            let output_name = Some(request.target().output_name());
+            if let Some(reporter) = reporter {
+                reporter.emit(&ProgressEvent::phase_changed(
+                    ProgressPhase::PlanningOutput,
+                    output_name,
+                ));
+            }
+            let planned = self.plan_mssql_output_with_timeline(request, timeline)?;
+            if let Some(reporter) = reporter {
+                reporter.emit(&ProgressEvent::phase_changed(
+                    ProgressPhase::SettingUpStream,
+                    output_name,
+                ));
+            }
+            let MssqlOutputQueryExecution {
+                stream: batches,
+                query_phase_timings,
+                attach_profile_to_result,
+            } = create_mssql_output_query_execution_with_trace_context(
+                &self.context,
+                &self.sources,
+                &self.derived_tables,
+                &self.pending_derived_tables,
+                &planned,
+                None,
+                reporter.cloned(),
+                profile_mode,
+                trace_context.as_ref(),
             )
-        })?;
+            .await
+            .map_err(|failure| {
+                finish_mssql_write_error_timeline(
+                    failure.error,
+                    timeline,
+                    request.target().output_name(),
+                )
+            })?;
 
-        let mut phase_timings = planned.phase_timings().to_vec();
-        phase_timings.extend(query_phase_timings);
-        let result = writer
-            .write_output_with_timeline(
-                planned.output_plan().clone(),
-                planned.resolved_target().clone(),
-                batches,
-                self.options.mssql_write_backend(),
-                self.options.validation_options(),
-                reporter,
-                timeline,
-            )
-            .await;
-        let result = match attach_profile_to_result {
-            Some(attach_profile) => attach_profile(result),
-            None => result,
-        };
-        let result = match result {
-            Ok(report) => {
-                Ok(ensure_validation_phase_timing(report).with_phase_timings(phase_timings))
-            }
-            Err(error) => {
-                let error = prepend_mssql_write_phase_timings(error, phase_timings);
-                Err(error)
-            }
-        };
-        finish_mssql_write_timeline(result, timeline, request.target().output_name())
+            let mut phase_timings = planned.phase_timings().to_vec();
+            phase_timings.extend(query_phase_timings);
+            let result = writer
+                .write_output_with_timeline(
+                    planned.output_plan().clone(),
+                    planned.resolved_target().clone(),
+                    batches,
+                    self.options.mssql_write_backend(),
+                    self.options.validation_options(),
+                    reporter,
+                    timeline,
+                )
+                .await;
+            let result = match attach_profile_to_result {
+                Some(attach_profile) => attach_profile(result),
+                None => result,
+            };
+            let result = match result {
+                Ok(report) => {
+                    Ok(ensure_validation_phase_timing(report).with_phase_timings(phase_timings))
+                }
+                Err(error) => {
+                    let error = prepend_mssql_write_phase_timings(error, phase_timings);
+                    Err(error)
+                }
+            };
+            finish_mssql_write_timeline(result, timeline, request.target().output_name())
+        }
+        .await;
+        if let Some(context) = &trace_context {
+            context.record_process_result(if result.is_ok() { "ok" } else { "error" });
+        }
+        result
     }
 }
 

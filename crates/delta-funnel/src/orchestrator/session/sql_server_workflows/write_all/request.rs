@@ -4,7 +4,7 @@ use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlStreamBenchmarkOutputWriter,
     MssqlWorkflowOutputWriter, MssqlWorkflowSinkWriter, PhaseTimingReport, ReportReasonCode,
     observability,
-    profiling::OperationTraceContext,
+    profiling::{OperationTraceContext, OperationTraceKind},
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::{
         OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer, TimelineSpanStatus,
@@ -94,6 +94,7 @@ impl DeltaFunnelSession {
         validate_write_all_requests(requests)?;
         let active_reporter = if requests.is_empty() { None } else { reporter };
         let trace_context = OperationTraceContext::start(
+            OperationTraceKind::WriteAll,
             (options.execution_profile_mode() == ExecutionProfileMode::Detailed)
                 .then(OperationTimelineRecorder::start),
         );
@@ -263,6 +264,14 @@ impl DeltaFunnelSession {
             }
             (result, _) => result,
         };
+
+        if let Some(context) = &trace_context {
+            let process_result = match &result {
+                Ok(report) if report.all_succeeded() => "ok",
+                Ok(_) | Err(_) => "error",
+            };
+            context.record_process_result(process_result);
+        }
 
         if let Some(reporter) = active_reporter {
             reporter.emit(&match &result {

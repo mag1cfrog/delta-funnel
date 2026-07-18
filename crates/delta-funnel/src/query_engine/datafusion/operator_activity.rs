@@ -107,9 +107,11 @@ struct ActivityExecutionContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ActiveOperatorActivitySpan {
+    operation_id: u64,
     query_execution_id: u64,
     worker_lane_id: u64,
-    span_id: u64,
+    timeline_span_id: Option<u64>,
+    process_span_active: bool,
 }
 
 thread_local! {
@@ -162,7 +164,11 @@ impl OperatorActivityRecorder {
         stream_id: u64,
         activity: &'static str,
     ) -> Option<OperatorActivitySpanRecorder> {
-        let timeline = self.context.timeline()?;
+        let records_semantic_span = self.context.timeline().is_some();
+        let records_process_span = self.context.process_spans_enabled() && activity == "poll_next";
+        if !records_semantic_span && !records_process_span {
+            return None;
+        }
         if self
             .remaining_spans
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
@@ -175,16 +181,26 @@ impl OperatorActivityRecorder {
         }
 
         let context = self.execution_context();
-        let parent_id = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
-            active.borrow().last().and_then(|parent| {
-                (parent.query_execution_id == self.query_execution_id
-                    && parent.worker_lane_id == context.worker_lane.id)
-                    .then_some(parent.span_id)
-            })
+        let (parent_id, process_parent_active) = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
+            let active = active.borrow();
+            let matches_parent = |parent: &ActiveOperatorActivitySpan| {
+                parent.operation_id == self.context.operation_id()
+                    && parent.query_execution_id == self.query_execution_id
+                    && parent.worker_lane_id == context.worker_lane.id
+            };
+            let parent_id = active
+                .iter()
+                .rev()
+                .find(|parent| matches_parent(parent))
+                .and_then(|parent| parent.timeline_span_id);
+            let process_parent_active = active
+                .last()
+                .is_some_and(|parent| matches_parent(parent) && parent.process_span_active);
+            (parent_id, process_parent_active)
         });
         let track_name = context.worker_lane.track_name(self.query_execution_id);
-        let timeline_span = self
-            .with_query_identity(timeline.start_span(
+        let timeline_span = self.context.timeline().map(|timeline| {
+            self.with_query_identity(timeline.start_span(
                 operator_name,
                 OPERATOR_ACTIVITY_CATEGORY,
                 track_name,
@@ -198,7 +214,10 @@ impl OperatorActivityRecorder {
             .with_attribute("task_kind", Value::String(context.task_kind.to_owned()))
             .with_attribute(
                 "runtime_task_id",
-                context.runtime_task_id.map_or(Value::Null, Value::String),
+                context
+                    .runtime_task_id
+                    .clone()
+                    .map_or(Value::Null, Value::String),
             )
             .with_attribute("execution_stream_id", Value::from(stream_id))
             .with_attribute("node_id", Value::from(node_id))
@@ -210,24 +229,101 @@ impl OperatorActivityRecorder {
                 "operator_partition",
                 Value::from(usize_to_u64_saturating(partition)),
             )
-            .with_attribute("worker_thread_id", Value::String(context.worker_thread_id))
+            .with_attribute(
+                "worker_thread_id",
+                Value::String(context.worker_thread_id.clone()),
+            )
             .with_attribute(
                 "worker_thread_name",
                 context
                     .worker_thread_name
+                    .clone()
                     .map_or(Value::Null, Value::String),
             )
-            .with_attribute("activity", Value::String(activity.to_owned()));
+            .with_attribute("activity", Value::String(activity.to_owned()))
+        });
+        let timeline_span_id = timeline_span
+            .as_ref()
+            .and_then(OperationTimelineSpanRecorder::id);
+        let process_span = records_process_span
+            .then(|| {
+                self.process_poll_span(
+                    operator_name,
+                    node_id,
+                    parent_node_id,
+                    partition,
+                    stream_id,
+                    &context,
+                    process_parent_active,
+                )
+            })
+            .flatten();
+        if timeline_span_id.is_none() && process_span.is_none() {
+            return None;
+        }
         let active = ActiveOperatorActivitySpan {
+            operation_id: self.context.operation_id(),
             query_execution_id: self.query_execution_id,
             worker_lane_id: context.worker_lane.id,
-            span_id: timeline_span.id()?,
+            timeline_span_id,
+            process_span_active: process_span.is_some(),
         };
         ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active));
         Some(OperatorActivitySpanRecorder {
-            timeline_span: Some(timeline_span),
+            timeline_span,
+            process_span,
+            process_result_recorded: false,
             active,
         })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the process span records the canonical operator activity identity"
+    )]
+    fn process_poll_span(
+        &self,
+        operator_name: &str,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        partition: usize,
+        stream_id: u64,
+        context: &ActivityExecutionContext,
+        process_parent_active: bool,
+    ) -> Option<tracing::Span> {
+        let operation_root = self.context.process_root_span()?;
+        let current = tracing::Span::current();
+        let parent = if process_parent_active {
+            &current
+        } else {
+            operation_root
+        };
+        let span = tracing::trace_span!(
+            target: crate::profiling::PROFILE_TARGET,
+            parent: parent,
+            "DataFusion operator poll",
+            operation_id = self.context.operation_id(),
+            query_execution_id = self.query_execution_id,
+            query_scope = self.query_scope.as_str(),
+            query_owner = tracing::field::Empty,
+            operator_name,
+            worker_lane_id = context.worker_lane.id,
+            worker_kind = context.worker_lane.kind.as_str(),
+            node_id,
+            parent_node_id = tracing::field::Empty,
+            operator_partition = usize_to_u64_saturating(partition),
+            execution_stream_id = stream_id,
+            activity = "poll_next",
+            result = tracing::field::Empty,
+            time_semantics = "active",
+        );
+        if let Some(query_owner) = &self.query_owner {
+            span.record("query_owner", query_owner.as_ref());
+        }
+        if let Some(parent_node_id) = parent_node_id {
+            span.record("parent_node_id", parent_node_id);
+        }
+        Some(span)
     }
 
     fn next_stream_id(&self) -> u64 {
@@ -327,32 +423,42 @@ impl OperatorActivityRecorder {
 
 struct OperatorActivitySpanRecorder {
     timeline_span: Option<OperationTimelineSpanRecorder>,
+    process_span: Option<tracing::Span>,
+    process_result_recorded: bool,
     active: ActiveOperatorActivitySpan,
 }
 
 impl OperatorActivitySpanRecorder {
-    fn with_attribute(mut self, name: impl Into<String>, value: Value) -> Self {
-        if let Some(span) = self.timeline_span.take() {
-            self.timeline_span = Some(span.with_attribute(name, value));
-        }
-        self
-    }
-
-    fn completed(mut self) {
-        if let Some(span) = self.timeline_span.take() {
-            span.completed();
+    fn in_process_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        match &self.process_span {
+            Some(span) => span.in_scope(operation),
+            None => operation(),
         }
     }
 
-    fn failed(mut self) {
+    fn finish(mut self, result: &'static str, failed: bool) {
         if let Some(span) = self.timeline_span.take() {
-            span.failed();
+            let span = span.with_attribute("result", Value::String(result.to_owned()));
+            if failed {
+                span.failed();
+            } else {
+                span.completed();
+            }
+        }
+        if let Some(span) = &self.process_span {
+            span.record("result", result);
+            self.process_result_recorded = true;
         }
     }
 }
 
 impl Drop for OperatorActivitySpanRecorder {
     fn drop(&mut self) {
+        if !self.process_result_recorded
+            && let Some(span) = &self.process_span
+        {
+            span.record("result", "cancelled");
+        }
         let _ = ACTIVE_OPERATOR_ACTIVITY_SPANS.try_with(|spans| {
             let popped = spans.borrow_mut().pop();
             debug_assert_eq!(popped, Some(self.active));
@@ -484,15 +590,10 @@ impl ExecutionPlan for ProfiledOperatorExec {
         );
         let result = self.inner.execute(partition, context);
         if let Some(span) = span {
-            let span = span.with_attribute(
-                "result",
-                Value::String(if result.is_ok() { "stream" } else { "error" }.to_owned()),
+            span.finish(
+                if result.is_ok() { "stream" } else { "error" },
+                result.is_err(),
             );
-            if result.is_ok() {
-                span.completed();
-            } else {
-                span.failed();
-            }
         }
         result.map(|inner| {
             Box::pin(ProfiledRecordBatchStream {
@@ -536,7 +637,10 @@ impl Stream for ProfiledRecordBatchStream {
             self.stream_id,
             "poll_next",
         );
-        let poll = self.inner.as_mut().poll_next(context);
+        let poll = match &span {
+            Some(span) => span.in_process_scope(|| self.inner.as_mut().poll_next(context)),
+            None => self.inner.as_mut().poll_next(context),
+        };
         if let Some(span) = span {
             let (result, failed) = match &poll {
                 Poll::Pending => ("pending", false),
@@ -544,12 +648,7 @@ impl Stream for ProfiledRecordBatchStream {
                 Poll::Ready(Some(Err(_))) => ("error", true),
                 Poll::Ready(None) => ("eof", false),
             };
-            let span = span.with_attribute("result", Value::String(result.to_owned()));
-            if failed {
-                span.failed();
-            } else {
-                span.completed();
-            }
+            span.finish(result, failed);
         }
         poll
     }
@@ -569,7 +668,7 @@ mod tests {
 
     use crate::{
         QueryExecutionOutcome, QueryExecutionScope, TimelineSpanStatus, TimelineSpanTimeSemantics,
-        profiling::OperationTraceContext,
+        observability::test_capture::TracingCapture, profiling::OperationTraceContext,
         query_engine::datafusion::execution_profile::collect_query_execution_profile,
         report::OperationTimelineRecorder,
     };
@@ -613,7 +712,7 @@ mod tests {
         activity
             .start_span("FilterExec", 0, None, 0, 1, "poll_next")
             .expect("first activity should fit")
-            .completed();
+            .finish("batch", false);
         assert!(
             activity
                 .start_span("FilterExec", 0, None, 0, 1, "poll_next")
@@ -689,7 +788,7 @@ mod tests {
                 activity
                     .start_span("WorkerExec", 0, None, 0, 1, "poll_next")
                     .expect("worker activity should fit")
-                    .completed();
+                    .finish("batch", false);
             }));
         }
         for task in tasks {
@@ -864,6 +963,76 @@ mod tests {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_only_operator_polls_are_active_and_properly_nested()
+    -> Result<(), Box<dyn Error>> {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let session = SessionContext::new();
+        let dataframe = session
+            .sql("select 1 as id union all select 2 as id")
+            .await?;
+        let task_context = Arc::new(dataframe.task_ctx());
+        let plan = dataframe.create_physical_plan().await?;
+        let context =
+            OperationTraceContext::start(crate::profiling::OperationTraceKind::Preview, None)
+                .expect("process tracing should create a context");
+        let operation_id = context.operation_id();
+        let identity = QueryTraceIdentity::new(context.clone(), QueryExecutionScope::Preview, None)
+            .expect("query trace identity should be available");
+        let plan = instrument_query_execution_plan(plan, identity)?;
+
+        let batches = collect(Arc::clone(&plan), task_context).await?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        context.record_process_result("ok");
+        drop(plan);
+        drop(context);
+
+        let spans = capture.captured().spans();
+        let root = spans
+            .iter()
+            .find(|span| span.name == "Delta Funnel preview")
+            .expect("operation root span should be captured");
+        let polls = spans
+            .iter()
+            .filter(|span| span.name == "DataFusion operator poll")
+            .collect::<Vec<_>>();
+        assert!(!polls.is_empty());
+        assert!(polls.iter().all(|span| {
+            span.target == crate::profiling::PROFILE_TARGET
+                && span.level == tracing::Level::TRACE
+                && span.fields["operation_id"] == operation_id.to_string()
+                && span.fields["query_execution_id"] == "1"
+                && span.fields["query_scope"] == "preview"
+                && span.fields["activity"] == "poll_next"
+                && span.fields["time_semantics"] == "active"
+                && span.fields.contains_key("operator_name")
+                && span.fields.contains_key("worker_lane_id")
+                && span.fields.contains_key("worker_kind")
+                && span.fields.contains_key("node_id")
+                && span.fields.contains_key("operator_partition")
+                && span.fields.contains_key("execution_stream_id")
+                && matches!(
+                    span.fields["result"].as_str(),
+                    "pending" | "batch" | "error" | "eof"
+                )
+                && span.enter_count == 1
+                && span.exit_count == 1
+                && span.closed
+        }));
+        assert!(polls.iter().all(|span| {
+            span.parent_id == Some(root.id)
+                || polls.iter().any(|parent| Some(parent.id) == span.parent_id)
+        }));
+        assert!(
+            polls
+                .iter()
+                .any(|span| polls.iter().any(|parent| Some(parent.id) == span.parent_id)),
+            "at least one child operator poll should nest under its caller"
+        );
 
         Ok(())
     }

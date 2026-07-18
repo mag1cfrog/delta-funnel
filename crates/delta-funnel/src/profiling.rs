@@ -2,7 +2,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use crate::report::OperationTimelineRecorder;
@@ -11,32 +11,45 @@ pub(crate) const PROFILE_TARGET: &str = "delta_funnel::profile";
 
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OperationTraceKind {
+    Preview,
+    MssqlWrite,
+    WriteAll,
+}
+
 /// One canonical identity and optional semantic sink for a profiled operation.
 #[derive(Debug, Clone)]
 pub(crate) struct OperationTraceContext {
     operation_id: u64,
     next_query_execution_id: Arc<AtomicU64>,
     timeline: Option<OperationTimelineRecorder>,
-    process_spans_enabled: bool,
+    process_trace: Option<Arc<ProcessOperationTrace>>,
 }
 
 impl OperationTraceContext {
-    pub(crate) fn start(timeline: Option<OperationTimelineRecorder>) -> Option<Self> {
-        Self::start_for_modes(timeline, process_spans_enabled())
+    pub(crate) fn start(
+        kind: OperationTraceKind,
+        timeline: Option<OperationTimelineRecorder>,
+    ) -> Option<Self> {
+        Self::start_for_modes(kind, timeline, process_spans_enabled())
     }
 
     fn start_for_modes(
+        kind: OperationTraceKind,
         timeline: Option<OperationTimelineRecorder>,
         process_spans_enabled: bool,
     ) -> Option<Self> {
         if timeline.is_none() && !process_spans_enabled {
             return None;
         }
+        let operation_id = allocate_id(&NEXT_OPERATION_ID)?;
         Some(Self {
-            operation_id: allocate_id(&NEXT_OPERATION_ID)?,
+            operation_id,
             next_query_execution_id: Arc::new(AtomicU64::new(1)),
             timeline,
-            process_spans_enabled,
+            process_trace: process_spans_enabled
+                .then(|| Arc::new(ProcessOperationTrace::new(kind, operation_id))),
         })
     }
 
@@ -45,7 +58,7 @@ impl OperationTraceContext {
         timeline: Option<OperationTimelineRecorder>,
         process_spans_enabled: bool,
     ) -> Option<Self> {
-        Self::start_for_modes(timeline, process_spans_enabled)
+        Self::start_for_modes(OperationTraceKind::Preview, timeline, process_spans_enabled)
     }
 
     pub(crate) const fn operation_id(&self) -> u64 {
@@ -57,11 +70,76 @@ impl OperationTraceContext {
     }
 
     pub(crate) const fn process_spans_enabled(&self) -> bool {
-        self.process_spans_enabled
+        self.process_trace.is_some()
+    }
+
+    pub(crate) fn process_root_span(&self) -> Option<&tracing::Span> {
+        self.process_trace.as_deref().map(|trace| &trace.span)
+    }
+
+    pub(crate) fn record_process_result(&self, result: &'static str) {
+        if let Some(trace) = &self.process_trace {
+            trace.record_result(result);
+        }
     }
 
     pub(crate) fn next_query_execution_id(&self) -> Option<u64> {
         allocate_id(&self.next_query_execution_id)
+    }
+}
+
+#[derive(Debug)]
+struct ProcessOperationTrace {
+    span: tracing::Span,
+    result_recorded: AtomicBool,
+}
+
+impl ProcessOperationTrace {
+    fn new(kind: OperationTraceKind, operation_id: u64) -> Self {
+        let span = match kind {
+            OperationTraceKind::Preview => tracing::trace_span!(
+                target: PROFILE_TARGET,
+                parent: None,
+                "Delta Funnel preview",
+                operation_id,
+                result = tracing::field::Empty,
+                time_semantics = "wall_clock",
+            ),
+            OperationTraceKind::MssqlWrite => tracing::trace_span!(
+                target: PROFILE_TARGET,
+                parent: None,
+                "Delta Funnel SQL Server write",
+                operation_id,
+                result = tracing::field::Empty,
+                time_semantics = "wall_clock",
+            ),
+            OperationTraceKind::WriteAll => tracing::trace_span!(
+                target: PROFILE_TARGET,
+                parent: None,
+                "Delta Funnel SQL Server write_all",
+                operation_id,
+                result = tracing::field::Empty,
+                time_semantics = "wall_clock",
+            ),
+        };
+        Self {
+            span,
+            result_recorded: AtomicBool::new(false),
+        }
+    }
+
+    fn record_result(&self, result: &'static str) {
+        if !self.result_recorded.swap(true, Ordering::Relaxed) {
+            self.span.record("result", result);
+        }
+    }
+}
+
+impl Drop for ProcessOperationTrace {
+    fn drop(&mut self) {
+        if !self.result_recorded.load(Ordering::Relaxed) {
+            self.span.record("result", "cancelled");
+        }
     }
 }
 
@@ -87,24 +165,34 @@ fn process_spans_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::report::OperationTimelineRecorder;
+    use crate::{observability::test_capture::TracingCapture, report::OperationTimelineRecorder};
 
     use super::*;
 
     #[test]
     fn activation_modes_share_one_context_without_requiring_a_timeline() {
-        assert!(OperationTraceContext::start_for_modes(None, false).is_none());
+        assert!(
+            OperationTraceContext::start_for_modes(OperationTraceKind::Preview, None, false)
+                .is_none()
+        );
 
         let semantic_timeline = OperationTimelineRecorder::start();
-        let semantic =
-            OperationTraceContext::start_for_modes(Some(semantic_timeline.clone()), false)
-                .expect("semantic tracing should create a context");
-        let process = OperationTraceContext::start_for_modes(None, true)
-            .expect("process tracing should create a context");
+        let semantic = OperationTraceContext::start_for_modes(
+            OperationTraceKind::Preview,
+            Some(semantic_timeline.clone()),
+            false,
+        )
+        .expect("semantic tracing should create a context");
+        let process =
+            OperationTraceContext::start_for_modes(OperationTraceKind::MssqlWrite, None, true)
+                .expect("process tracing should create a context");
         let combined_timeline = OperationTimelineRecorder::start();
-        let combined =
-            OperationTraceContext::start_for_modes(Some(combined_timeline.clone()), true)
-                .expect("combined tracing should create one context");
+        let combined = OperationTraceContext::start_for_modes(
+            OperationTraceKind::WriteAll,
+            Some(combined_timeline.clone()),
+            true,
+        )
+        .expect("combined tracing should create one context");
 
         assert!(semantic.timeline().is_some());
         assert!(!semantic.process_spans_enabled());
@@ -139,10 +227,11 @@ mod tests {
 
     #[test]
     fn query_ids_are_local_to_their_operation_context() {
-        let first = OperationTraceContext::start_for_modes(None, true)
+        let first = OperationTraceContext::start_for_modes(OperationTraceKind::Preview, None, true)
             .expect("process tracing should create a context");
-        let second = OperationTraceContext::start_for_modes(None, true)
-            .expect("process tracing should create a context");
+        let second =
+            OperationTraceContext::start_for_modes(OperationTraceKind::Preview, None, true)
+                .expect("process tracing should create a context");
 
         assert_eq!(first.next_query_execution_id(), Some(1));
         assert_eq!(first.next_query_execution_id(), Some(2));
@@ -165,14 +254,56 @@ mod tests {
         let _guard = crate::observability::test_capture::tracing_test_guard();
         let disabled = with_default(NoSubscriber::default(), || {
             tracing::callsite::rebuild_interest_cache();
-            OperationTraceContext::start(None)
+            OperationTraceContext::start(OperationTraceKind::Preview, None)
         });
         let enabled = with_default(Registry::default(), || {
             tracing::callsite::rebuild_interest_cache();
-            OperationTraceContext::start(None)
+            OperationTraceContext::start(OperationTraceKind::Preview, None)
         });
 
         assert!(disabled.is_none());
         assert!(enabled.is_some());
+    }
+
+    #[test]
+    fn operation_spans_record_bounded_identity_result_and_cancellation() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let application_span = tracing::info_span!("application operation");
+        let application_guard = application_span.enter();
+        let completed = OperationTraceContext::start(OperationTraceKind::MssqlWrite, None)
+            .expect("process tracing should create a context");
+        let completed_id = completed.operation_id();
+        completed.record_process_result("ok");
+        drop(completed);
+
+        let cancelled = OperationTraceContext::start(OperationTraceKind::Preview, None)
+            .expect("process tracing should create a context");
+        let cancelled_id = cancelled.operation_id();
+        drop(cancelled);
+        drop(application_guard);
+        drop(application_span);
+
+        let spans = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .filter(|span| span.target == PROFILE_TARGET)
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].name, "Delta Funnel SQL Server write");
+        assert_eq!(spans[0].fields["operation_id"], completed_id.to_string());
+        assert_eq!(spans[0].fields["result"], "ok");
+        assert_eq!(spans[1].name, "Delta Funnel preview");
+        assert_eq!(spans[1].fields["operation_id"], cancelled_id.to_string());
+        assert_eq!(spans[1].fields["result"], "cancelled");
+        assert!(spans.iter().all(|span| {
+            span.target == PROFILE_TARGET
+                && span.level == tracing::Level::TRACE
+                && span.parent_id.is_none()
+                && span.fields["time_semantics"] == "wall_clock"
+                && span.enter_count == 0
+                && span.exit_count == 0
+                && span.closed
+        }));
     }
 }
