@@ -27,8 +27,7 @@ use futures_util::Stream;
 use serde_json::Value;
 
 use crate::{
-    QueryExecutionScope,
-    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder},
+    QueryExecutionScope, profiling::OperationTraceContext, report::OperationTimelineSpanRecorder,
     usize_to_u64_saturating,
 };
 
@@ -120,7 +119,7 @@ thread_local! {
 
 #[derive(Debug, Clone)]
 struct OperatorActivityRecorder {
-    timeline: OperationTimelineRecorder,
+    context: OperationTraceContext,
     query_execution_id: u64,
     query_scope: QueryExecutionScope,
     query_owner: Option<Arc<str>>,
@@ -137,13 +136,13 @@ impl OperatorActivityRecorder {
 
     fn with_max_spans(identity: QueryTraceIdentity, maximum_spans: u64) -> Self {
         let QueryTraceIdentity {
-            timeline,
+            context,
             query_execution_id,
             query_scope,
             query_owner,
         } = identity;
         Self {
-            timeline,
+            context,
             query_execution_id,
             query_scope,
             query_owner,
@@ -163,6 +162,7 @@ impl OperatorActivityRecorder {
         stream_id: u64,
         activity: &'static str,
     ) -> Option<OperatorActivitySpanRecorder> {
+        let timeline = self.context.timeline()?;
         if self
             .remaining_spans
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
@@ -184,7 +184,7 @@ impl OperatorActivityRecorder {
         });
         let track_name = context.worker_lane.track_name(self.query_execution_id);
         let timeline_span = self
-            .with_query_identity(self.timeline.start_span(
+            .with_query_identity(timeline.start_span(
                 operator_name,
                 OPERATOR_ACTIVITY_CATEGORY,
                 track_name,
@@ -292,7 +292,10 @@ impl OperatorActivityRecorder {
 
     fn report_truncation(&self) {
         if !self.truncation_reported.swap(true, Ordering::Relaxed) {
-            self.with_query_identity(self.timeline.start_span(
+            let Some(timeline) = self.context.timeline() else {
+                return;
+            };
+            self.with_query_identity(timeline.start_span(
                 "Operator activity trace truncated",
                 OPERATOR_ACTIVITY_CATEGORY,
                 format!(
@@ -566,21 +569,33 @@ mod tests {
 
     use crate::{
         QueryExecutionOutcome, QueryExecutionScope, TimelineSpanStatus, TimelineSpanTimeSemantics,
+        profiling::OperationTraceContext,
         query_engine::datafusion::execution_profile::collect_query_execution_profile,
+        report::OperationTimelineRecorder,
     };
 
     use super::*;
 
     fn test_trace_identity(timeline: OperationTimelineRecorder) -> QueryTraceIdentity {
-        QueryTraceIdentity::new(timeline, QueryExecutionScope::Preview, None)
+        let context = OperationTraceContext::start_for_test(Some(timeline), false)
+            .expect("semantic tracing should create a context");
+        QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
+            .expect("query trace identity should be available")
     }
 
     #[test]
-    fn query_execution_ids_are_local_to_each_operation_timeline() {
+    fn query_execution_ids_are_local_to_each_operation_context() {
         let first_timeline = OperationTimelineRecorder::start();
-        let first_query =
-            OperatorActivityRecorder::new(test_trace_identity(first_timeline.clone()));
-        let second_query = OperatorActivityRecorder::new(test_trace_identity(first_timeline));
+        let first_context = OperationTraceContext::start_for_test(Some(first_timeline), false)
+            .expect("semantic tracing should create a context");
+        let first_query = OperatorActivityRecorder::new(
+            QueryTraceIdentity::new(first_context.clone(), QueryExecutionScope::Preview, None)
+                .expect("first query identity should be available"),
+        );
+        let second_query = OperatorActivityRecorder::new(
+            QueryTraceIdentity::new(first_context, QueryExecutionScope::Preview, None)
+                .expect("second query identity should be available"),
+        );
         let separate_timeline = OperationTimelineRecorder::start();
         let separate_query = OperatorActivityRecorder::new(test_trace_identity(separate_timeline));
 

@@ -93,7 +93,7 @@ impl PlanningActivityContext {
             .copied();
         let mut timeline_span = self
             .identity
-            .timeline()
+            .timeline()?
             .start_span(name, PLANNING_ACTIVITY_CATEGORY, self.track_name.as_ref())
             .with_parent_id(parent_id)
             .with_attribute("activity", Value::String(activity.to_owned()))
@@ -163,19 +163,22 @@ impl Drop for PlanningActivitySpanRecorder {
 
 #[cfg(test)]
 mod tests {
-    use crate::{QueryExecutionScope, TimelineSpanStatus, report::OperationTimelineRecorder};
+    use crate::{
+        QueryExecutionScope, TimelineSpanStatus, profiling::OperationTraceContext,
+        report::OperationTimelineRecorder,
+    };
 
     use super::*;
 
     #[tokio::test]
     async fn nested_planning_failures_keep_parentage_and_status() {
         let recorder = OperationTimelineRecorder::start();
+        let context = OperationTraceContext::start_for_test(Some(recorder.clone()), false)
+            .expect("semantic tracing should create a context");
 
-        let identity = QueryTraceIdentity::new(
-            recorder.clone(),
-            QueryExecutionScope::MssqlOutput,
-            Some("orders"),
-        );
+        let identity =
+            QueryTraceIdentity::new(context, QueryExecutionScope::MssqlOutput, Some("orders"))
+                .expect("query trace identity should be available");
         let result: Result<(), &str> = with_query_planning_activity(identity, async {
             profile_query_planning_sync_result("parent", "parent_activity", || {
                 profile_query_planning_sync_result("child", "child_activity", || Err("boom"))

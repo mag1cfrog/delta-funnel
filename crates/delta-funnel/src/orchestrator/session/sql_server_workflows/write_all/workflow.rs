@@ -5,8 +5,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlOutputQueryFuture, MssqlOutputWriteJob,
     MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, WriteAllCacheAliasReport,
-    progress::ProgressReporter, report::OperationTimelineRecorder, usize_to_u64_saturating,
-    write_mssql_outputs_with_writer,
+    profiling::OperationTraceContext, progress::ProgressReporter,
+    report::OperationTimelineRecorder, usize_to_u64_saturating, write_mssql_outputs_with_writer,
 };
 
 use super::super::super::{
@@ -54,7 +54,7 @@ impl DeltaFunnelSession {
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
-        self.build_write_all_uncached_jobs_with_timeline(
+        self.build_write_all_uncached_jobs_with_trace_context(
             planned_outputs,
             provider_stats_snapshots,
             reporter,
@@ -63,13 +63,13 @@ impl DeltaFunnelSession {
         )
     }
 
-    fn build_write_all_uncached_jobs_with_timeline(
+    fn build_write_all_uncached_jobs_with_trace_context(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
-        timeline: Option<OperationTimelineRecorder>,
+        trace_context: Option<OperationTraceContext>,
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
         let output_count = usize_to_u64_saturating(planned_outputs.len());
         planned_outputs
@@ -83,12 +83,12 @@ impl DeltaFunnelSession {
                         output_count,
                     )
                 });
-                let create_query_execution = self.mssql_output_query_factory_with_timeline(
+                let create_query_execution = self.mssql_output_query_factory_with_trace_context(
                     planned.clone(),
                     provider_stats_snapshots.clone(),
                     progress.clone(),
                     profile_mode,
-                    timeline.clone(),
+                    trace_context.clone(),
                 );
 
                 Ok(self.build_write_all_job(
@@ -96,20 +96,23 @@ impl DeltaFunnelSession {
                     output_schema,
                     create_query_execution,
                     progress,
-                    timeline.clone(),
+                    trace_context
+                        .as_ref()
+                        .and_then(OperationTraceContext::timeline)
+                        .cloned(),
                 ))
             })
             .collect()
     }
 
-    fn build_write_all_cached_jobs_with_timeline(
+    fn build_write_all_cached_jobs_with_trace_context(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         active_aliases: &[MssqlDerivedCacheAliasPlan],
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
-        timeline: Option<OperationTimelineRecorder>,
+        trace_context: Option<OperationTraceContext>,
     ) -> Result<Vec<MssqlOutputWriteJob>, DeltaFunnelError> {
         let output_count = usize_to_u64_saturating(planned_outputs.len());
         planned_outputs
@@ -123,13 +126,13 @@ impl DeltaFunnelSession {
                         output_count,
                     )
                 });
-                let create_query_execution = self.cached_output_query_factory_with_timeline(
+                let create_query_execution = self.cached_output_query_factory_with_trace_context(
                     planned,
                     active_aliases,
                     provider_stats_snapshots.clone(),
                     progress.clone(),
                     profile_mode,
-                    timeline.clone(),
+                    trace_context.clone(),
                 )?;
 
                 Ok(self.build_write_all_job(
@@ -137,30 +140,33 @@ impl DeltaFunnelSession {
                     output_schema,
                     create_query_execution,
                     progress,
-                    timeline.clone(),
+                    trace_context
+                        .as_ref()
+                        .and_then(OperationTraceContext::timeline)
+                        .cloned(),
                 ))
             })
             .collect()
     }
 
-    pub(super) async fn write_all_uncached_with_writer_and_timeline<W>(
+    pub(super) async fn write_all_uncached_with_writer_and_trace_context<W>(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         writer: W,
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
-        timeline: Option<OperationTimelineRecorder>,
+        trace_context: Option<OperationTraceContext>,
     ) -> Result<MssqlWorkflowWriteReport, DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
-        let jobs = self.build_write_all_uncached_jobs_with_timeline(
+        let jobs = self.build_write_all_uncached_jobs_with_trace_context(
             planned_outputs,
             provider_stats_snapshots,
             reporter,
             profile_mode,
-            timeline,
+            trace_context,
         )?;
 
         write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
@@ -181,7 +187,7 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
-        self.write_all_cached_with_writer_and_timeline(
+        self.write_all_cached_with_writer_and_trace_context(
             planned_outputs,
             cache_aliases,
             writer,
@@ -197,7 +203,7 @@ impl DeltaFunnelSession {
         clippy::too_many_arguments,
         reason = "cached workflow execution carries cache, reporting, and profiling state"
     )]
-    pub(super) async fn write_all_cached_with_writer_and_timeline<W>(
+    pub(super) async fn write_all_cached_with_writer_and_trace_context<W>(
         &self,
         planned_outputs: &[PlannedMssqlOutput],
         cache_aliases: &[MssqlDerivedCacheAliasPlan],
@@ -205,21 +211,26 @@ impl DeltaFunnelSession {
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
-        timeline: Option<OperationTimelineRecorder>,
+        trace_context: Option<OperationTraceContext>,
     ) -> Result<(MssqlWorkflowWriteReport, Vec<WriteAllCacheAliasReport>), DeltaFunnelError>
     where
         W: MssqlWorkflowOutputWriter,
     {
         let replacements = self
-            .replace_mssql_cache_aliases(cache_aliases, reporter, profile_mode, timeline.clone())
+            .replace_mssql_cache_aliases(
+                cache_aliases,
+                reporter,
+                profile_mode,
+                trace_context.clone(),
+            )
             .await?;
-        let jobs = match self.build_write_all_cached_jobs_with_timeline(
+        let jobs = match self.build_write_all_cached_jobs_with_trace_context(
             planned_outputs,
             cache_aliases,
             provider_stats_snapshots,
             reporter,
             profile_mode,
-            timeline,
+            trace_context,
         ) {
             Ok(jobs) => jobs,
             Err(error) => {

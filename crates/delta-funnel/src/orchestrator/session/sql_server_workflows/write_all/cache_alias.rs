@@ -15,6 +15,7 @@ use crate::{
     PhaseTimingReport, QueryExecutionProfile, QueryExecutionScope, ReportReasonCode,
     WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheFailure,
     observability::DeltaProviderScanOutcome,
+    profiling::OperationTraceContext,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
         DeltaProviderReadStatsHandle, QueryTraceIdentity,
@@ -234,7 +235,7 @@ impl DeltaFunnelSession {
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
     ) -> Result<MssqlScopedCacheAliasReplacement<'_>, CacheAliasReplacementFailure> {
-        self.replace_registered_derived_alias_with_cache_attempt_and_timeline(
+        self.replace_registered_derived_alias_with_cache_attempt_and_trace_context(
             table,
             output_indexes,
             reporter,
@@ -244,14 +245,17 @@ impl DeltaFunnelSession {
         .await
     }
 
-    async fn replace_registered_derived_alias_with_cache_attempt_and_timeline(
+    async fn replace_registered_derived_alias_with_cache_attempt_and_trace_context(
         &self,
         table: &LazyTable,
         output_indexes: Vec<usize>,
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
-        operation_timeline: Option<OperationTimelineRecorder>,
+        trace_context: Option<OperationTraceContext>,
     ) -> Result<MssqlScopedCacheAliasReplacement<'_>, CacheAliasReplacementFailure> {
+        let operation_timeline = trace_context
+            .as_ref()
+            .and_then(OperationTraceContext::timeline);
         let registered = self
             .registered_derived_for_scoped_cache_alias(table)
             .map_err(CacheAliasReplacementFailure::before_attempt)?;
@@ -276,11 +280,11 @@ impl DeltaFunnelSession {
             mut phase_timings,
             execution_profile,
         } = self
-            .materialize_cache_with_timeline(
+            .materialize_cache_with_trace_context(
                 alias_name.as_str(),
                 reporter,
                 profile_mode,
-                operation_timeline.as_ref(),
+                trace_context.as_ref(),
             )
             .await
             .map_err(|failure| {
@@ -289,14 +293,14 @@ impl DeltaFunnelSession {
 
         let install_timer = PhaseTimer::start(CACHE_ALIAS_INSTALL_PHASE);
         let install_span = start_cache_alias_span(
-            operation_timeline.as_ref(),
+            operation_timeline,
             alias_name.as_str(),
             "Install cache alias",
         );
         let original_provider = match self.install_scoped_cache_alias_provider(
             alias_name.as_str(),
             provider,
-            operation_timeline.as_ref(),
+            operation_timeline,
         ) {
             Ok(original_provider) => {
                 complete_cache_alias_span(install_span);
@@ -330,7 +334,7 @@ impl DeltaFunnelSession {
             original_provider,
             phase_timings,
             execution_profile,
-            operation_timeline,
+            operation_timeline: operation_timeline.cloned(),
         })
     }
 
@@ -339,7 +343,7 @@ impl DeltaFunnelSession {
         cache_aliases: &[MssqlDerivedCacheAliasPlan],
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
-        operation_timeline: Option<OperationTimelineRecorder>,
+        trace_context: Option<OperationTraceContext>,
     ) -> Result<Vec<MssqlScopedCacheAliasReplacement<'_>>, DeltaFunnelError> {
         let mut replacements = Vec::new();
 
@@ -356,12 +360,12 @@ impl DeltaFunnelSession {
             let table = registered.table().clone();
 
             match self
-                .replace_registered_derived_alias_with_cache_attempt_and_timeline(
+                .replace_registered_derived_alias_with_cache_attempt_and_trace_context(
                     &table,
                     cache_alias.output_indexes().to_vec(),
                     reporter,
                     profile_mode,
-                    operation_timeline.clone(),
+                    trace_context.clone(),
                 )
                 .await
             {
@@ -392,17 +396,18 @@ impl DeltaFunnelSession {
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
     ) -> Result<MaterializedCache, CacheAliasPhaseFailure> {
-        self.materialize_cache_with_timeline(alias_name, reporter, profile_mode, None)
+        self.materialize_cache_with_trace_context(alias_name, reporter, profile_mode, None)
             .await
     }
 
-    async fn materialize_cache_with_timeline(
+    async fn materialize_cache_with_trace_context(
         &self,
         alias_name: &str,
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
-        operation_timeline: Option<&OperationTimelineRecorder>,
+        trace_context: Option<&OperationTraceContext>,
     ) -> Result<MaterializedCache, CacheAliasPhaseFailure> {
+        let operation_timeline = trace_context.and_then(OperationTraceContext::timeline);
         let materialization_timer = PhaseTimer::start(CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE);
         let mut phase_timings = Vec::with_capacity(8);
 
@@ -425,14 +430,13 @@ impl DeltaFunnelSession {
         complete_cache_alias_span(resolution_span);
         phase_timings.push(resolution_timer.completed());
 
-        let trace_identity = match (profile_mode, operation_timeline) {
-            (ExecutionProfileMode::Detailed, Some(timeline)) => Some(QueryTraceIdentity::new(
-                timeline.clone(),
+        let trace_identity = trace_context.cloned().and_then(|context| {
+            QueryTraceIdentity::new(
+                context,
                 QueryExecutionScope::WriteAllCacheAlias,
                 Some(alias_name),
-            )),
-            _ => None,
-        };
+            )
+        });
         let task_ctx = Arc::new(dataframe.task_ctx());
         let planning_timer = PhaseTimer::start(CACHE_ALIAS_PHYSICAL_PLANNING_PHASE);
         let planning_span =
@@ -1750,13 +1754,15 @@ mod tests {
             .await?;
         session.register_alias("cache_alias", &pending)?;
         let timeline = OperationTimelineRecorder::start();
+        let trace_context = OperationTraceContext::start_for_test(Some(timeline.clone()), false)
+            .ok_or("expected semantic trace context")?;
 
         let materialized = session
-            .materialize_cache_with_timeline(
+            .materialize_cache_with_trace_context(
                 "cache_alias",
                 None,
                 ExecutionProfileMode::Detailed,
-                Some(&timeline),
+                Some(&trace_context),
             )
             .await
             .map_err(CacheAliasPhaseFailure::into_source)?;
@@ -1805,13 +1811,15 @@ mod tests {
             table.path().to_string_lossy().to_string(),
         ))?;
         let timeline = OperationTimelineRecorder::start();
+        let trace_context = OperationTraceContext::start_for_test(Some(timeline.clone()), false)
+            .ok_or("expected semantic trace context")?;
 
         session
-            .materialize_cache_with_timeline(
+            .materialize_cache_with_trace_context(
                 "cache_alias",
                 None,
                 ExecutionProfileMode::Detailed,
-                Some(&timeline),
+                Some(&trace_context),
             )
             .await
             .map_err(CacheAliasPhaseFailure::into_source)?;

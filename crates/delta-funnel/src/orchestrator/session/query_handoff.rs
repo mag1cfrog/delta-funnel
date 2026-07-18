@@ -27,6 +27,7 @@ use crate::{
     PhaseTimingReport, PreviewFailureContext, QueryExecutionProfile, QueryExecutionScope,
     ReportReasonCode, TimelineSpanStatus,
     observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
+    profiling::OperationTraceContext,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
         DFQueryExecution, DeltaProviderReadStatsHandle, QueryTraceIdentity,
@@ -845,6 +846,10 @@ impl DeltaFunnelSession {
         reporter: Option<&ProgressReporter>,
     ) -> Result<TablePreview, DeltaFunnelError> {
         let mut timings = PreviewTimingTracker::start();
+        let trace_context = OperationTraceContext::start(
+            (options.execution_profile_mode() == ExecutionProfileMode::Detailed)
+                .then(|| timings.timeline.clone()),
+        );
 
         emit_preview_phase(reporter, ProgressPhase::PreparingPreview);
         let dataframe_timer = timings.start_phase(PREVIEW_DATAFRAME_PLANNING_PHASE);
@@ -863,14 +868,9 @@ impl DeltaFunnelSession {
         let task_context = Arc::new(dataframe.task_ctx());
         timings.record_completed(dataframe_timer);
 
-        let trace_identity = match options.execution_profile_mode() {
-            ExecutionProfileMode::Disabled => None,
-            ExecutionProfileMode::Detailed => Some(QueryTraceIdentity::new(
-                timings.timeline.clone(),
-                QueryExecutionScope::Preview,
-                None,
-            )),
-        };
+        let trace_identity = trace_context.and_then(|context| {
+            QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
+        });
         let physical_plan_timer = timings.start_phase(PREVIEW_PHYSICAL_PLANNING_PHASE);
         let physical_plan_result = match &trace_identity {
             Some(trace_identity) => {
@@ -1930,8 +1930,11 @@ mod tests {
         let failing_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSetupFailingPlan::new(physical_plan));
         let timeline = crate::report::OperationTimelineRecorder::start();
-        let trace_identity =
-            QueryTraceIdentity::new(timeline.clone(), QueryExecutionScope::Preview, None);
+        let context =
+            crate::profiling::OperationTraceContext::start_for_test(Some(timeline.clone()), false)
+                .ok_or("expected semantic trace context")?;
+        let trace_identity = QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
+            .ok_or("expected query trace identity")?;
 
         let failure = match super::profiled_datafusion_query_output_stream_with_effective_root(
             Arc::clone(&failing_plan),

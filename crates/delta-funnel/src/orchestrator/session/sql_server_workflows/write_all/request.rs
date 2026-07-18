@@ -4,6 +4,7 @@ use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlStreamBenchmarkOutputWriter,
     MssqlWorkflowOutputWriter, MssqlWorkflowSinkWriter, PhaseTimingReport, ReportReasonCode,
     observability,
+    profiling::OperationTraceContext,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::{
         OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer, TimelineSpanStatus,
@@ -92,10 +93,13 @@ impl DeltaFunnelSession {
     {
         validate_write_all_requests(requests)?;
         let active_reporter = if requests.is_empty() { None } else { reporter };
-        let timeline = match options.execution_profile_mode() {
-            ExecutionProfileMode::Disabled => None,
-            ExecutionProfileMode::Detailed => Some(OperationTimelineRecorder::start()),
-        };
+        let trace_context = OperationTraceContext::start(
+            (options.execution_profile_mode() == ExecutionProfileMode::Detailed)
+                .then(OperationTimelineRecorder::start),
+        );
+        let timeline = trace_context
+            .as_ref()
+            .and_then(OperationTraceContext::timeline);
 
         if let Some(reporter) = active_reporter {
             reporter.emit(&ProgressEvent::started(ProgressOperation::WriteAllToMssql));
@@ -105,21 +109,21 @@ impl DeltaFunnelSession {
             // Resolve every output before cache planning or execution starts.
             let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
             let planning_span = start_write_all_phase_span(
-                timeline.as_ref(),
+                timeline,
                 "Plan outputs",
                 "delta_funnel.write_all.planning",
             );
-            let planned_outputs =
-                match self.plan_write_outputs(requests, active_reporter, timeline.as_ref()) {
-                    Ok(outputs) => {
-                        complete_write_all_span(planning_span);
-                        outputs
-                    }
-                    Err(error) => {
-                        fail_write_all_span(planning_span);
-                        return Err(error);
-                    }
-                };
+            let planned_outputs = match self.plan_write_outputs(requests, active_reporter, timeline)
+            {
+                Ok(outputs) => {
+                    complete_write_all_span(planning_span);
+                    outputs
+                }
+                Err(error) => {
+                    fail_write_all_span(planning_span);
+                    return Err(error);
+                }
+            };
             let mut phase_timings = vec![planning_timer.completed()];
 
             // Cache planning selects the execution route. Disabled mode records
@@ -128,7 +132,7 @@ impl DeltaFunnelSession {
                 WriteAllCacheMode::Auto => {
                     let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
                     let cache_span = start_write_all_phase_span(
-                        timeline.as_ref(),
+                        timeline,
                         "Plan caches",
                         "delta_funnel.write_all.planning",
                     );
@@ -151,32 +155,32 @@ impl DeltaFunnelSession {
             let shared_provider_stats = shared_provider_stats_snapshots();
             let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
             let workflow_span = start_write_all_phase_span(
-                timeline.as_ref(),
+                timeline,
                 "Execute output workflow",
                 "delta_funnel.write_all.execution",
             );
             let workflow_result = match automatic_cache_plan.as_ref() {
                 Some(cache_plan) => match cache_plan.decision() {
                     MssqlOutputCacheDecision::NoCache { .. } => self
-                        .write_all_uncached_with_writer_and_timeline(
+                        .write_all_uncached_with_writer_and_trace_context(
                             &planned_outputs,
                             writer,
                             Some(Arc::clone(&shared_provider_stats)),
                             active_reporter,
                             options.execution_profile_mode(),
-                            timeline.clone(),
+                            trace_context.clone(),
                         )
                         .await
                         .map(|workflow| (workflow, cache_report::from_plan(cache_plan))),
                     MssqlOutputCacheDecision::CacheAliases(cache_aliases) => self
-                        .write_all_cached_with_writer_and_timeline(
+                        .write_all_cached_with_writer_and_trace_context(
                             &planned_outputs,
                             cache_aliases,
                             writer,
                             Some(Arc::clone(&shared_provider_stats)),
                             active_reporter,
                             options.execution_profile_mode(),
-                            timeline.clone(),
+                            trace_context.clone(),
                         )
                         .await
                         .map(|(workflow, alias_reports)| {
@@ -187,13 +191,13 @@ impl DeltaFunnelSession {
                         }),
                 },
                 None => self
-                    .write_all_uncached_with_writer_and_timeline(
+                    .write_all_uncached_with_writer_and_trace_context(
                         &planned_outputs,
                         writer,
                         Some(Arc::clone(&shared_provider_stats)),
                         active_reporter,
                         options.execution_profile_mode(),
-                        timeline.clone(),
+                        trace_context.clone(),
                     )
                     .await
                     .map(|workflow| (workflow, cache_report::disabled())),
@@ -220,7 +224,7 @@ impl DeltaFunnelSession {
             }
             let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
             let source_span = start_write_all_phase_span(
-                timeline.as_ref(),
+                timeline,
                 "Report sources",
                 "delta_funnel.write_all.reporting",
             );
@@ -243,7 +247,7 @@ impl DeltaFunnelSession {
         }
         .await;
 
-        let result = match (result, timeline.as_ref()) {
+        let result = match (result, timeline) {
             (Ok(report), Some(timeline)) => {
                 let status = if report.all_succeeded() {
                     TimelineSpanStatus::Completed
