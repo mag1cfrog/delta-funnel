@@ -18,10 +18,10 @@ use super::{
     worker_track,
 };
 
-pub(super) const PROFILE_TARGET: &str = "delta_funnel::profile";
+pub(crate) const PROFILE_TARGET: &str = "delta_funnel::profile";
 
 #[derive(Debug, Default)]
-pub(super) struct PerfettoProfileLayer;
+pub(crate) struct PerfettoProfileLayer;
 
 impl<S> Layer<S> for PerfettoProfileLayer
 where

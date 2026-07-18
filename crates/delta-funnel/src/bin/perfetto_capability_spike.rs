@@ -20,101 +20,37 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 #[cfg(test)]
 use std::thread::ThreadId;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use delta_funnel::{DeltaFunnelSession, SessionOptions};
-use perfetto_sdk::producer::{Backends, Producer, ProducerInitArgsBuilder};
-use perfetto_sdk::protos::trace::track_event::track_descriptor::{
-    TrackDescriptorChildTracksOrdering, TrackDescriptorFieldNumber,
-    TrackDescriptorSiblingMergeBehavior,
-};
+#[cfg(test)]
+use perfetto_sdk::track_event::EventContext;
 #[cfg(test)]
 use perfetto_sdk::track_event::TrackEventDebugArg;
-use perfetto_sdk::track_event::{
-    EventContext, TrackEvent, TrackEventProtoField, TrackEventProtoTrack, TrackEventTrack,
-};
 #[cfg(test)]
 use perfetto_sdk::{track_event_begin, track_event_end};
-use perfetto_sdk::{track_event_categories, track_event_category_enabled};
 use tracing_subscriber::{Layer, filter::filter_fn, prelude::*};
 
-#[path = "perfetto_capability_spike/profile_layer.rs"]
-mod profile_layer;
+#[path = "perfetto_profile/mod.rs"]
+mod perfetto_profile;
 
-use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer};
+use perfetto_profile::{
+    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
+};
+#[cfg(test)]
+use perfetto_profile::{
+    SemanticTrack, diagnostics_track, operation_track, perfetto_te_ns, phase_track, query_token,
+    query_track, worker_token, worker_track,
+};
 
-const CATEGORY: &str = "delta_funnel.perfetto_spike";
-const CAPTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_METADATA_GRACE_PERIOD: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const RELEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_WORKER_ID: AtomicUsize = AtomicUsize::new(1);
 
 type DynError = Box<dyn Error + Send + Sync>;
-
-track_event_categories! {
-    pub mod delta_funnel_perfetto {
-        (
-            "delta_funnel.perfetto_spike",
-            "Delta Funnel Perfetto capability spike",
-            []
-        ),
-    }
-}
-
-use delta_funnel_perfetto as perfetto_te_ns;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SemanticTrack {
-    name: String,
-    uuid: u64,
-    parent_uuid: u64,
-    sibling_order_rank: u64,
-}
-
-impl SemanticTrack {
-    fn new(name: String, id: u64, parent_uuid: u64, sibling_order_rank: u64) -> Self {
-        let uuid = TrackEventTrack::named_track_uuid(&name, id, parent_uuid);
-        Self {
-            name,
-            uuid,
-            parent_uuid,
-            sibling_order_rank,
-        }
-    }
-
-    fn set_on(&self, context: &mut EventContext) {
-        let fields = [
-            TrackEventProtoField::VarInt(
-                TrackDescriptorFieldNumber::ParentUuid as u32,
-                self.parent_uuid,
-            ),
-            TrackEventProtoField::Cstr(TrackDescriptorFieldNumber::Name as u32, &self.name),
-            TrackEventProtoField::VarInt(
-                TrackDescriptorFieldNumber::DisallowMergingWithSystemTracks as u32,
-                1,
-            ),
-            TrackEventProtoField::VarInt(
-                TrackDescriptorFieldNumber::ChildOrdering as u32,
-                u64::from(u32::from(TrackDescriptorChildTracksOrdering::Explicit)),
-            ),
-            TrackEventProtoField::VarInt(
-                TrackDescriptorFieldNumber::SiblingOrderRank as u32,
-                self.sibling_order_rank,
-            ),
-            TrackEventProtoField::VarInt(
-                TrackDescriptorFieldNumber::SiblingMergeBehavior as u32,
-                u64::from(u32::from(
-                    TrackDescriptorSiblingMergeBehavior::SiblingMergeBehaviorNone,
-                )),
-            ),
-        ];
-        context.set_proto_track(&TrackEventProtoTrack {
-            uuid: self.uuid,
-            fields: &fields,
-        });
-    }
-}
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,73 +109,6 @@ impl SemanticTracks {
     }
 }
 
-fn diagnostics_track(process_uuid: u64) -> SemanticTrack {
-    SemanticTrack::new("Delta Funnel diagnostics".to_owned(), 0, process_uuid, 10)
-}
-
-fn operation_track(operation_id: u64, diagnostics_uuid: u64) -> SemanticTrack {
-    SemanticTrack::new(
-        format!("Operation [{}]", operation_token(operation_id)),
-        operation_id,
-        diagnostics_uuid,
-        operation_id,
-    )
-}
-
-fn phase_track(operation_id: u64, operation_uuid: u64) -> SemanticTrack {
-    SemanticTrack::new(
-        format!("Operation [{}] / phases", operation_token(operation_id)),
-        0,
-        operation_uuid,
-        10,
-    )
-}
-
-fn query_track(operation_id: u64, query_execution_id: u64, operation_uuid: u64) -> SemanticTrack {
-    SemanticTrack::new(
-        format!(
-            "Operation [{}] / query [{}]",
-            operation_token(operation_id),
-            query_token(query_execution_id)
-        ),
-        query_execution_id,
-        operation_uuid,
-        20_u64.saturating_add(query_execution_id),
-    )
-}
-
-fn worker_track(
-    operation_id: u64,
-    query_execution_id: u64,
-    worker_lane_id: u64,
-    query_uuid: u64,
-    sibling_order_rank: u64,
-) -> SemanticTrack {
-    SemanticTrack::new(
-        format!(
-            "Operation [{}] / query [{}] / worker [{}]",
-            operation_token(operation_id),
-            query_token(query_execution_id),
-            worker_token(worker_lane_id)
-        ),
-        worker_lane_id,
-        query_uuid,
-        sibling_order_rank,
-    )
-}
-
-fn operation_token(id: u64) -> String {
-    format!("op-{id:020}")
-}
-
-fn query_token(id: u64) -> String {
-    format!("q-{id:020}")
-}
-
-fn worker_token(id: u64) -> String {
-    format!("w-{id:020}")
-}
-
 #[cfg(test)]
 #[derive(Debug)]
 struct WorkerMigrationEvidence {
@@ -284,28 +153,6 @@ async fn emit_representative_preview() -> Result<(), DynError> {
         "captured representative Delta Funnel preview: {} rendered bytes",
         preview.text().len()
     );
-    Ok(())
-}
-
-fn initialize_perfetto() -> Result<(), DynError> {
-    let producer_args = ProducerInitArgsBuilder::new().backends(Backends::SYSTEM);
-    Producer::init(producer_args.build());
-    TrackEvent::init();
-    perfetto_te_ns::register()?;
-    Ok(())
-}
-
-fn wait_for_capture() -> Result<(), DynError> {
-    let deadline = Instant::now() + CAPTURE_WAIT_TIMEOUT;
-    while !track_event_category_enabled!("delta_funnel.perfetto_spike") {
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "Perfetto category {CATEGORY:?} was not enabled within {CAPTURE_WAIT_TIMEOUT:?}"
-            )
-            .into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
     Ok(())
 }
 
