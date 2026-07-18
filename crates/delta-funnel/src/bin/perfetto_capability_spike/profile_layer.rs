@@ -93,6 +93,7 @@ struct ProfileFields {
     worker_lane_id: Option<u64>,
     maximum_spans: Option<u64>,
     operator_name: Option<String>,
+    phase: Option<String>,
     result: Option<String>,
 }
 
@@ -110,6 +111,7 @@ impl Visit for ProfileFields {
     fn record_str(&mut self, field: &Field, value: &str) {
         match field.name() {
             "operator_name" => self.operator_name = Some(value.to_owned()),
+            "phase" => self.phase = Some(value.to_owned()),
             "result" => self.result = Some(value.to_owned()),
             _ => {}
         }
@@ -155,6 +157,10 @@ impl ActiveProfileSpan {
                     query: query_track(operation_id, query_execution_id, operation.uuid),
                 }
             }
+            "Delta Funnel operation phase" => ProfileEvent::Phase {
+                kind: OperationPhaseKind::from_str(fields.phase.as_deref()?)?,
+                phases: phase_track(operation_id, operation.uuid),
+            },
             "DataFusion operator poll" => {
                 let query_execution_id = fields.query_execution_id?;
                 let worker_lane_id = fields.worker_lane_id?;
@@ -229,6 +235,32 @@ impl ActiveProfileSpan {
                     }
                 );
             }
+            ProfileEvent::Phase { kind, phases } => match kind {
+                OperationPhaseKind::Planning => track_event_begin!(
+                    "delta_funnel.perfetto_spike",
+                    "Planning",
+                    |context: &mut EventContext| {
+                        phases.set_on(context);
+                        self.add_identity_args(context);
+                    }
+                ),
+                OperationPhaseKind::Execution => track_event_begin!(
+                    "delta_funnel.perfetto_spike",
+                    "Execution",
+                    |context: &mut EventContext| {
+                        phases.set_on(context);
+                        self.add_identity_args(context);
+                    }
+                ),
+                OperationPhaseKind::Finalization => track_event_begin!(
+                    "delta_funnel.perfetto_spike",
+                    "Finalization",
+                    |context: &mut EventContext| {
+                        phases.set_on(context);
+                        self.add_identity_args(context);
+                    }
+                ),
+            },
             ProfileEvent::Operator { name, worker } => {
                 if let Ok(name) = CString::new(name.as_str()) {
                     track_event!(
@@ -257,6 +289,7 @@ impl ActiveProfileSpan {
         let (track, flush) = match &self.event {
             ProfileEvent::Operation { operation, .. } => (operation, true),
             ProfileEvent::Planning { phases, .. } => (phases, false),
+            ProfileEvent::Phase { phases, .. } => (phases, false),
             ProfileEvent::Operator { worker, .. } => (worker, false),
         };
         track_event_end!(
@@ -300,6 +333,7 @@ impl ActiveProfileSpan {
         match &self.event {
             ProfileEvent::Operation { operation, .. } => operation,
             ProfileEvent::Planning { phases, .. } => phases,
+            ProfileEvent::Phase { phases, .. } => phases,
             ProfileEvent::Operator { worker, .. } => worker,
         }
     }
@@ -316,6 +350,10 @@ enum ProfileEvent {
         phases: SemanticTrack,
         query: SemanticTrack,
     },
+    Phase {
+        kind: OperationPhaseKind,
+        phases: SemanticTrack,
+    },
     Operator {
         name: String,
         worker: SemanticTrack,
@@ -327,6 +365,24 @@ enum OperationKind {
     Preview,
     MssqlWrite,
     WriteAll,
+}
+
+#[derive(Debug)]
+enum OperationPhaseKind {
+    Planning,
+    Execution,
+    Finalization,
+}
+
+impl OperationPhaseKind {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "planning" => Some(Self::Planning),
+            "execution" => Some(Self::Execution),
+            "finalization" => Some(Self::Finalization),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +439,41 @@ mod tests {
                 .is_none()
         );
         assert!(ActiveProfileSpan::from_fields("application span", fields(1, 1, 1)).is_none());
+    }
+
+    #[test]
+    fn operation_phases_share_one_deterministic_track() {
+        let phase = |value: &str| ProfileFields {
+            operation_id: Some(7),
+            phase: Some(value.to_owned()),
+            ..ProfileFields::default()
+        };
+        let planning =
+            ActiveProfileSpan::from_fields("Delta Funnel operation phase", phase("planning"))
+                .expect("a known phase should map");
+        let execution =
+            ActiveProfileSpan::from_fields("Delta Funnel operation phase", phase("execution"))
+                .expect("a known phase should map");
+        let finalization =
+            ActiveProfileSpan::from_fields("Delta Funnel operation phase", phase("finalization"))
+                .expect("a known phase should map");
+
+        assert_eq!(planning.track(), execution.track());
+        assert_eq!(execution.track(), finalization.track());
+        assert!(
+            ActiveProfileSpan::from_fields("Delta Funnel operation phase", phase("unknown"))
+                .is_none()
+        );
+        assert!(
+            ActiveProfileSpan::from_fields(
+                "Delta Funnel operation phase",
+                ProfileFields {
+                    operation_id: Some(7),
+                    ..ProfileFields::default()
+                }
+            )
+            .is_none()
+        );
     }
 
     #[derive(Clone)]

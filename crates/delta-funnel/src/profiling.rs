@@ -19,6 +19,23 @@ pub(crate) enum OperationTraceKind {
     WriteAll,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperationTracePhase {
+    Planning,
+    Execution,
+    Finalization,
+}
+
+impl OperationTracePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Execution => "execution",
+            Self::Finalization => "finalization",
+        }
+    }
+}
+
 /// One canonical identity and optional semantic sink for a profiled operation.
 #[derive(Debug, Clone)]
 pub(crate) struct OperationTraceContext {
@@ -104,12 +121,56 @@ impl OperationTraceContext {
         }
     }
 
+    pub(crate) fn start_process_phase(
+        &self,
+        phase: OperationTracePhase,
+    ) -> Option<ProcessOperationPhaseTrace> {
+        let root = self.process_root_span()?;
+        let span = tracing::trace_span!(
+            target: PROFILE_TARGET,
+            parent: root,
+            "Delta Funnel operation phase",
+            operation_id = self.operation_id,
+            phase = phase.as_str(),
+            result = tracing::field::Empty,
+            time_semantics = "wall_clock",
+        );
+        Some(ProcessOperationPhaseTrace {
+            span,
+            _context: self.clone(),
+            result_recorded: false,
+        })
+    }
+
     pub(crate) fn next_query_execution_id(&self) -> Option<u64> {
         allocate_id(&self.next_query_execution_id)
     }
 
     pub(crate) fn reserve_operator_activity(&self) -> Result<(), OperatorActivityLimit> {
         self.operator_activity_budget.reserve()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ProcessOperationPhaseTrace {
+    span: tracing::Span,
+    // Retain the operation root until this child span closes on cancellation.
+    _context: OperationTraceContext,
+    result_recorded: bool,
+}
+
+impl ProcessOperationPhaseTrace {
+    pub(crate) fn finish(mut self, result: &'static str) {
+        self.span.record("result", result);
+        self.result_recorded = true;
+    }
+}
+
+impl Drop for ProcessOperationPhaseTrace {
+    fn drop(&mut self) {
+        if !self.result_recorded {
+            self.span.record("result", "cancelled");
+        }
     }
 }
 
@@ -369,5 +430,50 @@ mod tests {
                 && span.exit_count == 0
                 && span.closed
         }));
+    }
+
+    #[test]
+    fn operation_phase_retains_its_root_and_records_cancellation() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let context = OperationTraceContext::start(OperationTraceKind::Preview, None)
+            .expect("process tracing should create a context");
+        let root_id = context
+            .process_root_span()
+            .expect("process tracing should create a root span")
+            .id()
+            .expect("the root span should be enabled")
+            .into_u64();
+        let phase = context
+            .start_process_phase(OperationTracePhase::Execution)
+            .expect("process tracing should create a phase span");
+
+        drop(context);
+        let open_root = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .find(|span| span.id == root_id)
+            .expect("the operation root should be captured");
+        assert!(!open_root.closed);
+
+        drop(phase);
+        let spans = capture.captured().spans();
+        let root = spans
+            .iter()
+            .find(|span| span.id == root_id)
+            .expect("the operation root should be captured");
+        let phase = spans
+            .iter()
+            .find(|span| span.name == "Delta Funnel operation phase")
+            .expect("the operation phase should be captured");
+        assert!(root.closed);
+        assert_eq!(root.fields["result"], "cancelled");
+        assert!(phase.closed);
+        assert_eq!(phase.parent_id, Some(root_id));
+        assert_eq!(phase.fields["phase"], "execution");
+        assert_eq!(phase.fields["result"], "cancelled");
+        assert_eq!(phase.fields["time_semantics"], "wall_clock");
+        assert_eq!(phase.enter_count, 0);
+        assert_eq!(phase.exit_count, 0);
     }
 }
