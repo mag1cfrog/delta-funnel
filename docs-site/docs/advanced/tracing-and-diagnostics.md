@@ -94,6 +94,11 @@ The tracing targets are:
 - `arrow_tiberius` for Arrow-to-SQL Server writer lifecycle events
 - `tiberius_raw_bulk::protocol` for sanitized raw bulk protocol events
 
+For a short Linux source-build investigation that needs exact Delta Funnel
+semantic tracks and sampled native Rust call stacks in one file, follow
+[Capture Python Perfetto diagnostics](https://github.com/mag1cfrog/delta-funnel/blob/main/docs/python-perfetto-diagnostics.md).
+This is an opt-in developer workflow; published Python wheels remain unchanged.
+
 ## Inspect Terminal Parquet I/O
 
 Alongside the phase-based lifecycle events above,

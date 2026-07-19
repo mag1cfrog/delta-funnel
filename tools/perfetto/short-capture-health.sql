@@ -167,6 +167,7 @@ SELECT
   missing_canonical_field_values,
   incomplete_semantic_slices,
   (SELECT count(*) FROM crossing_slice_ids) AS crossing_semantic_slices,
+  (SELECT count(*) FROM sched) AS scheduler_rows,
   native_samples,
   samples_with_call_sites,
   samples_without_call_sites,
