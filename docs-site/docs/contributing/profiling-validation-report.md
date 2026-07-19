@@ -320,12 +320,16 @@ preserved `target/profiling/delta_scan_partition_bench-feature-off` path.
 For a three-repetition short Perfetto measurement, use the readiness and
 shutdown lifecycle from the canonical how-to with one of these configs:
 
+Recommended short mode:
+
 ```bash
-# Recommended short mode.
 capture_config=tools/perfetto/delta-funnel-standard.pbtx
 capture_path=target/perfetto-captures/benchmark-standard.pftrace
+```
 
-# Optional scheduler investigation.
+Optional scheduler investigation:
+
+```bash
 capture_config=tools/perfetto/delta-funnel-deep-system.pbtx
 capture_path=target/perfetto-captures/benchmark-deep-system.pftrace
 ```
@@ -400,6 +404,54 @@ A tracked-file search found no remaining spike-named binary, config, module,
 custom Perfetto exporter, temporary trace parser, trace merger, or run diary.
 Historical evidence remains in GitHub issue #522 and ignored local `target/`
 artifacts rather than in production source.
+
+## Final repository verification
+
+The closeout branch passed the default and feature-enabled repository checks:
+
+```bash
+cargo fmt --all -- --check
+cargo check --locked --workspace --all-targets
+cargo test --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS='-D warnings' \
+  cargo doc --locked --workspace --all-features --no-deps
+cargo xtask python-package-check
+python -m pip install -r docs-site/requirements.txt
+python -m zensical build --strict -f docs-site/mkdocs.yml
+git diff --check
+```
+
+The default dependency-tree checks shown above found no Perfetto dependency in
+the core or Python package. The normal Python package check built an abi3 wheel,
+verified its contents and metadata, installed it into a clean environment, and
+passed terminal, minimum-Rich, and Jupyter progress smoke tests.
+
+The diagnostic wheel passed a separate optimized build and clean-environment
+import check:
+
+```bash
+maturin build --locked --profile profiling \
+  --features perfetto-profile \
+  --skip-auditwheel \
+  --out target/python-perfetto-closeout-wheels \
+  --manifest-path crates/delta-funnel-python/Cargo.toml
+```
+
+The installed diagnostic wheel exported `init_perfetto_diagnostics()` and
+returned the structured `capture_timeout` kind when invoked without an active
+capture. This distinguishes the feature-enabled wheel from the default wheel's
+`not_available` result without starting an expensive workload.
+
+The all-feature run passed 1,421 core tests and 167 Python binding tests, with
+no failures. The default run passed 1,412 core tests and 160 Python binding
+tests, with no failures. SQL Server tests that require an external target are
+ignored by the ordinary workspace command; the #528 production matrix ran
+those paths separately. Stock Perfetto short and streaming inspection was also
+performed separately because it is an interactive acceptance check, not a
+unit test.
 
 ## Interpretation limits
 
