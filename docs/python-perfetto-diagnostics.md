@@ -89,6 +89,28 @@ kill -TERM "$trace_pid"
 wait "$trace_pid"
 ```
 
+Run the checked-in Trace Processor health query and report the saved file size
+before interpreting the trace:
+
+```sh
+trace_processor_shell query \
+  -f tools/perfetto/short-capture-health.sql \
+  target/perfetto-captures/python-preview.pftrace
+stat --format='trace_file_bytes=%s' \
+  target/perfetto-captures/python-preview.pftrace
+```
+
+`semantic_health` must be `complete`. Any incomplete operation root, truncation
+marker, missing canonical field, crossing semantic slice, buffer loss, or flush
+failure makes the semantic capture incomplete. Nonzero `data_source_loss_events`,
+`skipped_samples`, or `unwind_errors` values are visible evidence of reduced
+source coverage and must be reported. The system timebase can produce
+`samples_without_call_sites` for non-target work, so that count is evidence
+rather than an automatic failure. A
+`trace_finalization_status` of `not_reported` means the trace did not expose a
+dedicated final-flush result; use the separate flush and semantic completeness
+fields instead.
+
 Open `target/perfetto-captures/python-preview.pftrace` in
 [Perfetto UI](https://ui.perfetto.dev/). The `Delta Funnel diagnostics` process
 track contains this hierarchy:
