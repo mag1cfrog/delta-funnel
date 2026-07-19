@@ -9,7 +9,7 @@ This workflow has a **Limited go** status. The checked-in configurations use a
 two-minute safety timeout and bounded `DISCARD` buffers. They are suitable for
 occasional short captures, not unattended or 10-minute profiling. See
 [#522](https://github.com/mag1cfrog/delta-funnel/issues/522) for the historical
-prototype evidence and
+decision evidence and
 [#527](https://github.com/mag1cfrog/delta-funnel/issues/527) for the planned
 long-capture work.
 
@@ -37,23 +37,31 @@ available on `PATH`:
 - `maturin`
 - Perfetto `tracebox`
 - Perfetto `trace_processor_shell`
+- Linux `perf`
+- GNU `timeout`
 
 The workflow is verified with matching Perfetto v57.2 tools. Record the version
 output when sharing a health summary:
 
 ```sh
 test "$(uname -s)" = Linux
-command -v maturin tracebox trace_processor_shell
+command -v maturin tracebox trace_processor_shell perf timeout
 maturin --version
 tracebox --version
 trace_processor_shell --version
 tracebox --help | grep -F -- '--system-sockets'
 tracebox --system-sockets --query >/dev/null
 cat /proc/sys/kernel/perf_event_paranoid
+cat /proc/sys/kernel/kptr_restrict
+perf stat --all-cpus --event cpu-clock -- sleep 0.1 >/dev/null
 ```
 
-The final `tracebox` readiness check below is authoritative. Missing system
-sockets or insufficient perf permission must fail before the workload starts.
+The `perf stat` command exercises the same per-CPU software clock used by the
+checked-in Perfetto configs. It is the authoritative permission preflight;
+`tracebox --notify-fd` can report ready even when the kernel later rejects
+`perf_event_open`. The final `tracebox` readiness check below independently
+verifies the producer and configured data sources. Either check must fail
+before the workload starts.
 
 If the host policy does not already allow the capture, this temporary setting
 lasts until reboot:
@@ -95,7 +103,9 @@ wheels do not link the Perfetto SDK. The virtual-environment symlink gives the
 example a unique process command line without breaking Python's environment
 discovery. Keep this exact unstripped diagnostic extension available while
 inspecting the trace. Optimized and inlined Rust code can still collapse or
-move frames even when symbols are present.
+move frames even when symbols are present. A restrictive `kernel.kptr_restrict`
+setting can leave kernel frames as raw addresses, but it does not prevent local
+user-space Rust symbolization or make the capture unhealthy.
 
 ## Start the external capture
 
@@ -108,6 +118,7 @@ capture_config=tools/perfetto/delta-funnel-standard.pbtx
 capture_path=target/perfetto-captures/python-preview.pftrace
 capture_dir="${capture_path%/*}"
 ready_fifo="$capture_dir/tracebox-ready"
+ready_timeout_seconds=15
 
 mkdir -p "$capture_dir"
 test -w "$capture_dir"
@@ -122,17 +133,34 @@ tracebox --txt --system-sockets --no-clobber \
   3>"$ready_fifo" &
 trace_pid=$!
 
-readiness="$(od -An -tu1 -N1 "$ready_fifo" | tr -d '[:space:]')"
+if readiness_raw="$(timeout "$ready_timeout_seconds" \
+  od -An -tu1 -N1 "$ready_fifo")"; then
+  readiness="$(tr -d '[:space:]' <<<"$readiness_raw")"
+else
+  readiness=
+fi
 rm -f "$ready_fifo"
+if test "$readiness" != 0; then
+  kill -TERM "$trace_pid" 2>/dev/null || true
+  if wait "$trace_pid"; then
+    tracebox_status=0
+  else
+    tracebox_status=$?
+  fi
+  unset trace_pid
+  printf 'tracebox readiness failed: status=%s\n' \
+    "$tracebox_status" >&2
+fi
 test "$readiness" = 0
 ```
 
 The standard configuration scopes native sampling to the
 `delta-funnel-perfetto-preview` process token used below. It samples native call
 stacks at 100 Hz while preserving exact Delta Funnel semantic spans and process
-metadata in separate buffers. If the final `test` fails, run
-`wait "$trace_pid"` and fix the tool, socket, permission, or output error. Do not
-run the workload.
+metadata in separate buffers. If the final `test` fails, tracebox has already
+been stopped and waited for. Fix the tool, socket, permission, timeout, or
+output error. Do not run the workload. The explicit readiness timeout also
+bounds data-source failures that do not produce a notification byte.
 
 The standard buffers are 128 MiB for semantic events, 64 MiB for native
 samples, and 4 MiB for process metadata. `DISCARD` preserves the beginning of a
@@ -145,11 +173,16 @@ Call `init_perfetto_diagnostics()` once, before `init_logging()` and before any
 preview or write operation:
 
 ```bash
-if target/python-perfetto-venv/bin/delta-funnel-perfetto-preview \
-  examples/perfetto_preview.py; then
-  workload_status=0
+if test -n "${trace_pid:-}" && kill -0 "$trace_pid" 2>/dev/null; then
+  if target/python-perfetto-venv/bin/delta-funnel-perfetto-preview \
+    examples/perfetto_preview.py; then
+    workload_status=0
+  else
+    workload_status=$?
+  fi
 else
-  workload_status=$?
+  printf 'tracebox is not ready; workload was not started\n' >&2
+  workload_status=125
 fi
 ```
 
@@ -174,11 +207,15 @@ After Python exits, stop the child `tracebox` and preserve its result separately
 from the workload result:
 
 ```bash
-kill -TERM "$trace_pid" 2>/dev/null || true
-if wait "$trace_pid"; then
-  tracebox_status=0
+if test -n "${trace_pid:-}"; then
+  kill -TERM "$trace_pid" 2>/dev/null || true
+  if wait "$trace_pid"; then
+    tracebox_status=0
+  else
+    tracebox_status=$?
+  fi
 else
-  tracebox_status=$?
+  tracebox_status="${tracebox_status:-125}"
 fi
 printf 'workload_status=%s tracebox_status=%s\n' \
   "$workload_status" "$tracebox_status"
