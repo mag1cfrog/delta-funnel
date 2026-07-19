@@ -46,8 +46,3 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }
-
-[[bin]]
-name = "perfetto_capability_spike"
-path = "src/bin/perfetto_capability_spike.rs"
-required-features = ["perfetto-profile"]
