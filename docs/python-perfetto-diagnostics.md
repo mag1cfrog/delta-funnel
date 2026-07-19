@@ -282,7 +282,18 @@ instead of assuming a fixed output size.
 
 ## Use deep-system mode only for scheduler questions
 
-Replace the `capture_config` and `capture_path` assignments in the start step:
+Deep-system mode additionally requires read and write access to tracefs. Check
+that access before starting tracebox:
+
+```sh
+test -r /sys/kernel/tracing/events/sched/sched_switch/id
+test -w /sys/kernel/tracing/tracing_on
+```
+
+If either check fails, use the host's normal access-management process to grant
+the current user tracefs access. Do not run tracebox or the Python workload with
+`sudo` as a workaround. Then replace the `capture_config` and `capture_path`
+assignments in the start step:
 
 ```bash
 capture_config=tools/perfetto/delta-funnel-deep-system.pbtx
