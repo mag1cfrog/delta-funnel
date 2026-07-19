@@ -3,6 +3,7 @@
 //! This module does not install a tracing subscriber or manage the external capture process.
 
 use std::io;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use perfetto_sdk::producer::{Backends, Producer, ProducerInitArgsBuilder};
@@ -21,6 +22,7 @@ pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer};
 
 const CATEGORY: &str = "delta_funnel.profile";
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+static PERFETTO_INITIALIZATION: OnceLock<Result<(), String>> = OnceLock::new();
 
 track_event_categories! {
     pub(crate) mod delta_funnel_perfetto {
@@ -157,19 +159,25 @@ pub(crate) fn worker_token(id: u64) -> String {
     format!("w-{id:020}")
 }
 
-/// Initializes the system Perfetto producer and registers the profile category.
+/// Initializes the system Perfetto producer and registers the profile category
+/// once per process.
+///
+/// Repeated and concurrent calls reuse the first initialization result.
 ///
 /// # Errors
 ///
 /// Returns an error when the process-wide category cannot be registered.
 pub fn initialize_perfetto() -> io::Result<()> {
-    let producer_args = ProducerInitArgsBuilder::new().backends(Backends::SYSTEM);
-    Producer::init(producer_args.build());
-    TrackEvent::init();
-    perfetto_te_ns::register().map_err(|error| {
-        io::Error::other(format!("failed to register Perfetto category: {error}"))
-    })?;
-    Ok(())
+    match PERFETTO_INITIALIZATION.get_or_init(|| {
+        let producer_args = ProducerInitArgsBuilder::new().backends(Backends::SYSTEM);
+        Producer::init(producer_args.build());
+        TrackEvent::init();
+        perfetto_te_ns::register()
+            .map_err(|error| format!("failed to register Perfetto category: {error}"))
+    }) {
+        Ok(()) => Ok(()),
+        Err(message) => Err(io::Error::other(message.clone())),
+    }
 }
 
 /// Waits up to `timeout` for an external system capture to enable the profile category.
@@ -207,8 +215,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::error::Error;
     use std::hint::black_box;
-    use std::sync::mpsc;
-    use std::thread::ThreadId;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::thread::{self, ThreadId};
 
     use perfetto_sdk::track_event::{EventContext, TrackEventDebugArg};
     use perfetto_sdk::{track_event_begin, track_event_end};
@@ -322,12 +330,35 @@ mod tests {
     }
 
     #[test]
-    fn capture_wait_uses_the_caller_timeout() {
-        let error = wait_for_capture(Duration::ZERO)
-            .expect_err("an inactive category must time out immediately");
+    fn producer_initialization_is_concurrent_and_retry_safe() -> io::Result<()> {
+        let barrier = Arc::new(Barrier::new(8));
+        let initializations = (0..8)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    initialize_perfetto()
+                })
+            })
+            .collect::<Vec<_>>();
+        for initialization in initializations {
+            initialization
+                .join()
+                .expect("Perfetto initialization thread must not panic")?;
+        }
 
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(error.to_string().contains(CATEGORY));
+        initialize_perfetto()?;
+        let first_error = wait_for_capture(Duration::ZERO)
+            .expect_err("an inactive category must time out immediately");
+        initialize_perfetto()?;
+        let second_error = wait_for_capture(Duration::ZERO)
+            .expect_err("a repeated inactive wait must still time out");
+
+        assert_eq!(first_error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(second_error.kind(), io::ErrorKind::TimedOut);
+        assert!(first_error.to_string().contains(CATEGORY));
+        assert!(second_error.to_string().contains(CATEGORY));
+        Ok(())
     }
 
     #[test]

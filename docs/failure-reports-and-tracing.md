@@ -7,3 +7,4 @@ This documentation moved to the Delta Funnel docs site:
 - [Terminal execution-profile tracing](https://mag1cfrog.github.io/delta-funnel/advanced/tracing-and-diagnostics/#inspect-terminal-execution-profiles)
 - [Returned write-all cache diagnostics](https://mag1cfrog.github.io/delta-funnel/advanced/tracing-and-diagnostics/#inspect-returned-write-all-cache-diagnostics)
 - [Execution profile model](https://mag1cfrog.github.io/delta-funnel/reference/api/#execution-profile-model)
+- [Capture Python Perfetto diagnostics](python-perfetto-diagnostics.md)

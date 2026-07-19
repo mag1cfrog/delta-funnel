@@ -17,6 +17,13 @@ class WriteAllExecutionOptions(TypedDict, total=False):
 def init_logging(filter: str | None = None, logger: str = "deltafunnel") -> bool: ...
 
 
+def init_perfetto_diagnostics(
+    filter: str | None = None,
+    logger: str = "deltafunnel",
+    wait_timeout_seconds: float = 10.0,
+) -> bool: ...
+
+
 class DeltaFunnelError(Exception):
     phase: str
     kind: str
