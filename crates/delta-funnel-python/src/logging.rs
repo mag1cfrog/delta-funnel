@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
+#[cfg(feature = "perfetto-profile")]
+use std::io;
 use std::time::Duration;
 
 #[cfg(feature = "perfetto-profile")]
@@ -95,22 +97,53 @@ fn init_perfetto_diagnostics_inner(
     logger: String,
     wait_timeout: Duration,
 ) -> PyResult<bool> {
-    if tracing::dispatcher::has_been_set() {
-        return Ok(false);
-    }
+    py.detach(move || {
+        activate_perfetto_diagnostics(
+            filter,
+            logger,
+            wait_timeout,
+            tracing::dispatcher::has_been_set,
+            initialize_perfetto,
+            wait_for_capture,
+            install_perfetto_subscriber,
+        )
+    })
+    .map_err(|error| perfetto_activation_py_error(py, error))
+}
 
-    py.detach(initialize_perfetto).map_err(|error| {
-        perfetto_diagnostics_py_error(py, "producer_initialization_failed", error.to_string())
-    })?;
-    py.detach(|| wait_for_capture(wait_timeout))
-        .map_err(|error| capture_readiness_py_error(py, &error))?;
-
+#[cfg(feature = "perfetto-profile")]
+fn install_perfetto_subscriber(filter: EnvFilter, logger: String) -> bool {
     let logging_layer = python_logging_layer(logger).with_filter(filter);
     let perfetto_layer =
         PerfettoProfileLayer.with_filter(filter_fn(|metadata| metadata.target() == PROFILE_TARGET));
     let subscriber = Registry::default().with(logging_layer).with(perfetto_layer);
 
-    Ok(tracing::subscriber::set_global_default(subscriber).is_ok())
+    tracing::subscriber::set_global_default(subscriber).is_ok()
+}
+
+#[cfg(feature = "perfetto-profile")]
+fn activate_perfetto_diagnostics(
+    filter: EnvFilter,
+    logger: String,
+    wait_timeout: Duration,
+    subscriber_has_been_set: impl FnOnce() -> bool,
+    initialize: impl FnOnce() -> io::Result<()>,
+    wait_for_capture: impl FnOnce(Duration) -> io::Result<()>,
+    install_subscriber: impl FnOnce(EnvFilter, String) -> bool,
+) -> Result<bool, PerfettoActivationError> {
+    if subscriber_has_been_set() {
+        return Ok(false);
+    }
+    initialize().map_err(PerfettoActivationError::ProducerInitialization)?;
+    wait_for_capture(wait_timeout).map_err(PerfettoActivationError::CaptureReadiness)?;
+    Ok(install_subscriber(filter, logger))
+}
+
+#[cfg(feature = "perfetto-profile")]
+#[derive(Debug)]
+enum PerfettoActivationError {
+    ProducerInitialization(io::Error),
+    CaptureReadiness(io::Error),
 }
 
 fn parse_logging_filter(
@@ -142,13 +175,20 @@ fn perfetto_diagnostics_py_error(py: Python<'_>, kind: &'static str, message: St
 }
 
 #[cfg(feature = "perfetto-profile")]
-fn capture_readiness_py_error(py: Python<'_>, error: &std::io::Error) -> PyErr {
-    let kind = match error.kind() {
-        std::io::ErrorKind::InvalidInput => "invalid_wait_timeout",
-        std::io::ErrorKind::TimedOut => "capture_timeout",
-        _ => "capture_unavailable",
-    };
-    perfetto_diagnostics_py_error(py, kind, error.to_string())
+fn perfetto_activation_py_error(py: Python<'_>, error: PerfettoActivationError) -> PyErr {
+    match error {
+        PerfettoActivationError::ProducerInitialization(error) => {
+            perfetto_diagnostics_py_error(py, "producer_initialization_failed", error.to_string())
+        }
+        PerfettoActivationError::CaptureReadiness(error) => {
+            let kind = match error.kind() {
+                io::ErrorKind::InvalidInput => "invalid_wait_timeout",
+                io::ErrorKind::TimedOut => "capture_timeout",
+                _ => "capture_unavailable",
+            };
+            perfetto_diagnostics_py_error(py, kind, error.to_string())
+        }
+    }
 }
 
 fn python_logging_layer(logger_name: String) -> PythonLoggingLayer {
@@ -254,12 +294,21 @@ impl Visit for FieldVisitor {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "perfetto-profile")]
+    use std::cell::{Cell, RefCell};
+    #[cfg(feature = "perfetto-profile")]
+    use std::io;
+    #[cfg(feature = "perfetto-profile")]
+    use std::time::Duration;
+
     use pyo3::prelude::*;
     use pyo3::types::{PyAny, PyAnyMethods, PyDict, PyList, PyModule};
     use tracing::Level;
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
 
+    #[cfg(feature = "perfetto-profile")]
+    use super::DEFAULT_LOGGER;
     use super::{DEFAULT_FILTER, PythonLoggingLayer, parse_logging_filter, python_log_level};
     use crate::deltafunnel;
 
@@ -375,6 +424,166 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
+    fn perfetto_activation_runs_each_step_once_in_order() -> io::Result<()> {
+        let events = RefCell::new(Vec::new());
+        let timeout = Duration::from_millis(250);
+
+        let installed = super::activate_perfetto_diagnostics(
+            EnvFilter::new(DEFAULT_FILTER),
+            "deltafunnel.test.perfetto".to_owned(),
+            timeout,
+            || {
+                events.borrow_mut().push("check_subscriber");
+                false
+            },
+            || {
+                events.borrow_mut().push("initialize_producer");
+                Ok(())
+            },
+            |actual_timeout| {
+                assert_eq!(actual_timeout, timeout);
+                events.borrow_mut().push("wait_for_capture");
+                Ok(())
+            },
+            |_filter, logger| {
+                assert_eq!(logger, "deltafunnel.test.perfetto");
+                events.borrow_mut().push("install_subscriber");
+                true
+            },
+        )
+        .map_err(activation_test_error)?;
+
+        assert!(installed);
+        assert_eq!(
+            events.into_inner(),
+            [
+                "check_subscriber",
+                "initialize_producer",
+                "wait_for_capture",
+                "install_subscriber",
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
+    fn existing_subscriber_short_circuits_before_perfetto_initialization() -> io::Result<()> {
+        let producer_initializations = Cell::new(0);
+        let readiness_waits = Cell::new(0);
+        let subscriber_installations = Cell::new(0);
+        let installed = super::activate_perfetto_diagnostics(
+            EnvFilter::new(DEFAULT_FILTER),
+            DEFAULT_LOGGER.to_owned(),
+            Duration::from_secs(1),
+            || true,
+            || {
+                producer_initializations.set(producer_initializations.get() + 1);
+                Ok(())
+            },
+            |_| {
+                readiness_waits.set(readiness_waits.get() + 1);
+                Ok(())
+            },
+            |_, _| {
+                subscriber_installations.set(subscriber_installations.get() + 1);
+                true
+            },
+        )
+        .map_err(activation_test_error)?;
+
+        assert!(!installed);
+        assert_eq!(producer_initializations.get(), 0);
+        assert_eq!(readiness_waits.get(), 0);
+        assert_eq!(subscriber_installations.get(), 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
+    fn subscriber_installation_race_returns_false_after_readiness() -> io::Result<()> {
+        let events = RefCell::new(Vec::new());
+        let installed = super::activate_perfetto_diagnostics(
+            EnvFilter::new(DEFAULT_FILTER),
+            DEFAULT_LOGGER.to_owned(),
+            Duration::from_secs(1),
+            || {
+                events.borrow_mut().push("check_subscriber");
+                false
+            },
+            || {
+                events.borrow_mut().push("initialize_producer");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("wait_for_capture");
+                Ok(())
+            },
+            |_, _| {
+                events.borrow_mut().push("install_subscriber_lost_race");
+                false
+            },
+        )
+        .map_err(activation_test_error)?;
+
+        assert!(!installed);
+        assert_eq!(
+            events.into_inner(),
+            [
+                "check_subscriber",
+                "initialize_producer",
+                "wait_for_capture",
+                "install_subscriber_lost_race",
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
+    fn repeated_perfetto_activation_does_not_repeat_side_effects() -> io::Result<()> {
+        let subscriber_is_set = Cell::new(false);
+        let producer_initializations = Cell::new(0);
+        let readiness_waits = Cell::new(0);
+        let subscriber_installations = Cell::new(0);
+
+        for expected in [true, false] {
+            let installed = super::activate_perfetto_diagnostics(
+                EnvFilter::new(DEFAULT_FILTER),
+                DEFAULT_LOGGER.to_owned(),
+                Duration::from_secs(1),
+                || subscriber_is_set.get(),
+                || {
+                    producer_initializations.set(producer_initializations.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    readiness_waits.set(readiness_waits.get() + 1);
+                    Ok(())
+                },
+                |_, _| {
+                    subscriber_installations.set(subscriber_installations.get() + 1);
+                    subscriber_is_set.set(true);
+                    true
+                },
+            )
+            .map_err(activation_test_error)?;
+            assert_eq!(installed, expected);
+        }
+
+        assert_eq!(producer_initializations.get(), 1);
+        assert_eq!(readiness_waits.get(), 1);
+        assert_eq!(subscriber_installations.get(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    fn activation_test_error(error: super::PerfettoActivationError) -> io::Error {
+        io::Error::other(format!("unexpected activation error: {error:?}"))
     }
 
     #[test]
