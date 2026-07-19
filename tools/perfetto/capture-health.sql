@@ -102,11 +102,20 @@ profile_counts AS (
       AS truncation_marker_count
   FROM classified_slices
 ),
+profile_processes AS (
+  -- linux.perf can retain rows outside its call-stack scope. A semantic track
+  -- provides the trace-local process identity without matching display names.
+  SELECT DISTINCT pt.upid
+  FROM process_track AS pt
+  JOIN semantic_slices AS s ON s.track_id = pt.id
+),
 sample_counts AS (
   SELECT
     count(*) AS perf_sample_count,
-    count(*) - count(callsite_id) AS perf_sample_without_callsite_count
-  FROM perf_sample
+    count(*) - count(ps.callsite_id) AS perf_sample_without_callsite_count
+  FROM perf_sample AS ps
+  JOIN thread AS t USING (utid)
+  JOIN profile_processes AS pp USING (upid)
 ),
 lifecycle_counts AS (
   SELECT coalesce(sum(name = 'tracing_disabled_ns'), 0) AS tracing_disabled_count
