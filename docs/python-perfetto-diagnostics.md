@@ -195,6 +195,12 @@ minutes of retention: a workload with many short operations can fill the file
 sooner. Streaming intentionally excludes scheduler tracing. Use deep-system
 mode separately when scheduler evidence is required.
 
+The streaming config asks the Perfetto v57.2 tracing service to deflate the
+saved trace. Stock Perfetto UI and Trace Processor open the compressed file
+directly. Compression preserves every captured packet and reduces disk usage at
+the cost of additional tracing-service CPU. The short configurations remain
+uncompressed so their startup and finalization behavior does not change.
+
 ## Activate diagnostics and run a preview
 
 Call `init_perfetto_diagnostics()` once, before `init_logging()` and before any

@@ -10,6 +10,11 @@ write_into_file: true
 file_write_period_ms: 5000
 max_file_size_bytes: 536870912
 
+# Perfetto v57.2 predates the newer zstd compression config. Its tracing
+# service supports this legacy deflate mode and stock Perfetto readers
+# transparently decompress the resulting trace.
+compression_type: COMPRESSION_TYPE_DEFLATE
+
 # Exact semantic Track Events: 64 MiB.
 buffers {
   size_kb: 65536
