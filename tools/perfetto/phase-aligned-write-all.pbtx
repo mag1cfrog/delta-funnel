@@ -26,7 +26,7 @@ data_sources {
     name: "track_event"
     target_buffer: 0
     track_event_config {
-      enabled_categories: "delta_funnel.perfetto_spike"
+      enabled_categories: "delta_funnel.profile"
     }
   }
 }

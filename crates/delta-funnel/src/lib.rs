@@ -93,6 +93,8 @@
 pub mod error;
 mod observability;
 mod orchestrator;
+#[cfg(feature = "perfetto-profile")]
+pub mod perfetto_profile;
 mod pipeline;
 mod profiling;
 #[doc(hidden)]

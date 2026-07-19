@@ -65,6 +65,10 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
+#[cfg(feature = "perfetto-profile")]
+use delta_funnel::perfetto_profile::{
+    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
+};
 use delta_funnel::{
     DeltaFunnelSession, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend,
     DeltaProviderScanExecutionOptions, DeltaScanPartitionTargetDiagnosticInput,
@@ -90,16 +94,9 @@ use tracing_subscriber::fmt::MakeWriter;
 #[cfg(feature = "perfetto-profile")]
 use tracing_subscriber::{Layer, filter::filter_fn, prelude::*};
 
-#[cfg(feature = "perfetto-profile")]
-#[path = "perfetto_profile/mod.rs"]
-mod perfetto_profile;
-
-#[cfg(feature = "perfetto-profile")]
-use perfetto_profile::{
-    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
-};
-
 const MIB: u64 = 1024 * 1024;
+#[cfg(feature = "perfetto-profile")]
+const PERFETTO_CAPTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const BENCHMARK_FD_PER_PARTITION_CANDIDATES: [usize; 4] = [4, 8, 16, 32];
 const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
     [64 * MIB, 128 * MIB, 256 * MIB, 512 * MIB];
@@ -326,7 +323,7 @@ fn run_benchmark_with_subscriber(config: &BenchmarkRunnerConfig) -> Result<(), B
 #[cfg(feature = "perfetto-profile")]
 fn run_benchmark_with_subscriber(config: &BenchmarkRunnerConfig) -> Result<(), Box<dyn Error>> {
     initialize_perfetto()?;
-    wait_for_capture()?;
+    wait_for_capture(PERFETTO_CAPTURE_WAIT_TIMEOUT)?;
 
     let perfetto_layer = || {
         PerfettoProfileLayer.with_filter(filter_fn(|metadata| metadata.target() == PROFILE_TARGET))
