@@ -13,7 +13,7 @@ use tracing::{
 };
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
-use crate::{
+use super::{
     SemanticTrack, diagnostics_track, operation_track, perfetto_te_ns, phase_track, query_track,
     worker_track,
 };
@@ -22,6 +22,8 @@ use crate::{
 pub const PROFILE_TARGET: &str = "delta_funnel::profile";
 
 /// Converts canonical Delta Funnel profiling spans into Perfetto Track Events.
+///
+/// The host owns subscriber composition and installation.
 #[derive(Debug, Default)]
 pub struct PerfettoProfileLayer;
 
@@ -76,7 +78,7 @@ where
         let diagnostics = diagnostics_track(TrackEventTrack::process_track_uuid());
         let operation = operation_track(operation_id, diagnostics.uuid);
         track_event_instant!(
-            "delta_funnel.perfetto_spike",
+            "delta_funnel.profile",
             "Operator activity trace truncated",
             |context: &mut EventContext| {
                 operation.set_on(context);
@@ -216,23 +218,23 @@ impl ActiveProfileSpan {
                 operation,
             } => {
                 track_event_instant!(
-                    "delta_funnel.perfetto_spike",
+                    "delta_funnel.profile",
                     "Delta Funnel diagnostic group",
                     |context: &mut EventContext| diagnostics.set_on(context)
                 );
                 match kind {
                     OperationKind::Preview => track_event_begin!(
-                        "delta_funnel.perfetto_spike",
+                        "delta_funnel.profile",
                         "Delta Funnel preview",
                         |context: &mut EventContext| self.set_operation_on(context, operation)
                     ),
                     OperationKind::MssqlWrite => track_event_begin!(
-                        "delta_funnel.perfetto_spike",
+                        "delta_funnel.profile",
                         "Delta Funnel SQL Server write",
                         |context: &mut EventContext| self.set_operation_on(context, operation)
                     ),
                     OperationKind::WriteAll => track_event_begin!(
-                        "delta_funnel.perfetto_spike",
+                        "delta_funnel.profile",
                         "Delta Funnel SQL Server write_all",
                         |context: &mut EventContext| self.set_operation_on(context, operation)
                     ),
@@ -240,7 +242,7 @@ impl ActiveProfileSpan {
             }
             ProfileEvent::Planning { phases, query } => {
                 track_event_instant!(
-                    "delta_funnel.perfetto_spike",
+                    "delta_funnel.profile",
                     "DataFusion query",
                     |context: &mut EventContext| {
                         query.set_on(context);
@@ -248,7 +250,7 @@ impl ActiveProfileSpan {
                     }
                 );
                 track_event_begin!(
-                    "delta_funnel.perfetto_spike",
+                    "delta_funnel.profile",
                     "DataFusion query planning",
                     |context: &mut EventContext| {
                         phases.set_on(context);
@@ -258,7 +260,7 @@ impl ActiveProfileSpan {
             }
             ProfileEvent::Phase { kind, phases } => match kind {
                 OperationPhaseKind::Planning => track_event_begin!(
-                    "delta_funnel.perfetto_spike",
+                    "delta_funnel.profile",
                     "Planning",
                     |context: &mut EventContext| {
                         phases.set_on(context);
@@ -266,7 +268,7 @@ impl ActiveProfileSpan {
                     }
                 ),
                 OperationPhaseKind::Execution => track_event_begin!(
-                    "delta_funnel.perfetto_spike",
+                    "delta_funnel.profile",
                     "Execution",
                     |context: &mut EventContext| {
                         phases.set_on(context);
@@ -274,7 +276,7 @@ impl ActiveProfileSpan {
                     }
                 ),
                 OperationPhaseKind::Finalization => track_event_begin!(
-                    "delta_funnel.perfetto_spike",
+                    "delta_funnel.profile",
                     "Finalization",
                     |context: &mut EventContext| {
                         phases.set_on(context);
@@ -285,7 +287,7 @@ impl ActiveProfileSpan {
             ProfileEvent::Operator { name, worker } => {
                 if let Ok(name) = CString::new(name.as_str()) {
                     track_event!(
-                        "delta_funnel.perfetto_spike",
+                        "delta_funnel.profile",
                         TrackEventType::SliceBegin(name.as_ptr()),
                         |context: &mut EventContext| {
                             worker.set_on(context);
@@ -294,7 +296,7 @@ impl ActiveProfileSpan {
                     );
                 } else {
                     track_event_begin!(
-                        "delta_funnel.perfetto_spike",
+                        "delta_funnel.profile",
                         "DataFusion operator",
                         |context: &mut EventContext| {
                             worker.set_on(context);
@@ -313,16 +315,13 @@ impl ActiveProfileSpan {
             ProfileEvent::Phase { phases, .. } => (phases, false),
             ProfileEvent::Operator { worker, .. } => (worker, false),
         };
-        track_event_end!(
-            "delta_funnel.perfetto_spike",
-            |context: &mut EventContext| {
-                track.set_on(context);
-                self.add_completion_args(context);
-                if flush {
-                    context.set_flush();
-                }
+        track_event_end!("delta_funnel.profile", |context: &mut EventContext| {
+            track.set_on(context);
+            self.add_completion_args(context);
+            if flush {
+                context.set_flush();
             }
-        );
+        });
     }
 
     fn set_operation_on(&self, context: &mut EventContext, operation: &SemanticTrack) {
@@ -513,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn fields_recorded_after_span_creation_are_preserved() {
+    fn completion_records_preserve_begin_identity_and_update_completion_fields() {
         let mut initial = fields(1, 1, 1);
         initial.query_owner = None;
         initial.parent_node_id = None;
@@ -521,12 +520,18 @@ mod tests {
             .expect("complete operator identity should map");
 
         active.record(ProfileFields {
+            operation_id: Some(99),
+            query_execution_id: Some(99),
             query_owner: Some("orders".to_owned()),
+            worker_lane_id: Some(99),
             parent_node_id: Some(3),
             result: Some("batch".to_owned()),
             ..ProfileFields::default()
         });
 
+        assert_eq!(active.fields.operation_id, Some(1));
+        assert_eq!(active.fields.query_execution_id, Some(1));
+        assert_eq!(active.fields.worker_lane_id, Some(1));
         assert_eq!(active.fields.query_owner.as_deref(), Some("orders"));
         assert_eq!(active.fields.parent_node_id, Some(3));
         assert_eq!(active.fields.result.as_deref(), Some("batch"));

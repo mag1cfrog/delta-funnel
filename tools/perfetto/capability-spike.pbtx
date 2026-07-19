@@ -9,7 +9,7 @@ data_sources {
   config {
     name: "track_event"
     track_event_config {
-      enabled_categories: "delta_funnel.perfetto_spike"
+      enabled_categories: "delta_funnel.profile"
     }
   }
 }

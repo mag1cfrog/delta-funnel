@@ -1267,28 +1267,18 @@ dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
- "delta-funnel-perfetto",
  "delta_kernel",
  "futures-util",
  "libc",
  "object_store",
  "parquet",
+ "perfetto-sdk",
  "serde_json",
  "snafu",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "delta-funnel-perfetto"
-version = "0.3.3"
-dependencies = [
- "perfetto-sdk",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

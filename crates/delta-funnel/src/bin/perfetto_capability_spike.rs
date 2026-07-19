@@ -11,20 +11,23 @@ use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use delta_funnel::{DeltaFunnelSession, SessionOptions};
-use delta_funnel_perfetto::{
-    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
+use delta_funnel::{
+    DeltaFunnelSession, SessionOptions,
+    perfetto_profile::{
+        PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
+    },
 };
 use tracing_subscriber::{Layer, filter::filter_fn, prelude::*};
 
 const PROCESS_METADATA_GRACE_PERIOD: Duration = Duration::from_millis(250);
+const CAPTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_WORKER_ID: AtomicUsize = AtomicUsize::new(1);
 
 type DynError = Box<dyn Error + Send + Sync>;
 
 fn main() -> Result<(), DynError> {
     initialize_perfetto()?;
-    wait_for_capture()?;
+    wait_for_capture(CAPTURE_WAIT_TIMEOUT)?;
 
     let perfetto_layer =
         PerfettoProfileLayer.with_filter(filter_fn(|metadata| metadata.target() == PROFILE_TARGET));

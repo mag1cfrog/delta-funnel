@@ -1,6 +1,6 @@
 //! Opt-in Perfetto producer and semantic track adapter for Delta Funnel diagnostics.
-
-#![cfg(feature = "sdk")]
+//!
+//! This module does not install a tracing subscriber or manage the external capture process.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -19,14 +19,14 @@ mod profile_layer;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer};
 
-const CATEGORY: &str = "delta_funnel.perfetto_spike";
-const CAPTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const CATEGORY: &str = "delta_funnel.profile";
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 track_event_categories! {
     pub(crate) mod delta_funnel_perfetto {
         (
-            "delta_funnel.perfetto_spike",
-            "Delta Funnel Perfetto capability spike",
+            "delta_funnel.profile",
+            "Delta Funnel semantic profiling",
             []
         ),
     }
@@ -158,6 +158,10 @@ pub(crate) fn worker_token(id: u64) -> String {
 }
 
 /// Initializes the system Perfetto producer and registers the profile category.
+///
+/// # Errors
+///
+/// Returns an error when the process-wide category cannot be registered.
 pub fn initialize_perfetto() -> io::Result<()> {
     let producer_args = ProducerInitArgsBuilder::new().backends(Backends::SYSTEM);
     Producer::init(producer_args.build());
@@ -168,19 +172,32 @@ pub fn initialize_perfetto() -> io::Result<()> {
     Ok(())
 }
 
-/// Waits for an external system capture to enable the profile category.
-pub fn wait_for_capture() -> io::Result<()> {
-    let deadline = Instant::now() + CAPTURE_WAIT_TIMEOUT;
-    while !track_event_category_enabled!("delta_funnel.perfetto_spike") {
-        if Instant::now() >= deadline {
+/// Waits up to `timeout` for an external system capture to enable the profile category.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::TimedOut`] when no capture enables the category, or
+/// [`io::ErrorKind::InvalidInput`] when `timeout` cannot be represented by the platform clock.
+pub fn wait_for_capture(timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Perfetto capture wait timeout {timeout:?} is too large"),
+        )
+    })?;
+    while !track_event_category_enabled!("delta_funnel.profile") {
+        let now = Instant::now();
+        if now >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!(
-                    "Perfetto category {CATEGORY:?} was not enabled within {CAPTURE_WAIT_TIMEOUT:?}"
-                ),
+                format!("Perfetto category {CATEGORY:?} was not enabled within {timeout:?}"),
             ));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(CAPTURE_POLL_INTERVAL),
+        );
     }
     Ok(())
 }
@@ -304,6 +321,23 @@ mod tests {
         assert_ne!(tracks.workers[0].1.uuid, operation_2.workers[0].1.uuid);
     }
 
+    #[test]
+    fn capture_wait_uses_the_caller_timeout() {
+        let error = wait_for_capture(Duration::ZERO)
+            .expect_err("an inactive category must time out immediately");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains(CATEGORY));
+    }
+
+    #[test]
+    fn capture_wait_rejects_an_unrepresentable_timeout() {
+        let error = wait_for_capture(Duration::MAX)
+            .expect_err("an unrepresentable deadline must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn logical_worker_track_survives_tokio_worker_migration() -> Result<(), DynError> {
         let tracks = SemanticTracks::new(42, 1, 1, [1, 10]);
@@ -330,7 +364,7 @@ mod tests {
             let begin_thread = std::thread::current().id();
             let begin_worker = current_thread_name();
             track_event_begin!(
-                "delta_funnel.perfetto_spike",
+                "delta_funnel.profile",
                 "Logical worker activity",
                 |context: &mut EventContext| {
                     first_track.set_on(context);
@@ -357,7 +391,7 @@ mod tests {
             let parallel_thread = std::thread::current().id();
             let parallel_worker = current_thread_name();
             track_event_begin!(
-                "delta_funnel.perfetto_spike",
+                "delta_funnel.profile",
                 "Logical worker activity",
                 |context: &mut EventContext| {
                     parallel_track.set_on(context);
@@ -372,10 +406,9 @@ mod tests {
                 }
             );
             sampled_cpu_work(work_duration);
-            track_event_end!(
-                "delta_funnel.perfetto_spike",
-                |context: &mut EventContext| parallel_track.set_on(context)
-            );
+            track_event_end!("delta_funnel.profile", |context: &mut EventContext| {
+                parallel_track.set_on(context)
+            });
             Ok::<_, DynError>(parallel_thread)
         });
         let parallel_result = match parallel_task.await {
@@ -399,14 +432,10 @@ mod tests {
                 return Err("logical worker begin and end ran on the same Tokio worker".into());
             }
             sampled_cpu_work(work_duration / 2);
-            track_event_end!(
-                "delta_funnel.perfetto_spike",
-                |context: &mut EventContext| {
-                    first_end_track.set_on(context);
-                    context
-                        .add_debug_arg("end_tokio_worker", TrackEventDebugArg::String(&end_worker));
-                }
-            );
+            track_event_end!("delta_funnel.profile", |context: &mut EventContext| {
+                first_end_track.set_on(context);
+                context.add_debug_arg("end_tokio_worker", TrackEventDebugArg::String(&end_worker));
+            });
             Ok::<_, DynError>(end_thread)
         });
 

@@ -65,6 +65,10 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
+#[cfg(feature = "perfetto-profile")]
+use delta_funnel::perfetto_profile::{
+    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
+};
 use delta_funnel::{
     DeltaFunnelSession, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend,
     DeltaProviderScanExecutionOptions, DeltaScanPartitionTargetDiagnosticInput,
@@ -79,10 +83,6 @@ use delta_funnel::{
     derive_delta_scan_partition_target_diagnostic, load_delta_source_with_tracing,
     preflight_delta_protocol_with_tracing, register_delta_sources_with_scan_execution_options,
 };
-#[cfg(feature = "perfetto-profile")]
-use delta_funnel_perfetto::{
-    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
-};
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::deletion_vector_writer::{
     KernelDeletionVector, StreamingDeletionVectorWriter,
@@ -95,6 +95,8 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{Layer, filter::filter_fn, prelude::*};
 
 const MIB: u64 = 1024 * 1024;
+#[cfg(feature = "perfetto-profile")]
+const PERFETTO_CAPTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const BENCHMARK_FD_PER_PARTITION_CANDIDATES: [usize; 4] = [4, 8, 16, 32];
 const BENCHMARK_MEMORY_BYTES_PER_PARTITION_CANDIDATES: [u64; 4] =
     [64 * MIB, 128 * MIB, 256 * MIB, 512 * MIB];
@@ -321,7 +323,7 @@ fn run_benchmark_with_subscriber(config: &BenchmarkRunnerConfig) -> Result<(), B
 #[cfg(feature = "perfetto-profile")]
 fn run_benchmark_with_subscriber(config: &BenchmarkRunnerConfig) -> Result<(), Box<dyn Error>> {
     initialize_perfetto()?;
-    wait_for_capture()?;
+    wait_for_capture(PERFETTO_CAPTURE_WAIT_TIMEOUT)?;
 
     let perfetto_layer = || {
         PerfettoProfileLayer.with_filter(filter_fn(|metadata| metadata.target() == PROFILE_TARGET))

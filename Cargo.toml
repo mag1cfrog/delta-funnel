@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/delta-funnel",
-    "crates/delta-funnel-perfetto",
     "crates/delta-funnel-python",
     "xtask",
 ]
