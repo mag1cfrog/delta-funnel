@@ -33,11 +33,15 @@ source target/python-perfetto-venv/bin/activate
 maturin develop --locked --profile profiling \
   --features perfetto-profile \
   --manifest-path crates/delta-funnel-python/Cargo.toml
+ln -sf python \
+  target/python-perfetto-venv/bin/delta-funnel-perfetto-preview
 ```
 
 The `profiling` profile preserves information needed to symbolize native call
 stacks. The `perfetto-profile` feature is opt-in so normal builds and published
-wheels do not link the Perfetto SDK.
+wheels do not link the Perfetto SDK. The virtual-environment symlink gives the
+example a unique process command line without breaking Python's environment
+discovery.
 
 ## Start the external capture
 
@@ -63,32 +67,14 @@ Call `init_perfetto_diagnostics()` once, before `init_logging()` and before any
 preview or write operation:
 
 ```bash
-exec -a delta-funnel-perfetto-preview python - <<'PY'
-import deltafunnel
-
-installed = deltafunnel.init_perfetto_diagnostics(
-    wait_timeout_seconds=10.0,
-)
-if not installed:
-    raise RuntimeError(
-        "another global tracing subscriber is already installed; "
-        "start a fresh Python process and activate Perfetto diagnostics first"
-    )
-
-session = deltafunnel.Session()
-table = session.table_from_sql(
-    "SELECT SUM(LENGTH(REGEXP_REPLACE(CAST(value AS VARCHAR), "
-    "'[0-9]', 'x', 'g'))) AS total "
-    "FROM generate_series(1, 200000000) AS series(value)"
-)
-preview = table.preview(limit=1, progress=False)
-print(preview.text)
-PY
+target/python-perfetto-venv/bin/delta-funnel-perfetto-preview \
+  examples/perfetto_preview.py
 ```
 
-This example generates data in memory and is deliberately long enough to
-produce a useful sampled call stack on a typical development machine. Adjust
-the generated row count for the machine under test.
+The repository-owned example generates data in memory, exercises planning and
+parallel preview execution, and prints only a completion message. It exits
+nonzero if diagnostics are unavailable or not ready, and it never starts or
+stops `tracebox` itself.
 
 `DELTAFUNNEL_LOG` and the function's `filter` and `logger` arguments configure
 the Python logging side of the combined subscriber. They do not disable the
