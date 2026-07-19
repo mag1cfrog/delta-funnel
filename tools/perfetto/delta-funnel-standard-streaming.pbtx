@@ -1,0 +1,63 @@
+# Standard long Delta Funnel capture: exact semantic spans, 100 Hz native
+# on-CPU samples, and process metadata. Stop tracebox when the workload exits.
+# The 12-minute duration is a safety timeout for the 10-minute validation.
+duration_ms: 720000
+
+# Periodically drain both ring buffers into the output file. Five seconds is
+# Perfetto's default long-trace period; the 64 MiB buffers retain ample headroom
+# over the measured data produced between writes by the canonical workload.
+write_into_file: true
+file_write_period_ms: 5000
+max_file_size_bytes: 536870912
+
+# Exact semantic Track Events: 64 MiB.
+buffers {
+  size_kb: 65536
+  fill_policy: RING_BUFFER
+}
+
+# Target-process native samples and process metadata: 64 MiB.
+buffers {
+  size_kb: 65536
+  fill_policy: RING_BUFFER
+}
+
+data_sources {
+  config {
+    name: "track_event"
+    target_buffer: 0
+    track_event_config {
+      enabled_categories: "delta_funnel.profile"
+    }
+  }
+}
+
+data_sources {
+  config {
+    name: "linux.perf"
+    target_buffer: 1
+    perf_event_config {
+      timebase {
+        counter: SW_CPU_CLOCK
+        frequency: 100
+        timestamp_clock: PERF_CLOCK_MONOTONIC
+      }
+      callstack_sampling {
+        scope {
+          target_cmdline: "delta-funnel-perfetto-preview"
+        }
+        kernel_frames: true
+      }
+    }
+  }
+}
+
+data_sources {
+  config {
+    name: "linux.process_stats"
+    target_buffer: 1
+    process_stats_config {
+      scan_all_processes_on_start: true
+    }
+  }
+}
