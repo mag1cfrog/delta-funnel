@@ -113,12 +113,18 @@ fn init_perfetto_diagnostics_inner(
 
 #[cfg(feature = "perfetto-profile")]
 fn install_perfetto_subscriber(filter: EnvFilter, logger: String) -> bool {
+    tracing::subscriber::set_global_default(perfetto_diagnostics_subscriber(filter, logger)).is_ok()
+}
+
+#[cfg(feature = "perfetto-profile")]
+fn perfetto_diagnostics_subscriber(
+    filter: EnvFilter,
+    logger: String,
+) -> impl Subscriber + Send + Sync + 'static {
     let logging_layer = python_logging_layer(logger).with_filter(filter);
     let perfetto_layer =
         PerfettoProfileLayer.with_filter(filter_fn(|metadata| metadata.target() == PROFILE_TARGET));
-    let subscriber = Registry::default().with(logging_layer).with(perfetto_layer);
-
-    tracing::subscriber::set_global_default(subscriber).is_ok()
+    Registry::default().with(logging_layer).with(perfetto_layer)
 }
 
 #[cfg(feature = "perfetto-profile")]
@@ -578,6 +584,112 @@ mod tests {
         assert_eq!(producer_initializations.get(), 1);
         assert_eq!(readiness_waits.get(), 1);
         assert_eq!(subscriber_installations.get(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
+    fn combined_subscriber_keeps_logging_and_perfetto_filters_independent() -> PyResult<()> {
+        Python::attach(|py| {
+            let logger_name = "deltafunnel.test.combined";
+            let (logger, handler, records) = install_capture_handler(py, logger_name)?;
+            let subscriber = super::perfetto_diagnostics_subscriber(
+                EnvFilter::new("delta_funnel=info"),
+                logger_name.to_owned(),
+            );
+
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(tracing::enabled!(
+                    target: "delta_funnel::profile",
+                    Level::TRACE
+                ));
+                assert!(tracing::enabled!(target: "delta_funnel", Level::INFO));
+                assert!(!tracing::enabled!(target: "unrelated", Level::TRACE));
+                tracing::trace!(target: "delta_funnel::profile", "profile.trace");
+                tracing::info!(target: "delta_funnel", "application.info");
+                tracing::trace!(target: "unrelated", "unrelated.trace");
+            });
+
+            logger.call_method1("removeHandler", (&handler,))?;
+            let record = only_record(&records)?;
+            assert_eq!(
+                record.getattr("msg")?.extract::<String>()?,
+                "application.info"
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
+    fn perfetto_activation_errors_have_stable_python_fields() -> PyResult<()> {
+        Python::attach(|py| {
+            for (error, expected_kind) in [
+                (
+                    super::PerfettoActivationError::ProducerInitialization(io::Error::other(
+                        "producer unavailable",
+                    )),
+                    "producer_initialization_failed",
+                ),
+                (
+                    super::PerfettoActivationError::CaptureReadiness(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "capture timed out",
+                    )),
+                    "capture_timeout",
+                ),
+                (
+                    super::PerfettoActivationError::CaptureReadiness(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "capture disconnected",
+                    )),
+                    "capture_unavailable",
+                ),
+                (
+                    super::PerfettoActivationError::CaptureReadiness(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "timeout cannot be represented",
+                    )),
+                    "invalid_wait_timeout",
+                ),
+            ] {
+                let error = super::perfetto_activation_py_error(py, error);
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "perfetto_diagnostics"
+                );
+                assert_eq!(
+                    error.value(py).getattr("kind")?.extract::<String>()?,
+                    expected_kind
+                );
+                assert!(error.value(py).getattr("context")?.is_none());
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
+    fn inactive_capture_does_not_change_preview_result() -> Result<(), Box<dyn std::error::Error>> {
+        let subscriber = super::perfetto_diagnostics_subscriber(
+            EnvFilter::new("off"),
+            "deltafunnel.test.inactive_capture".to_owned(),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+
+        let preview = tracing::subscriber::with_default(subscriber, || {
+            runtime
+                .block_on(async {
+                    let mut session = delta_funnel::DeltaFunnelSession::new(
+                        delta_funnel::SessionOptions::default(),
+                    )?;
+                    let table = session.table_from_sql("SELECT 1 AS value").await?;
+                    session.preview_table(&table, 20).await
+                })
+                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+        })?;
+
+        assert!(preview.text().contains('1'));
         Ok(())
     }
 
