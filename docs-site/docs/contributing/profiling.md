@@ -25,6 +25,10 @@ counts. On Linux, native sampling is on-CPU only. Time blocked on I/O, locks,
 or sleep is absent from the sampled stacks; use the deep-system mode only when
 scheduler context is needed.
 
+See the [profiling validation report](profiling-validation-report.md) for the
+canonical 13.4M-row performance comparison, 10-minute streaming result, and
+production correctness matrix behind these recommendations.
+
 ## Export the stable semantic timeline
 
 Use stable semantic JSON when the question is about exact wall-clock phase,
