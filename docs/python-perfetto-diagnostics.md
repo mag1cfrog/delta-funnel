@@ -44,25 +44,26 @@ wheels do not link the Perfetto SDK.
 Start `tracebox` before activating diagnostics in Python:
 
 ```sh
-mkdir -p target/perfetto-spike
+mkdir -p target/perfetto-captures
 trace_pid="$(
   tracebox --txt --system-sockets --background-wait \
-    --config tools/perfetto/phase-aligned-write-all-standard.pbtx \
-    --out target/perfetto-spike/python-preview.pftrace
+    --config tools/perfetto/delta-funnel-standard.pbtx \
+    --out target/perfetto-captures/python-preview.pftrace
 )"
 ```
 
-The standard configuration targets both the Rust diagnostic benchmark and
-Python. It samples native call stacks at 100 Hz while preserving exact Delta
-Funnel semantic spans on a separate buffer.
+The standard configuration scopes native sampling to the
+`delta-funnel-perfetto-preview` process token used below. It samples native call
+stacks at 100 Hz while preserving exact Delta Funnel semantic spans and process
+metadata in separate buffers.
 
 ## Activate diagnostics and run a preview
 
 Call `init_perfetto_diagnostics()` once, before `init_logging()` and before any
 preview or write operation:
 
-```sh
-python - <<'PY'
+```bash
+exec -a delta-funnel-perfetto-preview python - <<'PY'
 import deltafunnel
 
 installed = deltafunnel.init_perfetto_diagnostics(
@@ -102,7 +103,7 @@ kill -TERM "$trace_pid"
 wait "$trace_pid"
 ```
 
-Open `target/perfetto-spike/python-preview.pftrace` in
+Open `target/perfetto-captures/python-preview.pftrace` in
 [Perfetto UI](https://ui.perfetto.dev/). The `Delta Funnel diagnostics` process
 track contains this hierarchy:
 
