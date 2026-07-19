@@ -1,0 +1,27 @@
+[package]
+name = "delta-funnel-perfetto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Opt-in Perfetto diagnostics adapter for Delta Funnel development builds"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+sdk = ["dep:perfetto-sdk", "dep:tracing", "dep:tracing-subscriber"]
+
+[dependencies]
+perfetto-sdk = { version = "1.0.3", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "registry",
+], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

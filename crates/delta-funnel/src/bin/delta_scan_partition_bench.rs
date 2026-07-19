@@ -79,6 +79,10 @@ use delta_funnel::{
     derive_delta_scan_partition_target_diagnostic, load_delta_source_with_tracing,
     preflight_delta_protocol_with_tracing, register_delta_sources_with_scan_execution_options,
 };
+#[cfg(feature = "perfetto-profile")]
+use delta_funnel_perfetto::{
+    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
+};
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::deletion_vector_writer::{
     KernelDeletionVector, StreamingDeletionVectorWriter,
@@ -89,15 +93,6 @@ use parquet::file::properties::WriterProperties;
 use tracing_subscriber::fmt::MakeWriter;
 #[cfg(feature = "perfetto-profile")]
 use tracing_subscriber::{Layer, filter::filter_fn, prelude::*};
-
-#[cfg(feature = "perfetto-profile")]
-#[path = "perfetto_profile/mod.rs"]
-mod perfetto_profile;
-
-#[cfg(feature = "perfetto-profile")]
-use perfetto_profile::{
-    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
-};
 
 const MIB: u64 = 1024 * 1024;
 const BENCHMARK_FD_PER_PARTITION_CANDIDATES: [usize; 4] = [4, 8, 16, 32];

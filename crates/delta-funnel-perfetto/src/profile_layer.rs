@@ -13,15 +13,17 @@ use tracing::{
 };
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
-use super::{
+use crate::{
     SemanticTrack, diagnostics_track, operation_track, perfetto_te_ns, phase_track, query_track,
     worker_track,
 };
 
-pub(crate) const PROFILE_TARGET: &str = "delta_funnel::profile";
+/// Exact tracing target consumed by the Perfetto profile layer.
+pub const PROFILE_TARGET: &str = "delta_funnel::profile";
 
+/// Converts canonical Delta Funnel profiling spans into Perfetto Track Events.
 #[derive(Debug, Default)]
-pub(crate) struct PerfettoProfileLayer;
+pub struct PerfettoProfileLayer;
 
 impl<S> Layer<S> for PerfettoProfileLayer
 where
