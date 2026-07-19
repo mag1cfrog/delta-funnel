@@ -5,7 +5,7 @@ use std::env;
 use std::fmt;
 #[cfg(feature = "perfetto-profile")]
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "perfetto-profile")]
 use delta_funnel::perfetto_profile::{
@@ -65,15 +65,27 @@ fn init_perfetto_diagnostics(
             "Perfetto diagnostics logger name must not be empty".to_owned(),
         ));
     }
-    let wait_timeout = Duration::try_from_secs_f64(wait_timeout_seconds).map_err(|error| {
+    let wait_timeout = parse_perfetto_wait_timeout(py, wait_timeout_seconds)?;
+
+    init_perfetto_diagnostics_inner(py, filter, logger, wait_timeout)
+}
+
+fn parse_perfetto_wait_timeout(py: Python<'_>, seconds: f64) -> PyResult<Duration> {
+    let timeout = Duration::try_from_secs_f64(seconds).map_err(|error| {
         perfetto_diagnostics_py_error(
             py,
             "invalid_wait_timeout",
             format!("invalid Perfetto diagnostics wait timeout: {error}"),
         )
     })?;
-
-    init_perfetto_diagnostics_inner(py, filter, logger, wait_timeout)
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        perfetto_diagnostics_py_error(
+            py,
+            "invalid_wait_timeout",
+            format!("Perfetto diagnostics wait timeout {timeout:?} is too large"),
+        )
+    })?;
+    Ok(timeout)
 }
 
 #[cfg(not(feature = "perfetto-profile"))]
@@ -372,6 +384,7 @@ mod tests {
                 ((py.None(), " ", 10.0), "invalid_logger"),
                 ((py.None(), "deltafunnel", -1.0), "invalid_wait_timeout"),
                 ((py.None(), "deltafunnel", f64::NAN), "invalid_wait_timeout"),
+                ((py.None(), "deltafunnel", 1e19), "invalid_wait_timeout"),
             ] {
                 let error = module
                     .call_method1("init_perfetto_diagnostics", arguments)
@@ -691,6 +704,43 @@ mod tests {
 
         assert!(preview.text().contains('1'));
         Ok(())
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
+    fn inactive_capture_does_not_change_dry_run_write_result() -> PyResult<()> {
+        let subscriber = super::perfetto_diagnostics_subscriber(
+            EnvFilter::new("off"),
+            "deltafunnel.test.inactive_capture_write".to_owned(),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            Python::attach(|py| {
+                let module = PyModule::new(py, "deltafunnel")?;
+                deltafunnel(&module)?;
+                let session = module.getattr("Session")?.call0()?;
+                let table = session.call_method1("table_from_sql", ("SELECT 1 AS value",))?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("schema", "dbo")?;
+                kwargs.set_item("table", "diagnostic_write")?;
+                kwargs.set_item("load_mode", "create_and_load")?;
+                kwargs.set_item("connection_string", "server=tcp:sql.example.com")?;
+                kwargs.set_item("dry_run", true)?;
+                kwargs.set_item("progress", false)?;
+
+                let report = table
+                    .call_method("write_to_mssql", (), Some(&kwargs))?
+                    .cast_into::<PyDict>()?;
+                assert_eq!(
+                    report
+                        .get_item("run_mode")?
+                        .expect("dry-run report must include run_mode")
+                        .extract::<String>()?,
+                    "dry_run"
+                );
+                Ok(())
+            })
+        })
     }
 
     #[cfg(feature = "perfetto-profile")]
