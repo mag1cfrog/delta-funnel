@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf 'Usage: %s TRACE_PATH [CONFIGURED_FILE_CAP_BYTES]\n' "$0"
+}
+
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+  usage
+  exit 0
+fi
+if (( $# < 1 || $# > 2 )); then
+  usage >&2
+  exit 64
+fi
+
+trace_path=$1
+configured_file_cap_bytes=${2:-NULL}
+if [[ ! -f $trace_path || ! -r $trace_path ]]; then
+  printf 'capture-health: trace is not a readable file: %s\n' "$trace_path" >&2
+  exit 66
+fi
+if [[ $configured_file_cap_bytes != NULL &&
+      ! $configured_file_cap_bytes =~ ^[1-9][0-9]*$ ]]; then
+  printf 'capture-health: file cap must be a positive integer\n' >&2
+  exit 64
+fi
+
+case $trace_path in
+  /*) ;;
+  *) trace_path=$PWD/$trace_path ;;
+esac
+
+trace_processor=${TRACE_PROCESSOR_SHELL:-trace_processor_shell}
+if ! command -v "$trace_processor" >/dev/null 2>&1; then
+  printf 'capture-health: trace processor is not executable: %s\n' \
+    "$trace_processor" >&2
+  exit 127
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+saved_file_bytes=$(stat --format='%s' -- "$trace_path")
+
+{
+  printf '%s\n' \
+    "CREATE PERFETTO TABLE delta_funnel_capture_health_input AS" \
+    "SELECT $configured_file_cap_bytes AS configured_file_cap_bytes," \
+    "       $saved_file_bytes AS saved_file_bytes;"
+  sed -n '1,$p' "$script_dir/capture-health.sql"
+} | "$trace_processor" query --query-file - "$trace_path"

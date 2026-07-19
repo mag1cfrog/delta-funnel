@@ -2,16 +2,18 @@
 
 Use this workflow to capture Delta Funnel's exact semantic operation hierarchy
 and sampled native Rust call stacks in one local Perfetto trace. It is intended
-for experienced developers diagnosing short Python-driven workloads on Linux.
+for experienced developers diagnosing Python-driven workloads on Linux.
 Published Python wheels do not include the Perfetto producer.
 
-This workflow has a **Limited go** status. The checked-in configurations use a
-two-minute safety timeout and bounded `DISCARD` buffers. They are suitable for
-occasional short captures, not unattended or 10-minute profiling. See
+This workflow is for occasional diagnostics, not continuous or unattended
+collection. Use the short configuration for brief captures. Use the bounded
+streaming configuration for a workload expected to run for more than two
+minutes and up to ten minutes. Streaming has a 12-minute safety timeout and a
+512 MiB saved-file cap, but high event volume can reach that cap sooner. See
 [#522](https://github.com/mag1cfrog/delta-funnel/issues/522) for the historical
 decision evidence and
-[#527](https://github.com/mag1cfrog/delta-funnel/issues/527) for the planned
-long-capture work.
+[#527](https://github.com/mag1cfrog/delta-funnel/issues/527) for the bounded
+streaming design and validation contract.
 
 ## Choose the diagnostic mode
 
@@ -19,15 +21,17 @@ long-capture work.
 | --- | --- |
 | Inspect exact operation, phase, query, worker, and operator timing | Stable semantic JSON export |
 | Find native Rust CPU hotspots and source lines with the smallest capture | Samply |
-| Correlate exact semantic timing with sampled native Rust stacks | Standard Perfetto |
+| Correlate a brief workload with sampled native Rust stacks | Standard short Perfetto |
+| Correlate a workload expected to run for up to ten minutes | Standard streaming Perfetto |
 | Add scheduler and wakeup context to a short standard capture | Deep-system Perfetto |
 
-Use the standard Perfetto mode by default for this guide. Semantic Track Events
-record exact begin and end timestamps. The 100 Hz native call stacks are
-statistical samples, so nearby runs can have different sample counts. On Linux,
-native sampling is on-CPU only. Time blocked on I/O, locks, or sleep is absent
-from the sampled stacks; use the deep-system mode only when scheduler context is
-needed.
+Use the short standard mode for a brief workload and the streaming standard
+mode when the expected duration exceeds two minutes. Both modes record exact
+begin and end timestamps as semantic Track Events. Their 100 Hz native call
+stacks are statistical samples, so nearby runs can have different sample
+counts. On Linux, native sampling is on-CPU only. Time blocked on I/O, locks,
+or sleep is absent from the sampled stacks; use the deep-system mode only when
+scheduler context is needed.
 
 ## Prerequisites
 
@@ -109,13 +113,29 @@ user-space Rust symbolization or make the capture unhealthy.
 
 ## Start the external capture
 
-Preflight a new local output path, then start `tracebox` as a child of the
-controlling Bash shell. The readiness FIFO lets `tracebox` reject unavailable
-data sources before Python runs:
+Choose exactly one configuration. The short mode preserves the beginning of a
+brief capture. The streaming mode periodically drains ring buffers to a bounded
+file and is intended for a workload expected to run for more than two minutes:
 
 ```bash
+# Short standard capture:
 capture_config=tools/perfetto/delta-funnel-standard.pbtx
 capture_path=target/perfetto-captures/python-preview.pftrace
+configured_file_cap_bytes=
+```
+
+```bash
+# Bounded streaming standard capture:
+capture_config=tools/perfetto/delta-funnel-standard-streaming.pbtx
+capture_path=target/perfetto-captures/python-preview-streaming.pftrace
+configured_file_cap_bytes=536870912
+```
+
+Preflight the selected new local output path, then start `tracebox` as a child
+of the controlling Bash shell. The readiness FIFO lets `tracebox` reject
+unavailable data sources before Python runs:
+
+```bash
 capture_dir="${capture_path%/*}"
 ready_fifo="$capture_dir/tracebox-ready"
 ready_timeout_seconds=15
@@ -154,7 +174,7 @@ fi
 test "$readiness" = 0
 ```
 
-The standard configuration scopes native sampling to the
+Both standard configurations scope native sampling to the
 `delta-funnel-perfetto-preview` process token used below. It samples native call
 stacks at 100 Hz while preserving exact Delta Funnel semantic spans and process
 metadata in separate buffers. If the final `test` fails, tracebox has already
@@ -162,10 +182,24 @@ been stopped and waited for. Fix the tool, socket, permission, timeout, or
 output error. Do not run the workload. The explicit readiness timeout also
 bounds data-source failures that do not produce a notification byte.
 
-The standard buffers are 128 MiB for semantic events, 64 MiB for native
+The short standard buffers are 128 MiB for semantic events, 64 MiB for native
 samples, and 4 MiB for process metadata. `DISCARD` preserves the beginning of a
 short capture but drops new packets after a buffer fills, so a saturated buffer
 has an incomplete tail.
+
+The streaming standard buffers are 64 MiB for semantic events and 64 MiB for
+native samples plus process metadata. `RING_BUFFER` retains recent packets
+between five-second file writes. The 512 MiB cap bounds the saved file, while
+the 12-minute duration is only a safety stop. Neither value guarantees ten
+minutes of retention: a workload with many short operations can fill the file
+sooner. Streaming intentionally excludes scheduler tracing. Use deep-system
+mode separately when scheduler evidence is required.
+
+The streaming config asks the Perfetto v57.2 tracing service to deflate the
+saved trace. Stock Perfetto UI and Trace Processor open the compressed file
+directly. Compression preserves every captured packet and reduces disk usage at
+the cost of additional tracing-service CPU. The short configurations remain
+uncompressed so their startup and finalization behavior does not change.
 
 ## Activate diagnostics and run a preview
 
@@ -227,28 +261,52 @@ diagnostic evidence. A successful workload remains successful if tracebox
 shutdown, file writing, the health query, or the UI later fails. In particular,
 never retry a database write because capture finalization failed.
 
+In streaming mode, reaching the saved-file cap can stop tracebox before the
+workload exits. The target process continues independently. The `kill` command
+above is harmless when the child has already exited, and `wait` still collects
+its status. A zero `tracebox_status` only reports a clean process exit. It does
+not prove that the full workload interval was retained or finalized.
+
 ## Check capture health
 
-Run the checked-in Trace Processor health query and report the saved file size
-before interpreting the trace:
+Run the checked-in health command before interpreting the trace. Pass the
+configured cap for streaming mode so the row records both the configured bound
+and the factual saved size:
 
-```sh
-trace_processor_shell query \
-  -f tools/perfetto/short-capture-health.sql \
-  "$capture_path"
-stat --format='trace_file_bytes=%s' "$capture_path"
+```bash
+if test -n "$configured_file_cap_bytes"; then
+  tools/perfetto/capture-health \
+    "$capture_path" "$configured_file_cap_bytes"
+else
+  tools/perfetto/capture-health "$capture_path"
+fi
 ```
 
-`semantic_health` must be `complete`. Any incomplete operation root, truncation
-marker, missing canonical field, crossing semantic slice, buffer loss, or flush
-failure makes the semantic capture incomplete. Nonzero `data_source_loss_events`,
-`skipped_samples`, or `unwind_errors` values are visible evidence of reduced
-source coverage and must be reported. The system timebase can produce
-`samples_without_call_sites` for non-target work, so that count is evidence
-rather than an automatic failure. A
-`trace_finalization_status` of `not_reported` means the trace did not expose a
-dedicated final-flush result; use the separate flush and semantic completeness
-fields instead. For the standard config, `scheduler_rows` must be `0`.
+`capture_complete` must be 1 before treating the file as a complete capture.
+`semantic_complete` reports exact Delta Funnel event health independently from
+the statistical sample counts. Nonzero `perf_samples_skipped` or
+`perf_sample_without_callsite_count` values reduce sampling confidence but do
+not automatically make exact semantic data incomplete. A normal
+`truncation_marker_count` records the documented per-operation activity budget
+and is not buffer loss. `finalization_observed` is 1 only when the trace contains
+Perfetto's `tracing_disabled` lifecycle marker. TraceStats in a streaming trace
+are periodic snapshots, so `flush_failure_count` reports observed failures but
+is not a separate final-flush attestation. Use the flush, semantic, and
+finalization fields together when deciding whether the available evidence is
+complete.
+
+`configured_file_cap_bytes` and `saved_file_bytes` are facts, not a stop-reason
+heuristic. Do not infer that the cap was or was not reached from their
+proximity. If `finalization_observed` is 0, the available file may have stopped
+because of the cap, a write failure, or hard termination. Perfetto does not
+provide enough retained evidence here to distinguish those cases reliably.
+
+An incomplete streaming trace still contains packets drained before output
+stopped. Treat missing tail time as unknown, not as zero activity. Asynchronous
+data sources can stop at slightly different boundaries, and ring-buffer
+overwrite can remove older packets that were not drained in time. Exact spans
+and native samples that passed the health checks remain useful for their
+retained interval, but they do not describe the omitted interval.
 
 ## Inspect the semantic hierarchy and native stacks
 
@@ -276,9 +334,12 @@ sample density, not the exact semantic spans. Treat a high skipped-sample count
 or lost semantic packets as an unhealthy capture.
 
 The generated example takes about 6 seconds and produced about 12 MB during the
-v57.2 validation run. Hardware and symbols change both values. The total
-standard buffer allocation is 196 MiB, so check the saved size and health row
-instead of assuming a fixed output size.
+v57.2 validation run. Hardware and symbols change both values. The short
+standard mode allocates 196 MiB of service buffers, while streaming allocates
+128 MiB. The diagnostics-enabled target additionally requests a bounded 32 MiB
+producer shared-memory buffer to absorb semantic event bursts. These are
+in-memory buffer allocations, not expected file sizes. Always check the factual
+saved size and health row.
 
 ## Use deep-system mode only for scheduler questions
 
@@ -298,12 +359,15 @@ assignments in the start step:
 ```bash
 capture_config=tools/perfetto/delta-funnel-deep-system.pbtx
 capture_path=target/perfetto-captures/python-preview-deep-system.pftrace
+configured_file_cap_bytes=
 ```
 
 Deep-system mode adds a separate 256 MiB compact scheduler buffer, for a total
-allocation of 452 MiB. Its health row should have nonzero `scheduler_rows`.
-Scheduler events can substantially increase file size and system overhead, so
-do not use this mode as the default.
+allocation of 452 MiB. Confirm that scheduler tracks are present in Perfetto UI
+before relying on them; the canonical health row intentionally contains only
+fields shared by short and streaming captures. Scheduler events can
+substantially increase file size and system overhead, so do not use this mode
+as the default.
 
 ## Keep capture data local
 

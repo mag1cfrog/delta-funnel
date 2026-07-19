@@ -22,6 +22,9 @@ pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer};
 
 const CATEGORY: &str = "delta_funnel.profile";
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Perfetto's 256 KiB default dropped semantic packets during canonical event
+// bursts. This is the largest bounded hint accepted by Perfetto v57.2.
+const PRODUCER_SHMEM_SIZE_HINT_KB: u32 = 32 * 1024;
 static PERFETTO_INITIALIZATION: OnceLock<Result<(), String>> = OnceLock::new();
 
 track_event_categories! {
@@ -169,7 +172,9 @@ pub(crate) fn worker_token(id: u64) -> String {
 /// Returns an error when the process-wide category cannot be registered.
 pub fn initialize_perfetto() -> io::Result<()> {
     match PERFETTO_INITIALIZATION.get_or_init(|| {
-        let producer_args = ProducerInitArgsBuilder::new().backends(Backends::SYSTEM);
+        let producer_args = ProducerInitArgsBuilder::new()
+            .backends(Backends::SYSTEM)
+            .shmem_size_hint_kb(PRODUCER_SHMEM_SIZE_HINT_KB);
         Producer::init(producer_args.build());
         TrackEvent::init();
         perfetto_te_ns::register()
