@@ -3,10 +3,17 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
+use std::time::Duration;
 
+#[cfg(feature = "perfetto-profile")]
+use delta_funnel::perfetto_profile::{
+    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModuleMethods};
 use tracing::{Event, Level, Subscriber, field::Field, field::Visit};
+#[cfg(feature = "perfetto-profile")]
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::{
     EnvFilter, Layer, Registry, layer::Context, prelude::*, registry::LookupSpan,
 };
@@ -15,10 +22,13 @@ use crate::exception::delta_funnel_py_error;
 
 const DEFAULT_LOGGER: &str = "deltafunnel";
 const DEFAULT_FILTER: &str = "delta_funnel=info,arrow_tiberius=info";
+const DEFAULT_PERFETTO_WAIT_TIMEOUT_SECONDS: f64 = 10.0;
 const LOG_FILTER_ENV: &str = "DELTAFUNNEL_LOG";
+const PERFETTO_DIAGNOSTICS_PHASE: &str = "perfetto_diagnostics";
 
 pub(crate) fn add_logging(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(init_logging, module)?)?;
+    module.add_function(wrap_pyfunction!(init_perfetto_diagnostics, module)?)?;
     Ok(())
 }
 
@@ -26,9 +36,79 @@ pub(crate) fn add_logging(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyo3(signature = (filter=None, logger=DEFAULT_LOGGER.to_owned()))]
 fn init_logging(py: Python<'_>, filter: Option<String>, logger: String) -> PyResult<bool> {
     let filter = parse_logging_filter(py, filter, env::var(LOG_FILTER_ENV).ok())?;
-    let subscriber = Registry::default().with(filter).with(PythonLoggingLayer {
-        logger_name: logger,
-    });
+    let subscriber = Registry::default()
+        .with(filter)
+        .with(python_logging_layer(logger));
+
+    Ok(tracing::subscriber::set_global_default(subscriber).is_ok())
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    filter=None,
+    logger=DEFAULT_LOGGER.to_owned(),
+    wait_timeout_seconds=DEFAULT_PERFETTO_WAIT_TIMEOUT_SECONDS,
+))]
+fn init_perfetto_diagnostics(
+    py: Python<'_>,
+    filter: Option<String>,
+    logger: String,
+    wait_timeout_seconds: f64,
+) -> PyResult<bool> {
+    let filter = parse_logging_filter(py, filter, env::var(LOG_FILTER_ENV).ok())?;
+    if logger.trim().is_empty() {
+        return Err(perfetto_diagnostics_py_error(
+            py,
+            "invalid_logger",
+            "Perfetto diagnostics logger name must not be empty".to_owned(),
+        ));
+    }
+    let wait_timeout = Duration::try_from_secs_f64(wait_timeout_seconds).map_err(|error| {
+        perfetto_diagnostics_py_error(
+            py,
+            "invalid_wait_timeout",
+            format!("invalid Perfetto diagnostics wait timeout: {error}"),
+        )
+    })?;
+
+    init_perfetto_diagnostics_inner(py, filter, logger, wait_timeout)
+}
+
+#[cfg(not(feature = "perfetto-profile"))]
+fn init_perfetto_diagnostics_inner(
+    py: Python<'_>,
+    _filter: EnvFilter,
+    _logger: String,
+    _wait_timeout: Duration,
+) -> PyResult<bool> {
+    Err(perfetto_diagnostics_py_error(
+        py,
+        "not_available",
+        "this deltafunnel build does not include Perfetto diagnostics".to_owned(),
+    ))
+}
+
+#[cfg(feature = "perfetto-profile")]
+fn init_perfetto_diagnostics_inner(
+    py: Python<'_>,
+    filter: EnvFilter,
+    logger: String,
+    wait_timeout: Duration,
+) -> PyResult<bool> {
+    if tracing::dispatcher::has_been_set() {
+        return Ok(false);
+    }
+
+    py.detach(initialize_perfetto).map_err(|error| {
+        perfetto_diagnostics_py_error(py, "producer_initialization_failed", error.to_string())
+    })?;
+    py.detach(|| wait_for_capture(wait_timeout))
+        .map_err(|error| capture_readiness_py_error(py, &error))?;
+
+    let logging_layer = python_logging_layer(logger).with_filter(filter);
+    let perfetto_layer =
+        PerfettoProfileLayer.with_filter(filter_fn(|metadata| metadata.target() == PROFILE_TARGET));
+    let subscriber = Registry::default().with(logging_layer).with(perfetto_layer);
 
     Ok(tracing::subscriber::set_global_default(subscriber).is_ok())
 }
@@ -52,6 +132,27 @@ fn invalid_logging_filter_py_error(py: Python<'_>, message: String) -> PyErr {
         Ok(error) => error,
         Err(error) => error,
     }
+}
+
+fn perfetto_diagnostics_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr {
+    match delta_funnel_py_error(py, PERFETTO_DIAGNOSTICS_PHASE, kind, message, None) {
+        Ok(error) => error,
+        Err(error) => error,
+    }
+}
+
+#[cfg(feature = "perfetto-profile")]
+fn capture_readiness_py_error(py: Python<'_>, error: &std::io::Error) -> PyErr {
+    let kind = match error.kind() {
+        std::io::ErrorKind::InvalidInput => "invalid_wait_timeout",
+        std::io::ErrorKind::TimedOut => "capture_timeout",
+        _ => "capture_unavailable",
+    };
+    perfetto_diagnostics_py_error(py, kind, error.to_string())
+}
+
+fn python_logging_layer(logger_name: String) -> PythonLoggingLayer {
+    PythonLoggingLayer { logger_name }
 }
 
 struct PythonLoggingLayer {
@@ -163,12 +264,13 @@ mod tests {
     use crate::deltafunnel;
 
     #[test]
-    fn module_exports_init_logging() -> PyResult<()> {
+    fn module_exports_logging_initializers() -> PyResult<()> {
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
             deltafunnel(&module)?;
 
             assert!(module.hasattr("init_logging")?);
+            assert!(module.hasattr("init_perfetto_diagnostics")?);
 
             Ok(())
         })
@@ -197,10 +299,82 @@ mod tests {
     }
 
     #[test]
-    fn pyi_stub_exports_init_logging() {
+    fn pyi_stub_exports_logging_initializers() {
         let stub = include_str!("../deltafunnel.pyi");
 
         assert!(stub.contains("def init_logging("));
+        assert!(stub.contains("def init_perfetto_diagnostics("));
+        assert!(stub.contains("wait_timeout_seconds: float = 10.0"));
+    }
+
+    #[test]
+    fn perfetto_initializer_rejects_invalid_arguments_before_activation() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+
+            for (arguments, expected_kind) in [
+                ((py.None(), " ", 10.0), "invalid_logger"),
+                ((py.None(), "deltafunnel", -1.0), "invalid_wait_timeout"),
+                ((py.None(), "deltafunnel", f64::NAN), "invalid_wait_timeout"),
+            ] {
+                let error = module
+                    .call_method1("init_perfetto_diagnostics", arguments)
+                    .expect_err("invalid diagnostics arguments must fail");
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "perfetto_diagnostics"
+                );
+                assert_eq!(
+                    error.value(py).getattr("kind")?.extract::<String>()?,
+                    expected_kind
+                );
+            }
+
+            let error = module
+                .call_method1(
+                    "init_perfetto_diagnostics",
+                    ("delta_funnel=[", "deltafunnel", 10.0),
+                )
+                .expect_err("invalid diagnostics filter must fail");
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_logging_filter"
+            );
+
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "perfetto-profile"))]
+    #[test]
+    fn feature_off_perfetto_initializer_is_stable_and_side_effect_free() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let subscriber_was_set = tracing::dispatcher::has_been_set();
+
+            let error = module
+                .call_method0("init_perfetto_diagnostics")
+                .expect_err("feature-off diagnostics must fail");
+
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "perfetto_diagnostics"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "not_available"
+            );
+            assert!(error.value(py).getattr("context")?.is_none());
+            assert_eq!(tracing::dispatcher::has_been_set(), subscriber_was_set);
+
+            Ok(())
+        })
     }
 
     #[test]
