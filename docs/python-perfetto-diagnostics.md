@@ -229,26 +229,24 @@ never retry a database write because capture finalization failed.
 
 ## Check capture health
 
-Run the checked-in Trace Processor health query and report the saved file size
-before interpreting the trace:
+Run the checked-in health command before interpreting the trace:
 
 ```sh
-trace_processor_shell query \
-  -f tools/perfetto/short-capture-health.sql \
-  "$capture_path"
-stat --format='trace_file_bytes=%s' "$capture_path"
+tools/perfetto/capture-health "$capture_path"
 ```
 
-`semantic_health` must be `complete`. Any incomplete operation root, truncation
-marker, missing canonical field, crossing semantic slice, buffer loss, or flush
-failure makes the semantic capture incomplete. Nonzero `data_source_loss_events`,
-`skipped_samples`, or `unwind_errors` values are visible evidence of reduced
-source coverage and must be reported. The system timebase can produce
-`samples_without_call_sites` for non-target work, so that count is evidence
-rather than an automatic failure. A
-`trace_finalization_status` of `not_reported` means the trace did not expose a
-dedicated final-flush result; use the separate flush and semantic completeness
-fields instead. For the standard config, `scheduler_rows` must be `0`.
+`capture_complete` must be 1 before treating the file as a complete capture.
+`semantic_complete` reports exact Delta Funnel event health independently from
+the statistical sample counts. Nonzero `perf_samples_skipped` or
+`perf_sample_without_callsite_count` values reduce sampling confidence but do
+not automatically make exact semantic data incomplete. A normal
+`truncation_marker_count` records the documented per-operation activity budget
+and is not buffer loss. `finalization_observed` is 1 only when the trace contains
+Perfetto's `tracing_disabled` lifecycle marker. TraceStats in a streaming trace
+are periodic snapshots, so `flush_failure_count` reports observed failures but
+is not a separate final-flush attestation. Use the flush, semantic, and
+finalization fields together when deciding whether the available evidence is
+complete.
 
 ## Inspect the semantic hierarchy and native stacks
 
@@ -301,9 +299,11 @@ capture_path=target/perfetto-captures/python-preview-deep-system.pftrace
 ```
 
 Deep-system mode adds a separate 256 MiB compact scheduler buffer, for a total
-allocation of 452 MiB. Its health row should have nonzero `scheduler_rows`.
-Scheduler events can substantially increase file size and system overhead, so
-do not use this mode as the default.
+allocation of 452 MiB. Confirm that scheduler tracks are present in Perfetto UI
+before relying on them; the canonical health row intentionally contains only
+fields shared by short and streaming captures. Scheduler events can
+substantially increase file size and system overhead, so do not use this mode
+as the default.
 
 ## Keep capture data local
 
