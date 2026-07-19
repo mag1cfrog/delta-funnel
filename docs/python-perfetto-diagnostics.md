@@ -330,8 +330,10 @@ or lost semantic packets as an unhealthy capture.
 The generated example takes about 6 seconds and produced about 12 MB during the
 v57.2 validation run. Hardware and symbols change both values. The short
 standard mode allocates 196 MiB of service buffers, while streaming allocates
-128 MiB. These are in-memory buffer allocations, not expected file sizes.
-Always check the factual saved size and health row.
+128 MiB. The diagnostics-enabled target additionally requests a bounded 32 MiB
+producer shared-memory buffer to absorb semantic event bursts. These are
+in-memory buffer allocations, not expected file sizes. Always check the factual
+saved size and health row.
 
 ## Use deep-system mode only for scheduler questions
 
