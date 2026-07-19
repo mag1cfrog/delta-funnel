@@ -371,6 +371,36 @@ Record the CSV, GNU `time` output, capture size, health row, tool versions,
 config file, commit, and host policy. Reopen the trace in a fresh stock
 Perfetto session before claiming viewer usability.
 
+## Prototype cleanup audit
+
+The final tracked tree was compared with the #522 prototype commit after
+production parity had passed. No prototype-only runtime remains:
+
+- `perfetto_capability_spike` and its `capability-spike.pbtx` config were
+  removed. Production adapter unit tests, Python activation tests, the
+  repository example, and the end-to-end matrix cover their supported
+  properties.
+- The adapter moved from the binary-private `src/bin/perfetto_profile` module
+  to the single feature-gated `src/perfetto_profile` production module.
+- `phase-aligned-write-all-standard.pbtx` became
+  `delta-funnel-standard.pbtx`.
+- `phase-aligned-write-all.pbtx` became `delta-funnel-deep-system.pbtx`.
+- Bounded long capture uses the additional production
+  `delta-funnel-standard-streaming.pbtx` config and canonical
+  `capture-health` command.
+- The `delta_scan_partition_bench` binary remains because it is the canonical
+  generated correctness, performance, and volume workload. It is not a second
+  adapter or a capability-only harness.
+- Stable semantic JSON remains because it is a supported public diagnostic
+  format. It does not duplicate Perfetto capture control or native sampling.
+- The old root documentation path is a short compatibility redirect to the
+  canonical how-to, not a second maintained guide.
+
+A tracked-file search found no remaining spike-named binary, config, module,
+custom Perfetto exporter, temporary trace parser, trace merger, or run diary.
+Historical evidence remains in GitHub issue #522 and ignored local `target/`
+artifacts rather than in production source.
+
 ## Interpretation limits
 
 - The host was shared and the matrices were not randomized. Small differences
