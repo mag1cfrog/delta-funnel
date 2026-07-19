@@ -45,6 +45,7 @@ nav:
   - Contributors:
       - Development:
           - Local development: contributing/development.md
+          - Profiling workloads: contributing/profiling.md
           - SQL Server integration tests: contributing/sql-server-tests.md
       - Delta internals:
           - DataFusion and Delta overview: internals/datafusion-delta.md
