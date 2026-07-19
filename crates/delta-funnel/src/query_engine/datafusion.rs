@@ -9,7 +9,7 @@ use datafusion::physical_plan::{
     coalesce_partitions::CoalescePartitionsExec,
 };
 
-use crate::{DeltaFunnelError, QueryExecutionScope, report::OperationTimelineRecorder};
+use crate::{DeltaFunnelError, QueryExecutionScope, profiling::OperationTraceContext};
 
 mod catalog;
 mod execution;
@@ -46,7 +46,7 @@ pub use session::{QueryOptions, datafusion_session_config, datafusion_session_co
 /// Shared identity for the planning and execution events of one query.
 #[derive(Debug, Clone)]
 pub(crate) struct QueryTraceIdentity {
-    timeline: OperationTimelineRecorder,
+    context: OperationTraceContext,
     query_execution_id: u64,
     query_scope: QueryExecutionScope,
     query_owner: Option<Arc<str>>,
@@ -54,21 +54,31 @@ pub(crate) struct QueryTraceIdentity {
 
 impl QueryTraceIdentity {
     pub(crate) fn new(
-        timeline: OperationTimelineRecorder,
+        context: OperationTraceContext,
         query_scope: QueryExecutionScope,
         query_owner: Option<&str>,
-    ) -> Self {
-        let query_execution_id = timeline.next_query_execution_id();
-        Self {
-            timeline,
+    ) -> Option<Self> {
+        debug_assert_ne!(context.operation_id(), 0);
+        debug_assert!(context.timeline().is_some() || context.process_spans_enabled());
+        let query_execution_id = context.next_query_execution_id()?;
+        Some(Self {
+            context,
             query_execution_id,
             query_scope,
             query_owner: query_owner.map(Arc::<str>::from),
-        }
+        })
     }
 
-    const fn timeline(&self) -> &OperationTimelineRecorder {
-        &self.timeline
+    const fn timeline(&self) -> Option<&crate::report::OperationTimelineRecorder> {
+        self.context.timeline()
+    }
+
+    const fn operation_id(&self) -> u64 {
+        self.context.operation_id()
+    }
+
+    fn process_root_span(&self) -> Option<&tracing::Span> {
+        self.context.process_root_span()
     }
 
     const fn query_execution_id(&self) -> u64 {

@@ -6,12 +6,8 @@ use std::{
     collections::HashMap,
     fmt,
     pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     task::{Context, Poll},
-    thread::ThreadId,
 };
 
 use datafusion::{
@@ -27,15 +23,13 @@ use futures_util::Stream;
 use serde_json::Value;
 
 use crate::{
-    QueryExecutionScope,
-    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder},
+    QueryExecutionScope, profiling::OperationTraceContext, report::OperationTimelineSpanRecorder,
     usize_to_u64_saturating,
 };
 
 use super::QueryTraceIdentity;
 
 const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
-const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivityWorkerKind {
@@ -82,8 +76,13 @@ impl ActivityWorkerLane {
 struct OperatorActivityIdentityState {
     next_stream_id: u64,
     next_worker_lane_id: u64,
-    coordinator_thread: Option<ThreadId>,
-    worker_lanes: HashMap<ThreadId, ActivityWorkerLane>,
+    worker_lanes: Vec<ActivityWorkerLaneState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActivityWorkerLaneState {
+    lane: ActivityWorkerLane,
+    active: bool,
 }
 
 impl Default for OperatorActivityIdentityState {
@@ -91,8 +90,7 @@ impl Default for OperatorActivityIdentityState {
         Self {
             next_stream_id: 1,
             next_worker_lane_id: 1,
-            coordinator_thread: None,
-            worker_lanes: HashMap::new(),
+            worker_lanes: Vec::new(),
         }
     }
 }
@@ -108,9 +106,12 @@ struct ActivityExecutionContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ActiveOperatorActivitySpan {
+    operation_id: u64,
     query_execution_id: u64,
-    worker_lane_id: u64,
-    span_id: u64,
+    worker_lane: ActivityWorkerLane,
+    owns_worker_lane: bool,
+    timeline_span_id: Option<u64>,
+    process_span_active: bool,
 }
 
 thread_local! {
@@ -120,37 +121,27 @@ thread_local! {
 
 #[derive(Debug, Clone)]
 struct OperatorActivityRecorder {
-    timeline: OperationTimelineRecorder,
+    context: OperationTraceContext,
     query_execution_id: u64,
     query_scope: QueryExecutionScope,
     query_owner: Option<Arc<str>>,
     identities: Arc<Mutex<OperatorActivityIdentityState>>,
-    maximum_spans: u64,
-    remaining_spans: Arc<AtomicU64>,
-    truncation_reported: Arc<AtomicBool>,
 }
 
 impl OperatorActivityRecorder {
     fn new(identity: QueryTraceIdentity) -> Self {
-        Self::with_max_spans(identity, MAX_OPERATOR_ACTIVITY_SPANS)
-    }
-
-    fn with_max_spans(identity: QueryTraceIdentity, maximum_spans: u64) -> Self {
         let QueryTraceIdentity {
-            timeline,
+            context,
             query_execution_id,
             query_scope,
             query_owner,
         } = identity;
         Self {
-            timeline,
+            context,
             query_execution_id,
             query_scope,
             query_owner,
             identities: Arc::new(Mutex::new(OperatorActivityIdentityState::default())),
-            maximum_spans,
-            remaining_spans: Arc::new(AtomicU64::new(maximum_spans)),
-            truncation_reported: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -163,28 +154,39 @@ impl OperatorActivityRecorder {
         stream_id: u64,
         activity: &'static str,
     ) -> Option<OperatorActivitySpanRecorder> {
-        if self
-            .remaining_spans
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_err()
-        {
-            self.report_truncation();
+        let records_semantic_span = self.context.timeline().is_some();
+        let records_process_span = self.context.process_spans_enabled() && activity == "poll_next";
+        if !records_semantic_span && !records_process_span {
+            return None;
+        }
+        if let Err(limit) = self.context.reserve_operator_activity() {
+            if limit.should_report {
+                self.report_truncation(limit.maximum_spans);
+            }
             return None;
         }
 
-        let context = self.execution_context();
-        let parent_id = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
-            active.borrow().last().and_then(|parent| {
-                (parent.query_execution_id == self.query_execution_id
-                    && parent.worker_lane_id == context.worker_lane.id)
-                    .then_some(parent.span_id)
-            })
+        let (context, owns_worker_lane) = self.execution_context(partition);
+        let (parent_id, process_parent_active) = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
+            let active = active.borrow();
+            let matches_parent = |parent: &ActiveOperatorActivitySpan| {
+                parent.operation_id == self.context.operation_id()
+                    && parent.query_execution_id == self.query_execution_id
+                    && parent.worker_lane.id == context.worker_lane.id
+            };
+            let parent_id = active
+                .iter()
+                .rev()
+                .find(|parent| matches_parent(parent))
+                .and_then(|parent| parent.timeline_span_id);
+            let process_parent_active = active
+                .last()
+                .is_some_and(|parent| matches_parent(parent) && parent.process_span_active);
+            (parent_id, process_parent_active)
         });
         let track_name = context.worker_lane.track_name(self.query_execution_id);
-        let timeline_span = self
-            .with_query_identity(self.timeline.start_span(
+        let timeline_span = self.context.timeline().map(|timeline| {
+            self.with_query_identity(timeline.start_span(
                 operator_name,
                 OPERATOR_ACTIVITY_CATEGORY,
                 track_name,
@@ -198,7 +200,10 @@ impl OperatorActivityRecorder {
             .with_attribute("task_kind", Value::String(context.task_kind.to_owned()))
             .with_attribute(
                 "runtime_task_id",
-                context.runtime_task_id.map_or(Value::Null, Value::String),
+                context
+                    .runtime_task_id
+                    .clone()
+                    .map_or(Value::Null, Value::String),
             )
             .with_attribute("execution_stream_id", Value::from(stream_id))
             .with_attribute("node_id", Value::from(node_id))
@@ -210,24 +215,106 @@ impl OperatorActivityRecorder {
                 "operator_partition",
                 Value::from(usize_to_u64_saturating(partition)),
             )
-            .with_attribute("worker_thread_id", Value::String(context.worker_thread_id))
+            .with_attribute(
+                "worker_thread_id",
+                Value::String(context.worker_thread_id.clone()),
+            )
             .with_attribute(
                 "worker_thread_name",
                 context
                     .worker_thread_name
+                    .clone()
                     .map_or(Value::Null, Value::String),
             )
-            .with_attribute("activity", Value::String(activity.to_owned()));
+            .with_attribute("activity", Value::String(activity.to_owned()))
+        });
+        let timeline_span_id = timeline_span
+            .as_ref()
+            .and_then(OperationTimelineSpanRecorder::id);
+        let process_span = records_process_span
+            .then(|| {
+                self.process_poll_span(
+                    operator_name,
+                    node_id,
+                    parent_node_id,
+                    partition,
+                    stream_id,
+                    &context,
+                    process_parent_active,
+                )
+            })
+            .flatten();
+        if timeline_span_id.is_none() && process_span.is_none() {
+            if owns_worker_lane {
+                Self::release_worker_lane(&self.identities, context.worker_lane);
+            }
+            return None;
+        }
         let active = ActiveOperatorActivitySpan {
+            operation_id: self.context.operation_id(),
             query_execution_id: self.query_execution_id,
-            worker_lane_id: context.worker_lane.id,
-            span_id: timeline_span.id()?,
+            worker_lane: context.worker_lane,
+            owns_worker_lane,
+            timeline_span_id,
+            process_span_active: process_span.is_some(),
         };
         ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active));
         Some(OperatorActivitySpanRecorder {
-            timeline_span: Some(timeline_span),
+            timeline_span,
+            process_span,
+            process_result_recorded: false,
+            identities: Arc::clone(&self.identities),
             active,
         })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the process span records the canonical operator activity identity"
+    )]
+    fn process_poll_span(
+        &self,
+        operator_name: &str,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        partition: usize,
+        stream_id: u64,
+        context: &ActivityExecutionContext,
+        process_parent_active: bool,
+    ) -> Option<tracing::Span> {
+        let operation_root = self.context.process_root_span()?;
+        let current = tracing::Span::current();
+        let parent = if process_parent_active {
+            &current
+        } else {
+            operation_root
+        };
+        let span = tracing::trace_span!(
+            target: crate::profiling::PROFILE_TARGET,
+            parent: parent,
+            "DataFusion operator poll",
+            operation_id = self.context.operation_id(),
+            query_execution_id = self.query_execution_id,
+            query_scope = self.query_scope.as_str(),
+            query_owner = tracing::field::Empty,
+            operator_name,
+            worker_lane_id = context.worker_lane.id,
+            worker_kind = context.worker_lane.kind.as_str(),
+            node_id,
+            parent_node_id = tracing::field::Empty,
+            operator_partition = usize_to_u64_saturating(partition),
+            execution_stream_id = stream_id,
+            activity = "poll_next",
+            result = tracing::field::Empty,
+            time_semantics = "active",
+        );
+        if let Some(query_owner) = &self.query_owner {
+            span.record("query_owner", query_owner.as_ref());
+        }
+        if let Some(parent_node_id) = parent_node_id {
+            span.record("parent_node_id", parent_node_id);
+        }
+        Some(span)
     }
 
     fn next_stream_id(&self) -> u64 {
@@ -240,7 +327,7 @@ impl OperatorActivityRecorder {
         stream_id
     }
 
-    fn execution_context(&self) -> ActivityExecutionContext {
+    fn execution_context(&self, partition: usize) -> (ActivityExecutionContext, bool) {
         let thread = std::thread::current();
         let runtime_task_id = tokio::task::try_id().map(|id| id.to_string());
         let task_kind = if runtime_task_id.is_some() {
@@ -249,50 +336,89 @@ impl OperatorActivityRecorder {
             "external"
         };
         let thread_id = thread.id();
-        let worker_lane = {
-            let mut identities = self
-                .identities
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            match identities.worker_lanes.get(&thread_id) {
-                Some(worker_lane) => *worker_lane,
-                None => {
-                    let worker_lane =
-                        if runtime_task_id.is_none() && identities.coordinator_thread.is_none() {
-                            identities.coordinator_thread = Some(thread_id);
-                            ActivityWorkerLane {
-                                id: 0,
-                                kind: ActivityWorkerKind::Coordinator,
-                            }
-                        } else {
-                            let id = identities.next_worker_lane_id;
-                            identities.next_worker_lane_id = id.saturating_add(1);
-                            ActivityWorkerLane {
-                                id,
-                                kind: if runtime_task_id.is_some() {
-                                    ActivityWorkerKind::Runtime
-                                } else {
-                                    ActivityWorkerKind::External
-                                },
-                            }
-                        };
-                    identities.worker_lanes.insert(thread_id, worker_lane);
-                    worker_lane
-                }
+        let inherited_worker_lane = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
+            active.borrow().iter().rev().find_map(|parent| {
+                (parent.operation_id == self.context.operation_id()
+                    && parent.query_execution_id == self.query_execution_id)
+                    .then_some(parent.worker_lane)
+            })
+        });
+        let (worker_lane, owns_worker_lane) = match inherited_worker_lane {
+            Some(worker_lane) => (worker_lane, false),
+            None if runtime_task_id.is_none() && partition == 0 => (
+                ActivityWorkerLane {
+                    id: 0,
+                    kind: ActivityWorkerKind::Coordinator,
+                },
+                false,
+            ),
+            None => {
+                let kind = if runtime_task_id.is_some() {
+                    ActivityWorkerKind::Runtime
+                } else {
+                    ActivityWorkerKind::External
+                };
+                (self.acquire_worker_lane(kind), true)
             }
         };
-        ActivityExecutionContext {
-            worker_lane,
-            task_kind,
-            runtime_task_id,
-            worker_thread_id: format!("{thread_id:?}"),
-            worker_thread_name: thread.name().map(str::to_owned),
+        (
+            ActivityExecutionContext {
+                worker_lane,
+                task_kind,
+                runtime_task_id,
+                worker_thread_id: format!("{thread_id:?}"),
+                worker_thread_name: thread.name().map(str::to_owned),
+            },
+            owns_worker_lane,
+        )
+    }
+
+    fn acquire_worker_lane(&self, kind: ActivityWorkerKind) -> ActivityWorkerLane {
+        let mut identities = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Logical lanes represent bounded active executor slots. Reusing an
+        // inactive lane keeps identity independent from Tokio tasks and OS
+        // threads while preventing overlapping slices on one lane.
+        if let Some(state) = identities
+            .worker_lanes
+            .iter_mut()
+            .find(|state| state.lane.kind == kind && !state.active)
+        {
+            state.active = true;
+            return state.lane;
+        }
+
+        let lane = ActivityWorkerLane {
+            id: identities.next_worker_lane_id,
+            kind,
+        };
+        identities.next_worker_lane_id = identities.next_worker_lane_id.saturating_add(1);
+        identities
+            .worker_lanes
+            .push(ActivityWorkerLaneState { lane, active: true });
+        lane
+    }
+
+    fn release_worker_lane(
+        identities: &Mutex<OperatorActivityIdentityState>,
+        lane: ActivityWorkerLane,
+    ) {
+        let mut identities = identities.lock().unwrap_or_else(|error| error.into_inner());
+        let state = identities
+            .worker_lanes
+            .iter_mut()
+            .find(|state| state.lane == lane);
+        debug_assert!(state.as_ref().is_some_and(|state| state.active));
+        if let Some(state) = state {
+            state.active = false;
         }
     }
 
-    fn report_truncation(&self) {
-        if !self.truncation_reported.swap(true, Ordering::Relaxed) {
-            self.with_query_identity(self.timeline.start_span(
+    fn report_truncation(&self, maximum_spans: u64) {
+        if let Some(timeline) = self.context.timeline() {
+            self.with_query_identity(timeline.start_span(
                 "Operator activity trace truncated",
                 OPERATOR_ACTIVITY_CATEGORY,
                 format!(
@@ -300,8 +426,18 @@ impl OperatorActivityRecorder {
                     self.query_execution_id
                 ),
             ))
-            .with_attribute("maximum_spans", Value::from(self.maximum_spans))
+            .with_attribute("maximum_spans", Value::from(maximum_spans))
             .completed();
+        }
+        if let Some(root) = self.context.process_root_span() {
+            tracing::event!(
+                name: "Operator activity trace truncated",
+                target: crate::profiling::PROFILE_TARGET,
+                parent: root.id(),
+                tracing::Level::TRACE,
+                operation_id = self.context.operation_id(),
+                maximum_spans,
+            );
         }
     }
 
@@ -324,36 +460,55 @@ impl OperatorActivityRecorder {
 
 struct OperatorActivitySpanRecorder {
     timeline_span: Option<OperationTimelineSpanRecorder>,
+    process_span: Option<tracing::Span>,
+    process_result_recorded: bool,
+    identities: Arc<Mutex<OperatorActivityIdentityState>>,
     active: ActiveOperatorActivitySpan,
 }
 
 impl OperatorActivitySpanRecorder {
-    fn with_attribute(mut self, name: impl Into<String>, value: Value) -> Self {
-        if let Some(span) = self.timeline_span.take() {
-            self.timeline_span = Some(span.with_attribute(name, value));
-        }
-        self
-    }
-
-    fn completed(mut self) {
-        if let Some(span) = self.timeline_span.take() {
-            span.completed();
+    fn in_process_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        match &self.process_span {
+            Some(span) => span.in_scope(operation),
+            None => operation(),
         }
     }
 
-    fn failed(mut self) {
+    fn finish(mut self, result: &'static str, failed: bool) {
         if let Some(span) = self.timeline_span.take() {
-            span.failed();
+            let span = span.with_attribute("result", Value::String(result.to_owned()));
+            if failed {
+                span.failed();
+            } else {
+                span.completed();
+            }
+        }
+        if let Some(span) = &self.process_span {
+            span.record("result", result);
+            self.process_result_recorded = true;
         }
     }
 }
 
 impl Drop for OperatorActivitySpanRecorder {
     fn drop(&mut self) {
+        if !self.process_result_recorded
+            && let Some(span) = &self.process_span
+        {
+            span.record("result", "cancelled");
+        }
         let _ = ACTIVE_OPERATOR_ACTIVITY_SPANS.try_with(|spans| {
             let popped = spans.borrow_mut().pop();
             debug_assert_eq!(popped, Some(self.active));
         });
+        drop(self.timeline_span.take());
+        drop(self.process_span.take());
+        if self.active.owns_worker_lane {
+            OperatorActivityRecorder::release_worker_lane(
+                &self.identities,
+                self.active.worker_lane,
+            );
+        }
     }
 }
 
@@ -481,15 +636,10 @@ impl ExecutionPlan for ProfiledOperatorExec {
         );
         let result = self.inner.execute(partition, context);
         if let Some(span) = span {
-            let span = span.with_attribute(
-                "result",
-                Value::String(if result.is_ok() { "stream" } else { "error" }.to_owned()),
+            span.finish(
+                if result.is_ok() { "stream" } else { "error" },
+                result.is_err(),
             );
-            if result.is_ok() {
-                span.completed();
-            } else {
-                span.failed();
-            }
         }
         result.map(|inner| {
             Box::pin(ProfiledRecordBatchStream {
@@ -533,7 +683,10 @@ impl Stream for ProfiledRecordBatchStream {
             self.stream_id,
             "poll_next",
         );
-        let poll = self.inner.as_mut().poll_next(context);
+        let poll = match &span {
+            Some(span) => span.in_process_scope(|| self.inner.as_mut().poll_next(context)),
+            None => self.inner.as_mut().poll_next(context),
+        };
         if let Some(span) = span {
             let (result, failed) = match &poll {
                 Poll::Pending => ("pending", false),
@@ -541,12 +694,7 @@ impl Stream for ProfiledRecordBatchStream {
                 Poll::Ready(Some(Err(_))) => ("error", true),
                 Poll::Ready(None) => ("eof", false),
             };
-            let span = span.with_attribute("result", Value::String(result.to_owned()));
-            if failed {
-                span.failed();
-            } else {
-                span.completed();
-            }
+            span.finish(result, failed);
         }
         poll
     }
@@ -560,27 +708,59 @@ impl RecordBatchStream for ProfiledRecordBatchStream {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, error::Error, sync::Arc};
+    use std::{
+        collections::BTreeSet,
+        error::Error,
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
 
     use datafusion::{physical_plan::collect, prelude::SessionContext};
 
     use crate::{
         QueryExecutionOutcome, QueryExecutionScope, TimelineSpanStatus, TimelineSpanTimeSemantics,
+        observability::test_capture::TracingCapture, profiling::OperationTraceContext,
         query_engine::datafusion::execution_profile::collect_query_execution_profile,
+        report::OperationTimelineRecorder,
     };
 
     use super::*;
 
     fn test_trace_identity(timeline: OperationTimelineRecorder) -> QueryTraceIdentity {
-        QueryTraceIdentity::new(timeline, QueryExecutionScope::Preview, None)
+        let context = OperationTraceContext::start_for_test(Some(timeline), false)
+            .expect("semantic tracing should create a context");
+        QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
+            .expect("query trace identity should be available")
+    }
+
+    fn test_trace_identity_with_limit(
+        timeline: Option<OperationTimelineRecorder>,
+        process_spans_enabled: bool,
+        maximum_spans: u64,
+    ) -> QueryTraceIdentity {
+        let context = OperationTraceContext::start_for_test_with_operator_activity_limit(
+            timeline,
+            process_spans_enabled,
+            maximum_spans,
+        )
+        .expect("profiling should create a context");
+        QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
+            .expect("query trace identity should be available")
     }
 
     #[test]
-    fn query_execution_ids_are_local_to_each_operation_timeline() {
+    fn query_execution_ids_are_local_to_each_operation_context() {
         let first_timeline = OperationTimelineRecorder::start();
-        let first_query =
-            OperatorActivityRecorder::new(test_trace_identity(first_timeline.clone()));
-        let second_query = OperatorActivityRecorder::new(test_trace_identity(first_timeline));
+        let first_context = OperationTraceContext::start_for_test(Some(first_timeline), false)
+            .expect("semantic tracing should create a context");
+        let first_query = OperatorActivityRecorder::new(
+            QueryTraceIdentity::new(first_context.clone(), QueryExecutionScope::Preview, None)
+                .expect("first query identity should be available"),
+        );
+        let second_query = OperatorActivityRecorder::new(
+            QueryTraceIdentity::new(first_context, QueryExecutionScope::Preview, None)
+                .expect("second query identity should be available"),
+        );
         let separate_timeline = OperationTimelineRecorder::start();
         let separate_query = OperatorActivityRecorder::new(test_trace_identity(separate_timeline));
 
@@ -592,13 +772,16 @@ mod tests {
     #[test]
     fn activity_limit_records_one_visible_truncation_marker() {
         let timeline = OperationTimelineRecorder::start();
-        let activity =
-            OperatorActivityRecorder::with_max_spans(test_trace_identity(timeline.clone()), 1);
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            false,
+            1,
+        ));
 
         activity
             .start_span("FilterExec", 0, None, 0, 1, "poll_next")
             .expect("first activity should fit")
-            .completed();
+            .finish("batch", false);
         assert!(
             activity
                 .start_span("FilterExec", 0, None, 0, 1, "poll_next")
@@ -635,6 +818,185 @@ mod tests {
     }
 
     #[test]
+    fn operation_activity_limit_is_shared_by_queries() {
+        let timeline = OperationTimelineRecorder::start();
+        let context = OperationTraceContext::start_for_test_with_operator_activity_limit(
+            Some(timeline.clone()),
+            false,
+            1,
+        )
+        .expect("semantic profiling should create a context");
+        let first = OperatorActivityRecorder::new(
+            QueryTraceIdentity::new(context.clone(), QueryExecutionScope::Preview, None)
+                .expect("first query identity should be available"),
+        );
+        let second = OperatorActivityRecorder::new(
+            QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
+                .expect("second query identity should be available"),
+        );
+
+        first
+            .start_span("FirstExec", 0, None, 0, 1, "poll_next")
+            .expect("first query should consume the operation budget")
+            .finish("batch", false);
+        assert!(
+            second
+                .start_span("SecondExec", 0, None, 0, 1, "poll_next")
+                .is_none()
+        );
+        assert!(
+            first
+                .start_span("FirstExec", 0, None, 0, 1, "poll_next")
+                .is_none()
+        );
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        let markers = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.name() == "Operator activity trace truncated")
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].attributes()["query_execution_id"], 2);
+        assert_eq!(markers[0].attributes()["maximum_spans"], 1);
+    }
+
+    #[test]
+    fn concurrent_operations_emit_independent_truncation_markers() {
+        let first_timeline = OperationTimelineRecorder::start();
+        let second_timeline = OperationTimelineRecorder::start();
+        let first = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(first_timeline.clone()),
+            false,
+            1,
+        ));
+        let second = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(second_timeline.clone()),
+            false,
+            1,
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let exceed = |activity: OperatorActivityRecorder, barrier: Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                activity
+                    .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+                    .expect("each operation should have its own first reservation")
+                    .finish("batch", false);
+                assert!(
+                    activity
+                        .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+                        .is_none()
+                );
+            })
+        };
+
+        let first = exceed(first, Arc::clone(&barrier));
+        let second = exceed(second, barrier);
+        first.join().expect("first operation should finish");
+        second.join().expect("second operation should finish");
+
+        for timeline in [first_timeline, second_timeline] {
+            let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+            let markers = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.name() == "Operator activity trace truncated")
+                .collect::<Vec<_>>();
+            assert_eq!(markers.len(), 1);
+            assert_eq!(markers[0].attributes()["maximum_spans"], 1);
+            assert_eq!(
+                timeline
+                    .spans()
+                    .iter()
+                    .filter(|span| span.name() == "FilterExec")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn combined_activity_limit_reserves_once_and_reports_each_output_once() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            true,
+            1,
+        ));
+        let operation_id = activity.context.operation_id();
+
+        activity
+            .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+            .expect("one logical poll should fit both active outputs")
+            .finish("batch", false);
+        assert!(
+            activity
+                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+                .is_none()
+        );
+        assert!(
+            activity
+                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+                .is_none()
+        );
+        drop(activity);
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        let semantic_markers = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.name() == "Operator activity trace truncated")
+            .collect::<Vec<_>>();
+        assert_eq!(semantic_markers.len(), 1);
+        assert_eq!(semantic_markers[0].attributes()["maximum_spans"], 1);
+
+        let process_markers = capture
+            .captured()
+            .events()
+            .into_iter()
+            .filter(|event| event.name == "Operator activity trace truncated")
+            .collect::<Vec<_>>();
+        assert_eq!(process_markers.len(), 1);
+        assert_eq!(process_markers[0].target, crate::profiling::PROFILE_TARGET);
+        assert_eq!(process_markers[0].level, tracing::Level::TRACE);
+        assert_eq!(
+            process_markers[0].fields["operation_id"],
+            operation_id.to_string()
+        );
+        assert_eq!(process_markers[0].fields["maximum_spans"], "1");
+        assert_eq!(process_markers[0].span_names, ["Delta Funnel preview"]);
+    }
+
+    #[test]
+    fn process_only_activity_limit_reports_without_a_semantic_timeline() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(None, true, 1));
+
+        activity
+            .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+            .expect("first process activity should fit")
+            .finish("batch", false);
+        assert!(
+            activity
+                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+                .is_none()
+        );
+        drop(activity);
+
+        assert_eq!(
+            capture
+                .captured()
+                .events()
+                .iter()
+                .filter(|event| event.name == "Operator activity trace truncated")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn track_names_delimit_query_and_worker_ids() {
         let worker_1 = ActivityWorkerLane {
             id: 1,
@@ -658,7 +1020,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn worker_tracks_are_bounded_by_executor_threads_not_task_count()
+    async fn worker_tracks_are_bounded_by_active_parallelism_not_task_count()
     -> Result<(), Box<dyn Error>> {
         const TASK_COUNT: usize = 32;
         let timeline = OperationTimelineRecorder::start();
@@ -674,7 +1036,7 @@ mod tests {
                 activity
                     .start_span("WorkerExec", 0, None, 0, 1, "poll_next")
                     .expect("worker activity should fit")
-                    .completed();
+                    .finish("batch", false);
             }));
         }
         for task in tasks {
@@ -704,13 +1066,69 @@ mod tests {
         assert_eq!(runtime_task_ids.len(), TASK_COUNT);
         assert!(!worker_lane_ids.is_empty());
         assert!(worker_lane_ids.len() <= 2);
-        assert_eq!(worker_thread_ids.len(), worker_lane_ids.len());
+        assert!(!worker_thread_ids.is_empty());
+        assert!(worker_thread_ids.len() <= 2);
         assert!(runtime_task_ids.len() > worker_lane_ids.len());
         assert!(spans.iter().all(|span| {
             span.attributes()["worker_kind"] == "runtime"
                 && span.track_name().starts_with("DataFusion query ")
                 && span.track_name().contains(" / worker ")
         }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn logical_worker_lane_is_reused_across_os_threads() -> Result<(), Box<dyn Error>> {
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity(timeline.clone()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let first_activity = activity.clone();
+        let first = tokio::spawn(async move {
+            first_activity
+                .start_span("WorkerExec", 0, None, 0, 1, "poll_next")
+                .expect("first worker activity should fit")
+                .finish("batch", false);
+            let thread_id = format!("{:?}", std::thread::current().id());
+            let _ = started_tx.send(thread_id);
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let first_thread_id = started_rx.await?;
+        let second_activity = activity.clone();
+        let second_thread_id = tokio::spawn(async move {
+            second_activity
+                .start_span("WorkerExec", 0, None, 0, 2, "poll_next")
+                .expect("second worker activity should fit")
+                .finish("batch", false);
+            format!("{:?}", std::thread::current().id())
+        })
+        .await?;
+        release_tx.send(())?;
+        first.await?;
+
+        assert_ne!(first_thread_id, second_thread_id);
+        let timeline = timeline.finish("workers", TimelineSpanStatus::Completed);
+        let spans = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == OPERATOR_ACTIVITY_CATEGORY)
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|span| {
+            span.attributes()["worker_lane_id"] == 1
+                && span.attributes()["worker_kind"] == "runtime"
+        }));
+        assert_eq!(
+            spans
+                .iter()
+                .filter_map(|span| span.attributes()["worker_thread_id"].as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
 
         Ok(())
     }
@@ -849,6 +1267,76 @@ mod tests {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_only_operator_polls_are_active_and_properly_nested()
+    -> Result<(), Box<dyn Error>> {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let session = SessionContext::new();
+        let dataframe = session
+            .sql("select 1 as id union all select 2 as id")
+            .await?;
+        let task_context = Arc::new(dataframe.task_ctx());
+        let plan = dataframe.create_physical_plan().await?;
+        let context =
+            OperationTraceContext::start(crate::profiling::OperationTraceKind::Preview, None)
+                .expect("process tracing should create a context");
+        let operation_id = context.operation_id();
+        let identity = QueryTraceIdentity::new(context.clone(), QueryExecutionScope::Preview, None)
+            .expect("query trace identity should be available");
+        let plan = instrument_query_execution_plan(plan, identity)?;
+
+        let batches = collect(Arc::clone(&plan), task_context).await?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        context.record_process_result("ok");
+        drop(plan);
+        drop(context);
+
+        let spans = capture.captured().spans();
+        let root = spans
+            .iter()
+            .find(|span| span.name == "Delta Funnel preview")
+            .expect("operation root span should be captured");
+        let polls = spans
+            .iter()
+            .filter(|span| span.name == "DataFusion operator poll")
+            .collect::<Vec<_>>();
+        assert!(!polls.is_empty());
+        assert!(polls.iter().all(|span| {
+            span.target == crate::profiling::PROFILE_TARGET
+                && span.level == tracing::Level::TRACE
+                && span.fields["operation_id"] == operation_id.to_string()
+                && span.fields["query_execution_id"] == "1"
+                && span.fields["query_scope"] == "preview"
+                && span.fields["activity"] == "poll_next"
+                && span.fields["time_semantics"] == "active"
+                && span.fields.contains_key("operator_name")
+                && span.fields.contains_key("worker_lane_id")
+                && span.fields.contains_key("worker_kind")
+                && span.fields.contains_key("node_id")
+                && span.fields.contains_key("operator_partition")
+                && span.fields.contains_key("execution_stream_id")
+                && matches!(
+                    span.fields["result"].as_str(),
+                    "pending" | "batch" | "error" | "eof"
+                )
+                && span.enter_count == 1
+                && span.exit_count == 1
+                && span.closed
+        }));
+        assert!(polls.iter().all(|span| {
+            span.parent_id == Some(root.id)
+                || polls.iter().any(|parent| Some(parent.id) == span.parent_id)
+        }));
+        assert!(
+            polls
+                .iter()
+                .any(|span| polls.iter().any(|parent| Some(parent.id) == span.parent_id)),
+            "at least one child operator poll should nest under its caller"
+        );
 
         Ok(())
     }

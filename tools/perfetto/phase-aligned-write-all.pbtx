@@ -1,0 +1,76 @@
+# Deep diagnostic capture with semantic spans, native samples, and scheduler
+# events. The duration is a safety timeout for the three-repetition benchmark.
+# Stop tracebox when the benchmark exits so the trace has no artificial idle tail.
+duration_ms: 900000
+
+# Keep exact semantic Track Events independent from higher-volume system data.
+buffers {
+  size_kb: 131072
+  fill_policy: DISCARD
+}
+
+# Native call-stack samples and process metadata.
+buffers {
+  size_kb: 65536
+  fill_policy: DISCARD
+}
+
+# Compact system scheduler context.
+buffers {
+  size_kb: 524288
+  fill_policy: DISCARD
+}
+
+data_sources {
+  config {
+    name: "track_event"
+    target_buffer: 0
+    track_event_config {
+      enabled_categories: "delta_funnel.perfetto_spike"
+    }
+  }
+}
+
+data_sources {
+  config {
+    name: "linux.perf"
+    target_buffer: 1
+    perf_event_config {
+      timebase {
+        counter: SW_CPU_CLOCK
+        frequency: 100
+        timestamp_clock: PERF_CLOCK_MONOTONIC
+      }
+      callstack_sampling {
+        scope {
+          target_cmdline: "delta_scan_partition_bench"
+        }
+        kernel_frames: true
+      }
+    }
+  }
+}
+
+data_sources {
+  config {
+    name: "linux.process_stats"
+    target_buffer: 1
+    process_stats_config {
+      scan_all_processes_on_start: true
+    }
+  }
+}
+
+data_sources {
+  config {
+    name: "linux.ftrace"
+    target_buffer: 2
+    ftrace_config {
+      compact_sched {
+        enabled: true
+      }
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "sched/sched_waking"
+    }
+  }
+}

@@ -6,9 +6,8 @@ use datafusion::{arrow::datatypes::SchemaRef, prelude::SessionContext};
 use crate::MssqlOutputBatchStreamFactory;
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlOutputQueryError, MssqlOutputQueryExecution,
-    MssqlOutputQueryFuture, MssqlWritePhase,
-    progress::ProgressReporter,
-    report::{OperationTimelineRecorder, PhaseTimer},
+    MssqlOutputQueryFuture, MssqlWritePhase, profiling::OperationTraceContext,
+    progress::ProgressReporter, report::PhaseTimer,
 };
 
 use super::super::super::{
@@ -19,7 +18,8 @@ use super::super::super::{
 };
 use super::super::output::{
     QUERY_DATAFRAME_PLANNING_PHASE,
-    create_mssql_output_query_execution_from_dataframe_with_timeline, mssql_output_query_error,
+    create_mssql_output_query_execution_from_dataframe_with_trace_context,
+    mssql_output_query_error,
 };
 use super::MssqlDerivedCacheAliasPlan;
 
@@ -49,8 +49,11 @@ async fn create_cached_output_query_execution_from_retained_sql(
     provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
     reporter: Option<ProgressReporter>,
     profile_mode: ExecutionProfileMode,
-    timeline: Option<OperationTimelineRecorder>,
+    trace_context: Option<OperationTraceContext>,
 ) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
+    let timeline = trace_context
+        .as_ref()
+        .and_then(OperationTraceContext::timeline);
     let output_name = planned.resolved_target().output_name();
     let dataframe_timer = PhaseTimer::start(QUERY_DATAFRAME_PLANNING_PHASE);
     let dataframe_span = timeline.as_ref().map(|timeline| {
@@ -103,7 +106,7 @@ async fn create_cached_output_query_execution_from_retained_sql(
     }
     let query_phase_timings = vec![dataframe_timer.completed()];
 
-    create_mssql_output_query_execution_from_dataframe_with_timeline(
+    create_mssql_output_query_execution_from_dataframe_with_trace_context(
         &context,
         &planned,
         dataframe,
@@ -111,7 +114,8 @@ async fn create_cached_output_query_execution_from_retained_sql(
         provider_stats_snapshots,
         reporter,
         profile_mode,
-        timeline.as_ref(),
+        trace_context.as_ref(),
+        None,
     )
     .await
 }
@@ -178,7 +182,7 @@ impl DeltaFunnelSession {
         reporter: Option<ProgressReporter>,
         profile_mode: ExecutionProfileMode,
     ) -> Result<Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send>, DeltaFunnelError> {
-        self.cached_output_query_factory_with_timeline(
+        self.cached_output_query_factory_with_trace_context(
             planned,
             active_aliases,
             provider_stats_snapshots,
@@ -188,23 +192,23 @@ impl DeltaFunnelSession {
         )
     }
 
-    pub(super) fn cached_output_query_factory_with_timeline(
+    pub(super) fn cached_output_query_factory_with_trace_context(
         &self,
         planned: &PlannedMssqlOutput,
         active_aliases: &[MssqlDerivedCacheAliasPlan],
         provider_stats_snapshots: Option<SharedProviderStatsSnapshots>,
         reporter: Option<ProgressReporter>,
         profile_mode: ExecutionProfileMode,
-        timeline: Option<OperationTimelineRecorder>,
+        trace_context: Option<OperationTraceContext>,
     ) -> Result<Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send>, DeltaFunnelError> {
         let request = planned.request();
         if !self.output_requires_cache_replan(request, active_aliases)? {
-            return Ok(self.mssql_output_query_factory_with_timeline(
+            return Ok(self.mssql_output_query_factory_with_trace_context(
                 planned.clone(),
                 provider_stats_snapshots,
                 reporter,
                 profile_mode,
-                timeline,
+                trace_context,
             ));
         }
 
@@ -233,7 +237,7 @@ impl DeltaFunnelSession {
                     provider_stats_snapshots,
                     reporter,
                     profile_mode,
-                    timeline,
+                    trace_context,
                 )
                 .await
             })

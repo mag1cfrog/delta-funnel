@@ -14,6 +14,9 @@ categories = ["database"]
 [lints]
 workspace = true
 
+[features]
+perfetto-profile = ["dep:perfetto-sdk"]
+
 [dependencies]
 async-trait = "0.1"
 arrow-schema = "58.3.0"
@@ -31,6 +34,7 @@ futures-util = "0.3"
 libc = "0.2"
 object_store = "0.13.2"
 parquet = { version = "58.3.0", features = ["async", "object_store"] }
+perfetto-sdk = { version = "1.0.3", optional = true }
 snafu = "0.9"
 serde_json = "1"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time"] }
@@ -42,3 +46,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }
+
+[[bin]]
+name = "perfetto_capability_spike"
+path = "src/bin/perfetto_capability_spike.rs"
+required-features = ["perfetto-profile"]

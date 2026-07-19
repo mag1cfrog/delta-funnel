@@ -27,6 +27,10 @@ use crate::{
     PhaseTimingReport, PreviewFailureContext, QueryExecutionProfile, QueryExecutionScope,
     ReportReasonCode, TimelineSpanStatus,
     observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
+    profiling::{
+        OperationTraceContext, OperationTraceKind, OperationTracePhase,
+        ProcessOperationPhaseTracker,
+    },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
         DFQueryExecution, DeltaProviderReadStatsHandle, QueryTraceIdentity,
@@ -604,6 +608,7 @@ pub(super) fn batch_stream_for_physical_plan(
 struct PreviewTimingTracker {
     phase_timings: Vec<PhaseTimingReport>,
     timeline: OperationTimelineRecorder,
+    process_phases: ProcessOperationPhaseTracker,
 }
 
 struct PreviewPhaseTimer {
@@ -616,6 +621,7 @@ impl PreviewTimingTracker {
         Self {
             phase_timings: Vec::with_capacity(PREVIEW_PHASE_NAMES.len()),
             timeline: OperationTimelineRecorder::start(),
+            process_phases: ProcessOperationPhaseTracker::default(),
         }
     }
 
@@ -658,6 +664,7 @@ impl PreviewTimingTracker {
         mut self,
         execution_profile: Option<&QueryExecutionProfile>,
     ) -> (Vec<PhaseTimingReport>, OperationTimeline) {
+        self.process_phases.finish("ok");
         if let Some(execution_profile) = execution_profile {
             self.timeline.append_operator_lifecycles(execution_profile);
         }
@@ -677,6 +684,7 @@ impl PreviewTimingTracker {
         execution_profile: Option<QueryExecutionProfile>,
         source: DeltaFunnelError,
     ) -> DeltaFunnelError {
+        self.process_phases.finish("error");
         let failed_timing = self.record_timing(timer, TimelineSpanStatus::Failed);
         let failed_phase = failed_timing.phase_name().to_owned();
         self.phase_timings.push(failed_timing);
@@ -845,126 +853,150 @@ impl DeltaFunnelSession {
         reporter: Option<&ProgressReporter>,
     ) -> Result<TablePreview, DeltaFunnelError> {
         let mut timings = PreviewTimingTracker::start();
+        let trace_context = OperationTraceContext::start(
+            OperationTraceKind::Preview,
+            (options.execution_profile_mode() == ExecutionProfileMode::Detailed)
+                .then(|| timings.timeline.clone()),
+        );
+        timings.process_phases = ProcessOperationPhaseTracker::start(
+            trace_context.as_ref(),
+            OperationTracePhase::Planning,
+        );
 
-        emit_preview_phase(reporter, ProgressPhase::PreparingPreview);
-        let dataframe_timer = timings.start_phase(PREVIEW_DATAFRAME_PLANNING_PHASE);
-        let dataframe = match self.dataframe_for_lazy_table(table).await {
-            Ok(dataframe) => dataframe,
-            Err(source) => return Err(timings.failed(dataframe_timer, None, source)),
-        };
-        let schema = Arc::new(dataframe.schema().as_arrow().clone());
-        let dataframe = match dataframe.limit(0, Some(options.limit())) {
-            Ok(dataframe) => dataframe,
-            Err(error) => {
-                let source = datafusion_handoff_setup_error("preview_limit", error);
-                return Err(timings.failed(dataframe_timer, None, source));
-            }
-        };
-        let task_context = Arc::new(dataframe.task_ctx());
-        timings.record_completed(dataframe_timer);
+        let result = async {
+            emit_preview_phase(reporter, ProgressPhase::PreparingPreview);
+            let dataframe_timer = timings.start_phase(PREVIEW_DATAFRAME_PLANNING_PHASE);
+            let dataframe = match self.dataframe_for_lazy_table(table).await {
+                Ok(dataframe) => dataframe,
+                Err(source) => return Err(timings.failed(dataframe_timer, None, source)),
+            };
+            let schema = Arc::new(dataframe.schema().as_arrow().clone());
+            let dataframe = match dataframe.limit(0, Some(options.limit())) {
+                Ok(dataframe) => dataframe,
+                Err(error) => {
+                    let source = datafusion_handoff_setup_error("preview_limit", error);
+                    return Err(timings.failed(dataframe_timer, None, source));
+                }
+            };
+            let task_context = Arc::new(dataframe.task_ctx());
+            timings.record_completed(dataframe_timer);
 
-        let trace_identity = match options.execution_profile_mode() {
-            ExecutionProfileMode::Disabled => None,
-            ExecutionProfileMode::Detailed => Some(QueryTraceIdentity::new(
-                timings.timeline.clone(),
-                QueryExecutionScope::Preview,
+            let trace_identity = trace_context.clone().and_then(|context| {
+                QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
+            });
+            let physical_plan_timer = timings.start_phase(PREVIEW_PHYSICAL_PLANNING_PHASE);
+            let physical_plan_result = match &trace_identity {
+                Some(trace_identity) => {
+                    with_query_planning_activity(
+                        trace_identity.clone(),
+                        dataframe.create_physical_plan(),
+                    )
+                    .await
+                }
+                None => dataframe.create_physical_plan().await,
+            };
+            let physical_plan = match physical_plan_result {
+                Ok(physical_plan) => physical_plan,
+                Err(error) => {
+                    let source = datafusion_handoff_setup_error("preview_collect", error);
+                    return Err(timings.failed(physical_plan_timer, None, source));
+                }
+            };
+            timings.record_completed(physical_plan_timer);
+
+            timings
+                .process_phases
+                .transition(OperationTracePhase::Execution);
+            let stream_setup_timer = timings.start_phase(PREVIEW_STREAM_SETUP_PHASE);
+            let read_stats_handles =
+                collect_delta_provider_read_stats_handles(physical_plan.as_ref());
+            emit_preview_phase(reporter, ProgressPhase::CollectingPreview);
+            let DFQueryExecution {
+                stream,
+                effective_profile_root,
+            } = match match trace_identity {
+                None => datafusion_query_output_stream_with_effective_root(
+                    Arc::clone(&physical_plan),
+                    task_context,
+                ),
+                Some(trace_identity) => {
+                    profiled_datafusion_query_output_stream_with_effective_root(
+                        Arc::clone(&physical_plan),
+                        task_context,
+                        trace_identity,
+                    )
+                }
+            } {
+                Ok(execution) => execution,
+                Err(failure) => {
+                    let (profile_consumer, profile_result) =
+                        register_preview_execution_profile(failure.effective_profile_root, options);
+                    finalize_tracked_query_execution(
+                        &read_stats_handles,
+                        None,
+                        profile_consumer,
+                        DeltaProviderScanOutcome::Error,
+                    );
+                    let execution_profile = clone_terminal_execution_profile(profile_result);
+                    let source = datafusion_handoff_setup_error("preview_collect", failure.source);
+                    return Err(timings.failed(stream_setup_timer, execution_profile, source));
+                }
+            };
+            drop(physical_plan);
+            let (profile_consumer, profile_result) =
+                register_preview_execution_profile(effective_profile_root, options);
+            let stream: MssqlOutputBatchStream = Box::pin(stream.map(|batch| {
+                batch.map_err(|error| datafusion_handoff_setup_error("preview_collect", error))
+            }));
+            let stream = match reporter {
+                Some(reporter) => {
+                    let sampler = DeltaFileProgressSampler::new(
+                        read_stats_handles.clone(),
+                        reporter.clone(),
+                        ProgressPhase::CollectingPreview,
+                        None,
+                    );
+                    track_delta_file_progress(stream, sampler)
+                }
+                None => stream,
+            };
+            let stream = track_query_execution_completion(
+                stream,
+                read_stats_handles,
                 None,
-            )),
-        };
-        let physical_plan_timer = timings.start_phase(PREVIEW_PHYSICAL_PLANNING_PHASE);
-        let physical_plan_result = match &trace_identity {
-            Some(trace_identity) => {
-                with_query_planning_activity(
-                    trace_identity.clone(),
-                    dataframe.create_physical_plan(),
-                )
-                .await
-            }
-            None => dataframe.create_physical_plan().await,
-        };
-        let physical_plan = match physical_plan_result {
-            Ok(physical_plan) => physical_plan,
-            Err(error) => {
-                let source = datafusion_handoff_setup_error("preview_collect", error);
-                return Err(timings.failed(physical_plan_timer, None, source));
-            }
-        };
-        timings.record_completed(physical_plan_timer);
+                profile_consumer,
+            );
+            timings.record_completed(stream_setup_timer);
 
-        let stream_setup_timer = timings.start_phase(PREVIEW_STREAM_SETUP_PHASE);
-        let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
-        emit_preview_phase(reporter, ProgressPhase::CollectingPreview);
-        let DFQueryExecution {
-            stream,
-            effective_profile_root,
-        } = match match trace_identity {
-            None => datafusion_query_output_stream_with_effective_root(
-                Arc::clone(&physical_plan),
-                task_context,
-            ),
-            Some(trace_identity) => profiled_datafusion_query_output_stream_with_effective_root(
-                Arc::clone(&physical_plan),
-                task_context,
-                trace_identity,
-            ),
-        } {
-            Ok(execution) => execution,
-            Err(failure) => {
-                let (profile_consumer, profile_result) =
-                    register_preview_execution_profile(failure.effective_profile_root, options);
-                finalize_tracked_query_execution(
-                    &read_stats_handles,
-                    None,
-                    profile_consumer,
-                    DeltaProviderScanOutcome::Error,
-                );
-                let execution_profile = clone_terminal_execution_profile(profile_result);
-                let source = datafusion_handoff_setup_error("preview_collect", failure.source);
-                return Err(timings.failed(stream_setup_timer, execution_profile, source));
-            }
-        };
-        drop(physical_plan);
-        let (profile_consumer, profile_result) =
-            register_preview_execution_profile(effective_profile_root, options);
-        let stream: MssqlOutputBatchStream = Box::pin(stream.map(|batch| {
-            batch.map_err(|error| datafusion_handoff_setup_error("preview_collect", error))
-        }));
-        let stream = match reporter {
-            Some(reporter) => {
-                let sampler = DeltaFileProgressSampler::new(
-                    read_stats_handles.clone(),
-                    reporter.clone(),
-                    ProgressPhase::CollectingPreview,
-                    None,
-                );
-                track_delta_file_progress(stream, sampler)
-            }
-            None => stream,
-        };
-        let stream =
-            track_query_execution_completion(stream, read_stats_handles, None, profile_consumer);
-        timings.record_completed(stream_setup_timer);
+            let execute_collect_timer = timings.start_phase(PREVIEW_EXECUTE_COLLECT_PHASE);
+            let batches = match stream.try_collect::<Vec<_>>().await {
+                Ok(batches) => batches,
+                Err(source) => {
+                    let execution_profile = clone_terminal_execution_profile(profile_result);
+                    return Err(timings.failed(execute_collect_timer, execution_profile, source));
+                }
+            };
+            timings.record_completed(execute_collect_timer);
+            timings
+                .process_phases
+                .transition(OperationTracePhase::Finalization);
+            let execution_profile = clone_terminal_execution_profile(profile_result);
 
-        let execute_collect_timer = timings.start_phase(PREVIEW_EXECUTE_COLLECT_PHASE);
-        let batches = match stream.try_collect::<Vec<_>>().await {
-            Ok(batches) => batches,
-            Err(source) => {
-                let execution_profile = clone_terminal_execution_profile(profile_result);
-                return Err(timings.failed(execute_collect_timer, execution_profile, source));
-            }
-        };
-        timings.record_completed(execute_collect_timer);
-        let execution_profile = clone_terminal_execution_profile(profile_result);
-
-        emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
-        format_preview_result(
-            &schema,
-            &batches,
-            timings,
-            execution_profile,
-            preview_batches_to_text,
-            preview_batches_to_html,
-        )
+            emit_preview_phase(reporter, ProgressPhase::FormattingPreview);
+            format_preview_result(
+                &schema,
+                &batches,
+                timings,
+                execution_profile,
+                preview_batches_to_text,
+                preview_batches_to_html,
+            )
+        }
+        .await;
+        if let Some(context) = &trace_context {
+            context.record_process_result(if result.is_ok() { "ok" } else { "error" });
+        }
+        result
     }
 
     pub(super) async fn dataframe_for_lazy_table(
@@ -1930,8 +1962,11 @@ mod tests {
         let failing_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSetupFailingPlan::new(physical_plan));
         let timeline = crate::report::OperationTimelineRecorder::start();
-        let trace_identity =
-            QueryTraceIdentity::new(timeline.clone(), QueryExecutionScope::Preview, None);
+        let context =
+            crate::profiling::OperationTraceContext::start_for_test(Some(timeline.clone()), false)
+                .ok_or("expected semantic trace context")?;
+        let trace_identity = QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
+            .ok_or("expected query trace identity")?;
 
         let failure = match super::profiled_datafusion_query_output_stream_with_effective_root(
             Arc::clone(&failing_plan),
@@ -2399,6 +2434,70 @@ mod tests {
                     <= timeline.total_duration_micros()
         }));
         assert!(execution_profile_events(capture.captured()).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_only_preview_records_one_complete_operation_story()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+
+        let preview = session.preview_table(&table, 2).await?;
+        assert_eq!(preview.execution_profile(), None);
+
+        let spans = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .filter(|span| span.target == crate::profiling::PROFILE_TARGET)
+            .collect::<Vec<_>>();
+        let root = spans
+            .iter()
+            .find(|span| span.name == "Delta Funnel preview")
+            .ok_or("expected process operation root")?;
+        assert_eq!(root.fields["result"], "ok");
+        assert!(root.closed);
+        let phases = spans
+            .iter()
+            .filter(|span| span.name == "Delta Funnel operation phase")
+            .collect::<Vec<_>>();
+        assert_eq!(phases.len(), 3);
+        assert_eq!(
+            phases
+                .iter()
+                .map(|span| span.fields["phase"].as_str())
+                .collect::<Vec<_>>(),
+            ["planning", "execution", "finalization"]
+        );
+        assert!(phases.iter().all(|phase| {
+            phase.parent_id == Some(root.id)
+                && phase.fields["operation_id"] == root.fields["operation_id"]
+                && phase.fields["result"] == "ok"
+                && phase.fields["time_semantics"] == "wall_clock"
+                && phase.enter_count == 0
+                && phase.exit_count == 0
+                && phase.closed
+        }));
+        let planning = spans
+            .iter()
+            .find(|span| span.name == "DataFusion query planning")
+            .ok_or("expected process planning span")?;
+        assert_eq!(planning.parent_id, Some(root.id));
+        assert!(spans.iter().any(|span| {
+            span.name == "DataFusion operator poll"
+                && (span.parent_id == Some(root.id)
+                    || spans.iter().any(|parent| Some(parent.id) == span.parent_id))
+        }));
+        assert!(
+            spans
+                .iter()
+                .all(|span| { span.fields["operation_id"] == root.fields["operation_id"] })
+        );
+
         Ok(())
     }
 

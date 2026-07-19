@@ -87,6 +87,17 @@ use futures_util::StreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use tracing_subscriber::fmt::MakeWriter;
+#[cfg(feature = "perfetto-profile")]
+use tracing_subscriber::{Layer, filter::filter_fn, prelude::*};
+
+#[cfg(feature = "perfetto-profile")]
+#[path = "perfetto_profile/mod.rs"]
+mod perfetto_profile;
+
+#[cfg(feature = "perfetto-profile")]
+use perfetto_profile::{
+    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
+};
 
 const MIB: u64 = 1024 * 1024;
 const BENCHMARK_FD_PER_PARTITION_CANDIDATES: [usize; 4] = [4, 8, 16, 32];
@@ -299,12 +310,43 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    run_benchmark_with_subscriber(&config)
+}
+
+#[cfg(not(feature = "perfetto-profile"))]
+fn run_benchmark_with_subscriber(config: &BenchmarkRunnerConfig) -> Result<(), Box<dyn Error>> {
     if let Some(trace_output_path) = &config.trace_output_path {
         let subscriber = provider_exec_trace_subscriber(trace_output_path)?;
-        return tracing::subscriber::with_default(subscriber, || run_benchmark(&config));
+        return tracing::subscriber::with_default(subscriber, || run_benchmark(config));
     }
 
-    run_benchmark(&config)
+    run_benchmark(config)
+}
+
+#[cfg(feature = "perfetto-profile")]
+fn run_benchmark_with_subscriber(config: &BenchmarkRunnerConfig) -> Result<(), Box<dyn Error>> {
+    initialize_perfetto()?;
+    wait_for_capture()?;
+
+    let perfetto_layer = || {
+        PerfettoProfileLayer.with_filter(filter_fn(|metadata| metadata.target() == PROFILE_TARGET))
+    };
+    if let Some(trace_output_path) = &config.trace_output_path {
+        let writer = TraceFileMakeWriter::new(trace_output_path.clone())?;
+        let subscriber = tracing_subscriber::registry().with(perfetto_layer()).with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_ansi(false)
+                .with_writer(writer),
+        );
+        // A scoped default does not follow work onto Tokio runtime threads.
+        tracing::subscriber::set_global_default(subscriber)?;
+        return run_benchmark(config);
+    }
+
+    let subscriber = tracing_subscriber::registry().with(perfetto_layer());
+    tracing::subscriber::set_global_default(subscriber)?;
+    run_benchmark(config)
 }
 
 fn run_benchmark(config: &BenchmarkRunnerConfig) -> Result<(), Box<dyn Error>> {
@@ -320,6 +362,7 @@ fn run_benchmark(config: &BenchmarkRunnerConfig) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(not(feature = "perfetto-profile"))]
 fn provider_exec_trace_subscriber(
     path: &Path,
 ) -> Result<impl tracing::Subscriber + Send + Sync, Box<dyn Error>> {

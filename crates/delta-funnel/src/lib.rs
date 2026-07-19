@@ -94,6 +94,7 @@ pub mod error;
 mod observability;
 mod orchestrator;
 mod pipeline;
+mod profiling;
 #[doc(hidden)]
 pub mod progress;
 pub(crate) mod query_engine;
