@@ -38,6 +38,7 @@ data_sources {
       callstack_sampling {
         scope {
           target_cmdline: "delta_scan_partition_bench"
+          target_cmdline: "python"
         }
         kernel_frames: true
       }
