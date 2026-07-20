@@ -16,8 +16,9 @@ use tracing::Instrument;
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationOptions,
     ValidationStatus, observability, plan_mssql_target_for_resolved_output,
+    profiling::{OperationStageContext, OperationStageTrace, OperationTraceContext},
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
-    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer},
+    report::{OperationTimelineRecorder, PhaseTimer},
     support::sanitize_text_for_display,
 };
 
@@ -86,7 +87,8 @@ pub struct MssqlOutputWriteJob {
     validation_options: ValidationOptions,
     phase_timings: Vec<PhaseTimingReport>,
     progress_reporter: Option<ProgressReporter>,
-    operation_timeline: Option<OperationTimelineRecorder>,
+    operation_trace_context: Option<OperationTraceContext>,
+    stage_owner_id: Option<u64>,
 }
 
 impl MssqlOutputWriteJob {
@@ -147,7 +149,8 @@ impl MssqlOutputWriteJob {
             validation_options,
             phase_timings: Vec::new(),
             progress_reporter: None,
-            operation_timeline: None,
+            operation_trace_context: None,
+            stage_owner_id: None,
         }
     }
 
@@ -168,13 +171,15 @@ impl MssqlOutputWriteJob {
         self
     }
 
-    /// Adds the shared write-all timeline used only if this output is attempted.
+    /// Adds the shared write-all trace used only if this output is attempted.
     #[must_use]
-    pub(crate) fn with_operation_timeline(
+    pub(crate) fn with_operation_trace_context(
         mut self,
-        operation_timeline: Option<OperationTimelineRecorder>,
+        operation_trace_context: Option<OperationTraceContext>,
+        stage_owner_id: u64,
     ) -> Self {
-        self.operation_timeline = operation_timeline;
+        self.operation_trace_context = operation_trace_context;
+        self.stage_owner_id = Some(stage_owner_id);
         self
     }
 
@@ -743,7 +748,7 @@ pub(crate) trait MssqlWorkflowOutputWriter: Send {
         clippy::too_many_arguments,
         reason = "the workflow writer receives one planned write plus profiling state"
     )]
-    async fn write_output_with_timeline(
+    async fn write_output_with_stage_context(
         &mut self,
         output_schema: SchemaRef,
         resolved_target: ResolvedMssqlTarget,
@@ -752,7 +757,7 @@ pub(crate) trait MssqlWorkflowOutputWriter: Send {
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
-        _timeline: Option<&OperationTimelineRecorder>,
+        _stage_context: OperationStageContext<'_>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         self.write_output(
             output_schema,
@@ -793,7 +798,7 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowSinkWriter {
         .await
     }
 
-    async fn write_output_with_timeline(
+    async fn write_output_with_stage_context(
         &mut self,
         output_schema: SchemaRef,
         resolved_target: ResolvedMssqlTarget,
@@ -802,7 +807,7 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowSinkWriter {
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
-        timeline: Option<&OperationTimelineRecorder>,
+        stage_context: OperationStageContext<'_>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         write_output_batches_to_mssql_for_workflow_with_stage_context(
             output_schema.as_ref(),
@@ -812,7 +817,7 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowSinkWriter {
             write_backend,
             validation_options,
             reporter,
-            crate::profiling::OperationStageContext::from_timeline(timeline),
+            stage_context,
         )
         .await
     }
@@ -959,17 +964,25 @@ where
         validation_options,
         phase_timings: mut planned_phase_timings,
         progress_reporter,
-        operation_timeline,
+        operation_trace_context,
+        stage_owner_id,
     } = job;
-    let output_timeline_span = operation_timeline.as_ref().map(|timeline| {
-        timeline
-            .start_span(
+    let operation_timeline = operation_trace_context
+        .as_ref()
+        .and_then(OperationTraceContext::timeline);
+    let stage_context =
+        OperationStageContext::new(operation_trace_context.as_ref(), stage_owner_id);
+    let output_stage = operation_trace_context
+        .as_ref()
+        .and_then(|_| {
+            stage_context.start_with_timeline_name(
+                "Write output",
                 format!("Write output: {}", target.output_name()),
                 "delta_funnel.write_all.output",
                 format!("Output: {}", target.output_name()),
             )
-            .with_attribute("output_name", target.output_name().to_owned().into())
-    });
+        })
+        .map(|span| span.with_attribute("output_name", target.output_name().to_owned().into()));
     if let Some(reporter) = progress_reporter.as_ref() {
         reporter.emit(&ProgressEvent::phase_changed(
             ProgressPhase::SettingUpStream,
@@ -981,11 +994,11 @@ where
         Ok(query_execution) => (query_execution, stream_setup_timer.completed()),
         Err(failure) => {
             append_error_profile_to_timeline(
-                operation_timeline.as_ref(),
+                operation_timeline,
                 &failure.error,
                 target.output_name(),
             );
-            fail_timeline_span(output_timeline_span);
+            fail_output_stage(output_stage);
             planned_phase_timings.extend(failure.query_phase_timings);
             let failure = MssqlWriteFailureReport::from_error(
                 target,
@@ -1007,7 +1020,7 @@ where
 
     let write_timer = PhaseTimer::start(SQL_WRITE_PHASE);
     let write_result = writer
-        .write_output_with_timeline(
+        .write_output_with_stage_context(
             output_schema,
             resolved_target,
             schema_options,
@@ -1015,7 +1028,7 @@ where
             write_backend,
             validation_options,
             progress_reporter.as_ref(),
-            operation_timeline.as_ref(),
+            stage_context,
         )
         .await;
     // The writer has now drained, failed, or dropped the stream, so the
@@ -1027,7 +1040,7 @@ where
     match &write_result {
         Ok(report) => {
             if let (Some(timeline), Some(profile)) =
-                (operation_timeline.as_ref(), report.execution_profile())
+                (operation_timeline, report.execution_profile())
             {
                 let output_name = target.output_name();
                 timeline.append_operator_lifecycles_with_owner(
@@ -1037,15 +1050,11 @@ where
                     &format!("Output: {output_name}"),
                 );
             }
-            complete_timeline_span(output_timeline_span);
+            complete_output_stage(output_stage);
         }
         Err(error) => {
-            append_error_profile_to_timeline(
-                operation_timeline.as_ref(),
-                error,
-                target.output_name(),
-            );
-            fail_timeline_span(output_timeline_span);
+            append_error_profile_to_timeline(operation_timeline, error, target.output_name());
+            fail_output_stage(output_stage);
         }
     }
     match write_result {
@@ -1090,13 +1099,13 @@ fn append_error_profile_to_timeline(
     }
 }
 
-fn complete_timeline_span(span: Option<OperationTimelineSpanRecorder>) {
+fn complete_output_stage(span: Option<OperationStageTrace>) {
     if let Some(span) = span {
         span.completed();
     }
 }
 
-fn fail_timeline_span(span: Option<OperationTimelineSpanRecorder>) {
+fn fail_output_stage(span: Option<OperationStageTrace>) {
     if let Some(span) = span {
         span.failed();
     }

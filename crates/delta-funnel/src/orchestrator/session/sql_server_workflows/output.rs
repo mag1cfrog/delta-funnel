@@ -362,6 +362,7 @@ impl DeltaFunnelSession {
         progress: Option<ProgressReporter>,
         profile_mode: ExecutionProfileMode,
         trace_context: Option<OperationTraceContext>,
+        stage_owner_id: Option<u64>,
     ) -> Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send> {
         let context = self.context.clone();
         let sources = self.sources.clone();
@@ -380,7 +381,7 @@ impl DeltaFunnelSession {
                     progress,
                     profile_mode,
                     trace_context.as_ref(),
-                    None,
+                    stage_owner_id,
                     None,
                 )
                 .await

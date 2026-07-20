@@ -299,10 +299,29 @@ impl<'a> OperationStageContext<'a> {
         category: &'static str,
         track_name: impl Into<String>,
     ) -> Option<OperationStageTrace> {
-        OperationStageTrace::start(
+        OperationStageTrace::start_with_timeline_name(
             self.operation,
             self.timeline,
             name,
+            name,
+            category,
+            track_name,
+            self.owner_id,
+        )
+    }
+
+    pub(crate) fn start_with_timeline_name(
+        self,
+        name: &'static str,
+        timeline_name: impl Into<String>,
+        category: &'static str,
+        track_name: impl Into<String>,
+    ) -> Option<OperationStageTrace> {
+        OperationStageTrace::start_with_timeline_name(
+            self.operation,
+            self.timeline,
+            name,
+            timeline_name,
             category,
             track_name,
             self.owner_id,
@@ -326,9 +345,23 @@ impl OperationStageTrace {
         track_name: impl Into<String>,
         owner_id: Option<u64>,
     ) -> Option<Self> {
+        Self::start_with_timeline_name(
+            context, timeline, name, name, category, track_name, owner_id,
+        )
+    }
+
+    fn start_with_timeline_name(
+        context: Option<&OperationTraceContext>,
+        timeline: Option<&OperationTimelineRecorder>,
+        name: &'static str,
+        timeline_name: impl Into<String>,
+        category: &'static str,
+        track_name: impl Into<String>,
+        owner_id: Option<u64>,
+    ) -> Option<Self> {
         debug_assert!(owner_id.is_none_or(|owner_id| owner_id != 0));
         let timeline_span =
-            timeline.map(|timeline| timeline.start_span(name, category, track_name));
+            timeline.map(|timeline| timeline.start_span(timeline_name, category, track_name));
         let process_span = context.and_then(|context| {
             context.start_process_stage(name, category, owner_id.filter(|owner_id| *owner_id != 0))
         });
