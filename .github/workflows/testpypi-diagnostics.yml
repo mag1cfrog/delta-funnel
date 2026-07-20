@@ -4,6 +4,15 @@ on:
   push:
     branches:
       - main
+    paths:
+      - ".github/workflows/testpypi-diagnostics.yml"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/delta-funnel/**"
+      - "crates/delta-funnel-python/**"
+      - "tools/perfetto/**"
+      - "xtask/Cargo.toml"
   workflow_dispatch:
 
 permissions:
@@ -35,6 +44,11 @@ jobs:
           version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
           test -n "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "${{ steps.rust-version.outputs.version }}" --profile minimal
+          rustup default "${{ steps.rust-version.outputs.version }}"
 
       - name: Prepare diagnostics package version
         id: package-version
@@ -110,10 +124,12 @@ jobs:
             --manifest-path crates/delta-funnel-python/Cargo.toml
             --features perfetto-profile
             --compatibility pypi
+            --target-dir target
             -i python3.10
 
       - name: Reset cache ownership
         run: |
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           if [ -d target ]; then
             sudo chown -R "$USER:$(id -gn)" target
           fi
