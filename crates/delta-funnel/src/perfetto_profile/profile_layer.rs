@@ -1043,10 +1043,10 @@ mod tests {
         assert_eq!(activity.track(), duplicate.track());
         assert_ne!(activity.track().uuid, other_stream.track().uuid);
         assert_ne!(activity.track().uuid, other_query.track().uuid);
-        assert_eq!(
-            activity.track().parent_uuid,
-            query_track(7, 3, operation_track(7, diagnostics_track(0).uuid).uuid).uuid
-        );
+        let query = query_track(7, 3, operation_track(7, diagnostics_track(0).uuid).uuid);
+        let same_id_worker = worker_track(7, 3, 10, query.uuid, 10);
+        assert!(same_id_worker.sibling_order_rank < other_stream.track().sibling_order_rank);
+        assert_eq!(activity.track().parent_uuid, query.uuid);
         assert!(
             activity
                 .track()

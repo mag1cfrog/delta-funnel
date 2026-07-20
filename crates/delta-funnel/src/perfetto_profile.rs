@@ -22,6 +22,8 @@ pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer};
 
 const CATEGORY: &str = "delta_funnel.profile";
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Keep output tracks after the bounded worker-lane rank range.
+const DELTA_SCAN_OUTPUT_SIBLING_ORDER_BASE: u64 = 1_000_000;
 // Perfetto's 256 KiB default dropped semantic packets during canonical event
 // bursts. This is the largest bounded hint accepted by Perfetto v57.2.
 const PRODUCER_SHMEM_SIZE_HINT_KB: u32 = 32 * 1024;
@@ -195,7 +197,7 @@ pub(crate) fn delta_scan_output_track(
         ),
         execution_stream_id,
         query_uuid,
-        execution_stream_id,
+        DELTA_SCAN_OUTPUT_SIBLING_ORDER_BASE.saturating_add(execution_stream_id),
     )
 }
 
