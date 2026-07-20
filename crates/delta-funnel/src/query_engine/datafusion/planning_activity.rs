@@ -269,6 +269,8 @@ impl Drop for PlanningActivitySpanRecorder {
 mod tests {
     use std::collections::BTreeSet;
 
+    use serde_json::json;
+
     use crate::{
         QueryExecutionScope, TimelineSpanStatus, observability::test_capture::TracingCapture,
         profiling::OperationTraceContext, report::OperationTimelineRecorder,
@@ -394,8 +396,6 @@ mod tests {
         .await
         .expect("timeline activity should succeed");
         let timeline = timeline_only.finish("stable", TimelineSpanStatus::Completed);
-        assert_eq!(timeline.spans().len(), 1);
-        assert_eq!(timeline.spans()[0].name(), "shared");
 
         let process_context = OperationTraceContext::start_for_test(None, true)
             .expect("process diagnostics should create a context");
@@ -428,12 +428,32 @@ mod tests {
         combined_context.record_process_result("ok");
         drop(combined_context);
         let combined = combined_timeline.finish("stable", TimelineSpanStatus::Completed);
-        assert_eq!(combined.spans().len(), 1);
-        assert_eq!(combined.spans()[0].name(), "shared");
-        assert_eq!(
-            without_timing(timeline.to_json_value()),
-            without_timing(combined.to_json_value())
-        );
+        let expected = json!({
+            "schema_version": 1,
+            "name": "stable",
+            "status": "completed",
+            "total_duration_micros": 0,
+            "spans": [{
+                "id": 1,
+                "parent_id": null,
+                "name": "shared",
+                "track_name": "DataFusion query planning / SQL output: orders",
+                "category": "datafusion.planning.activity",
+                "start_offset_micros": 0,
+                "duration_micros": 0,
+                "status": "completed",
+                "time_semantics": "wall_clock",
+                "attributes": {
+                    "activity": "shared",
+                    "query_execution_id": 1,
+                    "query_owner": "orders",
+                    "query_scope": "mssql_output",
+                    "result": "ok"
+                }
+            }]
+        });
+        assert_eq!(without_timing(timeline.to_json_value()), expected);
+        assert_eq!(without_timing(combined.to_json_value()), expected);
 
         let process_activities = capture
             .captured()
