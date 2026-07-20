@@ -804,10 +804,8 @@ where
         if let Some(span) = finalize_span {
             span.completed();
         }
-    } else {
-        if let Some(span) = finalize_span {
-            span.failed();
-        }
+    } else if let Some(span) = finalize_span {
+        span.failed();
     }
     finish_result.map_err(|source| {
         let elapsed_ms = elapsed_ms_since(started_at);
