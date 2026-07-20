@@ -278,14 +278,23 @@ mod tests {
 
     use super::*;
 
+    fn zero_u64_field(value: &mut Value, field: &str) {
+        let field_value = value
+            .get_mut(field)
+            .expect("timeline timing field should exist");
+        assert!(field_value.is_u64(), "{field} should be a u64");
+        *field_value = Value::from(0);
+    }
+
     fn without_timing(mut value: Value) -> Value {
-        value["total_duration_micros"] = Value::from(0);
-        for span in value["spans"]
-            .as_array_mut()
+        zero_u64_field(&mut value, "total_duration_micros");
+        for span in value
+            .get_mut("spans")
+            .and_then(Value::as_array_mut)
             .expect("timeline spans should be an array")
         {
-            span["start_offset_micros"] = Value::from(0);
-            span["duration_micros"] = Value::from(0);
+            zero_u64_field(span, "start_offset_micros");
+            zero_u64_field(span, "duration_micros");
         }
         value
     }
