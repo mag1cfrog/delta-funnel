@@ -6,12 +6,14 @@ semantic_slices AS (
     extract_arg(s.arg_set_id, 'debug.operation_id') AS operation_id,
     extract_arg(s.arg_set_id, 'debug.query_execution_id') AS query_execution_id,
     extract_arg(s.arg_set_id, 'debug.query_scope') AS query_scope,
+    extract_arg(s.arg_set_id, 'debug.query_owner') AS query_owner,
     extract_arg(s.arg_set_id, 'debug.worker_lane_id') AS worker_lane_id,
     extract_arg(s.arg_set_id, 'debug.worker_kind') AS worker_kind,
     extract_arg(s.arg_set_id, 'debug.node_id') AS node_id,
     extract_arg(s.arg_set_id, 'debug.operator_partition') AS operator_partition,
     extract_arg(s.arg_set_id, 'debug.execution_stream_id') AS execution_stream_id,
     extract_arg(s.arg_set_id, 'debug.activity') AS activity,
+    extract_arg(s.arg_set_id, 'debug.planning_activity_name') AS planning_activity_name,
     extract_arg(s.arg_set_id, 'debug.time_semantics') AS time_semantics,
     extract_arg(s.arg_set_id, 'debug.result') AS result
   FROM slice AS s
@@ -27,6 +29,7 @@ classified_slices AS (
         OR operator_partition IS NOT NULL
         OR execution_stream_id IS NOT NULL
       THEN 'operator'
+      WHEN planning_activity_name IS NOT NULL THEN 'planning_activity'
       WHEN name IN (
         'Delta Funnel preview',
         'Delta Funnel SQL Server write',
@@ -52,6 +55,11 @@ missing_fields AS (
         WHEN 'query_planning' THEN
           (operation_id IS NULL) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (time_semantics IS NULL) + (result IS NULL)
+        WHEN 'planning_activity' THEN
+          (operation_id IS NULL) + (query_execution_id IS NULL) +
+          (query_scope IS NULL) + (planning_activity_name = '') +
+          (activity IS NULL OR activity = '') + (time_semantics IS NULL) +
+          (result IS NULL)
         WHEN 'operator' THEN
           (operation_id IS NULL) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (worker_lane_id IS NULL) +
@@ -66,6 +74,7 @@ missing_fields AS (
 ordered_slices AS (
   SELECT
     id,
+    semantic_kind,
     ts,
     dur,
     track_id,
@@ -76,21 +85,52 @@ ordered_slices AS (
       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
     ) AS previous_end
   FROM classified_slices
-  WHERE semantic_kind = 'operator' AND dur > 0
+  WHERE semantic_kind IN ('operator', 'planning_activity') AND dur > 0
 ),
-crossing_worker_slice_ids AS (
-  SELECT id
+crossing_semantic_slice_ids AS (
+  SELECT id, semantic_kind
   FROM ordered_slices
   WHERE previous_end > ts
   UNION
-  SELECT child.id
+  SELECT child.id, child.semantic_kind
   FROM classified_slices AS child
   JOIN classified_slices AS parent ON parent.id = child.parent_id
-  WHERE child.semantic_kind = 'operator'
-    AND parent.semantic_kind = 'operator'
+  WHERE child.semantic_kind IN ('operator', 'planning_activity')
+    AND parent.semantic_kind = child.semantic_kind
     AND child.dur > 0
     AND parent.dur > 0
     AND child.ts + child.dur > parent.ts + parent.dur
+),
+crossing_counts AS (
+  SELECT
+    coalesce(sum(semantic_kind = 'operator'), 0) AS crossing_worker_slice_count,
+    coalesce(sum(semantic_kind = 'planning_activity'), 0)
+      AS crossing_planning_activity_slice_count
+  FROM crossing_semantic_slice_ids
+),
+invalid_planning_activity_hierarchy AS (
+  SELECT child.id
+  FROM classified_slices AS child
+  LEFT JOIN classified_slices AS parent ON parent.id = child.parent_id
+  WHERE child.semantic_kind = 'planning_activity'
+    AND (
+      parent.id IS NULL
+      OR parent.semantic_kind IS NULL
+      OR parent.semantic_kind NOT IN ('query_planning', 'planning_activity')
+      OR parent.track_id IS NOT child.track_id
+      OR parent.operation_id IS NOT child.operation_id
+      OR parent.query_execution_id IS NOT child.query_execution_id
+      OR parent.query_scope IS NOT child.query_scope
+      OR parent.query_owner IS NOT child.query_owner
+      OR (
+        child.dur >= 0
+        AND parent.dur >= 0
+        AND (
+          child.ts < parent.ts
+          OR child.ts + child.dur > parent.ts + parent.dur
+        )
+      )
+    )
 ),
 profile_counts AS (
   SELECT
@@ -98,6 +138,8 @@ profile_counts AS (
     coalesce(sum(semantic_kind = 'operation' AND dur < 0), 0)
       AS incomplete_operation_root_count,
     coalesce(sum(semantic_kind = 'operator'), 0) AS operator_slice_count,
+    coalesce(sum(semantic_kind = 'planning_activity'), 0)
+      AS planning_activity_slice_count,
     coalesce(sum(name = 'Operator activity trace truncated'), 0)
       AS truncation_marker_count
   FROM classified_slices
@@ -169,7 +211,9 @@ health_values AS (
     operation_root_count > 0
       AND incomplete_operation_root_count = 0
       AND missing_canonical_field_count = 0
-      AND (SELECT count(*) FROM crossing_worker_slice_ids) = 0
+      AND crossing_worker_slice_count = 0
+      AND crossing_planning_activity_slice_count = 0
+      AND (SELECT count(*) FROM invalid_planning_activity_hierarchy) = 0
       AND semantic_buffer_loss_count = 0
       AS semantic_complete,
     tracing_disabled_count > 0 AS finalization_observed,
@@ -177,10 +221,13 @@ health_values AS (
     operation_root_count,
     incomplete_operation_root_count,
     operator_slice_count,
+    planning_activity_slice_count,
     truncation_marker_count,
     missing_canonical_field_count,
-    (SELECT count(*) FROM crossing_worker_slice_ids)
-      AS crossing_worker_slice_count,
+    crossing_worker_slice_count,
+    crossing_planning_activity_slice_count,
+    (SELECT count(*) FROM invalid_planning_activity_hierarchy)
+      AS invalid_planning_activity_hierarchy_count,
     perf_sample_count,
     perf_sample_without_callsite_count,
     perf_samples_skipped,
@@ -193,6 +240,7 @@ health_values AS (
     sample_counts,
     lifecycle_counts,
     stat_counts,
+    crossing_counts,
     trace_metrics
 )
 SELECT
@@ -204,9 +252,12 @@ SELECT
   operation_root_count,
   incomplete_operation_root_count,
   operator_slice_count,
+  planning_activity_slice_count,
   truncation_marker_count,
   missing_canonical_field_count,
   crossing_worker_slice_count,
+  crossing_planning_activity_slice_count,
+  invalid_planning_activity_hierarchy_count,
   perf_sample_count,
   perf_sample_without_callsite_count,
   perf_samples_skipped,

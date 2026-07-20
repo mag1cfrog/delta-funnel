@@ -15,7 +15,7 @@ use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 use super::{
     SemanticTrack, diagnostics_track, operation_track, owner_track, perfetto_te_ns, phase_track,
-    query_track, worker_track,
+    planning_track, query_track, worker_track,
 };
 
 /// Exact tracing target consumed by the Perfetto profile layer.
@@ -101,6 +101,7 @@ struct ProfileFields {
     operator_partition: Option<u64>,
     execution_stream_id: Option<u64>,
     activity: Option<String>,
+    planning_activity_name: Option<String>,
     maximum_spans: Option<u64>,
     operator_name: Option<String>,
     phase: Option<String>,
@@ -134,6 +135,7 @@ impl Visit for ProfileFields {
             "query_owner" => self.query_owner = Some(value.to_owned()),
             "worker_kind" => self.worker_kind = Some(value.to_owned()),
             "activity" => self.activity = Some(value.to_owned()),
+            "planning_activity_name" => self.planning_activity_name = Some(value.to_owned()),
             "operator_name" => self.operator_name = Some(value.to_owned()),
             "phase" => self.phase = Some(value.to_owned()),
             "operation_kind" => self.operation_kind = Some(value.to_owned()),
@@ -177,9 +179,22 @@ impl ActiveProfileSpan {
             },
             "DataFusion query planning" => {
                 let query_execution_id = fields.query_execution_id?;
+                let phases = phase_track(operation_id, operation.uuid);
                 ProfileEvent::Planning {
-                    phases: phase_track(operation_id, operation.uuid),
+                    planning: planning_track(operation_id, query_execution_id, phases.uuid),
                     query: query_track(operation_id, query_execution_id, operation.uuid),
+                }
+            }
+            "DataFusion planning activity" => {
+                let query_execution_id = fields.query_execution_id?;
+                let name = fields.planning_activity_name.clone()?;
+                if fields.activity.as_deref()?.is_empty() {
+                    return None;
+                }
+                let phases = phase_track(operation_id, operation.uuid);
+                ProfileEvent::PlanningActivity {
+                    name,
+                    planning: planning_track(operation_id, query_execution_id, phases.uuid),
                 }
             }
             "Delta Funnel operation phase" => ProfileEvent::Phase {
@@ -222,7 +237,9 @@ impl ActiveProfileSpan {
     }
 
     fn record(&mut self, fields: ProfileFields) {
-        if fields.query_owner.is_some() {
+        if !matches!(&self.event, ProfileEvent::PlanningActivity { .. })
+            && fields.query_owner.is_some()
+        {
             self.fields.query_owner = fields.query_owner;
         }
         if fields.parent_node_id.is_some() {
@@ -263,7 +280,7 @@ impl ActiveProfileSpan {
                     ),
                 }
             }
-            ProfileEvent::Planning { phases, query } => {
+            ProfileEvent::Planning { planning, query } => {
                 track_event_instant!(
                     "delta_funnel.profile",
                     "DataFusion query",
@@ -276,10 +293,31 @@ impl ActiveProfileSpan {
                     "delta_funnel.profile",
                     "DataFusion query planning",
                     |context: &mut EventContext| {
-                        phases.set_on(context);
+                        planning.set_on(context);
                         self.add_profile_args(context);
                     }
                 );
+            }
+            ProfileEvent::PlanningActivity { name, planning } => {
+                if let Ok(name) = CString::new(name.as_str()) {
+                    track_event!(
+                        "delta_funnel.profile",
+                        TrackEventType::SliceBegin(name.as_ptr()),
+                        |context: &mut EventContext| {
+                            planning.set_on(context);
+                            self.add_profile_args(context);
+                        }
+                    );
+                } else {
+                    track_event_begin!(
+                        "delta_funnel.profile",
+                        "DataFusion planning activity",
+                        |context: &mut EventContext| {
+                            planning.set_on(context);
+                            self.add_profile_args(context);
+                        }
+                    );
+                }
             }
             ProfileEvent::Phase { kind, phases } => match kind {
                 OperationPhaseKind::Planning => track_event_begin!(
@@ -355,7 +393,8 @@ impl ActiveProfileSpan {
     fn emit_end(self) {
         let (track, flush) = match &self.event {
             ProfileEvent::Operation { operation, .. } => (operation, true),
-            ProfileEvent::Planning { phases, .. } => (phases, false),
+            ProfileEvent::Planning { planning, .. }
+            | ProfileEvent::PlanningActivity { planning, .. } => (planning, false),
             ProfileEvent::Phase { phases, .. } => (phases, false),
             ProfileEvent::Stage { track, .. } => (track, false),
             ProfileEvent::Operator { worker, .. } => (worker, false),
@@ -417,6 +456,9 @@ impl ActiveProfileSpan {
         if let Some(activity) = &self.fields.activity {
             context.add_debug_arg("activity", TrackEventDebugArg::String(activity));
         }
+        if let Some(name) = &self.fields.planning_activity_name {
+            context.add_debug_arg("planning_activity_name", TrackEventDebugArg::String(name));
+        }
         if let Some(operation_kind) = &self.fields.operation_kind {
             context.add_debug_arg("operation_kind", TrackEventDebugArg::String(operation_kind));
         }
@@ -450,7 +492,8 @@ impl ActiveProfileSpan {
     fn track(&self) -> &SemanticTrack {
         match &self.event {
             ProfileEvent::Operation { operation, .. } => operation,
-            ProfileEvent::Planning { phases, .. } => phases,
+            ProfileEvent::Planning { planning, .. }
+            | ProfileEvent::PlanningActivity { planning, .. } => planning,
             ProfileEvent::Phase { phases, .. } => phases,
             ProfileEvent::Stage { track, .. } => track,
             ProfileEvent::Operator { worker, .. } => worker,
@@ -466,8 +509,12 @@ enum ProfileEvent {
         operation: SemanticTrack,
     },
     Planning {
-        phases: SemanticTrack,
+        planning: SemanticTrack,
         query: SemanticTrack,
+    },
+    PlanningActivity {
+        name: String,
+        planning: SemanticTrack,
     },
     Phase {
         kind: OperationPhaseKind,
@@ -766,6 +813,153 @@ mod tests {
         );
         assert_eq!(active.fields.stage_owner_id, Some(2));
         assert_eq!(active.fields.result.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn planning_activities_share_their_query_planning_track() {
+        let planning_fields = |query_execution_id, name: &str| ProfileFields {
+            operation_id: Some(7),
+            query_execution_id: Some(query_execution_id),
+            query_scope: Some("mssql_output".to_owned()),
+            query_owner: Some("orders".to_owned()),
+            planning_activity_name: Some(name.to_owned()),
+            activity: Some("delta_scan_planning".to_owned()),
+            time_semantics: Some("wall_clock".to_owned()),
+            ..ProfileFields::default()
+        };
+        let query_planning = ActiveProfileSpan::from_fields(
+            "DataFusion query planning",
+            planning_fields(3, "unused"),
+        )
+        .expect("query planning should map");
+        let activity = ActiveProfileSpan::from_fields(
+            "DataFusion planning activity",
+            planning_fields(3, "Delta scan planning"),
+        )
+        .expect("the planning activity should map");
+        let duplicate = ActiveProfileSpan::from_fields(
+            "DataFusion planning activity",
+            planning_fields(3, "Delta scan planning"),
+        )
+        .expect("the same planning activity should map");
+        let other_query = ActiveProfileSpan::from_fields(
+            "DataFusion planning activity",
+            planning_fields(4, "Delta scan planning"),
+        )
+        .expect("another query should map");
+
+        assert_eq!(query_planning.track(), activity.track());
+        assert_eq!(activity.track(), duplicate.track());
+        assert_ne!(activity.track().uuid, other_query.track().uuid);
+        assert_eq!(
+            activity.track().parent_uuid,
+            phase_track(7, operation_track(7, diagnostics_track(0).uuid).uuid).uuid
+        );
+        assert!(
+            activity
+                .track()
+                .name
+                .contains("query [q-00000000000000000003] / planning")
+        );
+        assert_eq!(
+            activity.fields.planning_activity_name.as_deref(),
+            Some("Delta scan planning")
+        );
+        assert_eq!(
+            activity.fields.activity.as_deref(),
+            Some("delta_scan_planning")
+        );
+        assert_eq!(activity.fields.query_scope.as_deref(), Some("mssql_output"));
+        assert_eq!(activity.fields.query_owner.as_deref(), Some("orders"));
+        assert_eq!(
+            activity.fields.time_semantics.as_deref(),
+            Some("wall_clock")
+        );
+    }
+
+    #[test]
+    fn planning_activity_identity_is_begin_only_and_result_is_terminal() {
+        let mut active = ActiveProfileSpan::from_fields(
+            "DataFusion planning activity",
+            ProfileFields {
+                operation_id: Some(7),
+                query_execution_id: Some(3),
+                query_scope: Some("preview".to_owned()),
+                planning_activity_name: Some("Delta scan planning".to_owned()),
+                activity: Some("delta_scan_planning".to_owned()),
+                time_semantics: Some("wall_clock".to_owned()),
+                ..ProfileFields::default()
+            },
+        )
+        .expect("the planning activity should map");
+
+        active.record(ProfileFields {
+            operation_id: Some(99),
+            query_execution_id: Some(99),
+            query_scope: Some("mssql_output".to_owned()),
+            query_owner: Some("changed".to_owned()),
+            planning_activity_name: Some("Changed".to_owned()),
+            activity: Some("changed".to_owned()),
+            time_semantics: Some("active".to_owned()),
+            result: Some("ok".to_owned()),
+            ..ProfileFields::default()
+        });
+
+        assert_eq!(active.fields.operation_id, Some(7));
+        assert_eq!(active.fields.query_execution_id, Some(3));
+        assert_eq!(active.fields.query_scope.as_deref(), Some("preview"));
+        assert_eq!(active.fields.query_owner, None);
+        assert_eq!(
+            active.fields.planning_activity_name.as_deref(),
+            Some("Delta scan planning")
+        );
+        assert_eq!(
+            active.fields.activity.as_deref(),
+            Some("delta_scan_planning")
+        );
+        assert_eq!(active.fields.time_semantics.as_deref(), Some("wall_clock"));
+        assert_eq!(active.fields.result.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn incomplete_planning_activities_are_ignored() {
+        let complete = || ProfileFields {
+            operation_id: Some(7),
+            query_execution_id: Some(3),
+            planning_activity_name: Some("Delta scan planning".to_owned()),
+            activity: Some("delta_scan_planning".to_owned()),
+            ..ProfileFields::default()
+        };
+        assert!(
+            ActiveProfileSpan::from_fields(
+                "DataFusion planning activity",
+                ProfileFields {
+                    query_execution_id: None,
+                    ..complete()
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            ActiveProfileSpan::from_fields(
+                "DataFusion planning activity",
+                ProfileFields {
+                    planning_activity_name: None,
+                    ..complete()
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            ActiveProfileSpan::from_fields(
+                "DataFusion planning activity",
+                ProfileFields {
+                    activity: Some(String::new()),
+                    ..complete()
+                }
+            )
+            .is_none()
+        );
     }
 
     #[derive(Clone)]

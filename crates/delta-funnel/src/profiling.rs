@@ -337,6 +337,21 @@ pub(crate) struct OperationStageTrace {
 }
 
 impl OperationStageTrace {
+    pub(crate) fn from_parts(
+        timeline_span: Option<OperationTimelineSpanRecorder>,
+        process_span: Option<(tracing::Span, tracing::Span)>,
+    ) -> Option<Self> {
+        let process_span = process_span.map(|(span, parent)| ProcessSpanTrace {
+            span,
+            _parent: parent,
+            result_recorded: false,
+        });
+        (timeline_span.is_some() || process_span.is_some()).then_some(Self {
+            timeline_span,
+            process_span,
+        })
+    }
+
     pub(crate) fn start(
         context: Option<&OperationTraceContext>,
         timeline: Option<&OperationTimelineRecorder>,
