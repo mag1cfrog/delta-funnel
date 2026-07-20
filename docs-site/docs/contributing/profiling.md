@@ -264,34 +264,56 @@ policy that passes the real readiness check.
 
 ## Install or build a diagnostics-enabled Python extension
 
-Create and activate a dedicated virtual environment. The executable alias is
-required because the provided configs select the diagnostics process by this
-exact command-line token:
-
-```sh
-python3 -m venv target/python-perfetto-venv
-source target/python-perfetto-venv/bin/activate
-diagnostics_python="$VIRTUAL_ENV/bin/delta-funnel-perfetto-preview"
-ln -sf python "$diagnostics_python"
-```
+Choose exactly one installation route. Both routes define the same
+`diagnostics_python`, `perfetto_assets`, and `capture_health` variables used by
+the remaining steps. The executable alias is required because the provided
+configs select the diagnostics process by this exact command-line token.
 
 ### Install the latest TestPyPI diagnostics wheel
 
-Use this route to profile a real workload without a source build:
+Use this route to profile a real workload without a source build. Install `uv`,
+then merge these entries into the workload project's `pyproject.toml`. Keep any
+existing dependencies and index settings:
+
+```toml
+[project]
+dependencies = [
+    "deltafunnel>=0.0.0.dev0",
+]
+
+[[tool.uv.index]]
+name = "delta-funnel-testpypi"
+url = "https://test.pypi.org/simple"
+explicit = true
+
+[tool.uv.sources]
+deltafunnel = { index = "delta-funnel-testpypi" }
+```
+
+The explicit index and package source make only `deltafunnel` resolve from
+TestPyPI. Its `rich` dependency and all other packages continue to resolve from
+the default PyPI index.
+
+From the workload project root, update only Delta Funnel and create or sync the
+project environment:
 
 ```sh
 test "$(uname -m)" = x86_64
-python -m pip install --upgrade --pre --only-binary=:all: \
-  --index-url https://test.pypi.org/simple/ \
-  deltafunnel
+command -v uv
+uv sync --upgrade-package deltafunnel
 
-diagnostics_version="$(python -c \
+environment_python="$PWD/.venv/bin/python"
+diagnostics_python="$PWD/.venv/bin/delta-funnel-perfetto-preview"
+ln -sf python "$diagnostics_python"
+
+diagnostics_version="$("$environment_python" -c \
   'from importlib.metadata import version; print(version("deltafunnel"))')"
-perfetto_assets="$(python -c \
+printf 'diagnostics_version=%s\n' "$diagnostics_version"
+perfetto_assets="$("$environment_python" -c \
   'from importlib.resources import files; print(files("deltafunnel") / "perfetto")')"
 capture_health="$perfetto_assets/capture-health"
 
-python - <<'PY'
+"$environment_python" - <<'PY'
 from importlib.metadata import version
 import deltafunnel
 
@@ -306,12 +328,12 @@ PY
 The automated `main` workflow publishes one CPython 3.10+ ABI3 Linux x86_64
 wheel for glibc 2.28 or newer, with a version such as
 `0.3.4.dev202607200036290042`. Record the exact version with the capture.
-Reinstall that same build later with:
+The generated `uv.lock` records that exact version and its TestPyPI source.
+Preserve the lockfile with the capture and reproduce the environment later
+with:
 
 ```sh
-python -m pip install --pre --only-binary=:all: \
-  --index-url https://test.pypi.org/simple/ \
-  "deltafunnel==$diagnostics_version"
+uv sync --locked
 ```
 
 These builds are for occasional diagnostics and dogfooding. They are not a
@@ -324,6 +346,11 @@ Use this route from the repository root when native source-line resolution is
 required. Install `maturin>=1.13,<2`, then run:
 
 ```sh
+python3 -m venv target/python-perfetto-venv
+source target/python-perfetto-venv/bin/activate
+diagnostics_python="$VIRTUAL_ENV/bin/delta-funnel-perfetto-preview"
+ln -sf python "$diagnostics_python"
+
 maturin develop --locked --profile profiling \
   --features perfetto-profile \
   --manifest-path crates/delta-funnel-python/Cargo.toml
@@ -663,12 +690,12 @@ capture_unavailable
 An invalid logging filter remains a configuration error with kind
 `invalid_logging_filter`.
 
-If pip reports that no matching distribution exists, confirm that the active
+If uv reports that no matching distribution exists, confirm that the active
 interpreter is CPython 3.10 or newer on Linux x86_64 with glibc 2.28 or newer.
 If the resource checks fail or activation reports `not_available`, inspect the
-installed package with `python -m pip show deltafunnel`. Also print
-`sys.executable` from Python to confirm that the workload uses the diagnostics
-virtual environment rather than a stable wheel from another environment. A
+installed package with `uv pip show deltafunnel`. Also use `uv run python` to
+print `sys.executable` and confirm that the workload uses the diagnostics
+project environment rather than a stable wheel from another environment. A
 `capture_timeout` or `capture_unavailable` error means the diagnostics build is
 present but the external capture did not become ready; repeat the `perf`,
 system-socket, and FIFO readiness checks before running the workload again.

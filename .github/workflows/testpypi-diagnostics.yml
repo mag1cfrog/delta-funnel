@@ -25,7 +25,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Read Rust version
         id: rust-version
@@ -84,17 +86,17 @@ jobs:
           echo "python-version=$python_version" >> "$GITHUB_OUTPUT"
 
       - name: Set up build Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: testpypi-diagnostics-linux-x86-64
 
       - name: Build diagnostics wheel
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: build
           maturin-version: v1.13.3
@@ -152,7 +154,7 @@ jobs:
           PY
 
       - name: Upload diagnostics wheel
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: deltafunnel-testpypi-diagnostics-wheel
           path: dist/*.whl
@@ -168,16 +170,16 @@ jobs:
       url: https://test.pypi.org/project/deltafunnel/${{ needs.build.outputs.package-version }}/
     permissions:
       contents: read
-      id-token: write
+      id-token: write # Required for TestPyPI Trusted Publishing.
 
     steps:
       - name: Download diagnostics wheel
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: deltafunnel-testpypi-diagnostics-wheel
           path: dist
 
       - name: Publish diagnostics wheel
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
